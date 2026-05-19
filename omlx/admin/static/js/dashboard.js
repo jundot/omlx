@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -149,6 +149,13 @@
                     models: [],
                     model_memory_used: 0,
                     model_memory_max: 0,
+                    memory_pressure: {
+                        enabled: false,
+                        current_bytes: 0,
+                        soft_bytes: 0,
+                        hard_bytes: 0,
+                        pressure_level: 'ok',
+                    },
                     total_active_requests: 0,
                     total_waiting_requests: 0,
                 },
@@ -160,6 +167,10 @@
                     total_num_files: 0,
                     total_size_bytes: 0,
                     effective_block_sizes: [],
+                    hot_cache_size_bytes: 0,
+                    hot_cache_entries: 0,
+                    hot_cache_max_bytes: 0,
+                    disk_max_bytes: 0,
                 },
             },
             alltimeStats: {
@@ -190,6 +201,7 @@
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
             showClearSsdCacheConfirm: false,
+            showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -204,6 +216,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -252,6 +265,20 @@
             hfSearchLoading: false,
             hfSearchLoaded: false,
             hfSearchDebounceTimer: null,
+            // Search filters
+            hfSearchFiltersOpen: false,
+            hfSearchMinParams: '',
+            hfSearchMaxParams: '',
+            hfSearchMaxSize: '',
+            hfSearchMinSize: '',
+            // Table sort state for Browse Models
+            hfTableSort: 'downloads',
+            hfTableSortDir: 'desc',
+
+            // Computed: check if any filters are active
+            get hfSearchFiltersActive() {
+                return this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
+            },
 
             // Search history
             hfSearchHistory: JSON.parse(localStorage.getItem('hfSearchHistory') || '[]'),
@@ -1574,6 +1601,9 @@
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
                     dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
+                    dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
+                    dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model.dflash_compatible !== false,
                     dflash_compatibility_reason: model.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
@@ -1689,6 +1719,20 @@
                                     && !!this.modelSettings.dflash_in_memory_cache
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
+                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                dflash_draft_window_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_window_size
+                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
+                                    : null,
+                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_sink_size !== null
+                                    && this.modelSettings.dflash_draft_sink_size !== undefined
+                                    && this.modelSettings.dflash_draft_sink_size !== ''
+                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : null,
+                                dflash_verify_mode: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
+                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -1775,6 +1819,9 @@
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
+                        this.modelSettings.dflash_draft_window_size = null;
+                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
@@ -2045,6 +2092,10 @@
                 return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
             },
 
+            get hermesCommand() {
+                return this._launchCmd('hermes');
+            },
+
             get piCommand() {
                 return this._launchCmd('pi');
             },
@@ -2059,6 +2110,7 @@
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
@@ -2088,7 +2140,7 @@
                 }
             },
 
-            async loadStats() {
+            async loadStats(includeAlltime = true) {
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -2101,6 +2153,10 @@
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    }
+
+                    if (!includeAlltime) {
+                        return;
                     }
 
                     // Load all-time stats
@@ -2143,7 +2199,8 @@
 
             async clearSsdCache() {
                 try {
-                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
@@ -2152,11 +2209,24 @@
                 }
             },
 
+            async clearHotCache() {
+                try {
+                    const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
+                    this.showClearHotCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear hot cache:', err);
+                    this.showClearHotCacheConfirm = false;
+                }
+            },
+
             startStatsRefresh() {
                 this.stopStatsRefresh();
+                this.loadStats();
                 this._statsRefreshTimer = setInterval(() => {
-                    this.loadStats();
-                }, 1000);
+                    this.loadStats(false);
+                }, 500);
             },
 
             stopStatsRefresh() {
@@ -2170,6 +2240,36 @@
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            cacheObsCumulative(stats, selectedModel) {
+                const entries = stats.runtime_cache?.models || [];
+                if (entries.length === 0) return {};
+
+                if (selectedModel) {
+                    const entry = entries.find(m => m.id === selectedModel);
+                    return entry?.cache_rates?.cumulative || {};
+                }
+
+                const sumKeys = ['prefix_hits', 'prefix_misses', 'evictions', 'ssd_hot_hits', 'ssd_disk_loads', 'ssd_saves', 'hot_cache_evictions', 'hot_cache_promotions'];
+                let agg = {};
+
+                for (const m of entries) {
+                    const c = m.cache_rates?.cumulative;
+                    if (!c || Object.keys(c).length === 0) continue;
+                    for (const k of sumKeys) {
+                        agg[k] = (agg[k] || 0) + (c[k] || 0);
+                    }
+                }
+
+                const ph = agg.prefix_hits || 0;
+                const pm = agg.prefix_misses || 0;
+                const sh = agg.ssd_hot_hits || 0;
+                const sd = agg.ssd_disk_loads || 0;
+                agg.prefix_hit_rate = (ph + pm) > 0 ? ph / (ph + pm) : 0;
+                agg.ssd_hot_rate = (sh + sd) > 0 ? sh / (sh + sd) : 0;
+
+                return agg;
             },
 
             getStatFontClass(value) {
@@ -2233,10 +2333,72 @@
                 return 'bg-red-400';
             },
 
-            get activeModelsMemoryPercent() {
-                const am = this.stats.active_models;
-                if (!am || !am.model_memory_max) return 0;
-                return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
+            get runtimeHotCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.hot_cache_max_bytes) return 0;
+                return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+            },
+
+            get runtimeSsdCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.disk_max_bytes) return 0;
+                return Math.min(100, (rc.total_size_bytes / rc.disk_max_bytes) * 100);
+            },
+
+            get activeModelsPressurePercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes) return 0;
+                return Math.min(100, (mp.current_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsSoftPercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes || !mp.soft_bytes) return 0;
+                return Math.min(100, (mp.soft_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsPressureBarColor() {
+                const pct = this.activeModelsPressurePercent;
+                if (pct >= 90) return '#ef4444';
+                if (pct >= 80) return '#f97316';
+                if (pct >= 70) return '#f59e0b';
+                if (pct >= 60) return '#facc15';
+                return '#22c55e';
+            },
+
+            get activeModelsPressureBarStyle() {
+                return `width: ${this.activeModelsPressurePercent}%; height: 100%; display: block; background-color: ${this.activeModelsPressureBarColor};`;
+            },
+
+            get activeModelsSoftMarkerStyle() {
+                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+            },
+
+            activeModelsPressureLabel() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.enabled || !mp.hard_bytes) {
+                    return window.t('status.active_models.enforcer_disabled');
+                }
+                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+            },
+
+            modelSizeLabel(model) {
+                if (!model) return '-';
+                const estimated = model.estimated_size_formatted || '-';
+                if (model.is_loading) {
+                    return estimated;
+                }
+                // actual_size is a rough phys_footprint delta captured at load
+                // time and can include neighboring KV growth — mark with ~obs
+                // so it doesn't read as exact.
+                const actual = model.actual_size_formatted;
+                if (!actual) {
+                    return estimated;
+                }
+                if (!estimated || estimated === actual) {
+                    return `~${actual} obs`;
+                }
+                return `~${actual} obs / ${estimated} est`;
             },
 
             copyToClipboard(text) {
@@ -2929,6 +3091,28 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';
@@ -3985,10 +4169,18 @@
                 try {
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
-                        this.hfRecommended = await response.json();
+                        const data = await response.json();
+                        // Attach original rank so the # column survives column-header re-sorts
+                        this.hfRecommended = {
+                            trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                            popular: (data.popular || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                        };
                         this.hfRecommendedLoaded = true;
                         this.hfPage.trending = 1;
                         this.hfPage.popular = 1;
+                        // Default sort for trending/popular is original rank
+                        this.hfTableSort = 'rank';
+                        this.hfTableSortDir = 'asc';
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -4030,6 +4222,56 @@
                 return count.toString();
             },
 
+            // Table sort helpers for Browse Models
+            sortModels(list) {
+                const sortBy = this.hfTableSort;
+                const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
+                return [...list].sort((a, b) => {
+                    if (sortBy === 'rank') {
+                        return dir * ((a.rank || 0) - (b.rank || 0));
+                    } else if (sortBy === 'name') {
+                        return dir * (a.name || '').localeCompare(b.name || '');
+                    } else if (sortBy === 'downloads') {
+                        return dir * ((a.downloads || 0) - (b.downloads || 0));
+                    } else if (sortBy === 'likes') {
+                        return dir * ((a.likes || 0) - (b.likes || 0));
+                    } else if (sortBy === 'size') {
+                        return dir * ((a.size || 0) - (b.size || 0));
+                    } else if (sortBy === 'params') {
+                        return dir * ((a.params || 0) - (b.params || 0));
+                    }
+                    return 0;
+                });
+            },
+
+            toggleTableSort(column) {
+                if (this.hfTableSort === column) {
+                    this.hfTableSortDir = this.hfTableSortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.hfTableSort = column;
+                    // Name and rank read more naturally as ascending by default
+                    this.hfTableSortDir = (column === 'name' || column === 'rank') ? 'asc' : 'desc';
+                }
+            },
+
+            syncTableSortToDropdown() {
+                const map = {
+                    largest:      { col: 'size',      dir: 'desc' },
+                    smallest:     { col: 'size',      dir: 'asc'  },
+                    most_params:  { col: 'params',    dir: 'desc' },
+                    least_params: { col: 'params',    dir: 'asc'  },
+                    downloads:    { col: 'downloads', dir: 'desc' },
+                    trending:     { col: 'downloads', dir: 'desc' },
+                    created:      { col: 'downloads', dir: 'desc' },
+                    updated:      { col: 'downloads', dir: 'desc' },
+                };
+                const m = map[this.hfSearchSort];
+                if (m) {
+                    this.hfTableSort = m.col;
+                    this.hfTableSortDir = m.dir;
+                }
+            },
+
             // Pagination helpers
             getPagedModels(tab) {
                 const page = this.hfPage[tab] || 1;
@@ -4038,7 +4280,9 @@
                 if (tab === 'trending') list = this.hfRecommended.trending || [];
                 else if (tab === 'popular') list = this.hfRecommended.popular || [];
                 else list = this.hfSearchResults || [];
-                return list.slice((page - 1) * size, page * size);
+                // Apply table sorting
+                const sorted = this.sortModels(list);
+                return sorted.slice((page - 1) * size, page * size);
             },
 
             getTotalPages(tab) {
@@ -4060,6 +4304,9 @@
                 this.hfSearchLoading = true;
                 this.hfRecommendedTab = 'search';
                 this.hfPage.search = 1;
+                // Sync table sort with dropdown choice so the frontend re-sort
+                // does not override what the backend returned
+                this.syncTableSortToDropdown();
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
@@ -4069,6 +4316,23 @@
                         limit: '100',
                         mlx_only: this.hfMlxOnly,
                     });
+                    // Add filter parameters if set. Sizes use binary GiB to match
+                    // _format_model_size on the backend.
+                    const GIB = 1024 * 1024 * 1024;
+                    if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
+                    if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
+                    if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * GIB).toString());
+                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * GIB).toString());
+                    // Wire largest/smallest sort params to backend
+                    if (this.hfSearchSort === 'largest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'false');
+                    } else if (this.hfSearchSort === 'smallest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'true');
+                    }
+
+
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
@@ -4095,6 +4359,14 @@
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
                 }
+            },
+
+            clearHFSearchFilters() {
+                this.hfSearchMinParams = '';
+                this.hfSearchMaxParams = '';
+                this.hfSearchMaxSize = '';
+                this.hfSearchMinSize = '';
+                if (this.hfSearchQuery.trim()) this.immediateSearch();
             },
 
             debounceSearch() {

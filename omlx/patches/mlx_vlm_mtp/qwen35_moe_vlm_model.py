@@ -127,6 +127,9 @@ def apply() -> bool:
                 # mlx-lm model hierarchy. See qwen35_vlm_model.py for why.
                 key = "language_model." + key
 
+            if key.startswith("language_model.model.visual."):
+                key = "vision_tower." + key[len("language_model.model.visual."):]
+
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 # mx.moveaxis goes through the streaming-discovery
                 # monkey-patch in omlx.oq when called with _TrackedTensor;

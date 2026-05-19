@@ -10,11 +10,19 @@ from omlx.integrations.base import Integration
 from omlx.utils.install import get_cli_prefix
 
 
-class PiIntegration(Integration):
-    """Pi integration that configures ~/.pi/agent/models.json and settings.json."""
+def _get_agent_dir() -> Path:
+    """Get the pi agent config directory, respecting PI_CODING_AGENT_DIR."""
+    env_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return Path.home() / ".pi" / "agent"
 
-    MODELS_PATH = Path.home() / ".pi" / "agent" / "models.json"
-    SETTINGS_PATH = Path.home() / ".pi" / "agent" / "settings.json"
+class PiIntegration(Integration):
+    """Pi integration that configures the pi agent config directory."""
+
+    AGENT_DIR = _get_agent_dir()
+    MODELS_PATH = AGENT_DIR / "models.json"
+    SETTINGS_PATH = AGENT_DIR / "settings.json"
 
     def __init__(self):
         super().__init__(

@@ -21,6 +21,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from .base import BaseEngine, GenerationOutput
@@ -114,6 +115,10 @@ class DFlashEngine(BaseEngine):
         self._in_fallback_mode = False
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        # Protocol-specific output parser factory (gemma4 / harmony).
+        # Detected once in start() after the target model is loaded; None means
+        # the streaming detokenizer is used as-is (qwen, llama, etc.).
+        self._output_parser_factory: Any | None = None
 
         self._max_dflash_ctx = (
             getattr(model_settings, "dflash_max_ctx", None) if model_settings else None
@@ -137,6 +142,23 @@ class DFlashEngine(BaseEngine):
             bool(getattr(model_settings, "dflash_ssd_cache", False))
             if model_settings
             else False
+        )
+        # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
+        # `getattr` returns None for missing attrs so older settings files keep working.
+        self._draft_window_size = (
+            getattr(model_settings, "dflash_draft_window_size", None)
+            if model_settings
+            else None
+        )
+        self._draft_sink_size = (
+            getattr(model_settings, "dflash_draft_sink_size", None)
+            if model_settings
+            else None
+        )
+        self._verify_mode = (
+            getattr(model_settings, "dflash_verify_mode", None)
+            if model_settings
+            else None
         )
 
     @property
@@ -186,15 +208,12 @@ class DFlashEngine(BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
-        from dflash_mlx.runtime.context import (
-            build_runtime_context,
-            runtime_config_from_profile,
-        )
+        from dflash_mlx.runtime.config import runtime_config_from_defaults
+        from dflash_mlx.runtime.context import build_runtime_context
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
-        cfg = runtime_config_from_profile(
-            profile="balanced",
+        cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
@@ -203,6 +222,10 @@ class DFlashEngine(BaseEngine):
             # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
             # configuration, so dflash's own byte limit is intentionally large.
             prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
+            draft_window_size=self._draft_window_size,
+            draft_sink_size=self._draft_sink_size,
+            verify_mode=self._verify_mode,
         )
         return build_runtime_context(cfg)
 
@@ -215,7 +238,7 @@ class DFlashEngine(BaseEngine):
         loop = asyncio.get_running_loop()
 
         def _load_models():
-            from dflash_mlx.draft_backend import make_draft_backend
+            from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
                 load_target_bundle,
@@ -230,7 +253,7 @@ class DFlashEngine(BaseEngine):
                     self._draft_quant_group_size,
                 ) if self._draft_quant_enabled else None,
             )
-            draft_backend = make_draft_backend()
+            draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
@@ -253,18 +276,37 @@ class DFlashEngine(BaseEngine):
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
 
+        # Detect protocol-specific output parser (gemma4 channel markers,
+        # harmony channels). Scheduler-driven engines apply this via
+        # OutputParserSession.process_token per request; dflash bypasses the
+        # scheduler so we do the same wiring inline in our two generate paths.
+        parser_config = config if isinstance(config, dict) else None
+        try:
+            self._output_parser_factory = detect_output_parser(
+                self._model_name, self._executor_tokenizer, parser_config
+            )
+        except Exception as exc:
+            logger.debug(f"output parser detect failed: {exc}")
+            self._output_parser_factory = None
+
         self._runtime_context = self._build_runtime_context()
 
         self._loaded = True
         self._in_fallback_mode = False
         max_ctx_display = "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
+        # Resolved values dflash-mlx actually ended up using (None settings → dflash default).
+        runtime_cfg = getattr(self._runtime_context, "runtime", None)
+        window_used = getattr(runtime_cfg, "draft_window_size", "?")
+        sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
+        verify_used = getattr(runtime_cfg, "verify_mode", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
             f"max_ctx={max_ctx_display}, "
             f"fallback={self._fallback_engine_type}, "
             f"l1_cache={self._in_memory_cache_enabled}, "
-            f"l2_cache={self._resolve_dflash_l2_dir() is not None}"
+            f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
         )
 
     async def _evict_dflash_and_start_fallback(self) -> None:
@@ -285,6 +327,7 @@ class DFlashEngine(BaseEngine):
         self._draft_model = None
         self._draft_backend = None
         self._executor_tokenizer = None
+        self._output_parser_factory = None
 
         # Force memory reclaim with settle barrier
         gc.collect()
@@ -351,6 +394,7 @@ class DFlashEngine(BaseEngine):
         self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
+        self._output_parser_factory = None
         self._in_fallback_mode = False
         self._loaded = False
         logger.info("DFlashEngine stopped")
@@ -515,8 +559,13 @@ class DFlashEngine(BaseEngine):
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
         # index 2 = draft id; the middle slot is unused on the dflash side.
+        # ``tokenizer`` and ``cli_args`` are required since dflash-mlx 1ba6713 —
+        # build_prefix_key hashes the chat template / policy. cli_args=None
+        # makes chat_template_args fall back to {}.
         class _ModelProviderShim:
             model_key = (self._model_name, None, self._draft_model_path)
+            tokenizer = self._executor_tokenizer
+            cli_args = None
 
         prefix_flow = PrefixCacheFlow.for_request(
             model_provider=_ModelProviderShim(),
@@ -570,13 +619,22 @@ class DFlashEngine(BaseEngine):
                 max_tokens=max_tokens,
             )
 
-            # Use streaming detokenizer for proper UTF-8 handling (CJK etc.)
+            # Protocol-specific parser (gemma4 channel markers → <think> tags,
+            # harmony channels → <think>/visible split). When active it owns
+            # detokenization too, so the NaiveStreamingDetokenizer fallback is
+            # only created when no parser is available.
+            parser_session = (
+                self._output_parser_factory.create_session(self._executor_tokenizer)
+                if self._output_parser_factory is not None
+                else None
+            )
             detokenizer = None
-            try:
-                from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
-            except ImportError:
-                pass
+            if parser_session is None:
+                try:
+                    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+                    detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
+                except ImportError:
+                    pass
 
             for event in event_iter:
                 if stop_event.is_set():
@@ -588,16 +646,35 @@ class DFlashEngine(BaseEngine):
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
                         continue
-                    if detokenizer is not None:
+                    if parser_session is not None:
+                        result = parser_session.process_token(token_id)
+                        text = result.stream_text
+                    elif detokenizer is not None:
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
                     else:
                         text = self._executor_tokenizer.decode([token_id])
+                    # Parser sessions can emit empty stream_text on protocol
+                    # marker tokens — skip the chunk so clients don't see a
+                    # flood of empty deltas.
+                    if not text:
+                        continue
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
                     )
 
                 elif isinstance(event, SummaryEvent):
+                    # Flush any buffered tail from the parser (e.g. close an
+                    # unterminated <think> block) before the metrics chunk so
+                    # the client sees a well-formed final delta.
+                    if parser_session is not None:
+                        final = parser_session.finalize()
+                        tail = final.stream_text
+                        if tail:
+                            asyncio.run_coroutine_threadsafe(
+                                queue.put((tail, [], False, None)), loop
+                            )
+
                     gen_tokens = int(event.generation_tokens)
                     accept_ratio = float(event.acceptance_ratio)
                     cycles = int(event.cycles_completed)
@@ -702,12 +779,21 @@ class DFlashEngine(BaseEngine):
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
             event_iter = None
+            # Per-request parser session (gemma4 channel markers, harmony
+            # channels). Lives only inside the executor thread so the parser
+            # state cannot leak across requests.
+            parser_session = (
+                self._output_parser_factory.create_session(self._executor_tokenizer)
+                if self._output_parser_factory is not None
+                else None
+            )
             try:
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
                 )
                 tokens: list[int] = []
+                parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
                 for event in event_iter:
                     if stop_event.is_set():
@@ -718,9 +804,17 @@ class DFlashEngine(BaseEngine):
                         if token_id in stop_ids:
                             continue
                         tokens.append(token_id)
+                        if parser_session is not None:
+                            result = parser_session.process_token(token_id)
+                            if result.visible_text:
+                                parsed_visible_parts.append(result.visible_text)
                     elif isinstance(event, SummaryEvent):
                         summary = event
-                return summary, tokens
+                if parser_session is not None:
+                    final = parser_session.finalize()
+                    if final.visible_text:
+                        parsed_visible_parts.append(final.visible_text)
+                return summary, tokens, parser_session, parsed_visible_parts
             finally:
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
@@ -734,7 +828,9 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated = await asyncio.shield(asyncio.wrap_future(future))
+            summary, generated, parser_session, parsed_visible_parts = (
+                await asyncio.shield(asyncio.wrap_future(future))
+            )
         except asyncio.CancelledError:
             stop_event.set()
             logger.info("DFlash generate cancelled, waiting for executor to drain")
@@ -745,17 +841,28 @@ class DFlashEngine(BaseEngine):
             except Exception:
                 pass
             raise
-        text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
-        text = clean_special_tokens(text)
 
-        # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
-        # have <think>\n at the END of the prompt, so the model's first
-        # generated token is already INSIDE the thinking block. The opening
-        # tag never appears in the output, which would prevent extract_thinking
-        # / ThinkingParser from separating reasoning from content. Prepend
-        # the tag here so the API layer can split them correctly.
-        if self._detect_needs_think_prefix(prompt_tokens):
-            text = self._think_prefix_text() + text
+        if parser_session is not None:
+            # Parser already converted protocol markers to <think>...</think>
+            # and stripped channel marker tokens, so just join the visible
+            # segments. Don't re-decode the raw token list — that would
+            # reintroduce the raw markers and double-buffer detokenization.
+            text = "".join(parsed_visible_parts)
+        else:
+            text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+            text = clean_special_tokens(text)
+
+            # Reasoning models (Qwen3.x with enable_thinking, DeepSeek,
+            # MiniMax, ...) have <think>\n at the END of the prompt, so the
+            # model's first generated token is already INSIDE the thinking
+            # block. The opening tag never appears in the output, which would
+            # prevent extract_thinking / ThinkingParser from separating
+            # reasoning from content. Prepend the tag here so the API layer
+            # can split them correctly. Skipped when a parser session is
+            # active because gemma4/harmony parsers already emit <think> tags
+            # themselves and prepending would double the marker.
+            if self._detect_needs_think_prefix(prompt_tokens):
+                text = self._think_prefix_text() + text
 
         prompt_token_count = (
             int(summary.prompt_token_count) if summary is not None else len(prompt_tokens)
@@ -827,7 +934,13 @@ class DFlashEngine(BaseEngine):
         # ThinkingParser starts in _in_thinking=False, so without prepending
         # the opening tag on the first chunk the whole reasoning block leaks
         # into content. Mirror Scheduler._detect_needs_think_prefix here.
-        needs_think_prefix = self._detect_needs_think_prefix(prompt_tokens)
+        # When a protocol-aware parser session is active (gemma4 / harmony),
+        # the parser emits <think> tags itself, so prepending here would
+        # double the opening marker — gate it on factory absence.
+        needs_think_prefix = (
+            self._output_parser_factory is None
+            and self._detect_needs_think_prefix(prompt_tokens)
+        )
         think_prefix_pending = needs_think_prefix
 
         from ..engine_core import get_mlx_executor

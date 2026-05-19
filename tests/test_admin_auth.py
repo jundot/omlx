@@ -444,10 +444,10 @@ class TestCheckUpdate:
         """Dev/pre-release GitHub releases should not trigger update notification."""
         fake_resp = _FakeResponse(
             200,
-            {
+            [{
                 "tag_name": "v99.0.0.dev1",
                 "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0.dev1",
-            },
+            }],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)
@@ -461,10 +461,10 @@ class TestCheckUpdate:
         """Stable GitHub releases should trigger update notification."""
         fake_resp = _FakeResponse(
             200,
-            {
+            [{
                 "tag_name": "v99.0.0",
                 "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0",
-            },
+            }],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)
@@ -478,10 +478,10 @@ class TestCheckUpdate:
         """RC releases should not trigger update notification."""
         fake_resp = _FakeResponse(
             200,
-            {
+            [{
                 "tag_name": "v99.0.0rc1",
                 "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0rc1",
-            },
+            }],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)

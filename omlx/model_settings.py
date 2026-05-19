@@ -71,6 +71,13 @@ class ModelSettings:
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
+        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+            Helps stabilise acceptance rate on long-context prompts.
+        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
+            (None = dflash default 64).
+        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
+            (None = dflash default "adaptive"). "adaptive" can shrink block size when
+            acceptance drops.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, the BatchGenerator uses an MTP draft+verify path for single-request
             decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
@@ -136,6 +143,12 @@ class ModelSettings:
     dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
     dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
     dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
+    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
+    # agentic workloads where acceptance drops on the default sliding window.
+    dflash_draft_window_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = None
+    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:

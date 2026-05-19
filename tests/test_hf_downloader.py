@@ -297,10 +297,14 @@ class TestHFDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader, model_dir):
-        # Create partial files to verify they are preserved after cancel
-        target = model_dir / "model"
-        target.mkdir(exist_ok=True)
-        (target / "partial.bin").write_bytes(b"x" * 100)
+        # In-progress shards live under ._____temp and must be removed,
+        # while finalized shards outside it stay for resume on retry.
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
 
         with patch(
             "omlx.admin.hf_downloader.HfApi"
@@ -319,15 +323,83 @@ class TestHFDownloader:
             # Give it a moment to start
             await asyncio.sleep(0.2)
 
+            active_task = downloader._active_tasks[task.task_id]
             success = await downloader.cancel_download(task.task_id)
             assert success is True
             assert task.status == DownloadStatus.CANCELLED
+            await active_task
 
-            # Partial files should be preserved for resume
+            assert not temp_dir.exists()
+            assert (target / "model-00001-of-00002.safetensors").exists()
             assert target.exists()
-            assert (target / "partial.bin").exists()
 
             await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_download_cleans_up_temp_dir_only(
+        self, downloader, model_dir
+    ):
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"x")
+
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise asyncio.CancelledError()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.CANCELLED
+        assert not temp_dir.exists()
+        assert (target / "model-00001-of-00002.safetensors").exists()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_download_logs_cleanup_failure(self, downloader, caplog):
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise asyncio.CancelledError()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ), patch.object(
+            downloader, "_cleanup_partial", side_effect=Exception("boom")
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.CANCELLED
+        assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_returns_false(self, downloader):
@@ -488,33 +560,39 @@ class TestHFDownloader:
     # --- Cleanup ---
 
     @pytest.mark.asyncio
-    async def test_cleanup_partial_removes_directory(self, model_dir):
+    async def test_cleanup_partial_removes_temp_dir_only(self, model_dir):
+        """Cleanup deletes the hidden ._____temp dir, finalized shards stay."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
-        # Partial download lands at {model_dir}/{owner}/{model}
         org_dir = model_dir / "owner"
         target = org_dir / "model"
         target.mkdir(parents=True)
-        (target / "partial.bin").write_bytes(b"x" * 100)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
 
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
-        assert not target.exists()
-        # Empty org folder should also be removed.
-        assert not org_dir.exists()
+        # In-progress shards gone, finalized shards and dirs preserved
+        # so snapshot_download can resume on retry.
+        assert not temp_dir.exists()
+        assert (target / "model-00001-of-00002.safetensors").exists()
+        assert target.exists()
+        assert org_dir.exists()
 
     @pytest.mark.asyncio
-    async def test_cleanup_partial_keeps_org_folder_with_siblings(self, model_dir):
-        """Org folder must survive cleanup when it still has other models."""
+    async def test_cleanup_partial_is_noop_when_no_temp_dir(self, model_dir):
+        """With nothing in ._____temp, cleanup leaves the dir untouched."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
         org_dir = model_dir / "owner"
         target = org_dir / "model"
         target.mkdir(parents=True)
-        (target / "partial.bin").write_bytes(b"x")
+        (target / "config.json").write_text("{}")
 
         sibling = org_dir / "other-model"
         sibling.mkdir()
@@ -523,9 +601,9 @@ class TestHFDownloader:
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
-        assert not target.exists()
-        assert org_dir.exists()
+        assert (target / "config.json").exists()
         assert sibling.exists()
+        assert org_dir.exists()
 
     @pytest.mark.asyncio
     async def test_download_uses_owner_model_layout(self, model_dir):
@@ -1357,6 +1435,111 @@ class TestSearchModels:
             result = await HFDownloader.search_models(query="model", limit=5)
 
         assert len(result["models"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_search_largest_sort(self):
+        """Test largest sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="largest"
+            )
+
+        # Large should come first
+        assert result["models"][0]["repo_id"] == "org/large"
+        assert result["models"][1]["repo_id"] == "org/small"
+
+    @pytest.mark.asyncio
+    async def test_search_smallest_sort(self):
+        """Test smallest sorting works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model", sort="smallest"
+            )
+
+        # Small should come first
+        assert result["models"][0]["repo_id"] == "org/small"
+        assert result["models"][1]["repo_id"] == "org/large"
+
+    @pytest.mark.asyncio
+    async def test_search_sort_by_size(self):
+        """Test sort_by_size parameter works correctly."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, large]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="model",
+                sort="downloads",  # base sort
+                sort_by_size=True,
+                sort_ascending=True,  # smallest first
+            )
+
+        # Small should come first when ascending
+        assert result["models"][0]["repo_id"] == "org/small"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_by_min_max_params(self):
+        """Test filtering by parameter count range."""
+        small = _make_mock_model("org/small", disk_size_bytes=4_000_000_000, downloads=100)
+        medium = _make_mock_model("org/medium", disk_size_bytes=14_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=28_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, medium, large]
+            mock_api_cls.return_value = mock_api
+
+            # Filter: 3B-8B params (BF16: 4GB=2B, 14GB=7B, 28GB=14B)
+            result = await HFDownloader.search_models(
+                query="model",
+                min_params=3_000_000_000,
+                max_params=8_000_000_000,
+            )
+
+        # Only medium model should be included
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "org/medium"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_by_min_max_size(self):
+        """Test filtering by model size range."""
+        small = _make_mock_model("org/small", disk_size_bytes=2_000_000_000, downloads=100)
+        medium = _make_mock_model("org/medium", disk_size_bytes=8_000_000_000, downloads=100)
+        large = _make_mock_model("org/large", disk_size_bytes=20_000_000_000, downloads=100)
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [small, medium, large]
+            mock_api_cls.return_value = mock_api
+
+            # Filter: 5GB-15GB
+            result = await HFDownloader.search_models(
+                query="model",
+                min_size=5_000_000_000,
+                max_size=15_000_000_000,
+            )
+
+        # Only medium model should be included
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "org/medium"
 
 
 # =============================================================================

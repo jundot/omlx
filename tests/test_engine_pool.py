@@ -467,6 +467,90 @@ class TestVLMFallback:
         ), pytest.raises(Exception, match="Load failed"):
             await pool._load_engine("model-a", force_lm=True)
 
+    @pytest.mark.asyncio
+    async def test_vlm_fallback_to_llm_both_fail_surfaces_both_errors(
+        self, small_mock_model_dir
+    ):
+        """When VLM start fails AND the LLM fallback also fails, the raised
+        RuntimeError should embed both messages and chain ``__cause__`` to the
+        original VLM error (PR #1283)."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(
+            side_effect=Exception("Missing vision_tower parameters")
+        )
+        mock_vlm_engine.stop = AsyncMock()
+
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock(
+            side_effect=Exception("Model type lfm2_vl not supported")
+        )
+
+        with patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ), patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ), pytest.raises(RuntimeError) as excinfo:
+            await pool._load_engine("model-a")
+
+        msg = str(excinfo.value)
+        assert "VLM load failed" in msg
+        assert "Missing vision_tower parameters" in msg
+        assert "LLM fallback also failed" in msg
+        assert "Model type lfm2_vl not supported" in msg
+        # __cause__ chain preserves the original VLM error
+        assert excinfo.value.__cause__ is not None
+        assert "Missing vision_tower parameters" in str(excinfo.value.__cause__)
+
+    @pytest.mark.asyncio
+    async def test_force_lm_fallback_to_vlm_both_fail_surfaces_both_errors(
+        self, small_mock_model_dir
+    ):
+        """force_lm path: LM start fails AND VLM fallback also fails. Both
+        error messages should land in the raised RuntimeError, with the LM
+        error as ``__cause__`` (PR #1283)."""
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+
+        mock_batched_engine = MagicMock()
+        mock_batched_engine.start = AsyncMock(
+            side_effect=TypeError(
+                "ModelArgs.__init__() missing 1 required positional argument: "
+                "'tie_word_embeddings'"
+            )
+        )
+        mock_batched_engine.stop = AsyncMock()
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(
+            side_effect=Exception("vision encoder weights missing")
+        )
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        ), patch(
+            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        ), pytest.raises(RuntimeError) as excinfo:
+            await pool._load_engine("model-a", force_lm=True)
+
+        msg = str(excinfo.value)
+        assert "LM load failed" in msg
+        assert "force_lm=True" in msg
+        assert "tie_word_embeddings" in msg
+        assert "VLM fallback also failed" in msg
+        assert "vision encoder weights missing" in msg
+        assert isinstance(excinfo.value.__cause__, TypeError)
+
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""

@@ -110,12 +110,17 @@
                             <div class="flex items-center gap-3">
                                 <!-- Memory progress bar -->
                                 <div class="flex items-center gap-2">
-                                    <div class="w-24 h-2 bg-neutral-200 rounded-full overflow-hidden">
-                                        <div class="h-full bg-neutral-700 rounded-full transition-all duration-500"
-                                             :style="'width: ' + activeModelsMemoryPercent + '%'"></div>
+                                    <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                                        <div class="rounded-full transition-all duration-300"
+                                             :style="activeModelsPressureBarStyle"></div>
+                                        <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
+                                             x-cloak
+                                             class="absolute inset-y-0"
+                                             :style="activeModelsSoftMarkerStyle">
+                                        </div>
                                     </div>
                                     <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                                          x-text="formatSizeBytes(stats.active_models.model_memory_used) + ' / ' + formatSizeBytes(stats.active_models.model_memory_max)"></span>
+                                          x-text="activeModelsPressureLabel()"></span>
                                 </div>
                             </div>
                         </div>
@@ -169,7 +174,7 @@
                                                 </template>
                                             </div>
                                             <!-- Memory size -->
-                                            <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
+                                            <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="modelSizeLabel(m)"></span>
                                             <!-- Unload button -->
                                             <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
                                                  x-data="{ showTip: false }"
@@ -282,8 +287,47 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
                             </div>
                             <div class="flex items-center gap-2">
-                                <span class="text-xs text-neutral-500"
-                                      x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></span>
+                                <!-- Memory gauge (only when hot cache is enabled AND models are loaded) -->
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">Memory</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeHotCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache.hot_cache_size_bytes) + ' / ' + formatSizeBytes(stats.runtime_cache.hot_cache_max_bytes) + ' · ' + (stats.runtime_cache.hot_cache_entries || 0) + ' entries'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
+                                                @click="showClearHotCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                title="Clear memory cache">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <button @click="clearHotCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearHotCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Separator (only when both tiers visible) -->
+                                <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
+                                <!-- SSD gauge (always visible) -->
+                                <div class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">SSD</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                                </div>
                                 <div class="flex items-center gap-1.5">
                                     <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
                                             @click="showClearSsdCacheConfirm = true"
@@ -327,6 +371,33 @@
                                 </div>
                             </div>
 
+                            <!-- Cache rates (visible when models are loaded, session scope only) -->
+                            <div x-show="statsScope !== 'alltime' && stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 x-data="{ get c() { return cacheObsCumulative(stats, selectedStatsModel) } }"
+                                 :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
+                                 class="grid gap-3 border border-neutral-100 rounded-lg p-3">
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Hit Rate</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Hit Rate</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Evictions</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.evictions || 0).toLocaleString()"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Evictions</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
+                                </div>
+                            </div>
+
                             <div x-show="stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
                                  class="overflow-x-auto border border-neutral-100 rounded-lg">
                                 <table class="min-w-full text-xs">
@@ -336,8 +407,10 @@
                                             <th class="px-3 py-2 text-right">Block Size</th>
                                             <th class="px-3 py-2 text-right">Indexed Blocks</th>
                                             <th class="px-3 py-2 text-right">Sub-block Cache</th>
-                                            <th class="px-3 py-2 text-right">Cache Files</th>
-                                            <th class="px-3 py-2 text-right">Cache Size</th>
+                                            <th class="px-3 py-2 text-right">SSD Files</th>
+                                            <th class="px-3 py-2 text-right">SSD Size</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Entries</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Size</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-neutral-100 text-neutral-700">
@@ -358,6 +431,8 @@
                                                 </td>
                                                 <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
                                                 <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -647,6 +722,25 @@
                                 </select>
                                 <button x-data="{ copied: false }"
                                         @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
+                            <!-- Hermes Agent -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/hermes.svg" alt="Hermes Agent" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Hermes Agent</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="hermesCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(hermesCommand); copied = true; setTimeout(() => copied = false, 2000)"
                                         class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
                                         :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
                                         :title="window.t('status.integrations.copy_command_tooltip')">

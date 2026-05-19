@@ -88,7 +88,7 @@ Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4).
 
 ### Application macOS
 
-Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode ou Codex, voir [Intégrations](#intégrations).
+Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode, Codex ou Hermes Agent, voir [Intégrations](#intégrations).
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
@@ -194,7 +194,7 @@ Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans
 
 ### Intégrations
 
-Configurez OpenClaw, OpenCode, Codex et Pi directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
+Configurez OpenClaw, OpenCode, Codex, Hermes Agent et Pi directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">

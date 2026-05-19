@@ -10,6 +10,63 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_VLM_TEXT_PREFIX = "language_model."
+
+_MLX_LM_LOAD_CONFIG_PATCHED = False
+
+
+def expand_per_layer_quant_keys(cfg: dict) -> dict:
+    """Add ``language_model.``-prefixed variants of per-layer quantization keys.
+
+    oQ writes per-layer overrides keyed by safetensors tensor base name
+    (e.g. ``"lm_head"``), but ``nn.quantize``'s class_predicate receives
+    model-tree paths (``"language_model.lm_head"``).  Without the prefixed
+    variant the lookup misses and the global bits are used, causing a
+    shape mismatch at ``load_weights``.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    for config_key in ("quantization", "quantization_config"):
+        quant = cfg.get(config_key)
+        if not isinstance(quant, dict):
+            continue
+        extras: dict[str, dict] = {}
+        for key, val in quant.items():
+            if not isinstance(val, dict):
+                continue
+            prefixed = _VLM_TEXT_PREFIX + key
+            if not key.startswith(_VLM_TEXT_PREFIX) and prefixed not in quant:
+                extras[prefixed] = val
+            elif key.startswith(_VLM_TEXT_PREFIX):
+                short = key[len(_VLM_TEXT_PREFIX):]
+                if short not in quant:
+                    extras[short] = val
+        if extras:
+            quant.update(extras)
+    return cfg
+
+
+def _patch_mlx_lm_load_config() -> None:
+    """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
+    global _MLX_LM_LOAD_CONFIG_PATCHED
+    if _MLX_LM_LOAD_CONFIG_PATCHED:
+        return
+
+    try:
+        import mlx_lm.utils as _lu
+    except ImportError:
+        return
+
+    _original = _lu.load_config
+
+    def _patched(model_path, *args, **kwargs):
+        cfg = _original(model_path, *args, **kwargs)
+        expand_per_layer_quant_keys(cfg)
+        return cfg
+
+    _lu.load_config = _patched
+    _MLX_LM_LOAD_CONFIG_PATCHED = True
+
 
 def maybe_apply_pre_load_patches(
     model_name: str,
@@ -29,6 +86,15 @@ def maybe_apply_pre_load_patches(
 
     Safe to call repeatedly; the patches are idempotent.
     """
+    # Reset the process-wide MTP flag so non-MTP-compatible models (or
+    # models with mtp_enabled=False) are not polluted by a prior model
+    # load that left the flag True.
+    from ..patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(False)
+
+    _patch_mlx_lm_load_config()
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return

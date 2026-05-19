@@ -89,6 +89,32 @@ class TestExtractThinking:
         assert "Let me reason..." in thinking
         assert "Final answer." in content
 
+    def test_native_reasoning_no_tags_treated_as_thinking(self):
+        """start_in_thinking=True: prompt pre-opened <think> and the model
+        emitted no tags at all — treat the whole body as thinking."""
+        thinking, content = extract_thinking(
+            "just the reasoning", start_in_thinking=True
+        )
+        assert thinking == "just the reasoning"
+        assert content == ""
+
+    def test_native_reasoning_default_mode_unchanged(self):
+        """Regression guard: default start_in_thinking=False classifies
+        tag-free text as content, not thinking."""
+        thinking, content = extract_thinking("just the reasoning")
+        assert thinking == ""
+        assert content == "just the reasoning"
+
+    def test_native_reasoning_with_close_tag_only(self):
+        """start_in_thinking=True with model emitting `body</think>answer`
+        (no opening tag because prompt pre-opened it) — partial-tail
+        branch handles this regardless of start_in_thinking."""
+        thinking, content = extract_thinking(
+            "thought process</think>visible answer", start_in_thinking=True
+        )
+        assert thinking == "thought process"
+        assert content == "visible answer"
+
 
 class TestThinkingParser:
     """Tests for streaming ThinkingParser."""
@@ -318,6 +344,47 @@ class TestThinkingParser:
         assert "**4**" in content
         assert "<think>" not in thinking
         assert "</think>" not in content
+
+    def test_start_in_thinking_streams_as_thinking(self):
+        """start_in_thinking=True: feed() treats incoming text as thinking
+        until a </think> tag arrives."""
+        parser = ThinkingParser(start_in_thinking=True)
+        t1, c1 = parser.feed("step 1 ")
+        t2, c2 = parser.feed("step 2")
+        assert t1 == "step 1 "
+        assert c1 == ""
+        assert t2 == "step 2"
+        assert c2 == ""
+
+    def test_start_in_thinking_close_tag_switches_to_content(self):
+        """start_in_thinking=True with model emitting `body</think>answer`."""
+        parser = ThinkingParser(start_in_thinking=True)
+        t1, c1 = parser.feed("body</think>answer")
+        assert t1 == "body"
+        assert c1 == "answer"
+
+    def test_start_in_thinking_recovery_emits_thinking_as_content(self):
+        """Recovery is intentional UX fallback: if start_in_thinking=True
+        and no </think> ever arrives, finish() re-emits the accumulated
+        thinking as content so the message body is not empty. The client
+        ends up showing the same text in both panels — documented
+        trade-off, not a bug. Guard against accidental regression."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("the whole answer ")
+        parser.feed("never closed")
+        t, c = parser.finish()
+        assert t == ""
+        assert c == "the whole answer never closed"
+
+    def test_default_recovery_still_works(self):
+        """Regression guard for the legacy recovery branch — default
+        ThinkingParser (no start_in_thinking) with `<think>...` body and
+        no closing tag still re-emits thinking as content."""
+        parser = ThinkingParser()
+        parser.feed("<think>open but never closed")
+        t, c = parser.finish()
+        assert t == ""
+        assert c == "open but never closed"
 
 
 class TestCleanSpecialTokens:

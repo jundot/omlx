@@ -117,6 +117,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_saved = 0
         self._partial_block_skips = 0
         self._partial_tokens_skipped = 0
+        self._tokens_matched_total = 0
+        self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
 
@@ -285,6 +287,8 @@ class BlockAwarePrefixCache(CacheManager):
             num_prefix_tokens = len(tokens) - len(remaining)
             self._hits += 1
             self._tokens_saved += num_prefix_tokens
+            self._tokens_matched_total += num_prefix_tokens
+            self._tokens_requested_total += len(tokens)
 
             logger.debug(
                 f"Cache hit for {request_id}: "
@@ -310,6 +314,8 @@ class BlockAwarePrefixCache(CacheManager):
             remaining = tokens[prefix_len:]
             self._hits += 1
             self._tokens_saved += prefix_len
+            self._tokens_matched_total += prefix_len
+            self._tokens_requested_total += len(tokens)
 
             logger.debug(
                 f"Prefix index hit for {request_id}: " f"{prefix_len} tokens matched"
@@ -319,6 +325,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # No cache hit
         self._misses += 1
+        self._tokens_requested_total += len(tokens)
         logger.debug(f"Cache miss for {request_id}")
         return None, tokens
 
@@ -1371,6 +1378,36 @@ class BlockAwarePrefixCache(CacheManager):
 
         return forked_table
 
+    def preload_blocks(self, block_table: BlockTable) -> int:
+        """
+        Pre-load matched blocks from SSD into hot cache in parallel.
+
+        Call this between fetch_cache() and reconstruct_cache() to
+        convert cold-SSD reads into hot-cache hits. Warm-start requests
+        (blocks already in hot cache) return 0 with no I/O.
+
+        Args:
+            block_table: BlockTable from fetch_cache() containing matched block IDs.
+
+        Returns:
+            Number of blocks successfully preloaded into hot cache.
+        """
+        if self.paged_ssd_cache is None:
+            return 0
+        if not block_table or not block_table.block_ids:
+            return 0
+
+        block_hashes = []
+        for block_id in block_table.block_ids:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block and block.block_hash is not None:
+                block_hashes.append(block.block_hash)
+
+        if not block_hashes:
+            return 0
+
+        return self.paged_ssd_cache.preload_matched_blocks(block_hashes)
+
     def reconstruct_cache(
         self,
         block_table: BlockTable,
@@ -2380,6 +2417,8 @@ class BlockAwarePrefixCache(CacheManager):
             block_size=self.block_size,
             last_partial_tokens_skipped=self._last_partial_tokens_skipped,
             last_tokens_to_next_block=self._last_tokens_to_next_block,
+            tokens_matched_total=self._tokens_matched_total,
+            tokens_requested_total=self._tokens_requested_total,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -2406,6 +2445,8 @@ class BlockAwarePrefixCache(CacheManager):
             "block_size": self.block_size,
             "last_partial_tokens_skipped": self._last_partial_tokens_skipped,
             "last_tokens_to_next_block": self._last_tokens_to_next_block,
+            "tokens_matched_total": self._tokens_matched_total,
+            "tokens_requested_total": self._tokens_requested_total,
             "active_requests": len(self._request_tables),
             **paged_stats,
         }
@@ -2417,6 +2458,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_saved = 0
         self._partial_block_skips = 0
         self._partial_tokens_skipped = 0
+        self._tokens_matched_total = 0
+        self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
         self.paged_cache.reset_stats()

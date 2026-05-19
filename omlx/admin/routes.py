@@ -21,9 +21,9 @@ import sys
 import time
 from collections import deque
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Literal
+from typing import Any, Literal, Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -31,6 +31,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..settings import SubKeyEntry
+from ..utils.release_check import select_latest_stable_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -40,9 +43,6 @@ from .auth import (
     verify_api_key,
     verify_session,
 )
-from ..settings import SubKeyEntry
-from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
 
@@ -92,83 +92,86 @@ class CacheProbeRequest(BaseModel):
     """
 
     model_id: str
-    messages: List[Dict[str, Any]]
-    tools: Optional[List[Dict[str, Any]]] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
-    model_alias: Optional[str] = None
-    model_type_override: Optional[str] = None
-    max_context_window: Optional[int] = None
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    min_p: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    force_sampling: Optional[bool] = None
-    max_tool_result_tokens: Optional[int] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None
-    ttl_seconds: Optional[int] = None
-    index_cache_freq: Optional[int] = None
-    enable_thinking: Optional[bool] = None
-    thinking_budget_enabled: Optional[bool] = None
-    thinking_budget_tokens: Optional[int] = None
+    model_alias: str | None = None
+    model_type_override: str | None = None
+    max_context_window: int | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    force_sampling: bool | None = None
+    max_tool_result_tokens: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    forced_ct_kwargs: list[str] | None = None
+    ttl_seconds: int | None = None
+    index_cache_freq: int | None = None
+    enable_thinking: bool | None = None
+    thinking_budget_enabled: bool | None = None
+    thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
-    turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[float] = None
+    turboquant_kv_enabled: bool | None = None
+    turboquant_kv_bits: float | None = None
     # SpecPrefill (experimental)
-    specprefill_enabled: Optional[bool] = None
-    specprefill_draft_model: Optional[str] = None
-    specprefill_keep_pct: Optional[float] = None
-    specprefill_threshold: Optional[int] = None
+    specprefill_enabled: bool | None = None
+    specprefill_draft_model: str | None = None
+    specprefill_keep_pct: float | None = None
+    specprefill_threshold: int | None = None
     # DFlash (block diffusion speculative decoding)
-    dflash_enabled: Optional[bool] = None
-    dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_enabled: Optional[bool] = None
-    dflash_draft_quant_weight_bits: Optional[int] = None
-    dflash_draft_quant_activation_bits: Optional[int] = None
-    dflash_draft_quant_group_size: Optional[int] = None
-    dflash_max_ctx: Optional[int] = None
-    dflash_in_memory_cache: Optional[bool] = None
-    dflash_in_memory_cache_max_entries: Optional[int] = None
-    dflash_in_memory_cache_max_bytes: Optional[int] = None
-    dflash_ssd_cache: Optional[bool] = None
+    dflash_enabled: bool | None = None
+    dflash_draft_model: str | None = None
+    dflash_draft_quant_enabled: bool | None = None
+    dflash_draft_quant_weight_bits: int | None = None
+    dflash_draft_quant_activation_bits: int | None = None
+    dflash_draft_quant_group_size: int | None = None
+    dflash_max_ctx: int | None = None
+    dflash_in_memory_cache: bool | None = None
+    dflash_in_memory_cache_max_entries: int | None = None
+    dflash_in_memory_cache_max_bytes: int | None = None
+    dflash_ssd_cache: bool | None = None
+    dflash_draft_window_size: int | None = None
+    dflash_draft_sink_size: int | None = None
+    dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
-    mtp_enabled: Optional[bool] = None
+    mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
-    vlm_mtp_enabled: Optional[bool] = None
-    vlm_mtp_draft_model: Optional[str] = None
-    vlm_mtp_draft_block_size: Optional[int] = None
-    reasoning_parser: Optional[str] = None
-    is_pinned: Optional[bool] = None
-    is_default: Optional[bool] = None
+    vlm_mtp_enabled: bool | None = None
+    vlm_mtp_draft_model: str | None = None
+    vlm_mtp_draft_block_size: int | None = None
+    reasoning_parser: str | None = None
+    is_pinned: bool | None = None
+    is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
-    trust_remote_code: Optional[bool] = None
+    trust_remote_code: bool | None = None
 
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""
     name: str
     display_name: str
-    description: Optional[str] = None
-    settings: Dict[str, Any] = Field(default_factory=dict)
+    description: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
-    source_template: Optional[str] = None
+    source_template: str | None = None
 
 
 class UpdateProfileRequest(BaseModel):
     """Request body for updating/renaming a per-model profile."""
-    new_name: Optional[str] = None
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
-    source_template: Optional[str] = None
+    new_name: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    settings: dict[str, Any] | None = None
+    source_template: str | None = None
     also_save_as_template: bool = False
 
 
@@ -176,97 +179,99 @@ class CreateTemplateRequest(BaseModel):
     """Request body for creating a global template."""
     name: str
     display_name: str
-    description: Optional[str] = None
-    settings: Dict[str, Any] = Field(default_factory=dict)
+    description: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class UpdateTemplateRequest(BaseModel):
     """Request body for updating/renaming a global template."""
-    new_name: Optional[str] = None
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
+    new_name: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    settings: dict[str, Any] | None = None
 
 
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
     # Server settings
-    host: Optional[str] = None
-    port: Optional[int] = None
-    log_level: Optional[str] = None
-    server_aliases: Optional[List[str]] = None
-    sse_keepalive_mode: Optional[str] = None
+    host: str | None = None
+    port: int | None = None
+    log_level: str | None = None
+    server_aliases: list[str] | None = None
+    sse_keepalive_mode: str | None = None
 
     # Model settings
-    model_dirs: Optional[List[str]] = None
-    model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
-    max_model_memory: Optional[str] = None
-    model_fallback: Optional[bool] = None
+    model_dirs: list[str] | None = None
+    model_dir: str | None = None  # Deprecated: kept for backward compatibility
+    max_model_memory: str | None = None
+    model_fallback: bool | None = None
 
     # Memory enforcement
-    max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
-    memory_prefill_memory_guard: Optional[bool] = None
+    max_process_memory: str | None = None  # "auto", "disabled", or "XX%"
+    memory_prefill_memory_guard: bool | None = None
 
     # Scheduler settings
-    max_concurrent_requests: Optional[int] = None
+    max_concurrent_requests: int | None = None
+    chunked_prefill: bool | None = None
 
     # Cache settings
-    cache_enabled: Optional[bool] = None
-    ssd_cache_dir: Optional[str] = None
-    ssd_cache_max_size: Optional[str] = None
-    hot_cache_only: Optional[bool] = None
-    hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
-    initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
+    cache_enabled: bool | None = None
+    ssd_cache_dir: str | None = None
+    ssd_cache_max_size: str | None = None
+    hot_cache_only: bool | None = None
+    hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
+    initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
-    mcp_config: Optional[str] = None
+    mcp_config: str | None = None
 
     # HuggingFace settings
-    hf_endpoint: Optional[str] = None
+    hf_endpoint: str | None = None
 
     # ModelScope settings
-    ms_endpoint: Optional[str] = None
+    ms_endpoint: str | None = None
 
     # Network settings
-    network_http_proxy: Optional[str] = None
-    network_https_proxy: Optional[str] = None
-    network_no_proxy: Optional[str] = None
-    network_ca_bundle: Optional[str] = None
+    network_http_proxy: str | None = None
+    network_https_proxy: str | None = None
+    network_no_proxy: str | None = None
+    network_ca_bundle: str | None = None
 
     # Sampling defaults
-    sampling_max_context_window: Optional[int] = None
-    sampling_max_tokens: Optional[int] = None
-    sampling_temperature: Optional[float] = None
-    sampling_top_p: Optional[float] = None
-    sampling_top_k: Optional[int] = None
-    sampling_repetition_penalty: Optional[float] = None
+    sampling_max_context_window: int | None = None
+    sampling_max_tokens: int | None = None
+    sampling_temperature: float | None = None
+    sampling_top_p: float | None = None
+    sampling_top_k: int | None = None
+    sampling_repetition_penalty: float | None = None
 
     # Claude Code settings
-    claude_code_context_scaling_enabled: Optional[bool] = None
-    claude_code_target_context_size: Optional[int] = None
-    claude_code_mode: Optional[str] = None
-    claude_code_opus_model: Optional[str] = None
-    claude_code_sonnet_model: Optional[str] = None
-    claude_code_haiku_model: Optional[str] = None
+    claude_code_context_scaling_enabled: bool | None = None
+    claude_code_target_context_size: int | None = None
+    claude_code_mode: str | None = None
+    claude_code_opus_model: str | None = None
+    claude_code_sonnet_model: str | None = None
+    claude_code_haiku_model: str | None = None
 
     # Other integrations settings
-    integrations_copilot_model: Optional[str] = None
-    integrations_codex_model: Optional[str] = None
-    integrations_opencode_model: Optional[str] = None
-    integrations_openclaw_model: Optional[str] = None
-    integrations_pi_model: Optional[str] = None
-    integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
+    integrations_copilot_model: str | None = None
+    integrations_codex_model: str | None = None
+    integrations_opencode_model: str | None = None
+    integrations_openclaw_model: str | None = None
+    integrations_hermes_model: str | None = None
+    integrations_pi_model: str | None = None
+    integrations_openclaw_tools_profile: Literal["minimal", "coding", "messaging", "full"] | None = None
 
     # UI settings
-    ui_language: Optional[str] = None
+    ui_language: str | None = None
 
     # Idle timeout settings. null disables the global fallback.
-    idle_timeout_seconds: Optional[int] = Field(default=None, ge=60)
+    idle_timeout_seconds: int | None = Field(default=None, ge=60)
 
     # Auth settings
-    api_key: Optional[str] = None
-    skip_api_key_verification: Optional[bool] = None
+    api_key: str | None = None
+    skip_api_key_verification: bool | None = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -532,6 +537,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         Tuple of (success, message)
     """
     from pathlib import Path
+
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
@@ -643,8 +649,8 @@ async def _apply_max_model_memory_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..model_discovery import format_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -745,11 +751,11 @@ async def _apply_max_process_memory_runtime(
 
 
 async def _apply_cache_settings_runtime(
-    enabled: Optional[bool],
-    ssd_cache_dir: Optional[str],
-    ssd_cache_max_size: Optional[str],
+    enabled: bool | None,
+    ssd_cache_dir: str | None,
+    ssd_cache_max_size: str | None,
     global_settings,
-    hot_cache_max_size: Optional[str] = None,
+    hot_cache_max_size: str | None = None,
 ) -> tuple[bool, str]:
     """
     Apply cache settings at runtime.
@@ -760,8 +766,8 @@ async def _apply_cache_settings_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..config import parse_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -829,12 +835,12 @@ async def _apply_cache_settings_runtime(
 
 
 def _apply_sampling_settings_runtime(
-    max_context_window: Optional[int],
-    max_tokens: Optional[int],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    top_k: Optional[int],
-    repetition_penalty: Optional[float] = None,
+    max_context_window: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    repetition_penalty: float | None = None,
 ) -> tuple[bool, str]:
     """
     Apply sampling default settings at runtime.
@@ -898,6 +904,7 @@ def _static_version(path: str) -> str:
 templates.env.globals["static"] = _static_version
 
 from omlx._version import __version__ as _omlx_version
+
 templates.env.globals["version"] = _omlx_version
 
 # i18n defaults (English) — overridden once set_admin_getters is called
@@ -1431,7 +1438,7 @@ async def create_sub_key(
     entry = SubKeyEntry(
         key=request.key,
         name=request.name or "",
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     global_settings.auth.sub_keys.append(entry)
 
@@ -1494,7 +1501,7 @@ _SUPPORTED_MODELS_DOC_RE = re.compile(
 )
 
 
-def _models_from_docstring(fn) -> List[str]:
+def _models_from_docstring(fn) -> list[str]:
     """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
     structural-tag function's docstring. Returns ``[]`` if the section is
     absent or unparseable."""
@@ -1609,6 +1616,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
             "estimated_size_formatted": format_size(model_info.get("estimated_size", 0)),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_default": server_state.default_model == model_id if server_state else False,
             "engine_type": model_info.get("engine_type", "batched"),
@@ -1628,55 +1641,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         # Add settings if available
         if settings:
-            model_data["settings"] = {
-                "model_alias": settings.model_alias,
-                "model_type_override": settings.model_type_override,
-                "max_context_window": settings.max_context_window,
-                "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "top_k": settings.top_k,
-                "repetition_penalty": settings.repetition_penalty,
-                "min_p": settings.min_p,
-                "presence_penalty": settings.presence_penalty,
-                "force_sampling": settings.force_sampling,
-                "max_tool_result_tokens": settings.max_tool_result_tokens,
-                "enable_thinking": settings.enable_thinking,
-                "thinking_budget_enabled": settings.thinking_budget_enabled,
-                "thinking_budget_tokens": settings.thinking_budget_tokens,
-                "reasoning_parser": settings.reasoning_parser,
-                "chat_template_kwargs": settings.chat_template_kwargs,
-                "forced_ct_kwargs": settings.forced_ct_kwargs,
-                "ttl_seconds": settings.ttl_seconds,
-                "index_cache_freq": settings.index_cache_freq,
-                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
-                "turboquant_kv_bits": settings.turboquant_kv_bits,
-                "specprefill_enabled": settings.specprefill_enabled,
-                "specprefill_draft_model": settings.specprefill_draft_model,
-                "specprefill_keep_pct": settings.specprefill_keep_pct,
-                "specprefill_threshold": settings.specprefill_threshold,
-                "dflash_enabled": settings.dflash_enabled,
-                "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_enabled": settings.dflash_draft_quant_enabled,
-                "dflash_draft_quant_weight_bits": settings.dflash_draft_quant_weight_bits,
-                "dflash_draft_quant_activation_bits": settings.dflash_draft_quant_activation_bits,
-                "dflash_draft_quant_group_size": settings.dflash_draft_quant_group_size,
-                "dflash_max_ctx": settings.dflash_max_ctx,
-                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
-                "dflash_in_memory_cache_max_entries": settings.dflash_in_memory_cache_max_entries,
-                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
-                "dflash_ssd_cache": settings.dflash_ssd_cache,
-                "mtp_enabled": settings.mtp_enabled,
-                "vlm_mtp_enabled": settings.vlm_mtp_enabled,
-                "vlm_mtp_draft_model": settings.vlm_mtp_draft_model,
-                "vlm_mtp_draft_block_size": settings.vlm_mtp_draft_block_size,
-                "is_pinned": settings.is_pinned,
-                "is_default": settings.is_default,
-                "trust_remote_code": settings.trust_remote_code,
-                "display_name": settings.display_name,
-                "description": settings.description,
-                "active_profile_name": settings.active_profile_name,
-            }
+            model_data["settings"] = asdict(settings)
 
         models.append(model_data)
 
@@ -1806,7 +1771,6 @@ async def update_model_settings(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     # Get current settings
-    from ..model_settings import ModelSettings
     current_settings = settings_manager.get_settings(model_id)
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
@@ -1984,6 +1948,25 @@ async def update_model_settings(
                     ),
                 )
         current_settings.dflash_ssd_cache = ssd_requested
+    if "dflash_draft_window_size" in sent:
+        # 0 / None / negative → fall back to dflash-mlx internal default (1024).
+        value = request.dflash_draft_window_size
+        current_settings.dflash_draft_window_size = (
+            int(value) if value and value > 0 else None
+        )
+    if "dflash_draft_sink_size" in sent:
+        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        value = request.dflash_draft_sink_size
+        current_settings.dflash_draft_sink_size = (
+            int(value) if value is not None and value >= 0 else None
+        )
+    if "dflash_verify_mode" in sent:
+        value = request.dflash_verify_mode
+        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
+        # Anything else (including empty string) → revert to dflash default.
+        current_settings.dflash_verify_mode = (
+            value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -1994,9 +1977,10 @@ async def update_model_settings(
             # files must actually contain mtp.* tensors. The last check is
             # the one that catches mlx-community converted weights where the
             # default sanitize path stripped the MTP heads.
-            from ..utils.model_loading import _is_mtp_compatible
             import json
             from pathlib import Path
+
+            from ..utils.model_loading import _is_mtp_compatible
 
             cfg_path = Path(entry.model_path) / "config.json"
             if not cfg_path.exists():
@@ -2358,8 +2342,8 @@ async def apply_model_profile(
 @router.get("/api/profile-fields")
 async def get_profile_fields(is_admin: bool = Depends(require_admin)):
     from ..model_profiles import (
-        UNIVERSAL_PROFILE_FIELDS,
         MODEL_SPECIFIC_PROFILE_FIELDS,
+        UNIVERSAL_PROFILE_FIELDS,
     )
 
     return {
@@ -2502,7 +2486,7 @@ async def get_generation_config(
     gen_config_path = model_path / "generation_config.json"
     if gen_config_path.exists():
         try:
-            with open(gen_config_path, "r", encoding="utf-8") as f:
+            with open(gen_config_path, encoding="utf-8") as f:
                 gen_config = json_module.load(f)
 
             # Temperature: if do_sample is false, effective temperature is 0
@@ -2526,7 +2510,7 @@ async def get_generation_config(
     config_path = model_path / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 model_config = json_module.load(f)
 
             max_pos = (
@@ -2712,6 +2696,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
+            "chunked_prefill": global_settings.scheduler.chunked_prefill,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -2765,6 +2750,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
@@ -2815,7 +2801,7 @@ async def update_global_settings(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     # Track which settings were applied at runtime
-    runtime_applied: List[str] = []
+    runtime_applied: list[str] = []
 
     # Apply server settings
     if request.host is not None:
@@ -2943,6 +2929,26 @@ async def update_global_settings(
     if request.max_concurrent_requests is not None:
         global_settings.scheduler.max_concurrent_requests = (
             request.max_concurrent_requests
+        )
+
+    # Apply chunked prefill setting (Live)
+    if request.chunked_prefill is not None:
+        global_settings.scheduler.chunked_prefill = request.chunked_prefill
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            for mid, entry in pool._entries.items():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = getattr(async_core, "engine", None) if async_core is not None else None
+                scheduler = getattr(core, "scheduler", None) if core is not None else None
+                if scheduler is not None and hasattr(scheduler, "config"):
+                    scheduler.config.chunked_prefill = request.chunked_prefill
+        runtime_applied.append("chunked_prefill")
+        logger.info(
+            f"Chunked prefill {'enabled' if request.chunked_prefill else 'disabled'}"
         )
 
     # Apply cache settings
@@ -3147,6 +3153,9 @@ async def update_global_settings(
             request.integrations_openclaw_model
         )
         integrations_changed = True
+    if "integrations_hermes_model" in request.model_fields_set:
+        global_settings.integrations.hermes_model = request.integrations_hermes_model
+        integrations_changed = True
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
@@ -3164,6 +3173,7 @@ async def update_global_settings(
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"hermes={global_settings.integrations.hermes_model}, "
             f"pi={global_settings.integrations.pi_model}"
         )
 
@@ -3248,7 +3258,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     lines = deque(maxlen=num_lines)
     total_lines = 0
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             lines.append(line)
             total_lines += 1
@@ -3256,7 +3266,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     return "".join(lines), total_lines
 
 
-def _get_available_log_files(log_dir: Path) -> List[str]:
+def _get_available_log_files(log_dir: Path) -> list[str]:
     """
     Get list of available log files sorted by modification time.
 
@@ -3283,7 +3293,7 @@ def _get_available_log_files(log_dir: Path) -> List[str]:
 @router.get("/api/logs")
 async def get_logs(
     lines: int = 100,
-    file: Optional[str] = None,
+    file: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """
@@ -3501,6 +3511,13 @@ def _build_runtime_cache_observability(
         }
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+    cache_cfg = global_settings.cache
+    try:
+        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+    except (ValueError, OSError, TypeError) as exc:
+        logger.warning("Could not read SSD cache max size from config: %s", exc)
+        cfg_disk_max = 0
+
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
@@ -3509,6 +3526,10 @@ def _build_runtime_cache_observability(
         "total_num_files": 0,
         "total_size_bytes": 0,
         "effective_block_sizes": [],
+        "disk_max_bytes": cfg_disk_max,
+        "hot_cache_max_bytes": 0,
+        "hot_cache_size_bytes": 0,
+        "hot_cache_entries": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -3620,10 +3641,15 @@ def _build_runtime_cache_observability(
             "last_tokens_to_next_block": last_tokens_to_next_block,
             "num_files": int(ssd_stats.get("num_files", 0) or 0),
             "total_size_bytes": int(ssd_stats.get("total_size_bytes", 0) or 0),
+            "max_size_bytes": int(ssd_stats.get("max_size_bytes", 0) or 0),
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
         }
+
+        cache_rates = runtime_stats.get("cache_rates")
+        if cache_rates:
+            model_payload["cache_rates"] = cache_rates
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -3633,6 +3659,26 @@ def _build_runtime_cache_observability(
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+
+    # Aggregate hot-cache and disk-max across models.
+    # hot_cache_max sums across models (each model reserves its own slice of
+    # the same process-wide hot cache budget) so the gauge denominator matches
+    # the summed numerator.  disk_max keeps the config fallback via max()
+    # because a single SSD cache directory is shared — the effective cap is
+    # the largest configured limit, not a per-model sum.
+    hot_cache_max = 0
+    disk_max = payload["disk_max_bytes"]
+    hot_cache_size_total = 0
+    hot_cache_entries_total = 0
+    for m in payload["models"]:
+        hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
+        hot_cache_entries_total += m.get("hot_cache_entries", 0)
+        hot_cache_max += m.get("hot_cache_max_bytes", 0)
+        disk_max = max(disk_max, m.get("max_size_bytes", 0))
+    payload["hot_cache_max_bytes"] = hot_cache_max
+    payload["hot_cache_size_bytes"] = hot_cache_size_total
+    payload["hot_cache_entries"] = hot_cache_entries_total
+    payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache
     # directory directly so the dashboard still shows real disk usage.
@@ -3679,8 +3725,6 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
-    from ..model_discovery import format_size
-    from ..prefill_progress import get_prefill_tracker
     from ..utils.install import get_cli_prefix
 
     # Build active_models data for the dashboard card.
@@ -3718,11 +3762,22 @@ def _build_active_models_data() -> dict:
     from ..prefill_progress import get_prefill_tracker
 
     engine_pool = _get_engine_pool()
+    server_state = _get_server_state()
     if engine_pool is None:
         return {
             "models": [],
             "model_memory_used": 0,
             "model_memory_max": 0,
+            "memory_pressure": {
+                "enabled": False,
+                "current_bytes": 0,
+                "soft_bytes": 0,
+                "hard_bytes": 0,
+                "current_formatted": "0.0GB",
+                "soft_formatted": "0.0GB",
+                "hard_formatted": "0.0GB",
+                "pressure_level": "ok",
+            },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
         }
@@ -3730,6 +3785,12 @@ def _build_active_models_data() -> dict:
     now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
+    enforcer = (
+        getattr(server_state, "process_memory_enforcer", None)
+        if server_state is not None
+        else None
+    )
+    enforcer_status = enforcer.get_status() if enforcer is not None else None
     models = []
     total_active = 0
     total_waiting = 0
@@ -3847,6 +3908,12 @@ def _build_active_models_data() -> dict:
             "estimated_size_formatted": format_size(
                 model_info.get("estimated_size", 0)
             ),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
             "loading_elapsed_seconds": loading_elapsed_seconds,
@@ -3867,6 +3934,44 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
         "model_memory_max": status.get("max_model_memory", 0),
+        "memory_pressure": {
+            "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
+            "current_bytes": (
+                enforcer_status.get("current_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "soft_bytes": (
+                enforcer_status.get("soft_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "hard_bytes": (
+                enforcer_status.get("hard_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "current_formatted": (
+                enforcer_status.get("current_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "soft_formatted": (
+                enforcer_status.get("soft_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "hard_formatted": (
+                enforcer_status.get("hard_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "pressure_level": (
+                enforcer_status.get("pressure_level", "ok")
+                if enforcer_status is not None
+                else "ok"
+            ),
+        },
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }
@@ -3890,6 +3995,30 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Traverses the internal engine hierarchy: pool entry → async engine →
+    core engine → scheduler.  Both ``clear_ssd_cache`` and
+    ``clear_hot_cache`` share this traversal.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id or not model_info.get("loaded"):
+            continue
+        entry = engine_pool._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            continue
+        async_core = getattr(entry.engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if scheduler is not None:
+            yield model_id, scheduler
+
+
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """Clear all SSD cache files for all loaded models.
@@ -3900,38 +4029,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """
     total_deleted = 0
 
-    # Phase 1: clear via loaded models' cache managers (updates in-memory index)
-    engine_pool = _get_engine_pool()
-    if engine_pool is not None:
-        for model_info in engine_pool.get_status().get("models", []):
-            model_id = model_info.get("id")
-            if not model_id or not model_info.get("loaded"):
-                continue
-
-            entry = engine_pool._entries.get(model_id)
-            if entry is None or entry.engine is None:
-                continue
-
-            async_core = getattr(entry.engine, "_engine", None)
-            core = (
-                getattr(async_core, "engine", None) if async_core is not None else None
-            )
-            scheduler = (
-                getattr(core, "scheduler", None) if core is not None else None
-            )
-
-            if scheduler is not None:
-                ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-                if ssd_manager is not None:
-                    try:
-                        deleted = ssd_manager.clear()
-                        total_deleted += deleted
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to clear SSD cache for model '%s': %s",
-                            model_id,
-                            exc,
-                        )
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None:
+            try:
+                total_deleted += ssd_manager.clear()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear SSD cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
 
     # Phase 2: remove any remaining files on disk (covers unloaded models)
     global_settings = _get_global_settings()
@@ -3955,6 +4063,31 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+@router.post("/api/hot-cache/clear")
+async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
+    """Clear the in-memory (hot) cache for all loaded models.
+
+    No filesystem fallback needed — hot cache is in-memory only and does
+    not survive process restart.
+    """
+    total_cleared = 0
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
+            try:
+                total_cleared += ssd_manager.clear_hot_cache()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear hot cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+        rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
+        if rate_tracker is not None:
+            rate_tracker.clear()
+    return {"status": "ok", "total_cleared": total_cleared}
 
 
 @router.post("/api/cache/probe")
@@ -4240,7 +4373,7 @@ async def get_recommended_models(
             max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4255,9 +4388,30 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    # Filtering
+    min_params: Optional[int] = None,
+    max_params: Optional[int] = None,
+    min_size: Optional[int] = None,  # bytes
+    max_size: Optional[int] = None,  # bytes
+    # Sorting
+    sort_by_size: bool = False,
+    sort_ascending: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
-    """Search HuggingFace models by query."""
+    """Search HuggingFace models by query with filtering and sorting.
+
+    Query Parameters:
+        q: Search query string (required)
+        sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
+        limit: Maximum results (max 100)
+        mlx_only: Restrict to MLX library models
+        min_params: Minimum parameter count
+        max_params: Maximum parameter count
+        min_size: Minimum model size in bytes
+        max_size: Maximum model size in bytes
+        sort_by_size: Sort results by size instead of default sort
+        sort_ascending: Sort in ascending order
+    """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
 
@@ -4269,9 +4423,15 @@ async def search_hf_models(
             sort=sort,
             limit=min(limit, 100),
             mlx_only=mlx_only,
+            min_params=min_params,
+            max_params=max_params,
+            min_size=min_size,
+            max_size=max_size,
+            sort_by_size=sort_by_size,
+            sort_ascending=sort_ascending,
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4291,14 +4451,14 @@ async def get_hf_model_info(
             status_code=400, detail="Query parameter 'repo_id' is required"
         )
 
-    from .hf_downloader import HFDownloader
-
     from huggingface_hub.utils import RepositoryNotFoundError
+
+    from .hf_downloader import HFDownloader
 
     try:
         result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4597,7 +4757,7 @@ async def get_ms_recommended_models(
             max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4628,7 +4788,7 @@ async def search_ms_models(
             mlx_only=mlx_only,
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4653,7 +4813,7 @@ async def get_ms_model_info(
     try:
         result = await MSDownloader.get_model_info(model_id=model_id.strip())
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4805,7 +4965,7 @@ async def stream_accuracy_benchmark(
             while True:
                 try:
                     event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
 
@@ -4913,7 +5073,7 @@ async def stream_benchmark(
             while True:
                 try:
                     event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Send keepalive
                     yield ": keepalive\n\n"
                     continue
@@ -5019,7 +5179,7 @@ async def get_device_info(
 # Update Check
 # =============================================================================
 
-_update_cache: Optional[Dict[str, Any]] = None
+_update_cache: dict[str, Any] | None = None
 _update_cache_time: float = 0.0
 _UPDATE_CACHE_TTL = 3600  # 1 hour
 

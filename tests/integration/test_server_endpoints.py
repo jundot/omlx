@@ -15,8 +15,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.api.responses_utils import ResponseStore
+from omlx.engine.base import BaseEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
+from omlx.mcp.types import MCPToolResult
 
 
 @dataclass
@@ -143,7 +145,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine for testing."""
 
     def __init__(self, model_name: str = "test-llm-model"):
@@ -170,6 +172,9 @@ class MockBaseEngine:
     async def start(self) -> None:
         pass
 
+    async def stop(self) -> None:
+        pass
+
     async def generate(self, prompt: str, **kwargs) -> MockGenerationOutput:
         return MockGenerationOutput(text="Generated response.")
 
@@ -186,7 +191,7 @@ class MockBaseEngine:
             finish_reason="stop",
         )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
+    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None, **kwargs) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -205,6 +210,12 @@ class MockBaseEngine:
             finished=True,
             finish_reason="stop",
         )
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {}
+
+    def get_cache_stats(self):
+        return None
 
 
 class RecordingResponsesEngine(MockBaseEngine):
@@ -1118,6 +1129,106 @@ class TestMCPEndpoints:
 
         # Should return 503 when MCP not configured
         assert response.status_code == 503
+
+    def test_mcp_execute_accepts_tool_alias(self, client):
+        """Test MCP execute accepts tool as an alias for tool_name."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="test_tool",
+            content={"ok": True},
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool": "test_tool",
+                    "arguments": {"query": "hello"},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "tool_name": "test_tool",
+            "content": {"ok": True},
+            "is_error": False,
+            "error_message": None,
+        }
+        manager.execute_tool.assert_awaited_once_with(
+            "test_tool",
+            {"query": "hello"},
+        )
+
+    def test_mcp_execute_tool_name_field(self, client):
+        """Test MCP execute happy path with tool_name field."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="my_tool",
+            content="ok",
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "my_tool",
+                    "arguments": {"q": "x"},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("my_tool", {"q": "x"})
+
+    def test_mcp_execute_tool_name_wins_over_tool(self, client):
+        """Test tool_name takes precedence when both fields are present."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="canonical",
+            content="ok",
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "canonical",
+                    "tool": "alias_should_lose",
+                    "arguments": {},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("canonical", {})
+
+    def test_mcp_execute_rejects_missing_tool(self, client):
+        """Test MCP execute returns 422 when neither tool nor tool_name is present."""
+        response = client.post(
+            "/v1/mcp/execute",
+            json={"arguments": {"q": "x"}},
+        )
+
+        assert response.status_code == 422
 
 
 class TestErrorHandling:

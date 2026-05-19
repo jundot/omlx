@@ -2244,19 +2244,98 @@ def quantize_oq_streaming(
         f"{len(weight_files)} shards"
     )
 
-    from omlx.settings import get_system_memory as _get_system_memory
-    _model_bytes = all_weights.nbytes()
-    _system_ram = _get_system_memory()
-    _model_exceeds_ram = _model_bytes > int(_system_ram * _MAX_MODEL_RAM_FRACTION)
-    if _model_exceeds_ram:
-        logger.info(
-            f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
-            f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
-            "OOM-prone paths will be skipped"
-        )
+    sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
 
     cb("loading", 12.0)
 
+    if sensitivity_map_path.exists():
+        sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
+        logger.info(f"{sensitivity_map_path} found, skipping measuring.")
+    else:
+        from omlx.settings import get_system_memory as _get_system_memory
+        _model_bytes = all_weights.nbytes()
+        _system_ram = _get_system_memory()
+        _model_exceeds_ram = _model_bytes > int(_system_ram * _MAX_MODEL_RAM_FRACTION)
+        if _model_exceeds_ram:
+            logger.info(
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
+                f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
+                "OOM-prone paths will be skipped"
+            )
+
+        # --- Sensitivity measurement (before sanitize-plan discovery) ---------
+        # Must run before _build_model_sanitizer + _discover_sanitize_plan,
+        # because the discovery pass feeds _TrackedTensor proxies through
+        # Model.sanitize which corrupts mutable state in the MTP sanitize
+        # patch (weights.pop on tracked objects). Running sensitivity first
+        # ensures vlm_load_model sees a pristine patch chain.
+        if sensitivity_model_path:
+            logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
+            sensitivity_map = _measure_sensitivity_from_quantized_model(
+                sensitivity_model_path, config, oq_level,
+                num_samples=128, seq_length=256,
+            )
+        elif _model_exceeds_ram and auto_proxy_sensitivity:
+            logger.warning(
+                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
+                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
+                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
+                "measurement stays data-driven."
+            )
+            _proxy_dir: Path | None = None
+            try:
+                _proxy_dir = _build_proxy_for_sensitivity(
+                    model_path, dtype=dtype, working_dir=str(output.parent),
+                )
+                logger.info(
+                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
+                )
+                sensitivity_map = _measure_sensitivity_from_quantized_model(
+                    str(_proxy_dir), config, oq_level,
+                    num_samples=128, seq_length=256,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
+                    "Pass sensitivity_model_path with a pre-quantized version "
+                    "of this model, or run on a machine with enough RAM for "
+                    "full-fp16 sensitivity measurement."
+                ) from e
+            finally:
+                if _proxy_dir is not None and _proxy_dir.exists():
+                    shutil.rmtree(_proxy_dir, ignore_errors=True)
+                    logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
+        elif _model_exceeds_ram:
+            raise RuntimeError(
+                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
+                "of system RAM and auto_proxy_sensitivity is disabled. "
+                "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
+                "with a pre-quantized version of this model, or run on a "
+                "machine with enough RAM."
+            )
+        else:
+            logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
+            sensitivity_map = _measure_sensitivity(
+                model_path, config, oq_level,
+                num_samples=128, seq_length=256,
+            )
+
+    # Single enforcement point. Inner measurement helpers may return {} on
+    # load / calibration / layer-discovery failure; treat that as a hard
+    # error here so the rest of quantize_oq_streaming never runs without a
+    # data-driven sensitivity map.
+    if not sensitivity_map:
+        raise RuntimeError(
+            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
+            "Check the preceding log lines for the root cause (model load, "
+            "calibration data, or layer discovery), and either fix it or "
+            "pass an explicit sensitivity_model_path."
+        )
+
+    cb("loading", 15.0)
+
+    # --- Sanitize-plan discovery ------------------------------------------
     sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
     # When preserve_mtp is True, the patched sanitize functions
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
@@ -2272,11 +2351,6 @@ def quantize_oq_streaming(
             )
         except Exception as e:
             if _model_exceeds_ram:
-                # Silent skip used to produce broken artifacts (see #1204):
-                # the source layout (e.g. fused experts.gate_up_proj) never
-                # got remapped to inference-expected names, and load failed
-                # with "Received N parameters not in model". Hard-fail so the
-                # caller sees the cause immediately.
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
                     f"failed ({e}) and the eager fallback is unsafe with "
@@ -2296,72 +2370,6 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-
-    cb("loading", 15.0)
-
-    if sensitivity_model_path:
-        logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
-        sensitivity_map = _measure_sensitivity_from_quantized_model(
-            sensitivity_model_path, config, oq_level,
-            num_samples=128, seq_length=256,
-        )
-    elif _model_exceeds_ram and auto_proxy_sensitivity:
-        logger.warning(
-            f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
-            f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
-            f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
-            f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
-            "measurement stays data-driven."
-        )
-        _proxy_dir: Path | None = None
-        try:
-            _proxy_dir = _build_proxy_for_sensitivity(
-                model_path, dtype=dtype, working_dir=str(output.parent),
-            )
-            logger.info(
-                f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
-            )
-            sensitivity_map = _measure_sensitivity_from_quantized_model(
-                str(_proxy_dir), config, oq_level,
-                num_samples=128, seq_length=256,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
-                "Pass sensitivity_model_path with a pre-quantized version "
-                "of this model, or run on a machine with enough RAM for "
-                "full-fp16 sensitivity measurement."
-            ) from e
-        finally:
-            if _proxy_dir is not None and _proxy_dir.exists():
-                shutil.rmtree(_proxy_dir, ignore_errors=True)
-                logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
-    elif _model_exceeds_ram:
-        raise RuntimeError(
-            f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
-            "of system RAM and auto_proxy_sensitivity is disabled. "
-            "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
-            "with a pre-quantized version of this model, or run on a "
-            "machine with enough RAM."
-        )
-    else:
-        logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
-        sensitivity_map = _measure_sensitivity(
-            model_path, config, oq_level,
-            num_samples=128, seq_length=256,
-        )
-
-    # Single enforcement point. Inner measurement helpers may return {} on
-    # load / calibration / layer-discovery failure; treat that as a hard
-    # error here so the rest of quantize_oq_streaming never runs without a
-    # data-driven sensitivity map.
-    if not sensitivity_map:
-        raise RuntimeError(
-            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
-            "Check the preceding log lines for the root cause (model load, "
-            "calibration data, or layer discovery), and either fix it or "
-            "pass an explicit sensitivity_model_path."
-        )
     config["_oq_sensitivity_map"] = {
         str(k): v for k, v in sensitivity_map.items()
     }
@@ -2645,7 +2653,7 @@ CALIB_DATASETS = {
     "c4": "C4 (Web Crawl)",
     "code": "Code (StarCoder)",
     "multilingual": "Multilingual (CulturaX)",
-    "code_multilingual": "Code + Multilingual",
+    "code_multilingual": "Code + Multilingual + Reasoning",
 }
 
 
@@ -2712,7 +2720,7 @@ def _load_builtin_calibration(tokenizer, dataset: str, num_samples: int,
 
     if dataset == "code_multilingual":
         texts = []
-        for key in ("code", "en", "ko", "zh", "ja", "tool_calling"):
+        for key in ("code", "en", "ko", "zh", "ja", "tool_calling", "reasoning"):
             texts.extend(all_data.get(key, []))
     elif dataset == "code":
         texts = all_data.get("code", []) + all_data.get("en", [])
@@ -3056,57 +3064,60 @@ def _measure_sensitivity(
     num_samples=32, seq_length=256,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
+    from omlx.utils.model_loading import (
+        _has_mtp_heads,
+        maybe_apply_pre_load_patches,
+    )
+
+    # Reuse the centralised pre-load dispatch so every current and future
+    # patch (MTP sanitize, DeepSeek V4, nested-visual, load_config, …) is
+    # applied exactly as in the production load path.
+    maybe_apply_pre_load_patches(model_path)
+
     is_vlm = "vision_config" in config
 
-    # Apply the same MTP runtime patches that production load and the
-    # main quantize path use. Sanitize patches are already global (from
-    # _build_model_sanitizer above), so loaded weights arrive with
-    # ``language_model.mtp.*`` keys; without the runtime patch the
-    # mlx-vlm LanguageModel.__init__ never attaches ``self.mtp`` and
-    # load_weights rejects the MTP tensors with "parameters not in model".
-    try:
-        from omlx.patches.mlx_lm_mtp import (
-            apply_mlx_lm_mtp_patch,
-            is_mtp_active,
-            set_mtp_active,
-        )
-        _have_lm_patch = apply_mlx_lm_mtp_patch()
-    except Exception:
-        _have_lm_patch = False
-        is_mtp_active = None
-        set_mtp_active = None
-
-    if is_vlm:
+    # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
+    # for the text path: the patched qwen35_model.sanitize self-consistently
+    # strips mtp.* when no head is attached. The VLM path is different —
+    # mlx-vlm skips Model.sanitize entirely for MLX-format checkpoints, so
+    # the language_model.mtp.* weights stay in the dict. Without an attached
+    # MTP head load_weights(strict=True) then rejects them and the whole
+    # measurement silently returns {}. When the source declares MTP heads,
+    # attach the head for the load so the checkpoint matches the model.
+    # Sensitivity only reads backbone decoder layers, so this is load-only.
+    restore_mtp_active = None
+    if is_vlm and _has_mtp_heads(config):
         try:
+            from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
             from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
             apply_mlx_vlm_mtp_runtime_patch()
-        except Exception as e:
-            logger.debug(f"mlx-vlm runtime MTP patch skipped: {e}")
-
-    prev_active = is_mtp_active() if _have_lm_patch else False
-    try:
-        if _have_lm_patch:
+            prev_active = is_mtp_active()
             set_mtp_active(True)
-        try:
-            if is_vlm:
-                from mlx_vlm.utils import load_model as vlm_load_model
-
-                model = vlm_load_model(Path(model_path), lazy=True)
-                from mlx_lm import load as lm_load
-
-                _, tokenizer = lm_load(model_path, lazy=True)
-            else:
-                from mlx_lm import load as lm_load
-
-                model, tokenizer = lm_load(model_path, lazy=True)
+            restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
         except Exception as e:
-            logger.error(
-                f"Sensitivity measurement: model load failed ({e})"
-            )
-            return {}
+            logger.debug(f"mlx-vlm MTP runtime patch skipped for sensitivity: {e}")
+
+    try:
+        if is_vlm:
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            model = vlm_load_model(Path(model_path), lazy=True)
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+            tokenizer = load_tokenizer(Path(model_path))
+        else:
+            from mlx_lm import load as lm_load
+
+            model, tokenizer = lm_load(model_path, lazy=True)
+    except Exception as e:
+        logger.error(
+            f"Sensitivity measurement: model load failed ({e})"
+        )
+        return {}
     finally:
-        if _have_lm_patch:
-            set_mtp_active(prev_active)
+        if restore_mtp_active is not None:
+            restore_mtp_active()
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,

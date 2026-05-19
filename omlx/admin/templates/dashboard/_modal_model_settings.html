@@ -583,12 +583,12 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :disabled="modelSettings.is_paroquant"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                @click="if (!modelSettings.is_paroquant && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : '')"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -647,12 +647,12 @@
                                             <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
-                                                :disabled="modelSettings.is_paroquant"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
+                                                :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}' : '')"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.specprefill_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -703,12 +703,12 @@
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
                                         </div>
                                         <button type="button"
-                                                @click="if (modelSettings.dflash_compatible) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
-                                                :disabled="!modelSettings.dflash_compatible"
-                                                :title="modelSettings.dflash_compatible ? '' : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
+                                                @click="if (modelSettings.dflash_compatible && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
+                                                :disabled="!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.dflash_compatible ? (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict') }}' : '') : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
                                                 :class="[
                                                     modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    !modelSettings.dflash_compatible ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.dflash_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -775,6 +775,34 @@
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
                                         </div>
+                                        <div class="pt-2 border-t border-neutral-200 space-y-3">
+                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">Long-context tuning</p>
+                                            <div class="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft window size</label>
+                                                    <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="1024"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                    <p class="text-xs text-neutral-400 mt-1">Draft model sliding-attention window. Helps stabilise acceptance on long contexts. Leave empty for dflash default (1024).</p>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft sink size</label>
+                                                    <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="64"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                    <p class="text-xs text-neutral-400 mt-1">Attention-sink tokens always kept regardless of window. Leave empty for dflash default (64).</p>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Verify mode</label>
+                                                <select x-model="modelSettings.dflash_verify_mode"
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <option value="adaptive">adaptive (default)</option>
+                                                    <option value="dflash">dflash</option>
+                                                    <option value="ddtree">ddtree</option>
+                                                    <option value="off">off</option>
+                                                </select>
+                                                <p class="text-xs text-neutral-400 mt-1">Verifier algorithm. "adaptive" shrinks block size when acceptance drops; "off" disables speculative verify.</p>
+                                            </div>
+                                        </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
@@ -834,18 +862,20 @@
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.turboquant_kv_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
-                                                :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled"
+                                                @click="if ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.turboquant_kv_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
+                                                :disabled="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled || modelSettings.vlm_mtp_enabled"
                                                 :title="(!modelSettings.mtp_compatible && !modelSettings.mtp_enabled)
                                                             ? (modelSettings.mtp_compatibility_reason || 'Unsupported model')
                                                             : (modelSettings.dflash_enabled
                                                                 ? '{{ t('modal.model_settings.mtp_conflict_dflash') }}'
                                                                 : (modelSettings.turboquant_kv_enabled
                                                                     ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}'
-                                                                    : ''))"
+                                                                    : (modelSettings.vlm_mtp_enabled
+                                                                        ? '{{ t('modal.model_settings.vlm_mtp_conflict') }}'
+                                                                        : '')))"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.turboquant_kv_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.mtp_enabled ? 'translate-x-5' : 'translate-x-0'"

@@ -273,6 +273,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "chunked_prefill": False,
         }
 
     def test_from_dict(self):
@@ -673,7 +674,12 @@ class TestMemorySettings:
         """Test serialization."""
         settings = MemorySettings(max_process_memory="75%")
         d = settings.to_dict()
-        assert d == {"max_process_memory": "75%", "prefill_memory_guard": True}
+        assert d == {
+            "max_process_memory": "75%",
+            "prefill_memory_guard": True,
+            "soft_threshold": 0.85,
+            "hard_threshold": 0.95,
+        }
 
     def test_to_dict_guard_disabled(self):
         """Test serialization with prefill guard disabled."""

@@ -339,14 +339,14 @@ class TestBatchGeneratorDispatch:
 
         class _MtpModelWithoutHead:
             """Has the patched method but no actual MTP head attached
-            (mtp_enabled was False when this hypothetical model loaded)."""
+            (config did not declare an MTP head when this model loaded)."""
 
             def mtp_forward(self, *_):
                 pass
 
         class _MtpModel:
-            """Has both the method and the attached head — i.e. mtp_enabled
-            was True at load time."""
+            """Has both the method and the attached head — i.e. the model
+            class was patched and the head was attached at load time."""
 
             def __init__(self):
                 self.mtp = object()  # placeholder for an actual MTPModule
