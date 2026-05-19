@@ -186,15 +186,12 @@ class DFlashEngine(BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
-        from dflash_mlx.runtime.context import (
-            build_runtime_context,
-            runtime_config_from_profile,
-        )
+        from dflash_mlx.runtime.config import runtime_config_from_defaults
+        from dflash_mlx.runtime.context import build_runtime_context
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
-        cfg = runtime_config_from_profile(
-            profile="balanced",
+        cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
@@ -215,7 +212,7 @@ class DFlashEngine(BaseEngine):
         loop = asyncio.get_running_loop()
 
         def _load_models():
-            from dflash_mlx.draft_backend import make_draft_backend
+            from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
                 load_target_bundle,
@@ -230,7 +227,7 @@ class DFlashEngine(BaseEngine):
                     self._draft_quant_group_size,
                 ) if self._draft_quant_enabled else None,
             )
-            draft_backend = make_draft_backend()
+            draft_backend = EagerDraftBackend()
             return target_bundle, draft, draft_backend
 
         result = await loop.run_in_executor(get_mlx_executor(), _load_models)
@@ -515,8 +512,13 @@ class DFlashEngine(BaseEngine):
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
         # index 2 = draft id; the middle slot is unused on the dflash side.
+        # ``tokenizer`` and ``cli_args`` are required since dflash-mlx 1ba6713 —
+        # build_prefix_key hashes the chat template / policy. cli_args=None
+        # makes chat_template_args fall back to {}.
         class _ModelProviderShim:
             model_key = (self._model_name, None, self._draft_model_path)
+            tokenizer = self._executor_tokenizer
+            cli_args = None
 
         prefix_flow = PrefixCacheFlow.for_request(
             model_provider=_ModelProviderShim(),
