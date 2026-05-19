@@ -18,6 +18,7 @@ from omlx.api.responses_utils import ResponseStore
 from omlx.engine.base import BaseEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
+from omlx.mcp.types import MCPToolResult
 
 
 @dataclass
@@ -1128,6 +1129,42 @@ class TestMCPEndpoints:
 
         # Should return 503 when MCP not configured
         assert response.status_code == 503
+
+    def test_mcp_execute_accepts_tool_alias(self, client):
+        """Test MCP execute accepts tool as an alias for tool_name."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="test_tool",
+            content={"ok": True},
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool": "test_tool",
+                    "arguments": {"query": "hello"},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "tool_name": "test_tool",
+            "content": {"ok": True},
+            "is_error": False,
+            "error_message": None,
+        }
+        manager.execute_tool.assert_awaited_once_with(
+            "test_tool",
+            {"query": "hello"},
+        )
 
 
 class TestErrorHandling:
