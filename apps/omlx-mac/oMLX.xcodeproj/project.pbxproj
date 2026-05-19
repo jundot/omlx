@@ -46,6 +46,7 @@
 		6BB00000000000000000000C /* QuantizationScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000C /* QuantizationScreen.swift */; };
 		6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000D /* ThroughputBenchScreen.swift */; };
 		6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000E /* AccuracyBenchScreen.swift */; };
+		6BB00000000000000000000F /* NetworkScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000F /* NetworkScreen.swift */; };
 		7BB000000000000000000001 /* AppServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000001 /* AppServices.swift */; };
 		7BB000000000000000000002 /* OMLXClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000002 /* OMLXClient.swift */; };
 		7BB000000000000000000003 /* Endpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000003 /* Endpoints.swift */; };
@@ -137,6 +138,7 @@
 		6CC00000000000000000000C /* QuantizationScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationScreen.swift; sourceTree = "<group>"; };
 		6CC00000000000000000000D /* ThroughputBenchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThroughputBenchScreen.swift; sourceTree = "<group>"; };
 		6CC00000000000000000000E /* AccuracyBenchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccuracyBenchScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000F /* NetworkScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkScreen.swift; sourceTree = "<group>"; };
 		7CC000000000000000000001 /* AppServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServices.swift; sourceTree = "<group>"; };
 		7CC000000000000000000002 /* OMLXClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OMLXClient.swift; sourceTree = "<group>"; };
 		7CC000000000000000000003 /* Endpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Endpoints.swift; sourceTree = "<group>"; };
@@ -323,6 +325,7 @@
 				6CC00000000000000000000C /* QuantizationScreen.swift */,
 				6CC00000000000000000000D /* ThroughputBenchScreen.swift */,
 				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
+				6CC00000000000000000000F /* NetworkScreen.swift */,
 			);
 			path = Screens;
 			sourceTree = "<group>";
@@ -569,6 +572,7 @@
 				6BB00000000000000000000C /* QuantizationScreen.swift in Sources */,
 				6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */,
 				6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */,
+				6BB00000000000000000000F /* NetworkScreen.swift in Sources */,
 				7BB000000000000000000001 /* AppServices.swift in Sources */,
 				7BB000000000000000000002 /* OMLXClient.swift in Sources */,
 				7BB000000000000000000003 /* Endpoints.swift in Sources */,

@@ -24,6 +24,8 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// fallback chain points to.
     let sampling: SamplingDTO?
     let huggingface: HuggingFaceDTO?
+    let modelscope: ModelScopeDTO?
+    let network: NetworkDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
     let mcp: MCPSettings?
@@ -111,6 +113,21 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     struct MCPSettings: Codable, Equatable, Sendable {
         let configPath: String?
     }
+
+    /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
+    /// "use the default" (modelscope.cn). Patched via `ms_endpoint`.
+    struct ModelScopeDTO: Codable, Equatable, Sendable {
+        let endpoint: String
+    }
+
+    /// Mirrors `omlx.settings.NetworkSettings`. All four fields are simple
+    /// strings; empty string = unset. Patched via `network_*` flat keys.
+    struct NetworkDTO: Codable, Equatable, Sendable {
+        let httpProxy: String
+        let httpsProxy: String
+        let noProxy: String
+        let caBundle: String
+    }
 }
 
 /// Patch body for POST /admin/api/global-settings. Fields are flat (not
@@ -169,6 +186,18 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// HF_ENDPOINT env var to the HF default (huggingface.co). Patches in-
     /// place via `omlx/admin/routes.py:2804`.
     var hfEndpoint: String? = nil
+
+    /// ModelScope mirror endpoint. Empty string = use modelscope.cn.
+    /// Patched via `ms_endpoint` (encoder converts to snake_case).
+    var msEndpoint: String? = nil
+
+    /// Process-wide outbound HTTP proxy. Empty string = unset. The server
+    /// applies via env vars (HTTP_PROXY / HTTPS_PROXY / NO_PROXY /
+    /// SSL_CERT_FILE) so HF, MS, and Sparkle all pick them up.
+    var networkHttpProxy: String? = nil
+    var networkHttpsProxy: String? = nil
+    var networkNoProxy: String? = nil
+    var networkCaBundle: String? = nil
 }
 
 struct UpdateGlobalSettingsResponse: Decodable, Sendable {

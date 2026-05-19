@@ -68,6 +68,7 @@ struct AppView: View {
     private func screen(for section: AppSection) -> some View {
         switch section {
         case .server:       ServerScreen()
+        case .network:      NetworkScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
         case .models:
