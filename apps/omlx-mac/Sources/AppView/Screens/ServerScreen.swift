@@ -138,12 +138,15 @@ struct ServerHeroCard: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            Squircle(gradient: SquircleGradient.server, size: 52) {
-                Text("oM")
-                    .font(.omlxText(22, weight: .heavy))
-                    .kerning(-0.5)
-                    .foregroundStyle(.white)
-            }
+            // App logo — `AppLogo` asset ships the rounded omlx mark (same
+            // artwork as the README's hero icon, light/dark variants).
+            // Replaces the previous gradient squircle + "oM" placeholder
+            // so the hero card on Server / Status reads as oMLX rather
+            // than a generic Apple-style server icon.
+            Image("AppLogo")
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
                     Text("oMLX Server")
