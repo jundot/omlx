@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2357,3 +2358,175 @@ class TestMeasureSensitivityVlmMtp:
 
         mock_apply_runtime.assert_not_called()
         mock_set_active.assert_not_called()
+
+
+# =============================================================================
+# Test pre-computed sensitivity map loading (oq_sensitivity_map.json)
+# =============================================================================
+
+
+class TestPrecomputedSensitivityMap:
+    """Tests for the oq_sensitivity_map.json disk cache feature.
+
+    When a pre-computed sensitivity map file exists at
+    ``{model_path}/oq_sensitivity_map.json``, quantize_oq_streaming loads it
+    directly and skips the entire sensitivity measurement pipeline
+    (proxy building, model loading, calibration, etc.).
+    """
+
+    def test_loads_existing_sensitivity_map_and_skips_measurement(
+        self, tmp_path, monkeypatch
+    ):
+        """When oq_sensitivity_map.json exists, it is loaded and measurement
+        functions are never called."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        sensitivity_map = {"0": 0.05, "1": 0.03, "2": 0.01}
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps(sensitivity_map), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        # Stub all measurement functions — they should NOT be called
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity", MagicMock(side_effect=RuntimeError("should not call"))
+        )
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model",
+            MagicMock(side_effect=RuntimeError("should not call")),
+        )
+        monkeypatch.setattr(
+            _oq, "_build_proxy_for_sensitivity",
+            MagicMock(side_effect=RuntimeError("should not call")),
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        _oq._measure_sensitivity.assert_not_called()
+        _oq._measure_sensitivity_from_quantized_model.assert_not_called()
+        _oq._build_proxy_for_sensitivity.assert_not_called()
+
+    def test_sensitivity_map_used_in_quant_plan(
+        self, tmp_path, monkeypatch
+    ):
+        """The loaded sensitivity map is stored in config['_oq_sensitivity_map']
+        and flows into _build_quant_plan."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps({
+                "model_type": "llama",
+                "num_hidden_layers": 32,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 256,
+            })
+        )
+
+        sensitivity_map = {str(i): 0.1 / (i + 1) for i in range(32)}
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps(sensitivity_map), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        # Capture the config that flows into _build_quant_plan
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        assert len(captured_configs) == 1
+        config = captured_configs[0]
+        assert "_oq_sensitivity_map" in config
+        loaded_sens = config["_oq_sensitivity_map"]
+        assert loaded_sens == sensitivity_map
+
+    def test_no_sensitivity_map_falls_back_to_measurement(
+        self, tmp_path, monkeypatch
+    ):
+        """When oq_sensitivity_map.json does NOT exist, measurement runs."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as _oq
+
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity",
+            MagicMock(return_value={"0": 0.05, "1": 0.03}),
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        _oq._measure_sensitivity.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("content,expected_exc,expected_match"),
+        [
+            ("{}", RuntimeError, "sensitivity measurement produced no scores"),
+            ("not valid json", ValueError, None),
+        ],
+    )
+    def test_sensitivity_map_file_errors(
+        self,
+        tmp_path,
+        monkeypatch,
+        content,
+        expected_exc,
+        expected_match,
+    ):
+        """Sensitivity map file issues (empty JSON or malformed JSON) should raise."""
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+        (src / "oq_sensitivity_map.json").write_text(content, encoding="utf-8")
+
+        with pytest.raises(expected_exc, match=expected_match or ".*"):
+            quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
