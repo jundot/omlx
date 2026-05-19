@@ -12,8 +12,10 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let basePath: String?
     let server: ServerSettings
     let model: ModelSettings?
+    let memory: MemorySettings?
     let scheduler: SchedulerSettings?
     let cache: CacheSettings?
+    let idleTimeout: IdleTimeoutSettings?
     let auth: AuthSettings?
     let system: SystemInfo?
     /// Server-wide default sampling parameters. Patched through the flat
@@ -46,6 +48,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct SchedulerSettings: Codable, Equatable, Sendable {
         let maxConcurrentRequests: Int
+        let chunkedPrefill: Bool?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -54,6 +57,23 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let ssdCacheMaxSize: String?
         let hotCacheOnly: Bool?
         let hotCacheMaxSize: String?
+        let initialCacheBlocks: Int?
+    }
+
+    /// Mirrors the `memory.*` block of GET /admin/api/global-settings.
+    /// `max_process_memory` accepts "auto", "disabled", or "NN%". The
+    /// prefill guard is a runtime-applied bool — when on, the server
+    /// preflights prefill memory before kicking the engine.
+    struct MemorySettings: Codable, Equatable, Sendable {
+        let maxProcessMemory: String?
+        let prefillMemoryGuard: Bool?
+    }
+
+    /// Mirrors the `idle_timeout.*` block. `idle_timeout_seconds == nil`
+    /// disables the global fallback; per-model overrides may still apply.
+    /// Server enforces `>= 60` on patch.
+    struct IdleTimeoutSettings: Codable, Equatable, Sendable {
+        let idleTimeoutSeconds: Int?
     }
 
     struct AuthSettings: Codable, Equatable, Sendable {
@@ -198,6 +218,41 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var networkHttpsProxy: String? = nil
     var networkNoProxy: String? = nil
     var networkCaBundle: String? = nil
+
+    // Phase 3 — Performance / Memory / Cache / Lifecycle.
+    //
+    // All flat (snake-cased on the wire by `convertToSnakeCase`). Server
+    // applies live wherever possible — see `omlx/admin/routes.py` for the
+    // per-field apply paths. `initial_cache_blocks` and `max_process_memory`
+    // are persisted but only take effect on restart; everything else is
+    // hot-applied.
+
+    /// Free-form memory limit. Accepts `"auto"`, `"disabled"`, or `"NN%"`.
+    var maxProcessMemory: String? = nil
+    var memoryPrefillMemoryGuard: Bool? = nil
+
+    /// Max bytes the engine pool will hold (`"24GB"`, `"50%"`, etc.).
+    var maxModelMemory: String? = nil
+    /// When the requested model isn't loaded, fall back to any loaded
+    /// model rather than 404.
+    var modelFallback: Bool? = nil
+
+    /// Multi-block prefill — splits long prompts across scheduler ticks.
+    var chunkedPrefill: Bool? = nil
+
+    var cacheEnabled: Bool? = nil
+    var hotCacheOnly: Bool? = nil
+    var hotCacheMaxSize: String? = nil
+    var ssdCacheDir: String? = nil
+    var ssdCacheMaxSize: String? = nil
+    /// Starting cache block count. Requires server restart to take effect.
+    var initialCacheBlocks: Int? = nil
+
+    /// Server-wide model auto-unload after N seconds idle. Server enforces
+    /// `>= 60`. Pass `nil` to leave unchanged; the Swift VM models the
+    /// "disabled" case separately (server-side disable isn't a patch op
+    /// today — see PerformanceScreen).
+    var idleTimeoutSeconds: Int? = nil
 }
 
 struct UpdateGlobalSettingsResponse: Decodable, Sendable {

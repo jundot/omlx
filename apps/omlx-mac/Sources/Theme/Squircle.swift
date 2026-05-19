@@ -57,6 +57,9 @@ enum SquircleGradient {
     /// Network squircle — cyan → indigo. Distinct from `status` (green) and
     /// `throughputBench` (teal duo) so the Server group icons read at a glance.
     static let network: [Color] = [Color(rgb24: 0x5AC8FA), Color(rgb24: 0x5856D6)]
+    /// Performance squircle — yellow → orange, evoking speed/heat. Distinct
+    /// from `integrations` (orange→red) and `accuracyBench` (orange→red).
+    static let performance: [Color] = [Color(rgb24: 0xFFCC00), Color(rgb24: 0xFF9500)]
     static let status: [Color] = [Color(rgb24: 0x34C759), Color(rgb24: 0x1A8A3A)]
     static let logs: [Color]   = [Color(rgb24: 0x8E8E93), Color(rgb24: 0x5A5A5E)]
 

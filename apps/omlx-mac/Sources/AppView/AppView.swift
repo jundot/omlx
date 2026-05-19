@@ -69,6 +69,7 @@ struct AppView: View {
         switch section {
         case .server:       ServerScreen()
         case .network:      NetworkScreen()
+        case .performance:  PerformanceScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
         case .models:

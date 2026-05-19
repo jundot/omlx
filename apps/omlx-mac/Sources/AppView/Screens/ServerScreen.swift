@@ -33,18 +33,11 @@ struct ServerScreen: View {
                 }
                 Row(
                     label: "Port",
-                    sublabel: "Default 8080. Server restarts on save."
+                    sublabel: "Default 8080. Server restarts on save.",
+                    isLast: true
                 ) {
                     TextInput(text: $vm.portText, mono: true, width: 90)
                         .onSubmit { vm.savePort(services: services) }
-                }
-                Row(
-                    label: "Max Concurrent Requests",
-                    sublabel: "Cap on simultaneous /v1 requests.",
-                    isLast: true
-                ) {
-                    TextInput(text: $vm.maxConcurrentText, mono: true, width: 90)
-                        .onSubmit(vm.saveMaxConcurrent)
                 }
             }
 
@@ -427,7 +420,6 @@ private struct HintFooter: View {
 final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
     @Published var portText: String = "8080"
-    @Published var maxConcurrentText: String = "8"
     @Published var logLevel: String = "info"
     @Published var basePathText: String = AppConfig.defaultBasePath()
     @Published var modelDirText: String = ""
@@ -458,9 +450,6 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
-            if let mc = dto.scheduler?.maxConcurrentRequests {
-                self.maxConcurrentText = String(mc)
-            }
             self.effectiveHost = dto.server.host
             self.effectivePort = dto.server.port
             if let s = dto.sampling {
@@ -711,15 +700,6 @@ final class ServerScreenVM: ObservableObject {
 
     func saveLogLevel() {
         Task { await commit(GlobalSettingsPatch(logLevel: logLevel)) }
-    }
-
-    func saveMaxConcurrent() {
-        guard let value = Int(maxConcurrentText.trimmingCharacters(in: .whitespaces)),
-              value > 0 else {
-            self.lastError = "Max concurrent must be a positive integer."
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(maxConcurrentRequests: value)) }
     }
 
     /// Build a `Binding` that calls `save` after the value changes. Used for

@@ -13,7 +13,7 @@ import SwiftUI
 // MARK: - Section model
 
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
-    case server, network, status, logs
+    case server, network, performance, status, logs
     case models, downloads, integrations, quantization
     case throughputBench, accuracyBench
     case security, about
@@ -24,6 +24,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .server:           return "Server"
         case .network:          return "Network"
+        case .performance:      return "Performance"
         case .status:           return "Status"
         case .logs:             return "Logs"
         case .models:           return "Models"
@@ -47,6 +48,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .server:          return "server.rack"
         case .network:         return "network"
+        case .performance:     return "bolt.fill"
         case .status:          return "gauge.with.dots.needle.50percent"
         case .logs:            return "scroll"
         case .models:          return "cube.transparent"
@@ -64,6 +66,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         switch self {
         case .server:          return SquircleGradient.server
         case .network:         return SquircleGradient.network
+        case .performance:     return SquircleGradient.performance
         case .status:          return SquircleGradient.status
         case .logs:            return SquircleGradient.logs
         case .models:          return SquircleGradient.models
@@ -79,7 +82,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 
     var group: SidebarGroup {
         switch self {
-        case .server, .network, .status, .logs:                    return .server
+        case .server, .network, .performance, .status, .logs:      return .server
         case .models, .downloads, .integrations, .quantization:    return .models
         case .throughputBench, .accuracyBench:                     return .bench
         case .security, .about:                                    return .general
