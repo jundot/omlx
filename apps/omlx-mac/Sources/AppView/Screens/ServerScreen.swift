@@ -48,6 +48,9 @@ struct ServerScreen: View {
                 "Default Profile",
                 subtitle: "Fallback values used when a model has no profile, or when a profile leaves a field empty"
             )
+            // Deep-link target for the per-model Profiles tab's "Edit on
+            // Server →" link (see AppServices.ServerAnchor.defaultProfile).
+            .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
 
             SectionHeader("Logging")

@@ -23,9 +23,19 @@ final class AppServices: NSObject, ObservableObject {
     /// imperatively navigate the user (e.g. the Profiles tab's
     /// "Edit on Server →" link) without prop-drilling a `Binding<AppSection>`.
     @Published var requestedSection: AppSection?
+    /// Pair with `requestedSection` to scroll the Server screen to a
+    /// specific section after the deep-link lands. ContentScaffold's
+    /// `ScrollViewReader` observes this, scrolls, then nils it. Only the
+    /// Default Profile anchor is wired today — extend the enum as more
+    /// deep links land.
+    @Published var requestedServerAnchor: ServerAnchor?
 
     let client: OMLXClient
     let updates: UpdateController
+    /// Read-only preset bundle (sourced from the shipped JSON + remote
+    /// refresh). The per-model settings preset chip strip subscribes via
+    /// `@EnvironmentObject` to react to refreshes.
+    let presetBundle = PresetBundleStore()
 
     /// Long-lived view models for the Bench screens. Owned here (not by
     /// the screen's `@StateObject`) so a running benchmark survives
@@ -371,4 +381,11 @@ final class AppServices: NSObject, ObservableObject {
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
+}
+
+/// Scroll anchors inside the Server screen that other screens can deep
+/// link to via `AppServices.requestedServerAnchor`. The raw value is the
+/// `.id(_:)` attached to the corresponding `SectionHeader`.
+enum ServerAnchor: String, Sendable {
+    case defaultProfile = "server.defaultProfile"
 }

@@ -179,6 +179,13 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.profileTemplate(name), body: body)
     }
 
+    /// Force-refresh the preset bundle from omlx.ai (via the server proxy
+    /// at `/api/presets/refresh`). Callers cache the result on disk; the
+    /// `PresetBundleStore` is the single in-app consumer.
+    func refreshPresetBundle() async throws -> PresetBundleDTO {
+        try await postEmpty(AdminAPI.presetsRefresh)
+    }
+
     @discardableResult
     func deleteProfileTemplate(name: String) async throws -> DeleteResponse {
         try await delete(AdminAPI.profileTemplate(name))

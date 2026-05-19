@@ -37,6 +37,10 @@ enum AdminAPI {
     static func profileTemplate(_ name: String) -> String {
         "\(profileTemplates)/\(name)"
     }
+    /// Proxy that fetches the remote preset bundle from omlx.ai and returns
+    /// the parsed JSON. Mirrors HTML's `refreshPresets()` flow — clients
+    /// cache the result locally and use it as the read-only preset source.
+    static let presetsRefresh  = "\(prefix)/presets/refresh"
 
     static let hfTasks         = "\(prefix)/hf/tasks"
     static let hfDownload      = "\(prefix)/hf/download"

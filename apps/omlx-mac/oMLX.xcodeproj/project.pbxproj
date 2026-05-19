@@ -66,6 +66,8 @@
 		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
 		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
+		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
+		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
 		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
 		9BB000000000000000000002 /* OQDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000002 /* OQDTO.swift */; };
 		9BB000000000000000000003 /* HFUploadDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000003 /* HFUploadDTO.swift */; };
@@ -160,6 +162,8 @@
 		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
 		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
 		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000002 /* OQDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OQDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000003 /* HFUploadDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFUploadDTO.swift; sourceTree = "<group>"; };
@@ -266,6 +270,7 @@
 				6CC000000000000000000001 /* AppView.swift */,
 				6CC000000000000000000002 /* Sidebar.swift */,
 				7CC000000000000000000001 /* AppServices.swift */,
+				9CC000000000000000000006 /* PresetBundleStore.swift */,
 				6EE000000000000000000002 /* Screens */,
 			);
 			path = AppView;
@@ -296,6 +301,7 @@
 				9CC000000000000000000002 /* OQDTO.swift */,
 				9CC000000000000000000003 /* HFUploadDTO.swift */,
 				9CC000000000000000000004 /* BenchDTO.swift */,
+				9CC000000000000000000005 /* PresetBundleDTO.swift */,
 			);
 			path = DTO;
 			sourceTree = "<group>";
@@ -592,6 +598,8 @@
 				8BB000000000000000000002 /* ProfileDTO.swift in Sources */,
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB00000000000000000000A /* MSTaskDTO.swift in Sources */,
+				9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */,
+				9BB000000000000000000006 /* PresetBundleStore.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
 				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
 				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,

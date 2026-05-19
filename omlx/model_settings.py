@@ -16,7 +16,6 @@ from typing import Any, Dict, Optional
 from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
-    load_default_global_templates,
     validate_profile_name,
     utcnow,
 )
@@ -269,9 +268,6 @@ class ModelSettingsManager:
         self._settings: Dict[str, ModelSettings] = {}
         self._profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._templates: Dict[str, Dict[str, Any]] = {}
-        # Built-ins materialized lazily from the shipped JSON. None until
-        # _get_builtin_templates() runs once.
-        self._builtin_templates: Optional[Dict[str, Dict[str, Any]]] = None
 
         # Ensure base directory exists
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -680,38 +676,6 @@ class ModelSettingsManager:
             logger.error(f"Failed to load templates file: {e}")
             self._templates = {}
 
-    def _get_builtin_templates(self) -> Dict[str, Dict[str, Any]]:
-        """Return the in-memory view of the shipped built-in templates.
-
-        Materialized lazily on first call and cached on the instance — the
-        underlying JSON sibling never changes during a process's lifetime.
-        Returned entries carry ``is_builtin: True`` so the API/UI can render
-        them as read-only without a second lookup.
-        """
-        if self._builtin_templates is None:
-            out: Dict[str, Dict[str, Any]] = {}
-            for entry in load_default_global_templates():
-                name = entry.get("name")
-                if not isinstance(name, str):
-                    logger.warning(f"Skipping built-in template missing name: {entry!r}")
-                    continue
-                try:
-                    validate_profile_name(name)
-                except Exception as e:
-                    logger.warning(f"Skipping built-in template with invalid name {name!r}: {e}")
-                    continue
-                out[name] = {
-                    "name": name,
-                    "display_name": entry.get("display_name", name),
-                    "description": entry.get("description"),
-                    "created_at": None,
-                    "updated_at": None,
-                    "settings": filter_universal_fields(entry.get("settings", {})),
-                    "is_builtin": True,
-                }
-            self._builtin_templates = out
-        return self._builtin_templates
-
     def _save_templates(self) -> None:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
@@ -725,16 +689,13 @@ class ModelSettingsManager:
             raise
 
     def list_templates(self) -> list[dict]:
-        """Built-ins first (stable UI order), then user templates."""
+        """Return user templates. `is_builtin` is always `false` now that
+        the shipped JSON seeds were retired in favor of the client-side
+        preset bundle (`omlx/admin/static/omlx_preset.json`); the field is
+        kept on each entry so existing API consumers don't have to change."""
         with self._lock:
-            builtins = self._get_builtin_templates()
-            out: list[dict] = [copy.deepcopy(t) for t in builtins.values()]
-            for name, t in self._templates.items():
-                if name in builtins:
-                    # Defensive: user file ended up with a colliding name
-                    # (legacy disk state from before this refactor). The
-                    # built-in always wins.
-                    continue
+            out: list[dict] = []
+            for t in self._templates.values():
                 user = dict(t)
                 user["is_builtin"] = False
                 out.append(user)
@@ -742,9 +703,6 @@ class ModelSettingsManager:
 
     def get_template(self, name: str) -> Optional[dict]:
         with self._lock:
-            b = self._get_builtin_templates().get(name)
-            if b is not None:
-                return copy.deepcopy(b)
             u = self._templates.get(name)
             if u is None:
                 return None
@@ -762,10 +720,6 @@ class ModelSettingsManager:
         validate_profile_name(name)
         filtered = filter_universal_fields(settings or {})
         with self._lock:
-            if name in self._get_builtin_templates():
-                raise ValueError(
-                    f"Template '{name}' is a built-in — pick a different name"
-                )
             if name in self._templates:
                 raise ValueError(f"Template '{name}' already exists")
             now = utcnow().isoformat()
@@ -793,10 +747,6 @@ class ModelSettingsManager:
         validate_profile_name(name)
         filtered = filter_universal_fields(settings or {})
         with self._lock:
-            if name in self._get_builtin_templates():
-                raise ValueError(
-                    f"Template '{name}' is a built-in — pick a different name"
-                )
             now = utcnow().isoformat()
             existing = self._templates.get(name)
             created_at = existing["created_at"] if existing else now
@@ -823,22 +773,12 @@ class ModelSettingsManager:
         settings: Optional[Dict[str, Any]] = None,
     ) -> Optional[dict]:
         with self._lock:
-            builtins = self._get_builtin_templates()
-            if name in builtins:
-                raise ValueError(
-                    f"Template '{name}' is a built-in — cannot edit. "
-                    f"Create a new template with a different name instead."
-                )
             if name not in self._templates:
                 return None
             template = dict(self._templates[name])
             target = name
             if new_name is not None and new_name != name:
                 validate_profile_name(new_name)
-                if new_name in builtins:
-                    raise ValueError(
-                        f"Template '{new_name}' is a built-in — pick a different name"
-                    )
                 if new_name in self._templates:
                     raise ValueError(f"Template '{new_name}' already exists")
                 target = new_name
@@ -860,10 +800,6 @@ class ModelSettingsManager:
 
     def delete_template(self, name: str) -> bool:
         with self._lock:
-            if name in self._get_builtin_templates():
-                raise ValueError(
-                    f"Template '{name}' is a built-in — cannot delete"
-                )
             if name not in self._templates:
                 return False
             del self._templates[name]

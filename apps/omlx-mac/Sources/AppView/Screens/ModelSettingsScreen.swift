@@ -35,13 +35,17 @@ struct ModelSettingsScreen: View {
             case .profiles:
                 ProfilesTab(
                     vm: vm,
+                    presetStore: services.presetBundle,
                     client: services.client,
                     serverDefaults: vm.serverDefaultSampling,
-                    // No cross-screen navigation primitive in the app yet —
-                    // the link drills back to the Models screen so the user
-                    // can pick Server in the sidebar. UX compromise vs the
-                    // design's "Edit on Server →" deep link.
-                    onEditServer: { services.modelDetailID = nil }
+                    // Deep-link to the Server tab's Default Profile
+                    // section. Setting the anchor *before* the section
+                    // means ContentScaffold's `.task(id:)` sees both
+                    // pieces in one go and scrolls without a noop pass.
+                    onEditServer: {
+                        services.requestedServerAnchor = .defaultProfile
+                        services.requestedSection = .server
+                    }
                 )
             case .basic:
                 BasicTab(vm: vm, client: services.client)
@@ -125,6 +129,11 @@ private struct SectionPicker: View {
 
 private struct ProfilesTab: View {
     @ObservedObject var vm: ModelSettingsScreenVM
+    /// Source of `.preset` chips — the shipped JSON bundle, refreshable
+    /// from omlx.ai via `POST /api/presets/refresh`. Replaces the legacy
+    /// `vm.templates.filter { isBuiltin }` source after Phase 1 retired
+    /// the server-side builtin templates.
+    @ObservedObject var presetStore: PresetBundleStore
     let client: OMLXClient
     /// Optional binding to a Server-Defaults DTO surfaced read-only at
     /// the bottom of the tab. Lives on the parent (a `@StateObject`-
@@ -183,13 +192,17 @@ private struct ProfilesTab: View {
             ProfileGroup(
                 scope: .preset,
                 label: "Preset Profiles",
-                names: vm.templates.filter { $0.templateScope == .preset }.map(\.name),
+                names: presetStore.entries.map(\.name),
                 activeName: vm.activeProfileState.activeName(in: .preset),
                 basedOnName: vm.activeProfileState.basedOnName(in: .preset),
                 previewName: preview?.scope == .preset ? preview?.name : nil,
                 canSaveCurrent: false,
                 onSelect: { previewChip(scope: .preset, name: $0) },
-                onSaveCurrent: { }
+                onSaveCurrent: { },
+                onRefresh: {
+                    Task { await presetStore.refresh(client: client) }
+                },
+                isRefreshing: presetStore.isRefreshing
             )
 
             ProfileGroup(
@@ -201,7 +214,10 @@ private struct ProfilesTab: View {
                 previewName: preview?.scope == .global ? preview?.name : nil,
                 canSaveCurrent: vm.profileDirty,
                 onSelect: { previewChip(scope: .global, name: $0) },
-                onSaveCurrent: { openSaveAs(scope: .global) }
+                onSaveCurrent: { openSaveAs(scope: .global) },
+                onRename: { original, renamed in
+                    Task { await vm.renameTemplate(from: original, to: renamed, client: client) }
+                }
             )
 
             ProfileGroup(
@@ -215,7 +231,10 @@ private struct ProfilesTab: View {
                 previewName: preview?.scope == .model ? preview?.name : nil,
                 canSaveCurrent: vm.profileDirty,
                 onSelect: { previewChip(scope: .model, name: $0) },
-                onSaveCurrent: { openSaveAs(scope: .model) }
+                onSaveCurrent: { openSaveAs(scope: .model) },
+                onRename: { original, renamed in
+                    Task { await vm.renameModelProfile(from: original, to: renamed, client: client) }
+                }
             )
 
             detailCard
@@ -256,9 +275,15 @@ private struct ProfilesTab: View {
                 hasWorking: vm.profileDirty,
                 onApply: {
                     Task {
-                        await vm.applyChip(
-                            scope: preview.scope, name: preview.name, client: client
-                        )
+                        if preview.scope == .preset,
+                           let entry = presetStore.entries
+                                .first(where: { $0.name == preview.name }) {
+                            await vm.applyPreset(entry, client: client)
+                        } else {
+                            await vm.applyChip(
+                                scope: preview.scope, name: preview.name, client: client
+                            )
+                        }
                         self.preview = nil
                     }
                 },
@@ -358,7 +383,9 @@ private struct ProfilesTab: View {
 
     private func lookupSettings(scope: ProfileScope, name: String) -> [String: AnyCodable]? {
         switch scope {
-        case .preset, .global:
+        case .preset:
+            return presetStore.entries.first(where: { $0.name == name })?.settings
+        case .global:
             return vm.templates.first(where: { $0.name == name })?.settings
         case .model:
             return vm.profiles.first(where: { $0.name == name })?.settings
@@ -1476,12 +1503,20 @@ final class ModelSettingsScreenVM: ObservableObject {
 
     /// Apply a chip's profile to the model. Discards any working-profile
     /// state per chat2.md: "Any unsaved work is silently dispatched."
+    /// `.preset` is routed through `applyPreset(_:client:)` — that path
+    /// receives the bundle entry directly since presets aren't stored as
+    /// server templates.
     func applyChip(scope: ProfileScope, name: String, client: OMLXClient) async {
         do {
             switch scope {
+            case .preset:
+                // Caller dispatches via applyPreset(_:client:) — this
+                // branch is a defensive no-op so misrouted calls don't
+                // hit a template lookup that's guaranteed to miss.
+                return
             case .model:
                 _ = try await client.applyModelProfile(id: modelID, name: name)
-            case .preset, .global:
+            case .global:
                 // Templates aren't directly applicable — seed a model
                 // profile from the template, then apply it. Reuse the
                 // template's name; if a same-named model profile already
@@ -1503,6 +1538,64 @@ final class ModelSettingsScreenVM: ObservableObject {
                 }
                 _ = try await client.applyModelProfile(id: modelID, name: name)
             }
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    /// Rename a global template via PUT /api/profile-templates/{name}.
+    /// Server validates the slug + duplicate; we already pre-checked
+    /// in ProfileGroup, but the server stays the source of truth for
+    /// the activated state — reload after success.
+    func renameTemplate(from original: String, to renamed: String, client: OMLXClient) async {
+        do {
+            _ = try await client.updateProfileTemplate(
+                name: original,
+                body: UpdateTemplateRequest(newName: renamed)
+            )
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    /// Rename a per-model profile via PUT /api/models/{id}/profiles/{name}.
+    /// If the renamed profile was active, the server carries the active
+    /// pointer to the new name; reload to pick that up.
+    func renameModelProfile(from original: String, to renamed: String, client: OMLXClient) async {
+        do {
+            _ = try await client.updateModelProfile(
+                id: modelID,
+                name: original,
+                body: UpdateProfileRequest(newName: renamed)
+            )
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    /// Apply a bundled preset entry to the model. Seeds a per-model
+    /// profile (named after the preset, no `sourceTemplate` since presets
+    /// aren't stored as server templates) and activates it. Mirrors
+    /// HTML's behavior of materializing a preset as a model profile on
+    /// first apply.
+    func applyPreset(_ entry: PresetEntry, client: OMLXClient) async {
+        do {
+            if !self.profiles.contains(where: { $0.name == entry.name }) {
+                _ = try? await client.createModelProfile(
+                    id: modelID,
+                    body: CreateProfileRequest(
+                        name: entry.name,
+                        displayName: entry.displayName,
+                        description: entry.description,
+                        sourceTemplate: nil,
+                        settings: entry.settings
+                    )
+                )
+            }
+            _ = try await client.applyModelProfile(id: modelID, name: entry.name)
             await load(modelID: modelID, client: client)
         } catch {
             self.lastError = describe(error)

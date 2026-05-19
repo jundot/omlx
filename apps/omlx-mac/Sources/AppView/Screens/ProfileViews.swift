@@ -53,8 +53,24 @@ struct ProfileGroup: View {
 
     let onSelect: (String) -> Void
     let onSaveCurrent: () -> Void
+    /// Optional refresh affordance — when non-nil, a small refresh icon
+    /// renders in the header instead of (or alongside) the save button.
+    /// Used by the preset chip strip to pull the latest bundle from
+    /// omlx.ai via `POST /api/presets/refresh`.
+    var onRefresh: (() -> Void)? = nil
+    /// Spinner state for the refresh icon. Disables the button while a
+    /// refresh is in flight so a fast user can't queue duplicates.
+    var isRefreshing: Bool = false
+    /// Optional inline-rename callback. When provided, double-clicking a
+    /// chip swaps its label for a `TextField`; Enter commits via
+    /// `(originalName, newName)`. Pass nil for read-only groups (preset
+    /// chips backed by the shipped JSON bundle).
+    var onRename: ((String, String) -> Void)? = nil
 
     @Environment(\.omlxTheme) private var theme
+    @State private var renamingName: String? = nil
+    @State private var renameText: String = ""
+    @FocusState private var renameFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -77,6 +93,20 @@ struct ProfileGroup: View {
                 .textCase(.uppercase)
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 8)
+            if let onRefresh {
+                Button {
+                    onRefresh()
+                } label: {
+                    Image(systemName: isRefreshing
+                          ? "arrow.triangle.2.circlepath"
+                          : "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                        .symbolEffect(.rotate, isActive: isRefreshing)
+                }
+                .buttonStyle(.omlx(.plain, size: .small))
+                .help("Refresh presets from omlx.ai")
+                .disabled(isRefreshing)
+            }
             if canSaveCurrent {
                 Button {
                     onSaveCurrent()
@@ -139,15 +169,40 @@ struct ProfileGroup: View {
         let isActive = (activeName == name)
         let isBase = (basedOnName == name)
         let isPreviewed = (previewName == name)
+        let isEditing = (renamingName == name)
         HStack(spacing: 5) {
-            if isActive {
+            if isActive && !isEditing {
                 Image(systemName: "checkmark")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white)
             }
-            Text(name)
-                .font(.omlxText(12, weight: .medium))
-                .foregroundStyle(isActive ? .white : theme.text)
+            if isEditing {
+                TextField("", text: $renameText)
+                    .textFieldStyle(.plain)
+                    .font(.omlxText(12, weight: .medium))
+                    .foregroundStyle(isActive ? .white : theme.text)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .focused($renameFieldFocused)
+                    .onSubmit { commitRename(original: name) }
+                    .onExitCommand { renamingName = nil }
+                    .onChange(of: renameFieldFocused) { _, focused in
+                        // Commit on focus loss (click outside / tab away)
+                        // — same validation path as Enter. The TextField
+                        // only loses focus *after* `onSubmit` runs, and
+                        // `commitRename` clears `renamingName` before
+                        // returning, so this guard prevents a double-fire
+                        // on a clean Enter. Escape still cancels via
+                        // `.onExitCommand` (which nils `renamingName`
+                        // before focus loss propagates here).
+                        if !focused && renamingName == name {
+                            commitRename(original: name)
+                        }
+                    }
+            } else {
+                Text(name)
+                    .font(.omlxText(12, weight: .medium))
+                    .foregroundStyle(isActive ? .white : theme.text)
+            }
         }
         .padding(.horizontal, 11)
         .frame(height: 26)
@@ -170,7 +225,54 @@ struct ProfileGroup: View {
             )
         )
         .contentShape(Capsule())
-        .onTapGesture { onSelect(name) }
+        .gesture(
+            // ExclusiveGesture(first, second): the double-tap is tried
+            // first; if it succeeds the single-tap doesn't fire. Without
+            // this, double-clicking a chip would briefly flash the
+            // preview before entering rename mode.
+            ExclusiveGesture(
+                TapGesture(count: 2).onEnded {
+                    guard onRename != nil, !isEditing else { return }
+                    startRename(name)
+                },
+                TapGesture(count: 1).onEnded {
+                    guard !isEditing else { return }
+                    onSelect(name)
+                }
+            )
+        )
+    }
+
+    private func startRename(_ name: String) {
+        renamingName = name
+        renameText = name
+        // Focus on the next runloop tick so the @FocusState observer sees
+        // the TextField after it's been mounted into the hierarchy.
+        DispatchQueue.main.async { renameFieldFocused = true }
+    }
+
+    private func commitRename(original: String) {
+        let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Always exit rename mode — validation failures silently revert
+        // to the original name without an error banner.
+        defer { renamingName = nil }
+        guard !trimmed.isEmpty,
+              trimmed != original,
+              !names.contains(trimmed),
+              Self.isValidSlug(trimmed)
+        else { return }
+        onRename?(original, trimmed)
+    }
+
+    /// Mirror of the server's profile-name slug rule
+    /// (`omlx/model_profiles.py:validate_profile_name`). Pre-checking
+    /// client-side avoids a doomed PUT round-trip for invalid names.
+    private static func isValidSlug(_ s: String) -> Bool {
+        guard let re = try? NSRegularExpression(
+            pattern: #"^[a-z0-9][a-z0-9_-]{0,31}$"#
+        ) else { return false }
+        let range = NSRange(s.startIndex..., in: s)
+        return re.firstMatch(in: s, range: range) != nil
     }
 }
 
@@ -512,13 +614,30 @@ struct ProfileDetailCard: View {
             "force_sampling", "is_pinned",
         ]
         let hasBehavior = behaviorKeys.contains { s[$0] != nil }
+        // Per-model "Advanced" surface — fields from
+        // `MODEL_SPECIFIC_PROFILE_FIELDS` in `omlx/model_profiles.py`.
+        // None of these are universal, so they're absent from preset and
+        // global templates; they only appear on per-model profiles.
+        let accelKeys = [
+            "turboquant_kv_enabled", "dflash_enabled", "mtp_enabled",
+            "specprefill_enabled", "index_cache_freq",
+        ]
+        let hasAcceleration = accelKeys.contains { s[$0] != nil }
+        let templateKeys = ["reasoning_parser", "chat_template_kwargs", "forced_ct_kwargs"]
+        let hasTemplates = templateKeys.contains { k in
+            guard let v = s[k] else { return false }
+            return !isEmptyValue(v)
+        }
 
         VStack(alignment: .leading, spacing: 14) {
             if hasSampling { samplingSection(s) }
             if hasCapacity { capacitySection(s) }
             if hasPenalty { penaltySection(s) }
             if hasBehavior { behaviorSection(s) }
-            if !hasSampling && !hasCapacity && !hasPenalty && !hasBehavior {
+            if hasAcceleration { accelerationSection(s) }
+            if hasTemplates { templatesSection(s) }
+            if !hasSampling && !hasCapacity && !hasPenalty && !hasBehavior
+                && !hasAcceleration && !hasTemplates {
                 Text("This profile doesn't override any settings.")
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textTertiary)
@@ -599,6 +718,120 @@ struct ProfileDetailCard: View {
                 flagChip(label: "Pinned in memory", on: v)
             }
         }
+    }
+
+    /// Acceleration / experimental knobs that only land on per-model
+    /// profiles (TurboQuant KV, DFlash + drafter quant, native MTP,
+    /// SpecPrefill, IndexCache). Renders one chip per feature so the
+    /// preview surfaces whether a profile flips them — and at what
+    /// settings — without forcing the user back into the Advanced tab.
+    @ViewBuilder
+    private func accelerationSection(_ s: [String: AnyCodable]) -> some View {
+        sectionTitle("Acceleration")
+        FlowLayout(spacing: 6) {
+            if let on = s["turboquant_kv_enabled"].flatMap({ boolOf($0) }) {
+                flagChip(label: turboquantLabel(s, on: on), on: on)
+            }
+            if let on = s["dflash_enabled"].flatMap({ boolOf($0) }) {
+                flagChip(label: dflashLabel(s, on: on), on: on)
+                if on, let q = s["dflash_draft_quant_enabled"].flatMap({ boolOf($0) }), q {
+                    flagChip(label: dflashQuantLabel(s), on: true)
+                }
+            }
+            if let on = s["mtp_enabled"].flatMap({ boolOf($0) }) {
+                flagChip(label: "Native MTP", on: on)
+            }
+            if let on = s["specprefill_enabled"].flatMap({ boolOf($0) }) {
+                flagChip(label: specprefillLabel(s, on: on), on: on)
+            }
+            if let freq = intOf(s["index_cache_freq"]), freq > 0 {
+                flagChip(label: "IndexCache · every \(freq)", on: true)
+            }
+        }
+    }
+
+    /// Tokenizer / chat-template overrides — universal fields that the
+    /// existing Sampling / Capacity / Penalty / Behavior sections don't
+    /// cover. Kept separate so the visual weight matches its semantic
+    /// distance from the sampler knobs above.
+    @ViewBuilder
+    private func templatesSection(_ s: [String: AnyCodable]) -> some View {
+        sectionTitle("Templates")
+        FlowLayout(spacing: 6) {
+            if let parser = (s["reasoning_parser"]?.value as? String)?
+                .trimmingCharacters(in: .whitespaces), !parser.isEmpty {
+                flagChip(label: "Reasoning · \(parser)", on: true)
+            }
+            if let count = nonEmptyKwargCount(s["chat_template_kwargs"]) {
+                flagChip(
+                    label: "Chat template · \(count) override\(count == 1 ? "" : "s")",
+                    on: true
+                )
+            }
+            if let count = nonEmptyKwargCount(s["forced_ct_kwargs"]) {
+                flagChip(
+                    label: "Forced CT · \(count) key\(count == 1 ? "" : "s")",
+                    on: true
+                )
+            }
+        }
+    }
+
+    private func turboquantLabel(_ s: [String: AnyCodable], on: Bool) -> String {
+        guard on else { return "TurboQuant KV" }
+        let bits = doubleOf(s["turboquant_kv_bits"])
+        let skip = intOf(s["turboquant_skip_last"]) ?? 0
+        let bitsText = bits.map { v in
+            v.truncatingRemainder(dividingBy: 1) == 0
+                ? "\(Int(v))bit"
+                : String(format: "%.1fbit", v)
+        }
+        let parts = [bitsText, skip > 0 ? "skip \(skip)" : nil].compactMap { $0 }
+        return parts.isEmpty ? "TurboQuant KV" : "TurboQuant KV · \(parts.joined(separator: " / "))"
+    }
+
+    private func dflashLabel(_ s: [String: AnyCodable], on: Bool) -> String {
+        guard on else { return "DFlash" }
+        let drafter = (s["dflash_draft_model"]?.value as? String)?
+            .trimmingCharacters(in: .whitespaces)
+        if let d = drafter, !d.isEmpty {
+            return "DFlash · \(d)"
+        }
+        return "DFlash"
+    }
+
+    private func dflashQuantLabel(_ s: [String: AnyCodable]) -> String {
+        let w = intOf(s["dflash_draft_quant_weight_bits"]) ?? 4
+        let a = intOf(s["dflash_draft_quant_activation_bits"]) ?? 8
+        let g = intOf(s["dflash_draft_quant_group_size"]) ?? 64
+        return "Drafter quant · W\(w)/A\(a) G\(g)"
+    }
+
+    private func specprefillLabel(_ s: [String: AnyCodable], on: Bool) -> String {
+        guard on else { return "SpecPrefill" }
+        // `specprefill_keep_pct` is a fraction (0.1–0.5 per
+        // `omlx/model_settings.py:62`); render as a percent so the chip
+        // reads naturally.
+        let keep = doubleOf(s["specprefill_keep_pct"])
+            .map { String(format: "%.0f%%", $0 * 100) }
+        let thresh = intOf(s["specprefill_threshold"])
+            .map { "≥\(fmtCtx(Double($0))) tk" }
+        let parts = [keep, thresh].compactMap { $0 }
+        return parts.isEmpty ? "SpecPrefill" : "SpecPrefill · \(parts.joined(separator: " / "))"
+    }
+
+    /// Count of non-empty key-value pairs in a `[String: AnyCodable]`
+    /// dictionary blob. Returns nil if the field is absent, empty, or
+    /// not a dict — those cases should hide the chip entirely.
+    private func nonEmptyKwargCount(_ v: AnyCodable?) -> Int? {
+        guard let v else { return nil }
+        if let dict = v.value as? [String: AnyCodable] {
+            return dict.isEmpty ? nil : dict.count
+        }
+        if let dict = v.value as? [String: Any] {
+            return dict.isEmpty ? nil : dict.count
+        }
+        return nil
     }
 
     @ViewBuilder

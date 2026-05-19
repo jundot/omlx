@@ -1,11 +1,10 @@
 // The ProfileDTO/TemplateListResponse pair is the contract with the
-// Python admin API. When the server started returning null timestamps for
-// shipped built-in templates, ProfileDTO's non-optional `createdAt`/`updatedAt`
-// caused JSONDecoder to throw, and `try?` in ModelSettingsScreen swallowed it
-// to an empty list — the user saw "no templates" silently.
-//
-// These tests pin the decode shape so any future server-side nullability
-// change breaks the build instead of the UI.
+// Python admin API. `/admin/api/profile-templates` now returns
+// user-created templates only — the shipped built-ins were retired in
+// favor of the client-side preset bundle. The DTO still tolerates
+// `is_builtin: true` decode for back-compat with stale disk state and
+// older server builds, and `created_at`/`updated_at` remain nullable
+// because user templates may persist without stamps in legacy state.
 
 import XCTest
 @testable import oMLX_next
@@ -18,35 +17,37 @@ final class ProfileDTODecodeTests: XCTestCase {
         return d
     }()
 
-    func testBuiltinTemplateWithNullTimestampsDecodes() throws {
+    func testTemplateWithNullTimestampsDecodes() throws {
+        // Templates with null `created_at`/`updated_at` (legacy disk
+        // state from before timestamps were required) must still
+        // decode — non-optional fields here would silently empty the
+        // templates list via `try?` in ModelSettingsScreen.
         let json = """
         {
-            "name": "qwen36-thinking-general",
-            "display_name": "Qwen3.6 Thinking · General",
-            "description": "Built-in default.",
+            "name": "shared-coding",
+            "display_name": "Shared · Coding",
+            "description": "Legacy entry without stamps.",
             "created_at": null,
             "updated_at": null,
             "settings": {
                 "max_context_window": 131072,
-                "temperature": 1.0,
-                "enable_thinking": true
+                "temperature": 0.6,
+                "enable_thinking": false
             },
-            "is_builtin": true
+            "is_builtin": false
         }
         """.data(using: .utf8)!
 
         let dto = try decoder.decode(ProfileDTO.self, from: json)
-        XCTAssertEqual(dto.name, "qwen36-thinking-general")
-        XCTAssertEqual(dto.displayName, "Qwen3.6 Thinking · General")
+        XCTAssertEqual(dto.name, "shared-coding")
+        XCTAssertEqual(dto.displayName, "Shared · Coding")
         XCTAssertNil(dto.createdAt)
         XCTAssertNil(dto.updatedAt)
-        XCTAssertEqual(dto.isBuiltin, true)
+        XCTAssertEqual(dto.isBuiltin, false)
         XCTAssertNotNil(dto.settings)
     }
 
     func testUserTemplateWithStampsDecodes() throws {
-        // The other half of the contract: user-created templates carry
-        // ISO timestamps and is_builtin=false.
         let json = """
         {
             "name": "my-tuned",
@@ -65,28 +66,21 @@ final class ProfileDTODecodeTests: XCTestCase {
         XCTAssertEqual(dto.isBuiltin, false)
     }
 
-    func testTemplateListWithMixedBuiltinAndUserDecodes() throws {
-        // Mirrors the real /admin/api/profile-templates response: built-ins
-        // first (null stamps, is_builtin: true), then user entries.
+    func testTemplateListDecodes() throws {
+        // After the builtin-template retirement, the templates list is
+        // user-created entries only. The DTO still tolerates the legacy
+        // `is_builtin: true` shape from stale state — included here as
+        // a back-compat smoke test, not a current API behavior.
         let json = """
         {
             "templates": [
                 {
-                    "name": "qwen36-thinking-general",
-                    "display_name": "Qwen3.6 Thinking · General",
-                    "description": "ship default",
+                    "name": "legacy-shipped",
+                    "display_name": "Legacy Shipped",
+                    "description": "decode back-compat only",
                     "created_at": null,
                     "updated_at": null,
                     "settings": {"temperature": 1.0},
-                    "is_builtin": true
-                },
-                {
-                    "name": "qwen36-instruct-general",
-                    "display_name": "Qwen3.6 Instruct · General",
-                    "description": "ship default",
-                    "created_at": null,
-                    "updated_at": null,
-                    "settings": {"temperature": 0.7},
                     "is_builtin": true
                 },
                 {
@@ -103,10 +97,10 @@ final class ProfileDTODecodeTests: XCTestCase {
         """.data(using: .utf8)!
 
         let resp = try decoder.decode(TemplateListResponse.self, from: json)
-        XCTAssertEqual(resp.templates.count, 3)
+        XCTAssertEqual(resp.templates.count, 2)
         XCTAssertEqual(resp.templates[0].isBuiltin, true)
-        XCTAssertEqual(resp.templates[2].isBuiltin, false)
-        XCTAssertEqual(resp.templates[2].createdAt, "2026-05-12T10:00:00+00:00")
+        XCTAssertEqual(resp.templates[1].isBuiltin, false)
+        XCTAssertEqual(resp.templates[1].createdAt, "2026-05-12T10:00:00+00:00")
     }
 
     func testLegacyResponseMissingIsBuiltinStillDecodes() throws {

@@ -100,6 +100,7 @@ private struct ContentScaffold<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
+    @EnvironmentObject private var services: AppServices
 
     var body: some View {
         Group {
@@ -115,21 +116,50 @@ private struct ContentScaffold<Content: View>: View {
                 .padding(.horizontal, 28)
                 .padding(.bottom, 18)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        content()
-                            .frame(maxWidth: 720, alignment: .topLeading)
-                            .frame(maxWidth: .infinity, alignment: .top)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            content()
+                                .frame(maxWidth: 720, alignment: .topLeading)
+                                .frame(maxWidth: .infinity, alignment: .top)
+                        }
+                        .padding(.top, 20)
+                        .padding(.horizontal, 28)
+                        .padding(.bottom, 36)
                     }
-                    .padding(.top, 20)
-                    .padding(.horizontal, 28)
-                    .padding(.bottom, 36)
+                    // Deep-link scroll: when another screen (e.g. the
+                    // per-model "Edit on Server →" link) requested a
+                    // jump to a named anchor *inside the section we just
+                    // switched to*, scroll there once the inner view has
+                    // had a runloop tick to lay out. The id includes
+                    // both section and anchor so re-requesting the same
+                    // anchor in the same section still fires.
+                    .task(id: ScrollAnchorKey(section: section,
+                                              anchor: services.requestedServerAnchor)) {
+                        guard let anchor = services.requestedServerAnchor,
+                              section == .server else { return }
+                        // One render cycle to let ServerScreen mount its
+                        // SectionHeader with the `.id()` we're targeting.
+                        try? await Task.sleep(nanoseconds: 60_000_000)
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo(anchor.rawValue, anchor: .top)
+                        }
+                        services.requestedServerAnchor = nil
+                    }
                 }
             }
         }
         .background(theme.contentBg)
         .navigationTitle(detailTitle ?? section.title)
     }
+}
+
+/// Composite identity used by `ContentScaffold`'s deep-link scroll
+/// `.task(id:)` so the scroll fires whenever either the section or the
+/// anchor changes — and re-fires if the same anchor is requested twice.
+private struct ScrollAnchorKey: Equatable {
+    let section: AppSection
+    let anchor: ServerAnchor?
 }
 
 #Preview("AppView — light") {
