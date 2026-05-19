@@ -4,8 +4,8 @@
 // Resolution order (first match wins):
 //   1. OMLX_PYTHON_OVERRIDE env var — dev escape hatch.
 //   2. Bundle.main/Contents/Frameworks/cpython-3.11/bin/python3 — production.
-//      Layout matches the venvstacks export tree, which packaging/build.py
-//      copies verbatim into the Swift .app at the --swift-next step.
+//      Layout matches the venvstacks export tree, which
+//      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
 //
 // In the bundled case the spawn environment also sets:
 //   PYTHONHOME = Contents/Frameworks/cpython-3.11

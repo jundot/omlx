@@ -689,26 +689,18 @@ class ModelSettingsManager:
             raise
 
     def list_templates(self) -> list[dict]:
-        """Return user templates. `is_builtin` is always `false` now that
-        the shipped JSON seeds were retired in favor of the client-side
-        preset bundle (`omlx/admin/static/omlx_preset.json`); the field is
-        kept on each entry so existing API consumers don't have to change."""
+        # Shipped JSON seeds were retired in favor of the client-side preset
+        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # surface is user-created. Callers that distinguish presets from
+        # user templates do so via the preset bundle, not an `is_builtin`
+        # flag on this response.
         with self._lock:
-            out: list[dict] = []
-            for t in self._templates.values():
-                user = dict(t)
-                user["is_builtin"] = False
-                out.append(user)
-            return out
+            return [dict(t) for t in self._templates.values()]
 
     def get_template(self, name: str) -> Optional[dict]:
         with self._lock:
             u = self._templates.get(name)
-            if u is None:
-                return None
-            user = dict(u)
-            user["is_builtin"] = False
-            return user
+            return dict(u) if u is not None else None
 
     def save_template(
         self,
@@ -732,9 +724,7 @@ class ModelSettingsManager:
                 "settings": filtered,
             }
             self._save_templates()
-            out = dict(self._templates[name])
-            out["is_builtin"] = False
-            return out
+            return dict(self._templates[name])
 
     def upsert_template(
         self,
@@ -759,9 +749,7 @@ class ModelSettingsManager:
                 "settings": filtered,
             }
             self._save_templates()
-            out = dict(self._templates[name])
-            out["is_builtin"] = False
-            return out
+            return dict(self._templates[name])
 
     def update_template(
         self,
@@ -794,9 +782,7 @@ class ModelSettingsManager:
                 del self._templates[name]
             self._templates[target] = template
             self._save_templates()
-            out = dict(template)
-            out["is_builtin"] = False
-            return out
+            return dict(template)
 
     def delete_template(self, name: str) -> bool:
         with self._lock:

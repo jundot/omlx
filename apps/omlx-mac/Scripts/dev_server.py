@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Tiny HTTP stub used to verify the Swift ServerProcess spawn path.
 
-The real omlx server arrives via the bundled venvstacks runtime
-(packaging/build.py --swift-next). When iterating on the Swift code without
-a full venvstacks build, point ServerProcess at this script via:
+The real omlx server arrives via the bundled venvstacks runtime that
+`apps/omlx-mac/Scripts/build.sh` embeds into the .app. When iterating on
+the Swift code without a full venvstacks build, point ServerProcess at
+this script via:
 
     OMLX_PYTHON_OVERRIDE=/usr/bin/python3 \\
     OMLX_DEV_SERVER_SCRIPT=$(pwd)/apps/omlx-mac/Scripts/dev_server.py \\
