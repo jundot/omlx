@@ -13,14 +13,22 @@
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --no-sync  # skip uv sync + overlay
+#                                                       (use donor layer as-is)
 #
 # Env overrides:
 #   OMLX_DONOR_APP=/path/to/oMLX.app    # provider of cpython + mlx layers
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
+#   UV_BIN=/path/to/uv                  # explicit uv binary (default: PATH lookup)
 #
 # The donor app provides cpython-3.11 + framework-mlx-framework. The omlx
 # package itself is copied from this checkout's `omlx/` so local Python
 # changes are reflected in the bundle.
+#
+# Pyproject pins newer than the donor's frozen layer (e.g. mlx-vlm @ f96138e)
+# are reconciled by syncing an isolated Python 3.11 venv at $BUILD_DIR/venv
+# and overlaying selected packages onto framework-mlx-framework. See the
+# OVERLAY_PKGS list below.
 
 set -euo pipefail
 
@@ -32,10 +40,12 @@ case "$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 BARE=0
+NO_SYNC=0
 shift || true
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --no-sync) NO_SYNC=1 ;;
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -121,6 +131,69 @@ ok "  + framework-mlx-framework"
 if [ -d "$DONOR_LAYERS/__venvstacks__" ]; then
     ditto "$DONOR_LAYERS/__venvstacks__" "$FRAMEWORKS_DIR/__venvstacks__"
     ok "  + __venvstacks__ metadata"
+fi
+
+# --- Overlay diverging packages from a fresh uv-synced 3.11 venv ---------
+#
+# The donor app's framework-mlx-framework is frozen to whatever was current
+# at its build time. When pyproject.toml later moves a dependency forward
+# (e.g. `mlx-vlm @ f96138e` for the new `mlx_vlm.speculative.utils`
+# module), the donor's site-packages goes stale and the bundled server
+# fails to import at startup.
+#
+# Resolve this by syncing an isolated Python 3.11 venv under $BUILD_DIR
+# (kept separate from the worktree's own .venv, which may target a newer
+# Python) and overlaying the listed packages into the mlx framework layer.
+# Add package names to OVERLAY_PKGS as more pins drift from the donor.
+
+if [ "$NO_SYNC" -eq 0 ]; then
+    UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+    if [ -z "$UV_BIN" ]; then
+        for candidate in /opt/homebrew/bin/uv "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
+            if [ -x "$candidate" ]; then UV_BIN="$candidate"; break; fi
+        done
+    fi
+    [ -n "$UV_BIN" ] || die "uv not found — install via Homebrew (brew install uv), set UV_BIN, or pass --no-sync."
+
+    BUNDLE_VENV="$BUILD_DIR/venv"
+    log "Syncing bundle venv at $BUNDLE_VENV (Python 3.11)…"
+    UV_PROJECT_ENVIRONMENT="$BUNDLE_VENV" "$UV_BIN" sync \
+        --python 3.11 \
+        --project "$REPO_ROOT" \
+        >"$BUILD_DIR/uv-sync.log" 2>&1 \
+        || { tail -40 "$BUILD_DIR/uv-sync.log" >&2; die "uv sync failed; full log: $BUILD_DIR/uv-sync.log"; }
+
+    VENV_SITE="$BUNDLE_VENV/lib/python3.11/site-packages"
+    [ -d "$VENV_SITE" ] || die "Expected $VENV_SITE after uv sync — check $BUILD_DIR/uv-sync.log."
+
+    OVERLAY_PKGS=("mlx_vlm")
+    MLX_LAYER_SITE="$FRAMEWORKS_DIR/framework-mlx-framework/lib/python3.11/site-packages"
+
+    for pkg in "${OVERLAY_PKGS[@]}"; do
+        SRC="$VENV_SITE/$pkg"
+        if [ ! -d "$SRC" ]; then
+            warn "  skipped overlay: $pkg not present in $VENV_SITE"
+            continue
+        fi
+        log "Overlaying $pkg from bundle venv → mlx framework layer…"
+        rm -rf "$MLX_LAYER_SITE/$pkg"
+        rsync -a --exclude='__pycache__' --exclude='*.pyc' "$SRC/" "$MLX_LAYER_SITE/$pkg/"
+        # Drop stale donor dist-info for the package (both dash + underscore
+        # variants) and copy the freshly synced one so pip metadata stays
+        # consistent with the overlay.
+        pkg_dash="${pkg//_/-}"
+        find "$MLX_LAYER_SITE" -maxdepth 1 \
+            \( -name "${pkg}-*.dist-info" -o -name "${pkg_dash}-*.dist-info" \) \
+            -exec rm -rf {} + 2>/dev/null || true
+        find "$VENV_SITE" -maxdepth 1 \
+            \( -name "${pkg}-*.dist-info" -o -name "${pkg_dash}-*.dist-info" \) \
+            -print | while read -r dist; do
+                rsync -a "$dist/" "$MLX_LAYER_SITE/$(basename "$dist")/"
+            done
+        ok "  + $pkg (overlaid from bundle venv)"
+    done
+else
+    warn "--no-sync set: donor framework-mlx-framework used as-is; newer pins won't apply."
 fi
 
 # --- Embed omlx package ---------------------------------------------------
