@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields as dataclass_fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal

@@ -18,6 +18,7 @@ class IDPrefix(str, Enum):
     RERANK = "rerank"
     RESPONSE = "resp"
     FUNCTION_CALL = "fc"
+    REASONING = "rs"
 
 
 def generate_id(prefix: IDPrefix, length: int = 8) -> str:
@@ -37,6 +38,8 @@ def generate_id(prefix: IDPrefix, length: int = 8) -> str:
         return f"resp_{uuid.uuid4().hex[:24]}"
     if prefix == IDPrefix.FUNCTION_CALL:
         return f"fc_{uuid.uuid4().hex[:8]}"
+    if prefix == IDPrefix.REASONING:
+        return f"rs_{uuid.uuid4().hex[:24]}"
     return f"{prefix.value}-{uuid.uuid4().hex[:length]}"
 
 

@@ -28,6 +28,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "presence_penalty",
     "force_sampling",
     "enable_thinking",
+    "preserve_thinking",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
     "preserve_thinking",
