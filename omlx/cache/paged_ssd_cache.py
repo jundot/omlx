@@ -668,6 +668,12 @@ class PagedSSDCacheManager(CacheManager):
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
+        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
+        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
+        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
+        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
+        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
+        self._pending_write_buffers: dict[bytes, dict] = {}
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -769,13 +775,19 @@ class PagedSSDCacheManager(CacheManager):
             return False
         metadata = entry["file_metadata"]
 
-        # Add to SSD index now that block is being written to SSD
+        # 1. Buffer first — instant read-back for concurrent loads (CPD K1).
+        #    Must precede _index.add so load_block never sees an index hit
+        #    for a block that has no file and no buffer entry yet.
+        with self._pending_write_hashes_lock:
+            self._pending_write_buffers[block_hash] = entry
+            self._pending_write_hashes.add(block_hash)
+
+        # 2. Index second — makes the block discoverable in has_block/contains.
         if not self._index.contains(block_hash):
             self._enforce_size_limit_for_new_block()
             self._index.add(blk_meta)
 
-        with self._pending_write_hashes_lock:
-            self._pending_write_hashes.add(block_hash)
+        # 3. Queue third — enqueue for background writer.
         try:
             item = (block_hash, tensors_raw, metadata, file_path)
             if blocking:
@@ -795,6 +807,7 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.discard(block_hash)
+                self._pending_write_buffers.pop(block_hash, None)
             return False
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
@@ -804,6 +817,11 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache.move_to_end(block_hash)
                 return self._hot_cache[block_hash]
             return None
+
+    def _pending_write_buffer_get(self, block_hash: bytes) -> dict | None:
+        """Get entry from pending-write buffer. Returns None on miss."""
+        with self._pending_write_hashes_lock:
+            return self._pending_write_buffers.get(block_hash)
 
     def _hot_cache_remove(self, block_hash: bytes) -> None:
         """Remove entry from hot cache if present."""
@@ -1063,6 +1081,7 @@ class PagedSSDCacheManager(CacheManager):
                 # Remove from pending write tracking
                 with self._pending_write_hashes_lock:
                     self._pending_write_hashes.discard(block_hash)
+                    self._pending_write_buffers.pop(block_hash, None)
                 # When hot cache is disabled, remove temporary read buffer entry
                 if not self._hot_cache_enabled:
                     self._hot_cache_remove(block_hash)
@@ -1632,6 +1651,29 @@ class PagedSSDCacheManager(CacheManager):
                 logger.debug(f"Loaded block from hot cache: {block_hash.hex()[:16]}...")
             return cache_data
 
+        # Check pending-write buffer (evicted from hot cache, SSD write in progress)
+        entry = self._pending_write_buffer_get(block_hash)
+        if entry is not None:
+            arrays = entry.get("arrays") or self._arrays_from_tensors_raw(
+                entry["tensors_raw"]
+            )
+            cache_data = self._reconstruct_cache_data(
+                arrays,
+                entry["file_metadata"],
+                entry["num_layers"],
+                entry["layer_cache_types"],
+            )
+            if cache_data is not None:
+                self._index.touch(block_hash)
+                self._stats["loads"] += 1
+                self._stats["hits"] += 1
+                self._stats["hot_cache_hits"] += 1
+                logger.debug(
+                    f"Loaded block from pending write buffer: "
+                    f"{block_hash.hex()[:16]}..."
+                )
+            return cache_data
+
         # Check index
         metadata = self._index.get(block_hash)
         if metadata is None:
@@ -1775,6 +1817,40 @@ class PagedSSDCacheManager(CacheManager):
             )
             return cache_data, metadata_dict
 
+        # Check pending-write buffer (evicted from hot cache, SSD write in progress)
+        entry = self._pending_write_buffer_get(block_hash)
+        if entry is not None:
+            blk_meta = entry["block_metadata"]
+            arrays = entry.get("arrays") or self._arrays_from_tensors_raw(
+                entry["tensors_raw"]
+            )
+            cache_data = self._reconstruct_cache_data(
+                arrays,
+                entry["file_metadata"],
+                entry["num_layers"],
+                entry["layer_cache_types"],
+            )
+            if cache_data is None:
+                return None, None
+
+            metadata_dict = {
+                "num_layers": entry["num_layers"],
+                "token_count": blk_meta.token_count,
+                "model_name": blk_meta.model_name,
+                "layer_cache_types": entry["layer_cache_types"],
+                "layer_meta_states": blk_meta.layer_meta_states,
+            }
+
+            self._index.touch(block_hash)
+            self._stats["loads"] += 1
+            self._stats["hits"] += 1
+            self._stats["hot_cache_hits"] += 1
+            logger.debug(
+                f"Loaded block with metadata from pending write buffer: "
+                f"{block_hash.hex()[:16]}..."
+            )
+            return cache_data, metadata_dict
+
         # Check index
         block_metadata = self._index.get(block_hash)
         if block_metadata is None:
@@ -1885,19 +1961,25 @@ class PagedSSDCacheManager(CacheManager):
 
     def has_block(self, block_hash: bytes) -> bool:
         """
-        Check if a block exists in cache (hot cache or SSD storage).
+        Check if a block exists in cache (hot cache, pending writes, or SSD storage).
 
         Args:
             block_hash: Content hash for the block.
 
         Returns:
-            True if block exists in hot cache or SSD index.
+            True if block exists in hot cache, pending write buffer, or SSD index.
         """
         if self._index.contains(block_hash):
             return True
         # Block may have been evicted from SSD index but still in hot cache
         with self._hot_cache_lock:
-            return block_hash in self._hot_cache
+            if block_hash in self._hot_cache:
+                return True
+        # Block may be evicted from hot cache and awaiting SSD write
+        with self._pending_write_hashes_lock:
+            if block_hash in self._pending_write_buffers:
+                return True
+        return False
 
     def delete_block(self, block_hash: bytes) -> bool:
         """
@@ -1912,6 +1994,11 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             # Also remove from hot cache
             self._hot_cache_remove(block_hash)
+
+            # Also remove from pending write buffer
+            with self._pending_write_hashes_lock:
+                self._pending_write_buffers.pop(block_hash, None)
+                self._pending_write_hashes.discard(block_hash)
 
             metadata = self._index.remove(block_hash)
             if metadata is None:
@@ -2223,10 +2310,13 @@ class PagedSSDCacheManager(CacheManager):
                     f"SSD cache writer thread did not stop within {timeout}s"
                 )
 
-        # Clear hot cache
+        # Clear hot cache and pending write buffer
         with self._hot_cache_lock:
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
+        with self._pending_write_hashes_lock:
+            self._pending_write_buffers.clear()
+            self._pending_write_hashes.clear()
 
         logger.debug("PagedSSDCacheManager closed")
 
