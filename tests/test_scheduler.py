@@ -1700,6 +1700,40 @@ class TestCacheCorruptionRecovery:
         assert "req-orphan" in failed_ids
         assert "req-orphan" not in scheduler.requests
 
+    def test_fail_all_requests_excludes_async_cleanup_in_flight(
+        self, mock_model, mock_tokenizer
+    ):
+        """Finished requests awaiting async cache-store cleanup must not be failed.
+
+        ``_cleanup_finished`` keeps a finished request in ``self.requests``
+        and registers its store future in ``_inflight_store_futures`` until
+        ``_drain_pending_async_removes`` finalizes the cleanup. That request
+        has already emitted ``finished=True`` to its collector; if
+        ``fail_all_requests`` runs during this window, appending an error
+        output via the orphan sweep would override the success for
+        non-streaming ``generate()`` (engine_core returns the last queued
+        output). The sweep must skip ids present in
+        ``_inflight_store_futures`` and leave them for the async drain.
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        finished_pending_cleanup = Request(
+            request_id="req-async-cleanup",
+            prompt="finished",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[8, 9],
+            num_prompt_tokens=2,
+        )
+        # Simulate _cleanup_finished's terminal state: request lives in
+        # self.requests + _inflight_store_futures, absent from all three queues.
+        scheduler.requests[finished_pending_cleanup.request_id] = finished_pending_cleanup
+        scheduler._inflight_store_futures[finished_pending_cleanup.request_id] = MagicMock()
+
+        failed_ids = scheduler.fail_all_requests()
+
+        assert "req-async-cleanup" not in failed_ids
+        assert "req-async-cleanup" in scheduler.requests
+        assert "req-async-cleanup" in scheduler._inflight_store_futures
+
 
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
