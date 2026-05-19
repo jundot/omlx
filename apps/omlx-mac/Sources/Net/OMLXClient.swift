@@ -218,6 +218,66 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    // MARK: - ModelScope (Phase 2)
+    //
+    // 1:1 mirror of the /hf/* surface above, pointed at the parallel
+    // pipeline implemented by `omlx/admin/ms_downloader.py`. Task / model
+    // shapes are identical to HF (`MSTaskDTO = HFTaskDTO` typealias), so
+    // most call sites can read the response with the existing types.
+
+    /// GET /ms/status — returns `{available: bool}`. Use to gate the MS
+    /// branch of the Downloads UI so we don't render a flow that will only
+    /// ever 503 when the modelscope Python SDK isn't installed in the
+    /// bundle's venv layer.
+    func getMSStatus() async throws -> MSStatusResponse {
+        try await get(AdminAPI.msStatus)
+    }
+
+    func listMSTasks() async throws -> MSTaskListResponse {
+        try await get(AdminAPI.msTasks)
+    }
+
+    func startMSDownload(modelId: String, msToken: String = "") async throws -> StartMSDownloadResponse {
+        try await post(AdminAPI.msDownload, body: StartMSDownloadRequest(
+            modelId: modelId, msToken: msToken
+        ))
+    }
+
+    @discardableResult
+    func cancelMSDownload(taskId: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.msCancel(taskId))
+    }
+
+    @discardableResult
+    func retryMSDownload(taskId: String) async throws -> StartMSDownloadResponse {
+        try await postEmpty(AdminAPI.msRetry(taskId))
+    }
+
+    @discardableResult
+    func removeMSTask(taskId: String) async throws -> SimpleStatusResponse {
+        try await delete(AdminAPI.msTask(taskId))
+    }
+
+    func getMSRecommended(mlxOnly: Bool = true) async throws -> MSRecommendedResponse {
+        try await get(AdminAPI.msRecommended, query: [
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ])
+    }
+
+    func searchMSModels(
+        query: String,
+        sort: String = "trending",
+        limit: Int = 20,
+        mlxOnly: Bool = true
+    ) async throws -> MSSearchResponse {
+        try await get(AdminAPI.msSearch, query: [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ])
+    }
+
     /// Delete a downloaded model directory from disk. The server unloads
     /// the engine first if it's currently loaded, then rmtree's the model
     /// directory and refreshes the pool. 404 if the name doesn't resolve.

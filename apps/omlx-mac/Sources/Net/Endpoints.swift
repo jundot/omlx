@@ -44,6 +44,17 @@ enum AdminAPI {
     static let hfSearch        = "\(prefix)/hf/search"
     static func hfModel(_ name: String) -> String { "\(prefix)/hf/models/\(name)" }
 
+    // Phase 2 — ModelScope downloader (mirrors the /hf/* surface 1:1, just
+    // pointed at the parallel pipeline backed by ms_downloader.py).
+    static let msStatus        = "\(prefix)/ms/status"
+    static let msTasks         = "\(prefix)/ms/tasks"
+    static let msDownload      = "\(prefix)/ms/download"
+    static func msCancel(_ taskId: String) -> String { "\(prefix)/ms/cancel/\(taskId)" }
+    static func msRetry(_ taskId: String) -> String  { "\(prefix)/ms/retry/\(taskId)" }
+    static func msTask(_ taskId: String) -> String   { "\(prefix)/ms/task/\(taskId)" }
+    static let msRecommended   = "\(prefix)/ms/recommended"
+    static let msSearch        = "\(prefix)/ms/search"
+
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
     static let subKeys         = "\(prefix)/sub-keys"

@@ -2,9 +2,27 @@
 //
 // Wires the HF downloader endpoints (POST /admin/api/hf/download,
 // GET /admin/api/hf/tasks at 1 Hz, cancel / retry / delete, /hf/recommended).
-// ModelScope is browser-only (plan §1) and not surfaced here.
+//
+// Phase 2 — adds a source selector (HF / ModelScope) at the top. The MS
+// branch mirrors the HF flow 1:1 against /admin/api/ms/*. Switching the
+// source swaps the form + mirror editor; the task list, recent tasks, and
+// suggested-models sections rebind to whichever source is active (their
+// underlying DTOs are identical — see MSTaskDTO.swift).
 
 import SwiftUI
+
+/// Active downloader source. Mirrors the HTML admin's `downloaderSource`
+/// state at `omlx/admin/static/js/dashboard.js:266`.
+enum DownloadSource: String, CaseIterable, Hashable, Sendable {
+    case hf, ms
+
+    var label: String {
+        switch self {
+        case .hf: return "Hugging Face"
+        case .ms: return "ModelScope"
+        }
+    }
+}
 
 struct DownloadsScreen: View {
     @EnvironmentObject private var services: AppServices
@@ -12,25 +30,53 @@ struct DownloadsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            AddFromHFSection(
-                repoText: $vm.repoText,
-                isStarting: vm.isStarting,
-                mirrorHost: vm.mirrorHost,
-                mirrorIsCustom: vm.mirrorIsCustom,
-                isEditingMirror: $vm.isEditingMirror,
-                mirrorDraft: $vm.mirrorDraft,
-                mirrorBusy: vm.mirrorBusy,
-                searchResults: vm.searchResults,
-                searchLoading: vm.searchLoading,
-                searchDismissed: vm.searchDismissed,
-                onSubmit: { vm.startDownload(client: services.client) },
-                onSaveMirror: { vm.saveMirror(client: services.client) },
-                onResetMirror: { vm.resetMirror(client: services.client) },
-                onPickResult: { vm.pickSearchResult($0) },
-                onDismissSearch: { vm.dismissSearch() }
+            SourceSwitcher(
+                source: $vm.source,
+                msAvailable: vm.msAvailable
             )
-            .onChange(of: vm.repoText) { _, newValue in
-                vm.updateSearch(query: newValue, client: services.client)
+
+            if vm.source == .hf {
+                AddFromHFSection(
+                    repoText: $vm.repoText,
+                    isStarting: vm.isStarting,
+                    mirrorHost: vm.mirrorHost,
+                    mirrorIsCustom: vm.mirrorIsCustom,
+                    isEditingMirror: $vm.isEditingMirror,
+                    mirrorDraft: $vm.mirrorDraft,
+                    mirrorBusy: vm.mirrorBusy,
+                    searchResults: vm.searchResults,
+                    searchLoading: vm.searchLoading,
+                    searchDismissed: vm.searchDismissed,
+                    onSubmit: { vm.startDownload(client: services.client) },
+                    onSaveMirror: { vm.saveMirror(client: services.client) },
+                    onResetMirror: { vm.resetMirror(client: services.client) },
+                    onPickResult: { vm.pickSearchResult($0) },
+                    onDismissSearch: { vm.dismissSearch() }
+                )
+                .onChange(of: vm.repoText) { _, newValue in
+                    vm.updateSearch(query: newValue, client: services.client)
+                }
+            } else {
+                AddFromMSSection(
+                    repoText: $vm.msRepoText,
+                    isStarting: vm.isStarting,
+                    mirrorHost: vm.msMirrorHost,
+                    mirrorIsCustom: vm.msMirrorIsCustom,
+                    isEditingMirror: $vm.isEditingMsMirror,
+                    mirrorDraft: $vm.msMirrorDraft,
+                    mirrorBusy: vm.msMirrorBusy,
+                    searchResults: vm.msSearchResults,
+                    searchLoading: vm.msSearchLoading,
+                    searchDismissed: vm.msSearchDismissed,
+                    onSubmit: { vm.startDownload(client: services.client) },
+                    onSaveMirror: { vm.saveMsMirror(client: services.client) },
+                    onResetMirror: { vm.resetMsMirror(client: services.client) },
+                    onPickResult: { vm.pickMsSearchResult($0) },
+                    onDismissSearch: { vm.dismissMsSearch() }
+                )
+                .onChange(of: vm.msRepoText) { _, newValue in
+                    vm.updateMsSearch(query: newValue, client: services.client)
+                }
             }
 
             ActiveDownloadsSection(
@@ -63,6 +109,38 @@ struct DownloadsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+    }
+}
+
+// MARK: - Source switcher
+
+/// Segmented HF / ModelScope toggle pinned at the top of Downloads. When
+/// the server's modelscope SDK isn't installed (`/admin/api/ms/status`
+/// returns `available: false`), the MS option is disabled with a tooltip
+/// rather than hidden — so a user looking for it can see why it's not
+/// usable.
+private struct SourceSwitcher: View {
+    @Binding var source: DownloadSource
+    let msAvailable: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Segmented(
+                selection: $source,
+                options: DownloadSource.allCases.map { ($0, $0.label) }
+            )
+            .frame(width: 280)
+            .disabled(!msAvailable)
+            if !msAvailable {
+                Text("ModelScope SDK unavailable in this build")
+                    .font(.omlxText(10.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
     }
 }
 
@@ -173,6 +251,141 @@ private struct AddFromHFSection: View {
             TextInput(
                 text: $mirrorDraft,
                 placeholder: "https://hf-mirror.com  (empty = huggingface.co)",
+                mono: true
+            )
+            .frame(maxWidth: .infinity)
+            .focused($mirrorFocused)
+            .onSubmit { onSaveMirror() }
+            Button("Reset") {
+                mirrorDraft = ""
+                onResetMirror()
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .disabled(mirrorBusy || (!mirrorIsCustom && mirrorDraft.isEmpty))
+            Button("Cancel") {
+                isEditingMirror = false
+                mirrorDraft = ""
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(mirrorBusy)
+            Button("Save") { onSaveMirror() }
+                .buttonStyle(.omlx(.primary, size: .small))
+                .disabled(mirrorBusy)
+        }
+        .onAppear { mirrorFocused = true }
+    }
+}
+
+// MARK: - Add from MS
+
+/// Visual + behavioral parallel of AddFromHFSection for the ModelScope flow.
+/// Keeps the two source forms structurally identical so users moving between
+/// them aren't relearning the affordances — only labels + placeholders change.
+private struct AddFromMSSection: View {
+    @Binding var repoText: String
+    let isStarting: Bool
+    let mirrorHost: String
+    let mirrorIsCustom: Bool
+    @Binding var isEditingMirror: Bool
+    @Binding var mirrorDraft: String
+    let mirrorBusy: Bool
+    let searchResults: [MSModelInfo]
+    let searchLoading: Bool
+    let searchDismissed: Bool
+    let onSubmit: () -> Void
+    let onSaveMirror: () -> Void
+    let onResetMirror: () -> Void
+    let onPickResult: (MSModelInfo) -> Void
+    let onDismissSearch: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+    @FocusState private var mirrorFocused: Bool
+
+    private var showsDropdown: Bool {
+        !searchDismissed && (searchLoading || !searchResults.isEmpty)
+    }
+
+    var body: some View {
+        SectionHeader("Add Model from ModelScope")
+
+        ListGroup {
+            FreeRow(isLast: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        TextInput(
+                            text: $repoText,
+                            placeholder: "mlx-community/Qwen2.5-7B-Instruct-4bit",
+                            mono: true
+                        )
+                        .frame(maxWidth: .infinity)
+                        .onSubmit(onSubmit)
+                        if searchLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(.trailing, 2)
+                        }
+                        Button {
+                            onSubmit()
+                        } label: {
+                            Label("Download", systemImage: "icloud.and.arrow.down")
+                                .labelStyle(.titleAndIcon)
+                        }
+                        .buttonStyle(.omlx(.primary))
+                        .disabled(repoText.isEmpty || isStarting)
+                    }
+                    if showsDropdown {
+                        SearchDropdown(
+                            results: searchResults,
+                            isLoading: searchLoading,
+                            onPick: onPickResult,
+                            onDismiss: onDismissSearch
+                        )
+                    }
+                    if isEditingMirror {
+                        mirrorEditor
+                    } else {
+                        mirrorSummary
+                    }
+                }
+            }
+        }
+    }
+
+    private var mirrorSummary: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "globe")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textTertiary)
+            Text("Mirror:")
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textTertiary)
+            Text(mirrorHost)
+                .font(.omlxMono(11))
+                .foregroundStyle(theme.textSecondary)
+            if mirrorIsCustom {
+                Text("custom")
+                    .font(.omlxText(10, weight: .medium))
+                    .foregroundStyle(theme.blueDot)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(theme.blueDot.opacity(0.12))
+                    .clipShape(Capsule())
+            }
+            Spacer(minLength: 8)
+            Button("Configure mirror…") {
+                mirrorDraft = mirrorIsCustom ? mirrorHost : ""
+                isEditingMirror = true
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .disabled(mirrorBusy)
+        }
+    }
+
+    private var mirrorEditor: some View {
+        HStack(spacing: 8) {
+            TextInput(
+                text: $mirrorDraft,
+                placeholder: "https://modelscope.cn  (empty = ModelScope default)",
                 mono: true
             )
             .frame(maxWidth: .infinity)
@@ -551,13 +764,25 @@ enum SuggestedSort: String, Hashable, CaseIterable {
 
 @MainActor
 final class DownloadsScreenVM: ObservableObject {
+    // MARK: - Active source
+
+    /// Currently selected download source. Drives which form, task list,
+    /// and recommended set the view shows. Switching the source kicks a
+    /// fresh load of that source's tasks + recommended on first activation.
+    @Published var source: DownloadSource = .hf {
+        didSet { sourceDidChange() }
+    }
+
+    /// `true` when the server reports the modelscope SDK is importable. The
+    /// switcher disables the MS option when false so we never start a flow
+    /// that will only ever 503.
+    @Published private(set) var msAvailable: Bool = false
+
+    // MARK: - HF state (pre-existing)
+
     @Published var repoText: String = ""
     @Published private(set) var tasks: [HFTaskDTO] = []
     @Published private(set) var recommended: [HFModelInfo] = []
-    @Published private(set) var isStarting: Bool = false
-    @Published private(set) var recommendedLoading: Bool = false
-    @Published var recommendedSort: SuggestedSort = .downloads
-    @Published var lastError: String?
 
     /// Configured HF mirror endpoint. Empty when using the HF default
     /// (huggingface.co). Loaded once on screen start, kept in sync with
@@ -574,44 +799,80 @@ final class DownloadsScreenVM: ObservableObject {
     @Published private(set) var searchLoading: Bool = false
     @Published var searchDismissed: Bool = false
     private var searchTask: Task<Void, Never>?
-    /// Last query string sent to the server. Used so we don't refetch the
-    /// same query after it's been satisfied (e.g. the user clicked a
-    /// suggestion which set repoText to that exact value).
     private var lastSearchQuery: String = ""
+
+    // MARK: - MS state (Phase 2)
+
+    @Published var msRepoText: String = ""
+    @Published private(set) var msTasks: [MSTaskDTO] = []
+    @Published private(set) var msRecommended: [MSModelInfo] = []
+
+    /// Configured MS mirror endpoint. Empty = ModelScope default
+    /// (modelscope.cn). Kept in sync with PATCH /admin/api/global-settings
+    /// (`ms_endpoint`).
+    @Published private(set) var msMirrorEndpoint: String = ""
+    @Published var isEditingMsMirror: Bool = false
+    @Published var msMirrorDraft: String = ""
+    @Published private(set) var msMirrorBusy: Bool = false
+
+    @Published private(set) var msSearchResults: [MSModelInfo] = []
+    @Published private(set) var msSearchLoading: Bool = false
+    @Published var msSearchDismissed: Bool = false
+    private var msSearchTask: Task<Void, Never>?
+    private var lastMsSearchQuery: String = ""
+
+    // MARK: - Cross-source
+
+    @Published private(set) var isStarting: Bool = false
+    @Published private(set) var recommendedLoading: Bool = false
+    @Published var recommendedSort: SuggestedSort = .downloads
+    @Published var lastError: String?
 
     /// Host the user sees on the Downloads screen. Strips scheme so the
     /// inline label reads like `huggingface.co` / `hf-mirror.com` per design.
-    var mirrorHost: String {
-        let trimmed = mirrorEndpoint.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty { return "huggingface.co" }
-        if let url = URL(string: trimmed), let host = url.host { return host }
-        return trimmed
-    }
-
+    var mirrorHost: String { hostString(mirrorEndpoint, fallback: "huggingface.co") }
     var mirrorIsCustom: Bool {
         !mirrorEndpoint.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    /// Re-sorted view of `recommended`. Always descending; entries missing
-    /// the sort key fall to the bottom so they don't shove valid models out
-    /// of the top 15 the section displays.
+    var msMirrorHost: String { hostString(msMirrorEndpoint, fallback: "modelscope.cn") }
+    var msMirrorIsCustom: Bool {
+        !msMirrorEndpoint.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private func hostString(_ raw: String, fallback: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return fallback }
+        if let url = URL(string: trimmed), let host = url.host { return host }
+        return trimmed
+    }
+
+    /// Re-sorted view of the active source's recommended list. Always
+    /// descending; entries missing the sort key fall to the bottom so
+    /// they don't shove valid models out of the top 15 the section shows.
     var sortedRecommended: [HFModelInfo] {
+        let pool = (source == .hf) ? recommended : msRecommended
         switch recommendedSort {
         case .downloads:
-            return recommended.sorted { ($0.downloads ?? -1) > ($1.downloads ?? -1) }
+            return pool.sorted { ($0.downloads ?? -1) > ($1.downloads ?? -1) }
         case .params:
-            return recommended.sorted { ($0.params ?? -1) > ($1.params ?? -1) }
+            return pool.sorted { ($0.params ?? -1) > ($1.params ?? -1) }
         case .size:
-            return recommended.sorted { ($0.size ?? -1) > ($1.size ?? -1) }
+            return pool.sorted { ($0.size ?? -1) > ($1.size ?? -1) }
         }
     }
 
     private weak var client: OMLXClient?
     private var pollTask: Task<Void, Never>?
-    private var hasLoadedRecommended = false
+    private var hasLoadedHFRecommended = false
+    private var hasLoadedMSRecommended = false
 
-    var activeTasks: [HFTaskDTO]   { tasks.filter { $0.isActive } }
-    var terminalTasks: [HFTaskDTO] { tasks.filter { !$0.isActive } }
+    var activeTasks: [HFTaskDTO] {
+        (source == .hf ? tasks : msTasks).filter { $0.isActive }
+    }
+    var terminalTasks: [HFTaskDTO] {
+        (source == .hf ? tasks : msTasks).filter { !$0.isActive }
+    }
 
     func start(client: OMLXClient) async {
         self.client = client
@@ -623,20 +884,59 @@ final class DownloadsScreenVM: ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        await refreshMirror(client: client)
-        if !hasLoadedRecommended {
-            hasLoadedRecommended = true
-            await loadRecommended(client: client)
+        await refreshMirrors(client: client)
+        await refreshMsAvailability(client: client)
+        await loadActiveRecommendedIfNeeded(client: client)
+    }
+
+    /// Source-switch hook. When the user picks the other source, kick a
+    /// task refresh + lazy recommended load for that source. Mirror state
+    /// already lives in the VM, so the new form's preview values are ready
+    /// instantly.
+    private func sourceDidChange() {
+        guard let client else { return }
+        Task { [weak self] in
+            await self?.refreshTasks()
+            await self?.loadActiveRecommendedIfNeeded(client: client)
         }
     }
 
-    private func refreshMirror(client: OMLXClient) async {
+    private func loadActiveRecommendedIfNeeded(client: OMLXClient) async {
+        switch source {
+        case .hf:
+            if !hasLoadedHFRecommended {
+                hasLoadedHFRecommended = true
+                await loadRecommended(client: client)
+            }
+        case .ms:
+            if !hasLoadedMSRecommended {
+                hasLoadedMSRecommended = true
+                await loadRecommended(client: client)
+            }
+        }
+    }
+
+    private func refreshMirrors(client: OMLXClient) async {
+        // Load both mirror endpoints once so the inactive source's form
+        // reads correctly the moment the user switches.
         do {
             let settings = try await client.getGlobalSettings()
             self.mirrorEndpoint = settings.huggingface?.endpoint ?? ""
+            self.msMirrorEndpoint = settings.modelscope?.endpoint ?? ""
         } catch {
-            // Non-fatal — leave mirror as default and don't clobber an
-            // existing error from a download call.
+            // Non-fatal — leave mirrors as defaults.
+        }
+    }
+
+    private func refreshMsAvailability(client: OMLXClient) async {
+        do {
+            let resp = try await client.getMSStatus()
+            self.msAvailable = resp.available
+            if !resp.available && source == .ms {
+                self.source = .hf
+            }
+        } catch {
+            self.msAvailable = false
         }
     }
 
@@ -664,6 +964,31 @@ final class DownloadsScreenVM: ObservableObject {
     func resetMirror(client: OMLXClient) {
         mirrorDraft = ""
         saveMirror(client: client)
+    }
+
+    func saveMsMirror(client: OMLXClient) {
+        let draft = msMirrorDraft.trimmingCharacters(in: .whitespaces)
+        Task { [weak self] in
+            guard let self else { return }
+            self.msMirrorBusy = true
+            defer { Task { @MainActor [weak self] in self?.msMirrorBusy = false } }
+            do {
+                _ = try await client.updateGlobalSettings(
+                    GlobalSettingsPatch(msEndpoint: draft)
+                )
+                self.msMirrorEndpoint = draft
+                self.isEditingMsMirror = false
+                self.msMirrorDraft = ""
+                self.lastError = nil
+            } catch {
+                self.lastError = self.describe(error)
+            }
+        }
+    }
+
+    func resetMsMirror(client: OMLXClient) {
+        msMirrorDraft = ""
+        saveMsMirror(client: client)
     }
 
     // MARK: Autocomplete
@@ -727,20 +1052,83 @@ final class DownloadsScreenVM: ObservableObject {
         searchDismissed = true
     }
 
+    // MARK: - MS autocomplete
+
+    /// Mirror of `updateSearch` for the ModelScope source. Same debounce,
+    /// same min-length, same cancel semantics — only the endpoint changes.
+    func updateMsSearch(query rawQuery: String, client: OMLXClient) {
+        let q = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        msSearchTask?.cancel()
+        if q.isEmpty {
+            msSearchResults = []
+            msSearchLoading = false
+            msSearchDismissed = false
+            lastMsSearchQuery = ""
+            return
+        }
+        if q == lastMsSearchQuery && !msSearchResults.isEmpty { return }
+        if q.count < 2 { return }
+        msSearchDismissed = false
+        msSearchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { return }
+            guard let self else { return }
+            self.msSearchLoading = true
+            defer { Task { @MainActor [weak self] in self?.msSearchLoading = false } }
+            do {
+                let resp = try await client.searchMSModels(query: q, limit: 20)
+                if Task.isCancelled { return }
+                self.msSearchResults = resp.models
+                self.lastMsSearchQuery = q
+            } catch is CancellationError {
+                return
+            } catch {
+                // Soft fail — keep input usable for direct repo-id paste.
+                self.msSearchResults = []
+            }
+        }
+    }
+
+    func pickMsSearchResult(_ model: MSModelInfo) {
+        msRepoText = model.repoId
+        lastMsSearchQuery = model.repoId
+        msSearchResults = []
+        msSearchDismissed = true
+    }
+
+    func dismissMsSearch() {
+        msSearchTask?.cancel()
+        msSearchResults = []
+        msSearchDismissed = true
+    }
+
     func stop() {
         pollTask?.cancel()
         pollTask = nil
     }
 
+    // MARK: - Source-routed CRUD
+
+    /// Starts a download against the active source. `repo` lets the
+    /// suggested-models grid pass a repo id without having to first stuff
+    /// it into the input box.
     func startDownload(repo: String? = nil, client: OMLXClient) {
-        let target = (repo ?? repoText).trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = (repo ?? (source == .hf ? repoText : msRepoText))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return }
         isStarting = true
+        let activeSource = source
         Task { [weak self] in
             defer { Task { @MainActor in self?.isStarting = false } }
             do {
-                _ = try await client.startHFDownload(repoId: target)
-                if repo == nil { self?.repoText = "" }
+                switch activeSource {
+                case .hf:
+                    _ = try await client.startHFDownload(repoId: target)
+                    if repo == nil { self?.repoText = "" }
+                case .ms:
+                    _ = try await client.startMSDownload(modelId: target)
+                    if repo == nil { self?.msRepoText = "" }
+                }
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
@@ -750,9 +1138,13 @@ final class DownloadsScreenVM: ObservableObject {
     }
 
     func cancel(taskId: String, client: OMLXClient) {
+        let activeSource = source
         Task { [weak self] in
             do {
-                _ = try await client.cancelHFDownload(taskId: taskId)
+                switch activeSource {
+                case .hf: _ = try await client.cancelHFDownload(taskId: taskId)
+                case .ms: _ = try await client.cancelMSDownload(taskId: taskId)
+                }
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
@@ -762,9 +1154,13 @@ final class DownloadsScreenVM: ObservableObject {
     }
 
     func retry(taskId: String, client: OMLXClient) {
+        let activeSource = source
         Task { [weak self] in
             do {
-                _ = try await client.retryHFDownload(taskId: taskId)
+                switch activeSource {
+                case .hf: _ = try await client.retryHFDownload(taskId: taskId)
+                case .ms: _ = try await client.retryMSDownload(taskId: taskId)
+                }
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
@@ -774,9 +1170,13 @@ final class DownloadsScreenVM: ObservableObject {
     }
 
     func remove(taskId: String, client: OMLXClient) {
+        let activeSource = source
         Task { [weak self] in
             do {
-                _ = try await client.removeHFTask(taskId: taskId)
+                switch activeSource {
+                case .hf: _ = try await client.removeHFTask(taskId: taskId)
+                case .ms: _ = try await client.removeMSTask(taskId: taskId)
+                }
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
@@ -789,28 +1189,40 @@ final class DownloadsScreenVM: ObservableObject {
         self.recommendedLoading = true
         defer { self.recommendedLoading = false }
         do {
-            let resp = try await client.getHFRecommended()
             // Trending-first, then popular, deduped by repoId. Mirrors how
-            // the original dashboard surfaces both lists side-by-side; the
-            // Swift screen renders one combined feed.
-            var seen = Set<String>()
-            var merged: [HFModelInfo] = []
-            for m in resp.trending + resp.popular where seen.insert(m.repoId).inserted {
-                merged.append(m)
+            // the original dashboard surfaces both lists side-by-side.
+            switch source {
+            case .hf:
+                let resp = try await client.getHFRecommended()
+                self.recommended = Self.merge(trending: resp.trending, popular: resp.popular)
+            case .ms:
+                let resp = try await client.getMSRecommended()
+                self.msRecommended = Self.merge(trending: resp.trending, popular: resp.popular)
             }
-            self.recommended = merged
             self.lastError = nil
         } catch {
-            // 502/504 are common (HF unreachable, dev offline). Surface but
-            // keep UI usable.
+            // 502/504 are common (mirror unreachable, dev offline). Surface
+            // but keep UI usable.
             self.lastError = describe(error)
         }
+    }
+
+    private static func merge(trending: [HFModelInfo], popular: [HFModelInfo]) -> [HFModelInfo] {
+        var seen = Set<String>()
+        var merged: [HFModelInfo] = []
+        for m in trending + popular where seen.insert(m.repoId).inserted {
+            merged.append(m)
+        }
+        return merged
     }
 
     private func refreshTasks() async {
         guard let client else { return }
         do {
-            self.tasks = try await client.listHFTasks().tasks
+            switch source {
+            case .hf: self.tasks   = try await client.listHFTasks().tasks
+            case .ms: self.msTasks = try await client.listMSTasks().tasks
+            }
             self.lastError = nil
         } catch {
             self.lastError = describe(error)
