@@ -106,19 +106,6 @@ final class OMLXClient: ObservableObject {
         return try await get(AdminAPI.logs, query: q)
     }
 
-    /// Delete rotated log files. With `file == nil`, wipes every rotated
-    /// `server.log.YYYY-MM-DD` but keeps the live `server.log`. With a
-    /// specific name, deletes only that file. Server refuses to delete
-    /// `server.log` itself.
-    @discardableResult
-    func deleteLogs(file: String? = nil) async throws -> DeleteLogsResponse {
-        var q: [URLQueryItem] = []
-        if let file, !file.isEmpty {
-            q.append(URLQueryItem(name: "file", value: file))
-        }
-        return try await deleteQ(AdminAPI.logs, query: q)
-    }
-
     // PR 8 — Models / Profiles / HF
 
     func listModels() async throws -> ListModelsResponse {

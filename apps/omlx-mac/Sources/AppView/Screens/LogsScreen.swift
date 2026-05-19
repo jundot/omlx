@@ -34,25 +34,7 @@ struct LogsScreen: View {
                     Button("Copy") { vm.copyToPasteboard() }
                         .buttonStyle(.omlx(.normal, size: .small))
                         .disabled(vm.lines == 0 || vm.logText.isEmpty)
-                    if vm.hasRotatedFiles {
-                        Button("Clear History") { vm.showClearConfirm = true }
-                            .buttonStyle(.omlx(.normal, size: .small))
-                            .disabled(vm.isClearing)
-                            .help("Delete all rotated log files (server.log stays)")
-                    }
                 }
-            }
-            .confirmationDialog(
-                "Delete all rotated log files?",
-                isPresented: $vm.showClearConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Delete \(vm.rotatedFileCount) file\(vm.rotatedFileCount == 1 ? "" : "s")", role: .destructive) {
-                    Task { await vm.clearHistory(client: services.client) }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Removes every rotated log file (server.log.YYYY-MM-DD). The active server.log is kept.")
             }
 
             if vm.availableFiles.count > 1 {
@@ -214,18 +196,6 @@ final class LogsScreenVM: ObservableObject {
     @Published private(set) var totalLines: Int = 0
     @Published private(set) var refreshKey: Int = 0
 
-    /// Drives the "Delete all rotated log files?" confirmation. Bound to
-    /// the .confirmationDialog isPresented arg.
-    @Published var showClearConfirm: Bool = false
-    @Published private(set) var isClearing: Bool = false
-
-    /// True when there's at least one rotated file (server.log.YYYY-MM-DD)
-    /// to delete. The active server.log isn't counted.
-    var hasRotatedFiles: Bool { rotatedFileCount > 0 }
-    var rotatedFileCount: Int {
-        availableFiles.filter { $0 != "server.log" }.count
-    }
-
     private weak var client: OMLXClient?
     private var pollTask: Task<Void, Never>?
 
@@ -259,28 +229,6 @@ final class LogsScreenVM: ObservableObject {
 
     func reload() async {
         await tick()
-    }
-
-    /// Wipe every rotated log file. The server keeps `server.log` untouched
-    /// (deleting it would silently truncate the live tail because the
-    /// process holds an open handle). After the delete settles we refresh
-    /// so the file list and tail content reflect the new state.
-    func clearHistory(client: OMLXClient) async {
-        isClearing = true
-        defer { isClearing = false }
-        do {
-            let resp = try await client.deleteLogs(file: nil)
-            // If the user was viewing a rotated file, drop them back to
-            // server.log — the one they were on no longer exists.
-            if selectedFile != "server.log",
-               resp.deleted.contains(selectedFile) {
-                selectedFile = "server.log"
-            }
-            await tick()
-            lastError = nil
-        } catch {
-            lastError = describe(error)
-        }
     }
 
     func bumpRefreshKey() {
