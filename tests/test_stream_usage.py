@@ -139,6 +139,48 @@ class TestUsageChunkFormat:
         assert data["usage"]["generation_tokens_per_second"] == 36.23
         assert "model_load_duration" not in data["usage"]
 
+    def test_non_streaming_usage_only_total_time(self):
+        """Non-streaming responses know elapsed but not TTFT/decode split.
+
+        Usage should serialize total_time and drop fields that would require
+        per-token instrumentation (TTFT, prompt_eval_duration, generation_duration,
+        prompt_tokens_per_second, generation_tokens_per_second).
+        """
+        usage = Usage(
+            prompt_tokens=18,
+            completion_tokens=6,
+            total_tokens=24,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+            total_time=0.43,
+        )
+        dumped = json.loads(usage.model_dump_json(exclude_none=True))
+        assert dumped["total_time"] == 0.43
+        assert dumped["prompt_tokens"] == 18
+        assert dumped["completion_tokens"] == 6
+        for absent in (
+            "time_to_first_token",
+            "prompt_eval_duration",
+            "generation_duration",
+            "prompt_tokens_per_second",
+            "generation_tokens_per_second",
+            "model_load_duration",
+        ):
+            assert absent not in dumped, f"{absent} should be excluded when None"
+
+    def test_non_streaming_usage_with_model_load(self):
+        """model_load_duration appears only when > 1.0s (matches streaming gate)."""
+        usage = Usage(
+            prompt_tokens=18,
+            completion_tokens=6,
+            total_tokens=24,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+            model_load_duration=12.34,
+            total_time=15.67,
+        )
+        dumped = json.loads(usage.model_dump_json(exclude_none=True))
+        assert dumped["model_load_duration"] == 12.34
+        assert dumped["total_time"] == 15.67
+
     def test_usage_chunk_with_all_fields(self):
         chunk = ChatCompletionChunk(
             id="chatcmpl-test",
