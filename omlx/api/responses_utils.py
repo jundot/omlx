@@ -51,15 +51,22 @@ def _flush_pending_tool_calls(
     messages: List[Dict[str, Any]],
     pending: List[Dict[str, Any]],
     min_merge_index: int = 0,
-) -> None:
+    pending_reasoning: str = "",
+) -> str:
     """Flush accumulated tool calls into messages.
 
     If the last message is an assistant message without tool_calls, merge
     into it (avoids duplicate assistant turns that confuse chat templates).
     Otherwise create a new assistant message.
+
+    When ``pending_reasoning`` is set, attach it as ``reasoning_content``
+    on the synthesized assistant message so reasoning round-trips even
+    when the spec sequence is reasoning → function_call → output (no
+    intervening message item). Returns the passthrough reasoning when
+    no tool calls were flushed, or "" when reasoning was consumed.
     """
     if not pending:
-        return
+        return pending_reasoning
     if (
         messages
         and len(messages) - 1 >= min_merge_index
@@ -67,9 +74,15 @@ def _flush_pending_tool_calls(
         and "tool_calls" not in messages[-1]
     ):
         messages[-1]["tool_calls"] = list(pending)
+        if pending_reasoning:
+            messages[-1]["reasoning_content"] = pending_reasoning
     else:
-        messages.append({"role": "assistant", "tool_calls": list(pending)})
+        msg: Dict[str, Any] = {"role": "assistant", "tool_calls": list(pending)}
+        if pending_reasoning:
+            msg["reasoning_content"] = pending_reasoning
+        messages.append(msg)
     pending.clear()
+    return ""
 
 
 def _consolidate_system_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -149,9 +162,14 @@ def convert_responses_input_to_messages(
             item_type = "message"
 
         if item_type == "message":
-            # Flush pending tool calls before a new message
-            _flush_pending_tool_calls(
-                messages, pending_tool_calls, min_merge_index=current_message_start
+            # Flush pending tool calls before a new message. Reasoning
+            # passes through when no tool calls were flushed so it lands
+            # on this message instead.
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                min_merge_index=current_message_start,
+                pending_reasoning=pending_reasoning,
             )
 
             role = item.role or "user"
@@ -228,9 +246,13 @@ def convert_responses_input_to_messages(
             })
 
         elif item.type == "function_call_output":
-            # Flush pending tool calls first
-            _flush_pending_tool_calls(
-                messages, pending_tool_calls, min_merge_index=current_message_start
+            # Flush pending tool calls first. Any pending reasoning gets
+            # attached to the synthesized assistant tool_calls message.
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                min_merge_index=current_message_start,
+                pending_reasoning=pending_reasoning,
             )
 
             messages.append({
@@ -239,9 +261,13 @@ def convert_responses_input_to_messages(
                 "content": item.output or "",
             })
 
-    # Flush remaining pending tool calls
+    # Flush remaining pending tool calls. If reasoning survived without
+    # a trailing message, attach it to the synthesized tool_calls message.
     _flush_pending_tool_calls(
-        messages, pending_tool_calls, min_merge_index=current_message_start
+        messages,
+        pending_tool_calls,
+        min_merge_index=current_message_start,
+        pending_reasoning=pending_reasoning,
     )
 
     # Insert merged system message at position 0
@@ -578,7 +604,11 @@ def normalize_response_output_to_messages(
             parts = [s.get("text", "") for s in summary if isinstance(s, dict)]
             pending_reasoning = "\n".join(p for p in parts if p)
         elif item_type == "message":
-            _flush_pending_tool_calls(messages, pending_tool_calls)
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning=pending_reasoning,
+            )
             content_blocks = item.get("content", [])
             text_parts = []
             for block in content_blocks:
@@ -603,7 +633,11 @@ def normalize_response_output_to_messages(
                 },
             })
 
-    _flush_pending_tool_calls(messages, pending_tool_calls)
+    _flush_pending_tool_calls(
+        messages,
+        pending_tool_calls,
+        pending_reasoning=pending_reasoning,
+    )
     return _consolidate_system_messages(messages)
 
 

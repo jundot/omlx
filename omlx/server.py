@@ -4186,6 +4186,7 @@ async def stream_responses_api(
     reasoning_closed = False
     message_opened = False
     next_output_index = 0
+    reasoning_output_index: Optional[int] = None  # captured when reasoning opens
 
     # Build initial response object (in_progress, empty output)
     initial_response = ResponseObject(
@@ -4220,15 +4221,16 @@ async def stream_responses_api(
 
     # --- helper closures for lazy item emission ----------------------
     def _open_reasoning():
-        nonlocal seq, reasoning_opened, next_output_index
+        nonlocal seq, reasoning_opened, reasoning_output_index
         if reasoning_opened:
             return []
         reasoning_opened = True
+        reasoning_output_index = next_output_index
         events = []
         seq += 1
         events.append(format_sse_event("response.output_item.added", {
             "type": "response.output_item.added",
-            "output_index": next_output_index,
+            "output_index": reasoning_output_index,
             "item": {
                 "type": "reasoning",
                 "id": reasoning_id,
@@ -4241,7 +4243,7 @@ async def stream_responses_api(
         events.append(format_sse_event("response.reasoning_summary_part.added", {
             "type": "response.reasoning_summary_part.added",
             "item_id": reasoning_id,
-            "output_index": next_output_index,
+            "output_index": reasoning_output_index,
             "summary_index": 0,
             "part": {"type": "summary_text", "text": ""},
             "sequence_number": seq,
@@ -4253,7 +4255,6 @@ async def stream_responses_api(
         if reasoning_closed or not reasoning_opened:
             return []
         reasoning_closed = True
-        reasoning_output_index = next_output_index
         next_output_index += 1
         events = []
         seq += 1
@@ -4356,7 +4357,7 @@ async def stream_responses_api(
                     yield format_sse_event("response.reasoning_summary_text.delta", {
                         "type": "response.reasoning_summary_text.delta",
                         "item_id": reasoning_id,
-                        "output_index": 0 if not reasoning_closed else next_output_index - 1,
+                        "output_index": reasoning_output_index,
                         "summary_index": 0,
                         "delta": thinking_delta,
                         "sequence_number": seq,
