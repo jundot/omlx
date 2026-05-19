@@ -1204,6 +1204,32 @@ class TestGetRecommendedModels:
         assert item["params"] == 7_000_000_000
         assert item["params_formatted"] == "7.0B"
 
+    @pytest.mark.asyncio
+    async def test_includes_quantization_field(self):
+        """get_recommended_models should populate quantization so the Quant
+        column renders on the trending/popular tabs."""
+        model = _make_mock_model(
+            "mlx-community/Llama-3-8B-4bit",
+            disk_size_bytes=4 * 1024**3,
+            downloads=200,
+        )
+        model.safetensors = {
+            "parameters": {"Q4_K": 7_000_000_000, "BF16": 100_000_000},
+            "total": 7_100_000_000,
+        }
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3
+            )
+
+        for category in ("trending", "popular"):
+            assert result[category][0]["quantization"] == "int4"
+
 
 # =============================================================================
 # Search Models Tests
@@ -1501,7 +1527,27 @@ class TestSearchModels:
             result = await HFDownloader.search_models(query="model")
 
         assert "quantization" in result["models"][0]
-        assert result["models"][0]["quantization"] in ("int4", "q4_k")
+        assert result["models"][0]["quantization"] == "int4"
+
+    @pytest.mark.asyncio
+    async def test_search_filter_4bit_matches_int4_detected(self):
+        """4bit UI filter should match models detected as int4 even when the
+        repo id does not contain '4bit'."""
+        # Repo name has no 4bit/q4 hint, only the safetensors dtype reveals it
+        model = _make_mock_model(
+            "mlx-community/Qwen3-4B-Quant", disk_size_bytes=2_000_000_000, downloads=100
+        )
+        model.safetensors = {"parameters": {"Q4_K": 1_000_000_000}, "total": 1_000_000_000}
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(query="qwen", quant="4bit")
+
+        assert len(result["models"]) == 1
+        assert result["models"][0]["repo_id"] == "mlx-community/Qwen3-4B-Quant"
 
 
 # =============================================================================
@@ -1738,6 +1784,18 @@ class TestDetectQuantization:
 
         result = _detect_quantization(None, "mlx-community/Llama-3-8B-Instruct")
         assert result is None
+
+    def test_prefers_q_dtype_over_bf16(self):
+        """Quantized models often list BF16 (norms) before Q4_K (weights);
+        the Q* dtype should win regardless of dict ordering."""
+        from omlx.admin.hf_downloader import _detect_quantization
+
+        st = {
+            "parameters": {"BF16": 100_000_000, "Q4_K": 7_000_000_000},
+            "total": 7_100_000_000,
+        }
+        # Name has no quant hint so detection must come from safetensors
+        assert _detect_quantization(st, "org/some-quantized-model") == "int4"
 
 
 # =============================================================================

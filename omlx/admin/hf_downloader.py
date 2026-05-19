@@ -172,6 +172,15 @@ _SORT_MAP = {
 }
 
 
+# UI filter values normalize to detected labels (4bit → int4, etc.)
+_QUANT_ALIASES = {
+    "4bit": "int4",
+    "8bit": "int8",
+    "4-bit": "int4",
+    "8-bit": "int8",
+}
+
+
 def _detect_quantization(safetensors: Optional[dict], repo_id: str) -> Optional[str]:
     """Detect quantization type from model name or safetensors dtype.
 
@@ -183,7 +192,7 @@ def _detect_quantization(safetensors: Optional[dict], repo_id: str) -> Optional[
         repo_id: Full model repo ID (e.g., 'mlx-community/Llama-3-8B-4bit-MLX')
 
     Returns:
-        Quantization label string (e.g., '4bit', '8bit', 'bf16', 'fp16') or None.
+        Quantization label string (e.g., 'int4', 'int8', 'bf16', 'fp16') or None.
     """
     # Check model name first (more reliable for MLX quantized models)
     name_lower = repo_id.lower()
@@ -199,18 +208,15 @@ def _detect_quantization(safetensors: Optional[dict], repo_id: str) -> Optional[
     # Note: We don't infer quantization from bare 8B/4B/etc. parameter counts
     # as these indicate model size, not quantization (e.g., "Llama-3-8B" = 8B params)
 
-    # Fallback: check safetensors dtype
+    # Fallback: check safetensors dtype. Quantized models often have BF16 norms
+    # coexisting with Q* weights, so Q* takes precedence over the dict ordering.
     if safetensors and safetensors.get("parameters"):
         dtypes = list(safetensors["parameters"].keys())
-        if dtypes:
-            # Primary dtype determines quantization
-            primary_dtype = dtypes[0]
-            if primary_dtype in _DTYPE_TO_QUANT:
-                return _DTYPE_TO_QUANT[primary_dtype]
-            # Check for quantized dtypes (Q4, Q8, etc.)
-            for dtype in dtypes:
-                if dtype.startswith("Q"):
-                    return _DTYPE_TO_QUANT.get(dtype, dtype.lower())
+        for dtype in dtypes:
+            if dtype.startswith("Q") and dtype in _DTYPE_TO_QUANT:
+                return _DTYPE_TO_QUANT[dtype]
+        if dtypes and dtypes[0] in _DTYPE_TO_QUANT:
+            return _DTYPE_TO_QUANT[dtypes[0]]
 
     return None
 
@@ -272,6 +278,7 @@ class HFDownloader:
                 if size <= 0 or size > max_memory_bytes:
                     continue
                 params = _get_param_count(m.safetensors)
+                quantization = _detect_quantization(m.safetensors, m.id)
                 results.append(
                     {
                         "repo_id": m.id,
@@ -285,6 +292,7 @@ class HFDownloader:
                         "params_formatted": (
                             _format_param_count(params) if params > 0 else None
                         ),
+                        "quantization": quantization,
                     }
                 )
             return results
@@ -379,18 +387,17 @@ class HFDownloader:
 
             # Apply filters
             if quant:
-                # Check if model matches quant filter
-                # Either detected quantization matches, or model name contains quant label
+                quant_lower = quant.lower()
+                # UI filter labels (4bit/8bit) → detected labels (int4/int8)
+                normalized_quant = _QUANT_ALIASES.get(quant_lower, quant_lower)
                 name_lower = m.id.lower()
                 quant_match = False
-                
-                if quantization and quant.lower() in quantization.lower():
+
+                if quantization and normalized_quant == quantization.lower():
                     quant_match = True
-                elif quant.lower() in name_lower:
+                elif quant_lower in name_lower:
                     quant_match = True
-                elif name_lower.endswith(f"-{quant.lower()}"):
-                    quant_match = True
-                
+
                 if not quant_match:
                     continue
 
@@ -419,14 +426,12 @@ class HFDownloader:
             )
 
         # Apply Python-side sorting
-        reverse = not sort_ascending
-
         if sort == "most_params":
             results.sort(key=lambda x: x["params"] or 0, reverse=True)
         elif sort == "least_params":
             results.sort(key=lambda x: x["params"] or 0)
         elif sort in ("largest", "smallest") or sort_by_size:
-            # Sort by size, handling None values (put at end)
+            # Sort by size, putting unknown-size entries at the end
             results.sort(
                 key=lambda x: x["size"] if x["size"] > 0 else -1,
                 reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),

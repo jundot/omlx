@@ -4162,6 +4162,24 @@
                 }
             },
 
+            syncTableSortToDropdown() {
+                const map = {
+                    largest:      { col: 'size',      dir: 'desc' },
+                    smallest:     { col: 'size',      dir: 'asc'  },
+                    most_params:  { col: 'params',    dir: 'desc' },
+                    least_params: { col: 'params',    dir: 'asc'  },
+                    downloads:    { col: 'downloads', dir: 'desc' },
+                    trending:     { col: 'downloads', dir: 'desc' },
+                    created:      { col: 'downloads', dir: 'desc' },
+                    updated:      { col: 'downloads', dir: 'desc' },
+                };
+                const m = map[this.hfSearchSort];
+                if (m) {
+                    this.hfTableSort = m.col;
+                    this.hfTableSortDir = m.dir;
+                }
+            },
+
             // Pagination helpers
             getPagedModels(tab) {
                 const page = this.hfPage[tab] || 1;
@@ -4194,6 +4212,9 @@
                 this.hfSearchLoading = true;
                 this.hfRecommendedTab = 'search';
                 this.hfPage.search = 1;
+                // Sync table sort with dropdown choice so the frontend re-sort
+                // does not override what the backend returned
+                this.syncTableSortToDropdown();
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
@@ -4203,12 +4224,15 @@
                         limit: '100',
                         mlx_only: this.hfMlxOnly,
                     });
-                    // Add filter parameters if set
+                    // Add filter parameters if set. Sizes are decimal GB → bytes
+                    // for the slider input, while min/max use binary GiB to match
+                    // _format_model_size on the backend.
+                    const GIB = 1024 * 1024 * 1024;
                     if (this.hfSearchQuant) params.set('quant', this.hfSearchQuant);
                     if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
                     if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
-                    if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * 1e9).toString());
-                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * 1e9).toString());
+                    if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * GIB).toString());
+                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * GIB).toString());
                     // Wire largest/smallest sort params to backend
                     if (this.hfSearchSort === 'largest') {
                         params.set('sort_by_size', 'true');
@@ -4217,7 +4241,8 @@
                         params.set('sort_by_size', 'true');
                         params.set('sort_ascending', 'true');
                     }
-                    
+
+
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();

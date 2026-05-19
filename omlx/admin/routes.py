@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -4301,10 +4301,10 @@ async def search_hf_models(
     mlx_only: bool = True,
     # Filtering
     quant: str = "",
-    min_params: int = None,
-    max_params: int = None,
-    min_size: int = None,  # bytes
-    max_size: int = None,  # bytes
+    min_params: Optional[int] = None,
+    max_params: Optional[int] = None,
+    min_size: Optional[int] = None,  # bytes
+    max_size: Optional[int] = None,  # bytes
     # Sorting
     sort_by_size: bool = False,
     sort_ascending: bool = False,
