@@ -20,6 +20,9 @@ struct StatsDTO: Codable, Equatable, Sendable {
     let port: Int?
 
     let activeModels: ActiveModelsDTO
+    /// Disk-side SSD cache observability. Present on `scope=session` reads;
+    /// `nil` if the server can't compute it (no global settings yet).
+    let runtimeCache: RuntimeCacheDTO?
 
     struct ActiveModelsDTO: Codable, Equatable, Sendable {
         let models: [ActiveModelDTO]
@@ -38,4 +41,22 @@ struct StatsDTO: Codable, Equatable, Sendable {
         let activeRequests: Int?
         let waitingRequests: Int?
     }
+
+    /// Mirrors `_build_runtime_cache_observability` in `omlx/admin/routes.py`.
+    /// Only the totals are surfaced today — per-model breakdown is left off
+    /// the wire to keep the DTO small until a UI consumes it.
+    struct RuntimeCacheDTO: Codable, Equatable, Sendable {
+        let basePath: String?
+        let ssdCacheDir: String?
+        let totalNumFiles: Int
+        let totalSizeBytes: Int64
+        let effectiveBlockSizes: [Int]?
+    }
+}
+
+/// Response from `POST /admin/api/ssd-cache/clear`. `totalDeleted` counts
+/// files removed across loaded-model managers + direct filesystem cleanup.
+struct ClearSsdCacheResponse: Codable, Sendable {
+    let status: String?
+    let totalDeleted: Int
 }

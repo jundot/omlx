@@ -83,6 +83,21 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    @discardableResult
+    func clearStats() async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.statsClear)
+    }
+
+    @discardableResult
+    func clearAlltimeStats() async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.statsClearAlltime)
+    }
+
+    @discardableResult
+    func clearSsdCache() async throws -> ClearSsdCacheResponse {
+        try await postEmpty(AdminAPI.ssdCacheClear)
+    }
+
     func getLogs(lines: Int = 200, file: String? = nil) async throws -> LogsDTO {
         var q = [URLQueryItem(name: "lines", value: String(lines))]
         if let file, !file.isEmpty {
