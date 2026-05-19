@@ -25,7 +25,7 @@ struct StatusScreen: View {
             // endpoint.
             ServerHeroCard()
 
-            SectionHeader("Session Stats") {
+            SectionHeader("Serving Stats") {
                 HStack(spacing: 10) {
                     Segmented(selection: $vm.scope, options: [
                         ("session", "Session"),
