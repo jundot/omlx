@@ -568,10 +568,10 @@ class HFDownloader:
     async def retry_download(
         self, task_id: str, hf_token: str = ""
     ) -> DownloadTask:
-        """Retry a failed or cancelled download, resuming from existing files.
+        """Retry a failed or cancelled download.
 
-        Since partial files are preserved on disk, snapshot_download will
-        automatically skip already-completed files.
+        If partial files remain on disk after a failed download,
+        snapshot_download will automatically skip already-completed files.
 
         Args:
             task_id: The task ID of the failed/cancelled download.
@@ -599,7 +599,7 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes from existing files)
+        # Start fresh download (snapshot_download resumes any existing files)
         new_task = await self.start_download(repo_id, hf_token)
         new_task.retry_count = old_retry_count + 1
         return new_task
@@ -752,6 +752,12 @@ class HFDownloader:
                 DownloadStatus.FAILED,
             ):
                 task.status = DownloadStatus.CANCELLED
+            try:
+                self._cleanup_partial(task)
+            except Exception as e:
+                logger.error(
+                    f"Failed to clean up cancelled download {task.repo_id}: {e}"
+                )
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
             task.error = (
