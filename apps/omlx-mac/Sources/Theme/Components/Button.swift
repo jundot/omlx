@@ -17,6 +17,13 @@ struct OMLXButtonStyle: ButtonStyle {
     let size: Size
 
     @Environment(\.omlxTheme) private var theme
+    /// Without this, a `.disabled()` button keeps its enabled paint because the
+    /// custom background ignores SwiftUI's default isEnabled tint. Users then
+    /// click an enabled-looking primary button and see no press animation
+    /// (SwiftUI suppresses `isPressed` on disabled buttons) — leading to the
+    /// "Apply only animates the first time" report. Reading `isEnabled` here
+    /// dims the whole label so disabled state is visually unmistakable.
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         let labelFont = Font.omlxText(size == .small ? 11.5 : 13, weight: .medium)
@@ -31,8 +38,17 @@ struct OMLXButtonStyle: ButtonStyle {
             .background(background(configuration))
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .overlay(border(configuration))
-            .opacity(configuration.isPressed ? 0.78 : 1.0)
+            .opacity(opacity(configuration))
             .contentShape(Rectangle())
+    }
+
+    /// Disabled state wins over press feedback. 0.45 is the macOS-feeling
+    /// "this control is inert" tint — tested against `.primary` (blue),
+    /// `.destructive` (red), `.normal` (themed control bg), and `.plain`
+    /// (transparent + dimmed text).
+    private func opacity(_ cfg: Configuration) -> Double {
+        guard isEnabled else { return 0.45 }
+        return cfg.isPressed ? 0.78 : 1.0
     }
 
     @ViewBuilder
