@@ -103,7 +103,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
     case server  = "Server"
     case models  = "Models"
-    case bench   = "Bench"
+    case bench   = "Benchmark"
     case general = "General"
 
     var sections: [AppSection] {

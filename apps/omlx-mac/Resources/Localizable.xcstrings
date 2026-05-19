@@ -418,19 +418,19 @@
         }
       }
     },
-    "sidebar.group.bench": {
+    "sidebar.group.benchmark": {
       "extractionState": "manual",
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Bench"
+            "value": "Benchmark"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "ベンチ"
+            "value": "ベンチマーク"
           }
         },
         "ko": {
