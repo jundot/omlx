@@ -257,36 +257,6 @@
                                         <option value="trace">{{ t('settings.server.log_level_trace') }}</option>
                                     </select>
                                 </div>
-                                <!-- Restart server -->
-                                <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div class="flex flex-col gap-1 min-w-0">
-                                        <label class="text-sm text-neutral-700">{{ t('settings.server.restart_label') }}</label>
-                                        <p class="text-xs text-neutral-500">{{ t('settings.server.restart_desc') }}</p>
-                                        <!-- Status line is always rendered (empty when idle) so the row
-                                             height stays constant across state transitions. Color is
-                                             state-driven; the reserved min-height prevents layout shift
-                                             when restartServer.message goes from "" to text. -->
-                                        <p class="text-xs mt-1 min-h-[1rem]"
-                                           :class="restartServer.status === 'error' ? 'text-red-500'
-                                                 : restartServer.status === 'unsupported' ? 'text-amber-600'
-                                                 : 'text-neutral-500'"
-                                           x-text="restartServer.message"></p>
-                                    </div>
-                                    <button type="button"
-                                            @click="restartServerStart()"
-                                            :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
-                                            class="inline-flex items-center justify-center gap-2 h-10 min-w-[12rem] px-4 text-sm font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
-                                        <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
-                                           data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0"></i>
-                                        <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
-                                           data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
-                                        <span x-text="restartServer.status === 'restarting'
-                                                       ? '{{ t('settings.server.restart_button_restarting') }}'
-                                                       : (restartServer.status === 'waiting'
-                                                           ? '{{ t('settings.server.restart_button_waiting') }}'
-                                                           : '{{ t('settings.server.restart_button') }}')"></span>
-                                    </button>
-                                </div>
                             </div>
                         </div>
 
@@ -817,44 +787,80 @@
 
                     </div>
 
-                    <!-- Save Button -->
+                    <!-- Save / Restart Buttons -->
                     <div class="mt-10 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-4">
-                        <div>
-                            <!-- Success Message -->
+                        <div class="flex flex-col gap-1 min-w-0 sm:flex-1">
+                            <!-- Save success -->
                             <div x-show="saveSuccess" x-cloak
                                  x-transition:enter="transition ease-out duration-200"
                                  x-transition:leave="transition ease-in duration-150"
-                                 class="flex items-center gap-2 text-sm text-neutral-700">
-                                <i data-lucide="check-circle" class="w-4 h-4"></i>
-                                <span x-text="saveMessage"></span>
+                                 class="flex items-start gap-2 text-sm text-neutral-700 min-w-0"
+                                 :title="saveMessage">
+                                <i data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="saveMessage"></span>
                             </div>
-                            <!-- Error Message -->
+                            <!-- Save error -->
                             <div x-show="saveError" x-cloak
                                  x-transition:enter="transition ease-out duration-200"
                                  x-transition:leave="transition ease-in duration-150"
-                                 class="flex items-center gap-2 text-sm text-red-600">
-                                <i data-lucide="alert-circle" class="w-4 h-4"></i>
-                                <span x-text="saveError"></span>
+                                 class="flex items-start gap-2 text-sm text-red-600 min-w-0"
+                                 :title="saveError">
+                                <i data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="saveError"></span>
+                            </div>
+                            <!-- Restart status (any non-empty message) -->
+                            <div x-show="restartServer.message" x-cloak
+                                 class="flex items-start gap-2 text-sm min-w-0"
+                                 :class="restartServer.status === 'error' ? 'text-red-600'
+                                       : restartServer.status === 'unsupported' ? 'text-amber-600'
+                                       : 'text-neutral-700'"
+                                 :title="restartServer.message">
+                                <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                   data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0 mt-0.5"></i>
+                                <i x-show="restartServer.status === 'error' || restartServer.status === 'unsupported'"
+                                   data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <i x-show="restartServer.status === 'idle'"
+                                   data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="restartServer.message"></span>
                             </div>
                         </div>
-                        <button
-                            @click="saveGlobalSettings"
-                            :disabled="saving"
-                            class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
-                                   rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
-                                   focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
-                                   transform hover:scale-105 active:scale-95
-                                   disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-                        >
-                            <span x-show="!saving">{{ t('settings.save.button') }}</span>
-                            <span x-show="saving" class="flex items-center">
-                                <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                </svg>
-                                {{ t('settings.save.saving') }}
-                            </span>
-                        </button>
+                        <div class="flex items-center gap-3 shrink-0">
+                            <button type="button"
+                                    @click="restartServerStart()"
+                                    :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                    class="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white text-neutral-700 text-sm font-semibold
+                                           border border-neutral-300 rounded-full hover:bg-neutral-50 focus:outline-none focus:ring-2
+                                           focus:ring-neutral-300 focus:ring-offset-2 transition-all duration-200
+                                           disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
+                                   data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0"></i>
+                                <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
+                                   data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
+                                <span x-text="restartServer.status === 'restarting'
+                                               ? '{{ t('settings.server.restart_button_restarting') }}'
+                                               : (restartServer.status === 'waiting'
+                                                   ? '{{ t('settings.server.restart_button_waiting') }}'
+                                                   : '{{ t('settings.server.restart_button') }}')"></span>
+                            </button>
+                            <button
+                                @click="saveGlobalSettings"
+                                :disabled="saving"
+                                class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
+                                       rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
+                                       focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
+                                       transform hover:scale-105 active:scale-95
+                                       disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                            >
+                                <span x-show="!saving">{{ t('settings.save.button') }}</span>
+                                <span x-show="saving" class="flex items-center">
+                                    <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                    {{ t('settings.save.saving') }}
+                                </span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
