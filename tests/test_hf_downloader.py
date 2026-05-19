@@ -297,10 +297,14 @@ class TestHFDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader, model_dir):
-        # Create partial files to verify they are removed after cancel.
+        # In-progress shards live under ._____temp and must be removed,
+        # while finalized shards outside it stay for resume on retry.
         target = model_dir / "owner" / "model"
         target.mkdir(parents=True, exist_ok=True)
-        (target / "partial.bin").write_bytes(b"x" * 100)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
 
         with patch(
             "omlx.admin.hf_downloader.HfApi"
@@ -325,20 +329,22 @@ class TestHFDownloader:
             assert task.status == DownloadStatus.CANCELLED
             await active_task
 
-            assert not target.exists()
+            assert not temp_dir.exists()
+            assert (target / "model-00001-of-00002.safetensors").exists()
+            assert target.exists()
 
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_cancelled_download_cleans_up_partial_target_dir(
+    async def test_cancelled_download_cleans_up_temp_dir_only(
         self, downloader, model_dir
     ):
         target = model_dir / "owner" / "model"
         target.mkdir(parents=True)
-        (target / "._____temp").mkdir()
-        (target / "._____temp" / "model-00001-of-00002.safetensors").write_bytes(
-            b"x"
-        )
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"x")
 
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._tasks[task.task_id] = task
@@ -363,7 +369,8 @@ class TestHFDownloader:
             await downloader._run_download(task.task_id, "")
 
         assert task.status == DownloadStatus.CANCELLED
-        assert not target.exists()
+        assert not temp_dir.exists()
+        assert (target / "model-00001-of-00002.safetensors").exists()
 
     @pytest.mark.asyncio
     async def test_cancelled_download_logs_cleanup_failure(self, downloader, caplog):
@@ -553,33 +560,39 @@ class TestHFDownloader:
     # --- Cleanup ---
 
     @pytest.mark.asyncio
-    async def test_cleanup_partial_removes_directory(self, model_dir):
+    async def test_cleanup_partial_removes_temp_dir_only(self, model_dir):
+        """Cleanup deletes the hidden ._____temp dir, finalized shards stay."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
-        # Partial download lands at {model_dir}/{owner}/{model}
         org_dir = model_dir / "owner"
         target = org_dir / "model"
         target.mkdir(parents=True)
-        (target / "partial.bin").write_bytes(b"x" * 100)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        temp_dir = target / "._____temp"
+        temp_dir.mkdir()
+        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
 
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
-        assert not target.exists()
-        # Empty org folder should also be removed.
-        assert not org_dir.exists()
+        # In-progress shards gone, finalized shards and dirs preserved
+        # so snapshot_download can resume on retry.
+        assert not temp_dir.exists()
+        assert (target / "model-00001-of-00002.safetensors").exists()
+        assert target.exists()
+        assert org_dir.exists()
 
     @pytest.mark.asyncio
-    async def test_cleanup_partial_keeps_org_folder_with_siblings(self, model_dir):
-        """Org folder must survive cleanup when it still has other models."""
+    async def test_cleanup_partial_is_noop_when_no_temp_dir(self, model_dir):
+        """With nothing in ._____temp, cleanup leaves the dir untouched."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
         org_dir = model_dir / "owner"
         target = org_dir / "model"
         target.mkdir(parents=True)
-        (target / "partial.bin").write_bytes(b"x")
+        (target / "config.json").write_text("{}")
 
         sibling = org_dir / "other-model"
         sibling.mkdir()
@@ -588,9 +601,9 @@ class TestHFDownloader:
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
-        assert not target.exists()
-        assert org_dir.exists()
+        assert (target / "config.json").exists()
         assert sibling.exists()
+        assert org_dir.exists()
 
     @pytest.mark.asyncio
     async def test_download_uses_owner_model_layout(self, model_dir):

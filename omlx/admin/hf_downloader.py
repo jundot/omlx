@@ -568,10 +568,10 @@ class HFDownloader:
     async def retry_download(
         self, task_id: str, hf_token: str = ""
     ) -> DownloadTask:
-        """Retry a failed or cancelled download.
+        """Retry a failed or cancelled download, resuming from existing files.
 
-        If partial files remain on disk after a failed download,
-        snapshot_download will automatically skip already-completed files.
+        Finalized shards are preserved on disk so snapshot_download will
+        automatically skip already-completed files.
 
         Args:
             task_id: The task ID of the failed/cancelled download.
@@ -599,7 +599,7 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes any existing files)
+        # Start fresh download (snapshot_download resumes from existing files)
         new_task = await self.start_download(repo_id, hf_token)
         new_task.retry_count = old_retry_count + 1
         return new_task
@@ -886,23 +886,19 @@ class HFDownloader:
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove partially downloaded model directory."""
+        """Remove in-progress shards while keeping finalized files for resume.
+
+        Hub stages partial downloads inside a hidden ``._____temp`` directory
+        and only renames a shard into the target on completion. Wiping the
+        whole target dir would also nuke shards the user has already paid
+        for; finalized files are visible in the file browser, so users can
+        keep them for auto-resume on retry or remove them themselves.
+        """
         target_dir = self._model_dir / task.repo_id
-        if target_dir.exists():
+        temp_dir = target_dir / "._____temp"
+        if temp_dir.exists():
             try:
-                shutil.rmtree(target_dir)
-                logger.info(f"Cleaned up partial download: {target_dir}")
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
-                logger.error(f"Failed to clean up {target_dir}: {e}")
-        # Drop empty org folder so cancelled downloads do not leave
-        # stub directories behind.
-        parent = target_dir.parent
-        if (
-            parent != self._model_dir
-            and parent.exists()
-            and not any(parent.iterdir())
-        ):
-            try:
-                parent.rmdir()
-            except OSError as e:
-                logger.debug(f"Could not remove empty org folder {parent}: {e}")
+                logger.error(f"Failed to clean up {temp_dir}: {e}")
