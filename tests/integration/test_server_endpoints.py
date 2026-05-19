@@ -1166,6 +1166,70 @@ class TestMCPEndpoints:
             {"query": "hello"},
         )
 
+    def test_mcp_execute_tool_name_field(self, client):
+        """Test MCP execute happy path with tool_name field."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="my_tool",
+            content="ok",
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "my_tool",
+                    "arguments": {"q": "x"},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("my_tool", {"q": "x"})
+
+    def test_mcp_execute_tool_name_wins_over_tool(self, client):
+        """Test tool_name takes precedence when both fields are present."""
+        from omlx.server import _server_state
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = AsyncMock()
+        manager.execute_tool.return_value = MCPToolResult(
+            tool_name="canonical",
+            content="ok",
+        )
+
+        try:
+            _server_state.mcp_manager = manager
+
+            response = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "canonical",
+                    "tool": "alias_should_lose",
+                    "arguments": {},
+                },
+            )
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("canonical", {})
+
+    def test_mcp_execute_rejects_missing_tool(self, client):
+        """Test MCP execute returns 422 when neither tool nor tool_name is present."""
+        response = client.post(
+            "/v1/mcp/execute",
+            json={"arguments": {"q": "x"}},
+        )
+
+        assert response.status_code == 422
+
 
 class TestErrorHandling:
     """Tests for error handling in endpoints."""
