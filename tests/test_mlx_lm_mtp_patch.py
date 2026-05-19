@@ -331,6 +331,7 @@ class TestBatchGeneratorDispatch:
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
 
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
+        from omlx.patches import mlx_lm_mtp
         from omlx.patches.mlx_lm_mtp.batch_generator import _is_mtp_eligible
 
         class _NonMtpModel:
@@ -338,14 +339,14 @@ class TestBatchGeneratorDispatch:
 
         class _MtpModelWithoutHead:
             """Has the patched method but no actual MTP head attached
-            (mtp_enabled was False when this hypothetical model loaded)."""
+            (config did not declare an MTP head when this model loaded)."""
 
             def mtp_forward(self, *_):
                 pass
 
         class _MtpModel:
-            """Has both the method and the attached head — i.e. mtp_enabled
-            was True at load time."""
+            """Has both the method and the attached head — i.e. the model
+            class was patched and the head was attached at load time."""
 
             def __init__(self):
                 self.mtp = object()  # placeholder for an actual MTPModule
@@ -358,18 +359,34 @@ class TestBatchGeneratorDispatch:
                 self.model = model
                 self.uids = uids
 
-        # Non-MTP model never triggers the MTP path.
-        assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
-        # Has mtp_forward but no attached head → still off (mtp_enabled was False).
-        assert (
-            _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
-        )
-        # Has both method and head + batch=1 → triggers the path.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
-        # MTP model with batch=2 falls back to standard step.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
-        # Empty batch never triggers.
-        assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        prior_active = mlx_lm_mtp.is_mtp_active()
+        try:
+            # Head attached but the per-load mtp_active flag is off
+            # (e.g. VLM runtime patches attach unconditionally so weight
+            # load matches, while inference-time MTP stays disabled).
+            mlx_lm_mtp.set_mtp_active(False)
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+            )
+
+            mlx_lm_mtp.set_mtp_active(True)
+            # Non-MTP model never triggers the MTP path.
+            assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
+            # Has mtp_forward but no attached head → still off.
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1]))
+                is False
+            )
+            # Has both method and head + batch=1 + flag on → triggers the path.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
+            # MTP model with batch=2 falls back to standard step.
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
+            )
+            # Empty batch never triggers.
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
+        finally:
+            mlx_lm_mtp.set_mtp_active(prior_active)
 
 
 # ---------------------------------------------------------------------------
