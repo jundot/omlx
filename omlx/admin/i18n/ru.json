@@ -75,6 +75,7 @@
   "status.active_models.req": "запрос",
   "status.active_models.generating": "Генерация...",
   "status.active_models.unload": "Выгрузить модель",
+  "status.active_models.enforcer_disabled": "Enforcer disabled",
   "status.api.section_label": "API-эндпоинты",
   "status.api.openai": "OpenAI API",
   "status.api.claude": "Claude API",

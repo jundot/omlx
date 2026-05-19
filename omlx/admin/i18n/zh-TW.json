@@ -75,6 +75,7 @@
   "status.active_models.req": "請求",
   "status.active_models.generating": "生成中...",
   "status.active_models.unload": "卸載模型",
+  "status.active_models.enforcer_disabled": "Enforcer disabled",
   "status.api.section_label": "API 端點",
   "status.api.openai": "OpenAI API",
   "status.api.claude": "Claude API",

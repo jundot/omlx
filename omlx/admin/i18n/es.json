@@ -75,6 +75,7 @@
   "status.active_models.req": "req",
   "status.active_models.generating": "Generando...",
   "status.active_models.unload": "Descargar modelo",
+  "status.active_models.enforcer_disabled": "Enforcer disabled",
   "status.api.section_label": "Endpoints API",
   "status.api.openai": "API OpenAI",
   "status.api.claude": "API Claude",

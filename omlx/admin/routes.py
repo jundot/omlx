@@ -3746,7 +3746,6 @@ def _build_active_models_data() -> dict:
             "models": [],
             "model_memory_used": 0,
             "model_memory_max": 0,
-            "model_memory_used_actual": 0,
             "memory_pressure": {
                 "enabled": False,
                 "current_bytes": 0,
@@ -3913,7 +3912,6 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
         "model_memory_max": status.get("max_model_memory", 0),
-        "model_memory_used_actual": status.get("current_model_memory_actual", 0),
         "memory_pressure": {
             "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
             "current_bytes": (

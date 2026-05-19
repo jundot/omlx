@@ -149,7 +149,6 @@
                     models: [],
                     model_memory_used: 0,
                     model_memory_max: 0,
-                    model_memory_used_actual: 0,
                     memory_pressure: {
                         enabled: false,
                         current_bytes: 0,
@@ -2358,7 +2357,7 @@
             activeModelsPressureLabel() {
                 const mp = this.stats.active_models?.memory_pressure;
                 if (!mp || !mp.enabled || !mp.hard_bytes) {
-                    return 'Enforcer disabled';
+                    return window.t('status.active_models.enforcer_disabled');
                 }
                 return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
             },
@@ -2369,18 +2368,17 @@
                 if (model.is_loading) {
                     return estimated;
                 }
+                // actual_size is a rough phys_footprint delta captured at load
+                // time and can include neighboring KV growth — mark with ~obs
+                // so it doesn't read as exact.
                 const actual = model.actual_size_formatted;
                 if (!actual) {
                     return estimated;
                 }
                 if (!estimated || estimated === actual) {
-                    return `${actual}`;
+                    return `~${actual} obs`;
                 }
-                return `${actual} / ${estimated} est`;
-            },
-
-            activeModelSizeLabel(model) {
-                return this.modelSizeLabel(model);
+                return `~${actual} obs / ${estimated} est`;
             },
 
             copyToClipboard(text) {

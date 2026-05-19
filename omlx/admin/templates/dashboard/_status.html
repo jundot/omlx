@@ -110,14 +110,13 @@
                             <div class="flex items-center gap-3">
                                 <!-- Memory progress bar -->
                                 <div class="flex items-center gap-2">
-                                     <div class="bg-neutral-200 rounded-full overflow-hidden relative shrink-0"
-                                         style="width: 9rem; height: 0.625rem;">
+                                    <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
                                         <div class="rounded-full transition-all duration-300"
-                                            :style="activeModelsPressureBarStyle"></div>
+                                             :style="activeModelsPressureBarStyle"></div>
                                         <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
                                              x-cloak
-                                            class="absolute inset-y-0"
-                                            :style="activeModelsSoftMarkerStyle">
+                                             class="absolute inset-y-0"
+                                             :style="activeModelsSoftMarkerStyle">
                                         </div>
                                     </div>
                                     <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
@@ -175,7 +174,7 @@
                                                 </template>
                                             </div>
                                             <!-- Memory size -->
-                                                <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="activeModelSizeLabel(m)"></span>
+                                            <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="modelSizeLabel(m)"></span>
                                             <!-- Unload button -->
                                             <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
                                                  x-data="{ showTip: false }"

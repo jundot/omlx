@@ -984,11 +984,6 @@ class EnginePool:
         return {
             "max_model_memory": self._max_model_memory,
             "current_model_memory": self._current_model_memory,
-            "current_model_memory_actual": sum(
-                (e.actual_size or e.estimated_size)
-                for e in self._entries.values()
-                if e.engine is not None
-            ),
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
