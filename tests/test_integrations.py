@@ -15,7 +15,7 @@ from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
-from omlx.integrations.pi import PiIntegration
+from omlx.integrations.pi import PiIntegration, _get_agent_dir
 
 
 class TestIntegrationRegistry:
@@ -654,6 +654,24 @@ class TestHermesIntegration:
 
 
 class TestPiIntegration:
+    def test_get_agent_dir_default(self, tmp_path, monkeypatch):
+        """Default agent dir is ~/.pi/agent when env var is not set."""
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        result = _get_agent_dir()
+        assert result == Path.home() / ".pi" / "agent"
+
+    def test_get_agent_dir_custom_env(self, tmp_path, monkeypatch):
+        """PI_CODING_AGENT_DIR env var overrides the default path."""
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "custom_pi"))
+        result = _get_agent_dir()
+        assert result == tmp_path / "custom_pi"
+
+    def test_get_agent_dir_expands_user(self, tmp_path, monkeypatch):
+        """PI_CODING_AGENT_DIR ~ is expanded to the home directory."""
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/my-agent")
+        result = _get_agent_dir()
+        assert result == Path.home() / "my-agent"
+
     def test_get_command(self):
         pi = PiIntegration()
         cmd = pi.get_command(port=8000, api_key="key", model="qwen3.5")
