@@ -47,7 +47,15 @@ final class MenubarStatsPoller {
         self.interval = interval
 
         let cfg = URLSessionConfiguration.default
-        cfg.httpCookieStorage = HTTPCookieStorage()
+        // `HTTPCookieStorage()` returns a detached instance that never
+        // actually persists cookies, so the post-login session cookie was
+        // dropped and every subsequent /api/stats request 401-ed. Since
+        // FastAPI's 401 body still JSON-decodes into our all-Optional Stats
+        // struct (all keys missing → all fields nil), the menubar rendered
+        // "—" everywhere with no error trail. Use the process-wide shared
+        // jar — matches OMLXClient and inherits its login session.
+        cfg.httpCookieStorage = HTTPCookieStorage.shared
+        cfg.httpShouldSetCookies = true
         cfg.httpCookieAcceptPolicy = .always
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.timeoutIntervalForRequest = 2.0
@@ -101,7 +109,16 @@ final class MenubarStatsPoller {
 
         if let http = response as? HTTPURLResponse, http.statusCode == 401 {
             try await login()
-            let (data2, _) = try await session.data(for: req)
+            let (data2, response2) = try await session.data(for: req)
+            if let http2 = response2 as? HTTPURLResponse,
+               !(200..<300).contains(http2.statusCode) {
+                // Stats has all-Optional fields, so a FastAPI error body
+                // (`{"detail": "..."}`) decodes into an all-nil struct and
+                // silently overwrites real stats with dashes. Fail loudly
+                // instead so the outer tick() catches and we keep the last
+                // good values.
+                throw URLError(.userAuthenticationRequired)
+            }
             return try JSONDecoder().decode(Stats.self, from: data2)
         }
         return try JSONDecoder().decode(Stats.self, from: data)
