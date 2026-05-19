@@ -63,6 +63,10 @@
     [data-theme="dark"] .hover\:text-neutral-700:hover { color: var(--text-primary) !important; }
     [data-theme="dark"] .hover\:text-neutral-600:hover { color: var(--text-secondary) !important; }
 
+    /* === Gauge track (visible in both themes) === */
+    .gauge-track { background-color: #e5e5e5; }
+    [data-theme="dark"] .gauge-track { background-color: #3f3f46 !important; }
+
     /* === Active nav tab (bg-white with shadow inside dark nav) === */
     [data-theme="dark"] .shadow-sm { box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.3) !important; }
 

@@ -3483,6 +3483,13 @@ def _build_runtime_cache_observability(
         }
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+    cache_cfg = global_settings.cache
+    try:
+        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+    except (ValueError, OSError, TypeError) as exc:
+        logger.warning("Could not read SSD cache max size from config: %s", exc)
+        cfg_disk_max = 0
+
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
@@ -3491,6 +3498,10 @@ def _build_runtime_cache_observability(
         "total_num_files": 0,
         "total_size_bytes": 0,
         "effective_block_sizes": [],
+        "disk_max_bytes": cfg_disk_max,
+        "hot_cache_max_bytes": 0,
+        "hot_cache_size_bytes": 0,
+        "hot_cache_entries": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -3602,10 +3613,15 @@ def _build_runtime_cache_observability(
             "last_tokens_to_next_block": last_tokens_to_next_block,
             "num_files": int(ssd_stats.get("num_files", 0) or 0),
             "total_size_bytes": int(ssd_stats.get("total_size_bytes", 0) or 0),
+            "max_size_bytes": int(ssd_stats.get("max_size_bytes", 0) or 0),
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
         }
+
+        cache_rates = runtime_stats.get("cache_rates")
+        if cache_rates:
+            model_payload["cache_rates"] = cache_rates
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -3615,6 +3631,26 @@ def _build_runtime_cache_observability(
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+
+    # Aggregate hot-cache and disk-max across models.
+    # hot_cache_max sums across models (each model reserves its own slice of
+    # the same process-wide hot cache budget) so the gauge denominator matches
+    # the summed numerator.  disk_max keeps the config fallback via max()
+    # because a single SSD cache directory is shared — the effective cap is
+    # the largest configured limit, not a per-model sum.
+    hot_cache_max = 0
+    disk_max = payload["disk_max_bytes"]
+    hot_cache_size_total = 0
+    hot_cache_entries_total = 0
+    for m in payload["models"]:
+        hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
+        hot_cache_entries_total += m.get("hot_cache_entries", 0)
+        hot_cache_max += m.get("hot_cache_max_bytes", 0)
+        disk_max = max(disk_max, m.get("max_size_bytes", 0))
+    payload["hot_cache_max_bytes"] = hot_cache_max
+    payload["hot_cache_size_bytes"] = hot_cache_size_total
+    payload["hot_cache_entries"] = hot_cache_entries_total
+    payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache
     # directory directly so the dashboard still shows real disk usage.
@@ -3870,6 +3906,30 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Traverses the internal engine hierarchy: pool entry → async engine →
+    core engine → scheduler.  Both ``clear_ssd_cache`` and
+    ``clear_hot_cache`` share this traversal.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id or not model_info.get("loaded"):
+            continue
+        entry = engine_pool._entries.get(model_id)
+        if entry is None or entry.engine is None:
+            continue
+        async_core = getattr(entry.engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if scheduler is not None:
+            yield model_id, scheduler
+
+
 @router.post("/api/ssd-cache/clear")
 async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """Clear all SSD cache files for all loaded models.
@@ -3880,38 +3940,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     """
     total_deleted = 0
 
-    # Phase 1: clear via loaded models' cache managers (updates in-memory index)
-    engine_pool = _get_engine_pool()
-    if engine_pool is not None:
-        for model_info in engine_pool.get_status().get("models", []):
-            model_id = model_info.get("id")
-            if not model_id or not model_info.get("loaded"):
-                continue
-
-            entry = engine_pool._entries.get(model_id)
-            if entry is None or entry.engine is None:
-                continue
-
-            async_core = getattr(entry.engine, "_engine", None)
-            core = (
-                getattr(async_core, "engine", None) if async_core is not None else None
-            )
-            scheduler = (
-                getattr(core, "scheduler", None) if core is not None else None
-            )
-
-            if scheduler is not None:
-                ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-                if ssd_manager is not None:
-                    try:
-                        deleted = ssd_manager.clear()
-                        total_deleted += deleted
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to clear SSD cache for model '%s': %s",
-                            model_id,
-                            exc,
-                        )
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None:
+            try:
+                total_deleted += ssd_manager.clear()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear SSD cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
 
     # Phase 2: remove any remaining files on disk (covers unloaded models)
     global_settings = _get_global_settings()
@@ -3935,6 +3974,31 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
     return {"status": "ok", "total_deleted": total_deleted}
+
+
+@router.post("/api/hot-cache/clear")
+async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
+    """Clear the in-memory (hot) cache for all loaded models.
+
+    No filesystem fallback needed — hot cache is in-memory only and does
+    not survive process restart.
+    """
+    total_cleared = 0
+    for model_id, scheduler in _iter_loaded_schedulers():
+        ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
+            try:
+                total_cleared += ssd_manager.clear_hot_cache()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear hot cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+        rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
+        if rate_tracker is not None:
+            rate_tracker.clear()
+    return {"status": "ok", "total_cleared": total_cleared}
 
 
 @router.post("/api/cache/probe")

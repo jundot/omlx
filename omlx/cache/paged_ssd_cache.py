@@ -2122,6 +2122,20 @@ class PagedSSDCacheManager(CacheManager):
             )
             return freed
 
+    def clear_hot_cache(self) -> int:
+        """Clear all in-memory (hot) cache entries.
+
+        Returns:
+            Number of entries cleared.
+        """
+        with self._hot_cache_lock:
+            count = len(self._hot_cache)
+            self._hot_cache.clear()
+            self._hot_cache_total_bytes = 0
+        if count:
+            logger.info("Cleared %d hot cache entries", count)
+        return count
+
     def clear(self) -> int:
         """
         Clear all SSD cache files.
