@@ -260,7 +260,6 @@
             hfSearchDebounceTimer: null,
             // Search filters
             hfSearchFiltersOpen: false,
-            hfSearchQuant: '',
             hfSearchMinParams: '',
             hfSearchMaxParams: '',
             hfSearchMaxSize: '',
@@ -271,7 +270,7 @@
 
             // Computed: check if any filters are active
             get hfSearchFiltersActive() {
-                return this.hfSearchQuant || this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
+                return this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
             },
 
             // Search history
@@ -4088,10 +4087,18 @@
                 try {
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
-                        this.hfRecommended = await response.json();
+                        const data = await response.json();
+                        // Attach original rank so the # column survives column-header re-sorts
+                        this.hfRecommended = {
+                            trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                            popular: (data.popular || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                        };
                         this.hfRecommendedLoaded = true;
                         this.hfPage.trending = 1;
                         this.hfPage.popular = 1;
+                        // Default sort for trending/popular is original rank
+                        this.hfTableSort = 'rank';
+                        this.hfTableSortDir = 'asc';
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -4138,7 +4145,9 @@
                 const sortBy = this.hfTableSort;
                 const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
                 return [...list].sort((a, b) => {
-                    if (sortBy === 'name') {
+                    if (sortBy === 'rank') {
+                        return dir * ((a.rank || 0) - (b.rank || 0));
+                    } else if (sortBy === 'name') {
                         return dir * (a.name || '').localeCompare(b.name || '');
                     } else if (sortBy === 'downloads') {
                         return dir * ((a.downloads || 0) - (b.downloads || 0));
@@ -4158,7 +4167,8 @@
                     this.hfTableSortDir = this.hfTableSortDir === 'asc' ? 'desc' : 'asc';
                 } else {
                     this.hfTableSort = column;
-                    this.hfTableSortDir = column === 'name' ? 'asc' : 'desc';
+                    // Name and rank read more naturally as ascending by default
+                    this.hfTableSortDir = (column === 'name' || column === 'rank') ? 'asc' : 'desc';
                 }
             },
 
@@ -4224,11 +4234,9 @@
                         limit: '100',
                         mlx_only: this.hfMlxOnly,
                     });
-                    // Add filter parameters if set. Sizes are decimal GB → bytes
-                    // for the slider input, while min/max use binary GiB to match
+                    // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.
                     const GIB = 1024 * 1024 * 1024;
-                    if (this.hfSearchQuant) params.set('quant', this.hfSearchQuant);
                     if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
                     if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
                     if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * GIB).toString());
@@ -4272,7 +4280,6 @@
             },
 
             clearHFSearchFilters() {
-                this.hfSearchQuant = '';
                 this.hfSearchMinParams = '';
                 this.hfSearchMaxParams = '';
                 this.hfSearchMaxSize = '';

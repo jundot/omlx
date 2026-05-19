@@ -4300,7 +4300,6 @@ async def search_hf_models(
     limit: int = 100,
     mlx_only: bool = True,
     # Filtering
-    quant: str = "",
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
     min_size: Optional[int] = None,  # bytes
@@ -4317,7 +4316,6 @@ async def search_hf_models(
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
         mlx_only: Restrict to MLX library models
-        quant: Filter by quantization (e.g., '4bit', '8bit', 'bf16', 'fp16')
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -4336,7 +4334,6 @@ async def search_hf_models(
             sort=sort,
             limit=min(limit, 100),
             mlx_only=mlx_only,
-            quant=quant or None,
             min_params=min_params,
             max_params=max_params,
             min_size=min_size,

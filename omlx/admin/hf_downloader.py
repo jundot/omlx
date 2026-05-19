@@ -99,21 +99,6 @@ _DTYPE_BYTES = {
     "BOOL": 1,
 }
 
-# Quantization dtype mapping for display labels
-_DTYPE_TO_QUANT = {
-    "BF16": "bf16",
-    "F16": "fp16",
-    "F32": "fp32",
-    "Q8": "int8",
-    "Q4": "int4",
-    "Q2": "int2",
-    "Q6_K": "int6",
-    "Q5_K": "int5",
-    "Q4_K": "int4",
-    "Q3_K": "int3",
-    "Q2_K": "int2",
-}
-
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
@@ -170,55 +155,6 @@ _SORT_MAP = {
     "largest": "downloads",  # fetch by downloads, re-sort by size in Python
     "smallest": "downloads",  # fetch by downloads, re-sort by size in Python
 }
-
-
-# UI filter values normalize to detected labels (4bit → int4, etc.)
-_QUANT_ALIASES = {
-    "4bit": "int4",
-    "8bit": "int8",
-    "4-bit": "int4",
-    "8-bit": "int8",
-}
-
-
-def _detect_quantization(safetensors: Optional[dict], repo_id: str) -> Optional[str]:
-    """Detect quantization type from model name or safetensors dtype.
-
-    Model name is checked first as it's more reliable for MLX models
-    (safetensors metadata often shows F16 even for quantized models).
-
-    Args:
-        safetensors: Safetensors metadata dict with 'parameters' key.
-        repo_id: Full model repo ID (e.g., 'mlx-community/Llama-3-8B-4bit-MLX')
-
-    Returns:
-        Quantization label string (e.g., 'int4', 'int8', 'bf16', 'fp16') or None.
-    """
-    # Check model name first (more reliable for MLX quantized models)
-    name_lower = repo_id.lower()
-    # Check for explicit quant suffixes (8bit, 4bit, q4_k, etc.)
-    for label in ["8bit", "4bit", "16bit", "8-bit", "4-bit", "16-bit", "q8_k", "q4_k", "q6_k", "q4", "q8"]:
-        if label in name_lower:
-            if "8" in label:
-                return "int8"
-            elif "4" in label:
-                return "int4"
-            elif "16" in label:
-                return "fp16"
-    # Note: We don't infer quantization from bare 8B/4B/etc. parameter counts
-    # as these indicate model size, not quantization (e.g., "Llama-3-8B" = 8B params)
-
-    # Fallback: check safetensors dtype. Quantized models often have BF16 norms
-    # coexisting with Q* weights, so Q* takes precedence over the dict ordering.
-    if safetensors and safetensors.get("parameters"):
-        dtypes = list(safetensors["parameters"].keys())
-        for dtype in dtypes:
-            if dtype.startswith("Q") and dtype in _DTYPE_TO_QUANT:
-                return _DTYPE_TO_QUANT[dtype]
-        if dtypes and dtypes[0] in _DTYPE_TO_QUANT:
-            return _DTYPE_TO_QUANT[dtypes[0]]
-
-    return None
 
 
 class HFDownloader:
@@ -278,7 +214,6 @@ class HFDownloader:
                 if size <= 0 or size > max_memory_bytes:
                     continue
                 params = _get_param_count(m.safetensors)
-                quantization = _detect_quantization(m.safetensors, m.id)
                 results.append(
                     {
                         "repo_id": m.id,
@@ -292,7 +227,6 @@ class HFDownloader:
                         "params_formatted": (
                             _format_param_count(params) if params > 0 else None
                         ),
-                        "quantization": quantization,
                     }
                 )
             return results
@@ -314,7 +248,6 @@ class HFDownloader:
         limit: int = 100,
         mlx_only: bool = True,
         # Filtering options
-        quant: Optional[str] = None,
         min_params: Optional[int] = None,
         max_params: Optional[int] = None,
         min_size: Optional[int] = None,
@@ -333,7 +266,6 @@ class HFDownloader:
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
             mlx_only: If True, restrict to MLX library models only.
-            quant: Filter by quantization type (e.g., '4bit', '8bit', 'bf16', 'fp16').
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
@@ -372,35 +304,15 @@ class HFDownloader:
             params = None
             params_formatted = None
             size = 0
-            quantization = None
 
             if m.safetensors and m.safetensors.get("parameters"):
                 params = _get_param_count(m.safetensors)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(m.safetensors)
-                quantization = _detect_quantization(m.safetensors, m.id)
                 if params and params <= 0:
                     params = None
-            else:
-                # Still try to detect quantization from model name
-                quantization = _detect_quantization(None, m.id)
 
             # Apply filters
-            if quant:
-                quant_lower = quant.lower()
-                # UI filter labels (4bit/8bit) → detected labels (int4/int8)
-                normalized_quant = _QUANT_ALIASES.get(quant_lower, quant_lower)
-                name_lower = m.id.lower()
-                quant_match = False
-
-                if quantization and normalized_quant == quantization.lower():
-                    quant_match = True
-                elif quant_lower in name_lower:
-                    quant_match = True
-
-                if not quant_match:
-                    continue
-
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
@@ -421,7 +333,6 @@ class HFDownloader:
                     "size_formatted": _format_model_size(size) if size > 0 else "",
                     "params": params,
                     "params_formatted": params_formatted,
-                    "quantization": quantization,
                 }
             )
 
@@ -484,7 +395,6 @@ class HFDownloader:
         params = None
         params_formatted = None
         size = 0
-        quantization = None
         safetensors = getattr(info, "safetensors", None)
         if safetensors:
             st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
@@ -492,7 +402,6 @@ class HFDownloader:
                 params = _get_param_count(st_dict)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(st_dict)
-                quantization = _detect_quantization(st_dict, repo_id)
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -536,7 +445,6 @@ class HFDownloader:
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
             "is_adapter": is_adapter,
-            "quantization": quantization,
         }
 
     def __init__(

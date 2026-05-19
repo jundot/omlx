@@ -224,9 +224,10 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.search.section_label') }}</span>
                             </div>
                             <div class="px-6 py-5">
-                                <div class="flex items-center gap-3">
+                                <!-- Mobile: input on its own row, then sort+button row. Desktop: all inline -->
+                                <div class="flex flex-col md:flex-row md:items-center gap-3">
                                     <!-- Search input with history -->
-                                    <div class="flex-1 relative">
+                                    <div class="md:flex-1 relative">
                                         <input type="text" x-model="hfSearchQuery"
                                                @input="debounceSearch()"
                                                @keydown.enter="if (!$event.isComposing && $event.keyCode !== 229) immediateSearch()"
@@ -249,32 +250,35 @@
                                             </template>
                                         </div>
                                     </div>
-                                    <!-- Sort dropdown -->
-                                    <div class="w-52">
-                                        <select x-model="hfSearchSort"
-                                                @change="if (hfSearchQuery.trim()) immediateSearch()"
-                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
-                                                       focus:ring-2 focus:ring-neutral-900 focus:border-transparent
-                                                       transition-all bg-white appearance-none cursor-pointer">
-                                            <option value="trending">{{ t('models.search.sort.trending') }}</option>
-                                            <option value="downloads">{{ t('models.search.sort.downloads') }}</option>
-                                            <option value="created">{{ t('models.search.sort.created') }}</option>
-                                            <option value="updated">{{ t('models.search.sort.updated') }}</option>
-                                            <option value="most_params">{{ t('models.search.sort.most_params') }}</option>
-                                            <option value="least_params">{{ t('models.search.sort.least_params') }}</option>
-                                            <option value="largest">{{ t('models.search.sort.largest') }}</option>
-                                            <option value="smallest">{{ t('models.search.sort.smallest') }}</option>
-                                        </select>
+                                    <!-- Sort + Search button row (always side-by-side; full row on mobile) -->
+                                    <div class="flex items-center gap-3">
+                                        <!-- Sort dropdown -->
+                                        <div class="flex-1 md:flex-none md:w-52">
+                                            <select x-model="hfSearchSort"
+                                                    @change="if (hfSearchQuery.trim()) immediateSearch()"
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
+                                                           focus:ring-2 focus:ring-neutral-900 focus:border-transparent
+                                                           transition-all bg-white appearance-none cursor-pointer">
+                                                <option value="trending">{{ t('models.search.sort.trending') }}</option>
+                                                <option value="downloads">{{ t('models.search.sort.downloads') }}</option>
+                                                <option value="created">{{ t('models.search.sort.created') }}</option>
+                                                <option value="updated">{{ t('models.search.sort.updated') }}</option>
+                                                <option value="most_params">{{ t('models.search.sort.most_params') }}</option>
+                                                <option value="least_params">{{ t('models.search.sort.least_params') }}</option>
+                                                <option value="largest">{{ t('models.search.sort.largest') }}</option>
+                                                <option value="smallest">{{ t('models.search.sort.smallest') }}</option>
+                                            </select>
+                                        </div>
+                                        <!-- Search button -->
+                                        <button @click="immediateSearch()"
+                                                :disabled="hfSearchLoading || !hfSearchQuery.trim()"
+                                                class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
+                                                       hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed
+                                                       flex items-center gap-2 whitespace-nowrap">
+                                            <i data-lucide="search" class="w-4 h-4"></i>
+                                            {{ t('models.search.button') }}
+                                        </button>
                                     </div>
-                                    <!-- Search button -->
-                                    <button @click="immediateSearch()"
-                                            :disabled="hfSearchLoading || !hfSearchQuery.trim()"
-                                            class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-semibold rounded-full
-                                                   hover:bg-neutral-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed
-                                                   flex items-center gap-2 whitespace-nowrap">
-                                        <i data-lucide="search" class="w-4 h-4"></i>
-                                        {{ t('models.search.button') }}
-                                    </button>
                                 </div>
                                 <!-- Filter toggles -->
                                 <div class="mt-3 flex items-center gap-2">
@@ -291,20 +295,7 @@
                                 </div>
                                 <!-- Filter panel -->
                                 <div x-show="hfSearchFiltersOpen" x-cloak class="mt-3 p-4 bg-neutral-50 rounded-xl border border-neutral-200">
-                                    <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
-                                        <!-- Quantization filter -->
-                                        <div>
-                                            <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.search.filter.quant') }}</label>
-                                            <select x-model="hfSearchQuant"
-                                                    @change="if (hfSearchQuery.trim()) immediateSearch()"
-                                                    class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                                <option value="">{{ t('models.search.filter.any') }}</option>
-                                                <option value="4bit">{{ t('models.search.filter.quant_4bit') }}</option>
-                                                <option value="8bit">{{ t('models.search.filter.quant_8bit') }}</option>
-                                                <option value="bf16">{{ t('models.search.filter.quant_bf16') }}</option>
-                                                <option value="fp16">{{ t('models.search.filter.quant_fp16') }}</option>
-                                            </select>
-                                        </div>
+                                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                                         <!-- Min Params -->
                                         <div>
                                             <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.search.filter.min_params') }}</label>
@@ -353,7 +344,7 @@
                                     <!-- Clear filters -->
                                     <div class="mt-3 flex justify-end">
                                         <button @click="clearHFSearchFilters()"
-                                                x-show="hfSearchQuant || hfSearchMinParams || hfSearchMaxParams || hfSearchMinSize || hfSearchMaxSize"
+                                                x-show="hfSearchMinParams || hfSearchMaxParams || hfSearchMinSize || hfSearchMaxSize"
                                                 x-cloak
                                                 class="text-xs text-neutral-500 hover:text-neutral-700 underline">
                                             {{ t('models.search.filter.clear') }}
@@ -378,14 +369,14 @@
                                     </label>
                                 </div>
                                 <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
-                                    <button @click="hfRecommendedTab = 'trending'; hfPage.trending = 1"
+                                    <button @click="hfRecommendedTab = 'trending'; hfPage.trending = 1; hfTableSort = 'rank'; hfTableSortDir = 'asc'"
                                             :class="hfRecommendedTab === 'trending'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
                                             class="px-3 py-1 text-xs font-medium rounded-md transition-all">
                                         {{ t('models.browse.tab.trending') }}
                                     </button>
-                                    <button @click="hfRecommendedTab = 'popular'; hfPage.popular = 1"
+                                    <button @click="hfRecommendedTab = 'popular'; hfPage.popular = 1; hfTableSort = 'rank'; hfTableSortDir = 'asc'"
                                             :class="hfRecommendedTab === 'popular'
                                                 ? 'bg-white text-neutral-900 shadow-sm'
                                                 : 'text-neutral-500 hover:text-neutral-700'"
@@ -429,8 +420,17 @@
                                         <table class="w-full">
                                             <thead>
                                                 <tr class="border-b border-neutral-200">
+                                                    <th class="max-md:hidden px-4 py-3 text-left w-12">
+                                                        <button @click="toggleTableSort('rank')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                            #
+                                                            <span x-show="hfTableSort === 'rank'" class="text-neutral-700">
+                                                                <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
+                                                                <i x-show="hfTableSortDir === 'desc'" data-lucide="chevron-down" class="w-3 h-3"></i>
+                                                            </span>
+                                                        </button>
+                                                    </th>
                                                     <th class="px-4 py-3 text-left">
-                                                        <button @click="toggleTableSort('name')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                        <button @click="toggleTableSort('name')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                             {{ t('models.table.name') }}
                                                             <span x-show="hfTableSort === 'name'" class="text-neutral-700">
                                                                 <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -438,13 +438,8 @@
                                                             </span>
                                                         </button>
                                                     </th>
-                                                    <th class="px-4 py-3 text-left">
-                                                        <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">
-                                                            {{ t('models.table.quantization') }}
-                                                        </span>
-                                                    </th>
-                                                    <th class="px-4 py-3 text-left">
-                                                        <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                    <th class="max-md:hidden px-4 py-3 text-left">
+                                                        <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                             {{ t('models.table.size') }}
                                                             <span x-show="hfTableSort === 'size'" class="text-neutral-700">
                                                                 <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -452,8 +447,8 @@
                                                             </span>
                                                         </button>
                                                     </th>
-                                                    <th class="px-4 py-3 text-left">
-                                                        <button @click="toggleTableSort('downloads')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                    <th class="max-md:hidden px-4 py-3 text-left">
+                                                        <button @click="toggleTableSort('downloads')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                             {{ t('models.table.downloads') }}
                                                             <span x-show="hfTableSort === 'downloads'" class="text-neutral-700">
                                                                 <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -461,8 +456,8 @@
                                                             </span>
                                                         </button>
                                                     </th>
-                                                    <th class="px-4 py-3 text-left">
-                                                        <button @click="toggleTableSort('likes')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                    <th class="max-md:hidden px-4 py-3 text-left">
+                                                        <button @click="toggleTableSort('likes')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                             {{ t('models.table.likes') }}
                                                             <span x-show="hfTableSort === 'likes'" class="text-neutral-700">
                                                                 <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -470,8 +465,8 @@
                                                             </span>
                                                         </button>
                                                     </th>
-                                                    <th class="px-4 py-3 text-center">{{ t('models.table.action') }}</th>
-</tr>
+                                                    <th class="max-md:hidden px-4 py-3"></th>
+                                                </tr>
                                             </thead>
                                             <tbody class="divide-y divide-neutral-100">
                                                 <template x-if="getPagedModels(hfRecommendedTab).length === 0">
@@ -483,21 +478,49 @@
                                                 </template>
                                                 <template x-for="model in getPagedModels(hfRecommendedTab)" :key="model.repo_id">
                                                     <tr class="hover:bg-neutral-50 transition-colors">
+                                                        <td class="max-md:hidden px-4 py-3 text-xs text-neutral-400 tabular-nums" x-text="model.rank"></td>
                                                         <td class="px-4 py-3">
+                                                            <!-- Mobile: name with #rank prefix -->
+                                                            <div class="flex items-center gap-2 md:hidden">
+                                                                <span class="text-xs text-neutral-400 tabular-nums" x-text="'#' + model.rank"></span>
+                                                                <button @click="openModelDetail(model.repo_id)"
+                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer flex-1 min-w-0" x-text="model.name"></button>
+                                                            </div>
+                                                            <!-- Desktop: name -->
                                                             <button @click="openModelDetail(model.repo_id)"
-                                                                    class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer max-w-[200px] lg:max-w-[300px]" x-text="model.name"></button>
-                                                            <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                    class="max-md:hidden block text-sm font-medium text-neutral-900 hover:text-blue-600 truncate transition-colors text-left cursor-pointer max-w-[200px] lg:max-w-[300px]" x-text="model.name"></button>
+                                                            <!-- Desktop: only params shown below name -->
+                                                            <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                            <!-- Mobile: inline params + size + downloads + likes -->
+                                                            <div class="md:hidden flex items-center gap-2 flex-wrap mt-0.5 text-xs text-neutral-400">
+                                                                <span x-show="model.params" x-cloak x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                <span x-show="model.size > 0" x-cloak x-text="model.size_formatted"></span>
+                                                                <span x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                                <span x-text="'&#9829; ' + model.likes"></span>
+                                                            </div>
+                                                            <!-- Mobile: badge + download button on their own row -->
+                                                            <div class="md:hidden flex items-center gap-2 mt-2">
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
+                                                                    {{ t('models.browse.tight_fit') }}
+                                                                </span>
+                                                                <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                                      class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
+                                                                    {{ t('models.browse.high_oom_risk') }}
+                                                                </span>
+                                                                <button @click="downloadRecommended(model.repo_id)"
+                                                                        :disabled="hfDownloading"
+                                                                        class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
+                                                                    <i data-lucide="download" class="w-3 h-3"></i>
+                                                                    {{ t('models.downloader.download_button') }}
+                                                                </button>
+                                                            </div>
                                                         </td>
-                                                        <td class="px-4 py-3">
-                                                            <span x-show="model.quantization"
-                                                                  class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full bg-blue-100 text-blue-700"
-                                                                  x-text="model.quantization"></span>
-                                                        </td>
-                                                        <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size_formatted"></td>
-                                                        <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
-                                                        <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
-                                                        <td class="px-4 py-3">
-                                                            <div class="flex justify-center items-center gap-2">
+                                                        <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size_formatted"></td>
+                                                        <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
+                                                        <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
+                                                        <td class="max-md:hidden px-4 py-3">
+                                                            <div class="flex justify-end items-center gap-2">
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
                                                                       class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
                                                                     {{ t('models.browse.tight_fit') }}
@@ -558,7 +581,7 @@
                                                 <thead>
                                                     <tr class="border-b border-neutral-200">
                                                         <th class="px-4 py-3 text-left">
-                                                            <button @click="toggleTableSort('name')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                            <button @click="toggleTableSort('name')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                                 {{ t('models.table.name') }}
                                                                 <span x-show="hfTableSort === 'name'" class="text-neutral-700">
                                                                     <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -566,13 +589,8 @@
                                                                 </span>
                                                             </button>
                                                         </th>
-                                                        <th class="px-4 py-3 text-left">
-                                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">
-                                                                {{ t('models.table.quantization') }}
-                                                            </span>
-                                                        </th>
-                                                        <th class="px-4 py-3 text-left">
-                                                            <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                        <th class="max-md:hidden px-4 py-3 text-left">
+                                                            <button @click="toggleTableSort('size')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                                 {{ t('models.table.size') }}
                                                                 <span x-show="hfTableSort === 'size'" class="text-neutral-700">
                                                                     <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -580,8 +598,8 @@
                                                                 </span>
                                                             </button>
                                                         </th>
-                                                        <th class="px-4 py-3 text-left">
-                                                            <button @click="toggleTableSort('downloads')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                        <th class="max-md:hidden px-4 py-3 text-left">
+                                                            <button @click="toggleTableSort('downloads')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                                 {{ t('models.table.downloads') }}
                                                                 <span x-show="hfTableSort === 'downloads'" class="text-neutral-700">
                                                                     <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -589,8 +607,8 @@
                                                                 </span>
                                                             </button>
                                                         </th>
-                                                        <th class="px-4 py-3 text-left">
-                                                            <button @click="toggleTableSort('likes')" class="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
+                                                        <th class="max-md:hidden px-4 py-3 text-left">
+                                                            <button @click="toggleTableSort('likes')" class="flex items-center gap-1 text-xs font-bold uppercase tracking-wider text-neutral-500 hover:text-neutral-900 transition-colors">
                                                                 {{ t('models.table.likes') }}
                                                                 <span x-show="hfTableSort === 'likes'" class="text-neutral-700">
                                                                     <i x-show="hfTableSortDir === 'asc'" data-lucide="chevron-up" class="w-3 h-3"></i>
@@ -598,7 +616,7 @@
                                                                 </span>
                                                             </button>
                                                         </th>
-                                                        <th class="px-4 py-3 text-center">{{ t('models.table.action') }}</th>
+                                                        <th class="max-md:hidden px-4 py-3"></th>
                                                     </tr>
                                                 </thead>
                                                 <tbody class="divide-y divide-neutral-100">
@@ -607,18 +625,38 @@
                                                             <td class="px-4 py-3">
                                                                 <button @click="openModelDetail(model.repo_id)"
                                                                         class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[200px] lg:max-w-[300px]" x-text="model.repo_id"></button>
-                                                                <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                <!-- Desktop: only params shown below name -->
+                                                                <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                <!-- Mobile: inline params + size + downloads + likes -->
+                                                                <div class="md:hidden flex items-center gap-2 flex-wrap mt-0.5 text-xs text-neutral-400">
+                                                                    <span x-show="model.params" x-cloak x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
+                                                                    <span x-show="model.size > 0" x-cloak x-text="model.size_formatted"></span>
+                                                                    <span x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
+                                                                    <span x-text="'&#9829; ' + model.likes"></span>
+                                                                </div>
+                                                                <!-- Mobile: badge + download button on their own row -->
+                                                                <div class="md:hidden flex items-center gap-2 mt-2">
+                                                                    <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
+                                                                          class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
+                                                                        {{ t('models.browse.tight_fit') }}
+                                                                    </span>
+                                                                    <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
+                                                                          class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-red-50 text-red-700 border border-red-200 shrink-0">
+                                                                        {{ t('models.browse.high_oom_risk') }}
+                                                                    </span>
+                                                                    <button @click="downloadRecommended(model.repo_id)"
+                                                                            :disabled="hfDownloading"
+                                                                            class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
+                                                                        <i data-lucide="download" class="w-3 h-3"></i>
+                                                                        {{ t('models.downloader.download_button') }}
+                                                                    </button>
+                                                                </div>
                                                             </td>
-                                                            <td class="px-4 py-3">
-                                                                <span x-show="model.quantization"
-                                                                      class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full bg-blue-100 text-blue-700"
-                                                                      x-text="model.quantization"></span>
-                                                            </td>
-                                                            <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size > 0 ? model.size_formatted : '-'"></td>
-                                                            <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
-                                                            <td class="px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
-                                                            <td class="px-4 py-3">
-                                                                <div class="flex justify-center items-center gap-2">
+                                                            <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.size > 0 ? model.size_formatted : '-'"></td>
+                                                            <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="formatDownloads(model.downloads)"></td>
+                                                            <td class="max-md:hidden px-4 py-3 text-xs text-neutral-500 whitespace-nowrap" x-text="model.likes"></td>
+                                                            <td class="max-md:hidden px-4 py-3">
+                                                                <div class="flex justify-end items-center gap-2">
                                                                     <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
                                                                           class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200 shrink-0">
                                                                         {{ t('models.browse.tight_fit') }}
