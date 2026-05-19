@@ -2272,6 +2272,7 @@ class TestMeasureSensitivityVlmMtp:
     def _patch_common(self, monkeypatch, has_mtp, prev_active=False):
         from omlx import oq as oq_mod
 
+        mock_apply_patch = MagicMock()
         mock_apply_runtime = MagicMock()
         mock_set_active = MagicMock()
         mock_is_active = MagicMock(return_value=prev_active)
@@ -2289,7 +2290,10 @@ class TestMeasureSensitivityVlmMtp:
         )
         monkeypatch.setitem(
             sys.modules, "omlx.patches.mlx_vlm_mtp",
-            MagicMock(apply_mlx_vlm_mtp_runtime_patch=mock_apply_runtime),
+            MagicMock(
+                apply_mlx_vlm_mtp_patch=mock_apply_patch,
+                apply_mlx_vlm_mtp_runtime_patch=mock_apply_runtime,
+            ),
         )
         monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
         monkeypatch.setitem(
@@ -2305,11 +2309,11 @@ class TestMeasureSensitivityVlmMtp:
             oq_mod, "_measure_sensitivity_from_model",
             MagicMock(return_value={0: 0.1}),
         )
-        return mock_apply_runtime, mock_set_active
+        return mock_apply_patch, mock_apply_runtime, mock_set_active
 
     def test_vlm_with_mtp_heads_attaches_head(self, monkeypatch):
         """VLM + MTP heads → runtime patch applied, mtp_active toggled True for load."""
-        mock_apply_runtime, mock_set_active = self._patch_common(
+        mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
             monkeypatch, has_mtp=True,
         )
 
@@ -2318,6 +2322,7 @@ class TestMeasureSensitivityVlmMtp:
         )
 
         assert result == {0: 0.1}
+        mock_apply_patch.assert_called_once()
         mock_apply_runtime.assert_called_once()
         assert mock_set_active.call_args_list[0] == ((True,),)
         assert mock_set_active.call_args_list[-1] == ((False,),)
@@ -2325,7 +2330,7 @@ class TestMeasureSensitivityVlmMtp:
     @pytest.mark.parametrize("prev_active", [False, True])
     def test_mtp_active_restored_after_load(self, monkeypatch, prev_active):
         """The previous mtp_active state is restored once the load returns."""
-        _, mock_set_active = self._patch_common(
+        _, _, mock_set_active = self._patch_common(
             monkeypatch, has_mtp=True, prev_active=prev_active,
         )
 
@@ -2335,18 +2340,19 @@ class TestMeasureSensitivityVlmMtp:
 
     def test_vlm_without_mtp_heads_no_toggle(self, monkeypatch):
         """VLM without MTP heads → no runtime patch, no mtp_active toggle."""
-        mock_apply_runtime, mock_set_active = self._patch_common(
+        mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
             monkeypatch, has_mtp=False,
         )
 
         _measure_sensitivity("/fake/vlm", {"vision_config": {}}, 6)
 
+        mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
         mock_set_active.assert_not_called()
 
     def test_text_model_no_vlm_toggle(self, monkeypatch):
         """Text checkpoint → VLM MTP toggling is skipped entirely."""
-        mock_apply_runtime, mock_set_active = self._patch_common(
+        mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
             monkeypatch, has_mtp=True,
         )
         monkeypatch.setitem(
@@ -2356,6 +2362,7 @@ class TestMeasureSensitivityVlmMtp:
 
         _measure_sensitivity("/fake/text", {}, 6)
 
+        mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
         mock_set_active.assert_not_called()
 
