@@ -26,6 +26,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -648,6 +649,9 @@ class PagedSSDCacheManager(CacheManager):
             "hot_cache_hits": 0,
             "hot_cache_evictions": 0,
             "hot_cache_promotions": 0,
+            "preload_calls": 0,
+            "preload_blocks_loaded": 0,
+            "preload_time_ms": 0.0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -1980,6 +1984,104 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._pending_write_buffers:
                 return True
         return False
+
+    def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
+        """
+        Parallel-load matched blocks from SSD into hot cache.
+
+        For cold-start optimization: loads blocks that exist on SSD but not
+        in hot cache, using parallel I/O. After preload, subsequent
+        load_block() / load_block_with_metadata() calls hit hot cache (~0ms)
+        instead of SSD (~2ms per block).
+
+        Individual block failures are non-fatal (logged and skipped).
+
+        Args:
+            block_hashes: Block hashes confirmed as cache hits.
+
+        Returns:
+            Number of blocks successfully loaded into hot cache.
+        """
+        if not self._hot_cache_enabled:
+            return 0
+
+        if not HAS_MLX:
+            return 0
+
+        # Filter to blocks that need loading: in SSD index but not hot cache
+        to_load = []
+        for bh in block_hashes:
+            metadata = self._index.get(bh)
+            if metadata is None:
+                continue
+            if self._hot_cache_get(bh) is not None:
+                continue
+            to_load.append((bh, metadata))
+
+        if len(to_load) < 4:
+            return 0
+
+        # Guard: don't preload more than available hot cache capacity.
+        # If we preload N blocks but hot cache can only hold M < N,
+        # blocks evict each other and reconstruct_cache falls back to SSD.
+        # CPD-accepted (GLM L1).
+        available = self._hot_cache_max_bytes - self._hot_cache_total_bytes
+        if available <= 0:
+            return 0
+
+        # Cap workers to limit peak memory (each load allocates ~122-275MB).
+        # 8 workers ≈ 1.4GB peak, vs 2.8GB at 16. CPD-accepted (G1/Q3).
+        start = time.perf_counter()
+        loaded_count = 0
+        max_workers = min(8, len(to_load))
+
+        def _load_one(block_hash: bytes, metadata: PagedSSDBlockMetadata) -> bool:
+            file_path = metadata.file_path
+            if not file_path.exists():
+                return False
+            try:
+                arrays, file_metadata = mx.load(
+                    str(file_path), return_metadata=True
+                )
+                if (
+                    file_metadata
+                    and file_metadata.get("omlx_cache_format_version")
+                    not in _READABLE_CACHE_FORMAT_VERSIONS
+                ):
+                    return False
+                self._promote_to_hot_cache(
+                    block_hash, arrays, file_metadata, metadata
+                )
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Preload failed for block {block_hash.hex()[:16]}: {e}"
+                )
+                return False
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_load_one, bh, meta): bh
+                for bh, meta in to_load
+            }
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        loaded_count += 1
+                except Exception:
+                    pass
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        self._stats["preload_calls"] += 1
+        self._stats["preload_blocks_loaded"] += loaded_count
+        self._stats["preload_time_ms"] += elapsed_ms
+
+        if loaded_count > 0:
+            logger.info(
+                f"Preloaded {loaded_count}/{len(to_load)} blocks into hot cache "
+                f"(workers={max_workers}, time={elapsed_ms:.1f}ms)"
+            )
+        return loaded_count
 
     def delete_block(self, block_hash: bytes) -> bool:
         """

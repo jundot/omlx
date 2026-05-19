@@ -1365,6 +1365,36 @@ class BlockAwarePrefixCache(CacheManager):
 
         return forked_table
 
+    def preload_blocks(self, block_table: BlockTable) -> int:
+        """
+        Pre-load matched blocks from SSD into hot cache in parallel.
+
+        Call this between fetch_cache() and reconstruct_cache() to
+        convert cold-SSD reads into hot-cache hits. Warm-start requests
+        (blocks already in hot cache) return 0 with no I/O.
+
+        Args:
+            block_table: BlockTable from fetch_cache() containing matched block IDs.
+
+        Returns:
+            Number of blocks successfully preloaded into hot cache.
+        """
+        if self.paged_ssd_cache is None:
+            return 0
+        if not block_table or not block_table.block_ids:
+            return 0
+
+        block_hashes = []
+        for block_id in block_table.block_ids:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block and block.block_hash is not None:
+                block_hashes.append(block.block_hash)
+
+        if not block_hashes:
+            return 0
+
+        return self.paged_ssd_cache.preload_matched_blocks(block_hashes)
+
     def reconstruct_cache(
         self,
         block_table: BlockTable,

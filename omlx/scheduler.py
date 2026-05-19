@@ -3293,6 +3293,7 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
+                self.block_aware_cache.preload_blocks(block_table)
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
@@ -3798,6 +3799,7 @@ class Scheduler:
                         request.request_id, tokens_to_score
                     )
                     if block_table and block_table.num_tokens > 0:
+                        self._draft_prefix_cache.preload_blocks(block_table)
                         reconstructed = self._draft_prefix_cache.reconstruct_cache(
                             block_table
                         )
