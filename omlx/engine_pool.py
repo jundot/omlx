@@ -56,6 +56,7 @@ class EngineEntry:
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -499,6 +500,7 @@ class EnginePool:
         # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
+        entry.actual_size = None
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -599,6 +601,7 @@ class EnginePool:
         load_started_at = entry.loading_started_at
         load_completed = False
         entry.abort_loading = False
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -909,9 +912,14 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
+            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+            observed_delta = max(0, post_load_memory - pre_load_memory)
+            entry.actual_size = observed_delta or entry.estimated_size
+
             logger.info(
                 f"Loaded model: {model_id} "
-                f"(estimated: {format_size(entry.estimated_size)}, "
+                f"(actual: {format_size(entry.actual_size)}, "
+                f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
@@ -976,6 +984,11 @@ class EnginePool:
         return {
             "max_model_memory": self._max_model_memory,
             "current_model_memory": self._current_model_memory,
+            "current_model_memory_actual": sum(
+                (e.actual_size or e.estimated_size)
+                for e in self._entries.values()
+                if e.engine is not None
+            ),
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
@@ -988,6 +1001,7 @@ class EnginePool:
                     "is_loading": e.is_loading,
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
+                    "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,

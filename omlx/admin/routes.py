@@ -1613,6 +1613,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
             "estimated_size_formatted": format_size(model_info.get("estimated_size", 0)),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_default": server_state.default_model == model_id if server_state else False,
             "engine_type": model_info.get("engine_type", "batched"),
@@ -3734,11 +3740,23 @@ def _build_active_models_data() -> dict:
     from ..prefill_progress import get_prefill_tracker
 
     engine_pool = _get_engine_pool()
+    server_state = _get_server_state()
     if engine_pool is None:
         return {
             "models": [],
             "model_memory_used": 0,
             "model_memory_max": 0,
+            "model_memory_used_actual": 0,
+            "memory_pressure": {
+                "enabled": False,
+                "current_bytes": 0,
+                "soft_bytes": 0,
+                "hard_bytes": 0,
+                "current_formatted": "0.0GB",
+                "soft_formatted": "0.0GB",
+                "hard_formatted": "0.0GB",
+                "pressure_level": "ok",
+            },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
         }
@@ -3746,6 +3764,12 @@ def _build_active_models_data() -> dict:
     now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
+    enforcer = (
+        getattr(server_state, "process_memory_enforcer", None)
+        if server_state is not None
+        else None
+    )
+    enforcer_status = enforcer.get_status() if enforcer is not None else None
     models = []
     total_active = 0
     total_waiting = 0
@@ -3863,6 +3887,12 @@ def _build_active_models_data() -> dict:
             "estimated_size_formatted": format_size(
                 model_info.get("estimated_size", 0)
             ),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
             "loading_elapsed_seconds": loading_elapsed_seconds,
@@ -3883,6 +3913,45 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
         "model_memory_max": status.get("max_model_memory", 0),
+        "model_memory_used_actual": status.get("current_model_memory_actual", 0),
+        "memory_pressure": {
+            "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
+            "current_bytes": (
+                enforcer_status.get("current_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "soft_bytes": (
+                enforcer_status.get("soft_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "hard_bytes": (
+                enforcer_status.get("hard_bytes", 0)
+                if enforcer_status is not None
+                else 0
+            ),
+            "current_formatted": (
+                enforcer_status.get("current_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "soft_formatted": (
+                enforcer_status.get("soft_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "hard_formatted": (
+                enforcer_status.get("hard_formatted", "0.0GB")
+                if enforcer_status is not None
+                else "0.0GB"
+            ),
+            "pressure_level": (
+                enforcer_status.get("pressure_level", "ok")
+                if enforcer_status is not None
+                else "ok"
+            ),
+        },
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }

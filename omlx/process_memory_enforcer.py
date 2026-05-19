@@ -404,8 +404,15 @@ class ProcessMemoryEnforcer:
             "enabled": self._running,
             "max_bytes": self._max_bytes,
             "max_formatted": _format_gb(self._max_bytes),
+            "soft_threshold": self._soft_threshold,
+            "hard_threshold": self._hard_threshold,
+            "soft_bytes": self._soft_bytes,
+            "soft_formatted": _format_gb(self._soft_bytes),
+            "hard_bytes": self._hard_bytes,
+            "hard_formatted": _format_gb(self._hard_bytes),
             "current_bytes": current,
             "current_formatted": _format_gb(current),
+            "pressure_level": self._pressure_level if self._running else "ok",
             "utilization": (
                 current / self._max_bytes if self._max_bytes > 0 else 0.0
             ),
