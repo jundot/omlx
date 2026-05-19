@@ -2666,6 +2666,16 @@
         const stream = this.currentStream();
         if (!container) return;
 
+        // The stable/tail roots are a single shared DOM node across chats.
+        // If we last painted a different chat, wipe and re-render from scratch
+        // so the previous chat's stable portion doesn't leak into this one.
+        const activeChat = this.currentChatId || '';
+        if (container.dataset.streamChatId !== activeChat) {
+            container.innerHTML = '';
+            this.resetStreamRenderState(stream);
+            container.dataset.streamChatId = activeChat;
+        }
+
         if (!stream?.streamingContent) {
             container.innerHTML = '';
             this.resetStreamRenderState(stream);
