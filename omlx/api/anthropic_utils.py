@@ -151,8 +151,12 @@ def convert_anthropic_to_internal(
     Returns:
         List of {"role": str, "content": str or list}
     """
+    from .utils import _chat_template_supports_tool_role
+
     processed_messages: list[dict[str, Any]] = []
-    native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
+    native_tool_calling = bool(
+        tokenizer and _chat_template_supports_tool_role(tokenizer)
+    )
 
     # Handle system message (Anthropic has separate 'system' field)
     if request.system:

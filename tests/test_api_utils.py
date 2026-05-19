@@ -12,6 +12,7 @@ import pytest
 
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    _chat_template_supports_tool_role,
     _consolidate_system_messages,
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
@@ -2569,3 +2570,153 @@ class TestDropVoidAssistantMessages:
         assert result[1]["content"] == "reply"
         assert result[2]["role"] == "user"
         assert "c" in result[2]["content"] and "d" in result[2]["content"]
+
+
+class TestChatTemplateSupportsToolRole:
+    """Tests for the chat-template tool-role probe (issue #1290)."""
+
+    def test_returns_true_when_has_tool_calling_set(self):
+        """Tokenizers flagged by mlx-lm/mlx-vlm pass through immediately."""
+
+        class _Tok:
+            has_tool_calling = True
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_true_when_has_tool_calling_set_even_without_template(self):
+        """Trust the upstream flag even if chat_template attr is missing."""
+
+        class _Tok:
+            has_tool_calling = True
+            chat_template = None
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_true_for_template_with_tool_role_branch(self):
+        """Templates that branch on role == "tool" and emit tool_calls pass."""
+        template = (
+            "{%- for msg in messages %}"
+            '{%- if msg.role == "tool" %}<tool>{{ msg.content }}</tool>'
+            '{%- elif msg.role == "assistant" and msg.tool_calls %}'
+            "{%- for tc in msg.tool_calls %}<tool_call>{{ tc }}</tool_call>{%- endfor %}"
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_false_for_template_without_tool_role(self):
+        """Plain user/assistant templates must keep falling back to user."""
+        template = (
+            "{%- for msg in messages %}"
+            '{%- if msg.role == "user" %}USER: {{ msg.content }}'
+            '{%- elif msg.role == "assistant" %}AGENT: {{ msg.content }}'
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+    def test_returns_false_when_only_tool_role_present(self):
+        """Both the tool-role check and tool_calls must appear (false-positive guard)."""
+        template = '{%- if msg.role == "tool" %}{{ msg.content }}{%- endif %}'
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+    def test_returns_false_for_none_tokenizer(self):
+        assert _chat_template_supports_tool_role(None) is False
+
+    def test_returns_false_for_non_string_template(self):
+        """chat_template may be a callable in mlx-lm — treat as unsupported."""
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = lambda *a, **k: ""  # noqa: E731
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+
+class TestToolResultWithToolAwareTokenizer:
+    """Tool results are kept as role:tool when the probe matches (#1290)."""
+
+    @staticmethod
+    def _tool_aware_tokenizer():
+        class _Tok:
+            has_tool_calling = False
+            chat_template = (
+                '{%- if msg.role == "tool" %}{{ msg.content }}'
+                "{%- elif msg.tool_calls %}{{ msg.tool_calls }}{%- endif %}"
+            )
+
+        return _Tok()
+
+    def test_extract_text_content_preserves_tool_role(self):
+        messages = [
+            Message(
+                role="tool",
+                content='{"result": "ok"}',
+                tool_call_id="call_xyz",
+            )
+        ]
+        result = extract_text_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_xyz"
+        assert result[0]["content"] == '{"result": "ok"}'
+
+    def test_extract_multimodal_content_preserves_tool_role(self):
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "ok"}')],
+                tool_call_id="call_xyz",
+            )
+        ]
+        result = extract_multimodal_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_xyz"
+
+    def test_assistant_tool_calls_kept_structured(self):
+        messages = [
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "call_xyz",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Seoul"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result = extract_text_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        # Arguments are parsed into dict for the chat template.
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
+            "city": "Seoul"
+        }
