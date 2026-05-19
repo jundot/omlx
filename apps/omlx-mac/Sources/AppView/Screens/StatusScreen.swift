@@ -14,6 +14,9 @@ struct StatusScreen: View {
     @EnvironmentObject private var services: AppServices
     @StateObject private var vm = StatusScreenVM()
 
+    @State private var showingClearStatsConfirm = false
+    @State private var showingClearSsdCacheConfirm = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Same hero card the Server screen uses (omlx-screens.jsx:75
@@ -23,11 +26,22 @@ struct StatusScreen: View {
             ServerHeroCard()
 
             SectionHeader("Session Stats") {
-                Segmented(selection: $vm.scope, options: [
-                    ("session", "Session"),
-                    ("alltime", "All Time"),
-                ])
-                .frame(width: 160)
+                HStack(spacing: 10) {
+                    Segmented(selection: $vm.scope, options: [
+                        ("session", "Session"),
+                        ("alltime", "All Time"),
+                    ])
+                    .frame(width: 160)
+                    Button {
+                        showingClearStatsConfirm = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(.omlx(.plain, size: .small))
+                    .help(vm.scope == "alltime" ? "Clear all-time stats" : "Clear session stats")
+                    .disabled(vm.stats == nil)
+                }
             }
             StatTilesRow(stats: vm.stats)
 
@@ -60,6 +74,11 @@ struct StatusScreen: View {
                 }
             }
 
+            RuntimeCacheSection(
+                cache: vm.stats?.runtimeCache,
+                onClearTap: { showingClearSsdCacheConfirm = true }
+            )
+
             SectionHeader("Updates")
             UpdatesSection(updates: services.updates)
 
@@ -77,7 +96,102 @@ struct StatusScreen: View {
             await vm.start(client: services.client)
         }
         .onDisappear { vm.stop() }
+        .confirmationDialog(
+            vm.scope == "alltime"
+                ? "Clear all-time stats? This cannot be undone."
+                : "Clear session stats?",
+            isPresented: $showingClearStatsConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) {
+                Task { await vm.clearStats() }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Clear all SSD cache files? Loaded models will rebuild their KV cache on next prefill.",
+            isPresented: $showingClearSsdCacheConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) {
+                Task { await vm.clearSsdCache() }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
     }
+}
+
+// MARK: - Runtime Cache section
+
+/// File count + total size of the on-disk SSD KV cache, plus a `Clear`
+/// button. Mirrors HTML _status.html's "Runtime Cache Observability"
+/// panel — `total_num_files == 0` disables the clear button.
+private struct RuntimeCacheSection: View {
+    let cache: StatsDTO.RuntimeCacheDTO?
+    let onClearTap: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        SectionHeader("Runtime Cache", subtitle: subtitleText)
+        ListGroup {
+            Row(label: "Cache Files") {
+                Text(fileCountText)
+                    .font(.omlxMono(12))
+            }
+            Row(label: "Total Size") {
+                Text(sizeText)
+                    .font(.omlxMono(12))
+            }
+            if let dir = cache?.ssdCacheDir, !dir.isEmpty {
+                Row(label: "Location") {
+                    Text(dir)
+                        .font(.omlxMono(11))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 280, alignment: .trailing)
+                        .help(dir)
+                }
+            }
+            FreeRow(isLast: true) {
+                HStack {
+                    Spacer()
+                    Button("Clear SSD Cache", action: onClearTap)
+                        .buttonStyle(.omlx(.destructive, size: .small))
+                        .disabled((cache?.totalNumFiles ?? 0) == 0)
+                }
+            }
+        }
+    }
+
+    private var fileCountText: String {
+        guard let n = cache?.totalNumFiles else { return "—" }
+        return n == 1 ? "1 file" : "\(n) files"
+    }
+
+    private var sizeText: String {
+        guard let bytes = cache?.totalSizeBytes else { return "—" }
+        return formatByteCount(bytes)
+    }
+
+    private var subtitleText: String? {
+        guard let cache else { return nil }
+        let blocks = cache.effectiveBlockSizes ?? []
+        guard !blocks.isEmpty else { return nil }
+        let list = blocks.map(String.init).joined(separator: " · ")
+        return "Block size · \(list)"
+    }
+}
+
+/// Bytes → human-readable string. Mirrors `formatByteCount` in
+/// `omlx/admin/static/js/dashboard.js` — 1024-scaled, one decimal place.
+private func formatByteCount(_ bytes: Int64) -> String {
+    let b = Double(max(0, bytes))
+    if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
+    if b >= 1024 * 1024        { return String(format: "%.1f MB", b / (1024 * 1024)) }
+    if b >= 1024               { return String(format: "%.1f KB", b / 1024) }
+    return "\(Int(b.rounded())) B"
 }
 
 // MARK: - Stat tiles
@@ -538,6 +652,35 @@ final class StatusScreenVM: ObservableObject {
         do {
             self.stats = try await client.getStats(scope: scope)
             self.lastError = nil
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    /// Clear stats for the currently-displayed scope. Refreshes the tile
+    /// values immediately afterwards so the user sees the zeroed state
+    /// without waiting for the next poll.
+    func clearStats() async {
+        guard let client else { return }
+        do {
+            if scope == "alltime" {
+                try await client.clearAlltimeStats()
+            } else {
+                try await client.clearStats()
+            }
+            await tick()
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    /// Drop all SSD KV cache files (loaded models + direct disk sweep).
+    /// Refreshes stats so the Runtime Cache counters reset to zero.
+    func clearSsdCache() async {
+        guard let client else { return }
+        do {
+            _ = try await client.clearSsdCache()
+            await tick()
         } catch {
             self.lastError = describe(error)
         }
