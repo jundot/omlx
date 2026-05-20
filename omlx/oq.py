@@ -26,6 +26,8 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from omlx.model_discovery import _has_vision_subconfig
+
 logger = logging.getLogger(__name__)
 
 OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
@@ -3064,7 +3066,6 @@ def _measure_sensitivity(
     num_samples=32, seq_length=256,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
-    from omlx.model_discovery import _has_vision_subconfig
     from omlx.utils.model_loading import (
         _has_mtp_heads,
         maybe_apply_pre_load_patches,

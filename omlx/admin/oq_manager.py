@@ -22,6 +22,8 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from ..model_discovery import _has_vision_subconfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,7 +197,6 @@ class OQManager:
                                 or int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
                                 or int(tc.get("num_nextn_predict_layers", 0) or 0) > 0
                             )
-                            from ..model_discovery import _has_vision_subconfig
                             info = {
                                 "name": path.name,
                                 "path": str(path),
