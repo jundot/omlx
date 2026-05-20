@@ -3078,13 +3078,14 @@ def _measure_sensitivity(
 
     # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
     # for the text path: the patched qwen35_model.sanitize self-consistently
-    # strips mtp.* when no head is attached. The VLM path is different —
-    # mlx-vlm skips Model.sanitize entirely for MLX-format checkpoints, so
-    # the language_model.mtp.* weights stay in the dict. Without an attached
-    # MTP head load_weights(strict=True) then rejects them and the whole
-    # measurement silently returns {}. When the source declares MTP heads,
-    # attach the head for the load so the checkpoint matches the model.
-    # Sensitivity only reads backbone decoder layers, so this is load-only.
+    # strips mtp.* when no head is attached. The VLM path needs both patches.
+    # apply_mlx_vlm_mtp_patch fixes Model.sanitize so language_model.mtp.*
+    # weights survive the load with the correct keys (stock mlx-vlm sanitize
+    # strips them, which is what made the strict load fail with "Missing N
+    # parameters" and the measurement silently return {}). The runtime patch
+    # then attaches the MTP head so the checkpoint matches the model. Both
+    # are idempotent. Sensitivity only reads backbone decoder layers, so this
+    # is load-only.
     restore_mtp_active = None
     if is_vlm and _has_mtp_heads(config):
         try:
