@@ -4192,6 +4192,17 @@ class Scheduler:
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
+        # Clear stale uid mappings for every failed id. Running requests hold
+        # real uids; the in-flight orphan above holds the temp_uid assigned at
+        # _schedule_waiting (id(request)) that its success-path cleanup never
+        # reached. batch_generator is reset below, so these mappings are dead
+        # either way. failed_ids excludes _inflight_store_futures ids, so the
+        # async-cleanup uids that _drain_pending_async_removes still needs are
+        # left intact.
+        for rid in failed_ids:
+            uid = self.request_id_to_uid.pop(rid, None)
+            if uid is not None:
+                self.uid_to_request_id.pop(uid, None)
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None

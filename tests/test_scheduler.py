@@ -1691,6 +1691,12 @@ class TestCacheCorruptionRecovery:
         )
         # Orphan only: present in self.requests, absent from all three queues.
         scheduler.requests[orphan.request_id] = orphan
+        # _schedule_waiting assigns a temp_uid (id(request)) before prefill and
+        # only clears it on the success path, so an orphan leaves both uid maps
+        # populated.
+        temp_uid = id(orphan)
+        scheduler.request_id_to_uid[orphan.request_id] = temp_uid
+        scheduler.uid_to_request_id[temp_uid] = orphan.request_id
         assert orphan.request_id not in scheduler.waiting
         assert orphan.request_id not in scheduler.running
         assert orphan.request_id not in scheduler.prefilling
@@ -1699,6 +1705,9 @@ class TestCacheCorruptionRecovery:
 
         assert "req-orphan" in failed_ids
         assert "req-orphan" not in scheduler.requests
+        # Stale uid mappings for the orphan must be cleared too.
+        assert "req-orphan" not in scheduler.request_id_to_uid
+        assert temp_uid not in scheduler.uid_to_request_id
 
     def test_fail_all_requests_excludes_async_cleanup_in_flight(
         self, mock_model, mock_tokenizer
@@ -1727,12 +1736,19 @@ class TestCacheCorruptionRecovery:
         # self.requests + _inflight_store_futures, absent from all three queues.
         scheduler.requests[finished_pending_cleanup.request_id] = finished_pending_cleanup
         scheduler._inflight_store_futures[finished_pending_cleanup.request_id] = MagicMock()
+        # Its uid mapping is still live for _drain_pending_async_removes and
+        # must survive fail_all_requests untouched.
+        scheduler.request_id_to_uid[finished_pending_cleanup.request_id] = 999
+        scheduler.uid_to_request_id[999] = finished_pending_cleanup.request_id
 
         failed_ids = scheduler.fail_all_requests()
 
         assert "req-async-cleanup" not in failed_ids
         assert "req-async-cleanup" in scheduler.requests
         assert "req-async-cleanup" in scheduler._inflight_store_futures
+        # uid mapping preserved for the async drain.
+        assert scheduler.request_id_to_uid["req-async-cleanup"] == 999
+        assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
 
 
 class TestDetectNeedsThinkPrefix:
