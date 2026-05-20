@@ -4637,6 +4637,10 @@ async def delete_hf_model(
             pinned_models = settings_manager.get_pinned_model_ids()
 
         engine_pool._entries.pop(model_name, None)
+        # Release the deleted model's persisted settings (including its alias)
+        # so they can be reused by another model.
+        if settings_manager:
+            settings_manager.delete_settings(model_name)
         engine_pool.discover_models(
             [str(d) for d in model_dirs], pinned_models
         )

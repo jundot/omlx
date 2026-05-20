@@ -738,6 +738,8 @@ class TestHFDownloaderRoutes:
 
             assert not (model_dir_with_models / "model-a").exists()
             mock_pool.discover_models.assert_called_once()
+            # Deleted model's settings (alias etc.) must be released (issue #1321)
+            mock_settings_mgr.delete_settings.assert_called_once_with("model-a")
         finally:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool

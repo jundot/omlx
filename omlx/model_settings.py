@@ -387,6 +387,32 @@ class ModelSettingsManager:
 
             self._save()
 
+    def delete_settings(self, model_id: str) -> bool:
+        """Remove all persisted state for a model (settings + profiles).
+
+        Called when a model is deleted so its alias and other settings are
+        released and can be reused by another model.
+
+        Args:
+            model_id: The model identifier.
+
+        Returns:
+            True if any state was removed, False if nothing was stored.
+        """
+        with self._lock:
+            removed = False
+            if model_id in self._settings:
+                del self._settings[model_id]
+                self._save()
+                removed = True
+            if model_id in self._profiles:
+                del self._profiles[model_id]
+                self._save_profiles()
+                removed = True
+            if removed:
+                logger.info(f"Deleted settings for model '{model_id}'")
+            return removed
+
     def get_default_model_id(self) -> Optional[str]:
         """Get the ID of the default model.
 
