@@ -177,6 +177,7 @@ class TestTokenizerPatch:
     def test_fallback_on_max_position_embeddings_error(self, applied_patch):
         """The exact AttributeError that transformers raises when it cannot
         recognize deepseek_v4 must trigger a retry with PreTrainedConfig()."""
+        import pytest as _pytest
         from unittest.mock import patch as mock_patch
 
         from omlx.patches.deepseek_v4 import tokenizer_patch
@@ -196,7 +197,10 @@ class TestTokenizerPatch:
 
         with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
             wrapper = tokenizer_patch._build_wrapper()
-            result = wrapper.from_pretrained("/fake/path")
+            with _pytest.warns(
+                RuntimeWarning, match="Falling back to generic tokenizer config"
+            ):
+                result = wrapper.from_pretrained("/fake/path")
 
         assert result == "FALLBACK_OK"
         assert len(_FakeUpstream.calls) == 2
@@ -205,6 +209,7 @@ class TestTokenizerPatch:
 
     def test_fallback_on_deepseek_v4_value_error(self, applied_patch):
         """ValueError mentioning deepseek_v4 also triggers fallback."""
+        import pytest as _pytest
         from unittest.mock import patch as mock_patch
 
         from omlx.patches.deepseek_v4 import tokenizer_patch
@@ -221,7 +226,10 @@ class TestTokenizerPatch:
 
         with mock_patch("transformers.AutoTokenizer", _FakeUpstream):
             wrapper = tokenizer_patch._build_wrapper()
-            result = wrapper.from_pretrained("/fake/path")
+            with _pytest.warns(
+                RuntimeWarning, match="Falling back to generic tokenizer config"
+            ):
+                result = wrapper.from_pretrained("/fake/path")
 
         assert result == "FALLBACK_OK"
         assert len(_FakeUpstream.calls) == 2
