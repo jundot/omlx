@@ -25,6 +25,7 @@ from omlx.utils.model_loading import (
 # Patch orchestrator + sub-modules
 # ---------------------------------------------------------------------------
 
+
 class TestApplyOrchestrator:
     def test_apply_idempotent(self):
         from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
@@ -173,6 +174,7 @@ class TestQwen35MoeSanitize:
         if not qwen35_model.apply():
             pytest.skip("qwen35_model patch refused to apply")
         from omlx.patches.mlx_lm_mtp.qwen35_model import _patch_qwen3_5_moe
+
         _patch_qwen3_5_moe()
 
     @pytest.fixture()
@@ -278,7 +280,9 @@ class TestDeepseekV4Model:
         from omlx.patches.mlx_lm_mtp import deepseek_v4_model
 
         # Simulate the base patch not having run by removing the module.
-        monkeypatch.setitem(__import__("sys").modules, "mlx_lm.models.deepseek_v4", None)
+        monkeypatch.setitem(
+            __import__("sys").modules, "mlx_lm.models.deepseek_v4", None
+        )
         # Reset the module-level _PATCHED flag so apply() actually runs the
         # gating check rather than short-circuiting on idempotency.
         monkeypatch.setattr(deepseek_v4_model, "_PATCHED", False)
@@ -297,7 +301,11 @@ class TestDeepseekV4Model:
             from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
         except ImportError:
             pytest.skip("omlx.patches.deepseek_v4 not importable")
-        if not apply_deepseek_v4_patch():
+        try:
+            applied_base = apply_deepseek_v4_patch()
+        except ImportError as exc:
+            pytest.skip(f"DeepSeek-V4 base patch dependency unavailable: {exc}")
+        if not applied_base:
             pytest.skip("DeepSeek-V4 base patch refused to apply in this env")
 
         from omlx.patches.mlx_lm_mtp import deepseek_v4_model
@@ -365,24 +373,19 @@ class TestBatchGeneratorDispatch:
             # (e.g. VLM runtime patches attach unconditionally so weight
             # load matches, while inference-time MTP stays disabled).
             mlx_lm_mtp.set_mtp_active(False)
-            assert (
-                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
-            )
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
 
             mlx_lm_mtp.set_mtp_active(True)
             # Non-MTP model never triggers the MTP path.
             assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
             # Has mtp_forward but no attached head → still off.
             assert (
-                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1]))
-                is False
+                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
             )
             # Has both method and head + batch=1 + flag on → triggers the path.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
             # MTP model with batch=2 falls back to standard step.
-            assert (
-                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
-            )
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
             # Empty batch never triggers.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
         finally:
@@ -393,6 +396,7 @@ class TestBatchGeneratorDispatch:
 # ModelSettings — mtp_enabled field + mutual exclusion
 # ---------------------------------------------------------------------------
 
+
 class TestModelSettingsMtp:
     def test_default_mtp_disabled(self):
         s = ModelSettings()
@@ -402,6 +406,32 @@ class TestModelSettingsMtp:
         original = ModelSettings(mtp_enabled=True)
         restored = ModelSettings.from_dict(original.to_dict())
         assert restored.mtp_enabled is True
+
+    def test_ngram_settings_roundtrip(self):
+        original = ModelSettings(
+            mtp_enabled=True,
+            ngram_spec_enabled=True,
+            ngram_spec_n_match=4,
+            ngram_spec_draft_min=2,
+            ngram_spec_draft_max=6,
+            ngram_spec_min_count=3,
+            ngram_spec_min_confidence=0.75,
+            ngram_spec_max_entries=128,
+            ngram_spec_mtp_fallback=False,
+            ngram_spec_mtp_adaptive=False,
+            ngram_spec_mtp_min_cycles=4,
+            ngram_spec_mtp_min_accept_rate=0.25,
+        )
+        restored = ModelSettings.from_dict(original.to_dict())
+        assert restored.ngram_spec_enabled is True
+        assert restored.ngram_spec_n_match == 4
+        assert restored.ngram_spec_min_count == 3
+        assert restored.ngram_spec_min_confidence == 0.75
+        assert restored.ngram_spec_max_entries == 128
+        assert restored.ngram_spec_mtp_fallback is False
+        assert restored.ngram_spec_mtp_adaptive is False
+        assert restored.ngram_spec_mtp_min_cycles == 4
+        assert restored.ngram_spec_mtp_min_accept_rate == 0.25
 
     def test_legacy_settings_dict_defaults_mtp_off(self):
         s = ModelSettings.from_dict({"display_name": "qwen3.6"})
@@ -422,10 +452,94 @@ class TestModelSettingsMtp:
         assert s.mtp_enabled is True
         assert s.specprefill_enabled is True
 
+    def test_ngram_requires_repeated_key_before_indexing(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _update_ngram_index,
+        )
+
+        state = _MtpState()
+        history = [1, 2, 3, 1, 2, 3, 1, 2, 4]
+
+        _update_ngram_index(
+            state,
+            history,
+            n_match=2,
+            min_count=2,
+            min_confidence=0.5,
+            max_entries=8,
+        )
+
+        assert state.ngram_index[(1, 2)] == 3
+        assert (2, 4) not in state.ngram_index
+
+    def test_ngram_index_respects_max_entries(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _update_ngram_index,
+        )
+
+        state = _MtpState()
+        history = [1, 9, 1, 9, 2, 9, 2, 9, 3, 9, 3, 9]
+
+        _update_ngram_index(
+            state,
+            history,
+            n_match=1,
+            min_count=2,
+            min_confidence=0.5,
+            max_entries=2,
+        )
+
+        assert len(state.ngram_index) == 2
+
+    def test_ngram_index_requires_confident_follower(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _update_ngram_index,
+        )
+
+        state = _MtpState()
+        history = [1, 2, 3, 1, 2, 4, 1, 2, 3, 1, 2, 4]
+
+        _update_ngram_index(
+            state,
+            history,
+            n_match=2,
+            min_count=2,
+            min_confidence=0.75,
+            max_entries=8,
+        )
+
+        assert (1, 2) not in state.ngram_index
+
+    def test_ngram_draft_prioritizes_used_over_frequency(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _MtpState,
+            _draft_from_ngram,
+        )
+
+        state = _MtpState()
+        state.ngram_index[(1, 2)] = 3
+        state.ngram_counts[(1, 2)] = {3: 10}
+        state.ngram_used[(1, 2)] = 4
+
+        draft = _draft_from_ngram(
+            state,
+            history=[1, 2],
+            n_match=2,
+            min_count=3,
+            min_confidence=0.8,
+            draft_max=1,
+        )
+
+        assert draft == [4]
+
 
 # ---------------------------------------------------------------------------
 # utils.model_loading — compatibility helpers + dispatch
 # ---------------------------------------------------------------------------
+
 
 class TestMtpCompatibilityHelpers:
     def test_has_mtp_heads_top_level_field(self):
@@ -435,9 +549,7 @@ class TestMtpCompatibilityHelpers:
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
 
     def test_has_mtp_heads_text_config_field(self):
-        assert (
-            _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
-        )
+        assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
 
     def test_has_mtp_heads_zero_is_false(self):
         assert _has_mtp_heads({"mtp_num_hidden_layers": 0}) is False
@@ -501,10 +613,13 @@ class TestPreLoadPatchDispatch:
             str(tmp_path), model_settings=ModelSettings(mtp_enabled=True)
         )
         # The skip path should log a warning so the user sees why MTP was inactive.
-        assert any(
-            "MTP path will be inactive" in record.getMessage()
-            for record in caplog.records
-        ) or True  # logger.warning may be filtered by pytest logging level
+        assert (
+            any(
+                "MTP path will be inactive" in record.getMessage()
+                for record in caplog.records
+            )
+            or True
+        )  # logger.warning may be filtered by pytest logging level
 
     def test_dispatch_handles_missing_config(self, tmp_path):
         # No config.json at all — function must not raise.

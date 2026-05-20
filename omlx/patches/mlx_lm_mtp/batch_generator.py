@@ -73,6 +73,7 @@ _PATCHED = False
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def apply() -> bool:
     """Wrap ``GenerationBatch.__init__`` + ``GenerationBatch.next``."""
     global _PATCHED
@@ -124,9 +125,7 @@ def apply() -> bool:
                 try:
                     return _mtp_next(self, state)
                 except _MtpStepFallback as exc:
-                    logger.debug(
-                        "MTP next() fallback to standard step: %s", exc
-                    )
+                    logger.debug("MTP next() fallback to standard step: %s", exc)
                     # Best-effort: drop state so subsequent calls don't try
                     # to resume a half-built MTP cycle from a stale snapshot.
                     if hasattr(self, "_omlx_mtp_state"):
@@ -220,6 +219,7 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
         return False
     try:
         from . import is_mtp_active
+
         if not is_mtp_active():
             return False
     except Exception:
@@ -247,6 +247,7 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         return "model has no attached mtp head"
     try:
         from . import is_mtp_active
+
         if not is_mtp_active():
             return "mtp_active flag is off (model_settings.mtp_enabled was False at load time)"
     except Exception:
@@ -267,6 +268,7 @@ class _MtpStepFallback(RuntimeError):
 # State
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _MtpStats:
     """Acceptance / throughput counters for one MTP-active sequence.
@@ -283,6 +285,15 @@ class _MtpStats:
     draft_emits: int = 0  # tokens emitted as accepted drafts
     bonus_emits: int = 0  # tokens emitted as bonus (accepted + emit_bonus)
     verify_emits: int = 0  # tokens emitted as verify-position correction (reject path)
+    ngram_emits: int = 0  # tokens emitted from fully accepted n-gram drafts
+    ngram_cycles: int = 0  # number of n-gram verify cycles run
+    ngram_accepts: int = 0  # n-gram cycles whose whole draft was accepted
+    ngram_rejects: int = 0  # n-gram cycles that fell back to target token
+    ngram_draft_tokens: int = 0  # total n-gram draft tokens verified
+    ngram_accepted_tokens: int = 0  # total n-gram draft tokens accepted
+    mtp_fallback_cycles: int = 0  # MTP verify cycles run behind n-gram misses
+    mtp_fallback_accepts: int = 0  # accepted MTP fallback cycles
+    mtp_fallback_disabled: bool = False  # adaptive routing disabled MTP fallback
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -321,13 +332,32 @@ class _MtpState:
     # GPU→CPU sync (`int(draft_tok.tolist()[0])` would force a stall).
     draft_id: int = -1
 
+    # Lazy MTP refresh state. Consecutive n-gram cycles do not need an MTP
+    # draft; keep the confirmed hidden/token pair and build the MTP draft
+    # only when n-gram misses and the normal MTP verifier is actually needed.
+    pending_mtp_hidden: Optional[Any] = None
+    pending_mtp_token: Optional[Any] = None
+    pending_mtp_prev_buf: Optional[Any] = None
+
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
+    mtp_fallback_cycles: int = 0
+    mtp_fallback_accepts: int = 0
+    mtp_fallback_disabled: bool = False
+
+    # Draftless n-gram speculation state. ``ngram_used`` tracks followers that
+    # were confirmed during this inference and is consulted before the prompt
+    # frequency table in ``ngram_index``.
+    ngram_index: dict[tuple[int, ...], int] = field(default_factory=dict)
+    ngram_used: dict[tuple[int, ...], int] = field(default_factory=dict)
+    ngram_counts: dict[tuple[int, ...], dict[int, int]] = field(default_factory=dict)
+    ngram_indexed_until: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_generation_stream():
     """Return the ``mlx_lm.generate`` module-level generation stream.
@@ -355,10 +385,9 @@ def _resolve_sampler(gen_batch: Any):
 
 
 def _is_greedy(gen_batch: Any) -> bool:
-    """Heuristic mirroring PR 990's ``sampler is None``."""
-    if gen_batch.samplers and gen_batch.samplers[0] is not None:
-        return False
-    return True
+    """Return True when the resolved oMLX sampler is deterministic argmax."""
+    sampler = _resolve_sampler(gen_batch)
+    return float(getattr(sampler, "temp", 0.0) or 0.0) == 0.0
 
 
 def _proc_list(gen_batch: Any) -> Optional[List[Any]]:
@@ -429,7 +458,7 @@ def _trim_token_buffer(gen_batch: Any, n: int) -> None:
     buf._size = max(0, buf._size - n)
 
 
-def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
+def _restore_or_trim_caches(prompt_cache: List[Any], trim_tokens: int = 1) -> bool:
     """Roll back one token from each layer cache after a draft rejection.
 
     SSM / linear-attention layers expose ``rollback_state`` populated by the
@@ -447,7 +476,8 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
             c.rollback_state = None
             continue
         if hasattr(c, "is_trimmable") and c.is_trimmable():
-            c.trim(1)
+            if trim_tokens:
+                c.trim(trim_tokens)
             continue
         return False
     return True
@@ -482,11 +512,10 @@ def _rollback_after_reject(
     non-MTP step.
     """
     if gdn_states is not None and hasattr(model, "rollback_speculative_cache"):
-        model.rollback_speculative_cache(
-            prompt_cache, gdn_states, accepted, block_size
-        )
+        model.rollback_speculative_cache(prompt_cache, gdn_states, accepted, block_size)
         return True
-    return _restore_or_trim_caches(prompt_cache)
+    trim_tokens = max(0, block_size - (accepted + 1))
+    return _restore_or_trim_caches(prompt_cache, trim_tokens=trim_tokens)
 
 
 def _call_backbone(
@@ -518,9 +547,7 @@ def _call_backbone(
             return result
         if len(result) == 2:
             return result[0], result[1], None
-    raise TypeError(
-        f"backbone returned unexpected shape: {type(result).__name__}"
-    )
+    raise TypeError(f"backbone returned unexpected shape: {type(result).__name__}")
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
@@ -543,6 +570,7 @@ def _ensure_uint32(arr):
 # Post-init: run one extra backbone forward + MTP forward; queue the two
 # emitted tokens; stash a draft for the first verify cycle.
 # ---------------------------------------------------------------------------
+
 
 def _post_init_mtp(gen_batch: Any) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
@@ -605,9 +633,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
-        mtp_logits_2d = _apply_processors(
-            procs, prev_with_main_and_next, mtp_logits_2d
-        )
+        mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -639,6 +665,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
 # next() dispatch
 # ---------------------------------------------------------------------------
 
+
 def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     """Emit one token; run a verify cycle if the queue is empty."""
     if state.queue:
@@ -646,6 +673,40 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
         _bump_emit_stat(state, source)
         return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
+    if _try_ngram_cycle(gen_batch, state):
+        if state.queue:
+            token_id, logprobs_1d, source = state.queue.popleft()
+            _bump_emit_stat(state, source)
+            return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+
+    if _ngram_enabled(gen_batch) and _is_greedy(gen_batch):
+        use_mtp_fallback = (
+            _ngram_mtp_fallback_enabled(gen_batch) and not state.mtp_fallback_disabled
+        )
+        if use_mtp_fallback:
+            cycles_before = state.stats.cycles
+            accepts_before = state.stats.accepts
+            _ensure_mtp_draft(gen_batch, state)
+            _run_verify_cycle(gen_batch, state)
+            _record_used_from_queue(gen_batch, state)
+            _update_mtp_fallback_route(
+                gen_batch,
+                state,
+                cycles_before=cycles_before,
+                accepts_before=accepts_before,
+            )
+            if not state.queue:
+                raise _MtpStepFallback("verify cycle produced no emit tokens")
+            token_id, logprobs_1d, source = state.queue.popleft()
+            _bump_emit_stat(state, source)
+            return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+
+        _run_target_greedy_cycle(gen_batch, state)
+        token_id, logprobs_1d, source = state.queue.popleft()
+        _bump_emit_stat(state, source)
+        return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
+
+    _ensure_mtp_draft(gen_batch, state)
     _run_verify_cycle(gen_batch, state)
     if not state.queue:
         # Verify cycle should always populate the queue with at least the
@@ -668,7 +729,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
     """
     total_emits = (
-        stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
+        stats.init_emits
+        + stats.draft_emits
+        + stats.bonus_emits
+        + stats.verify_emits
+        + stats.ngram_emits
     )
     if stats.cycles > 0:
         rate_str = f"{stats.accepts / stats.cycles * 100:.1f}%"
@@ -676,7 +741,9 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         rate_str = "n/a"
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d accept=%d/%d (%s) "
-        "emits[init=%d,draft=%d,bonus=%d,verify=%d] "
+        "ngram[cycles=%d accept=%d reject=%d tokens=%d/%d] "
+        "mtp_fallback[cycles=%d accept=%d disabled=%d] "
+        "emits[init=%d,draft=%d,bonus=%d,verify=%d,ngram=%d] "
         "timing[backbone=%.1fms mtp=%.1fms sample=%.1fms cache=%.1fms]",
         uid,
         finish_reason,
@@ -685,10 +752,19 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         stats.accepts,
         stats.cycles,
         rate_str,
+        stats.ngram_cycles,
+        stats.ngram_accepts,
+        stats.ngram_rejects,
+        stats.ngram_accepted_tokens,
+        stats.ngram_draft_tokens,
+        stats.mtp_fallback_cycles,
+        stats.mtp_fallback_accepts,
+        1 if stats.mtp_fallback_disabled else 0,
         stats.init_emits,
         stats.draft_emits,
         stats.bonus_emits,
         stats.verify_emits,
+        stats.ngram_emits,
         stats.backbone_ms,
         stats.mtp_head_ms,
         stats.sample_ms,
@@ -705,11 +781,498 @@ def _bump_emit_stat(state: _MtpState, source: str) -> None:
         state.stats.bonus_emits += 1
     elif source == "verify":
         state.stats.verify_emits += 1
+    elif source == "ngram":
+        state.stats.ngram_emits += 1
+
+
+# ---------------------------------------------------------------------------
+# Draftless n-gram speculation. This composes with native MTP by trying a
+# history-derived draft first; when it misses or rejects, the normal MTP
+# state is refreshed and remains the fallback for the next cycle.
+# ---------------------------------------------------------------------------
+
+
+def _ngram_enabled(gen_batch: Any) -> bool:
+    return bool(getattr(gen_batch.model, "_omlx_ngram_spec_enabled", False))
+
+
+def _ngram_mtp_fallback_enabled(gen_batch: Any) -> bool:
+    return bool(getattr(gen_batch.model, "_omlx_ngram_spec_mtp_fallback", True))
+
+
+def _ngram_mtp_adaptive_enabled(gen_batch: Any) -> bool:
+    return bool(getattr(gen_batch.model, "_omlx_ngram_spec_mtp_adaptive", True))
+
+
+def _ngram_mtp_adaptive_config(gen_batch: Any) -> tuple[int, float]:
+    min_cycles = max(
+        1, int(getattr(gen_batch.model, "_omlx_ngram_spec_mtp_min_cycles", 8))
+    )
+    min_rate = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                getattr(gen_batch.model, "_omlx_ngram_spec_mtp_min_accept_rate", 0.5)
+            ),
+        ),
+    )
+    return min_cycles, min_rate
+
+
+def _ngram_config(gen_batch: Any) -> tuple[int, int, int, int, float, int]:
+    n_match = max(1, int(getattr(gen_batch.model, "_omlx_ngram_spec_n_match", 4)))
+    draft_min = max(1, int(getattr(gen_batch.model, "_omlx_ngram_spec_draft_min", 1)))
+    draft_max = max(
+        draft_min, int(getattr(gen_batch.model, "_omlx_ngram_spec_draft_max", 2))
+    )
+    min_count = max(1, int(getattr(gen_batch.model, "_omlx_ngram_spec_min_count", 3)))
+    min_confidence = min(
+        1.0,
+        max(
+            0.0, float(getattr(gen_batch.model, "_omlx_ngram_spec_min_confidence", 0.8))
+        ),
+    )
+    max_entries = max(
+        1, int(getattr(gen_batch.model, "_omlx_ngram_spec_max_entries", 2048))
+    )
+    return n_match, draft_min, draft_max, min_count, min_confidence, max_entries
+
+
+def _update_ngram_index(
+    state: _MtpState,
+    history: list[int],
+    n_match: int,
+    min_count: int,
+    min_confidence: float,
+    max_entries: int,
+) -> None:
+    """Index only repeated n-grams with a stable most-common follower."""
+    last_start = len(history) - n_match - 1
+    if last_start < state.ngram_indexed_until:
+        return
+    for i in range(state.ngram_indexed_until, last_start + 1):
+        key = tuple(history[i : i + n_match])
+        follower = int(history[i + n_match])
+        counts = state.ngram_counts.setdefault(key, {})
+        counts[follower] = counts.get(follower, 0) + 1
+        best_token, best_count = max(
+            counts.items(), key=lambda item: (item[1], item[0])
+        )
+        total = sum(counts.values())
+        confidence = best_count / total if total else 0.0
+        if best_count < min_count or confidence < min_confidence:
+            state.ngram_index.pop(key, None)
+            continue
+        if key in state.ngram_index or len(state.ngram_index) < max_entries:
+            state.ngram_index[key] = int(best_token)
+    state.ngram_indexed_until = last_start + 1
+
+
+def _draft_from_ngram(
+    state: _MtpState,
+    history: list[int],
+    n_match: int,
+    min_count: int,
+    min_confidence: float,
+    draft_max: int,
+) -> list[int]:
+    """Iteratively draft by feeding predicted tokens back into the lookup key."""
+    if len(history) < n_match:
+        return []
+    draft: list[int] = []
+    rolling = [int(t) for t in history[-n_match:]]
+    for _ in range(draft_max):
+        key = tuple(rolling[-n_match:])
+        used_token = state.ngram_used.get(key)
+        if used_token is not None:
+            draft.append(int(used_token))
+            rolling.append(int(used_token))
+            continue
+        next_token = state.ngram_index.get(key)
+        if next_token is None:
+            break
+        counts = state.ngram_counts.get(key)
+        if not counts:
+            break
+        best_count = counts.get(next_token, 0)
+        total = sum(counts.values())
+        if best_count < min_count or not total or best_count / total < min_confidence:
+            break
+        draft.append(int(next_token))
+        rolling.append(int(next_token))
+    return draft
+
+
+def _ngram_history(gen_batch: Any) -> list[int]:
+    """Return prompt + emitted-token history for n-gram lookup.
+
+    ``GenerationBatch.tokens[0]`` is not a reliable full-context source in
+    oMLX's external-prefill path; in practice it can contain only emitted
+    completion tokens. ``_token_context[0]`` is initialized from the prompt
+    for logits processors, so combine it with the emitted list when needed.
+    """
+    emitted = [int(t) for t in gen_batch.tokens[0]]
+    try:
+        uid = gen_batch.uids[0]
+        prompt_map = getattr(gen_batch.model, "_omlx_ngram_prompt_tokens", None)
+        mapped_prompt = prompt_map.get(uid) if prompt_map is not None else None
+        if mapped_prompt:
+            return [int(t) for t in mapped_prompt] + emitted
+    except Exception:
+        pass
+    try:
+        prompt_tokens = [int(t) for t in gen_batch._token_context[0].tokens.tolist()]
+    except Exception:
+        return emitted
+
+    if not prompt_tokens:
+        return emitted
+    if (
+        len(emitted) >= len(prompt_tokens)
+        and emitted[: len(prompt_tokens)] == prompt_tokens
+    ):
+        return emitted
+    return prompt_tokens + emitted
+
+
+def _defer_mtp_refresh(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_at_position: Any,
+    token: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    state.mtp_cache = gen_batch.model.make_mtp_cache()
+    state.pending_mtp_hidden = hidden_at_position
+    state.pending_mtp_token = _ensure_uint32(token)
+    state.pending_mtp_prev_buf = prev_buf
+    state.draft_tok = None
+    state.draft_lp = None
+    state.draft_accept_lp = None
+    state.draft_id = -1
+
+
+def _ensure_mtp_draft(gen_batch: Any, state: _MtpState) -> None:
+    if state.draft_tok is not None:
+        return
+    if state.pending_mtp_hidden is None or state.pending_mtp_token is None:
+        raise _MtpStepFallback("MTP draft unavailable")
+    new_draft, new_draft_lp = _step_mtp(
+        gen_batch,
+        state.pending_mtp_hidden,
+        state.pending_mtp_token,
+        prev_buf=state.pending_mtp_prev_buf,
+        stats=state.stats,
+    )
+    state.draft_tok = new_draft
+    state.draft_lp = new_draft_lp
+    state.pending_mtp_hidden = None
+    state.pending_mtp_token = None
+    state.pending_mtp_prev_buf = None
+
+
+def _mark_used_ngram(
+    state: _MtpState,
+    history: list[int],
+    follower: int,
+    n_match: int,
+    max_entries: int,
+) -> None:
+    if len(history) < n_match:
+        return
+    if (
+        len(state.ngram_used) >= max_entries
+        and tuple(history[-n_match:]) not in state.ngram_used
+    ):
+        return
+    state.ngram_used[tuple(history[-n_match:])] = int(follower)
+
+
+def _mark_used_ngram_chain(
+    state: _MtpState,
+    history: list[int],
+    followers: list[int],
+    n_match: int,
+    max_entries: int,
+) -> None:
+    rolling = [int(t) for t in history]
+    for follower in followers:
+        _mark_used_ngram(state, rolling, int(follower), n_match, max_entries)
+        rolling.append(int(follower))
+
+
+def _record_used_from_queue(gen_batch: Any, state: _MtpState) -> None:
+    if not state.queue:
+        return
+    n_match, _, _, _, _, max_entries = _ngram_config(gen_batch)
+    followers = [int(token_id) for token_id, _, _ in state.queue]
+    _mark_used_ngram_chain(
+        state,
+        _ngram_history(gen_batch),
+        followers,
+        n_match,
+        max_entries,
+    )
+
+
+def _update_mtp_fallback_route(
+    gen_batch: Any,
+    state: _MtpState,
+    cycles_before: int,
+    accepts_before: int,
+) -> None:
+    cycles_delta = state.stats.cycles - cycles_before
+    if cycles_delta <= 0:
+        return
+    accepts_delta = state.stats.accepts - accepts_before
+    state.mtp_fallback_cycles += cycles_delta
+    state.mtp_fallback_accepts += accepts_delta
+    state.stats.mtp_fallback_cycles = state.mtp_fallback_cycles
+    state.stats.mtp_fallback_accepts = state.mtp_fallback_accepts
+    if not _ngram_mtp_adaptive_enabled(gen_batch):
+        return
+    min_cycles, min_rate = _ngram_mtp_adaptive_config(gen_batch)
+    if state.mtp_fallback_cycles < min_cycles:
+        return
+    rate = state.mtp_fallback_accepts / state.mtp_fallback_cycles
+    if rate < min_rate:
+        state.mtp_fallback_disabled = True
+        state.stats.mtp_fallback_disabled = True
+
+
+def _record_high_prob_ngram(
+    state: _MtpState,
+    history: list[int],
+    follower: int,
+    n_match: int,
+    min_count: int,
+    min_confidence: float,
+    max_entries: int,
+) -> None:
+    """Save a target-greedy continuation observed during inference.
+
+    Prompt frequency gives the first n-gram table. Target-greedy fallback
+    gives us model-confirmed high-probability followers for the generated
+    branch, so future repeats in the same request can draft from the actual
+    branch the model is taking rather than only the most common prompt branch.
+    """
+    if len(history) < n_match:
+        return
+    key = tuple(history[-n_match:])
+    _mark_used_ngram(state, history, follower, n_match, max_entries)
+    counts = state.ngram_counts.setdefault(key, {})
+    counts[int(follower)] = counts.get(int(follower), 0) + 1
+    best_token, best_count = max(counts.items(), key=lambda item: (item[1], item[0]))
+    total = sum(counts.values())
+    confidence = best_count / total if total else 0.0
+    if best_count >= min_count and confidence >= min_confidence:
+        if key in state.ngram_index or len(state.ngram_index) < max_entries:
+            state.ngram_index[key] = int(best_token)
+
+
+def _run_target_greedy_cycle(gen_batch: Any, state: _MtpState) -> None:
+    """Correct greedy fallback for n-gram mode.
+
+    The native MTP fallback can drift on the Qwen GDN path. When n-gram mode
+    is enabled, use a plain target-model greedy step on misses/reject gaps and
+    record that model-confirmed continuation for later n-gram drafting.
+    """
+    import time
+
+    import mlx.core as mx
+
+    if state.next_main is None:
+        raise _MtpStepFallback("target fallback entered without next_main")
+
+    procs = _proc_list(gen_batch)
+    prev_buf = None
+    if procs is not None:
+        prev_buf = gen_batch._token_context[0].update_and_fetch(state.next_main)
+
+    t0 = time.perf_counter()
+    with mx.stream(_get_generation_stream()):
+        logits, _, _ = _call_backbone(
+            gen_batch.model,
+            state.next_main[:, None],
+            gen_batch.prompt_cache,
+        )
+        next_logits = logits[:, -1, :]
+    state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    if procs is not None:
+        next_logits = _apply_processors(procs, prev_buf, next_logits)
+    next_tok = mx.argmax(next_logits, axis=-1).reshape(-1)
+    mx.eval(next_tok)
+    emit_id = int(next_tok.tolist()[0])
+    state.stats.sample_ms += (time.perf_counter() - t0) * 1000
+
+    n_match, _, _, min_count, min_confidence, max_entries = _ngram_config(gen_batch)
+    _record_high_prob_ngram(
+        state,
+        _ngram_history(gen_batch),
+        emit_id,
+        n_match,
+        min_count,
+        min_confidence,
+        max_entries,
+    )
+
+    emit_tok = _ensure_uint32(next_tok)
+    state.next_main = emit_tok
+    _defer_mtp_refresh(gen_batch, state, None, emit_tok, None)
+    state.queue.append((emit_id, None, "verify"))
+
+
+def _try_ngram_cycle(gen_batch: Any, state: _MtpState) -> bool:
+    """Run one all-or-nothing n-gram verify cycle.
+
+    The cache is kept only when the full n-gram draft matches target greedy
+    tokens. On any mismatch we roll back the entire draft suffix, emit the
+    target token after ``state.next_main``, and refresh the MTP draft from the
+    confirmed hidden state. This preserves exact greedy output while avoiding
+    partial-accept rollback complexity for GDN caches.
+    """
+    import time
+
+    import mlx.core as mx
+
+    if not _ngram_enabled(gen_batch) or not _is_greedy(gen_batch):
+        return False
+    if state.next_main is None:
+        return False
+
+    n_match, draft_min, draft_max, min_count, min_confidence, max_entries = (
+        _ngram_config(gen_batch)
+    )
+    history = _ngram_history(gen_batch)
+    if len(history) < n_match:
+        return False
+
+    _update_ngram_index(state, history, n_match, min_count, min_confidence, max_entries)
+    draft_ids = _draft_from_ngram(
+        state, history, n_match, min_count, min_confidence, draft_max
+    )
+    if len(draft_ids) < draft_min:
+        return False
+
+    sampler = _resolve_sampler(gen_batch)
+    procs = _proc_list(gen_batch)
+    draft_arr = mx.array(draft_ids, dtype=mx.uint32)
+    inputs = mx.concatenate([state.next_main, draft_arr])
+
+    prev_buffers: list[Any] = []
+    if procs is not None:
+        prev_buffers.append(
+            gen_batch._token_context[0].update_and_fetch(state.next_main)
+        )
+        for token_id in draft_ids:
+            tok = mx.array([token_id], dtype=mx.uint32)
+            prev_buffers.append(gen_batch._token_context[0].update_and_fetch(tok))
+
+    t0 = time.perf_counter()
+    with mx.stream(_get_generation_stream()):
+        logits, hidden, gdn_states = _call_backbone(
+            gen_batch.model,
+            inputs[None, :],
+            gen_batch.prompt_cache,
+            n_confirmed=1,
+        )
+    state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    verify_logits = logits[:, : len(draft_ids), :]
+    bonus_logits = logits[:, len(draft_ids), :]
+    if procs is not None:
+        processed = []
+        for i in range(len(draft_ids)):
+            processed.append(
+                _apply_processors(procs, prev_buffers[i], verify_logits[:, i, :])
+            )
+        verify_logits = mx.stack(processed, axis=1)
+        bonus_logits = _apply_processors(procs, prev_buffers[-1], bonus_logits)
+
+    verify_tok = mx.argmax(verify_logits, axis=-1).reshape(-1)
+    bonus_tok = mx.argmax(bonus_logits, axis=-1).reshape(-1)
+    mx.eval(verify_tok, bonus_tok)
+
+    verify_ids = [int(t) for t in verify_tok.tolist()]
+    bonus_id = int(bonus_tok.tolist()[0])
+    n_accept = 0
+    for expected, actual in zip(draft_ids, verify_ids):
+        if expected != actual:
+            break
+        n_accept += 1
+    full_accept = n_accept == len(draft_ids)
+    state.stats.sample_ms += (time.perf_counter() - t0) * 1000
+    state.stats.ngram_cycles += 1
+    state.stats.ngram_draft_tokens += len(draft_ids)
+
+    if full_accept:
+        state.stats.ngram_accepts += 1
+        state.stats.ngram_accepted_tokens += len(draft_ids)
+        _mark_used_ngram_chain(
+            state,
+            history,
+            draft_ids + [bonus_id],
+            n_match,
+            max_entries,
+        )
+        t0 = time.perf_counter()
+        _clear_rollback(gen_batch.prompt_cache)
+        state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+
+        hidden_at_last_accepted = hidden[:, len(draft_ids) : len(draft_ids) + 1, :]
+        _defer_mtp_refresh(
+            gen_batch,
+            state,
+            hidden_at_last_accepted,
+            _ensure_uint32(bonus_tok),
+            prev_buffers[-1] if procs is not None else None,
+        )
+        for i, token_id in enumerate(draft_ids):
+            state.queue.append((token_id, None, "ngram"))
+        state.queue.append((bonus_id, None, "bonus"))
+        state.next_main = _ensure_uint32(bonus_tok)
+        return True
+
+    state.stats.ngram_rejects += 1
+    t0 = time.perf_counter()
+    if not _rollback_after_reject(
+        gen_batch.model,
+        gen_batch.prompt_cache,
+        gdn_states,
+        accepted=0,
+        block_size=len(draft_ids) + 1,
+    ):
+        if procs is not None:
+            _trim_token_buffer(gen_batch, len(draft_ids))
+        return False
+    if procs is not None:
+        _trim_token_buffer(gen_batch, len(draft_ids))
+    state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+
+    emit_id = verify_ids[0]
+    _mark_used_ngram(state, history, emit_id, n_match, max_entries)
+    emit_tok = mx.array([emit_id], dtype=mx.uint32)
+    hidden_at_last_committed = hidden[:, 0:1, :]
+    _defer_mtp_refresh(
+        gen_batch,
+        state,
+        hidden_at_last_committed,
+        emit_tok,
+        prev_buffers[0] if procs is not None else None,
+    )
+    state.queue.append((emit_id, None, "verify"))
+    state.next_main = emit_tok
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Verify cycle: 2-token forward + accept/reject + MTP forward for next draft.
 # ---------------------------------------------------------------------------
+
 
 def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     """Run one verify cycle. Populates ``state.queue`` with 1 (reject) or 2
@@ -793,8 +1356,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         accept = verify_id == draft_id
     else:
         log_accept = (
-            verify_accept_lp[0, draft_id].item()
-            - draft_accept_lp[draft_id].item()
+            verify_accept_lp[0, draft_id].item() - draft_accept_lp[draft_id].item()
         )
         accept = log_accept >= 0 or random.random() < math.exp(log_accept)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
@@ -834,8 +1396,11 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     # accepted=0 means only the confirmed token (verify position) is kept;
     # block_size=2 covers both the confirmed and the rejected draft.
     if not _rollback_after_reject(
-        gen_batch.model, gen_batch.prompt_cache, gdn_states,
-        accepted=0, block_size=2,
+        gen_batch.model,
+        gen_batch.prompt_cache,
+        gdn_states,
+        accepted=0,
+        block_size=2,
     ):
         if procs is not None:
             _trim_token_buffer(gen_batch, 1)
@@ -876,6 +1441,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
 # Helpers used by the verify cycle.
 # ---------------------------------------------------------------------------
 
+
 def _step_mtp(
     gen_batch: Any,
     hidden_at_position: Any,
@@ -905,9 +1471,7 @@ def _step_mtp(
         )
         mtp_logits_2d = mtp_logits[:, -1, :]
     if procs is not None and prev_buf is not None:
-        prev_with_next = mx.concatenate(
-            [prev_buf, _ensure_uint32(next_main_tok)]
-        )
+        prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
         mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
@@ -952,6 +1516,7 @@ def _residual_sample(verify_lp_2d: Any, draft_lp_1d: Any) -> Tuple[int, Any]:
 # ---------------------------------------------------------------------------
 # Response builder — mirrors GenerationBatch.next()'s per-sequence epilogue.
 # ---------------------------------------------------------------------------
+
 
 def _emit_response(
     gen_batch: Any,

@@ -61,6 +61,17 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "ngram_spec_enabled",
+    "ngram_spec_n_match",
+    "ngram_spec_draft_min",
+    "ngram_spec_draft_max",
+    "ngram_spec_min_count",
+    "ngram_spec_min_confidence",
+    "ngram_spec_max_entries",
+    "ngram_spec_mtp_fallback",
+    "ngram_spec_mtp_adaptive",
+    "ngram_spec_mtp_min_cycles",
+    "ngram_spec_mtp_min_accept_rate",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",
@@ -69,18 +80,20 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
 )
 
 # Excluded — never stored in a profile or template.
-EXCLUDED_FROM_PROFILES = frozenset({
-    "is_pinned",
-    "is_default",
-    "display_name",
-    "description",
-    "model_alias",
-    "model_type_override",
-    "active_profile_name",
-    "ttl_seconds",
-    # Security flag must be explicit per model — never propagated via profiles.
-    "trust_remote_code",
-})
+EXCLUDED_FROM_PROFILES = frozenset(
+    {
+        "is_pinned",
+        "is_default",
+        "display_name",
+        "description",
+        "model_alias",
+        "model_type_override",
+        "active_profile_name",
+        "ttl_seconds",
+        # Security flag must be explicit per model — never propagated via profiles.
+        "trust_remote_code",
+    }
+)
 
 
 def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:

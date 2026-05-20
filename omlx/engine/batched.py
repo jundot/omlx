@@ -252,6 +252,42 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        if self._model_settings is not None:
+            self._model._omlx_ngram_spec_enabled = bool(
+                getattr(self._model_settings, "ngram_spec_enabled", False)
+            )
+            self._model._omlx_ngram_spec_n_match = int(
+                getattr(self._model_settings, "ngram_spec_n_match", 4) or 4
+            )
+            self._model._omlx_ngram_spec_draft_min = int(
+                getattr(self._model_settings, "ngram_spec_draft_min", 1) or 1
+            )
+            self._model._omlx_ngram_spec_draft_max = int(
+                getattr(self._model_settings, "ngram_spec_draft_max", 2) or 2
+            )
+            self._model._omlx_ngram_spec_min_count = int(
+                getattr(self._model_settings, "ngram_spec_min_count", 3) or 3
+            )
+            self._model._omlx_ngram_spec_min_confidence = float(
+                getattr(self._model_settings, "ngram_spec_min_confidence", 0.8) or 0.8
+            )
+            self._model._omlx_ngram_spec_max_entries = int(
+                getattr(self._model_settings, "ngram_spec_max_entries", 2048) or 2048
+            )
+            self._model._omlx_ngram_spec_mtp_fallback = bool(
+                getattr(self._model_settings, "ngram_spec_mtp_fallback", True)
+            )
+            self._model._omlx_ngram_spec_mtp_adaptive = bool(
+                getattr(self._model_settings, "ngram_spec_mtp_adaptive", True)
+            )
+            self._model._omlx_ngram_spec_mtp_min_cycles = int(
+                getattr(self._model_settings, "ngram_spec_mtp_min_cycles", 8) or 8
+            )
+            self._model._omlx_ngram_spec_mtp_min_accept_rate = float(
+                getattr(self._model_settings, "ngram_spec_mtp_min_accept_rate", 0.5)
+                or 0.5
+            )
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
@@ -440,7 +476,8 @@ class BatchedEngine(BaseEngine):
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            messages, template_tools,
+            messages,
+            template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
@@ -675,8 +712,10 @@ class BatchedEngine(BaseEngine):
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools,
-            chat_template_kwargs=ct_kwargs, is_partial=partial,
+            messages,
+            template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=partial,
         )
 
         return await self.generate(
@@ -735,8 +774,10 @@ class BatchedEngine(BaseEngine):
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools,
-            chat_template_kwargs=ct_kwargs, is_partial=partial,
+            messages,
+            template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=partial,
         )
 
         # SpecPrefill: compute system prompt token count for protection.

@@ -301,6 +301,7 @@ try:
     _ckvcache_methods_skipped: list[str] = []
 
     if not hasattr(_CKVCache, "merge"):
+
         @classmethod
         def _ckvcache_merge_passthrough(cls, caches):
             if len(caches) == 1:
@@ -315,6 +316,7 @@ try:
         _ckvcache_methods_skipped.append("merge")
 
     if not hasattr(_CKVCache, "filter"):
+
         def _ckvcache_filter_passthrough(self, batch_indices):
             try:
                 n = len(batch_indices)
@@ -339,6 +341,7 @@ try:
         _ckvcache_methods_skipped.append("filter")
 
     if not hasattr(_CKVCache, "extract"):
+
         def _ckvcache_extract_passthrough(self, idx):
             return self
 
@@ -347,6 +350,7 @@ try:
         _ckvcache_methods_skipped.append("extract")
 
     if not hasattr(_CKVCache, "size"):
+
         def _ckvcache_size(self):
             return max(0, self.offset - self.start_position)
 
@@ -355,6 +359,7 @@ try:
         _ckvcache_methods_skipped.append("size")
 
     if not hasattr(_CKVCache, "extend"):
+
         def _ckvcache_extend_passthrough(self, other):
             if other is None or other.empty():
                 return
@@ -378,8 +383,7 @@ try:
         # Surface which ones so a regression in Llama-4 batching is visible
         # to operators without diffing the patch against installed mlx_lm.
         logger.info(
-            "ChunkedKVCache patch: methods already present upstream, "
-            "skipped: %s",
+            "ChunkedKVCache patch: methods already present upstream, " "skipped: %s",
             ", ".join(_ckvcache_methods_skipped),
         )
 except ImportError:
@@ -1885,7 +1889,11 @@ class Scheduler:
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
 
-        prompt_cache = existing_cache if existing_cache is not None else make_prompt_cache(self.model)
+        prompt_cache = (
+            existing_cache
+            if existing_cache is not None
+            else make_prompt_cache(self.model)
+        )
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
@@ -1967,7 +1975,9 @@ class Scheduler:
                 and total_tokens % state.block_size == 0
                 and state.emitted_boundaries.get(rid, -1) < total_tokens
             ):
-                self._emit_prefill_boundary_snapshot(state.request, state.cache, total_tokens)
+                self._emit_prefill_boundary_snapshot(
+                    state.request, state.cache, total_tokens
+                )
                 state.emitted_boundaries[rid] = total_tokens
 
         # Progress callback so the admin UI prefilling list advances during
@@ -1978,9 +1988,11 @@ class Scheduler:
             state.request.request_id,
             state.tokens_processed,
             state.total_length - 1,
-            os.path.basename(self.config.model_name.rstrip("/"))
-            if self.config.model_name
-            else "",
+            (
+                os.path.basename(self.config.model_name.rstrip("/"))
+                if self.config.model_name
+                else ""
+            ),
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
@@ -2025,7 +2037,9 @@ class Scheduler:
             and total_tokens % state.block_size == 0
             and state.emitted_boundaries.get(rid, -1) < total_tokens
         ):
-            self._emit_prefill_boundary_snapshot(state.request, state.cache, total_tokens)
+            self._emit_prefill_boundary_snapshot(
+                state.request, state.cache, total_tokens
+            )
 
     def _insert_prefilled_request(
         self,
@@ -2057,6 +2071,12 @@ class Scheduler:
 
         if uids:
             uid = uids[0]
+            if getattr(self.model, "_omlx_ngram_spec_enabled", False):
+                prompt_map = getattr(self.model, "_omlx_ngram_prompt_tokens", None)
+                if prompt_map is None:
+                    prompt_map = {}
+                    self.model._omlx_ngram_prompt_tokens = prompt_map
+                prompt_map[uid] = list(request.prompt_token_ids or [])
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
             now = time.monotonic()
@@ -2077,8 +2097,11 @@ class Scheduler:
             logger.debug(
                 "Scheduled chunked-prefill request %s (uid=%d) "
                 "with %d tokens (%d total)%s",
-                request.request_id, uid,
-                len(state.last_token), request.num_prompt_tokens, cache_info,
+                request.request_id,
+                uid,
+                len(state.last_token),
+                request.num_prompt_tokens,
+                cache_info,
             )
 
     def _advance_chunked_prefills(
@@ -2154,7 +2177,8 @@ class Scheduler:
                 # Unlikely, but if BG creation fails put request back.
                 logger.error(
                     "BatchGenerator unavailable at chunked-prefill completion "
-                    "for %s; requeueing.", rid
+                    "for %s; requeueing.",
+                    rid,
                 )
                 still_prefilling.append(request)
                 self._prefill_states[rid] = state
@@ -3812,7 +3836,8 @@ class Scheduler:
             spec_extra = {
                 "prompt_tokens": request.num_prompt_tokens,
                 "system_tokens": request.specprefill_system_end,
-                "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                "conversation_tokens": request.num_prompt_tokens
+                - request.specprefill_system_end,
                 "cached_tokens": request.cached_tokens,
             }
 
@@ -4130,7 +4155,12 @@ class Scheduler:
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
         """
-        return bool(self.waiting or self.prefilling or self.running or self._deferred_clear_at is not None)
+        return bool(
+            self.waiting
+            or self.prefilling
+            or self.running
+            or self._deferred_clear_at is not None
+        )
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -4480,13 +4510,14 @@ class Scheduler:
                         spec_sparse_extra = {
                             "prompt_tokens": request.num_prompt_tokens,
                             "system_tokens": request.specprefill_system_end,
-                            "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                            "conversation_tokens": request.num_prompt_tokens
+                            - request.specprefill_system_end,
                             "cached_tokens": request.cached_tokens,
                             "scored_tokens": m_pre,
                             "selected_tokens": n_eff,
-                            "keep_percent": round(n_eff / m_pre * 100)
-                            if m_pre > 0
-                            else 0,
+                            "keep_percent": (
+                                round(n_eff / m_pre * 100) if m_pre > 0 else 0
+                            ),
                         }
                         while sys_arr.size > step:
                             _check_specprefill_abort(sys_processed)
@@ -4576,12 +4607,15 @@ class Scheduler:
                             extra={
                                 "scored_tokens": M,
                                 "selected_tokens": int(selected.shape[0]),
-                                "keep_percent": round(int(selected.shape[0]) / M * 100)
-                                if M > 0
-                                else 0,
+                                "keep_percent": (
+                                    round(int(selected.shape[0]) / M * 100)
+                                    if M > 0
+                                    else 0
+                                ),
                                 "prompt_tokens": request.num_prompt_tokens,
                                 "system_tokens": request.specprefill_system_end,
-                                "conversation_tokens": request.num_prompt_tokens - request.specprefill_system_end,
+                                "conversation_tokens": request.num_prompt_tokens
+                                - request.specprefill_system_end,
                                 "cached_tokens": request.cached_tokens,
                             },
                         )
@@ -4660,7 +4694,9 @@ class Scheduler:
                 ):
                     sm = self._build_state_machine(request)
                     per_row_lps = list(logits_processors) if logits_processors else []
-                    state = self._begin_prefill(request, tokens_to_process, cache_to_use)
+                    state = self._begin_prefill(
+                        request, tokens_to_process, cache_to_use
+                    )
                     state.sampler = sampler
                     state.sm = sm
                     state.per_row_lps = per_row_lps
@@ -4784,6 +4820,12 @@ class Scheduler:
 
             if uids:
                 uid = uids[0]
+                if getattr(self.model, "_omlx_ngram_spec_enabled", False):
+                    prompt_map = getattr(self.model, "_omlx_ngram_prompt_tokens", None)
+                    if prompt_map is None:
+                        prompt_map = {}
+                        self.model._omlx_ngram_prompt_tokens = prompt_map
+                    prompt_map[uid] = list(request.prompt_token_ids or [])
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 now = time.monotonic()
@@ -5205,6 +5247,9 @@ class Scheduler:
             # fall back to immediate remove for back-compat behavior.
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
+                prompt_map = getattr(self.model, "_omlx_ngram_prompt_tokens", None)
+                if prompt_map is not None:
+                    prompt_map.pop(uid, None)
                 if store_future is not None:
                     self._pending_async_removes.append((uid, request_id, store_future))
                 else:
@@ -5457,7 +5502,9 @@ class Scheduler:
             # Run generation step if we have running requests.
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
-            if (self.batch_generator is not None or self._vlm_mtp_active) and self.running:
+            if (
+                self.batch_generator is not None or self._vlm_mtp_active
+            ) and self.running:
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
                 else:
@@ -5492,10 +5539,9 @@ class Scheduler:
                     # there is no race window. Decode-only path —
                     # next_generated() returns nothing during prefill, so
                     # we never disrupt prefill activation buffers.
-                    self._tokens_since_clear_cache = (
-                        getattr(self, "_tokens_since_clear_cache", 0)
-                        + len(responses)
-                    )
+                    self._tokens_since_clear_cache = getattr(
+                        self, "_tokens_since_clear_cache", 0
+                    ) + len(responses)
                     if self._tokens_since_clear_cache >= 1024:
                         _sync_and_clear_cache()
                         self._tokens_since_clear_cache = 0
