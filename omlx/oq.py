@@ -3089,8 +3089,9 @@ def _measure_sensitivity(
     if is_vlm and _has_mtp_heads(config):
         try:
             from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
-            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch, apply_mlx_vlm_mtp_runtime_patch
 
+            apply_mlx_vlm_mtp_patch()
             apply_mlx_vlm_mtp_runtime_patch()
             prev_active = is_mtp_active()
             set_mtp_active(True)
