@@ -3064,6 +3064,7 @@ def _measure_sensitivity(
     num_samples=32, seq_length=256,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
+    from omlx.model_discovery import _has_vision_subconfig
     from omlx.utils.model_loading import (
         _has_mtp_heads,
         maybe_apply_pre_load_patches,
@@ -3074,7 +3075,10 @@ def _measure_sensitivity(
     # applied exactly as in the production load path.
     maybe_apply_pre_load_patches(model_path)
 
-    is_vlm = "vision_config" in config
+    # Treat any model with a vision sub-config (vision_config / vit_config /
+    # mm_vision_tower) as a VLM for the MTP attach decision. The classifier
+    # in model_discovery._has_vision_subconfig owns the canonical predicate.
+    is_vlm = _has_vision_subconfig(config)
 
     # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
     # for the text path: the patched qwen35_model.sanitize self-consistently

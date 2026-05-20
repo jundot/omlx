@@ -368,6 +368,48 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_vlm_molmo2_via_vit_config(self, tmp_path):
+        """Molmo2 bf16 ships ``vit_config`` (not ``vision_config``) — must classify as VLM."""
+        config = {
+            "model_type": "molmo2",
+            "architectures": ["Molmo2ForConditionalGeneration"],
+            "vit_config": {"hidden_size": 1024, "num_layers": 24},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_vlm_fastvlm_via_mm_vision_tower(self, tmp_path):
+        """FastVLM bf16 ships ``mm_vision_tower`` (older LLaVA style) — must classify as VLM."""
+        config = {
+            "model_type": "llava_qwen2",
+            "architectures": ["LlavaQwen2ForCausalLM"],
+            "mm_vision_tower": "openai/clip-vit-large-patch14-336",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_text_only_quant_with_empty_mm_vision_tower_as_llm(self, tmp_path):
+        """``mm_vision_tower`` evidence check is non-empty-only — empty string falls back to LLM."""
+        config = {
+            "model_type": "llava_qwen2",
+            "architectures": ["LlavaQwen2ForCausalLM"],
+            "mm_vision_tower": "",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_text_only_quant_no_vision_evidence_as_llm(self, tmp_path):
+        """A VLM_ARCHITECTURE match without any vision sub-config evidence is a text-only quant."""
+        config = {
+            # qwen3_5_moe is in VLM_MODEL_TYPES, and the unsloth Qwen3.5-122B
+            # text-only quant ships only the chat backbone arch.
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5_MoEForCausalLM"],
+            # No vision_config / vit_config / mm_vision_tower.
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""

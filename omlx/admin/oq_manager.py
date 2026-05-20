@@ -195,6 +195,7 @@ class OQManager:
                                 or int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
                                 or int(tc.get("num_nextn_predict_layers", 0) or 0) > 0
                             )
+                            from ..model_discovery import _has_vision_subconfig
                             info = {
                                 "name": path.name,
                                 "path": str(path),
@@ -202,7 +203,10 @@ class OQManager:
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "") or tc.get("model_type", ""),
                                 "is_quantized": "quantization" in config,
-                                "is_vlm": "vision_config" in config,
+                                # Treat vision_config / vit_config / mm_vision_tower as VLM
+                                # evidence (Molmo / Molmo2 use vit_config; FastVLM uses
+                                # mm_vision_tower). Same predicate as model_discovery.
+                                "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
                             }
                             all_models.append(info)
