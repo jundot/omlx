@@ -10,6 +10,7 @@ follow-up once the BatchGenerator integration body is filled in.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -159,6 +160,51 @@ class TestQwen35Model:
         assert hasattr(Model, "mtp_forward")
         assert hasattr(Model, "make_mtp_cache")
         assert hasattr(Model, "_omlx_mtp_patched")
+
+    def test_decoder_layer_omits_n_confirmed_when_zero(self):
+        """DFlash replaces linear_attn.__call__ with a hook that has no
+        n_confirmed param. The patched DecoderLayer must not pass the kwarg
+        on the n_confirmed==0 path (stock / DFlash). Regression for #1318.
+        """
+        from mlx_lm.models.qwen3_5 import DecoderLayer
+
+        seen = {"passed": None}
+
+        # Mimic DFlash's speculative hook: no n_confirmed parameter.
+        def linear_attn_no_kwarg(h, mask=None, cache=None):
+            seen["passed"] = False
+            return h
+
+        fake = SimpleNamespace(
+            is_linear=True,
+            input_layernorm=lambda x: x,
+            post_attention_layernorm=lambda x: x,
+            linear_attn=linear_attn_no_kwarg,
+            mlp=lambda x: 0.0,
+        )
+        # Must not raise TypeError on the unexpected n_confirmed kwarg.
+        DecoderLayer.__call__(fake, 0.0, mask=None, cache=None, n_confirmed=0)
+        assert seen["passed"] is False
+
+    def test_decoder_layer_forwards_n_confirmed_when_nonzero(self):
+        """The MTP draft/verify path (n_confirmed>0) still threads the kwarg."""
+        from mlx_lm.models.qwen3_5 import DecoderLayer
+
+        seen = {"n_confirmed": None}
+
+        def linear_attn_with_kwarg(h, mask=None, cache=None, n_confirmed=0):
+            seen["n_confirmed"] = n_confirmed
+            return h
+
+        fake = SimpleNamespace(
+            is_linear=True,
+            input_layernorm=lambda x: x,
+            post_attention_layernorm=lambda x: x,
+            linear_attn=linear_attn_with_kwarg,
+            mlp=lambda x: 0.0,
+        )
+        DecoderLayer.__call__(fake, 0.0, mask=None, cache=None, n_confirmed=3)
+        assert seen["n_confirmed"] == 3
 
 
 class TestQwen35MoeSanitize:

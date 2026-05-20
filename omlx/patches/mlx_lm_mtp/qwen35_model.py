@@ -363,9 +363,17 @@ def _patch_decoder_layer(q35: Any) -> None:
 
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
         if self.is_linear:
-            r = self.linear_attn(
-                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
-            )
+            h_in = self.input_layernorm(x)
+            # n_confirmed is an MTP draft/verify concern and is always 0 on
+            # the stock and DFlash forward paths. Forward it only when it
+            # actually splits the sequence, so linear_attn implementations
+            # that don't accept the kwarg keep working — DFlash replaces
+            # linear_attn.__call__ with a hook that has no n_confirmed param.
+            # Mirrors the conditional in batch_generator._call_backbone.
+            if n_confirmed:
+                r = self.linear_attn(h_in, mask, cache, n_confirmed=n_confirmed)
+            else:
+                r = self.linear_attn(h_in, mask, cache)
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r

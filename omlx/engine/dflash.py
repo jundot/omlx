@@ -24,6 +24,7 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..utils.model_loading import maybe_apply_pre_load_patches
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,16 @@ class DFlashEngine(BaseEngine):
             from dflash_mlx.runtime.loading import (
                 load_draft_bundle,
                 load_target_bundle,
+            )
+
+            # Apply the same pre-load patches BatchedEngine uses before
+            # mlx_lm.load() runs. MTP-bearing targets (e.g. Qwen3.6 *-mtp)
+            # need the MTP-compat sanitize patch or stock mlx-lm double-shifts
+            # the already-converted norm and emits garbage. dflash and mtp are
+            # mutually exclusive per model_settings, so this never attaches an
+            # MTP head; it only fixes sanitize. See issue #1318.
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
             )
 
             target_bundle = load_target_bundle(self._model_name)
