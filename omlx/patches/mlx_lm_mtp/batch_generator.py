@@ -25,6 +25,16 @@ The throughput math (greedy, accept rate p):
   - At p≈1: 0.575 cost/token → ~1.74× throughput
   - At p≈0.5: ~0.77 cost/token → ~1.30× throughput
 
+Known limitation (compute-bound single-stream Apple Silicon):
+  The cost model above assumes the 2-token verify forward is nearly free
+  relative to a 1-token forward, which is the bandwidth-bound decode regime
+  speculative decoding targets. On lower-end single-stream Apple Silicon
+  (e.g. M1/M2 base/Pro) decode is compute-bound, so the verify forward costs
+  ~2× a 1-token forward and MTP can be net-negative regardless of accept
+  rate. Wins are expected on M3/M4 or higher-end parts, on MoE models with a
+  smaller per-step backbone, or under continuous batching where spare
+  compute exists. See #1097 / #1311 for measurements.
+
 Greedy identity (sampler is None): the patched dispatch produces the same
 tokens as the standard step. PR 990's ``test_mtp_generate_identity``
 encodes this contract; the oMLX-side equivalent lives in
@@ -59,7 +69,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, List, Optional, Tuple
@@ -736,12 +745,15 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         prev_main = gen_batch._token_context[0].update_and_fetch(state.next_main)
         prev_draft = gen_batch._token_context[0].update_and_fetch(state.draft_tok)
 
-    # --- backbone forward + sample (single eval point) ---
-    # Dispatch backbone, processors, logprobs, and sampler all on stream
-    # without forcing intermediate evaluation. The single ``mx.eval`` after
-    # sampling resolves the whole graph in one stall instead of two.
-    # Tradeoff: backbone_ms / sample_ms split is no longer wall-clock
-    # accurate (everything lands in sample_ms), but cumulative timing is.
+    # --- backbone forward (materialized before sampling) ---
+    # Dispatch the backbone on the generation stream, then force ``mx.eval``
+    # on the logits before the sampler runs. MLX is lazy, so without this the
+    # later ``mx.eval(verify_tok, bonus_tok)`` barrier would resolve the whole
+    # graph in one stall and the heavy verify forward would leak into
+    # sample_ms (this is what made the sampler look like the bottleneck in
+    # #1097 / #1311 / #1330). The extra eval costs one CPU<->GPU round-trip
+    # per cycle (negligible vs the forward compute) and keeps the
+    # backbone_ms / sample_ms split accurate.
     t0 = time.perf_counter()
     with mx.stream(_get_generation_stream()):
         logits, hidden, gdn_states = _call_backbone(
@@ -752,8 +764,6 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         )
         verify_logits = logits[:, 0, :]
         bonus_logits = logits[:, 1, :]
-    # materialize logits now so that it doesn't count as
-    # sampler timing during mx.eval(verify_tok, bonus_tok)
     mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
@@ -799,7 +809,13 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             verify_accept_lp[0, draft_id].item()
             - draft_accept_lp[draft_id].item()
         )
-        accept = log_accept >= 0 or random.random() < math.exp(log_accept)
+        # Draw the acceptance roll from mx.random so it follows the same
+        # mx.random.seed the rest of the sampler uses (line ~962 residual
+        # sampling). stdlib ``random`` was never seeded by oMLX, which made
+        # stochastic acceptance irreproducible even with a fixed seed (#1330).
+        accept = log_accept >= 0 or float(
+            mx.random.uniform(shape=()).item()
+        ) < math.exp(log_accept)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     hidden_at_confirmed = hidden[:, 0:1, :]
