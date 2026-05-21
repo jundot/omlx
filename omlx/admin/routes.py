@@ -17,6 +17,7 @@ import re
 import secrets
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -1096,11 +1097,11 @@ def get_system_memory_info() -> dict:
         and auto_limit_formatted (80% of total).
     """
     try:
-        # macOS: use sysctl to get physical memory
-        import subprocess
-
+        # macOS: use sysctl to get physical memory. Invoke by absolute path —
+        # sysctl lives in /usr/sbin, which isn't on PATH in some headless
+        # launchd contexts (brew services). See issue #1322.
         result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             capture_output=True,
             text=True,
             timeout=5,
