@@ -781,6 +781,7 @@
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
+                            chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
