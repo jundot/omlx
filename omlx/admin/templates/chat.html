@@ -40,6 +40,7 @@
         --btn-primary-text: #ffffff;
         --text-danger: #ef4444;
         --bg-danger-hover: rgba(239, 68, 68, 0.1);
+        --timeline-accent: #3b82f6;
     }
 
     [data-theme="dark"] {
@@ -58,6 +59,7 @@
         --btn-primary-text: #18181b;
         --text-danger: #f87171;
         --bg-danger-hover: rgba(239, 68, 68, 0.2);
+        --timeline-accent: #60a5fa;
     }
 
     body {
@@ -72,7 +74,8 @@
     }
 
     .chat-shell {
-        height: 100vh; /* fallback for browsers without dvh support */
+        height: 100vh;
+        /* fallback for browsers without dvh support */
         height: 100dvh;
     }
 
@@ -109,6 +112,7 @@
     /* Messages */
     .message-fade-in {
         animation: fadeIn 0.3s ease;
+        position: relative;
     }
 
     @keyframes fadeIn {
@@ -374,7 +378,7 @@
 
     .user-message-actions {
         position: absolute;
-        left: -64px;
+        left: -96px;
         top: 4px;
         display: flex;
         flex-direction: row;
@@ -662,6 +666,99 @@
         border-radius: 6px;
         border: 1px solid var(--border-faint);
     }
+
+    /* Right Sidebar styling */
+    .right-sidebar-width {
+        width: 320px;
+        min-width: 320px;
+    }
+
+    .right-sidebar-hidden {
+        width: 0 !important;
+        min-width: 0 !important;
+        overflow: hidden;
+        border-left: none !important;
+    }
+
+    .right-sidebar-transition {
+        transition: all 0.25s ease;
+    }
+
+    /* Mobile/tablet responsive for right sidebar */
+    @media (max-width: 1024px) {
+        .right-sidebar-width {
+            position: fixed;
+            right: 0;
+            z-index: 50;
+            height: 100%;
+        }
+
+        .right-sidebar-hidden {
+            transform: translateX(100%);
+            border-left: none !important;
+        }
+
+        .right-sidebar-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 40;
+        }
+
+        .right-sidebar-overlay.hidden {
+            display: none;
+        }
+    }
+
+    /* Timeline Rail */
+    .timeline-rail-line {
+        position: absolute;
+        left: 50%;
+        top: 16px;
+        bottom: 16px;
+        width: 1px;
+        transform: translateX(-50%);
+        background: var(--border-normal);
+        opacity: 0.4;
+        pointer-events: none;
+    }
+
+    .timeline-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: transparent;
+        border: 0.5px solid var(--text-tertiary);
+        transition: all 0.15s ease;
+        cursor: pointer;
+        flex-shrink: 0;
+        pointer-events: auto;
+    }
+
+    .timeline-dot:hover {
+        border-color: var(--timeline-accent) !important;
+        background: var(--timeline-accent) !important;
+    }
+
+    .timeline-dot-active {
+        background: var(--timeline-accent) !important;
+        border: 1.5px solid var(--timeline-accent) !important;
+        transform: scale(1.2);
+    }
+
+    .timeline-tooltip-content {
+        background: var(--bg-primary);
+        border: 1px solid var(--border-normal);
+        border-radius: 8px;
+        padding: 8px 12px;
+        max-width: 260px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        font-size: 12px;
+        color: var(--text-primary);
+        line-height: 1.4;
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+    }
 </style>
 {% endblock %}
 
@@ -701,13 +798,35 @@
         <!-- Sidebar Header -->
         <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center justify-between">
-                <a href="/admin/dashboard" class="flex items-center gap-2 hover:opacity-80 transition-opacity">
-                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
-                        class="w-[30px] h-[30px]">
-                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
-                        class="w-[30px] h-[30px]" x-cloak>
-                    <span class="font-semibold">{{ t('chat.brand') }}</span>
-                </a>
+                <div class="flex items-center gap-2">
+                    <a href="/admin/dashboard">
+                        <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX"
+                            class="w-[30px] h-[30px]">
+                        <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX"
+                            class="w-[30px] h-[30px]" x-cloak>
+                    </a>
+                    <div class="flex flex-col gap-0">
+                        <a href="/admin/dashboard" class="font-semibold leading-tight">{{ t('chat.brand') }}</a>
+                        <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
+                           class="relative text-[10px] leading-none hover:opacity-80 transition-opacity"
+                           style="color: var(--text-muted);"
+                           @mouseenter="versionHover = true" @mouseleave="versionHover = false">
+                            v{{ version }}
+                            <span x-show="updateAvailable" x-cloak
+                                  class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
+                            <span x-show="versionHover" x-cloak
+                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                  x-text="updateAvailable && latestVersion
+                                      ? window.t('navbar.update_available').replace('{version}', latestVersion)
+                                      : window.t('navbar.go_to_github')"></span>
+                        </a>
+                    </div>
+                </div>
+                <button @click="sidebarOpen = false"
+                    class="p-1 hover:bg-surface-alt rounded-lg transition-colors"
+                    :title="window.t('chat.close_sidebar') || 'Close sidebar'">
+                    <i data-lucide="panel-left-close" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                </button>
             </div>
         </div>
 
@@ -748,7 +867,7 @@
                     </template>
                     <template x-if="renamingChatId !== chat.id">
                         <div class="flex items-center gap-0 flex-1 min-w-0">
-                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);"
+                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);" :title="chat.title"
                                 x-text="chat.title || window.t('chat.new_chat_title')"></span>
                             <button @click.stop="startRenamingChat(chat)"
                                 class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
@@ -789,6 +908,19 @@
                     </select>
                 </div>
             </div>
+            <!-- Auto-name chat -->
+            <div class="relative w-full" x-show="true">
+                <div class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
+                    <i data-lucide="type" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                    <span class="flex-1 truncate">Auto-name</span>
+                    <button @click="autoName = !autoName; localStorage.setItem('omlx_auto_name', autoName)" type="button"
+                        class="w-8 h-4 rounded-full transition-colors flex-shrink-0 relative"
+                        :class="autoName ? 'bg-accent' : 'bg-surface-muted'">
+                        <div class="absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform"
+                            :class="autoName ? 'translate-x-4' : 'translate-x-0'"></div>
+                    </button>
+                </div>
+            </div>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
                 class="w-full flex items-center gap-1.5 px-2 py-1 text-xs text-danger hover:bg-danger-bg rounded">
                 <i data-lucide="trash-2" class="w-3 h-3"></i>
@@ -803,57 +935,26 @@
     </div>
 
     <!-- Main Content -->
-    <div class="flex-1 flex flex-col bg-surface overflow-hidden min-w-0">
-        <!-- Header -->
-        <header class="h-14 px-4 border-b border-line flex items-center justify-between bg-surface flex-shrink-0">
-            <button @click="sidebarOpen = true" class="p-2 hover:bg-surface-muted rounded-lg md:hidden"
-                style="color: var(--text-primary);">
-                <i data-lucide="menu" class="w-5 h-5"></i>
-            </button>
-            <button @click="sidebarOpen = !sidebarOpen" class="p-2 hover:bg-surface-muted rounded-lg hidden md:block"
-                style="color: var(--text-primary);">
-                <i data-lucide="panel-left-open" class="w-5 h-5" x-show="!sidebarOpen"></i>
-                <i data-lucide="panel-left-close" class="w-5 h-5" x-show="sidebarOpen"></i>
-            </button>
+    <div class="flex-1 flex flex-col bg-surface overflow-hidden min-w-0 relative">
+        <!-- Floating Sidebar Toggles -->
+        <button @click="sidebarOpen = true"
+            class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm"
+            style="top: 1rem; left: 1rem; color: var(--text-primary);"
+            x-show="showLeftToggle">
+            <i data-lucide="menu" class="w-5 h-5"></i>
+        </button>
 
-            <!-- Model Selector -->
-            <div class="relative" x-data="{ open: false }">
-                <button @click="open = !open"
-                    class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium hover:bg-surface-muted rounded-lg"
-                    style="color: var(--text-primary);">
-                    <i data-lucide="cpu" class="w-4 h-4"></i>
-                    <span x-text="currentModel || window.t('chat.select_model')"></span>
-                    <i data-lucide="chevron-down" class="w-4 h-4"></i>
-                </button>
-                <div x-show="open" @click.away="open = false" x-cloak
-                    class="absolute top-full mt-1 left-1/2 -translate-x-1/2 border border-line rounded-lg shadow-lg py-1 min-w-[360px] max-w-[500px] max-h-60 overflow-y-auto z-50"
-                    style="background: var(--bg-primary); border-color: var(--border-faint);">
-                    <template x-for="model in availableModels" :key="model.id">
-                        <button @click="selectModel(model.id); open = false"
-                            class="w-full px-3 py-2 text-sm text-left hover:bg-surface-muted"
-                            :class="{ 'bg-surface-muted': currentModel === model.id }"
-                            style="color: var(--text-primary);">
-                            <span x-text="model.id"></span>
-                        </button>
-                    </template>
-                    <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm"
-                        style="color: var(--text-tertiary);">
-                        {{ t('chat.no_models') }}
-                    </div>
-                </div>
-            </div>
+        <button @click="rightSidebarOpen = true" class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm"
+            style="top: 1rem; right: 1rem; color: var(--text-primary);"
+            :title="'Show settings'"
+            x-show="showRightToggle">
+            <i data-lucide="settings" class="w-5 h-5"></i>
+        </button>
 
-            <button @click="systemPromptDraft = systemPrompt; showSystemPromptModal = true"
-                class="p-2 hover:bg-surface-muted rounded-lg relative" style="color: var(--text-primary);"
-                :title="window.t('chat.system_prompt.title')">
-                <i data-lucide="settings" class="w-5 h-5"></i>
-                <span x-show="systemPrompt.trim()" x-cloak
-                    class="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full"></span>
-            </button>
-        </header>
-
-        <!-- Messages Area -->
-        <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
+        <!-- Messages area with rail -->
+        <div class="flex-1 min-h-0 relative">
+            <!-- Messages Container -->
+            <div class="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
             <div x-show="messages.length === 0" class="h-full flex items-center justify-center" x-cloak>
                 <div class="text-center max-w-lg px-4">
@@ -879,7 +980,7 @@
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message" :class="{ 'is-editing': editingIndex === index }">
-                                <div x-show="editingIndex !== index" class="user-message-actions">
+                                <div x-show="editingIndex !== index" class="user-message-actions" x-data="{ contextOpen: false }">
                                     <button @click="copyMessage(msg.content)" class="user-message-action-btn"
                                         title="{{ t('chat.copy_tooltip') }}">
                                         <i data-lucide="copy" class="w-4 h-4"></i>
@@ -888,8 +989,35 @@
                                         title="{{ t('chat.edit_tooltip') }}">
                                         <i data-lucide="pencil" class="w-4 h-4"></i>
                                     </button>
-                                </div>
-                                <template x-if="editingIndex !== index">
+                                    <div class="relative">
+                                        <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
+                                            class="user-message-action-btn" title="More actions">
+                                            <i data-lucide="more-vertical" class="w-4 h-4"></i>
+                                        </button>
+                                        <div x-show="contextOpen" x-transition
+                                            class="absolute right-0 top-full mt-1 z-50 bg-surface border border-line rounded-lg shadow-lg py-1 min-w-[150px]"
+                                            style="min-width: 160px; border-color: var(--border-normal);">
+                                            <button @click="branchChat(index); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
+                                                Branch Here
+                                            </button>
+                                            <button @click="deleteMessage(index); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger-bg">
+                                                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                                Delete
+                                            </button>
+                                            <button @click="copyMarkdown(msg); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
+                                                Copy Markdown
+                                             </button>
+                 </div>
+             </div>
+             </div>
+                                 <template x-if="editingIndex !== index">
                                     <div>
                                         <!-- Images from content array -->
                                         <template x-if="getImageUrls(msg.content).length > 0">
@@ -916,7 +1044,7 @@
                                         </template>
                                         <!-- Text content -->
                                         <template x-if="getTextContent(msg.content)">
-                                            <div class="user-message-bubble"
+                                            <div class="user-message-bubble markdown-content"
                                                 x-html="renderMarkdown(getTextContent(msg.content))"></div>
                                         </template>
                                     </div>
@@ -957,8 +1085,12 @@
                                     style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                                     <span x-text="msg.model || currentModel || window.t('chat.assistant_label')"></span>
+                                    <span x-show="msg._profile && msg._profile !== 'System Default'"
+                                        class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
+                                        style="color: var(--text-tertiary);"
+                                        x-text="msg._profile"></span>
                                 </div>
-                                <div class="flex gap-1">
+                                <div class="flex gap-1" x-data="{ contextOpen: false }">
                                     <!-- Timeline toggle: only visible when timeline data is attached -->
                                     <button x-show="msg._perfLog?.length > 0"
                                         @click="msg._perfVisible = !msg._perfVisible"
@@ -977,8 +1109,35 @@
                                         title="{{ t('chat.regenerate_tooltip') }}">
                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                     </button>
-                                </div>
-                            </div>
+                                    <div class="relative min-w-[170px]">
+                                        <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
+                                            class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary">
+                                            <i data-lucide="more-vertical" class="w-4 h-4"></i>
+                                        </button>
+                                        <div x-show="contextOpen" x-transition
+                                            class="absolute right-0 top-full mt-1 z-50 bg-surface border border-line rounded-lg shadow-lg py-1 min-w-[150px]"
+                                            style="min-width: 160px; border-color: var(--border-normal);">
+                                            <button @click="branchChat(index); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
+                                                Branch here
+                                            </button>
+                                            <button @click="deleteMessage(index); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger-bg">
+                                                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                                Delete
+                                            </button>
+                                            <button @click="copyMarkdown(msg); contextOpen = false"
+                                                class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                                <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
+                                                Copy markdown
+                                            </button>
+                                        </div>
+               </div>
+            </div>
+        </div>
                             <!-- Collapsible performance timeline -->
                             <div x-show="msg._perfVisible === true && msg._perfLog?.length > 0"
                                 class="px-1 pt-1 pb-2 mb-1 border-b space-y-0.5"
@@ -1025,7 +1184,6 @@
                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
                                 x-html="renderMarkdown(msg.content)"></div>
                         </div>
-
                     </div>
                 </template>
 
@@ -1135,8 +1293,33 @@
             </div>
         </div>
 
+        <!-- Timeline rail -->
+        <div x-show="messages.length > 0 && timelineDots.length > 0"
+            class="absolute top-0 h-full z-20 pointer-events-none"
+            style="width:20px;right:max(0px,calc(50% - 468px));">
+            <div class="timeline-rail-line"></div>
+            <template x-for="dot in timelineDots" :key="dot.index">
+                <div class="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto cursor-pointer"
+                    :style="'top:' + dot.topPx + 'px;width:9px;height:9px;display:flex;align-items:center;justify-content:center;border-radius:50%;'"
+                    @mouseenter="showDotTooltip($event, messages[dot.index], dot.index)"
+                    @mouseleave="hideDotTooltip()"
+                    @click="scrollToMessage(dot.index)">
+                    <span class="timeline-dot"
+                        :class="timelineActive === dot.index ? 'timeline-dot-active' : ''"></span>
+                </div>
+            </template>
+        </div>
+    </div>
+
+        <!-- Timeline tooltip -->
+        <div x-show="timelineTooltip.show" x-transition
+            class="fixed pointer-events-none z-50"
+            :style="'left:' + timelineTooltip.x + 'px;top:' + timelineTooltip.y + 'px;'">
+            <div class="timeline-tooltip-content" x-html="timelineTooltip.content"></div>
+        </div>
+
         <!-- Input Area -->
-        <div class="p-4 border-t border-line bg-surface flex-shrink-0">
+        <div class="p-4 bg-surface flex-shrink-0">
             <div class="max-w-4xl mx-auto">
                 <div class="input-container" :class="{ 'drag-over': isDragOver }" @dragover.prevent="isDragOver = true"
                     @dragleave.prevent="isDragOver = false" @drop.prevent="isDragOver = false; handleDrop($event)">
@@ -1162,9 +1345,9 @@
                         <!-- Image upload button (only for VLM models) -->
                         <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
                             :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadImages.length >= 10"
-                            class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
-                            <i data-lucide="image" class="w-5 h-5"></i>
+                            <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -1175,16 +1358,427 @@
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
                             style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
-                            <button @click="sendMessage()"
-                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel || isCurrentChatStreaming()"
+                            <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
+                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
+                            </button>
+                            <button x-show="isCurrentChatStreaming()" @click="stopStreaming()"
+                                class="w-10 h-10 m-1 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center">
+                                <div class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
                             </button>
                             <!-- Image count badge -->
                             <div x-show="uploadImages.length > 0"
                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadImages.length"></div>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right Sidebar Overlay (mobile) -->
+    <div class="right-sidebar-overlay" :class="{ 'hidden': !rightSidebarOpen }" @click="rightSidebarOpen = false"
+        x-cloak></div>
+
+    <!-- Right Sidebar -->
+    <div class="right-sidebar-width h-full bg-surface border-l border-line flex flex-col right-sidebar-transition"
+        :class="{ 'right-sidebar-hidden': !rightSidebarOpen }" x-cloak>
+
+        <!-- Sidebar Header with tabs -->
+        <div class="p-4 border-b border-line flex-shrink-0">
+            <div class="flex items-center gap-1">
+                <div class="flex flex-1 items-center gap-1">
+                    <button @click="rightSidebarTab = 'settings'"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        :class="rightSidebarTab === 'settings'
+                            ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
+                            : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
+                        <i data-lucide="settings" class="w-3 h-3"></i>
+                        <span>MODEL</span>
+                    </button>
+                    <button @click="rightSidebarTab = 'profile'"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        :class="rightSidebarTab === 'profile'
+                            ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
+                            : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
+                        <i data-lucide="user" class="w-3 h-3"></i>
+                        <span>PROFILE</span>
+                    </button>
+                </div>
+                <button @click="rightSidebarOpen = false"
+                    class="p-1 hover:bg-surface-alt rounded-lg transition-colors"
+                    title="Close settings">
+                    <i data-lucide="panel-right-close" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Tab Content: Scrollable area -->
+        <div class="flex-1 overflow-y-auto custom-scrollbar">
+
+            <!-- ==================== PROFILE TAB ==================== -->
+            <div x-show="rightSidebarTab === 'profile'" class="px-4 py-3 space-y-3">
+
+                <!-- Profile list -->
+                <div class="space-y-0.5">
+                    <template x-for="p in promptProfiles" :key="p.name">
+                        <div>
+                            <!-- Normal row -->
+                            <template x-if="!(editingPromptProfileName && activePromptProfile === p.name)">
+                                <div @click="selectPromptProfile(p.name)"
+                                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer group transition-colors"
+                                    :class="activePromptProfile === p.name ? 'bg-surface-muted' : 'hover:bg-surface-muted'">
+                                    <span class="w-2 h-2 rounded-full flex-shrink-0"
+                                        :class="activePromptProfile === p.name ? 'bg-blue-500' : 'border border-line'"></span>
+                                    <span class="flex-1 text-xs font-medium truncate"
+                                        style="color: var(--text-primary);" x-text="p.name"></span>
+                                    <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                                        :class="{'!opacity-100': activePromptProfile === p.name}">
+                                        <button x-show="p.name !== 'System Default'" @click.stop="startRenamingPromptProfile()"
+                                            class="p-1 rounded hover:bg-surface-alt transition-colors" title="Rename">
+                                            <i data-lucide="pencil" class="w-3 h-3" style="color: var(--text-tertiary);"></i>
+                                        </button>
+                                        <template x-if="profileDeleteConfirm !== p.name && p.name !== 'System Default'">
+                                            <button @click.stop="profileDeleteConfirm = p.name"
+                                                class="p-1 rounded hover:bg-red-50 transition-colors" title="Delete">
+                                                <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
+                                            </button>
+                                        </template>
+                                        <template x-if="profileDeleteConfirm === p.name">
+                                            <span class="flex items-center gap-0.5">
+                                                <button @click.stop="deletePromptProfile(p.name)"
+                                                    class="p-1 text-green-600 hover:bg-surface-muted rounded">
+                                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                                </button>
+                                                <button @click.stop="profileDeleteConfirm = null"
+                                                    class="p-1 text-red-500 hover:bg-surface-muted rounded">
+                                                    <i data-lucide="x" class="w-3 h-3"></i>
+                                                </button>
+                                            </span>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
+                            <!-- Rename inline input -->
+                            <template x-if="editingPromptProfileName && activePromptProfile === p.name">
+                                <div class="flex items-center gap-2 px-3 py-1">
+                                    <input x-model="newProfileNameDraft"
+                                        @keydown.enter.prevent="commitRenamingPromptProfile()"
+                                        @keydown.escape.prevent="cancelRenamingPromptProfile()"
+                                        @click.stop
+                                        class="flex-1 px-2 py-1 text-xs border border-line rounded-md bg-surface-muted"
+                                        style="color: var(--text-primary);"
+                                        placeholder="Profile name..."
+                                        autofocus>
+                                    <button @click.stop="commitRenamingPromptProfile()"
+                                        class="p-1 text-green-600 hover:bg-surface-muted rounded">
+                                        <i data-lucide="check" class="w-3 h-3"></i>
+                                    </button>
+                                    <button @click.stop="cancelRenamingPromptProfile()"
+                                        class="p-1 text-red-500 hover:bg-surface-muted rounded">
+                                        <i data-lucide="x" class="w-3 h-3"></i>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+                <!-- Add Profile button -->
+                <button @click="addNewPromptProfile()"
+                    class="w-full flex items-center gap-2 px-3 py-2 mt-2 rounded-lg text-xs transition-colors hover:bg-surface-muted"
+                    style="color: var(--text-tertiary);">
+                    <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+                    <span>Add Profile</span>
+                </button>
+
+                <!-- Prompt textarea -->
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">Prompt Content</label>
+                    <textarea x-model="systemPrompt" rows="5"
+                        @input="promptDirty = (activePromptProfile && systemPrompt !== promptProfiles.find(p => p.name === activePromptProfile)?.content); const s = getChatSession(currentChatId, true); if (s) s.systemPrompt = systemPrompt;"
+                        placeholder="Enter instructions for this session..."
+                        class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong transition-all resize-y bg-surface-muted"
+                        style="color: var(--text-primary);"></textarea>
+                </div>
+
+                <!-- Save -->
+                <div class="flex justify-center pt-1">
+                    <button @click="savePromptProfile()"
+                        :disabled="!activePromptProfile || !promptDirty"
+                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[10px] font-semibold transition-all duration-200"
+                        :class="promptDirty && activePromptProfile
+                            ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
+                            : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
+                        <i data-lucide="save" class="w-3 h-3"></i>
+                        <span>Save Setting</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- ==================== MODEL TAB ==================== -->
+            <div x-show="rightSidebarTab === 'settings'" class="px-4 py-3 space-y-3">
+
+                <!-- Active Profile selector (shared with PROFILE tab) -->
+                <div class="space-y-1">
+                    <div class="flex items-center gap-1.5 mb-1">
+                        <i data-lucide="user" class="w-3 h-3" style="color: var(--text-secondary);"></i>
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Active Profile</label>
+                    </div>
+                    <div class="relative">
+                        <select
+                            :value="activePromptProfile || ''"
+                            @change="selectPromptProfile($event.target.value || null)"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
+                            style="color: var(--text-primary);">
+                            <template x-for="p in promptProfiles" :key="p.name">
+                                <option :value="p.name" x-text="p.name"></option>
+                            </template>
+                        </select>
+                        <i data-lucide="chevron-down"
+                            class="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                            style="color: var(--text-tertiary);"></i>
+                    </div>
+                </div>
+
+                <!-- Active Model Selector -->
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">Active Model</label>
+                    <div class="relative">
+                        <select x-model="currentModel"
+                            @change="selectModel($event.target.value); modelSettingsDirty = false;"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
+                            style="color: var(--text-primary);">
+                            <template x-for="model in availableModels" :key="model.id">
+                                <option :value="model.id" x-text="model.name"></option>
+                            </template>
+                        </select>
+                        <i data-lucide="chevron-down"
+                            class="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                            style="color: var(--text-tertiary);"></i>
+                    </div>
+                    <div x-show="availableModels.length === 0">
+                        {{ t('chat.no_models') }}
+                    </div>
+                </div>
+
+                <!-- Temperature & Max Tokens -->
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Temperature</label>
+                        <input type="number" x-model.number="modelSettings.temperature" @input="modelSettingsDirty = true"
+                            step="0.1" min="0" max="2" placeholder="Default"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Max Tokens</label>
+                        <input type="number" x-model.number="modelSettings.max_tokens" @input="modelSettingsDirty = true"
+                            min="1" placeholder="Default"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                </div>
+
+                <!-- Sampling Advanced parameters: Top P, Top K, Min P -->
+                <div class="grid grid-cols-3 gap-2">
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Top P</label>
+                        <input type="number" x-model.number="modelSettings.top_p" @input="modelSettingsDirty = true"
+                            step="0.05" min="0" max="1" placeholder="—"
+                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Top K</label>
+                        <input type="number" x-model.number="modelSettings.top_k" @input="modelSettingsDirty = true" min="0"
+                            placeholder="—"
+                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Min P</label>
+                        <input type="number" x-model.number="modelSettings.min_p" @input="modelSettingsDirty = true"
+                            step="0.01" min="0" max="1" placeholder="—"
+                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                </div>
+
+                <!-- Repetition Penalty & Presence Penalty -->
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Rep Penalty</label>
+                        <input type="number" x-model.number="modelSettings.repetition_penalty"
+                            @input="modelSettingsDirty = true" step="0.05" min="0" placeholder="Default"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Pres Penalty</label>
+                        <input type="number" x-model.number="modelSettings.presence_penalty"
+                            @input="modelSettingsDirty = true" step="0.05" min="-2" max="2" placeholder="Default"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
+                </div>
+
+                <!-- Thinking Mode Toggle -->
+                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
+                    <div class="flex items-center gap-2">
+                        <input type="checkbox" x-model="modelSettings.enable_thinking" @change="modelSettingsDirty = true"
+                            class="rounded flex-shrink-0">
+                        <label class="text-xs font-semibold flex-1" style="color: var(--text-primary);">Thinking</label>
+                        <div x-show="modelSettings.enable_thinking" x-collapse class="flex items-center gap-1.5">
+                            <select x-model="modelSettings.thinking_budget_enabled" @change="modelSettingsDirty = true"
+                                class="px-2 py-1 text-[10px] border border-line rounded-lg bg-surface"
+                                style="color: var(--text-primary);">
+                                <option :value="false">No Limit</option>
+                                <option :value="true">Limit</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div x-show="modelSettings.enable_thinking && modelSettings.thinking_budget_enabled" x-collapse>
+                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
+                            @input="modelSettingsDirty = true" placeholder="Tokens (e.g. 1024)"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                            style="color: var(--text-primary);">
+                    </div>
+                </div>
+
+                <!-- KV Cache Quantization (TurboQuant) -->
+                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
+                    <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                            <label class="text-xs font-semibold block" style="color: var(--text-primary);">KV Cache
+                                Quantization</label>
+                            <p class="text-[10px] mt-0.5" style="color: var(--text-tertiary);">Compress with TurboQuant</p>
+                        </div>
+                        <button type="button" @click="if (!isParoquant && speculativeEngine !== 'mtp' && speculativeEngine !== 'vlm_mtp') { modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled; modelSettingsDirty = true; }"
+                            :disabled="isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp'"
+                            :title="isParoquant ? paroquantReason : (speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp' ? 'MTP is incompatible with TurboQuant' : '')"
+                            :style="{
+                                backgroundColor: modelSettings.turboquant_kv_enabled ? 'var(--text-primary)' : 'var(--border-normal)',
+                                opacity: (isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp') ? 0.4 : 1,
+                                cursor: (isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp') ? 'not-allowed' : 'pointer'
+                            }"
+                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none">
+                            <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                        </button>
+                    </div>
+                    <div x-show="modelSettings.turboquant_kv_enabled" x-collapse class="space-y-2">
+                        <div class="space-y-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider block"
+                                style="color: var(--text-secondary);">Bit Depth</label>
+                            <select x-model="modelSettings.turboquant_kv_bits" @change="modelSettingsDirty = true"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                                style="color: var(--text-primary);">
+                                <template x-for="bits in turboquantBitDepths" :key="bits">
+                                    <option :value="bits" x-text="bits + '-bit'"></option>
+                                </template>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speculative Decoding Selector -->
+                <div class="p-3 bg-surface-muted rounded-xl space-y-2 border border-line">
+                    <label class="text-xs font-semibold block" style="color: var(--text-primary);">Speculative
+                        Decoding</label>
+                    <select x-model="speculativeEngine" @change="modelSettingsDirty = true"
+                        class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                        style="color: var(--text-primary);">
+                        <option value="none">None</option>
+                        <option value="dflash">DFlash (Diffusion SpecDec)</option>
+                        <option value="mtp" :disabled="!isMtpCompatible">Native MTP</option>
+                        <option value="vlm_mtp" :disabled="!isVlm">VLM MTP</option>
+                        <option value="specprefill">SpecPrefill</option>
+                    </select>
+                    <div x-show="['dflash', 'vlm_mtp', 'specprefill'].includes(speculativeEngine)" x-collapse
+                        class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Draft Model Path / Alias</label>
+                        <input type="text" x-model="speculativeDraftModel" @input="modelSettingsDirty = true"
+                            placeholder="e.g. mlx-community/DraftModel"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                            style="color: var(--text-primary);">
+                    </div>
+                </div>
+
+                <!-- Save Model Settings button -->
+                <div class="flex justify-center pt-1">
+                    <button @click="saveAdminModelSettings()" :disabled="savingModelSettings || showSavedText"
+                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[10px] font-semibold transition-all duration-200"
+                        :class="modelSettingsDirty && !savingModelSettings && !showSavedText
+                            ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
+                            : showSavedText
+                                ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
+                                : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
+                        <i data-lucide="save" class="w-3 h-3" x-show="!savingModelSettings && !showSavedText"></i>
+                        <span x-show="!savingModelSettings && !showSavedText">Save Setting</span>
+                        <span x-show="savingModelSettings">Saving…</span>
+                        <span x-show="showSavedText">Saved</span>
+                    </button>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Performance Stats Panel on the Bottom -->
+        <div class="p-3 border-t border-line bg-surface flex-shrink-0">
+            <div class="grid grid-cols-2 gap-2">
+                <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
+                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                        style="color: var(--text-tertiary);">Prefill (t/s)</span>
+                    <div class="flex items-end justify-between">
+                        <div class="text-sm font-semibold" style="color: var(--text-primary);"
+                            x-text="recentStats?.avg_prefill_tps ? Number(recentStats.avg_prefill_tps).toFixed(1) : '0.0'">
+                        </div>
+                        <div class="text-[10px]" style="color: var(--text-primary);"
+                            x-show="recentStats?.prompt_tokens > 0" x-text="recentStats.prompt_tokens + ' tok'"></div>
+                    </div>
+                </div>
+                <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
+                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                        style="color: var(--text-tertiary);">Token Gen (t/s)</span>
+                    <div class="flex items-end justify-between">
+                        <div class="text-sm font-semibold" style="color: var(--text-primary);"
+                            x-text="recentStats?.avg_generation_tps ? Number(recentStats.avg_generation_tps).toFixed(1) : '0.0'">
+                        </div>
+                        <div class="text-[10px]" style="color: var(--text-primary);"
+                            x-show="recentStats?.total_tokens > 0" x-text="recentStats.total_tokens + ' tok'"></div>
+                    </div>
+                </div>
+                <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
+                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                        style="color: var(--text-tertiary);">Thinking (s)</span>
+                    <div class="flex items-end justify-between">
+                        <div class="text-sm font-semibold" style="color: var(--text-primary);"
+                            x-text="recentStats?.thinking_time ? Number(recentStats.thinking_time).toFixed(1) : '-'">
+                        </div>
+                        <div class="text-[10px]" style="color: var(--text-primary);"
+                            x-show="recentStats?.thinking_tokens > 0" x-text="recentStats.thinking_tokens + ' tok'">
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
+                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                        style="color: var(--text-tertiary);">Duration (s)</span>
+                    <div class="flex items-end justify-between">
+                        <div class="text-sm font-semibold" style="color: var(--text-primary);"
+                            x-text="recentStats?.total_time ? Number(recentStats.total_time).toFixed(1) : '-'"></div>
                     </div>
                 </div>
             </div>
@@ -1200,44 +1794,6 @@
         <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
     </div>
 
-    <!-- System Prompt Modal -->
-    <div x-show="showSystemPromptModal" x-cloak
-        class="fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
-        @click="showSystemPromptModal = false" @keydown.escape.window="showSystemPromptModal = false">
-        <div class="bg-surface rounded-2xl p-6 max-w-[500px] w-[90%] shadow-2xl" @click.stop>
-            <div class="flex items-center justify-between mb-4">
-                <h3 class="text-lg font-bold" style="color: var(--text-primary);">
-                    {{ t('chat.system_prompt.title') }}
-                </h3>
-                <button @click="showSystemPromptModal = false" class="p-1 hover:bg-surface-muted rounded-lg"
-                    style="color: var(--text-tertiary);">
-                    <i data-lucide="x" class="w-5 h-5"></i>
-                </button>
-            </div>
-            <p class="text-sm mb-3" style="color: var(--text-tertiary);">
-                {{ t('chat.system_prompt.description') }}
-            </p>
-            <textarea x-model="systemPromptDraft" rows="6" :placeholder="window.t('chat.system_prompt.placeholder')"
-                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong resize-y"
-                style="background: var(--bg-primary); color: var(--text-primary);"></textarea>
-            <div class="flex items-center justify-between">
-                <button @click="clearSystemPrompt()" class="text-sm px-3 py-2 hover:bg-surface-muted rounded-lg"
-                    style="color: var(--text-tertiary);" x-show="systemPrompt.trim()">
-                    {{ t('chat.system_prompt.clear') }}
-                </button>
-                <div class="flex items-center gap-2 ml-auto">
-                    <button @click="showSystemPromptModal = false"
-                        class="px-4 py-2 text-sm rounded-xl hover:bg-surface-muted" style="color: var(--text-primary);">
-                        {{ t('chat.system_prompt.cancel') }}
-                    </button>
-                    <button @click="saveSystemPrompt()"
-                        class="px-4 py-2 text-sm bg-accent text-accent-fg rounded-xl hover:bg-accent-hover">
-                        {{ t('chat.system_prompt.save') }}
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
 </div>
 {% endblock %}
 
@@ -1268,6 +1824,7 @@
             // UI State
             isMobile: window.innerWidth < 768,
             sidebarOpen: window.innerWidth >= 768,
+            showLeftToggle: window.innerWidth < 768,
             theme: localStorage.getItem('omlx-chat-theme') || 'auto',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
@@ -1313,17 +1870,93 @@
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+            aliasToGateway: {},          // { aliasName: gatewayId } maps alias to directory name
 
-            // System Prompt
-            systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
-            showSystemPromptModal: false,
-            systemPromptDraft: '',
+            // Session Prompt
+            systemPrompt: '',
+
+            // Right Sidebar Tab
+            rightSidebarTab: 'settings',
+
+            // PROFILE Section State
+            promptProfiles: [],
+            activePromptProfile: null,
+            promptDirty: false,
+            editingPromptProfileName: false,
+            newProfileNameDraft: '',
+            profileDeleteConfirm: null,
+
+            // MODEL SETTINGS Section State (shared prompt profiles from PROFILE tab)
             // MCP Tool Call Limits
             MAX_TOOL_DEPTH: 10,          // Max recursive streamResponse calls for tool loops
             TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
 
             // MCP tools & prefill polling
             mcpTools: [],                // OpenAI-format tool definitions loaded from /v1/mcp/tools
+
+            // Right Sidebar State
+            rightSidebarOpen: window.innerWidth >= 1200,
+            showRightToggle: window.innerWidth < 1200,
+            savingModelSettings: false,
+            showSavedText: false,
+            modelSettingsDirty: false,
+            speculativeEngine: 'none',
+            speculativeDraftModel: '',
+            isMtpCompatible: false,
+            isVlm: false,
+            recentStats: {
+                avg_prefill_tps: 0,
+                avg_generation_tps: 0,
+                thinking_time: 0,
+                total_time: 0
+            },
+            statsInterval: null,
+
+            // Update check state
+            updateAvailable: false,
+            latestVersion: null,
+            releaseUrl: null,
+            versionHover: false,
+            _updateCheckTimer: null,
+
+            autoName: localStorage.getItem('omlx_auto_name') !== 'false',
+
+            // Timeline navigation rail
+            timelineDots: [],              // [{ index, topPx }]
+            timelineActive: -1,
+            timelineTooltip: { show: false, content: '', x: 0, y: 0 },
+
+            isParoquant: false,
+            paroquantReason: '',
+            turboquantBitDepths: [2, 2.5, 3, 3.5, 4, 6, 8],
+
+            modelSettings: {
+                temperature: null,
+                max_tokens: null,
+                top_p: null,
+                top_k: null,
+                min_p: null,
+                repetition_penalty: null,
+                presence_penalty: null,
+                enable_thinking: false,
+                thinking_budget_enabled: false,
+                thinking_budget_tokens: null,
+                turboquant_kv_enabled: false,
+                turboquant_kv_bits: 4,
+                turboquant_skip_last: true,
+            },
+
+            emptyStats() {
+                return {
+                    avg_prefill_tps: 0,
+                    avg_generation_tps: 0,
+                    thinking_time: 0,
+                    total_time: 0,
+                    prompt_tokens: 0,
+                    thinking_tokens: 0,
+                    total_tokens: 0
+                };
+            },
 
             cloneData(value) {
                 return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -1332,9 +1965,6 @@
             createThinkingState() {
                 return {
                     isInThinking: false,
-                    thinkingIndex: 0,
-                    thinkingContent: '',
-                    regularContent: '',
                     thinkingStartTime: null
                 };
             },
@@ -1377,10 +2007,6 @@
                     };
                 }
                 return this.chatSessions[chatId] || null;
-            },
-
-            getCurrentChatSession() {
-                return this.getChatSession(this.currentChatId, false);
             },
 
             getStreamSession(chatId = this.currentChatId, create = false) {
@@ -1438,6 +2064,8 @@
                     stream.statusLog = [];
                     stream.statusTimelineVisible = false;
                     stream._statusStart = 0;
+                    stream._thinkSecs = 0;
+                    stream._ttft = 0;
                 }
                 if (!preserveFinalContent) {
                     stream.finalContent = false;
@@ -1454,6 +2082,8 @@
 
             async init() {
 
+        this.loadPromptProfiles();
+
                 const serverApiKey = {{ api_key | tojson }};
 
         if (serverApiKey) {
@@ -1464,14 +2094,52 @@
         if (storedKey) {
             this.apiKeySet = true;
             await this.loadModels();
+            if (this.currentModel) {
+                await this.loadAdminModelSettings(this.currentModel);
+            }
             this.loadChatHistory();
             this.fetchMcpTools();
         }
 
         this.applyTheme();
+        this.checkForUpdate();
+        this.startUpdateCheckTimer();
 
         this.$nextTick(() => {
             this.setupScrollListener();
+            this.computeTimelineDots();
+            this.computeTimelineActive();
+        });
+
+        this.$watch('rightSidebarOpen', () => {
+            this.$nextTick(() => this.computeTimelineDots());
+            clearTimeout(this._sidebarTransitionTimer);
+            this._sidebarTransitionTimer = setTimeout(() => this.computeTimelineDots(), 260);
+        });
+
+        this.$watch('sidebarOpen', (val) => {
+            clearTimeout(this._sidebarShowTimer);
+            if (val) {
+                this.showLeftToggle = false;
+            } else {
+                this._sidebarShowTimer = setTimeout(() => { this.showLeftToggle = true; }, 260);
+            }
+        });
+
+        this.$watch('rightSidebarOpen', (val) => {
+            clearTimeout(this._rightSidebarShowTimer);
+            if (val) {
+                this.showRightToggle = false;
+            } else {
+                this._rightSidebarShowTimer = setTimeout(() => { this.showRightToggle = true; }, 260);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            clearTimeout(this._timelineResizeTimer);
+            this._timelineResizeTimer = setTimeout(() => {
+                this.computeTimelineDots();
+            }, 200);
         });
 
     },
@@ -1713,6 +2381,12 @@
             this.scrollTimeout = setTimeout(() => {
                 this.isUserScrolling = false;
             }, 150);
+
+            // Update active dot on scroll
+            clearTimeout(this._timelineScrollTimer);
+            this._timelineScrollTimer = setTimeout(() => {
+                this.computeTimelineActive();
+            }, 50);
         });
     },
 
@@ -1743,9 +2417,14 @@
 
             async loadModels() {
         try {
-            // Fetch models and server health in parallel
-            const [modelsResponse, healthResponse] = await Promise.all([
+            // Fetch models, admin model list, and server health in parallel
+            const [modelsResponse, adminModelsResponse, healthResponse] = await Promise.all([
                 fetch('/v1/models', {
+                    headers: {
+                        'Authorization': `Bearer ${this.getApiKey()}`
+                    }
+                }),
+                fetch('/admin/api/models', {
                     headers: {
                         'Authorization': `Bearer ${this.getApiKey()}`
                     }
@@ -1765,17 +2444,37 @@
                 throw new Error('Failed to load models');
             }
 
-            const modelsData = await modelsResponse.json();
-            const allModels = modelsData.data || [];
-
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
 
-            // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+            // Build alias → gateway id mapping from admin API
+            // (admin/api/models returns directory names as model.id, with alias in settings)
+            this.aliasToGateway = {};
+            if (adminModelsResponse.ok) {
+                const adminData = await adminModelsResponse.json();
+                for (const m of (adminData.models || [])) {
+                    const alias = m.settings?.model_alias || m.model_alias;
+                    if (alias) {
+                        this.aliasToGateway[alias] = m.id;
+                    }
+                }
+            }
+
+            const modelsData = await modelsResponse.json();
+            const allModels = modelsData.data || [];
+
+            // Build available models with gateway id (directory name) as the value
+            // Store alias for display (in case we want to show it later)
             this.availableModels = allModels.filter(m => {
-                const t = (this.modelTypeMap[m.id] || '').toLowerCase();
+                const gatewayId = this.aliasToGateway[m.id] || m.id;
+                const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
                 return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
-            });
+            }).map(m => ({
+                id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
+                name: m.id, // original name (alias or directory name) for display
+                owned_by: m.owned_by
+            }));
+
             // Get default model from health endpoint
             let defaultModel = null;
             if (healthResponse.ok) {
@@ -1783,12 +2482,11 @@
                 defaultModel = healthData.default_model;
             }
 
-            // Auto-select default model if set, otherwise first model
+            // Auto-select default model if set, otherwise first model (gateway id)
             if (!this.currentModel && this.availableModels.length > 0) {
-                if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
-                    this.currentModel = defaultModel;
-                } else {
-                    this.currentModel = this.availableModels[0].id;
+                this.currentModel = this.aliasToGateway[this.availableModels[0].name] || this.availableModels[0].name;
+                if (defaultModel) {
+                    this.currentModel = this.aliasToGateway[defaultModel] || defaultModel;
                 }
             }
         } catch (error) {
@@ -1796,12 +2494,378 @@
         }
     },
 
-    selectModel(modelId) {
+    // Load admin settings from /admin/api/models
+    async loadAdminModelSettings(modelId) {
+        if (!modelId) return;
+        try {
+            const response = await fetch('/admin/api/models', { credentials: 'same-origin' });
+            if (response.ok) {
+                const data = await response.json();
+                const model = (data.models || []).find(m => m.id === modelId);
+                if (model) {
+                    this.isMtpCompatible = !!model.mtp_compatible;
+                    this.isVlm = model.model_type === 'vlm';
+                    this.isParoquant = model.is_paroquant === true;
+                    this.paroquantReason = model.paroquant_reason || '';
+
+                    // Map existing setting parameters
+                    const s = model.settings || {};
+                    this.modelSettings.temperature = s.temperature;
+                    this.modelSettings.max_tokens = s.max_tokens;
+                    this.modelSettings.top_p = s.top_p;
+                    this.modelSettings.top_k = s.top_k;
+                    this.modelSettings.min_p = s.min_p;
+                    this.modelSettings.repetition_penalty = s.repetition_penalty;
+                    this.modelSettings.presence_penalty = s.presence_penalty;
+                    this.modelSettings.enable_thinking = !!s.enable_thinking;
+                    this.modelSettings.thinking_budget_enabled = !!s.thinking_budget_enabled;
+                    this.modelSettings.thinking_budget_tokens = s.thinking_budget_tokens;
+                    this.modelSettings.turboquant_kv_enabled = !!s.turboquant_kv_enabled;
+                    this.modelSettings.turboquant_kv_bits = s.turboquant_kv_bits || 4;
+                    this.modelSettings.turboquant_skip_last = s.turboquant_skip_last !== false;
+
+                    // Map speculative engine single value selector
+                    if (s.dflash_enabled) {
+                        this.speculativeEngine = 'dflash';
+                        this.speculativeDraftModel = s.dflash_draft_model || '';
+                    } else if (s.mtp_enabled) {
+                        this.speculativeEngine = 'mtp';
+                        this.speculativeDraftModel = '';
+                    } else if (s.vlm_mtp_enabled) {
+                        this.speculativeEngine = 'vlm_mtp';
+                        this.speculativeDraftModel = s.vlm_mtp_draft_model || '';
+                    } else if (s.specprefill_enabled) {
+                        this.speculativeEngine = 'specprefill';
+                        this.speculativeDraftModel = s.specprefill_draft_model || '';
+                    } else {
+                        this.speculativeEngine = 'none';
+                        this.speculativeDraftModel = '';
+                    }
+                    // Reset dirty flags after loading
+                    this.modelSettingsDirty = false;
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load admin model settings:', e);
+        }
+    },
+
+    // Save model settings to PUT /admin/api/models/{model_id}/settings
+    async saveAdminModelSettings() {
+        if (!this.currentModel) return;
+        this.savingModelSettings = true;
+        try {
+            // Build request body matching ModelSettingsRequest
+            const body = {
+                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
+                max_tokens: Number.isFinite(this.modelSettings.max_tokens) ? this.modelSettings.max_tokens : null,
+                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
+                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
+                min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
+                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
+                presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
+                enable_thinking: this.modelSettings.enable_thinking,
+                thinking_budget_enabled: this.modelSettings.thinking_budget_enabled,
+                thinking_budget_tokens: this.modelSettings.thinking_budget_enabled ? (this.modelSettings.thinking_budget_tokens || 0) : 0,
+
+                // Set speculative engines mutually exclusively
+                dflash_enabled: this.speculativeEngine === 'dflash',
+                dflash_draft_model: this.speculativeEngine === 'dflash' ? this.speculativeDraftModel : null,
+
+                mtp_enabled: this.speculativeEngine === 'mtp',
+
+                vlm_mtp_enabled: this.speculativeEngine === 'vlm_mtp',
+                vlm_mtp_draft_model: this.speculativeEngine === 'vlm_mtp' ? this.speculativeDraftModel : null,
+
+                specprefill_enabled: this.speculativeEngine === 'specprefill',
+                specprefill_draft_model: this.speculativeEngine === 'specprefill' ? this.speculativeDraftModel : null,
+
+                // TurboQuant KV cache
+                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
+                turboquant_kv_bits: this.modelSettings.turboquant_kv_bits,
+                turboquant_skip_last: this.modelSettings.turboquant_skip_last
+            };
+
+            const response = await fetch(`/admin/api/models/${encodeURIComponent(this.currentModel)}/settings`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                credentials: 'same-origin'
+            });
+
+            if (response.ok) {
+                await this.loadAdminModelSettings(this.currentModel);
+                this.showSavedText = true;
+                setTimeout(() => this.showSavedText = false, 2000);
+            } else {
+                const data = await response.json();
+                alert(`Failed to save: ${data.detail || 'Unknown error'}`);
+            }
+        } catch (e) {
+            console.error('Error saving model settings:', e);
+            alert('Error saving settings to backend.');
+        } finally {
+            this.savingModelSettings = false;
+        }
+    },
+
+    // Poll stats during generation
+    async fetchStats() {
+        try {
+            const modelParam = this.currentModel ? `?model=${encodeURIComponent(this.currentModel)}` : '';
+            const resp = await fetch(`/admin/api/stats${modelParam}`, { credentials: 'same-origin' });
+            if (resp.ok) {
+                const data = await resp.json();
+
+                let activePrefillTps = 0;
+                let activeGenTps = 0;
+                let activePromptTokens = 0;
+                let activeGenTokens = 0;
+
+                // Extract active request stats if available
+                if (data.active_models && data.active_models.models) {
+                    const modelData = data.active_models.models.find(m => m.id === this.currentModel);
+                    if (modelData) {
+                        if (modelData.prefilling && modelData.prefilling.length > 0) {
+                            activePrefillTps = modelData.prefilling[0].speed || 0;
+                            activePromptTokens = modelData.prefilling[0].prompt_tokens || 0;
+                        }
+                        if (modelData.generating && modelData.generating.length > 0) {
+                            activeGenTps = modelData.generating[0].tokens_per_second || 0;
+                            activePromptTokens = modelData.generating[0].prompt_tokens || 0;
+                            activeGenTokens = modelData.generating[0].generated_tokens || 0;
+
+                            // If generating, mathematically calculate the exact prefill speed for this active request
+                            if (activePromptTokens > 0) {
+                                const stream = this.getStreamSession(this.currentChatId, false);
+                                if (stream && stream._ttft > 0) {
+                                    activePrefillTps = activePromptTokens / stream._ttft;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Use model average as fallback if prefill was too fast to catch
+                const fallbackPrefill = data.avg_prefill_tps || 0;
+
+                let updatedStats = {
+                    ...this.recentStats,
+                    // Only overwrite prefill while prefilling is actually active.
+                    // Once the request moves to generating, lock the TTFT-derived value
+                    // and do NOT let the poll overwrite it with zero or fallback.
+                    avg_prefill_tps: (() => {
+                        if (activePrefillTps > 0) return activePrefillTps;
+                        // Generating but prefill already resolved — keep the locked value
+                        if (activeGenTokens > 0 && this.recentStats?.avg_prefill_tps > 0) return this.recentStats.avg_prefill_tps;
+                        return fallbackPrefill;
+                    })(),
+                    avg_generation_tps: activeGenTps > 0 ? activeGenTps : (this.recentStats?.avg_generation_tps || 0),
+                    prompt_tokens: activePromptTokens > 0 ? activePromptTokens : (this.recentStats?.prompt_tokens || 0),
+                    total_tokens: activeGenTokens > 0 ? activeGenTokens : (this.recentStats?.total_tokens || 0)
+                };
+
+                // Live calculate timer if streaming
+                const stream = this.getStreamSession(this.currentChatId, false);
+                if (stream && stream.isStreaming && stream._statusStart) {
+                    updatedStats.total_time = ((Date.now() - stream._statusStart) / 1000).toFixed(1);
+                    if (stream.thinkingState?.isInThinking && stream.thinkingState.thinkingStartTime) {
+                        updatedStats.thinking_time = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
+                        // Snapshot thinking tokens live while in thinking phase
+                        stream._thinkTokens = activeGenTokens;
+                        updatedStats.thinking_tokens = activeGenTokens;
+                    } else if (stream._thinkSecs) {
+                        // Thinking phase ended — freeze the locked values
+                        updatedStats.thinking_time = stream._thinkSecs;
+                        updatedStats.thinking_tokens = stream._thinkTokens || 0;
+                    }
+                } else if (!stream?.isStreaming) {
+                    // Stream finished — preserve thinking tokens from last known state
+                    if (this.recentStats?.thinking_tokens > 0) {
+                        updatedStats.thinking_tokens = this.recentStats.thinking_tokens;
+                    }
+                }
+
+                this.recentStats = updatedStats;
+            }
+        } catch (e) {
+            console.error('Failed to fetch stats:', e);
+        }
+    },
+
+    startStatsPolling() {
+        this.stopStatsPolling();
+        this.recentStats = {
+            avg_prefill_tps: 0,
+            avg_generation_tps: 0,
+            thinking_time: 0,
+            total_time: 0,
+            prompt_tokens: 0,
+            thinking_tokens: 0,
+            total_tokens: 0
+        };
+        this.fetchStats(); // initial immediate fetch
+        this.statsInterval = setInterval(() => {
+            this.fetchStats();
+        }, 200);
+    },
+
+    stopStatsPolling() {
+        if (this.statsInterval) {
+            clearInterval(this.statsInterval);
+            this.statsInterval = null;
+        }
+    },
+
+    // ===== PROFILE Section (Prompt Profiles) =====
+
+    loadPromptProfiles() {
+        try {
+            const raw = localStorage.getItem('omlx_chat_prompt_profiles');
+            if (raw) {
+                this.promptProfiles = JSON.parse(raw);
+            } else {
+                // Migrate from old single-default format
+                const oldDefault = localStorage.getItem('omlx_chat_system_prompt');
+                if (oldDefault) {
+                    this.promptProfiles = [{ name: 'System Default', content: oldDefault }];
+                    this._persistPromptProfiles();
+                    localStorage.removeItem('omlx_chat_system_prompt');
+                }
+            }
+            // Ensure System Default profile always exists
+            if (!this.promptProfiles.some(p => p.name === 'System Default')) {
+                this.promptProfiles.unshift({ name: 'System Default', content: '' });
+                this._persistPromptProfiles();
+            }
+            // Apply System Default profile's prompt if none set
+            if (!this.systemPrompt) {
+                const sysDefault = this.promptProfiles.find(p => p.name === 'System Default');
+                if (sysDefault) {
+                    this.systemPrompt = sysDefault.content;
+                    this.activePromptProfile = 'System Default';
+                }
+            }
+        } catch (e) {
+            this.promptProfiles = [];
+        }
+    },
+
+    _persistPromptProfiles() {
+        localStorage.setItem('omlx_chat_prompt_profiles', JSON.stringify(this.promptProfiles));
+    },
+
+    selectPromptProfile(name) {
+        if (!name) {
+            // Custom — keep current prompt, just clear association
+            this.activePromptProfile = null;
+            const session = this.getChatSession(this.currentChatId, true);
+            if (session) session.activeProfile = null;
+            return;
+        }
+        const profile = this.promptProfiles.find(p => p.name === name);
+        if (profile) {
+            this.systemPrompt = profile.content;
+            this.activePromptProfile = name;
+            this.promptDirty = false;
+            // Sync to current session
+            const session = this.getChatSession(this.currentChatId, true);
+            if (session) {
+                session.systemPrompt = profile.content;
+                session.activeProfile = this.activePromptProfile;
+            }
+        }
+    },
+
+    savePromptProfile() {
+        if (!this.activePromptProfile) return;
+        const profile = this.promptProfiles.find(p => p.name === this.activePromptProfile);
+        if (profile) {
+            profile.content = this.systemPrompt;
+            this._persistPromptProfiles();
+            this.promptDirty = false;
+            // Sync to session
+            const session = this.getChatSession(this.currentChatId, true);
+            if (session) {
+                session.systemPrompt = this.systemPrompt;
+                session.activeProfile = this.activePromptProfile;
+            }
+        }
+    },
+
+    deletePromptProfile(name) {
+        if (name === 'System Default') return;
+        this.promptProfiles = this.promptProfiles.filter(p => p.name !== name);
+        if (this.activePromptProfile === name) {
+            this.activePromptProfile = null;
+        }
+        this._persistPromptProfiles();
+        this.profileDeleteConfirm = null;
+    },
+
+    startRenamingPromptProfile() {
+        if (!this.activePromptProfile) return;
+        this.newProfileNameDraft = this.activePromptProfile;
+        this.editingPromptProfileName = true;
+    },
+
+    commitRenamingPromptProfile() {
+        const trimmed = this.newProfileNameDraft.trim();
+        if (!trimmed || !this.activePromptProfile) {
+            this.cancelRenamingPromptProfile();
+            return;
+        }
+        // Check for duplicate name (excluding current)
+        if (this.promptProfiles.some(p => p.name === trimmed && p.name !== this.activePromptProfile)) {
+            this.cancelRenamingPromptProfile();
+            return;
+        }
+        const profile = this.promptProfiles.find(p => p.name === this.activePromptProfile);
+        if (profile) {
+            profile.name = trimmed;
+            this._persistPromptProfiles();
+            this.activePromptProfile = trimmed;
+        }
+        this.editingPromptProfileName = false;
+        this.newProfileNameDraft = '';
+    },
+
+    cancelRenamingPromptProfile() {
+        this.editingPromptProfileName = false;
+        this.newProfileNameDraft = '';
+    },
+
+    // ===== PROFILE Tab: Add New Profile =====
+
+    addNewPromptProfile() {
+        let baseName = 'New Profile';
+        let counter = 1;
+        let name = baseName;
+        while (this.promptProfiles.some(p => p.name === name)) {
+            name = `${baseName} (${counter})`;
+            counter++;
+        }
+        this.promptProfiles.push({ name, content: '' });
+        this._persistPromptProfiles();
+        this.activePromptProfile = name;
+        this.systemPrompt = '';
+        this.promptDirty = false;
+        this.newProfileNameDraft = name;
+        this.editingPromptProfileName = true;
+        this.$nextTick(() => {
+            const input = document.querySelector('[x-model="newProfileNameDraft"]');
+            if (input) input.focus();
+        });
+        const session = this.getChatSession(this.currentChatId, true);
+        if (session) session.systemPrompt = '';
+    },
+
+    async selectModel(modelId) {
         this.currentModel = modelId;
         const session = this.getChatSession(this.currentChatId, true);
         if (session) {
             session.model = modelId;
         }
+        await this.loadAdminModelSettings(modelId);
     },
 
     loadChatHistory() {
@@ -1821,16 +2885,20 @@
 
     startNewChat() {
         const chatId = 'chat_' + Date.now();
-        const systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
+        // Load the System Default profile's prompt
+        const sysDefault = this.promptProfiles.find(p => p.name === 'System Default');
+        const systemPrompt = sysDefault ? sysDefault.content : '';
         this.currentChatId = chatId;
         this.uploadImages = [];
         this.systemPrompt = systemPrompt;
+        this.activePromptProfile = sysDefault ? sysDefault.name : null;
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
         this.chatSessions[chatId] = {
             messages: [],
             model: this.currentModel,
-            systemPrompt
+            systemPrompt,
+            activeProfile: this.activePromptProfile
         };
         this.messages = this.chatSessions[chatId].messages;
         this.resetStreamSession(this.getStreamSession(chatId, true));
@@ -1842,8 +2910,24 @@
             this.currentChatId = chatId;
             this.messages = session.messages;
             this.systemPrompt = session.systemPrompt || '';
+            this.activePromptProfile = session.activeProfile
+                && this.promptProfiles.some(p => p.name === session.activeProfile)
+                ? session.activeProfile : null;
             if (session.model) {
-                this.currentModel = session.model;
+                // Resolve legacy alias → gateway id for backward compatibility
+                const gatewayId = this.aliasToGateway[session.model] || session.model;
+                this.currentModel = gatewayId;
+                this.loadAdminModelSettings(gatewayId);
+            }
+            if (session.messages && session.messages.length > 0) {
+                const lastAsst = [...session.messages].reverse().find(m => m.role === 'assistant');
+                if (lastAsst) {
+                    this.recentStats = lastAsst._recentStats ? { ...lastAsst._recentStats } : this.emptyStats();
+                } else {
+                    this.recentStats = this.emptyStats();
+                }
+            } else {
+                this.recentStats = this.emptyStats();
             }
             this.scheduleEnhanceMessages();
         }
@@ -1888,6 +2972,7 @@
             messages: messagesForStorage,
             model: chatModel,
             systemPrompt: chatSystemPrompt,
+            activeProfile: session?.activeProfile ?? this.activePromptProfile ?? null,
             updatedAt: new Date().toISOString()
         };
 
@@ -1929,28 +3014,7 @@
         this.cancelRenamingChat();
     },
 
-    clearSystemPrompt() {
-        this.systemPromptDraft = '';
-        this.systemPrompt = '';
-        localStorage.removeItem('omlx_chat_system_prompt');
-        const session = this.getChatSession(this.currentChatId, true);
-        if (session) {
-            session.systemPrompt = '';
-        }
-        this.showSystemPromptModal = false;
-    },
-
-    saveSystemPrompt() {
-        this.systemPrompt = this.systemPromptDraft;
-        localStorage.setItem('omlx_chat_system_prompt', this.systemPrompt);
-        const session = this.getChatSession(this.currentChatId, true);
-        if (session) {
-            session.systemPrompt = this.systemPrompt;
-        }
-        this.showSystemPromptModal = false;
-    },
-
-            async sendMessage() {
+    async sendMessage() {
         const userText = this.inputMessage.trim();
         const images = [...this.uploadImages];
 
@@ -2001,7 +3065,8 @@
         const context = {
             chatId: streamContext?.chatId || this.currentChatId,
             model: streamContext?.model || this.currentModel,
-            systemPrompt: streamContext?.systemPrompt ?? this.systemPrompt
+            systemPrompt: streamContext?.systemPrompt ?? this.systemPrompt,
+            _profile: streamContext?._profile ?? this.activePromptProfile ?? null
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -2015,6 +3080,7 @@
                 role: 'assistant',
                 content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
                 model: context.model,
+                _profile: context._profile,
                 _perfVisible: false,
             });
             this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
@@ -2027,6 +3093,7 @@
             stream._statusStart = Date.now();
             stream.sourceModel = context.model;
             stream.sourceSystemPrompt = context.systemPrompt;
+            this.startStatsPolling();
         }
         stream.isStreaming = true;
         stream.sourceModel = context.model;
@@ -2142,6 +3209,7 @@
                             if (delta?.reasoning_content) {
                                 if (!firstToken) {
                                     firstToken = true;
+                                    stream._ttft = (Date.now() - stream._statusStart) / 1000;
                                     this.stopPrefillPolling(context.chatId);
                                 }
                                 if (!stream.thinkingState.isInThinking) {
@@ -2156,6 +3224,7 @@
                             if (delta?.content) {
                                 if (!firstToken) {
                                     firstToken = true;
+                                    stream._ttft = (Date.now() - stream._statusStart) / 1000;
                                     this.stopPrefillPolling(context.chatId);
                                 }
                                 // Log thinking duration to timeline when content starts
@@ -2164,6 +3233,7 @@
                                     this.setEngineStatus(context.chatId, { text: `Thought for ${thinkSecs}s` });
                                     stream.thinkingState.isInThinking = false;
                                     stream.thinkingState.thinkingStartTime = null;
+                                    stream._thinkSecs = thinkSecs;
                                 }
                                 // Only set finalContent on non-whitespace content
                                 if (!stream.finalContent && delta.content.trim()) {
@@ -2182,12 +3252,14 @@
                 }
             }
 
-            // If model ended while still thinking (tool-call turn), log elapsed and reset
+            // If model ended while still thinking (tool-call turn or manual stop), log elapsed and reset
             if (stream.thinkingState.isInThinking) {
                 const thinkSecs = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
                 this.setEngineStatus(context.chatId, { text: `Thought for ${thinkSecs}s` });
                 stream.thinkingState.isInThinking = false;
                 stream.thinkingState.thinkingStartTime = null;
+                stream._thinkSecs = thinkSecs;
+                stream._thinkTokens = this.recentStats?.thinking_tokens || 0;
             }
 
             // Log usage metrics as a single compact entry
@@ -2202,6 +3274,15 @@
                 if (gtps != null) parts.push(`gen ${Math.round(gtps)} tok/s`);
                 if (ttft != null) parts.push(`ttft ${ttft}s`);
                 if (parts.length) this.setEngineStatus(context.chatId, { text: parts.join(' · ') });
+
+                // Sync exact final timings to the performance panel
+                this.recentStats = {
+                    ...this.recentStats,
+                    avg_prefill_tps: ptps != null ? ptps : (this.recentStats?.avg_prefill_tps || 0),
+                    avg_generation_tps: gtps != null ? gtps : (this.recentStats?.avg_generation_tps || 0),
+                    prompt_tokens: pt != null ? pt : (this.recentStats?.prompt_tokens || 0),
+                    total_tokens: ct != null ? ct : (this.recentStats?.total_tokens || 0)
+                };
             }
 
             const toolCalls = Object.values(toolCallsMap);
@@ -2220,6 +3301,7 @@
                     content: stream.streamingContent || null,
                     model: context.model,
                     tool_calls: toolCalls,
+                    _profile: context._profile,
                     _ui: false,
                 });
 
@@ -2294,6 +3376,7 @@
                 role: 'assistant',
                 content: stream.streamingContent || '',
                 model: context.model,
+                _profile: context._profile,
                 _perfVisible: false,
                 _thinking: stream.streamingThinking || null,
                 _thinkingOpen: false,
@@ -2318,6 +3401,7 @@
                         role: 'assistant',
                         content: stream.streamingContent,
                         model: context.model,
+                        _profile: context._profile,
                         _perfVisible: false,
                         _thinking: stream.streamingThinking || null,
                         _thinkingOpen: false,
@@ -2333,6 +3417,7 @@
                     role: 'assistant',
                     content: `Error: ${error.message}`,
                     model: context.model,
+                    _profile: context._profile,
                     _perfVisible: false,
                 });
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
@@ -2343,19 +3428,29 @@
         } finally {
             // Attach performance timeline and thinking to the final assistant message, once per prompt
             if (depth === 0) {
+                this.stopStatsPolling();
                 for (let i = chatSession.messages.length - 1; i >= 0; i--) {
                     const msg = chatSession.messages[i];
                     if (msg.role === 'assistant' && msg._ui !== false) {
+                        const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2);
                         if (stream.statusLog.length > 0) {
-                            const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2) + 's total';
                             msg._perfLog = [...stream.statusLog];
-                            msg._perfTotal = totalTime;
+                            msg._perfTotal = totalTime + 's total';
                         }
+                        this.recentStats.total_time = totalTime;
+                        this.recentStats.thinking_time = stream._thinkSecs || 0;
+                        msg._recentStats = { ...this.recentStats };
                         if (stream.streamingThinking) {
                             msg._thinking = stream.streamingThinking;
                         }
                         break;
                     }
+                }
+                // Persist perf timeline that was just attached (saved earlier, before finally ran)
+                this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
+                // Auto-generate chat title after first assistant response
+                if (this.autoName && chatSession.messages.filter(m => m.role === 'user').length === 1) {
+                    this.regenerateChatTitle();
                 }
             }
             this.resetStreamSession(stream, { preserveFinalContent: true });
@@ -2381,6 +3476,10 @@
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
 
+        // Find the profile from the assistant message being regenerated
+        const origMsg = session.messages[index];
+        const profileToUse = origMsg?._profile ?? this.activePromptProfile ?? null;
+
         // Find the user message before this assistant message
         const messagesToKeep = session.messages.slice(0, index);
         session.messages = messagesToKeep;
@@ -2389,8 +3488,9 @@
 
         await this.streamResponse({
             chatId: this.currentChatId,
-            model: session.model || this.currentModel,
-            systemPrompt: session.systemPrompt ?? this.systemPrompt
+            model: this.currentModel,
+            systemPrompt: this.systemPrompt,
+            _profile: profileToUse
         }, 0);
     },
 
@@ -2425,6 +3525,133 @@
 
     copyMessage(content) {
         this._copyText(this.getTextContent(content));
+    },
+
+    copyMarkdown(msg) {
+        const raw = typeof msg.content === 'string' ? msg.content : '';
+        if (raw) {
+            this._copyText(raw);
+        }
+    },
+
+    deleteMessage(index) {
+        const session = this.getChatSession(this.currentChatId, true);
+        if (!session) return;
+        session.messages = session.messages.slice(0, index);
+        this.messages = session.messages;
+        this.saveCurrentChat(this.currentChatId);
+        this.scheduleEnhanceMessages();
+    },
+
+    branchChat(index) {
+        const session = this.getChatSession(this.currentChatId, true);
+        const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
+        const branchName = 'Branch of ' + (originalChat?.title || window.t('chat.new_chat_title'));
+
+        const branchId = 'chat_' + Date.now();
+        const branchMessages = session.messages.slice(0, index + 1).map(msg => ({ ...msg }));
+
+        // Use profile from the message at branch point
+        const branchMsg = session.messages[index];
+        const branchProfile = branchMsg?._profile ?? session.activeProfile ?? null;
+
+        const branchSession = {
+            messages: branchMessages,
+            model: session.model || this.currentModel,
+            systemPrompt: session.systemPrompt || '',
+            activeProfile: branchProfile
+        };
+        this.chatSessions[branchId] = branchSession;
+
+        const messagesForStorage = branchMessages.map(msg => {
+            if (!Array.isArray(msg.content)) return msg;
+            return {
+                ...msg,
+                content: msg.content.map(part => {
+                    if (part.type === 'image_url') {
+                        return { type: 'image_url', image_url: { url: '' } };
+                    }
+                    return part;
+                })
+            };
+        });
+
+        const branchData = {
+            id: branchId,
+            title: branchName,
+            manualTitle: true,
+            messages: messagesForStorage,
+            model: branchSession.model,
+            systemPrompt: branchSession.systemPrompt,
+            activeProfile: branchSession.activeProfile,
+            updatedAt: new Date().toISOString()
+        };
+
+        this.chatHistory.unshift(branchData);
+        this.saveChatHistory();
+        this.loadChat(branchId);
+    },
+
+
+    computeTimelineDots() {
+        const container = document.getElementById('messagesContainer');
+        if (!container || this.messages.length === 0) {
+            this.timelineDots = [];
+            return;
+        }
+        const railHeight = container.clientHeight;
+        const visible = container.querySelectorAll('.message-fade-in');
+        const scrollMax = container.scrollHeight - railHeight;
+        const result = [];
+        visible.forEach((el, i) => {
+            if (el.offsetParent === null) return;
+            const msgTop = el.offsetTop;
+            const ratio = scrollMax > 0 ? Math.min(msgTop / scrollMax, 1) : 0;
+            result.push({ index: i, topPx: 16 + (ratio * (railHeight - 32)) });
+        });
+        this.timelineDots = result;
+    },
+
+    computeTimelineActive() {
+        const container = document.getElementById('messagesContainer');
+        if (!container || this.messages.length === 0) return;
+        const scrollTop = container.scrollTop;
+        const visible = container.querySelectorAll('.message-fade-in');
+        let active = this.timelineActive;
+        visible.forEach((el, i) => {
+            if (el.offsetParent === null) return;
+            const offset = el.offsetTop;
+            if (offset <= scrollTop + 60) {
+                active = i;
+            }
+        });
+        this.timelineActive = active;
+    },
+
+    showDotTooltip(event, msg, index) {
+        const excerpt = this.getTextContent(msg.content)?.slice(0, 120) || '';
+        const userIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;margin-right:4px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+        const botIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;margin-right:4px;"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M15 2v2"/><path d="M9 2v2"/><path d="M15 20v2"/><path d="M9 20v2"/></svg>';
+        const icon = msg.role === 'user' ? userIcon : botIcon;
+        this.timelineTooltip.content = `<span style="font-size:11px;">${icon}${this.escapeHtml(excerpt)}${excerpt.length >= 120 ? '...' : ''}</span>`;
+        const rect = event.currentTarget.getBoundingClientRect();
+        this.timelineTooltip.x = rect.right + 8;
+        this.timelineTooltip.y = rect.top + rect.height / 2 - 16;
+        this.timelineTooltip.show = true;
+    },
+
+    hideDotTooltip() {
+        this.timelineTooltip.show = false;
+    },
+
+    scrollToMessage(index) {
+        this.timelineActive = index;
+        const container = document.getElementById('messagesContainer');
+        if (!container) return;
+        const target = container.querySelectorAll('.message-fade-in')[index];
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
     },
 
     // Edit functions
@@ -2480,10 +3707,14 @@
 
         // Scroll and get new response
         this.scrollToBottom();
+        // Use profile from last assistant message before edit, or current active profile
+        const lastAsstBeforeEdit = [...session.messages.slice(0, index)].reverse().find(m => m.role === 'assistant' && m._ui !== false);
+        const editProfile = lastAsstBeforeEdit?._profile ?? this.activePromptProfile ?? null;
         await this.streamResponse({
             chatId: this.currentChatId,
-            model: session.model || this.currentModel,
-            systemPrompt: session.systemPrompt ?? this.systemPrompt
+            model: this.currentModel,
+            systemPrompt: this.systemPrompt,
+            _profile: editProfile
         }, 0);
     },
 
@@ -2823,6 +4054,8 @@
             if (!container) return;
             this.addCodeCopyButtons(container);
             this.renderPendingMath(container);
+            this.computeTimelineDots();
+            this.computeTimelineActive();
         });
     },
 
@@ -2920,14 +4153,6 @@
         return lastSafeBoundary;
     },
 
-    // Check if scroll is at bottom
-    isAtBottom() {
-        const container = document.getElementById('messagesContainer');
-        if (!container) return true;
-        const threshold = 50;
-        return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
-    },
-
     // Scroll to bottom (respects autoScrollEnabled unless forced)
     scrollToBottom(force = false) {
         this.$nextTick(() => {
@@ -2950,50 +4175,6 @@
         this.scrollToBottom(true);
     },
 
-    // Scroll thinking content (respects thinkingAutoScroll, restores position if needed)
-    scrollThinkingContent() {
-        const thinkingContent = document.getElementById('streaming-thinking-content');
-        if (!thinkingContent) return;
-
-        // Setup scroll listener if not already done
-        if (!thinkingContent.hasAttribute('data-scroll-listener')) {
-            thinkingContent.setAttribute('data-scroll-listener', 'true');
-            this.setupThinkingScrollListener(thinkingContent);
-        }
-
-        if (this.thinkingAutoScroll) {
-            // Auto-scroll to bottom
-            thinkingContent.scrollTop = thinkingContent.scrollHeight;
-        } else {
-            // Restore saved scroll position
-            thinkingContent.scrollTop = this.thinkingScrollPosition;
-        }
-    },
-
-    // Setup scroll listener for thinking content
-    setupThinkingScrollListener(element) {
-        element.addEventListener('scroll', () => {
-            clearTimeout(this.thinkingScrollTimeout);
-
-            // Save current scroll position
-            this.thinkingScrollPosition = element.scrollTop;
-
-            // Check if at bottom
-            const threshold = 30;
-            const isAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
-
-            if (isAtBottom) {
-                this.thinkingAutoScroll = true;
-            } else {
-                this.thinkingAutoScroll = false;
-            }
-
-            this.thinkingScrollTimeout = setTimeout(() => {
-                // Scroll ended
-            }, 150);
-        });
-    },
-
     autoResize(el) {
         el.style.height = 'auto';
         el.style.height = Math.min(el.scrollHeight, 128) + 'px';
@@ -3008,6 +4189,24 @@
         this.theme = theme;
         localStorage.setItem('omlx-chat-theme', this.theme);
         this.applyTheme();
+    },
+
+    async checkForUpdate() {
+        try {
+            const resp = await fetch('/admin/api/update-check');
+            if (resp.ok) {
+                const data = await resp.json();
+                this.updateAvailable = data.update_available;
+                this.latestVersion = data.latest_version;
+                this.releaseUrl = data.release_url;
+            }
+        } catch (e) {
+            // Silently ignore - not critical
+        }
+    },
+
+    startUpdateCheckTimer() {
+        this._updateCheckTimer = setInterval(() => this.checkForUpdate(), 3600000);
     },
 
     applyTheme() {
