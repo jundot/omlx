@@ -103,6 +103,20 @@ def get_run(bench_id: str) -> Optional[BenchmarkRun]:
     return _benchmark_runs.get(bench_id)
 
 
+def get_active_run() -> Optional[BenchmarkRun]:
+    """Return the currently-running throughput benchmark, if any.
+
+    Discovery surface for clients that need to attach to an in-progress
+    run without knowing the bench_id upfront (page refresh, second tab).
+    Returns the first run with status == "running"; throughput benches
+    are 1-at-a-time so there's never more than one.
+    """
+    for run in _benchmark_runs.values():
+        if run.status == "running":
+            return run
+    return None
+
+
 def create_run(request: BenchmarkRequest) -> BenchmarkRun:
     """Create and register a new benchmark run."""
     bench_id = f"bench-{uuid.uuid4().hex[:12]}"

@@ -5007,6 +5007,27 @@ async def stream_accuracy_benchmark(
 # =============================================================================
 
 
+@router.get("/api/bench/active")
+async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
+    """Return the currently-running throughput benchmark, if any.
+
+    Symmetric to `/api/bench/accuracy/queue/status` — lets a fresh page
+    load or a second tab discover an in-flight run so it can attach to
+    the SSE stream. Combined with the replay-on-subscribe stream this
+    is what makes the multi-tab + page-refresh story actually work.
+    """
+    from .benchmark import get_active_run
+
+    run = get_active_run()
+    if run is None:
+        return {"running": False, "bench_id": None, "model_id": None}
+    return {
+        "running": True,
+        "bench_id": run.bench_id,
+        "model_id": run.request.model_id,
+    }
+
+
 @router.post("/api/bench/start")
 async def start_benchmark(
     request: Request,

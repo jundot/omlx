@@ -553,6 +553,7 @@
                 }
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
+                    await this.loadBenchState();
                     await this.loadAccState();
                 }
             },
@@ -2734,6 +2735,25 @@
                 }
             },
 
+            async loadBenchState() {
+                // Discover an in-progress throughput run on tab/page load so
+                // a second tab (or a refresh) can attach to its SSE stream
+                // and replay the run's full event history.
+                try {
+                    const resp = await fetch('/admin/api/bench/active');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (data.running && data.bench_id) {
+                        this.benchBenchId = data.bench_id;
+                        this.benchModelId = data.model_id;
+                        this.benchRunning = true;
+                        this.connectBenchSSE(data.bench_id);
+                    }
+                } catch (err) {
+                    console.error('Failed to load bench state:', err);
+                }
+            },
+
             // Bench sub-tab
             setBenchTab(tab) {
                 if (!DASHBOARD_BENCH_TABS.has(tab)) return;
@@ -2742,6 +2762,7 @@
                 this.syncTabStateToUrl();
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
+                    this.loadBenchState();
                 }
             },
 

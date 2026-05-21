@@ -24,7 +24,9 @@ import pytest
 from omlx.admin.benchmark import (
     BenchmarkRequest,
     BenchmarkRun,
+    _benchmark_runs,
     _send_event as bench_send_event,
+    get_active_run,
 )
 from omlx.admin.accuracy_benchmark import (
     AccuracyBenchmarkRequest,
@@ -168,6 +170,59 @@ class TestBenchmarkSSEReplay:
             {"type": "progress", "n": 2},
             {"type": "upload_done", "data": {}},
         ]
+
+
+# --- Active-run discovery ---------------------------------------------------
+
+
+class TestGetActiveRun:
+    """A second subscriber (page refresh / new tab) needs a way to find
+    the currently-running bench so it can attach to the SSE stream.
+    `get_active_run()` is that discovery surface — it scans the run
+    registry and returns the first one whose status is "running"."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_registry(self):
+        # Test-level isolation: the module-level _benchmark_runs registry
+        # leaks between tests otherwise.
+        _benchmark_runs.clear()
+        yield
+        _benchmark_runs.clear()
+
+    def test_returns_none_when_no_runs(self):
+        assert get_active_run() is None
+
+    def test_returns_none_when_all_completed(self):
+        r = _bench_run()
+        r.status = "completed"
+        _benchmark_runs[r.bench_id] = r
+        assert get_active_run() is None
+
+    def test_returns_the_running_run(self):
+        finished = _bench_run()
+        finished.status = "completed"
+        _benchmark_runs[finished.bench_id] = finished
+
+        running = BenchmarkRun(
+            bench_id="b-2",
+            request=BenchmarkRequest(model_id="x", prompt_lengths=[1024]),
+        )
+        running.status = "running"
+        _benchmark_runs[running.bench_id] = running
+
+        found = get_active_run()
+        assert found is running
+        assert found.status == "running"
+
+    def test_only_returns_running_status_not_cancelled_or_error(self):
+        for state in ("cancelled", "error"):
+            r = BenchmarkRun(
+                bench_id=f"b-{state}",
+                request=BenchmarkRequest(model_id="x", prompt_lengths=[1024]),
+            )
+            r.status = state
+            _benchmark_runs[r.bench_id] = r
+        assert get_active_run() is None
 
 
 # --- AccuracyBenchmarkRun ---------------------------------------------------
