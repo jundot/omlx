@@ -566,3 +566,179 @@ class TestPreLoadPatchDispatch:
             json.dumps({"model_type": "qwen3_5", "mtp_num_hidden_layers": 1})
         )
         maybe_apply_pre_load_patches(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# batch_generator — _resolve_sampler + _is_greedy
+# ---------------------------------------------------------------------------
+
+class TestResolveSampler:
+    """Tests for ``_resolve_sampler`` which mirrors GenerationBatch._step's
+    per-sequence sampler resolution (batch=1).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        applied = batch_generator.apply()
+        if not applied:
+            pytest.skip("batch_generator patch refused to apply (mlx_lm absent)")
+
+    def _make_batch(self, samplers=None, fallback_sampler=None):
+        return SimpleNamespace(
+            samplers=samplers,
+            fallback_sampler=fallback_sampler,
+        )
+
+    def test_returns_first_sampler_when_present(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        sampler = object()
+        batch = self._make_batch(samplers=[sampler])
+        assert _resolve_sampler(batch) is sampler
+
+    def test_skips_none_sampler_and_uses_fallback(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        fallback = object()
+        batch = self._make_batch(samplers=[None], fallback_sampler=fallback)
+        assert _resolve_sampler(batch) is fallback
+
+    def test_uses_fallback_when_samplers_empty(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        fallback = object()
+        batch = self._make_batch(samplers=[], fallback_sampler=fallback)
+        assert _resolve_sampler(batch) is fallback
+
+    def test_uses_fallback_when_samplers_missing(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        fallback = object()
+        batch = self._make_batch(samplers=None, fallback_sampler=fallback)
+        assert _resolve_sampler(batch) is fallback
+
+    def test_uses_fallback_when_samplers_is_none(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        fallback = object()
+        batch = self._make_batch(samplers=None, fallback_sampler=fallback)
+        assert _resolve_sampler(batch) is fallback
+
+    def test_prefers_samplers_0_over_fallback(self):
+        """Even if fallback_sampler is set, samplers[0] takes priority."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_sampler
+
+        primary = object()
+        fallback = object()
+        batch = self._make_batch(samplers=[primary], fallback_sampler=fallback)
+        assert _resolve_sampler(batch) is primary
+
+
+class TestIsGreedy:
+    """Tests for ``_is_greedy`` which determines whether the active sampler
+    performs greedy decoding (temperature == 0).
+
+    Regression guard for the refactor that replaced the old
+    ``gen_batch.samplers and gen_batch.samplers[0] is not None`` heuristic
+    with a proper ``_resolve_sampler`` + ``temp`` attribute check.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        applied = batch_generator.apply()
+        if not applied:
+            pytest.skip("batch_generator patch refused to apply (mlx_lm absent)")
+
+    def _make_batch(self, samplers=None, fallback_sampler=None):
+        return SimpleNamespace(
+            samplers=samplers,
+            fallback_sampler=fallback_sampler,
+        )
+
+    def _make_sampler(self, temp=0.0):
+        return SimpleNamespace(temp=temp)
+
+    def _make_sampler_no_temp(self):
+        """Sampler without a ``temp`` attribute — defaults to 0.0."""
+        return SimpleNamespace()
+
+    def test_greedy_when_sampler_temp_is_zero(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=[self._make_sampler(temp=0.0)])
+        assert _is_greedy(batch) is True
+
+    def test_not_greedy_when_sampler_temp_is_positive(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=[self._make_sampler(temp=0.7)])
+        assert _is_greedy(batch) is False
+
+    def test_greedy_when_sampler_has_no_temp_attribute(self):
+        """Missing ``temp`` defaults to 0.0 → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=[self._make_sampler_no_temp()])
+        assert _is_greedy(batch) is True
+
+    def test_greedy_when_sampler_is_none(self):
+        """No sampler → falls back to fallback_sampler → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=[None], fallback_sampler=None)
+        assert _is_greedy(batch) is True
+
+    def test_greedy_when_samplers_empty(self):
+        """Empty samplers list → falls back to fallback_sampler → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=[], fallback_sampler=None)
+        assert _is_greedy(batch) is True
+
+    def test_greedy_when_samplers_missing(self):
+        """No samplers attribute → falls back to fallback_sampler → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=None, fallback_sampler=None)
+        assert _is_greedy(batch) is True
+
+    def test_not_greedy_via_fallback_sampler(self):
+        """When samplers[0] is None, the fallback sampler's temp is checked."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(
+            samplers=[None],
+            fallback_sampler=self._make_sampler(temp=0.8),
+        )
+        assert _is_greedy(batch) is False
+
+    def test_greedy_via_fallback_sampler(self):
+        """Fallback sampler with temp=0.0 → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(
+            samplers=[None],
+            fallback_sampler=self._make_sampler(temp=0.0),
+        )
+        assert _is_greedy(batch) is True
+
+    def test_greedy_fallback_no_temp_attribute(self):
+        """Fallback sampler without ``temp`` → defaults to 0.0 → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(
+            samplers=[None],
+            fallback_sampler=self._make_sampler_no_temp(),
+        )
+        assert _is_greedy(batch) is True
+
+    def test_greedy_when_fallback_is_none(self):
+        """Both samplers and fallback are None → greedy."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _is_greedy
+
+        batch = self._make_batch(samplers=None, fallback_sampler=None)
+        assert _is_greedy(batch) is True

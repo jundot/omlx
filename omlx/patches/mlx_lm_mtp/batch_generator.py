@@ -354,10 +354,10 @@ def _resolve_sampler(gen_batch: Any):
     return gen_batch.fallback_sampler
 
 
-def _is_greedy(gen_batch: Any) -> bool:
-    """Heuristic mirroring PR 990's ``sampler is None``."""
-    if gen_batch.samplers and gen_batch.samplers[0] is not None:
-        return False
+def _is_greedy(gen_batch):
+    sampler = _resolve_sampler(gen_batch)
+    if sampler is not None:
+        return getattr(sampler, "temp", 0.0) == 0.0
     return True
 
 
