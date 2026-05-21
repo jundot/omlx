@@ -752,6 +752,9 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         )
         verify_logits = logits[:, 0, :]
         bonus_logits = logits[:, 1, :]
+    # materialize logits now so that it doesn't count as
+    # sampler timing during mx.eval(verify_tok, bonus_tok)
+    mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
