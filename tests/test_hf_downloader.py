@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
+from omlx.admin.hf_downloader import (
+    DownloadStatus,
+    DownloadTask,
+    HFDownloader,
+    _DownloadCancelled,
+    _make_cancellable_tqdm,
+)
 
 
 # =============================================================================
@@ -400,6 +406,82 @@ class TestHFDownloader:
 
         assert task.status == DownloadStatus.CANCELLED
         assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
+
+    def test_cancellable_tqdm_raises_only_after_cancel(self):
+        """The injected tqdm aborts on update() once the cancel flag is set."""
+        cancelled = {"v": False}
+        tqdm_cls = _make_cancellable_tqdm(lambda: cancelled["v"])
+        bar = tqdm_cls(total=100, disable=True)
+
+        # Not cancelled yet: update is a normal no-op.
+        bar.update(10)
+
+        cancelled["v"] = True
+        with pytest.raises(_DownloadCancelled):
+            bar.update(10)
+
+    @pytest.mark.asyncio
+    async def test_cancel_aborts_in_progress_download(self, downloader, model_dir):
+        """A download cancelled mid-flight is interrupted via the tqdm callback.
+
+        snapshot_download runs in a worker thread that can't be force-killed,
+        so cancel must propagate through the per-chunk progress callback.
+        """
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        seen = {"tqdm_class": None}
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            # Simulate huggingface_hub http_get: build the progress bar and
+            # call update() per chunk. The user cancels after the first chunk.
+            tqdm_cls = kwargs["tqdm_class"]
+            seen["tqdm_class"] = tqdm_cls
+            bar = tqdm_cls(total=100, disable=True)
+            bar.update(10)
+            downloader._cancelled.add(task.task_id)
+            bar.update(10)  # raises _DownloadCancelled
+            raise AssertionError("download should have been interrupted")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert seen["tqdm_class"] is not None
+        assert task.status == DownloadStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(self, downloader):
+        """shutdown() flags active tasks so in-flight threads abort via tqdm."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(10),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(0.2)
+
+            await downloader.shutdown()
+            assert task.task_id in downloader._cancelled
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_returns_false(self, downloader):

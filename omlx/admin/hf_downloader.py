@@ -21,6 +21,7 @@ from huggingface_hub.utils import (
     GatedRepoError,
     RepositoryNotFoundError,
 )
+from huggingface_hub.utils import tqdm as _hf_tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,33 @@ _HF_API_TIMEOUT = 10
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+
+class _DownloadCancelled(Exception):
+    """Raised inside the download thread to interrupt a cancelled download."""
+
+
+def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
+    """Build a tqdm subclass that aborts the download when cancelled.
+
+    huggingface_hub's http_get calls ``progress.update(len(chunk))`` once per
+    downloaded chunk (DOWNLOAD_CHUNK_SIZE, 10MB). A running thread can't be
+    force-stopped and snapshot_download takes no cancel token, so we cooperate
+    from the progress callback: raising here unwinds the download thread
+    cleanly within one chunk, releasing its buffers and connection.
+
+    Note: this relies on the Python http_get path. If HF_HUB_ENABLE_HF_TRANSFER
+    is on, the Rust path ignores tqdm_class and this won't interrupt; oMLX does
+    not enable hf_transfer.
+    """
+
+    class _CancellableTqdm(_hf_tqdm):
+        def update(self, n=1):
+            if should_cancel():
+                raise _DownloadCancelled()
+            return super().update(n)
+
+    return _CancellableTqdm
 
 
 def _get_hf_api() -> tuple[HfApi, str | None]:
@@ -619,8 +647,11 @@ class HFDownloader:
                 progress_task.cancel()
         self._progress_tasks.clear()
 
-        # Cancel all active download tasks
+        # Cancel all active download tasks. Mark cancelled first so an
+        # in-flight snapshot_download thread aborts via its progress callback;
+        # active_task.cancel() only unblocks tasks still waiting on the semaphore.
         for task_id, active_task in list(self._active_tasks.items()):
+            self._cancelled.add(task_id)
             if not active_task.done():
                 active_task.cancel()
                 task = self._tasks.get(task_id)
@@ -714,10 +745,16 @@ class HFDownloader:
                     self._poll_progress(task_id, target_dir)
                 )
 
-                # Run snapshot_download in a thread (blocking call)
+                # Run snapshot_download in a thread (blocking call). The
+                # cancellable tqdm aborts the download from its per-chunk
+                # progress callback so cancel actually stops it (the thread
+                # itself can't be force-killed).
                 await asyncio.to_thread(
                     snapshot_download,
                     **dl_kwargs,
+                    tqdm_class=_make_cancellable_tqdm(
+                        lambda: task_id in self._cancelled
+                    ),
                 )
 
                 # Check if cancelled while downloading
@@ -746,7 +783,7 @@ class HFDownloader:
                             f"Error in download completion callback: {e}"
                         )
 
-        except asyncio.CancelledError:
+        except (_DownloadCancelled, asyncio.CancelledError):
             if task.status not in (
                 DownloadStatus.CANCELLED,
                 DownloadStatus.FAILED,
