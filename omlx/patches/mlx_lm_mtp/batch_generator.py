@@ -131,6 +131,17 @@ def apply() -> bool:
         return original_next(self, *args, **kwargs)
 
     def patched_extend(self, batch, *args, **kwargs):
+        # The host (self) may be a singleton with active MTP about to gain a
+        # co-runner. The MTP path never maintains mlx-lm's _next_tokens, so a
+        # plain drop here would leave standard batched decode resuming from a
+        # stale _next_tokens against an MTP-advanced cache, corrupting one
+        # token. Reconcile the host to a standard-resumable state BEFORE the
+        # merge, while it is still single-sequence. Drop state either way:
+        # after the merge self is multi-seq and MTP is off by design.
+        host_state = getattr(self, "_omlx_mtp_state", None)
+        if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
+            _reconcile_mtp_to_standard(self, host_state)
+            _drop_mtp_state(self, "extend-reconciled")
         result = original_extend(self, batch, *args, **kwargs)
         _drop_mtp_state(batch, "donor-extended")
         _drop_invalid_mtp_state(self, "extend")
@@ -447,6 +458,93 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
 
         delta = model._uid_rope_deltas.get(uids[0], 0.0)
         model.set_batch_rope_deltas(mx.array([delta]))
+
+
+def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
+    """Build a fresh single-sequence batch-aware cache (left_padding=[0]).
+
+    Reuses mlx-lm's own ``_make_cache`` so the per-layer types match exactly
+    what ``extend()`` / ``_extend_cache`` expects, keeping the subsequent merge
+    type-compatible. Returns None if the converter is unavailable.
+    """
+    import sys
+
+    try:
+        make_cache = sys.modules["mlx_lm.generate"]._make_cache
+        return make_cache(model, [0], None)
+    except Exception as exc:
+        logger.warning("MTP reconcile: cache rebuild unavailable: %s", exc)
+        return None
+
+
+def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Rewind a to-be-dropped MTP singleton into a standard-resumable state.
+
+    The MTP path never maintains mlx-lm's ``_next_tokens`` — it streams tokens
+    from ``state.queue`` and advances the shared cache speculatively, and the
+    GatedDeltaNet rollback snapshot is cleared on accept, so a partial rollback
+    at an arbitrary drop point is not reliable. Instead, rebuild the cache by
+    re-prefilling exactly the already-streamed tokens (``gen_batch.tokens[0]``)
+    into a fresh cache (which deterministically reconstructs every layer state,
+    KV and SSM), then set ``_next_tokens`` to the correct next-to-emit token:
+
+    - if ``state.queue`` is non-empty, ``queue[0]`` is the correct, not-yet-
+      streamed next token — reuse it (and its logprobs). The rest of the queue
+      is discarded; standard decode re-derives those positions.
+    - otherwise (cycle boundary) sample from the re-prefill's last-position
+      logits, exactly as a standard ``_step`` would after feeding ``tokens[-1]``.
+
+    Leaves ``tokens[0]`` / ``_num_tokens[0]`` untouched (they already reflect
+    streamed tokens), so there is no duplicated or skipped token. Returns False
+    (caller falls back to a plain drop) when reconcile cannot be done safely.
+    """
+    import mlx.core as mx
+
+    tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
+    if not tokens:
+        return False
+    try:
+        new_cache = _rebuild_singleton_cache(gen_batch.model)
+        if new_cache is None:
+            return False
+        procs = _proc_list(gen_batch)
+        _set_singleton_mrope_delta(gen_batch)
+        tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        with mx.stream(_get_generation_stream()):
+            logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
+            last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+
+        if state.queue:
+            next_id, next_lp_1d, _src = state.queue[0]
+            next_tok = mx.array([int(next_id)], dtype=mx.uint32)
+            next_lp = next_lp_1d
+        else:
+            prev_buf = (
+                gen_batch._token_context[0].tokens if procs is not None else None
+            )
+            ll = _apply_processors(procs, prev_buf, last_logits)
+            next_lp_2d = _logprobs(ll)
+            next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
+            next_lp = next_lp_2d.squeeze(0)
+
+        mx.eval(next_tok)
+        gen_batch.prompt_cache = new_cache
+        gen_batch._next_tokens = next_tok
+        gen_batch._next_logprobs = [next_lp]
+        if procs is not None:
+            from mlx_lm.models.cache import TokenBuffer
+
+            gen_batch._token_context[0] = TokenBuffer(list(tokens))
+        logger.debug(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+            getattr(state, "uid", "?"),
+            len(tokens),
+            len(state.queue),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("MTP reconcile failed, falling back to plain drop: %s", exc)
+        return False
 
 
 def _apply_processors(processors, prev_tokens, logits_2d):
