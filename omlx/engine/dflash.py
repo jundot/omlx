@@ -114,6 +114,7 @@ class DFlashEngine(BaseEngine):
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
+        self._fallback_lock = asyncio.Lock()
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
         # Protocol-specific output parser factory (gemma4 / harmony).
@@ -497,6 +498,22 @@ class DFlashEngine(BaseEngine):
         )
         return len(self._tokenizer_obj.encode(prompt))
 
+    @property
+    def supports_multimodal_fallback(self) -> bool:
+        return self._fallback_engine_type == "vlm"
+
+    _MULTIMODAL_TYPES = frozenset({"image", "image_url", "input_image"})
+
+    @staticmethod
+    def _has_multimodal_content(messages: list[dict]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in DFlashEngine._MULTIMODAL_TYPES:
+                        return True
+        return False
+
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
         if self._max_dflash_ctx is None:
             return False
@@ -764,12 +781,13 @@ class DFlashEngine(BaseEngine):
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
             return await self._fallback_engine.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -915,12 +933,13 @@ class DFlashEngine(BaseEngine):
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
-            if not self._in_fallback_mode:
-                logger.info(
-                    f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
-                    f"evicting dflash models and switching to {self._fallback_engine_type} engine"
-                )
-                await self._evict_dflash_and_start_fallback()
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        f"DFlash context fallback: {len(prompt_tokens)} >= {self._max_dflash_ctx}, "
+                        f"evicting dflash models and switching to {self._fallback_engine_type} engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
             async for output in self._fallback_engine.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
@@ -1041,6 +1060,29 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if self._in_fallback_mode:
+            return await self._fallback_engine.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
+        if self._fallback_engine_type == "vlm" and self._has_multimodal_content(messages):
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        "DFlash multimodal fallback: image content detected, "
+                        "switching to VLM engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
+            return await self._fallback_engine.chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
@@ -1071,6 +1113,33 @@ class DFlashEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+
+        if self._in_fallback_mode:
+            async for output in self._fallback_engine.stream_chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
+
+        if self._fallback_engine_type == "vlm" and self._has_multimodal_content(messages):
+            async with self._fallback_lock:
+                if not self._in_fallback_mode:
+                    logger.info(
+                        "DFlash multimodal fallback: image content detected, "
+                        "switching to VLM engine"
+                    )
+                    await self._evict_dflash_and_start_fallback()
+            async for output in self._fallback_engine.stream_chat(
+                messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
