@@ -3,10 +3,15 @@
 
 import sys
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.utils.model_loading import maybe_load_custom_quantization
+from omlx.utils import model_loading
+from omlx.utils.model_loading import (
+    maybe_apply_pre_load_patches,
+    maybe_load_custom_quantization,
+)
 
 
 def _write_config(tmp_path, body: str) -> str:
@@ -56,9 +61,7 @@ def _install_paroquant_stub(monkeypatch, load_impl):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     load_mod = types.ModuleType("paroquant.inference.backends.mlx.load")
     load_mod.load = load_impl
-    monkeypatch.setitem(
-        sys.modules, "paroquant.inference.backends.mlx.load", load_mod
-    )
+    monkeypatch.setitem(sys.modules, "paroquant.inference.backends.mlx.load", load_mod)
 
 
 class TestParoquantDispatch:
@@ -112,9 +115,7 @@ class TestParoquantDispatch:
         result = maybe_load_custom_quantization(path, is_vlm=True)
         assert result == ("VLM_MODEL", "VLM_PROC")
 
-    def test_paroquant_text_only_for_vlm_load_raises(
-        self, tmp_path, monkeypatch
-    ):
+    def test_paroquant_text_only_for_vlm_load_raises(self, tmp_path, monkeypatch):
         # is_vlm=True but the loader returned (..., loaded_is_vlm=False).
         def fake_load(model_path, force_text):
             return "MODEL", "PROC", False
@@ -144,3 +145,76 @@ class TestParoquantDispatch:
         )
         assert maybe_load_custom_quantization(path, is_vlm=False) == ("M", "P")
         assert captured["called"] is True
+
+
+class TestVlmMtpPreLoadDispatch:
+    """maybe_apply_pre_load_patches must wire the mlx-vlm MTP sanitize
+    patch alongside the runtime patch for MTP-capable VLM checkpoints.
+
+    The dense Qwen3.5/3.6 VLM runtime patch does not touch Model.sanitize;
+    it relies on apply_mlx_vlm_mtp_patch having installed the mtp.*
+    preservation first. If only the runtime patch runs, stock mlx-vlm
+    sanitize strips every mtp.* key and the MTP head loads at random
+    init (PR #1320)."""
+
+    def _stub_patches(self, monkeypatch):
+        """Replace the patch modules with mocks that record call order.
+
+        Returns the recorded-order list plus the sanitize/runtime mocks."""
+        calls: list[str] = []
+        sanitize_mock = MagicMock(side_effect=lambda: calls.append("sanitize") or True)
+        runtime_mock = MagicMock(side_effect=lambda: calls.append("runtime") or True)
+        # Side-step the real mlx-lm load_config monkey-patch.
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(
+                set_mtp_active=MagicMock(),
+                apply_mlx_lm_mtp_patch=MagicMock(return_value=True),
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_vlm_mtp",
+            MagicMock(
+                apply_mlx_vlm_mtp_patch=sanitize_mock,
+                apply_mlx_vlm_mtp_runtime_patch=runtime_mock,
+            ),
+        )
+        return calls, sanitize_mock, runtime_mock
+
+    def test_sanitize_patch_runs_before_runtime_for_vlm_mtp(
+        self, tmp_path, monkeypatch
+    ):
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        # qwen3_5 (dense VLM) declaring an MTP head under text_config.
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        # Ordering matters: the dense runtime patch assumes sanitize was
+        # already installed by apply_mlx_vlm_mtp_patch.
+        assert calls == ["sanitize", "runtime"]
+
+    def test_sanitize_patch_skipped_when_mtp_disabled(self, tmp_path, monkeypatch):
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings)
+
+        sanitize_mock.assert_not_called()
+        runtime_mock.assert_not_called()
+        assert calls == []
