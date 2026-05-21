@@ -846,6 +846,12 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <div x-show="modelSettings.dflash_ssd_cache" x-transition>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">SSD cache size (GiB)</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_ssd_cache_max_gib" min="1" max="1024" step="1" placeholder="20"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">Disk budget for L2 spill; oldest entries are evicted when exceeded.</p>
+                                        </div>
                                     </div>
                                 </div>
 

@@ -71,6 +71,7 @@ class ModelSettings:
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
+        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
         dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
@@ -143,6 +144,7 @@ class ModelSettings:
     dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
     dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
     dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
     # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
     # agentic workloads where acceptance drops on the default sliding window.

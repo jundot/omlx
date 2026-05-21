@@ -144,6 +144,11 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else False
         )
+        self._ssd_cache_max_bytes = int(
+            getattr(model_settings, "dflash_ssd_cache_max_bytes", 20 * 1024**3)
+            if model_settings
+            else 20 * 1024**3
+        )
         # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
         # `getattr` returns None for missing attrs so older settings files keep working.
         self._draft_window_size = (
@@ -220,9 +225,10 @@ class DFlashEngine(BaseEngine):
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
             prefix_cache_l2=l2_enabled,
             prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
-            # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
-            # configuration, so dflash's own byte limit is intentionally large.
-            prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops the
+            # oldest snapshots once dflash_l2/ exceeds this, so the directory
+            # stays bounded instead of filling the disk (issue #1326).
+            prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,

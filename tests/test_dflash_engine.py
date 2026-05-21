@@ -131,6 +131,7 @@ class TestDFlashModelSettings:
             dflash_max_ctx=16384,
             dflash_in_memory_cache=False,
             dflash_ssd_cache=False,
+            dflash_ssd_cache_max_bytes=30 * 1024**3,
         )
         d = original.to_dict()
         restored = ModelSettings.from_dict(d)
@@ -143,6 +144,7 @@ class TestDFlashModelSettings:
         assert restored.dflash_max_ctx == original.dflash_max_ctx
         assert restored.dflash_in_memory_cache == original.dflash_in_memory_cache
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
+        assert restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
 
 
 class TestDFlashEngineInit:
@@ -410,6 +412,48 @@ class TestDFlashEngineInit:
         assert runtime.draft_window_size == 1024
         assert runtime.draft_sink_size == 64
         assert runtime.verify_mode == "adaptive"
+
+    def test_l2_max_bytes_from_settings(self, tmp_path):
+        """Issue #1326 — dflash L2 disk budget comes from the per-model setting,
+        not a hard-coded 1 TiB sentinel, so dflash_l2/ stays bounded."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_ssd_cache=True,
+                dflash_in_memory_cache=True,
+                dflash_ssd_cache_max_bytes=5 * 1024**3,
+            ),
+            omlx_ssd_cache_dir=tmp_path,
+        )
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+        assert runtime.prefix_cache_l2_max_bytes == 5 * 1024**3
+
+    def test_l2_max_bytes_defaults_to_20gib(self, tmp_path):
+        """No explicit setting → engine falls back to the 20 GiB default budget."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_ssd_cache=True,
+                dflash_in_memory_cache=True,
+            ),
+            omlx_ssd_cache_dir=tmp_path,
+        )
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+        assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
 
 
 class TestDFlashCompatibility:
