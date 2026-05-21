@@ -2042,6 +2042,10 @@
             .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
             .map(msg => {
                 const m = { role: msg.role, content: msg.content ?? null };
+                if (msg.reasoning_content) m.reasoning_content = msg.reasoning_content;
+                if (!m.reasoning_content && msg.role === 'assistant' && msg._thinking) {
+                    m.reasoning_content = msg._thinking;
+                }
                 if (msg.tool_calls) m.tool_calls = msg.tool_calls;
                 if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
                 return m;
@@ -2218,6 +2222,7 @@
                 chatSession.messages.push({
                     role: 'assistant',
                     content: stream.streamingContent || null,
+                    reasoning_content: stream.streamingThinking || null,
                     model: context.model,
                     tool_calls: toolCalls,
                     _ui: false,
@@ -2293,6 +2298,7 @@
             chatSession.messages.push({
                 role: 'assistant',
                 content: stream.streamingContent || '',
+                reasoning_content: stream.streamingThinking || null,
                 model: context.model,
                 _perfVisible: false,
                 _thinking: stream.streamingThinking || null,
@@ -2317,6 +2323,7 @@
                     chatSession.messages.push({
                         role: 'assistant',
                         content: stream.streamingContent,
+                        reasoning_content: stream.streamingThinking || null,
                         model: context.model,
                         _perfVisible: false,
                         _thinking: stream.streamingThinking || null,
