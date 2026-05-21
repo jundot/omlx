@@ -387,6 +387,11 @@
             benchUploadDone: null,
             benchUploading: false,
             benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            // { bench_id, model_id } when the server reports a running bench
+            // that is NOT the one this tab is displaying. Drives the "another
+            // bench is running" banner + disables Start so the user doesn't
+            // race a 409 on the server.
+            benchOtherActive: null,
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -473,6 +478,17 @@
                 // Watch for main tab changes to manage refresh timers
                 this.$watch('mainTab', (value) => {
                     this.handleMainTabChange(value);
+                });
+
+                // When the user returns to this browser tab after looking
+                // elsewhere, re-check whether a different bench just started
+                // in another tab. Fires the banner without requiring an
+                // in-app tab switch.
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState !== 'visible') return;
+                    if (this.mainTab === 'bench' && this.benchTab === 'throughput') {
+                        this.loadBenchState();
+                    }
                 });
 
                 this.$watch('hfMlxOnly', () => {
@@ -2739,19 +2755,82 @@
                 // Discover an in-progress throughput run on tab/page load so
                 // a second tab (or a refresh) can attach to its SSE stream
                 // and replay the run's full event history.
+                //
+                // Three cases:
+                //   1. No active run → clear any stale banner state.
+                //   2. Active run, this tab is already attached → no-op.
+                //   3. Active run, this tab is fresh → auto-attach.
+                //   4. Active run, this tab is displaying a *different*
+                //      completed bench → show banner; let the user decide
+                //      whether to clobber their result view.
                 try {
                     const resp = await fetch('/admin/api/bench/active');
                     if (!resp.ok) return;
                     const data = await resp.json();
-                    if (data.running && data.bench_id) {
-                        this.benchBenchId = data.bench_id;
-                        this.benchModelId = data.model_id;
-                        this.benchRunning = true;
-                        this.connectBenchSSE(data.bench_id);
+
+                    if (!data.running || !data.bench_id) {
+                        this.benchOtherActive = null;
+                        return;
                     }
+
+                    // Already attached to this bench — nothing to do.
+                    if (this.benchBenchId === data.bench_id && this.benchEventSource) {
+                        return;
+                    }
+
+                    // We have completed results from a DIFFERENT bench on
+                    // screen — don't silently swap them out. Show a banner
+                    // so the user can explicitly accept the new bench.
+                    const hasStaleResults = !this.benchRunning
+                        && this.benchBenchId
+                        && this.benchBenchId !== data.bench_id
+                        && (this.benchSingleResults.length > 0
+                            || this.benchBatchResults.length > 0);
+                    if (hasStaleResults) {
+                        this.benchOtherActive = {
+                            bench_id: data.bench_id,
+                            model_id: data.model_id,
+                        };
+                        return;
+                    }
+
+                    // Fresh slate: attach.
+                    this.benchBenchId = data.bench_id;
+                    this.benchModelId = data.model_id;
+                    this.benchRunning = true;
+                    this.benchOtherActive = null;
+                    this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to load bench state:', err);
                 }
+            },
+
+            // User clicked "View live" on the banner — clear the stale
+            // result display, attach to the active run. The replay-on-
+            // subscribe stream re-delivers every event so the new bench
+            // populates its table from the start.
+            acceptOtherBench() {
+                if (!this.benchOtherActive) return;
+                const other = this.benchOtherActive;
+                this.benchOtherActive = null;
+                this.benchBenchId = other.bench_id;
+                this.benchModelId = other.model_id;
+                this.benchRunning = true;
+                this.benchSingleResults = [];
+                this.benchBatchResults = [];
+                this.benchUploadResults = [];
+                this.benchUploadDone = null;
+                this.benchUploadSkipped = null;
+                this.benchProgress = null;
+                this.benchError = '';
+                this.connectBenchSSE(other.bench_id);
+            },
+
+            dismissOtherBench() {
+                // Hide for now; the banner reappears next loadBenchState if
+                // the run is still active. Use case: user wants to keep
+                // reviewing their previous result for a moment.
+                this.benchOtherActive = null;
             },
 
             // Bench sub-tab

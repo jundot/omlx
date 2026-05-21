@@ -266,3 +266,119 @@ class TestAccuracyBenchmarkSSEReplay:
             "phase": "eval",
             "current": 5,
         }
+
+
+# --- Route-level: /api/bench/active + 409 on concurrent start ---------------
+
+
+class _FakeEntry:
+    def __init__(self):
+        self.engine_type = "batched"
+        self.model_type = "llm"
+        self.engine = None
+        self.is_pinned = False
+        self.is_loading = False
+        self.model_path = "/fake"
+
+
+class _FakePool:
+    def __init__(self):
+        self._entries = {"model-x": _FakeEntry()}
+
+    def get_entry(self, model_id):
+        return self._entries.get(model_id)
+
+
+@pytest.fixture
+def bench_client(monkeypatch):
+    """FastAPI TestClient with auth stubbed and a fake engine pool wired in."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omlx.admin import routes as admin_routes
+
+    _benchmark_runs.clear()
+    admin_routes._get_engine_pool = lambda: _FakePool()
+
+    async def _fake_require_admin():
+        return True
+
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = _fake_require_admin
+    yield TestClient(app)
+    _benchmark_runs.clear()
+
+
+class TestActiveBenchEndpoint:
+    def test_returns_not_running_when_idle(self, bench_client):
+        r = bench_client.get("/admin/api/bench/active")
+        assert r.status_code == 200
+        assert r.json() == {"running": False, "bench_id": None, "model_id": None}
+
+    def test_returns_running_run_payload(self, bench_client):
+        run = BenchmarkRun(
+            bench_id="bench-abc",
+            request=BenchmarkRequest(model_id="model-x", prompt_lengths=[1024]),
+        )
+        run.status = "running"
+        _benchmark_runs[run.bench_id] = run
+
+        r = bench_client.get("/admin/api/bench/active")
+        assert r.status_code == 200
+        assert r.json() == {
+            "running": True,
+            "bench_id": "bench-abc",
+            "model_id": "model-x",
+        }
+
+
+class TestConcurrentStartRejection:
+    """Server refuses to start a second throughput bench while one is
+    running — two concurrent runs on the same engine produce mutually-
+    corrupted measurements, and there's no way to recover the data."""
+
+    def test_start_409_when_already_running(self, bench_client):
+        # Seed a running run in the registry.
+        existing = BenchmarkRun(
+            bench_id="bench-existing",
+            request=BenchmarkRequest(model_id="model-x", prompt_lengths=[1024]),
+        )
+        existing.status = "running"
+        _benchmark_runs[existing.bench_id] = existing
+
+        r = bench_client.post("/admin/api/bench/start", json={
+            "model_id": "model-x",
+            "prompt_lengths": [1024],
+        })
+        assert r.status_code == 409
+        body = r.json()
+        assert "already running" in body["detail"].lower()
+        assert "bench-existing" in body["detail"]
+        # Confirm the registry still has only the original run — no
+        # second one was spuriously created and abandoned.
+        assert len(_benchmark_runs) == 1
+
+    def test_start_allowed_when_previous_completed(self, bench_client, monkeypatch):
+        # A completed prior run must not block a fresh start.
+        finished = BenchmarkRun(
+            bench_id="bench-finished",
+            request=BenchmarkRequest(model_id="model-x", prompt_lengths=[1024]),
+        )
+        finished.status = "completed"
+        _benchmark_runs[finished.bench_id] = finished
+
+        # Stub out the async run_benchmark task so the request returns
+        # immediately without actually executing a bench.
+        from omlx.admin import benchmark as bench_module
+
+        async def _noop(run, pool):
+            return
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _noop)
+
+        r = bench_client.post("/admin/api/bench/start", json={
+            "model_id": "model-x",
+            "prompt_lengths": [1024],
+        })
+        assert r.status_code == 200, r.text

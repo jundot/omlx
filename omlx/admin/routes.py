@@ -5036,18 +5036,33 @@ async def start_benchmark(
     """Start a benchmark run.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task.
+    as an asyncio background task. Rejects with 409 if another
+    throughput bench is already running — two concurrent runs on
+    the same engine produce mutually-corrupted measurements.
     """
     from .benchmark import (
         BenchmarkRequest,
         cleanup_old_runs,
         create_run,
+        get_active_run,
         run_benchmark,
     )
 
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    # One throughput bench at a time. The replay-on-subscribe stream lets
+    # clients attach to the already-running one if that's what they want.
+    active = get_active_run()
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A throughput benchmark is already running "
+                f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
+            ),
+        )
 
     body = await request.json()
     try:
