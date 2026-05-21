@@ -364,13 +364,13 @@ class MemoryMonitor:
         return num_tokens * per_token
 
     def estimate_prefill_peak_bytes(
-        self, total_prompt_tokens: int, chunk_size: int
+        self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
     ) -> int:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
 
         Returns only the part directly attributable to this request's prefill:
-        KV cache for the prompt + SDPA attention activation peak for the last
+        newly allocated KV cache + SDPA attention activation peak for the last
         chunk. Does NOT include model weights (already in active baseline) or
         MLX cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
@@ -384,9 +384,20 @@ class MemoryMonitor:
         MLX SDPA fused kernel (head_dim <= 128):
           Tiled computation, O(n) memory. Only output buffer allocated.
 
+        The SDPA scores matrix at the last chunk attends over the FULL context
+        (cached_tokens + new_tokens), not just the newly prefilled tokens. With
+        a large prefix-cache hit (big cached prefix, small new suffix) the
+        kv_len term must use the full span, otherwise the transient is
+        undercounted by the cache-hit ratio and a request that actually
+        overflows the MetalAllocator slips past the preflight guard.
+
         Args:
-            total_prompt_tokens: Total tokens in the prompt.
+            new_tokens: Tokens to be prefilled (prompt minus cached prefix).
+                Drives newly allocated KV. Also the last chunk's query length.
             chunk_size: Prefill step size (default 2048).
+            cached_tokens: Tokens already resident in the prompt cache. Adds to
+                the SDPA kv_len span but not to newly allocated KV (cached KV is
+                already counted in the caller's `current` baseline).
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
@@ -400,16 +411,21 @@ class MemoryMonitor:
         if n_q == 0 or hd == 0:
             return 0  # can't estimate
 
+        # Last chunk attends over the full context; query length is the last
+        # chunk size (capped at the new-token count for short suffixes).
+        attn_span = new_tokens + cached_tokens
+        query_len = min(chunk_size, new_tokens)
+
         if hd > 128:
             # Fallback: full attention matrix materialized in float32
-            # scores [B, n_q, chunk, total_tokens] + output [B, n_q, chunk, hd]
-            attn = n_q * chunk_size * total_prompt_tokens * 4
-            attn += n_q * chunk_size * hd * 4  # output buffer (small)
+            # scores [B, n_q, query_len, attn_span] + output [B, n_q, query_len, hd]
+            attn = n_q * query_len * attn_span * 4
+            attn += n_q * query_len * hd * 4  # output buffer (small)
         else:
             # Fused kernel: tiled, only output buffer
-            attn = n_q * chunk_size * hd * 4
+            attn = n_q * query_len * hd * 4
 
-        kv = self.estimate_prompt_kv_bytes(total_prompt_tokens)
+        kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:

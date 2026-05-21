@@ -4256,7 +4256,7 @@ class Scheduler:
             return None
 
         peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
         )
         if peak == 0:
             return None  # can't estimate, skip
