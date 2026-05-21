@@ -68,12 +68,21 @@ class BenchmarkRequest(BaseModel):
 
 @dataclass
 class BenchmarkRun:
-    """Tracks the state of a running benchmark."""
+    """Tracks the state of a running benchmark.
+
+    SSE delivery model: events are appended to `events` (append-only
+    log) under `cond`. Subscribers replay `events` from offset 0 then
+    wait on `cond` for new entries. `terminal` is set once the final
+    event (`upload_done` / `error`) has been published so subscribers
+    know to close their stream rather than wait for a follow-up.
+    """
 
     bench_id: str
     request: BenchmarkRequest
     status: str = "running"  # running, completed, cancelled, error
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    events: list[dict] = field(default_factory=list)
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    terminal: bool = False
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
@@ -81,6 +90,12 @@ class BenchmarkRun:
     # the run's results are not uploaded to omlx.ai community benchmarks
     # because experimental features skew the numbers.
     experimental_features: list[str] = field(default_factory=list)
+
+
+# Event types that close the SSE stream for a bench run. `done` is NOT
+# terminal — it marks "tests finished, upload starting"; the real end of
+# stream is `upload_done` (or `error`).
+_BENCH_TERMINAL_TYPES = frozenset({"upload_done", "error"})
 
 
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
@@ -170,8 +185,16 @@ def _compute_single_metrics(
 
 
 async def _send_event(run: BenchmarkRun, event: dict) -> None:
-    """Send an SSE event to the run's queue."""
-    await run.queue.put(event)
+    """Append an event to the run's log and wake any subscribers.
+
+    Sets `run.terminal` when the event ends the stream so subscribers
+    can return rather than wait for an event that will never come.
+    """
+    async with run.cond:
+        run.events.append(event)
+        if event.get("type") in _BENCH_TERMINAL_TYPES:
+            run.terminal = True
+        run.cond.notify_all()
 
 
 async def _run_single_test(

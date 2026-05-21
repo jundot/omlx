@@ -72,16 +72,28 @@ class AccuracyBenchmarkRequest(BaseModel):
 
 @dataclass
 class AccuracyBenchmarkRun:
-    """Tracks the state of a running accuracy benchmark."""
+    """Tracks the state of a running accuracy benchmark.
+
+    SSE delivery model mirrors `BenchmarkRun`: append-only `events`
+    log + `cond` for live notification + `terminal` flag set on the
+    final event. See benchmark.py for the rationale.
+    """
 
     bench_id: str
     request: AccuracyBenchmarkRequest
     status: str = "running"  # running, completed, cancelled, error
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    events: list[dict] = field(default_factory=list)
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    terminal: bool = False
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
     last_progress: Optional[dict] = None  # last progress event for reconnect
+
+
+# Accuracy stream closes on `done` (run finished) or `error`. Unlike the
+# throughput bench there's no separate upload phase to ride out.
+_ACCURACY_TERMINAL_TYPES = frozenset({"done", "error"})
 
 
 # --- Run management ---
@@ -251,13 +263,18 @@ async def cancel_queue() -> None:
 
 
 async def _send_event(run: AccuracyBenchmarkRun, event: dict) -> None:
-    """Send an SSE event to the client."""
+    """Append an event to the run's log and wake subscribers.
+
+    Updates `last_progress` (used by the REST `queue/status` endpoint
+    for reconnect hints) and sets `run.terminal` on the final event.
+    """
     if event.get("type") == "progress":
         run.last_progress = event
-    try:
-        await run.queue.put(event)
-    except Exception:
-        pass
+    async with run.cond:
+        run.events.append(event)
+        if event.get("type") in _ACCURACY_TERMINAL_TYPES:
+            run.terminal = True
+        run.cond.notify_all()
 
 
 # --- Benchmark execution ---

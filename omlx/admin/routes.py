@@ -4965,17 +4965,28 @@ async def stream_accuracy_benchmark(
         )
 
     async def event_generator():
+        # Replay-then-attach: every subscriber starts at offset 0 of the
+        # run's event log and follows along live. Lets the HTML dashboard
+        # recover its view on page refresh and lets multiple consumers
+        # (e.g. browser + Swift app) share the same run.
+        seen = 0
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except TimeoutError:
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
                     yield ": keepalive\n\n"
-                    continue
-
-                yield f"data: {json.dumps(event)}\n\n"
-
-                if event.get("type") in ("done", "error"):
+                if done:
                     break
         except asyncio.CancelledError:
             pass
@@ -5073,19 +5084,28 @@ async def stream_benchmark(
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
 
     async def event_generator():
+        # Replay-then-attach: see /api/bench/accuracy/{id}/stream for the
+        # full rationale. The bench stream's terminal events are
+        # `upload_done` and `error` — `done` only marks the boundary
+        # between tests and upload.
+        seen = 0
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except TimeoutError:
-                    # Send keepalive
+                async with run.cond:
+                    while seen >= len(run.events) and not run.terminal:
+                        try:
+                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                        except TimeoutError:
+                            break
+                    new = list(run.events[seen:])
+                    seen = len(run.events)
+                    done = run.terminal
+
+                for ev in new:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if not new and not done:
                     yield ": keepalive\n\n"
-                    continue
-
-                yield f"data: {json.dumps(event)}\n\n"
-
-                # Stop streaming on terminal events
-                if event.get("type") in ("upload_done", "error"):
+                if done:
                     break
         except asyncio.CancelledError:
             pass

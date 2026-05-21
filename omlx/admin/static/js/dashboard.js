@@ -2527,10 +2527,24 @@
                                 total: data.total,
                             };
                         } else if (data.type === 'result') {
+                            // SSE replay-on-subscribe re-delivers every event on
+                            // every reconnect (incl. page refresh), so append-only
+                            // arrays must dedupe. Single rows are keyed by
+                            // (pp, tg); batch rows by batch_size.
                             if (data.data.test_type === 'single') {
-                                this.benchSingleResults = [...this.benchSingleResults, data.data];
+                                const exists = this.benchSingleResults.some(
+                                    r => r.pp === data.data.pp && r.tg === data.data.tg
+                                );
+                                if (!exists) {
+                                    this.benchSingleResults = [...this.benchSingleResults, data.data];
+                                }
                             } else if (data.data.test_type === 'batch') {
-                                this.benchBatchResults = [...this.benchBatchResults, data.data];
+                                const exists = this.benchBatchResults.some(
+                                    r => r.batch_size === data.data.batch_size
+                                );
+                                if (!exists) {
+                                    this.benchBatchResults = [...this.benchBatchResults, data.data];
+                                }
                             }
                         } else if (data.type === 'done') {
                             // Benchmark tests done, uploading starts
@@ -2543,7 +2557,13 @@
                             };
                             this.loadModels();
                         } else if (data.type === 'upload') {
-                            this.benchUploadResults = [...this.benchUploadResults, data.data];
+                            // Dedupe on replay: upload entries are unique by context_length.
+                            const exists = this.benchUploadResults.some(
+                                r => r.context_length === data.data.context_length
+                            );
+                            if (!exists) {
+                                this.benchUploadResults = [...this.benchUploadResults, data.data];
+                            }
                         } else if (data.type === 'upload_done') {
                             this.benchUploadDone = data.data;
                             this.benchUploading = false;
@@ -2837,8 +2857,18 @@
                                 this.accCurrentModel = data.model_id || this.accCurrentModel;
                                 break;
                             case 'result':
-                                data.data._showCategories = false;
-                                this.accAllResults.push(data.data);
+                                // Dedupe on replay: accuracy results are unique by
+                                // (model_id, benchmark).
+                                {
+                                    const exists = this.accAllResults.some(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (!exists) {
+                                        data.data._showCategories = false;
+                                        this.accAllResults.push(data.data);
+                                    }
+                                }
                                 break;
                             case 'done':
                                 this.accProgress = null;
