@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
@@ -31,6 +32,75 @@ _HF_API_TIMEOUT = 10
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+# Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
+# endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
+# 308-redirect to huggingface.co when accessed from IPs outside their region;
+# huggingface_hub does NOT follow those cross-origin 308s during HEAD probes,
+# so downloads fail. We resolve the redirect chain upfront and pin HfApi to
+# the final origin.
+_endpoint_resolution_cache: dict[str, str] = {}
+
+
+def _resolve_endpoint(endpoint: str) -> str:
+    """Follow permanent (301/308) cross-origin redirects on `endpoint`.
+
+    Returns the final origin (scheme://host[:port]) the endpoint resolves to.
+    Used to work around `huggingface_hub`'s inability to follow cross-origin
+    308 redirects during file-download HEAD probes.
+
+    Probes a known-stable HF API path (`/api/models/gpt2`) with HEAD; if the
+    server returns a 301/308 with a Location pointing at a different host,
+    the redirected origin is returned (and cached). Network errors fall back
+    to the original endpoint.
+    """
+    endpoint = endpoint.rstrip("/")
+    if endpoint in _endpoint_resolution_cache:
+        return _endpoint_resolution_cache[endpoint]
+
+    try:
+        import httpx
+    except ImportError:
+        return endpoint
+
+    probe = f"{endpoint}/api/models/gpt2"
+    original_host = urlparse(endpoint).netloc
+    resolved = endpoint
+    try:
+        with httpx.Client(follow_redirects=False, timeout=5.0) as client:
+            r = client.head(probe)
+            # Walk up to 3 permanent hops; stop on first non-permanent status.
+            hops = 0
+            current_url = probe
+            while r.status_code in (301, 308) and "location" in r.headers:
+                hops += 1
+                if hops > 3:
+                    break
+                location = r.headers["location"]
+                if location.startswith("/"):
+                    # Relative redirect — same origin, no rewrite needed.
+                    break
+                target = urlparse(location)
+                if not target.netloc:
+                    break
+                if target.netloc != original_host:
+                    # Cross-origin permanent redirect: rewrite the endpoint.
+                    port = f":{target.port}" if target.port else ""
+                    resolved = f"{target.scheme}://{target.hostname}{port}"
+                    original_host = target.netloc
+                current_url = location
+                r = client.head(current_url)
+    except Exception as e:  # noqa: BLE001 — probe is best-effort
+        logger.debug(f"HF endpoint probe failed for {endpoint}: {e}")
+        return endpoint
+
+    if resolved != endpoint:
+        logger.info(
+            f"HuggingFace endpoint {endpoint} permanently redirects to "
+            f"{resolved}; using resolved origin for downloads."
+        )
+    _endpoint_resolution_cache[endpoint] = resolved
+    return resolved
 
 
 class _DownloadCancelled(Exception):
@@ -63,17 +133,28 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
 def _get_hf_api() -> tuple[HfApi, str | None]:
     """Create HfApi instance with configured endpoint.
 
+    Only the admin UI's `huggingface.endpoint` setting is honored here.
+    When that's empty, return `HfApi()` with no explicit endpoint so
+    `huggingface_hub` falls back to its own resolution (which already
+    honors the `HF_ENDPOINT` env var). The configured endpoint, when
+    present, is run through `_resolve_endpoint()` to follow permanent
+    cross-origin redirects (e.g. hf-mirror.com → huggingface.co from
+    non-CN IPs) so downstream HF library code sees a stable origin.
+
     Returns:
         Tuple of (HfApi instance, endpoint URL or None).
     """
+    endpoint: str | None = None
     try:
         from ..settings import get_settings
 
-        endpoint = get_settings().huggingface.endpoint
-        if endpoint:
-            return HfApi(endpoint=endpoint), endpoint
+        endpoint = get_settings().huggingface.endpoint or None
     except (RuntimeError, AttributeError):
-        pass
+        endpoint = None
+
+    if endpoint:
+        resolved = _resolve_endpoint(endpoint)
+        return HfApi(endpoint=resolved), resolved
     return HfApi(), None
 
 

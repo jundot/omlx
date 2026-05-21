@@ -2375,3 +2375,144 @@ class TestEtagTimeout:
             assert call_kwargs["etag_timeout"] == 30
 
             await downloader.shutdown()
+
+
+# =============================================================================
+# Endpoint resolution (_resolve_endpoint)
+# =============================================================================
+#
+# Background: `huggingface_hub` does not follow cross-origin permanent
+# redirects during the HEAD probe it issues at the start of a download
+# (e.g. hf-mirror.com permanently 308s to huggingface.co when accessed
+# from non-CN IPs). The result is a silent download failure with a
+# misleading error. `_resolve_endpoint` probes the configured endpoint
+# upfront, walks the redirect chain, and pins HfApi to the final origin.
+#
+# These tests pin that behavior so a future refactor doesn't regress it.
+
+
+class TestResolveEndpoint:
+    """Pin the cross-origin redirect resolution for HF_ENDPOINT."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        # Cache is module-global; clear before/after every test so cases
+        # don't bleed into each other.
+        from omlx.admin.hf_downloader import _endpoint_resolution_cache
+        _endpoint_resolution_cache.clear()
+        yield
+        _endpoint_resolution_cache.clear()
+
+    @staticmethod
+    def _response(status_code: int, location: str | None = None) -> MagicMock:
+        r = MagicMock()
+        r.status_code = status_code
+        r.headers = {"location": location} if location else {}
+        return r
+
+    def _patch_httpx(self, responses: list):
+        """Patch httpx.Client.head to walk through `responses` in order."""
+        mock_client_cls = MagicMock()
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.head = MagicMock(side_effect=responses)
+        mock_client_cls.return_value = mock_client
+        return patch("httpx.Client", mock_client_cls), mock_client
+
+    def test_no_redirect_returns_endpoint_unchanged(self):
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([self._response(200)])
+        with ctx:
+            assert _resolve_endpoint("https://huggingface.co") == "https://huggingface.co"
+
+    def test_cross_origin_308_returns_redirected_origin(self):
+        # The bug this whole module exists to fix: hf-mirror permanently
+        # 308s to huggingface.co; downloads must resolve to the final origin.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),  # probe at resolved origin
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://huggingface.co"
+
+    def test_cross_origin_301_also_handled(self):
+        # 301 (Moved Permanently) gets the same treatment as 308.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(301, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://huggingface.co"
+
+    def test_same_origin_redirect_does_not_rewrite(self):
+        # If the server returns a relative Location (`/foo`) we must not
+        # try to rewrite the endpoint — same origin, same hostname.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "/api/models/gpt2"),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_chained_redirects_walk_up_to_3_hops(self):
+        # A → B → C all cross-origin permanent. Final hop wins.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "https://hop2.example/api/models/gpt2"),
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hop1.example") == "https://huggingface.co"
+
+    def test_temporary_redirect_is_not_followed(self):
+        # 302 / 307 are NOT permanent — leave the endpoint alone so the HF
+        # client can handle them per-request.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(302, "https://huggingface.co/api/models/gpt2"),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_network_error_falls_back_to_original_endpoint(self):
+        # Best-effort probe: any httpx exception leaves the endpoint as-is.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        mock_client_cls = MagicMock()
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.head = MagicMock(side_effect=OSError("network unreachable"))
+        mock_client_cls.return_value = mock_client
+        with patch("httpx.Client", mock_client_cls):
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_result_is_cached_per_endpoint(self):
+        # Second call for the same endpoint must not re-probe.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, mock_client = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            _resolve_endpoint("https://hf-mirror.com")
+            _resolve_endpoint("https://hf-mirror.com")
+        assert mock_client.head.call_count == 2  # one probe + one resolved probe
+
+    def test_trailing_slash_normalized(self):
+        # `https://hf-mirror.com/` and `https://hf-mirror.com` are the same
+        # endpoint and must share the cache.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, mock_client = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            r1 = _resolve_endpoint("https://hf-mirror.com")
+            r2 = _resolve_endpoint("https://hf-mirror.com/")
+        assert r1 == r2 == "https://huggingface.co"
+        # Second call was a cache hit — head() count unchanged from first probe.
+        assert mock_client.head.call_count == 2
