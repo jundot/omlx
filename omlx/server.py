@@ -3313,9 +3313,9 @@ async def stream_anthropic_messages(
 
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
+        # Only thinking was emitted. Keep block_index on the just-closed
+        # block so following tool_use blocks start at the next contiguous index.
         yield create_content_block_stop_event(index=block_index)
-        block_index += 1
     if text_block_started:
         yield create_content_block_stop_event(index=block_index)
     elif not thinking_block_started and not tool_calls:
