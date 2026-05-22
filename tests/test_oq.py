@@ -2537,3 +2537,96 @@ class TestPrecomputedSensitivityMap:
 
         with pytest.raises(expected_exc, match=expected_match or ".*"):
             quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+
+class TestOq6StreamingSkipScalesBiases:
+    """Regression tests for oQ6 streaming: skip .scales/.biases keys."""
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
+    def test_scales_and_biases_skipped_in_main_loop(self, tmp_path, monkeypatch):
+        """.scales and .biases keys should not appear in the output index."""
+        import mlx.core as mx
+        from safetensors import safe_open
+
+        src = tmp_path / "src"
+        src.mkdir()
+
+        # Create a pre-quantized source: uint32 weight + fp16 scales/biases
+        weight = mx.random.uniform(shape=(128, 256)).astype(mx.uint32)
+        scales = mx.random.uniform(shape=(128, 4)).astype(mx.float16)
+        biases = mx.random.uniform(shape=(128, 4)).astype(mx.float16)
+
+        from safetensors.numpy import save_file as np_save
+        np_save(
+            {
+                "model.layers.0.self_attn.q_proj.weight": np.array(weight),
+                "model.layers.0.self_attn.q_proj.scales": np.array(scales),
+                "model.layers.0.self_attn.q_proj.biases": np.array(biases),
+            },
+            str(src / "model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            '{"model_type": "qwen3_next", "quantization": {"group_size": 64, "bits": 4}}'
+        )
+
+        # Monkey-patch dequantize to capture calls
+        dequant_calls = []
+        original_dequantize = mx.dequantize
+
+        def capture_dequantize(w, s, b, **kwargs):
+            dequant_calls.append((w.dtype, s.dtype, b.dtype, kwargs))
+            # Return a dummy float array so downstream quantize doesn't crash
+            return mx.zeros(w.shape, dtype=mx.float16)
+
+        monkeypatch.setattr(mx, "dequantize", capture_dequantize)
+
+        quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+        # The .weight triggered inline dequantization
+        assert len(dequant_calls) == 1
+        w_dtype, s_dtype, b_dtype, kwargs = dequant_calls[0]
+        assert w_dtype == mx.uint32
+        assert s_dtype == mx.float16
+        assert b_dtype == mx.float16
+        assert kwargs.get("group_size") == 64
+        assert kwargs.get("bits") == 4
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
+    def test_scales_and_biases_removed_from_all_weights(self, tmp_path, monkeypatch):
+        """.scales and .biases must be popped so they don't leak into output."""
+        import mlx.core as mx
+
+        src = tmp_path / "src"
+        src.mkdir()
+
+        weight = mx.zeros((64, 128), dtype=mx.uint32)
+        scales = mx.zeros((64, 2), dtype=mx.float16)
+        biases = mx.zeros((64, 2), dtype=mx.float16)
+
+        from safetensors.numpy import save_file as np_save
+        np_save(
+            {
+                "model.layers.0.mlp.gate_proj.weight": np.array(weight),
+                "model.layers.0.mlp.gate_proj.scales": np.array(scales),
+                "model.layers.0.mlp.gate_proj.biases": np.array(biases),
+            },
+            str(src / "model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            '{"model_type": "qwen3_next", "quantization": {"group_size": 64, "bits": 4}}'
+        )
+
+        # Patch dequantize to avoid actual compute
+        monkeypatch.setattr(
+            mx, "dequantize", lambda w, s, b, **kw: mx.zeros(w.shape, dtype=mx.float16)
+        )
+
+        quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+        # Verify output index has no .scales/.biases keys
+        out_index_path = tmp_path / "out" / "model.safetensors.index.json"
+        if out_index_path.exists():
+            index = json.loads(out_index_path.read_text())
+            weight_map = index.get("weight_map", {})
+            assert "model.layers.0.mlp.gate_proj.scales" not in weight_map
+            assert "model.layers.0.mlp.gate_proj.biases" not in weight_map

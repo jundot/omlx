@@ -2413,6 +2413,13 @@ def quantize_oq_streaming(
 
     tensor_names = list(all_weights.keys())
     total_tensors = len(tensor_names)
+    # Build a set of .scales/.biases keys to skip in the main loop.
+    # Their corresponding .weight tensor will handle dequantization.
+    _skip_keys = set()
+    for k in tensor_names:
+        if k.endswith(".scales") or k.endswith(".biases"):
+            _skip_keys.add(k)
+
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
@@ -2426,10 +2433,35 @@ def quantize_oq_streaming(
     total_bytes = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
     processed_bytes = 0
 
+    # Pre-compute per-layer quantization params from config for fast lookup
+    _src_qcfg = config.get("quantization", {})
+
     for i, tensor_name in enumerate(tensor_names):
+        # Skip scales/biases — handled by their .weight counterpart.
+        # Do NOT pop them here; the .weight tensor's dequantization code
+        # will pop them later.
+        if tensor_name in _skip_keys:
+            continue
+
         w_mx = all_weights.pop(tensor_name)
         if isinstance(w_mx, _LazyTensor):
             w_mx = w_mx[:]
+        # Dequantize uint32 (MLX-quantized) source weights to float16.
+        # The streaming path expects bf16/fp16 input; a pre-quantized source
+        # stores weight=uint32 + scales/biases separately. Dequantize inline
+        # so downstream mx.quantize() gets float input.
+        if w_mx.dtype == mx.uint32 and tensor_name.endswith(".weight"):
+            base = tensor_name[:-7]
+            s_name, b_name = f"{base}.scales", f"{base}.biases"
+            # Look up per-layer quantization params; fall back to global defaults
+            _layer_q = _src_qcfg.get(base, {})
+            gs_in = _layer_q.get("group_size", _src_qcfg.get("group_size", 64))
+            bs_in = _layer_q.get("bits", _src_qcfg.get("bits", 4))
+            scales = all_weights.pop(s_name).astype(mx.float16)
+            biases = all_weights.pop(b_name).astype(mx.float16)
+            w_mx = mx.dequantize(
+                w_mx, scales, biases, group_size=gs_in, bits=bs_in,
+            ).astype(mx.float16)
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
