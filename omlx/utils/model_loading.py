@@ -230,9 +230,9 @@ def _has_mtp_heads(config: dict) -> bool:
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
-    Phase 1 supports Qwen3.5/3.6 (mlx-lm PR 990) and DeepSeek-V4-Flash
-    (Blaizzy/mlx-lm fork PR 15). The model also has to declare MTP heads
-    in the config; otherwise the patch is a no-op.
+    Phase 1 supports Qwen3.5/3.6 (mlx-lm PR 990), Qwen3-Next / Qwen3-Coder-Next,
+    and DeepSeek-V4-Flash (Blaizzy/mlx-lm fork PR 15). The model also has
+    to declare MTP heads in the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -241,6 +241,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
+        or model_type.startswith("qwen3_next")
         or model_type.startswith("deepseek_v4")
     )
 

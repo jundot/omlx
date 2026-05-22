@@ -645,7 +645,7 @@ class PagedCacheManager(CacheManager):
 
             block = self.free_block_queue.popleft()
 
-            # Evict from hash cache if needed
+            # Skip hash eviction when caching is disabled (critical optimization)
             if self.enable_caching:
                 self._maybe_evict_cached_block(block)
 
@@ -686,10 +686,15 @@ class PagedCacheManager(CacheManager):
 
             blocks = self.free_block_queue.popleft_n(num_blocks)
 
-            for block in blocks:
-                if self.enable_caching:
+            # Skip hash eviction when caching is disabled (batch optimization)
+            if self.enable_caching:
+                for block in blocks:
                     self._maybe_evict_cached_block(block)
+            else:
+                for block in blocks:
+                    block.block_hash = None
 
+            for block in blocks:
                 block.ref_count = 1
                 block.touch()
                 self.allocated_blocks[block.block_id] = block
@@ -712,7 +717,8 @@ class PagedCacheManager(CacheManager):
         Returns:
             True if block was evicted from cache
         """
-        if block.block_hash is None:
+        # Skip hash eviction when caching is disabled
+        if not self.enable_caching or block.block_hash is None:
             return False
 
         evicted = self.cached_block_hash_to_block.pop(
@@ -783,8 +789,8 @@ class PagedCacheManager(CacheManager):
                 block.ref_count -= 1
 
                 if block.ref_count <= 0:
-                    # Remove from hash cache
-                    if block.block_hash is not None:
+                    # Skip hash cache removal when caching is disabled
+                    if self.enable_caching and block.block_hash is not None:
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
 
                     del self.allocated_blocks[block.block_id]
