@@ -174,7 +174,7 @@
                                                             <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
                                                         </template>
                                                         <template x-if="m.ttl_remaining_seconds != null">
-                                                            <span class="text-[10px]" :class="m.ttl_remaining_seconds > 0 ? 'text-neutral-400' : 'text-red-500 font-medium'" x-text="m.ttl_remaining_seconds > 0 ? '~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : 'EXPIRED'"></span>
+                                                            <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + ' left'"></span>
                                                         </template>
                                                     </div>
                                                 </template>
