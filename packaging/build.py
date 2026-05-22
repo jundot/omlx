@@ -279,12 +279,13 @@ def _build_sdist_wheel(pkg_name: str) -> bool:
     return result.returncode == 0
 
 
-def build_local_wheels():
+def build_local_wheels(source_toml: Path | None = None):
     """Pre-build wheels for git-pinned packages.
 
     venvstacks/uv disables source builds (--only-binary :all:), so git-pinned
     packages must be pre-built as wheels. This function:
-    1. Parses git URLs from venvstacks.toml
+    1. Parses git URLs from `source_toml` (defaults to the resolved
+       venvstacks.toml emitted by `_generate_venvstacks_toml`)
     2. Builds wheels via pip
     3. Returns a mapping of package_name -> version for toml rewriting
 
@@ -293,8 +294,11 @@ def build_local_wheels():
     """
     print("\n[0/4] Building local wheels...")
 
-    toml_path = SCRIPT_DIR / "venvstacks.toml"
-    git_reqs = _parse_git_requirements(toml_path)
+    if source_toml is None:
+        source_toml = SCRIPT_DIR / "_venvstacks_resolved.toml"
+        if not source_toml.exists():
+            source_toml = SCRIPT_DIR / "venvstacks.toml"
+    git_reqs = _parse_git_requirements(source_toml)
 
     # Clean and recreate wheels dir for fresh builds
     if WHEELS_DIR.exists():
@@ -404,8 +408,10 @@ def _write_engine_commits(omlx_pkg_dir: Path):
     """
     import json
 
-    toml_path = SCRIPT_DIR / "venvstacks.toml"
-    git_reqs = _parse_git_requirements(toml_path)
+    # Git pins now live in pyproject.toml (single source of truth); the
+    # venvstacks.toml template no longer carries version-bearing entries.
+    pyproject_path = SCRIPT_DIR.parent / "pyproject.toml"
+    git_reqs = _parse_git_requirements(pyproject_path)
 
     repo_urls = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
@@ -431,16 +437,154 @@ def _write_engine_commits(omlx_pkg_dir: Path):
         print(f"  Generated _engine_commits.json: {list(commits.keys())}")
 
 
-def _create_resolved_toml(version_map: dict[str, str]) -> Path:
-    """Create a temporary venvstacks.toml with git URLs replaced by local file:// paths.
+# Maps each venvstacks layer name to the pyproject.toml sections whose
+# requirements feed into it. Entries:
+#   "project" → [project] dependencies (PEP 621)
+#   "<extra>" → [project.optional-dependencies].<extra>
+# Layers not listed here are left empty (e.g. cpython-3.11 has no deps).
+# When Jun's release path reintroduces a Python menubar application
+# layer, add an entry like {"omlx-app": ["menubar"]} alongside.
+# Later sources override earlier ones on a name collision (PEP 503
+# normalized). [bundle] last means a bundle-specific [audio]-extra entry
+# wins over [project]'s plain entry for the same package.
+_LAYER_REQUIREMENTS_SOURCES = {
+    "mlx-framework": ["project", "bundle"],
+}
 
-    Git-built wheels have different hashes than PyPI releases of the same version,
-    so we must point directly to the local wheel files to avoid hash mismatches.
+
+def _read_pyproject_requirements() -> dict[str, list[str]]:
+    """Read pyproject.toml and return {section: [req_string, ...]}.
+
+    section is "project" for the main dependencies or the name of an
+    entry under [project.optional-dependencies].
     """
-    toml_path = SCRIPT_DIR / "venvstacks.toml"
-    content = toml_path.read_text()
+    import tomllib
 
-    for full_req, git_url in _parse_git_requirements(toml_path):
+    pyproject = SCRIPT_DIR.parent / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text())
+    out: dict[str, list[str]] = {
+        "project": list(data["project"]["dependencies"]),
+    }
+    for name, reqs in data["project"].get("optional-dependencies", {}).items():
+        out[name] = list(reqs)
+    return out
+
+
+def _generate_venvstacks_toml() -> Path:
+    """Render the venvstacks layer template + pyproject.toml deps into a
+    resolved venvstacks.toml the rest of the build pipeline can consume.
+
+    The committed packaging/venvstacks.toml carries only layer structure
+    + dynlib_exclude + [tool.uv] settings; its `requirements = []` arrays
+    are placeholders. This function fills them in from pyproject.toml so
+    Python dep versions live in exactly one place.
+
+    Stdlib-only implementation: tomllib to parse the template for layer
+    discovery, then plain text substitution to inject populated arrays.
+    Avoids a tomlkit dependency on the host Python that runs build.py.
+    """
+    import tomllib
+
+    template_path = SCRIPT_DIR / "venvstacks.toml"
+    out_path = SCRIPT_DIR / "_venvstacks_resolved.toml"
+    pp_reqs = _read_pyproject_requirements()
+
+    template_text = template_path.read_text()
+    parsed = tomllib.loads(template_text)
+
+    # Split the template on `[[...]]` table-array headers so we can find
+    # and modify the right section without disturbing siblings.
+    sections = re.split(r"(?m)(?=^\[\[)", template_text)
+
+    populated = []
+    for layer in parsed.get("frameworks", []) + parsed.get("applications", []):
+        layer_name = str(layer["name"])
+        sources = _LAYER_REQUIREMENTS_SOURCES.get(layer_name)
+        if not sources:
+            continue
+
+        # Merge requirements from each pyproject section in order, deduping
+        # by PEP 503 normalized name with extras stripped. Later sources
+        # win — so [bundle]'s extras-bearing entries override [project]'s
+        # plain entries for the same package (e.g. mistral-common[audio]).
+        merged_map: dict[str, str] = {}
+        for src in sources:
+            if src not in pp_reqs:
+                print(
+                    f"  ✗ Layer {layer_name!r} references pyproject section "
+                    f"{src!r} which is not declared. "
+                    "Add it to pyproject.toml [project.optional-dependencies].",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for req in pp_reqs[src]:
+                key = req.split("@", 1)[0].split(";", 1)[0]
+                key = re.split(r"[<>=!~]", key, maxsplit=1)[0].strip()
+                key = key.split("[", 1)[0].lower()  # strip PEP 508 extras
+                merged_map[key] = req
+        merged = list(merged_map.values())
+
+        formatted_array = (
+            "requirements = [\n"
+            + "".join(f'    "{r}",\n' for r in merged)
+            + "]"
+        )
+
+        # Find the section starting with [[frameworks]] or [[applications]]
+        # whose `name = "X"` matches this layer, and replace its
+        # `requirements = []` placeholder.
+        layer_re = re.compile(
+            rf'^name\s*=\s*"{re.escape(layer_name)}"\s*$',
+            re.MULTILINE,
+        )
+        placeholder_re = re.compile(
+            r"^requirements\s*=\s*\[\s*\]\s*$",
+            re.MULTILINE,
+        )
+        section_re = re.compile(r"^\[\[(?:frameworks|applications)\]\]")
+
+        injected = False
+        for i, section in enumerate(sections):
+            if not section_re.match(section):
+                continue
+            if not layer_re.search(section):
+                continue
+            new_section, n = placeholder_re.subn(
+                formatted_array, section, count=1
+            )
+            if n == 0:
+                continue
+            sections[i] = new_section
+            injected = True
+            break
+
+        if not injected:
+            print(
+                f"  ✗ Could not find `requirements = []` placeholder in layer "
+                f"{layer_name!r}. The template at {template_path} must contain "
+                "a stand-alone `requirements = []` line within the layer block.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        populated.append(f"{layer_name} ({len(merged)} reqs)")
+
+    out_path.write_text("".join(sections))
+    print(f"  Resolved layer requirements from pyproject.toml: {', '.join(populated)}")
+    return out_path
+
+
+def _create_resolved_toml(version_map: dict[str, str], base_toml: Path) -> Path:
+    """Rewrite git URLs in base_toml to local file:// wheel paths.
+
+    Git-built wheels have different hashes than PyPI releases of the
+    same version, so we must point directly to the local wheel files to
+    avoid hash mismatches. The input toml comes from
+    _generate_venvstacks_toml() and the output overwrites it in place.
+    """
+    content = base_toml.read_text()
+
+    for full_req, git_url in _parse_git_requirements(base_toml):
         pkg_name = full_req.split("@")[0].strip()
         whl = _find_wheel_for_package(pkg_name)
         if whl:
@@ -450,44 +594,8 @@ def _create_resolved_toml(version_map: dict[str, str]) -> Path:
             content = content.replace(old_line, new_line)
             print(f"    {pkg_name} @ git+... → {whl.name}")
 
-    resolved_path = SCRIPT_DIR / "_venvstacks_resolved.toml"
-    resolved_path.write_text(content)
-    return resolved_path
-
-
-def _check_git_commit_sync():
-    """Verify git commit SHAs match between pyproject.toml and venvstacks.toml.
-
-    Aborts the build if any git-pinned package has different commits
-    in the two files, preventing accidental stale builds.
-    """
-    pyproject_path = SCRIPT_DIR.parent / "pyproject.toml"
-    venvstacks_path = SCRIPT_DIR / "venvstacks.toml"
-
-    pyproject_reqs = {
-        r[0].split("@")[0].strip().lower(): r[1]
-        for r in _parse_git_requirements(pyproject_path)
-    }
-    venvstacks_reqs = {
-        r[0].split("@")[0].strip().lower(): r[1]
-        for r in _parse_git_requirements(venvstacks_path)
-    }
-
-    mismatches = []
-    for pkg in pyproject_reqs:
-        if pkg in venvstacks_reqs and pyproject_reqs[pkg] != venvstacks_reqs[pkg]:
-            mismatches.append(
-                f"  {pkg}:\n"
-                f"    pyproject.toml:    {pyproject_reqs[pkg]}\n"
-                f"    venvstacks.toml:   {venvstacks_reqs[pkg]}"
-            )
-
-    if mismatches:
-        print("\n✗ Git commit mismatch between pyproject.toml and venvstacks.toml:")
-        for m in mismatches:
-            print(m)
-        print("\nUpdate both files to the same commit before building.")
-        sys.exit(1)
+    base_toml.write_text(content)
+    return base_toml
 
 
 def _venvstacks_driver() -> list[str]:
@@ -525,20 +633,20 @@ def build_venvstacks():
     """Build venvstacks layers."""
     print("\n[1/4] Building venvstacks layers...")
 
-    _check_git_commit_sync()
-
     venvstacks_cmd = _venvstacks_driver()
     print(f"  Using venvstacks driver: {' '.join(venvstacks_cmd)}")
 
-    # Step 1: Build wheels from git-pinned packages
-    version_map = build_local_wheels()
+    # Step 0: Render the resolved venvstacks.toml from pyproject.toml deps
+    print("\n  Resolving layer requirements from pyproject.toml...")
+    resolved_toml = _generate_venvstacks_toml()
 
-    # Step 2: Create resolved toml (git URLs → version pins)
+    # Step 1: Build wheels from git-pinned packages
+    version_map = build_local_wheels(resolved_toml)
+
+    # Step 2: Swap git URLs in the resolved toml for local wheel paths
     if version_map:
-        print("\n  Resolving git requirements to version pins...")
-        resolved_toml = _create_resolved_toml(version_map)
-    else:
-        resolved_toml = SCRIPT_DIR / "venvstacks.toml"
+        print("\n  Resolving git requirements to local wheel paths...")
+        _create_resolved_toml(version_map, resolved_toml)
 
     # Local wheels args
     local_wheels_args = []
@@ -579,8 +687,9 @@ def build_venvstacks():
         "--output-dir", str(EXPORT_DIR),
     ])
 
-    # Cleanup temporary toml
-    if version_map and resolved_toml.exists():
+    # Cleanup the generated resolved toml — always temporary now that it's
+    # produced fresh each build from pyproject.toml + venvstacks.toml.
+    if resolved_toml.exists():
         resolved_toml.unlink()
 
     # Install mlx-audio separately: build wheel from git, install --no-deps.

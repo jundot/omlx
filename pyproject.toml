@@ -104,6 +104,37 @@ paroquant = [
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
     "paroquant==0.1.14; python_version >= '3.11'",
 ]
+# Internal extra consumed by packaging/build.py to populate the
+# venvstacks mlx-framework layer's requirements list. Listed here as the
+# single source of truth so the layer-template venvstacks.toml stays
+# version-free. End-users don't `pip install omlx[bundle]`; this is for
+# the macOS .app build pipeline.
+#
+# mlx-audio[tts,stt,sts]'s 12 transitive deps appear explicitly because
+# venvstacks 0.7.0's internal `uv pip compile` runs with --no-config and
+# doesn't propagate pyproject.toml's `tool.uv.override-dependencies`,
+# so it can't resolve mlx-audio's `mlx-lm==0.31.1` pin against our
+# git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
+# separately via --no-deps post-resolution.
+bundle = [
+    "mcp>=1.0.0",
+    "modelscope>=1.10.0",
+    # mlx-audio[tts,stt,sts] transitives:
+    "scipy>=1.11.0",
+    "librosa>=0.10.0",
+    "miniaudio>=1.59",
+    "numba>=0.59.0",
+    "pyloudnorm>=0.1.0",
+    "sounddevice>=0.4.6",
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    "webrtcvad>=2.0.10",
+    # [audio] extra on top of pyproject's plain mistral-common>=1.10
+    "mistral-common[audio]>=1.10",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
