@@ -1306,20 +1306,76 @@ def create_dmg(app_dir: Path):
     return dmg_path
 
 
+def _compute_donor_fingerprint() -> str:
+    """Hash of the inputs that determine the venvstacks export shape.
+
+    Used by `apps/omlx-mac/Scripts/build.sh` to decide whether the cached
+    `_export/` is still in sync with the current sources, or needs a
+    rebuild.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    inputs = [
+        SCRIPT_DIR.parent / "pyproject.toml",
+        SCRIPT_DIR / "venvstacks.toml",
+        SCRIPT_DIR.parent / "uv.lock",
+    ]
+    for path in inputs:
+        if path.exists():
+            h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def _write_export_fingerprint():
+    """Write the current fingerprint into _export/ so callers can detect drift."""
+    if not EXPORT_DIR.exists():
+        return
+    fingerprint = _compute_donor_fingerprint()
+    (EXPORT_DIR / ".fingerprint").write_text(fingerprint + "\n")
+    print(f"  Wrote _export/.fingerprint ({fingerprint[:12]}…)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build oMLX macOS app")
     parser.add_argument("--skip-venv", action="store_true",
                         help="Skip venvstacks build")
     parser.add_argument("--dmg-only", action="store_true",
                         help="Only create DMG from existing build")
+    parser.add_argument("--venvstacks-only", action="store_true",
+                        help="Run venvstacks lock+build+export and stop. "
+                             "Used by the Swift dev build (build.sh) to "
+                             "produce a fresh donor without going through "
+                             "the full app+DMG pipeline.")
+    parser.add_argument("--print-fingerprint", action="store_true",
+                        help="Print the donor fingerprint and exit. The "
+                             "Swift dev build uses this to detect drift "
+                             "between sources and the cached _export/.")
     parser.add_argument("--macos-target",
                         help="Target macOS version for mlx/mlx-metal wheels "
                         "(e.g. 26.0). Downloads platform-specific wheels "
                         "with M5 Neural Accelerator support.")
     args = parser.parse_args()
 
+    if args.print_fingerprint:
+        print(_compute_donor_fingerprint())
+        return
+
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)
+
+    if args.venvstacks_only:
+        # Honor --skip-venv for the unusual case where someone wants to
+        # reuse an in-place export but refresh the fingerprint.
+        if not args.skip_venv or not EXPORT_DIR.exists():
+            build_venvstacks()
+        if args.macos_target:
+            swap_platform_wheels(EXPORT_DIR, args.macos_target)
+        _write_export_fingerprint()
+        print("\n" + "=" * 50)
+        print("venvstacks export ready at:")
+        print(f"  {EXPORT_DIR}")
+        return
 
     # Clean build artifacts before starting (unless dmg-only)
     if not args.dmg_only:
@@ -1339,6 +1395,8 @@ def main():
         elif not EXPORT_DIR.exists():
             print("Warning: No existing envs found, building venvstacks...")
             build_venvstacks()
+
+        _write_export_fingerprint()
 
         # Swap mlx/mlx-metal wheels for target macOS version
         if args.macos_target:

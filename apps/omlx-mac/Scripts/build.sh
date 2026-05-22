@@ -2,33 +2,42 @@
 # build.sh — produce a runnable oMLX-next.app for local manual testing.
 #
 # This is the side-by-side Swift bundle path called out in plan.md §5.
-# It runs xcodebuild then "stages" the Python runtime (venvstacks layers +
-# the omlx package) in-place. The canonical, codesigned + notarized release
-# path will live in `packaging/build.py` once PR 12 lands; this script is
-# just enough to run an end-to-end smoke test against the live admin API.
+# Pipeline:
+#   1. (optional) rebuild venvstacks export if sources have drifted
+#   2. xcodebuild with `-resolvePackageDependencies` so SPM deps pick up
+#      any new minor/patch within the pin range each build
+#   3. stage the Swift `.app` and embed Python layers from the donor
+#   4. uv-sync an isolated bundle venv and overlay any packages that
+#      have drifted from the donor (auto-detected via dist-info versions)
+#
+# Donor source resolution (in order):
+#   1. $OMLX_DONOR_APP — explicit override (e.g. /Applications/oMLX.app).
+#                        Bypasses venvstacks rebuild; uses the override as-is.
+#   2. packaging/_export/ — the venvstacks export tree. Default for dev
+#                           builds. Rebuilt automatically when stale
+#                           (fingerprint of pyproject.toml + venvstacks.toml
+#                           + uv.lock differs from packaging/_export/.fingerprint).
+#   3. /Applications/oMLX.app — last-resort fallback when --no-rebuild-donor
+#                               is set and no local export exists.
 #
 # Usage:
-#   apps/omlx-mac/Scripts/build.sh                    # Release, default donor
+#   apps/omlx-mac/Scripts/build.sh                    # Release, auto-rebuild donor when stale
 #   apps/omlx-mac/Scripts/build.sh debug              # Debug build instead
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
 #   apps/omlx-mac/Scripts/build.sh release --no-sync  # skip uv sync + overlay
 #                                                       (use donor layer as-is)
+#   apps/omlx-mac/Scripts/build.sh --rebuild-donor    # force venvstacks rebuild
+#   apps/omlx-mac/Scripts/build.sh --no-rebuild-donor # never rebuild; use
+#                                                       existing donor even if stale
 #
 # Env overrides:
-#   OMLX_DONOR_APP=/path/to/oMLX.app    # provider of cpython + mlx layers
+#   OMLX_DONOR_APP=/path/to/oMLX.app    # explicit donor (bypasses venvstacks)
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
 #   UV_BIN=/path/to/uv                  # explicit uv binary (default: PATH lookup)
-#
-# The donor app provides cpython-3.11 + framework-mlx-framework. The omlx
-# package itself is copied from this checkout's `omlx/` so local Python
-# changes are reflected in the bundle.
-#
-# Pyproject pins newer than the donor's frozen layer (e.g. mlx-vlm @ f96138e)
-# are reconciled by syncing an isolated Python 3.11 venv at $BUILD_DIR/venv
-# and overlaying selected packages onto framework-mlx-framework. See the
-# OVERLAY_PKGS list below.
+#   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
+#                                       (default: PATH lookup of python3)
 
 set -euo pipefail
 
@@ -41,11 +50,14 @@ esac
 
 BARE=0
 NO_SYNC=0
+REBUILD_DONOR=auto    # auto | force | never
 shift || true
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
         --no-sync) NO_SYNC=1 ;;
+        --rebuild-donor) REBUILD_DONOR=force ;;
+        --no-rebuild-donor) REBUILD_DONOR=never ;;
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
@@ -53,8 +65,13 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+PACKAGING_DIR="$REPO_ROOT/packaging"
+LOCAL_EXPORT="$PACKAGING_DIR/_export"
 
-DONOR_APP="${OMLX_DONOR_APP:-/Applications/oMLX.app}"
+# OMLX_DONOR_APP is "explicit" only when the user set it; the default
+# (/Applications/oMLX.app) is treated as a fallback, not an override.
+OMLX_DONOR_APP_SET="${OMLX_DONOR_APP+1}"
+OMLX_DONOR_APP="${OMLX_DONOR_APP:-/Applications/oMLX.app}"
 OUTPUT_DIR="${OMLX_NEXT_OUT:-$PROJECT_DIR/build/Stage}"
 BUILD_DIR="$PROJECT_DIR/build"
 
@@ -69,10 +86,90 @@ ok()   { printf "${GREEN}[build.sh]${RESET} %s\n" "$*"; }
 warn() { printf "${YELLOW}[build.sh]${RESET} %s\n" "$*"; }
 die()  { printf "${RED}[build.sh ERROR]${RESET} %s\n" "$*" >&2; exit 1; }
 
+# --- Resolve donor: pick a layer source and (re)build via venvstacks if stale
+
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+
+# Returns 0 if the local _export/ exists and its stored fingerprint matches
+# the current pyproject/venvstacks/lockfile state.
+_local_export_fresh() {
+    [ -d "$LOCAL_EXPORT" ] || return 1
+    [ -f "$LOCAL_EXPORT/.fingerprint" ] || return 1
+    [ -n "$PYTHON_BIN" ] || return 1
+    local current
+    current="$("$PYTHON_BIN" "$PACKAGING_DIR/build.py" --print-fingerprint 2>/dev/null || true)"
+    [ -n "$current" ] || return 1
+    [ "$(cat "$LOCAL_EXPORT/.fingerprint")" = "$current" ]
+}
+
+_rebuild_venvstacks_export() {
+    [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
+    log "Rebuilding venvstacks export (this may take 5–10 minutes)…"
+    "$PYTHON_BIN" "$PACKAGING_DIR/build.py" --venvstacks-only \
+        || die "venvstacks rebuild failed; see output above."
+    [ -d "$LOCAL_EXPORT" ] || die "venvstacks rebuild reported success but $LOCAL_EXPORT is missing."
+    ok "Venvstacks export ready at $LOCAL_EXPORT"
+}
+
+resolve_donor_layers() {
+    # Explicit OMLX_DONOR_APP override → use it, skip rebuild logic entirely.
+    if [ -n "$OMLX_DONOR_APP_SET" ]; then
+        [ -d "$OMLX_DONOR_APP" ] || die "OMLX_DONOR_APP set but not found: $OMLX_DONOR_APP"
+        DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Python"
+        [ -d "$DONOR_LAYERS" ] || DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Frameworks"
+        DONOR_SOURCE="OMLX_DONOR_APP=$OMLX_DONOR_APP"
+        return
+    fi
+
+    case "$REBUILD_DONOR" in
+        force)
+            _rebuild_venvstacks_export
+            DONOR_LAYERS="$LOCAL_EXPORT"
+            DONOR_SOURCE="$LOCAL_EXPORT (forced rebuild)"
+            ;;
+        never)
+            if [ -d "$LOCAL_EXPORT" ]; then
+                DONOR_LAYERS="$LOCAL_EXPORT"
+                DONOR_SOURCE="$LOCAL_EXPORT (no rebuild)"
+                _local_export_fresh \
+                    || warn "Local export fingerprint mismatch; using stale layers (--no-rebuild-donor)."
+            elif [ -d "$OMLX_DONOR_APP" ]; then
+                DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Python"
+                [ -d "$DONOR_LAYERS" ] || DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Frameworks"
+                DONOR_SOURCE="$OMLX_DONOR_APP (fallback, --no-rebuild-donor)"
+            else
+                die "No donor available: $LOCAL_EXPORT and $OMLX_DONOR_APP both missing, --no-rebuild-donor prevents rebuild."
+            fi
+            ;;
+        auto)
+            if _local_export_fresh; then
+                DONOR_LAYERS="$LOCAL_EXPORT"
+                DONOR_SOURCE="$LOCAL_EXPORT (cached, fingerprint match)"
+            else
+                if [ -d "$LOCAL_EXPORT" ]; then
+                    log "Local export is stale (fingerprint mismatch) — rebuilding."
+                else
+                    log "Local export missing — building."
+                fi
+                _rebuild_venvstacks_export
+                DONOR_LAYERS="$LOCAL_EXPORT"
+                DONOR_SOURCE="$LOCAL_EXPORT (rebuilt)"
+            fi
+            ;;
+    esac
+}
+
 # --- xcodebuild -----------------------------------------------------------
 
 log "Building oMLX-next ($CONFIG)…"
 mkdir -p "$BUILD_DIR"
+
+log "Resolving Swift package dependencies…"
+xcodebuild -resolvePackageDependencies \
+    -project "$PROJECT_DIR/oMLX.xcodeproj" \
+    -scheme oMLX-next \
+    >"$BUILD_DIR/spm-resolve.log" 2>&1 \
+        || warn "SPM resolve emitted warnings; continuing with existing Package.resolved (see $BUILD_DIR/spm-resolve.log)."
 
 xcodebuild \
     -project "$PROJECT_DIR/oMLX.xcodeproj" \
@@ -111,14 +208,10 @@ mkdir -p "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
 
 # --- Embed Python layers --------------------------------------------------
 
-[ -d "$DONOR_APP" ] || die "Donor app not found: $DONOR_APP — install /Applications/oMLX.app or set OMLX_DONOR_APP."
-
-DONOR_LAYERS="$DONOR_APP/Contents/Python"
-if [ ! -d "$DONOR_LAYERS" ]; then
-    DONOR_LAYERS="$DONOR_APP/Contents/Frameworks"
-fi
+resolve_donor_layers
+log "Using donor: $DONOR_SOURCE"
 [ -d "$DONOR_LAYERS/cpython-3.11" ] || die "Donor missing cpython-3.11 at $DONOR_LAYERS"
-[ -d "$DONOR_LAYERS/framework-mlx-framework" ] || die "Donor missing framework-mlx-framework"
+[ -d "$DONOR_LAYERS/framework-mlx-framework" ] || die "Donor missing framework-mlx-framework at $DONOR_LAYERS"
 
 log "Copying cpython-3.11 from donor…"
 ditto "$DONOR_LAYERS/cpython-3.11" "$FRAMEWORKS_DIR/cpython-3.11"
@@ -135,16 +228,92 @@ fi
 
 # --- Overlay diverging packages from a fresh uv-synced 3.11 venv ---------
 #
-# The donor app's framework-mlx-framework is frozen to whatever was current
-# at its build time. When pyproject.toml later moves a dependency forward
-# (e.g. `mlx-vlm @ f96138e` for the new `mlx_vlm.speculative.utils`
-# module), the donor's site-packages goes stale and the bundled server
-# fails to import at startup.
+# Even when the donor is freshly rebuilt above, the bundle venv path is
+# kept because:
+#   1. With --no-rebuild-donor or an explicit OMLX_DONOR_APP, the donor
+#      can still be stale relative to the worktree's pyproject.toml.
+#   2. uv sync is fast (~10–30s) versus a full venvstacks rebuild
+#      (~5–10 min), so it's the right tool for tight iteration on a
+#      single dependency without re-locking the entire stack.
 #
-# Resolve this by syncing an isolated Python 3.11 venv under $BUILD_DIR
-# (kept separate from the worktree's own .venv, which may target a newer
-# Python) and overlaying the listed packages into the mlx framework layer.
-# Add package names to OVERLAY_PKGS as more pins drift from the donor.
+# Drift detection is automatic: every dist-info under the fresh venv is
+# compared (by Version field) against the donor's dist-info; any package
+# whose version has moved gets overlaid. No more manual OVERLAY_PKGS list.
+
+_extract_metadata_field() {
+    # $1: METADATA path, $2: field name (case-insensitive)
+    grep -m1 -i "^$2: " "$1" 2>/dev/null | sed -E "s/^[^:]+:[[:space:]]*//"
+}
+
+_normalize_pkg_name() {
+    # PEP 503 normalized name: lowercase, dashes/underscores/periods → dash
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr '_.' '--'
+}
+
+_find_donor_dist_info() {
+    # $1: layer site-packages, $2: PEP 503 normalized name
+    # Returns the *.dist-info directory path or empty string. Matches
+    # both dash and underscore variants and is case-insensitive so
+    # original-cased dist-info dirs (e.g. Pillow-9.5.0.dist-info) match
+    # the normalized lookup key.
+    local site="$1" name="$2" name_us found
+    name_us="$(echo "$name" | tr '-' '_')"
+    found="$(find "$site" -maxdepth 1 -type d -iname "${name}-*.dist-info" -print -quit 2>/dev/null || true)"
+    [ -z "$found" ] && \
+        found="$(find "$site" -maxdepth 1 -type d -iname "${name_us}-*.dist-info" -print -quit 2>/dev/null || true)"
+    echo "$found"
+}
+
+_overlay_one() {
+    # Overlay a single drifted package from the fresh venv onto the donor
+    # mlx layer. $1: PEP 503 name, $2: fresh dist-info, $3: donor site
+    local name="$1" fresh_dist="$2" donor_site="$3"
+    local fresh_site
+    fresh_site="$(dirname "$fresh_dist")"
+
+    # Determine top-level entries to copy. top_level.txt is best-effort;
+    # not every wheel writes it. Fall back to RECORD parsing when absent.
+    local top_levels=()
+    if [ -f "$fresh_dist/top_level.txt" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && top_levels+=("$line")
+        done < "$fresh_dist/top_level.txt"
+    fi
+
+    # Even if top_level.txt lists names, single-module packages may live
+    # only as <name>.py at the site-packages root, so also try the
+    # normalized name as a directory + .py fallback.
+    if [ "${#top_levels[@]}" -eq 0 ]; then
+        top_levels+=("$(echo "$name" | tr '-' '_')")
+    fi
+
+    # Drop stale donor dist-info (case-insensitive, both dash and underscore).
+    local name_us
+    name_us="$(echo "$name" | tr '-' '_')"
+    find "$donor_site" -maxdepth 1 -type d \
+        \( -iname "${name}-*.dist-info" -o -iname "${name_us}-*.dist-info" \) \
+        -exec rm -rf {} + 2>/dev/null || true
+
+    # Copy each top-level entry (directory or single-file .py)
+    local copied=0
+    for entry in "${top_levels[@]}"; do
+        if [ -d "$fresh_site/$entry" ]; then
+            rm -rf "$donor_site/$entry"
+            rsync -a --exclude='__pycache__' --exclude='*.pyc' \
+                "$fresh_site/$entry/" "$donor_site/$entry/"
+            copied=1
+        elif [ -f "$fresh_site/$entry.py" ]; then
+            rm -f "$donor_site/$entry.py"
+            cp -p "$fresh_site/$entry.py" "$donor_site/$entry.py"
+            copied=1
+        fi
+    done
+
+    # Copy the fresh dist-info verbatim (preserves RECORD, METADATA, etc.)
+    rsync -a "$fresh_dist/" "$donor_site/$(basename "$fresh_dist")/"
+    [ "$copied" -eq 1 ] && return 0
+    return 1
+}
 
 if [ "$NO_SYNC" -eq 0 ]; then
     UV_BIN="${UV_BIN:-$(command -v uv || true)}"
@@ -166,32 +335,46 @@ if [ "$NO_SYNC" -eq 0 ]; then
     VENV_SITE="$BUNDLE_VENV/lib/python3.11/site-packages"
     [ -d "$VENV_SITE" ] || die "Expected $VENV_SITE after uv sync — check $BUILD_DIR/uv-sync.log."
 
-    OVERLAY_PKGS=("mlx_vlm")
     MLX_LAYER_SITE="$FRAMEWORKS_DIR/framework-mlx-framework/lib/python3.11/site-packages"
 
-    for pkg in "${OVERLAY_PKGS[@]}"; do
-        SRC="$VENV_SITE/$pkg"
-        if [ ! -d "$SRC" ]; then
-            warn "  skipped overlay: $pkg not present in $VENV_SITE"
+    log "Detecting package drift between bundle venv and donor framework…"
+    overlaid_count=0
+    skipped_count=0
+    skipped_missing=0
+    for fresh_dist in "$VENV_SITE"/*.dist-info; do
+        [ -d "$fresh_dist" ] || continue
+        metadata="$fresh_dist/METADATA"
+        [ -f "$metadata" ] || continue
+
+        raw_name="$(_extract_metadata_field "$metadata" Name)"
+        fresh_version="$(_extract_metadata_field "$metadata" Version)"
+        [ -n "$raw_name" ] || continue
+        [ -n "$fresh_version" ] || continue
+        name="$(_normalize_pkg_name "$raw_name")"
+
+        donor_dist="$(_find_donor_dist_info "$MLX_LAYER_SITE" "$name")"
+        if [ -z "$donor_dist" ]; then
+            # Package not present in donor. Skip rather than introduce
+            # surprise additions — anything truly required for the
+            # framework should be declared in venvstacks.toml.
+            ((skipped_missing+=1)) || true
             continue
         fi
-        log "Overlaying $pkg from bundle venv → mlx framework layer…"
-        rm -rf "$MLX_LAYER_SITE/$pkg"
-        rsync -a --exclude='__pycache__' --exclude='*.pyc' "$SRC/" "$MLX_LAYER_SITE/$pkg/"
-        # Drop stale donor dist-info for the package (both dash + underscore
-        # variants) and copy the freshly synced one so pip metadata stays
-        # consistent with the overlay.
-        pkg_dash="${pkg//_/-}"
-        find "$MLX_LAYER_SITE" -maxdepth 1 \
-            \( -name "${pkg}-*.dist-info" -o -name "${pkg_dash}-*.dist-info" \) \
-            -exec rm -rf {} + 2>/dev/null || true
-        find "$VENV_SITE" -maxdepth 1 \
-            \( -name "${pkg}-*.dist-info" -o -name "${pkg_dash}-*.dist-info" \) \
-            -print | while read -r dist; do
-                rsync -a "$dist/" "$MLX_LAYER_SITE/$(basename "$dist")/"
-            done
-        ok "  + $pkg (overlaid from bundle venv)"
+        donor_version="$(_extract_metadata_field "$donor_dist/METADATA" Version)"
+
+        if [ "$fresh_version" = "$donor_version" ]; then
+            ((skipped_count+=1)) || true
+            continue
+        fi
+
+        log "  overlay: $raw_name $donor_version → $fresh_version"
+        if _overlay_one "$name" "$fresh_dist" "$MLX_LAYER_SITE"; then
+            ((overlaid_count+=1)) || true
+        else
+            warn "    no top-level files copied for $raw_name; check top_level.txt"
+        fi
     done
+    ok "Overlay: $overlaid_count drifted, $skipped_count in-sync, $skipped_missing not-in-donor (skipped)"
 else
     warn "--no-sync set: donor framework-mlx-framework used as-is; newer pins won't apply."
 fi
