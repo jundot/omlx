@@ -119,7 +119,7 @@ class CodexIntegration(Integration):
     ) -> None:
         self.configure(port, api_key, model, host=host)
 
-        env = os.environ.copy()
+        env = self._scrubbed_env()
         env["OMLX_API_KEY"] = api_key or "omlx"
 
         args = ["codex"]

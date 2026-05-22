@@ -105,7 +105,7 @@ class PiIntegration(Integration):
             model_type=model_type,
         )
 
-        env = os.environ.copy()
+        env = self._scrubbed_env()
         args = ["pi"]
         if model:
             args.extend(["--model", f"omlx/{model}"])

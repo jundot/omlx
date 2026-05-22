@@ -163,9 +163,7 @@ class HermesIntegration(Integration):
             max_tokens=max_tokens,
         )
 
-        env = os.environ.copy()
-        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
-            env.pop(key, None)
+        env = self._scrubbed_env()
 
         # Hermes Agent v0.12.0's classic prompt_toolkit REPL registers an
         # invalid Ctrl+Shift+C keybinding ("c-S-c") on startup. The modern TUI

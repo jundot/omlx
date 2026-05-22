@@ -164,7 +164,7 @@ class OpenClawIntegration(Integration):
         self.configure(port, api_key, model, host=host, tools_profile=tools_profile)
         self.configure_exec_approvals(tools_profile)
 
-        env = os.environ.copy()
+        env = self._scrubbed_env()
         bin_name = "openclaw"
 
         # Run onboarding if not yet completed (like ollama does)
