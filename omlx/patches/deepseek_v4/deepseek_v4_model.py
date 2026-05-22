@@ -81,12 +81,12 @@ class ModelArgs(BaseModelArgs):
 
 
 def make_quantization_config(model):
-    mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    affine2 = {"group_size": 32, "bits": 2, "mode": "affine"}
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
     flat_modules = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
     experts = {
-        k: mxfp4
+        k: affine2
         for k, _ in flat_modules
         if ".ffn.switch_mlp." in k and k.endswith("_proj")
     }
@@ -103,6 +103,7 @@ def make_quantization_config(model):
         **shared_experts,
         **attn,
     }
+
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
@@ -1088,8 +1089,12 @@ class Model(nn.Module):
 
         top_remap = {
             "embed.weight": "model.embed_tokens.weight",
+            "embed.scales": "model.embed_tokens.scales",
+            "embed.biases": "model.embed_tokens.biases",
             "norm.weight": "model.norm.weight",
             "head.weight": "lm_head.weight",
+            "head.scales": "lm_head.scales",
+            "head.biases": "lm_head.biases",
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",
@@ -1103,6 +1108,7 @@ class Model(nn.Module):
         for k, v in weights.items():
             nk = "model." + k if k.startswith("layers.") else k
             nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+            nk = nk.replace(".mlp.switch_mlp.", ".ffn.switch_mlp.")
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
@@ -1137,6 +1143,171 @@ class Model(nn.Module):
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
                     )
+
+            # Native JAnq runtime integration
+        is_jangtq = any(".tq_packed" in k for k in weights.keys())
+        if is_jangtq:
+            import sys
+            import logging
+            logger = logging.getLogger("mlx_lm")
+            if "/Users/true/Library/Python/3.14/lib/python/site-packages" not in sys.path:
+                sys.path.append("/Users/true/Library/Python/3.14/lib/python/site-packages")
+            
+            try:
+                from jang_tools.turboquant.tq_kernel import TurboQuantSwitchLinear
+                from mlx_lm.models.switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
+                from jang_tools.turboquant.fused_gate_up_kernel import (
+                    fused_gate_up_swiglu_matmul,
+                    make_fused_gate_up_swiglu_decode,
+                )
+                from jang_tools.turboquant.gather_tq_kernel import make_gather_tq_decode_per_row
+                from jang_tools.turboquant.hadamard_kernel import hadamard_rotate_metal
+            except ImportError as e:
+                msg = f"Failed to import JAnq runtime modules: {e}. Please ensure jang_tools is installed."
+                logger.error(msg)
+                print(msg)
+                raise
+
+            import json
+            from pathlib import Path
+            jang_cfg_path = Path(getattr(self, "model_path", "")) / "jang_config.json"
+            if jang_cfg_path.exists():
+                with open(jang_cfg_path) as f:
+                    jang_cfg = json.load(f)
+            else:
+                jang_cfg = {}
+            mxtq_seed = jang_cfg.get("mxtq_seed", 42)
+            
+            msg = f"JANGTQ model detected. Hydrating with native JAnq/jang_tools runtime (seed={mxtq_seed})..."
+            logger.info(msg)
+            print(msg)
+
+            for layer_idx in range(n_layers):
+                layer = self.layers[layer_idx]
+                for prefix in (f"model.layers.{layer_idx}.ffn.switch_mlp", f"layers.{layer_idx}.ffn.switch_mlp"):
+                    for dst in ("gate_proj", "up_proj", "down_proj"):
+                        tq_packed_key = f"{prefix}.{dst}.tq_packed"
+                        
+                        pk_key = tq_packed_key if tq_packed_key in weights else (f"model.{tq_packed_key}" if f"model.{tq_packed_key}" in weights else None)
+                        if pk_key is not None:
+                            nm_key = pk_key.replace(".tq_packed", ".tq_norms")
+                            bt_key = pk_key.replace(".tq_packed", ".tq_bits")
+                            
+                            packed = weights.pop(pk_key)
+                            norms = weights.pop(nm_key)
+                            bits_arr = weights.pop(bt_key)
+                            bits = int(bits_arr.item())
+                            
+                            num_experts, out_features, packed_cols = packed.shape
+                            vals_per_u32 = 32 // bits
+                            in_features = packed_cols * vals_per_u32
+                            
+                            new_module = TurboQuantSwitchLinear(
+                                in_features=in_features,
+                                out_features=out_features,
+                                num_experts=num_experts,
+                                bits=bits,
+                                bias=False,
+                                seed=mxtq_seed,
+                            )
+                            new_module.packed = packed
+                            new_module.norms = norms
+                            
+                            setattr(layer.ffn.switch_mlp, dst, new_module)
+                            
+                            # Expose via standard parameter names for model.load_weights
+                            target_pk_key = pk_key.replace(".tq_packed", ".packed")
+                            target_nm_key = nm_key.replace(".tq_norms", ".norms")
+                            weights[target_pk_key] = packed
+                            weights[target_nm_key] = norms
+
+            if not hasattr(SwitchGLU, "_orig_call"):
+                SwitchGLU._orig_call = SwitchGLU.__call__
+
+            _decode_compiled = {}
+
+            def _get_compiled_decode(in_f, out_f, bits, k, swiglu_limit=0.0, dp_bits=None):
+                if dp_bits is None:
+                    dp_bits = bits
+                limit_milli = int(round(float(swiglu_limit or 0.0) * 1000.0))
+                cache_key = (in_f, out_f, bits, dp_bits, k, limit_milli)
+                if cache_key in _decode_compiled:
+                    return _decode_compiled[cache_key]
+                fused_gu = make_fused_gate_up_swiglu_decode(
+                    in_f, out_f, bits, k, swiglu_limit=swiglu_limit
+                )
+                gather_dn = make_gather_tq_decode_per_row(out_f, in_f, dp_bits, k)
+
+                def _mlp(x_flat, pg, ng, pu, nu, pd, nd, cb_gate, cb_down, signs_in, signs_dn, idx_flat):
+                    x_rot = hadamard_rotate_metal(x_flat, signs_in)
+                    x_act = fused_gu(x_rot, pg, ng, pu, nu, cb_gate, idx_flat)
+                    x_act_rot = hadamard_rotate_metal(x_act, signs_dn)
+                    return gather_dn(x_act_rot, pd, nd, cb_down, idx_flat)
+
+                _decode_compiled[cache_key] = mx.compile(_mlp)
+                return _decode_compiled[cache_key]
+
+            def _dsv4_fused_switchglu_call(self_sg, x, indices):
+                gp = self_sg.gate_proj
+                up = self_sg.up_proj
+                dp = self_sg.down_proj
+                if not isinstance(gp, TurboQuantSwitchLinear) or not isinstance(up, TurboQuantSwitchLinear):
+                    return SwitchGLU._orig_call(self_sg, x, indices)
+                activation = getattr(self_sg, "activation", None)
+                swiglu_limit = getattr(activation, "swiglu_limit", 0.0) or 0.0
+                x_sq = x
+                while x_sq.ndim > 2 and x_sq.shape[-2] == 1:
+                    x_sq = x_sq.squeeze(-2)
+                x_flat = x_sq.reshape(-1, gp.in_features)
+                batch = x_flat.shape[0]
+                k = indices.shape[-1] if indices.ndim > 0 else 1
+                can_fast = batch == 1 and k > 0 and indices.ndim >= 1 and indices.size < 64
+                if can_fast and not getattr(self_sg, "training", False):
+                    idx_flat = indices.reshape(-1).astype(mx.uint32)
+                    compiled_mlp = _get_compiled_decode(
+                        gp.in_features, gp.out_features, gp.bits, k, swiglu_limit,
+                        dp_bits=dp.bits,
+                    )
+                    y = compiled_mlp(
+                        x_flat.astype(mx.float32),
+                        gp.packed, gp.norms, up.packed, up.norms,
+                        dp.packed, dp.norms,
+                        gp.codebook, dp.codebook,
+                        gp.signs, dp.signs, idx_flat,
+                    )
+                    out = y.reshape(*indices.shape[:-1], k, 1, gp.in_features)
+                    if out.dtype != x.dtype:
+                        out = out.astype(x.dtype)
+                    return out.squeeze(-2)
+
+                x_exp = mx.expand_dims(x, (-2, -3))
+                do_sort = indices.size >= 64
+                idx = indices
+                inv_order = None
+                if do_sort:
+                    x_exp, idx, inv_order = _gather_sort(x_exp, indices)
+                if getattr(self_sg, "training", False):
+                    idx = mx.stop_gradient(idx)
+                x_act = fused_gate_up_swiglu_matmul(
+                    x_exp,
+                    gp.packed, gp.norms,
+                    up.packed, up.norms,
+                    gp.codebook, gp.signs,
+                    idx,
+                    bits=gp.bits,
+                    swiglu_limit=swiglu_limit,
+                )
+                x_out = dp(x_act, idx, sorted_indices=do_sort)
+                if do_sort:
+                    x_out = _scatter_unsort(x_out, inv_order, indices.shape)
+                return x_out.squeeze(-2)
+
+            SwitchGLU.__call__ = _dsv4_fused_switchglu_call
+            
+            import gc
+            gc.collect()
+            mx.metal.clear_cache()
+
 
         return weights
 
