@@ -490,11 +490,45 @@ def _check_git_commit_sync():
         sys.exit(1)
 
 
+def _venvstacks_driver() -> list[str]:
+    """Pick an available venvstacks driver as a command prefix.
+
+    Resolution order (first that works wins):
+      1. `venvstacks` directly on PATH — installed via the dev extra in
+         pyproject.toml, fastest path with no extra startup overhead.
+      2. `uvx venvstacks` — uv's pipx-equivalent. Already available to
+         anyone using uv for development setup.
+      3. `pipx run venvstacks` — historical default; works if pipx is
+         installed on the host.
+
+    Aborts with a clear remediation message if none are available, so a
+    contributor with neither uv nor pipx nor a dev-installed venvstacks
+    gets actionable guidance instead of a cryptic "command not found".
+    """
+    if shutil.which("venvstacks") is not None:
+        return ["venvstacks"]
+    if shutil.which("uvx") is not None:
+        return ["uvx", "venvstacks"]
+    if shutil.which("pipx") is not None:
+        return ["pipx", "run", "venvstacks"]
+    print(
+        "  ✗ No venvstacks driver found. Install with one of:\n"
+        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
+        "      uv sync --dev                (uv-managed venv)\n"
+        "      pipx install venvstacks       (host-global tool)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def build_venvstacks():
     """Build venvstacks layers."""
     print("\n[1/4] Building venvstacks layers...")
 
     _check_git_commit_sync()
+
+    venvstacks_cmd = _venvstacks_driver()
+    print(f"  Using venvstacks driver: {' '.join(venvstacks_cmd)}")
 
     # Step 1: Build wheels from git-pinned packages
     version_map = build_local_wheels()
@@ -515,8 +549,8 @@ def build_venvstacks():
     # If lock fails due to sdist-only packages (no pre-built wheel on PyPI),
     # _lock_with_sdist_retry() builds them locally and retries automatically.
     print("\n  Locking environments...")
-    lock_cmd = [
-        "pipx", "run", "venvstacks", "lock",
+    lock_cmd = venvstacks_cmd + [
+        "lock",
         str(resolved_toml),
     ] + local_wheels_args
     if version_map:
@@ -528,8 +562,8 @@ def build_venvstacks():
 
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
-    run_cmd([
-        "pipx", "run", "venvstacks", "build",
+    run_cmd(venvstacks_cmd + [
+        "build",
         str(resolved_toml),
         "--no-lock",
     ] + local_wheels_args)
@@ -539,8 +573,8 @@ def build_venvstacks():
     if EXPORT_DIR.exists():
         shutil.rmtree(EXPORT_DIR)
 
-    run_cmd([
-        "pipx", "run", "venvstacks", "local-export",
+    run_cmd(venvstacks_cmd + [
+        "local-export",
         str(resolved_toml),
         "--output-dir", str(EXPORT_DIR),
     ])
