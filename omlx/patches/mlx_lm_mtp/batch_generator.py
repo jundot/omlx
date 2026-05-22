@@ -6,24 +6,36 @@ paged cache / prefix cache / SSD cache stack drive MTP without touching any
 of those layers. ``GenerationBatch`` is mlx-lm's per-step decoder for the
 active set of sequences in continuous batching. We patch:
 
-- ``GenerationBatch.__init__`` — after the standard ``_step()`` has run
-  the prompt's last token through the backbone, we add an MTP "post-init"
-  step that runs one more 1-token backbone forward (with hidden) and one
-  MTP-head forward. Two confirmed tokens are queued for emission and a
-  draft is stashed for the first verify cycle.
+- ``GenerationBatch.__init__`` — leave the standard mlx-lm initialization
+  untouched. Fresh singleton donor batches may still be merged into a larger
+  continuous batch, so MTP must not mutate cache state in ``__init__``.
 
 - ``GenerationBatch.next`` — when the batch holds exactly one MTP-capable
-  sequence we emit from the per-batch queue first; once empty, we run a
-  2-token verify forward over ``[next_main, draft]`` with
-  ``n_confirmed=1`` and a single MTP-head forward at the bonus position
-  (accept) or confirmed position (reject), refilling the queue from the
-  verify outputs.
+  sequence, lazily initialize MTP from the standard post-prefill state. We
+  emit from the per-batch queue first; once empty, we run a 2-token verify
+  forward over ``[next_main, draft]`` with ``n_confirmed=1`` and a single
+  MTP-head forward at the bonus position (accept) or confirmed position
+  (reject), refilling the queue from the verify outputs.
+
+- ``GenerationBatch.extend`` / ``filter`` — drop MTP state whenever continuous
+  batching reshapes ownership. MTP state belongs to one uid in one singleton
+  timeline; it must not survive standard batched decoding.
 
 The throughput math (greedy, accept rate p):
   - Cost per *cycle*: 1× backbone (2-token verify) + 1× MTP head ≈ 1.15
   - Tokens per cycle: 1 + p (accept emits draft+bonus; reject emits verify_pred only)
   - At p≈1: 0.575 cost/token → ~1.74× throughput
   - At p≈0.5: ~0.77 cost/token → ~1.30× throughput
+
+Known limitation (compute-bound single-stream Apple Silicon):
+  The cost model above assumes the 2-token verify forward is nearly free
+  relative to a 1-token forward, which is the bandwidth-bound decode regime
+  speculative decoding targets. On lower-end single-stream Apple Silicon
+  (e.g. M1/M2 base/Pro) decode is compute-bound, so the verify forward costs
+  ~2× a 1-token forward and MTP can be net-negative regardless of accept
+  rate. Wins are expected on M3/M4 or higher-end parts, on MoE models with a
+  smaller per-step backbone, or under continuous batching where spare
+  compute exists. See #1097 / #1311 for measurements.
 
 Greedy identity (sampler is None): the patched dispatch produces the same
 tokens as the standard step. PR 990's ``test_mtp_generate_identity``
@@ -59,7 +71,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 import sys
 import types
 from collections import deque
@@ -108,86 +119,49 @@ def apply() -> bool:
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        if _is_mtp_eligible(self):
-            try:
-                _post_init_mtp(self)
-                logger.info(
-                    "MTP path activated for uid=%s (model has mtp_forward, batch=1)",
-                    getattr(self, "uids", ["?"])[0],
-                )
-            except _MtpStepFallback as exc:
-                logger.warning("MTP post-init fallback: %s", exc)
-        else:
-            # The empty-batch case is BatchGenerator.__init__ pre-creating
-            # ``self._generation_batch = GenerationBatch.empty(...)`` and is
-            # always part of normal startup — silence it. Only log when the
-            # batch is genuinely populated (e.g. continuous batching with
-            # batch>1) so the message points at a real misconfiguration.
-            uids = getattr(self, "uids", None)
-            if uids:
-                reason = _ineligibility_reason(self)
-                if reason:
-                    logger.debug("MTP path not active: %s", reason)
+        # Do not activate MTP here. Fresh singleton batches created by
+        # PromptProcessingBatch.generate() may still be merged into a larger
+        # continuous batch; mutating their cache in __init__ can corrupt the
+        # later standard batched path. Activation is lazy in patched_next().
+        uids = getattr(self, "uids", None)
+        if uids:
+            reason = _ineligibility_reason(self)
+            if reason:
+                logger.debug("MTP path not active: %s", reason)
 
     def patched_next(self, *args, **kwargs):
         if _is_mtp_eligible(self):
-            state = getattr(self, "_omlx_mtp_state", None)
-            if state is not None:
-                try:
+            try:
+                state = _prepare_mtp_state_for_next(self)
+                if state is not None:
                     return _mtp_next(self, state)
-                except _MtpStepFallback as exc:
-                    logger.debug(
-                        "MTP next() fallback to standard step: %s", exc
-                    )
-                    # Best-effort: drop state so subsequent calls don't try
-                    # to resume a half-built MTP cycle from a stale snapshot.
-                    if hasattr(self, "_omlx_mtp_state"):
-                        try:
-                            delattr(self, "_omlx_mtp_state")
-                        except AttributeError:
-                            pass
+            except _MtpStepFallback as exc:
+                logger.debug("MTP next() fallback to standard step: %s", exc)
+                _drop_mtp_state(self, "step-fallback")
+        else:
+            _drop_mtp_state(self, "non-singleton-or-ineligible")
         return original_next(self, *args, **kwargs)
 
     def patched_extend(self, batch, *args, **kwargs):
-        # ``BatchGenerator._next()`` builds a fresh single-sequence
-        # ``GenerationBatch`` via ``prompt_batch.split(...).generate(...)``
-        # then merges it into ``self._generation_batch`` via extend(). The
-        # MTP post-init runs on the fresh batch (since that's the one whose
-        # __init__ fires with uids=[0]); without this transfer the state
-        # would die with the donor instance.
-        donor_state = getattr(batch, "_omlx_mtp_state", None)
+        # The host (self) may be a singleton with active MTP about to gain a
+        # co-runner. The MTP path never maintains mlx-lm's _next_tokens, so a
+        # plain drop here would leave standard batched decode resuming from a
+        # stale _next_tokens against an MTP-advanced cache, corrupting one
+        # token. Reconcile the host to a standard-resumable state BEFORE the
+        # merge, while it is still single-sequence. Drop state either way:
+        # after the merge self is multi-seq and MTP is off by design.
+        host_state = getattr(self, "_omlx_mtp_state", None)
+        if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
+            _reconcile_mtp_to_standard(self, host_state)
+            _drop_mtp_state(self, "extend-reconciled")
         result = original_extend(self, batch, *args, **kwargs)
-        if donor_state is not None and not hasattr(self, "_omlx_mtp_state"):
-            self._omlx_mtp_state = donor_state
-            try:
-                delattr(batch, "_omlx_mtp_state")
-            except AttributeError:
-                pass
-            logger.debug(
-                "MTP state transferred from donor batch to host batch (uid=%s)",
-                getattr(self, "uids", ["?"])[0] if getattr(self, "uids", None) else "?",
-            )
+        _drop_mtp_state(batch, "donor-extended")
+        _drop_invalid_mtp_state(self, "extend")
         return result
 
     def patched_filter(self, keep, *args, **kwargs):
-        # When the outer scheduler retires this sequence (e.g. EOS detected
-        # outside our finish path), it calls filter([]) to drop everything.
-        # Surface stats here so the user sees them even when the standard
-        # _emit_response finish path doesn't fire.
-        state = getattr(self, "_omlx_mtp_state", None)
         result = original_filter(self, keep, *args, **kwargs)
-        if state is not None and not getattr(self, "uids", None):
-            # Batch is now empty — log + drop state.
-            try:
-                _log_mtp_stats(
-                    "?", state.stats, getattr(state, "_finish_reason", "external")
-                )
-            except Exception:
-                pass
-            try:
-                delattr(self, "_omlx_mtp_state")
-            except AttributeError:
-                pass
+        _drop_invalid_mtp_state(self, "filter", log_empty=True)
         return result
 
     GenerationBatch.__init__ = patched_init
@@ -239,6 +213,8 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) != 1:
         return False
+    if _has_grammar_processors(gen_batch):
+        return False
     return True
 
 
@@ -268,6 +244,8 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         return "GenerationBatch has no uids"
     if len(uids) != 1:
         return f"batch size {len(uids)} != 1 (continuous batching, MTP off by design)"
+    if _has_grammar_processors(gen_batch):
+        return "grammar-constrained decoding uses GenerationBatch._step hooks"
     return ""
 
 
@@ -306,6 +284,10 @@ class _MtpStats:
 @dataclass
 class _MtpState:
     """Per-batch MTP state stashed on the GenerationBatch instance."""
+
+    # MTP state is valid only for this exact singleton uid. It must be dropped
+    # across any standard batched step or batch reshape that breaks ownership.
+    uid: Any = None
 
     # Pending tokens to emit in upcoming next() calls. Each entry is
     # (token_id_int, logprobs_1d, source_label). source_label is one of
@@ -366,10 +348,10 @@ def _resolve_sampler(gen_batch: Any):
     return gen_batch.fallback_sampler
 
 
-def _is_greedy(gen_batch: Any) -> bool:
-    """Heuristic mirroring PR 990's ``sampler is None``."""
-    if gen_batch.samplers and gen_batch.samplers[0] is not None:
-        return False
+def _is_greedy(gen_batch):
+    sampler = _resolve_sampler(gen_batch)
+    if sampler is not None:
+        return getattr(sampler, "temp", 0.0) == 0.0
     return True
 
 
@@ -377,6 +359,204 @@ def _proc_list(gen_batch: Any) -> Optional[List[Any]]:
     if gen_batch.logits_processors and gen_batch.logits_processors[0]:
         return gen_batch.logits_processors[0]
     return None
+
+
+def _has_grammar_processors(gen_batch: Any) -> bool:
+    """True when MTP would bypass grammar state advanced by scheduler._step."""
+    processors_by_seq = getattr(gen_batch, "logits_processors", None)
+    if not processors_by_seq:
+        return False
+    try:
+        from omlx.api.grammar import GrammarConstraintProcessor
+    except Exception:
+        return False
+    return any(
+        isinstance(proc, GrammarConstraintProcessor)
+        for processors in processors_by_seq
+        for proc in (processors or [])
+    )
+
+
+def _mtp_state_valid_for_batch(gen_batch: Any, state: Optional[_MtpState]) -> bool:
+    """MTP state may only represent one uid in one current singleton slot."""
+    if state is None:
+        return False
+    uids = getattr(gen_batch, "uids", None)
+    return bool(uids is not None and len(uids) == 1 and uids[0] == state.uid)
+
+
+def _drop_mtp_state(
+    gen_batch: Any,
+    reason: str,
+    *,
+    log_stats: bool = False,
+) -> Optional[_MtpState]:
+    """Delete attached MTP state, optionally surfacing stats for external finish."""
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None:
+        return None
+    if log_stats:
+        try:
+            _log_mtp_stats(
+                getattr(state, "uid", "?"),
+                state.stats,
+                getattr(state, "_finish_reason", reason),
+            )
+        except Exception:
+            pass
+    try:
+        delattr(gen_batch, "_omlx_mtp_state")
+    except AttributeError:
+        pass
+    logger.debug("MTP state dropped: %s", reason)
+    return state
+
+
+def _drop_invalid_mtp_state(
+    gen_batch: Any,
+    reason: str,
+    *,
+    log_empty: bool = False,
+) -> Optional[_MtpState]:
+    """Drop state after a batch reshape unless ownership still matches."""
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None:
+        return None
+    if _mtp_state_valid_for_batch(gen_batch, state):
+        return state
+    uids = getattr(gen_batch, "uids", None)
+    return _drop_mtp_state(
+        gen_batch,
+        reason,
+        log_stats=bool(log_empty and not uids),
+    )
+
+
+def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
+    """Return a valid singleton MTP state, lazily initializing if needed."""
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if _mtp_state_valid_for_batch(gen_batch, state):
+        return state
+    if state is not None:
+        _drop_mtp_state(gen_batch, "stale-owner")
+
+    _set_singleton_mrope_delta(gen_batch)
+    _post_init_mtp(gen_batch)
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if not _mtp_state_valid_for_batch(gen_batch, state):
+        _drop_mtp_state(gen_batch, "post-init-invalid")
+        return None
+
+    logger.info(
+        "MTP path activated for uid=%s (model has mtp_forward, batch=1)",
+        state.uid,
+    )
+    return state
+
+
+def _set_singleton_mrope_delta(gen_batch: Any) -> None:
+    """Mirror scheduler._step's per-uid mRoPE setup for direct MTP forwards."""
+    model = getattr(gen_batch, "model", None)
+    uids = getattr(gen_batch, "uids", None)
+    if (
+        model is not None
+        and getattr(model, "_uses_mrope", False)
+        and getattr(model, "_uid_rope_deltas", None)
+        and uids
+        and len(uids) == 1
+        and hasattr(model, "set_batch_rope_deltas")
+    ):
+        import mlx.core as mx
+
+        delta = model._uid_rope_deltas.get(uids[0], 0.0)
+        model.set_batch_rope_deltas(mx.array([delta]))
+
+
+def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
+    """Build a fresh single-sequence batch-aware cache (left_padding=[0]).
+
+    Reuses mlx-lm's own ``_make_cache`` so the per-layer types match exactly
+    what ``extend()`` / ``_extend_cache`` expects, keeping the subsequent merge
+    type-compatible. Returns None if the converter is unavailable.
+    """
+    import sys
+
+    try:
+        make_cache = sys.modules["mlx_lm.generate"]._make_cache
+        return make_cache(model, [0], None)
+    except Exception as exc:
+        logger.warning("MTP reconcile: cache rebuild unavailable: %s", exc)
+        return None
+
+
+def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
+    """Rewind a to-be-dropped MTP singleton into a standard-resumable state.
+
+    The MTP path never maintains mlx-lm's ``_next_tokens`` — it streams tokens
+    from ``state.queue`` and advances the shared cache speculatively, and the
+    GatedDeltaNet rollback snapshot is cleared on accept, so a partial rollback
+    at an arbitrary drop point is not reliable. Instead, rebuild the cache by
+    re-prefilling exactly the already-streamed tokens (``gen_batch.tokens[0]``)
+    into a fresh cache (which deterministically reconstructs every layer state,
+    KV and SSM), then set ``_next_tokens`` to the correct next-to-emit token:
+
+    - if ``state.queue`` is non-empty, ``queue[0]`` is the correct, not-yet-
+      streamed next token — reuse it (and its logprobs). The rest of the queue
+      is discarded; standard decode re-derives those positions.
+    - otherwise (cycle boundary) sample from the re-prefill's last-position
+      logits, exactly as a standard ``_step`` would after feeding ``tokens[-1]``.
+
+    Leaves ``tokens[0]`` / ``_num_tokens[0]`` untouched (they already reflect
+    streamed tokens), so there is no duplicated or skipped token. Returns False
+    (caller falls back to a plain drop) when reconcile cannot be done safely.
+    """
+    import mlx.core as mx
+
+    tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
+    if not tokens:
+        return False
+    try:
+        new_cache = _rebuild_singleton_cache(gen_batch.model)
+        if new_cache is None:
+            return False
+        procs = _proc_list(gen_batch)
+        _set_singleton_mrope_delta(gen_batch)
+        tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        with mx.stream(_get_generation_stream()):
+            logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
+            last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+
+        if state.queue:
+            next_id, next_lp_1d, _src = state.queue[0]
+            next_tok = mx.array([int(next_id)], dtype=mx.uint32)
+            next_lp = next_lp_1d
+        else:
+            prev_buf = (
+                gen_batch._token_context[0].tokens if procs is not None else None
+            )
+            ll = _apply_processors(procs, prev_buf, last_logits)
+            next_lp_2d = _logprobs(ll)
+            next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
+            next_lp = next_lp_2d.squeeze(0)
+
+        mx.eval(next_tok)
+        gen_batch.prompt_cache = new_cache
+        gen_batch._next_tokens = next_tok
+        gen_batch._next_logprobs = [next_lp]
+        if procs is not None:
+            from mlx_lm.models.cache import TokenBuffer
+
+            gen_batch._token_context[0] = TokenBuffer(list(tokens))
+        logger.debug(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+            getattr(state, "uid", "?"),
+            len(tokens),
+            len(state.queue),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("MTP reconcile failed, falling back to plain drop: %s", exc)
+        return False
 
 
 def _apply_processors(processors, prev_tokens, logits_2d):
@@ -632,7 +812,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     # Queue the two confirmed tokens (main_tok + next_main_tok); their
     # logprobs come from the standard / patched samplers. Cache draft_id
     # while the array is already evaluated to avoid re-syncing in cycle 1.
-    state = _MtpState()
+    state = _MtpState(uid=gen_batch.uids[0])
     state.mtp_cache = mtp_cache
     state.next_main = _ensure_uint32(next_main_tok)
     state.draft_tok = _ensure_uint32(draft_tok)
@@ -748,12 +928,15 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         prev_main = gen_batch._token_context[0].update_and_fetch(state.next_main)
         prev_draft = gen_batch._token_context[0].update_and_fetch(state.draft_tok)
 
-    # --- backbone forward + sample (single eval point) ---
-    # Dispatch backbone, processors, logprobs, and sampler all on stream
-    # without forcing intermediate evaluation. The single ``mx.eval`` after
-    # sampling resolves the whole graph in one stall instead of two.
-    # Tradeoff: backbone_ms / sample_ms split is no longer wall-clock
-    # accurate (everything lands in sample_ms), but cumulative timing is.
+    # --- backbone forward (materialized before sampling) ---
+    # Dispatch the backbone on the generation stream, then force ``mx.eval``
+    # on the logits before the sampler runs. MLX is lazy, so without this the
+    # later ``mx.eval(verify_tok, bonus_tok)`` barrier would resolve the whole
+    # graph in one stall and the heavy verify forward would leak into
+    # sample_ms (this is what made the sampler look like the bottleneck in
+    # #1097 / #1311 / #1330). The extra eval costs one CPU<->GPU round-trip
+    # per cycle (negligible vs the forward compute) and keeps the
+    # backbone_ms / sample_ms split accurate.
     t0 = time.perf_counter()
     with mx.stream(_get_generation_stream()):
         logits, hidden, gdn_states = _call_backbone(
@@ -764,6 +947,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         )
         verify_logits = logits[:, 0, :]
         bonus_logits = logits[:, 1, :]
+    mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
@@ -808,7 +992,13 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
             verify_accept_lp[0, draft_id].item()
             - draft_accept_lp[draft_id].item()
         )
-        accept = log_accept >= 0 or random.random() < math.exp(log_accept)
+        # Draw the acceptance roll from mx.random so it follows the same
+        # mx.random.seed the rest of the sampler uses (line ~962 residual
+        # sampling). stdlib ``random`` was never seeded by oMLX, which made
+        # stochastic acceptance irreproducible even with a fixed seed (#1330).
+        accept = log_accept >= 0 or float(
+            mx.random.uniform(shape=()).item()
+        ) < math.exp(log_accept)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     hidden_at_confirmed = hidden[:, 0:1, :]

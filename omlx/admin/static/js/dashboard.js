@@ -781,6 +781,7 @@
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
+                            chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1601,6 +1602,9 @@
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
                     dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_ssd_cache_max_gib: settings.dflash_ssd_cache_max_bytes
+                        ? Math.round(settings.dflash_ssd_cache_max_bytes / (1024 ** 3))
+                        : 20,
                     dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
                     dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
@@ -1719,6 +1723,9 @@
                                     && !!this.modelSettings.dflash_in_memory_cache
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
+                                dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
+                                    ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
+                                    : 20 * (1024 ** 3),
                                 // Long-context tuning. Null → server keeps it null → dflash-mlx default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
@@ -1819,6 +1826,7 @@
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
+                        this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';

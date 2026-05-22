@@ -166,10 +166,17 @@ name = "old-omlx"
 
         def fake_execvpe(binary, argv, env):
             captured["argv"] = argv
+            captured["env"] = env
 
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         with (
             patch.object(CodexIntegration, "CONFIG_PATH", config_path),
-            patch("omlx.integrations.codex.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.codex.os.environ", base_env),
             patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
         ):
             codex.launch(
@@ -180,6 +187,10 @@ name = "old-omlx"
             )
 
         assert captured["argv"] == ["codex", "-m", "qwen3.5", "--yolo"]
+        assert captured["env"]["OMLX_API_KEY"] == "key"
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
 
 class TestOpenCodeIntegration:
@@ -332,6 +343,33 @@ class TestOpenCodeIntegration:
         model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
         assert "limit" not in model_config
 
+    def test_launch_scrubs_python_env(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.opencode.os.environ", base_env),
+            patch("omlx.integrations.opencode.os.execvpe", side_effect=fake_execvpe),
+        ):
+            oc.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["opencode"]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
     def test_type(self):
         oc = OpenCodeIntegration()
         assert oc.type == "config_file"
@@ -440,6 +478,48 @@ class TestOpenClawIntegration:
 
         config = json.loads(config_path.read_text())
         assert config["tools"]["profile"] == "full"
+
+    def test_launch_scrubs_python_env(self, tmp_path):
+        ocl = OpenClawIntegration()
+        config_path = tmp_path / "openclaw.json"
+        approvals_path = tmp_path / "exec-approvals.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["exec_env"] = env
+
+        def fake_run(args, **kwargs):
+            captured["run_env"] = kwargs.get("env")
+            return None
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(OpenClawIntegration, "CONFIG_PATH", config_path),
+            patch.object(OpenClawIntegration, "EXEC_APPROVALS_PATH", approvals_path),
+            patch.object(OpenClawIntegration, "_is_onboarded", return_value=True),
+            patch.object(
+                OpenClawIntegration, "_gateway_info", return_value=("localhost", 9999)
+            ),
+            # Gateway already running: hits the daemon-restart subprocess.run
+            # branch and skips gateway start, so execvpe is reached.
+            patch.object(OpenClawIntegration, "_port_open", return_value=True),
+            patch.object(OpenClawIntegration, "_wait_for_port", return_value=True),
+            patch("omlx.integrations.openclaw.os.environ", base_env),
+            patch("omlx.integrations.openclaw.subprocess.run", side_effect=fake_run),
+            patch("omlx.integrations.openclaw.os.execvpe", side_effect=fake_execvpe),
+        ):
+            ocl.launch(port=8000, api_key="key", model="qwen3.5")
+
+        # Both the daemon-restart subprocess and the TUI exec get scrubbed env.
+        for env in (captured["run_env"], captured["exec_env"]):
+            assert "PYTHONHOME" not in env
+            assert "PYTHONPATH" not in env
+            assert "PYTHONDONTWRITEBYTECODE" not in env
 
     def test_type(self):
         ocl = OpenClawIntegration()
@@ -786,6 +866,35 @@ class TestPiIntegration:
         assert settings_config["theme"] == "dark"
         assert settings_config["defaultProvider"] == "omlx"
         assert settings_config["defaultModel"] == "llama"
+
+    def test_launch_scrubs_python_env(self, tmp_path):
+        pi = PiIntegration()
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+            patch("omlx.integrations.pi.os.environ", base_env),
+            patch("omlx.integrations.pi.os.execvpe", side_effect=fake_execvpe),
+        ):
+            pi.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["pi", "--model", "omlx/qwen3.5"]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
     def test_type(self):
         pi = PiIntegration()

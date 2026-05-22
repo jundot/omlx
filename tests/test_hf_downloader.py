@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
+from omlx.admin.hf_downloader import (
+    DownloadStatus,
+    DownloadTask,
+    HFDownloader,
+    _DownloadCancelled,
+    _make_cancellable_tqdm,
+)
 
 
 # =============================================================================
@@ -401,6 +407,82 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
         assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
+    def test_cancellable_tqdm_raises_only_after_cancel(self):
+        """The injected tqdm aborts on update() once the cancel flag is set."""
+        cancelled = {"v": False}
+        tqdm_cls = _make_cancellable_tqdm(lambda: cancelled["v"])
+        bar = tqdm_cls(total=100, disable=True)
+
+        # Not cancelled yet: update is a normal no-op.
+        bar.update(10)
+
+        cancelled["v"] = True
+        with pytest.raises(_DownloadCancelled):
+            bar.update(10)
+
+    @pytest.mark.asyncio
+    async def test_cancel_aborts_in_progress_download(self, downloader, model_dir):
+        """A download cancelled mid-flight is interrupted via the tqdm callback.
+
+        snapshot_download runs in a worker thread that can't be force-killed,
+        so cancel must propagate through the per-chunk progress callback.
+        """
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        seen = {"tqdm_class": None}
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            # Simulate huggingface_hub http_get: build the progress bar and
+            # call update() per chunk. The user cancels after the first chunk.
+            tqdm_cls = kwargs["tqdm_class"]
+            seen["tqdm_class"] = tqdm_cls
+            bar = tqdm_cls(total=100, disable=True)
+            bar.update(10)
+            downloader._cancelled.add(task.task_id)
+            bar.update(10)  # raises _DownloadCancelled
+            raise AssertionError("download should have been interrupted")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert seen["tqdm_class"] is not None
+        assert task.status == DownloadStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_shutdown_marks_tasks_cancelled_for_thread_abort(self, downloader):
+        """shutdown() flags active tasks so in-flight threads abort via tqdm."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=lambda **kwargs: time.sleep(10),
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("owner/model")
+            await asyncio.sleep(0.2)
+
+            await downloader.shutdown()
+            assert task.task_id in downloader._cancelled
+
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_returns_false(self, downloader):
         result = await downloader.cancel_download("nonexistent-id")
@@ -738,6 +820,8 @@ class TestHFDownloaderRoutes:
 
             assert not (model_dir_with_models / "model-a").exists()
             mock_pool.discover_models.assert_called_once()
+            # Deleted model's settings (alias etc.) must be released (issue #1321)
+            mock_settings_mgr.delete_settings.assert_called_once_with("model-a")
         finally:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool
@@ -2291,3 +2375,144 @@ class TestEtagTimeout:
             assert call_kwargs["etag_timeout"] == 30
 
             await downloader.shutdown()
+
+
+# =============================================================================
+# Endpoint resolution (_resolve_endpoint)
+# =============================================================================
+#
+# Background: `huggingface_hub` does not follow cross-origin permanent
+# redirects during the HEAD probe it issues at the start of a download
+# (e.g. hf-mirror.com permanently 308s to huggingface.co when accessed
+# from non-CN IPs). The result is a silent download failure with a
+# misleading error. `_resolve_endpoint` probes the configured endpoint
+# upfront, walks the redirect chain, and pins HfApi to the final origin.
+#
+# These tests pin that behavior so a future refactor doesn't regress it.
+
+
+class TestResolveEndpoint:
+    """Pin the cross-origin redirect resolution for HF_ENDPOINT."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        # Cache is module-global; clear before/after every test so cases
+        # don't bleed into each other.
+        from omlx.admin.hf_downloader import _endpoint_resolution_cache
+        _endpoint_resolution_cache.clear()
+        yield
+        _endpoint_resolution_cache.clear()
+
+    @staticmethod
+    def _response(status_code: int, location: str | None = None) -> MagicMock:
+        r = MagicMock()
+        r.status_code = status_code
+        r.headers = {"location": location} if location else {}
+        return r
+
+    def _patch_httpx(self, responses: list):
+        """Patch httpx.Client.head to walk through `responses` in order."""
+        mock_client_cls = MagicMock()
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.head = MagicMock(side_effect=responses)
+        mock_client_cls.return_value = mock_client
+        return patch("httpx.Client", mock_client_cls), mock_client
+
+    def test_no_redirect_returns_endpoint_unchanged(self):
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([self._response(200)])
+        with ctx:
+            assert _resolve_endpoint("https://huggingface.co") == "https://huggingface.co"
+
+    def test_cross_origin_308_returns_redirected_origin(self):
+        # The bug this whole module exists to fix: hf-mirror permanently
+        # 308s to huggingface.co; downloads must resolve to the final origin.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),  # probe at resolved origin
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://huggingface.co"
+
+    def test_cross_origin_301_also_handled(self):
+        # 301 (Moved Permanently) gets the same treatment as 308.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(301, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://huggingface.co"
+
+    def test_same_origin_redirect_does_not_rewrite(self):
+        # If the server returns a relative Location (`/foo`) we must not
+        # try to rewrite the endpoint — same origin, same hostname.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "/api/models/gpt2"),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_chained_redirects_walk_up_to_3_hops(self):
+        # A → B → C all cross-origin permanent. Final hop wins.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(308, "https://hop2.example/api/models/gpt2"),
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hop1.example") == "https://huggingface.co"
+
+    def test_temporary_redirect_is_not_followed(self):
+        # 302 / 307 are NOT permanent — leave the endpoint alone so the HF
+        # client can handle them per-request.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, _ = self._patch_httpx([
+            self._response(302, "https://huggingface.co/api/models/gpt2"),
+        ])
+        with ctx:
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_network_error_falls_back_to_original_endpoint(self):
+        # Best-effort probe: any httpx exception leaves the endpoint as-is.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        mock_client_cls = MagicMock()
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.head = MagicMock(side_effect=OSError("network unreachable"))
+        mock_client_cls.return_value = mock_client
+        with patch("httpx.Client", mock_client_cls):
+            assert _resolve_endpoint("https://hf-mirror.com") == "https://hf-mirror.com"
+
+    def test_result_is_cached_per_endpoint(self):
+        # Second call for the same endpoint must not re-probe.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, mock_client = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            _resolve_endpoint("https://hf-mirror.com")
+            _resolve_endpoint("https://hf-mirror.com")
+        assert mock_client.head.call_count == 2  # one probe + one resolved probe
+
+    def test_trailing_slash_normalized(self):
+        # `https://hf-mirror.com/` and `https://hf-mirror.com` are the same
+        # endpoint and must share the cache.
+        from omlx.admin.hf_downloader import _resolve_endpoint
+        ctx, mock_client = self._patch_httpx([
+            self._response(308, "https://huggingface.co/api/models/gpt2"),
+            self._response(200),
+        ])
+        with ctx:
+            r1 = _resolve_endpoint("https://hf-mirror.com")
+            r2 = _resolve_endpoint("https://hf-mirror.com/")
+        assert r1 == r2 == "https://huggingface.co"
+        # Second call was a cache hit — head() count unchanged from first probe.
+        assert mock_client.head.call_count == 2

@@ -330,5 +330,38 @@ class TestEstimatePrefillPeakBytes:
         # someone added back the magic constants.
         m = self._make_monitor(head_dim=128, n_attn=8, n_kv=2, n_layers=8)
         peak = m.estimate_prefill_peak_bytes(512, 2048)
-        # KV: 8*2*128*2*2*512 ≈ 4 MB. SDPA fused: 8*2048*128*4 ≈ 8 MB. Total ≈ 12 MB.
+        # KV: 8*2*128*2*2*512 ≈ 4 MB. SDPA fused: 8*512*128*4 ≈ 2 MB. Total ≈ 6 MB.
         assert peak < 100 * 1024**2, f"unexpected large peak: {peak / 1024**2:.1f} MB"
+
+    def test_cached_tokens_extends_sdpa_span(self):
+        # head_dim>128 fallback: the last chunk attends over cached+new tokens.
+        # A request with a big prefix-cache hit (small new suffix) must still
+        # estimate the SDPA transient over the full span, not just new_tokens.
+        m = self._make_monitor(head_dim=256, n_attn=16, n_kv=2, n_layers=40)
+        # 2k new on top of 30k cached → SDPA span is 32k, query is 2k.
+        with_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=30 * 1024)
+        # Same new_tokens, no cache → SDPA span is only 2k.
+        without_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=0)
+        # SDPA dominates: span 32k vs 2k → ~16x larger transient.
+        sdpa_with = 16 * 2048 * (2048 + 30 * 1024) * 4
+        sdpa_without = 16 * 2048 * 2048 * 4
+        assert with_cache - without_cache == sdpa_with - sdpa_without
+        assert with_cache > without_cache * 5
+
+    def test_cached_tokens_default_matches_no_cache(self):
+        # Omitting cached_tokens must reproduce the pre-change behavior so the
+        # no-cache path (cached=0) is a strict regression guard.
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_prefill_peak_bytes(
+            32768, 2048
+        ) == m.estimate_prefill_peak_bytes(32768, 2048, cached_tokens=0)
+
+    def test_query_len_capped_at_new_tokens(self):
+        # When new_tokens < chunk_size the last (only) chunk's query length is
+        # new_tokens, not the full step size.
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # 512 new on top of 10k cached: query=512, span=10k+512.
+        peak = m.estimate_prefill_peak_bytes(512, 2048, cached_tokens=10 * 1024)
+        expected_sdpa = 8 * 512 * (512 + 10 * 1024) * 4 + 8 * 512 * 256 * 4
+        expected_kv = m.estimate_prompt_kv_bytes(512)
+        assert peak == expected_sdpa + expected_kv

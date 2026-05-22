@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import time
@@ -37,6 +38,18 @@ class Integration:
     def is_installed(self) -> bool:
         """Check if the tool binary is available."""
         return shutil.which(self.install_check) is not None
+
+    def _scrubbed_env(self) -> dict[str, str]:
+        """Return an os.environ copy with bundled-Python vars removed.
+
+        oMLX.app sets PYTHONHOME/PYTHONPATH to its bundled cpython-3.11.
+        Launched tools spawn their own Python subprocesses; if they inherit
+        these they crash with init_fs_encoding errors.
+        """
+        env = os.environ.copy()
+        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
+            env.pop(key, None)
+        return env
 
     def select_model(
         self, models_info: list[dict], tool_name: str | None = None

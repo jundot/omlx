@@ -4575,6 +4575,41 @@ class Scheduler:
                 req.prompt_cache = None
                 self._reset_request_prefill_state(req)
         self.waiting.clear()
+        # Catch in-flight orphans: a request popped from self.waiting but
+        # not yet added to self.running (or self.prefilling) sits as a
+        # local in _schedule_waiting. If _do_external_prefill raises, the
+        # request is unreachable through the three queues but still lives
+        # in self.requests (and the engine_core collector / finished_event
+        # for its id is still waiting). Without this pass, fail_all_requests
+        # returns an incomplete list and the HTTP request hangs forever.
+        #
+        # Exclude finished requests still awaiting async cache-store cleanup
+        # (those have an entry in ``_inflight_store_futures`` — see
+        # ``_cleanup_finished`` line ~5267). They have already emitted a
+        # ``finished=True`` output to their collector; ``_drain_pending_async_removes``
+        # pops them from ``self.requests`` after the store future completes.
+        # Failing them here would append an error output that wins over the
+        # success for non-streaming ``generate()`` callers (engine_core
+        # returns the last queued output).
+        for request_id in list(self.requests):
+            if request_id in self._inflight_store_futures:
+                continue
+            failed_ids.append(request_id)
+            req = self.requests.pop(request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
+        # Clear stale uid mappings for every failed id. Running requests hold
+        # real uids; the in-flight orphan above holds the temp_uid assigned at
+        # _schedule_waiting (id(request)) that its success-path cleanup never
+        # reached. batch_generator is reset below, so these mappings are dead
+        # either way. failed_ids excludes _inflight_store_futures ids, so the
+        # async-cleanup uids that _drain_pending_async_removes still needs are
+        # left intact.
+        for rid in failed_ids:
+            uid = self.request_id_to_uid.pop(rid, None)
+            if uid is not None:
+                self.uid_to_request_id.pop(uid, None)
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -4628,7 +4663,7 @@ class Scheduler:
             return None
 
         peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
         )
         if peak == 0:
             return None  # can't estimate, skip

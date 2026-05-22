@@ -346,6 +346,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 request_id = await engine.add_request(prompt="Hello")
                 await engine.abort_request(request_id)
@@ -387,6 +388,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 request_id = await engine.add_request(prompt="Hello")
 
@@ -430,6 +432,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 request_id = await engine.add_request(prompt="Hello")
 
@@ -566,6 +569,7 @@ class TestEngineCoreGenerateCancellation:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 # Create a task that calls generate - it will block on event.wait()
                 task = asyncio.create_task(
@@ -866,6 +870,7 @@ class TestEngineCoreAbortAllRequests:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 # Add multiple requests
                 rid1 = await engine.add_request(prompt="Hello")
@@ -925,6 +930,7 @@ class TestEngineCoreAbortAllRequests:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 rid = await engine.add_request(prompt="Hello")
                 await engine.abort_all_requests()
