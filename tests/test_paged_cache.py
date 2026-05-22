@@ -894,3 +894,93 @@ class TestPagedCacheManager:
 
         assert num_tokens == 0
         assert len(cached_blocks) == 0
+
+    def test_enable_caching_false_skips_hash_ops(self):
+        """When caching disabled, hash operations are skipped during alloc/free."""
+        manager = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+            enable_caching=False,
+        )
+
+        # Allocate some blocks — should not touch hash structures
+        block = manager.allocate_block()
+        assert block is not None
+        assert block.block_hash is None
+
+        blocks = manager.get_new_blocks(3)
+        assert len(blocks) == 3
+        for b in blocks:
+            assert b.block_hash is None
+
+        # Free a block — should not touch hash structures
+        freed = manager.free_block(block.block_id)
+        assert freed is True
+
+        # Check that hash-to-block map is empty
+        assert len(manager.cached_block_hash_to_block) == 0
+
+        # Check stats: no evictions should occur when caching is off
+        assert manager.stats.evictions == 0
+
+    def test_enable_caching_false_free_blocks_batch(self):
+        """When caching disabled, free_blocks() skips hash cache removal."""
+        manager = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+            enable_caching=False,
+        )
+
+        blocks = manager.get_new_blocks(5)
+        # Use free_block individually since free_blocks property shadows method
+        for b in blocks:
+            manager.free_block(b.block_id)
+
+        # No entries in hash-to-block map
+        assert len(manager.cached_block_hash_to_block) == 0
+
+        # All blocks returned to free queue (only null block remains allocated)
+        assert len(manager.allocated_blocks) == 1
+        assert manager.free_blocks == 99
+
+    def test_enable_caching_true_preserves_hash_ops(self):
+        """When caching enabled, hash operations proceed normally."""
+        manager = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+            enable_caching=True,
+        )
+
+        block = manager.allocate_block()
+        # Manually assign a hash (simulating prefix caching)
+        block_hash = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        block.block_hash = block_hash
+        manager.cached_block_hash_to_block.insert(block_hash, block)
+
+        # Free should remove from hash map (block's own hash remains; reset_hash is only in _maybe_evict)
+        freed = manager.free_block(block.block_id)
+        assert freed is True
+        assert len(manager.cached_block_hash_to_block) == 0
+        assert manager.stats.evictions == 0  # freeing ≠ eviction
+
+    def test_maybe_evict_cached_block_returns_false_when_caching_disabled(self):
+        """_maybe_evict_cached_block returns False immediately if caching disabled."""
+        manager = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+            enable_caching=False,
+        )
+
+        block = manager.allocate_block()
+        block.block_hash = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+
+        result = manager._maybe_evict_cached_block(block)
+        assert result is False
