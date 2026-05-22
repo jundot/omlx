@@ -2542,6 +2542,20 @@ class TestPrecomputedSensitivityMap:
 class TestOq6StreamingSkipScalesBiases:
     """Regression tests for oQ6 streaming: skip .scales/.biases keys."""
 
+    @pytest.fixture(autouse=True)
+    def _mock_sensitivity(self, monkeypatch):
+        """Bypass real sensitivity measurement for synthetic fixtures."""
+        from omlx import oq as _oq
+
+        def _fake_measure(model_path, config, oq_level, **_kw):
+            n = config.get("num_hidden_layers", 4)
+            return {i: 0.1 for i in range(n)}
+
+        monkeypatch.setattr(_oq, "_measure_sensitivity", _fake_measure)
+        monkeypatch.setattr(
+            _oq, "_measure_sensitivity_from_quantized_model", _fake_measure
+        )
+
     @pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
     def test_scales_and_biases_skipped_in_main_loop(self, tmp_path, monkeypatch):
         """.scales and .biases keys should not appear in the output index."""

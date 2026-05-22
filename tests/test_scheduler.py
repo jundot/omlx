@@ -2102,3 +2102,21 @@ class TestBuildStateMachineStopStrings:
                 assert tok in node
                 node = node[tok]
             assert "__match__" in node
+
+
+class TestVlmMtpImportGuard:
+    """Regression test for bare vlm_mtp import crash (text-only deployments)."""
+
+    def test_scheduler_imports_when_vlm_mtp_missing(self, monkeypatch):
+        """Importing scheduler must not fail when speculative.vlm_mtp is absent."""
+        import sys
+
+        # Force re-import of scheduler by removing cached module
+        monkeypatch.delitem(sys.modules, "omlx.scheduler", raising=False)
+        monkeypatch.setitem(sys.modules, "omlx.speculative.vlm_mtp", None)
+
+        # Re-import must succeed without raising
+        import omlx.scheduler as sched
+
+        assert sched.VLMMTPDrafter is not None  # falls back to typing.Any
+        assert sched.run_vlm_mtp_decode is None  # falls back to None

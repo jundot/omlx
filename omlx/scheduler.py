@@ -43,7 +43,12 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+try:
+    from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+except ImportError:
+    from typing import Any
+    VLMMTPDrafter = Any  # type: ignore[assignment, misc]
+    run_vlm_mtp_decode = None  # type: ignore[assignment, misc]
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 
