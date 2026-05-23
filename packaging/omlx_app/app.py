@@ -64,7 +64,7 @@ from Foundation import (
 
 from omlx.utils.release_check import select_latest_stable_release
 
-from .config import ServerConfig
+from .config import ServerConfig, resolve_local_server_base_url
 from .server_manager import PortConflict, ServerManager, ServerStatus
 
 logger = logging.getLogger(__name__)
@@ -212,6 +212,9 @@ class OMLXAppDelegate(NSObject):
 
         logger.info("oMLX menubar app launched successfully")
 
+        # Install omlx CLI symlink so `omlx launch claude` works from the terminal
+        self._install_cli_symlink()
+
         # Clean up leftover staged update from previous attempt
         from .updater import AppUpdater
 
@@ -245,6 +248,40 @@ class OMLXAppDelegate(NSObject):
                 3.0, self, "checkStatusItemVisibility:", None, False
             )
         )
+
+    def _install_cli_symlink(self) -> None:
+        """Install `omlx` CLI symlink so it's available in PATH.
+
+        Tries /usr/local/bin first (like ollama), falls back to ~/.local/bin.
+        Silently skips if neither directory is writable or the symlink already exists.
+        """
+        bundle = NSBundle.mainBundle()
+        exec_url = bundle.executableURL()
+        if exec_url is None:
+            return
+
+        macos_dir = Path(str(exec_url.path())).parent
+        cli_src = macos_dir / "omlx-cli"
+        if not cli_src.exists():
+            return
+
+        for target_dir in [Path("/usr/local/bin"), Path.home() / ".local" / "bin"]:
+            target = target_dir / "omlx"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    if target.resolve() == cli_src.resolve():
+                        return  # already correct
+                    target.unlink()
+                elif target.exists():
+                    return  # non-symlink file present, don't overwrite
+                target.symlink_to(cli_src)
+                logger.info(f"Installed CLI symlink: {target} → {cli_src}")
+                return
+            except OSError:
+                continue
+
+        logger.warning("Could not install omlx CLI symlink — no writable bin directory found")
 
     def _create_status_item(self):
         """Create the NSStatusItem and set accessibility metadata.
@@ -1710,7 +1747,9 @@ class OMLXAppDelegate(NSObject):
         """
         try:
             api_key = self.config.get_server_api_key()
-            base_url = f"http://127.0.0.1:{self.config.port}"
+            base_url = resolve_local_server_base_url(
+                self.config.get_server_bind_host(), self.config.port
+            )
 
             if not api_key:
                 self._cached_stats = None
@@ -1810,6 +1849,9 @@ class OMLXAppDelegate(NSObject):
         # Always refresh icon in case theme changed
         self._update_menubar_icon()
 
+        # Check once per day; self-gates on a 24h timestamp cache.
+        self._check_for_updates()
+
     # --- Menu actions ---
 
     def _handle_port_conflict(self, conflict: PortConflict) -> None:
@@ -1907,7 +1949,9 @@ class OMLXAppDelegate(NSObject):
         if self.server_manager.status != ServerStatus.RUNNING:
             return
 
-        base_url = f"http://127.0.0.1:{self.config.port}"
+        base_url = resolve_local_server_base_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
         api_key = self.config.get_server_api_key()
 
         if api_key:

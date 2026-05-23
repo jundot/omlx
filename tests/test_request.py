@@ -156,13 +156,13 @@ class TestRequest:
 
     def test_arrival_time_auto_set(self):
         """Test that arrival_time is automatically set."""
-        before = time.time()
+        before = time.monotonic()
         request = Request(
             request_id="test-003",
             prompt="Test",
             sampling_params=SamplingParams(),
         )
-        after = time.time()
+        after = time.monotonic()
         assert before <= request.arrival_time <= after
 
     def test_num_output_tokens_property(self):

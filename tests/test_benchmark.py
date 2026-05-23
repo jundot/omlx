@@ -416,6 +416,7 @@ class TestUploadToOmlxAi:
         mock_entry.model_path = "/models/Qwen3-30B-4bit"
         mock_pool = MagicMock()
         mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
 
         mock_response = MagicMock()
         mock_response.status_code = 201
@@ -476,6 +477,7 @@ class TestUploadToOmlxAi:
         mock_entry.model_path = "/models/Qwen3-30B-4bit"
         mock_pool = MagicMock()
         mock_pool.get_entry.return_value = mock_entry
+        mock_pool._settings_manager = None
 
         mock_response = MagicMock()
         mock_response.status_code = 409
@@ -500,3 +502,145 @@ class TestUploadToOmlxAi:
 
         done_event = next(e for e in events if e["type"] == "upload_done")
         assert done_event["data"]["success"] == 1
+
+    @pytest.mark.asyncio
+    async def test_upload_skipped_when_experimental_features_enabled(self):
+        """Upload is skipped (no HTTP call) when experimental features were active."""
+        from omlx.admin.benchmark import _upload_to_omlx_ai
+
+        run = BenchmarkRun(
+            bench_id="test-bench",
+            request=BenchmarkRequest(
+                model_id="Qwen3-30B-4bit",
+                prompt_lengths=[1024],
+            ),
+            experimental_features=["dflash", "turboquant"],
+        )
+        run.results = [
+            {
+                "test_type": "single",
+                "pp": 1024,
+                "tg": 128,
+                "processing_tps": 500.0,
+                "gen_tps": 50.0,
+                "ttft_ms": 100.0,
+                "peak_memory_bytes": 0,
+            },
+        ]
+
+        mock_pool = MagicMock()
+        mock_pool._settings_manager = None
+        mock_to_thread = AsyncMock()
+
+        with patch("asyncio.to_thread", mock_to_thread):
+            await _upload_to_omlx_ai(run, mock_pool)
+
+        events = []
+        while not run.queue.empty():
+            events.append(run.queue.get_nowait())
+
+        # Only an upload_skipped event is emitted, no progress / upload / upload_done
+        event_types = [e["type"] for e in events]
+        assert "upload_skipped" in event_types
+        assert "upload" not in event_types
+        assert "upload_done" not in event_types
+        assert "progress" not in event_types
+
+        skipped = next(e for e in events if e["type"] == "upload_skipped")
+        assert skipped["reason"] == "experimental_features"
+        assert skipped["features"] == ["dflash", "turboquant"]
+
+        # No HTTP call was made
+        mock_to_thread.assert_not_called()
+
+
+_CF_INTERSTITIAL = (
+    '<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>'
+    '<meta http-equiv="refresh" content="360"></head><body><div class="main-wrapper">'
+    + ("x" * 5000)
+    + "</div></body></html>"
+)
+
+
+class TestSanitizeUploadError:
+    """The Cloudflare interstitial pollutes the dashboard upload panel when
+    omlx.ai's API endpoint is gated behind a managed challenge. The
+    sanitizer must detect that case and surface an actionable message
+    without dumping the full 5KB HTML body."""
+
+    def _resp(self, status=403, headers=None, text="", json_raises=True, json_data=None):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = headers or {}
+        resp.text = text
+        if json_raises:
+            resp.json.side_effect = ValueError("not JSON")
+        else:
+            resp.json.return_value = json_data or {}
+        return resp
+
+    def test_cloudflare_challenge_via_header(self):
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(
+            status=403,
+            headers={"cf-mitigated": "challenge"},
+            text=_CF_INTERSTITIAL,
+        )
+        msg = _sanitize_upload_error(resp)
+        assert "Cloudflare" in msg
+        assert "403" in msg
+        # The raw HTML body must NOT appear in the error message.
+        assert "<!DOCTYPE" not in msg
+        assert "Just a moment" not in msg
+        assert len(msg) < 300
+
+    def test_cloudflare_challenge_via_body_sniff(self):
+        """Header missing but body still contains the interstitial — covers
+        edge transports / proxies that strip cf-mitigated."""
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(status=403, headers={}, text=_CF_INTERSTITIAL)
+        msg = _sanitize_upload_error(resp)
+        assert "Cloudflare" in msg
+        assert "<!DOCTYPE" not in msg
+
+    def test_json_error_field_extracted(self):
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(
+            status=400,
+            json_raises=False,
+            json_data={"error": "Invalid model_name"},
+            text='{"error": "Invalid model_name"}',
+        )
+        assert _sanitize_upload_error(resp) == "Invalid model_name"
+
+    def test_json_detail_field_extracted(self):
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(
+            status=422,
+            json_raises=False,
+            json_data={"detail": "context_length out of range"},
+            text='{"detail": "context_length out of range"}',
+        )
+        assert _sanitize_upload_error(resp) == "context_length out of range"
+
+    def test_html_body_without_cf_signals_collapses_to_hint(self):
+        """Non-CF HTML body (e.g. nginx 502 page) should not be dumped raw."""
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(
+            status=502,
+            text="<html><body>502 Bad Gateway</body></html>",
+        )
+        msg = _sanitize_upload_error(resp)
+        assert "<html>" not in msg
+        assert "502" in msg
+
+    def test_plain_text_short_body_passes_through(self):
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(status=500, text="upstream connection refused")
+        assert _sanitize_upload_error(resp) == "upstream connection refused"
+
+    def test_empty_body_falls_back_to_status(self):
+        from omlx.admin.benchmark import _sanitize_upload_error
+        resp = self._resp(status=503, text="")
+        assert _sanitize_upload_error(resp) == "HTTP 503"

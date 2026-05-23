@@ -64,7 +64,33 @@ class ModelSettings:
         specprefill_threshold: Min tokens to trigger SpecPrefill.
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
-        dflash_draft_quant_bits: Draft model quantization bits.
+        dflash_draft_quant_enabled: Enable draft model quantization.
+        dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
+        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
+        dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
+        dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
+        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
+        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
+        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
+        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
+        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
+        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+            Helps stabilise acceptance rate on long-context prompts.
+        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
+            (None = dflash default 64).
+        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
+            (None = dflash default "adaptive"). "adaptive" can shrink block size when
+            acceptance drops.
+        mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
+            When True, the BatchGenerator uses an MTP draft+verify path for single-request
+            decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
+            exclusive with dflash_enabled and turboquant_kv_enabled. Concurrent requests on
+            the same model fall back to standard continuous batching automatically.
+        vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
+            drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
+            "gemma4_assistant" model.
+        vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
+        vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -111,7 +137,37 @@ class ModelSettings:
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
-    dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
+    dflash_draft_quant_enabled: Optional[bool] = None
+    dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
+    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
+    dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
+    dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
+    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
+    dflash_in_memory_cache: bool = True
+    dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
+    dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
+    dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
+    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
+    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
+    # agentic workloads where acceptance drops on the default sliding window.
+    dflash_draft_window_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = None
+    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+
+    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
+    # uses MTP draft+verify path for single-request decoding. Compatible model_types:
+    # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
+    mtp_enabled: bool = False
+
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
+    # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
+    # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
+    # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.
+    vlm_mtp_enabled: bool = False
+    vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
+    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
 
     # Model management flags
     is_pinned: bool = False
@@ -126,6 +182,38 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
+
+    def __post_init__(self) -> None:
+        # Native MTP is mutually exclusive with DFlash (also speculative) and
+        # TurboQuant KV (patches the same attention path). Reject combos at
+        # construction time so the conflict surfaces in the admin UI / API
+        # rather than at model load.
+        if self.mtp_enabled and self.dflash_enabled:
+            raise ValueError(
+                "mtp_enabled and dflash_enabled cannot both be True; choose one "
+                "speculative-decoding path per model"
+            )
+        if self.mtp_enabled and self.turboquant_kv_enabled:
+            raise ValueError(
+                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
+                "TurboQuant patches the attention path that MTP relies on"
+            )
+        # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
+        # at decode time, so it cannot coexist with any other speculative path
+        # or with TurboQuant (which mutates the same cache objects).
+        if self.vlm_mtp_enabled:
+            conflicts = [
+                ("dflash_enabled", self.dflash_enabled),
+                ("specprefill_enabled", self.specprefill_enabled),
+                ("mtp_enabled", self.mtp_enabled),
+                ("turboquant_kv_enabled", self.turboquant_kv_enabled),
+            ]
+            for name, value in conflicts:
+                if value:
+                    raise ValueError(
+                        f"vlm_mtp_enabled and {name} cannot both be True; "
+                        "choose one speculative path per model"
+                    )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -304,6 +392,32 @@ class ModelSettingsManager:
             logger.info(f"Updated settings for model '{model_id}'")
 
             self._save()
+
+    def delete_settings(self, model_id: str) -> bool:
+        """Remove all persisted state for a model (settings + profiles).
+
+        Called when a model is deleted so its alias and other settings are
+        released and can be reused by another model.
+
+        Args:
+            model_id: The model identifier.
+
+        Returns:
+            True if any state was removed, False if nothing was stored.
+        """
+        with self._lock:
+            removed = False
+            if model_id in self._settings:
+                del self._settings[model_id]
+                self._save()
+                removed = True
+            if model_id in self._profiles:
+                del self._profiles[model_id]
+                self._save_profiles()
+                removed = True
+            if removed:
+                logger.info(f"Deleted settings for model '{model_id}'")
+            return removed
 
     def get_default_model_id(self) -> Optional[str]:
         """Get the ID of the default model.

@@ -14,12 +14,38 @@ Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
 from abc import ABC
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
 from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
+
+
+class FakeStreamingCore:
+    """Minimal async engine core for stream cleanup tests."""
+
+    def __init__(self):
+        self.aborted_request_id = None
+
+    async def add_request(self, **kwargs):
+        return "request-1"
+
+    async def stream_outputs(self, request_id):
+        yield SimpleNamespace(
+            output_text="partial",
+            new_text="partial",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=False,
+            finish_reason=None,
+            tool_calls=None,
+            cached_tokens=0,
+        )
+
+    async def abort_request(self, request_id):
+        self.aborted_request_id = request_id
 
 
 class TestGenerationOutput:
@@ -267,6 +293,29 @@ class TestBatchedEngineInitialization:
         engine = BatchedEngine(model_name="test-model")
 
         assert engine.model_type is None
+
+
+class TestBatchedEngineStreamingCleanup:
+    """Tests for streaming generator cleanup paths."""
+
+    @pytest.mark.asyncio
+    async def test_stream_abort_uses_captured_engine_if_engine_cleared(self):
+        """Generator finalization aborts on the original engine reference."""
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello")
+        first = await stream.__anext__()
+        assert first.text == "partial"
+
+        engine._engine = None
+        await stream.aclose()
+
+        assert fake_engine.aborted_request_id == "request-1"
 
 
 class TestBatchedEngineApplyChatTemplate:
@@ -673,3 +722,62 @@ class TestApplyChatTemplatePartialMode:
         # partial stripped from message dicts
         call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
         assert "partial" not in call_msgs[-1]
+
+    def test_count_then_apply_chat_template_idempotent_under_partial_mode(self):
+        """Server flow: count_chat_tokens then _apply_chat_template on the
+        same messages list must render with identical partial-mode flags.
+
+        Mimics the post-fix server contract: detect_and_strip_partial once
+        at the API boundary, forward the resolved value to engine methods
+        via an explicit is_partial parameter, and assert both phases pass
+        the same partial-mode flags to apply_chat_template.
+        """
+        from omlx.api.utils import detect_and_strip_partial
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        mock_tokenizer.encode.return_value = [1, 2, 3]
+        engine._tokenizer = mock_tokenizer
+
+        messages = [
+            {"role": "user", "content": "Generate JSON"},
+            {"role": "assistant", "content": "{", "partial": True},
+        ]
+
+        # Server flow: detect_and_strip_partial once at the API boundary,
+        # forward the resolved value to all engine methods.
+        is_partial = detect_and_strip_partial(messages)
+        assert is_partial is True
+
+        # Phase 1: count.
+        engine.count_chat_tokens(messages, is_partial=is_partial)
+        count_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Phase 2: chat.  Operates on the same (now-stripped) messages list.
+        engine._apply_chat_template(messages, is_partial=is_partial)
+        chat_kwargs = dict(mock_tokenizer.apply_chat_template.call_args.kwargs)
+
+        # Both phases must render with identical partial-mode flags.
+        assert count_kwargs.get("continue_final_message") == chat_kwargs.get(
+            "continue_final_message"
+        ), (
+            "continue_final_message diverged across phases: "
+            f"count={count_kwargs.get('continue_final_message')}, "
+            f"chat={chat_kwargs.get('continue_final_message')}"
+        )
+        assert (
+            count_kwargs["add_generation_prompt"]
+            == chat_kwargs["add_generation_prompt"]
+        ), (
+            "add_generation_prompt diverged across phases: "
+            f"count={count_kwargs['add_generation_prompt']}, "
+            f"chat={chat_kwargs['add_generation_prompt']}"
+        )
+
+        # Specific contract: with partial=True forwarded, both phases use
+        # continue_final_message=True (not add_generation_prompt=True).
+        assert count_kwargs["continue_final_message"] is True
+        assert count_kwargs["add_generation_prompt"] is False

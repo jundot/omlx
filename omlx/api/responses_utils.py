@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from .responses_models import (
     InputItem,
+    InputTokensDetails,
     OutputContent,
     OutputItem,
     ResponsesTool,
@@ -50,15 +51,22 @@ def _flush_pending_tool_calls(
     messages: List[Dict[str, Any]],
     pending: List[Dict[str, Any]],
     min_merge_index: int = 0,
-) -> None:
+    pending_reasoning: str = "",
+) -> str:
     """Flush accumulated tool calls into messages.
 
     If the last message is an assistant message without tool_calls, merge
     into it (avoids duplicate assistant turns that confuse chat templates).
     Otherwise create a new assistant message.
+
+    When ``pending_reasoning`` is set, attach it as ``reasoning_content``
+    on the synthesized assistant message so reasoning round-trips even
+    when the spec sequence is reasoning → function_call → output (no
+    intervening message item). Returns the passthrough reasoning when
+    no tool calls were flushed, or "" when reasoning was consumed.
     """
     if not pending:
-        return
+        return pending_reasoning
     if (
         messages
         and len(messages) - 1 >= min_merge_index
@@ -66,9 +74,15 @@ def _flush_pending_tool_calls(
         and "tool_calls" not in messages[-1]
     ):
         messages[-1]["tool_calls"] = list(pending)
+        if pending_reasoning:
+            messages[-1]["reasoning_content"] = pending_reasoning
     else:
-        messages.append({"role": "assistant", "tool_calls": list(pending)})
+        msg: Dict[str, Any] = {"role": "assistant", "tool_calls": list(pending)}
+        if pending_reasoning:
+            msg["reasoning_content"] = pending_reasoning
+        messages.append(msg)
     pending.clear()
+    return ""
 
 
 def _consolidate_system_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -138,6 +152,8 @@ def convert_responses_input_to_messages(
     # Process input items
     # Track pending tool calls for grouping into a single assistant message
     pending_tool_calls: List[Dict[str, Any]] = []
+    # Track reasoning content to attach to the next assistant message
+    pending_reasoning: str = ""
 
     for item in input_data:
         # Resolve effective type: EasyInputMessage has no type field
@@ -146,9 +162,14 @@ def convert_responses_input_to_messages(
             item_type = "message"
 
         if item_type == "message":
-            # Flush pending tool calls before a new message
-            _flush_pending_tool_calls(
-                messages, pending_tool_calls, min_merge_index=current_message_start
+            # Flush pending tool calls before a new message. Reasoning
+            # passes through when no tool calls were flushed so it lands
+            # on this message instead.
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                min_merge_index=current_message_start,
+                pending_reasoning=pending_reasoning,
             )
 
             role = item.role or "user"
@@ -191,7 +212,26 @@ def convert_responses_input_to_messages(
             if role == "system":
                 system_parts.append(content or "")
             else:
-                messages.append({"role": role, "content": content or ""})
+                msg_dict: Dict[str, Any] = {"role": role, "content": content or ""}
+                if role == "assistant" and pending_reasoning:
+                    msg_dict["reasoning_content"] = pending_reasoning
+                    pending_reasoning = ""
+                messages.append(msg_dict)
+
+        elif item_type == "reasoning":
+            # Collect reasoning summary text to attach to the next
+            # assistant message as reasoning_content.
+            summary = getattr(item, "summary", None) or (
+                (item.model_extra or {}).get("summary") if hasattr(item, "model_extra") else None
+            )
+            if summary:
+                parts = []
+                for s in summary:
+                    if isinstance(s, dict):
+                        parts.append(s.get("text", ""))
+                    else:
+                        parts.append(getattr(s, "text", ""))
+                pending_reasoning = "\n".join(p for p in parts if p)
 
         elif item.type == "function_call":
             # Assistant's tool call — accumulate for grouping
@@ -206,9 +246,13 @@ def convert_responses_input_to_messages(
             })
 
         elif item.type == "function_call_output":
-            # Flush pending tool calls first
-            _flush_pending_tool_calls(
-                messages, pending_tool_calls, min_merge_index=current_message_start
+            # Flush pending tool calls first. Any pending reasoning gets
+            # attached to the synthesized assistant tool_calls message.
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                min_merge_index=current_message_start,
+                pending_reasoning=pending_reasoning,
             )
 
             messages.append({
@@ -217,9 +261,13 @@ def convert_responses_input_to_messages(
                 "content": item.output or "",
             })
 
-    # Flush remaining pending tool calls
+    # Flush remaining pending tool calls. If reasoning survived without
+    # a trailing message, attach it to the synthesized tool_calls message.
     _flush_pending_tool_calls(
-        messages, pending_tool_calls, min_merge_index=current_message_start
+        messages,
+        pending_tool_calls,
+        min_merge_index=current_message_start,
+        pending_reasoning=pending_reasoning,
     )
 
     # Insert merged system message at position 0
@@ -302,14 +350,38 @@ def build_function_call_output_item(
     )
 
 
+def build_reasoning_output_item(
+    reasoning_text: str,
+    item_id: Optional[str] = None,
+    status: str = "completed",
+) -> OutputItem:
+    """Build a reasoning-type OutputItem with full CoT in summary[0].text."""
+    from .responses_models import ReasoningSummaryPart
+
+    summary = [ReasoningSummaryPart(text=reasoning_text)] if reasoning_text else []
+    return OutputItem(
+        type="reasoning",
+        id=item_id or generate_id(IDPrefix.REASONING),
+        status=status,
+        summary=summary,
+    )
+
+
 def build_response_usage(
-    input_tokens: int, output_tokens: int
+    input_tokens: int,
+    output_tokens: int,
+    reasoning_tokens: int = 0,
+    cached_tokens: int = 0,
 ) -> ResponseUsage:
     """Build ResponseUsage from token counts."""
+    from .responses_models import OutputTokensDetails
+
     return ResponseUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=reasoning_tokens),
     )
 
 
@@ -523,20 +595,33 @@ def normalize_response_output_to_messages(
     """Convert response output items to assistant/tool-call history messages."""
     messages: List[Dict[str, Any]] = []
     pending_tool_calls: List[Dict[str, Any]] = []
+    pending_reasoning: str = ""
 
     for item in output_items:
         item_type = item.get("type")
-        if item_type == "message":
-            _flush_pending_tool_calls(messages, pending_tool_calls)
+        if item_type == "reasoning":
+            summary = item.get("summary", [])
+            parts = [s.get("text", "") for s in summary if isinstance(s, dict)]
+            pending_reasoning = "\n".join(p for p in parts if p)
+        elif item_type == "message":
+            pending_reasoning = _flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning=pending_reasoning,
+            )
             content_blocks = item.get("content", [])
             text_parts = []
             for block in content_blocks:
                 if block.get("type") == "output_text":
                     text_parts.append(block.get("text", ""))
-            messages.append({
+            msg_dict: Dict[str, Any] = {
                 "role": item.get("role", "assistant"),
                 "content": "\n".join(text_parts),
-            })
+            }
+            if pending_reasoning:
+                msg_dict["reasoning_content"] = pending_reasoning
+                pending_reasoning = ""
+            messages.append(msg_dict)
         elif item_type == "function_call":
             call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:8]}")
             pending_tool_calls.append({
@@ -548,7 +633,11 @@ def normalize_response_output_to_messages(
                 },
             })
 
-    _flush_pending_tool_calls(messages, pending_tool_calls)
+    _flush_pending_tool_calls(
+        messages,
+        pending_tool_calls,
+        pending_reasoning=pending_reasoning,
+    )
     return _consolidate_system_messages(messages)
 
 

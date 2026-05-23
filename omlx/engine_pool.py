@@ -42,6 +42,7 @@ from .exceptions import (
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
+from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,14 @@ class EngineEntry:
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
+    loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
 
@@ -97,6 +100,8 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        self._load_seconds_per_gb_ema: float | None = None
+        self._load_time_observations: int = 0
 
     @property
     def max_model_memory(self) -> int | None:
@@ -375,12 +380,14 @@ class EnginePool:
             # Check process memory limit before loading.
             # Try evicting LRU models first to free actual Metal memory.
             # max_bytes <= 0 means enforcement is disabled (no limit).
+            # max(active, phys_footprint) matches what jetsam sees and what
+            # ProcessMemoryEnforcer uses, so load decisions are consistent.
             if self._process_memory_enforcer is not None:
                 enforcer = self._process_memory_enforcer
                 if enforcer.max_bytes > 0:
                     while True:
-                        current_active = mx.get_active_memory()
-                        projected = current_active + entry.estimated_size
+                        current = max(mx.get_active_memory(), get_phys_footprint())
+                        projected = current + entry.estimated_size
                         if projected <= enforcer.max_bytes:
                             break
                         # Try to evict an LRU model to free memory
@@ -397,12 +404,12 @@ class EnginePool:
                         # No more victims — cannot fit
                         raise InsufficientMemoryError(
                             required=entry.estimated_size,
-                            current=current_active,
+                            current=current,
                             message=(
                                 f"Cannot load {model_id}: projected memory "
                                 f"{format_size(projected)} would exceed process "
                                 f"limit {format_size(enforcer.max_bytes)} "
-                                f"(current: {format_size(current_active)}, "
+                                f"(current: {format_size(current)}, "
                                 f"model: {format_size(entry.estimated_size)})"
                             ),
                         )
@@ -493,6 +500,7 @@ class EnginePool:
         # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
+        entry.actual_size = None
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -589,7 +597,11 @@ class EnginePool:
             raise ModelLoadingError(model_id)
 
         entry.is_loading = True
+        entry.loading_started_at = time.monotonic()
+        load_started_at = entry.loading_started_at
+        load_completed = False
         entry.abort_loading = False
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -603,6 +615,17 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
+            # Native MTP forces LM-only dispatch even for VLM models. Vision
+            # encoder weights are ignored because the patched mtp_forward only
+            # exists on the language model path. mtp_enabled was already
+            # validated as mutually exclusive with dflash / turboquant in
+            # metal-knowledge: with the mlx-vlm runtime MTP patch (see
+            # omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py) VLM models
+            # can run MTP natively while keeping vision intact. The old
+            # force-LM-dispatch shortcut here is obsolete for patched
+            # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
+            pass
+
             # Check if DFlash is enabled — takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
@@ -615,10 +638,16 @@ class EnginePool:
                         engine = DFlashEngine(
                             model_name=entry.model_path,
                             draft_model_path=dflash_draft,
-                            draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                            draft_quant_enabled=getattr(model_settings, "dflash_draft_quant_enabled", False),
+                            draft_quant_weight_bits=getattr(model_settings, "dflash_draft_quant_weight_bits", 4),
+                            draft_quant_activation_bits=getattr(model_settings, "dflash_draft_quant_activation_bits", 16),
+                            draft_quant_group_size=getattr(model_settings, "dflash_draft_quant_group_size", 64),
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
+                            omlx_ssd_cache_dir=getattr(
+                                self._scheduler_config, "paged_ssd_cache_dir", None
+                            ),
                         )
                         logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
                     except ImportError:
@@ -711,7 +740,13 @@ class EnginePool:
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"DFlash load failed: {start_error}; "
+                            f"{effective_type} fallback also failed: {fallback_error}"
+                        ) from start_error
                     logger.info(
                         f"Successfully loaded {model_id} as {effective_type} "
                         f"(fallback from DFlash)"
@@ -742,7 +777,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"LM load failed (force_lm=True): {start_error}; "
+                            f"VLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     logger.info(
                         f"Successfully loaded {model_id} as VLM "
@@ -771,7 +812,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"VLM load failed: {start_error}; "
+                            f"LLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
@@ -807,6 +854,47 @@ class EnginePool:
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
+            load_completed = True
+
+            # VLM MTP: load gemma4_assistant drafter and attach to engine.
+            # Fail-soft — drafter load issues never block the target engine.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "vlm_mtp_enabled", False)
+                and getattr(model_settings, "vlm_mtp_draft_model", None)
+                and hasattr(engine, "set_vlm_mtp_drafter")
+            ):
+                drafter_id = model_settings.vlm_mtp_draft_model
+                drafter_entry = self._entries.get(drafter_id)
+                drafter_path = (
+                    drafter_entry.model_path if drafter_entry else drafter_id
+                )
+
+                def _load_drafter_sync(path: str = drafter_path):
+                    from .speculative.vlm_mtp import load_vlm_mtp_drafter
+                    return load_vlm_mtp_drafter(path)
+
+                loop = asyncio.get_running_loop()
+                try:
+                    drafter = await loop.run_in_executor(
+                        get_mlx_executor(), _load_drafter_sync
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"VLM MTP drafter load raised for {model_id} "
+                        f"(drafter={drafter_id}): {e} — toggle ignored"
+                    )
+                    drafter = None
+                if drafter is not None:
+                    engine.set_vlm_mtp_drafter(drafter)
+                    logger.info(
+                        f"VLM MTP enabled for {model_id}, drafter={drafter_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"VLM MTP toggle on for {model_id} but drafter "
+                        f"load failed; toggle ignored"
+                    )
 
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
@@ -824,13 +912,36 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
+            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+            observed_delta = max(0, post_load_memory - pre_load_memory)
+            entry.actual_size = observed_delta or entry.estimated_size
+
             logger.info(
                 f"Loaded model: {model_id} "
-                f"(estimated: {format_size(entry.estimated_size)}, "
+                f"(actual: {format_size(entry.actual_size)}, "
+                f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
+            if load_completed and load_started_at is not None and entry.estimated_size > 0:
+                elapsed = max(0.0, time.monotonic() - load_started_at)
+                size_gb = entry.estimated_size / (1024 ** 3)
+                if size_gb > 0 and elapsed > 0:
+                    sample = elapsed / size_gb
+                    if self._load_seconds_per_gb_ema is None:
+                        self._load_seconds_per_gb_ema = sample
+                    else:
+                        self._load_seconds_per_gb_ema = (
+                            self._load_seconds_per_gb_ema * 0.9 + sample * 0.1
+                        )
+                    self._load_time_observations += 1
+                    logger.debug(
+                        f"Observed model load speed: {sample:.2f}s/GB "
+                        f"for {model_id} ({elapsed:.1f}s, {format_size(entry.estimated_size)}); "
+                        f"EMA={self._load_seconds_per_gb_ema:.2f}s/GB"
+                    )
             entry.is_loading = False
+            entry.loading_started_at = None
             entry.abort_loading = False
 
     async def preload_pinned_models(self) -> None:
@@ -875,13 +986,17 @@ class EnginePool:
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
             "models": [
                 {
                     "id": mid,
                     "model_path": e.model_path,
                     "loaded": e.engine is not None,
                     "is_loading": e.is_loading,
+                    "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
+                    "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,

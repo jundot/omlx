@@ -77,6 +77,10 @@ class BenchmarkRun:
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
+    # Experimental flags active when the benchmark started. When non-empty
+    # the run's results are not uploaded to omlx.ai community benchmarks
+    # because experimental features skew the numbers.
+    experimental_features: list[str] = field(default_factory=list)
 
 
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
@@ -374,6 +378,51 @@ def _clean_model_name(model_id: str, quantization: str) -> str:
     return name.strip("-_ ")
 
 
+def _sanitize_upload_error(resp: Any) -> str:
+    """Extract a user-presentable error string from a failed upload response.
+
+    Avoids dumping raw HTML bodies (e.g. Cloudflare's "Just a moment..."
+    challenge interstitial) into the dashboard's red-x error column.
+    Detects CF mitigation specifically so users get actionable context
+    instead of a 5KB markup blob.
+
+    Resolution order:
+    1. Cloudflare challenge — header ``cf-mitigated: challenge`` is
+       authoritative; a body sniff for "just a moment" / "cf-chl" covers
+       edge transports that strip the header.
+    2. JSON envelope — the omlx.ai API's normal error shape; extract
+       ``error`` / ``detail`` / ``message`` if present, truncated.
+    3. Plain-text body — short responses only; HTML-looking bodies are
+       collapsed to a one-line "non-JSON response (N bytes)" hint.
+    4. Fallback to the bare HTTP status code.
+    """
+    headers = getattr(resp, "headers", {}) or {}
+    cf_mitigated = str(headers.get("cf-mitigated", "")).lower()
+    body = getattr(resp, "text", "") or ""
+    status = getattr(resp, "status_code", "?")
+
+    body_head = body[:512].lower()
+    if cf_mitigated == "challenge" or "just a moment" in body_head or "cf-chl" in body_head:
+        return (
+            f"Upload blocked by Cloudflare (HTTP {status}). "
+            f"This is a server-side issue with omlx.ai — retry later or "
+            f"report it to the maintainer."
+        )
+
+    try:
+        data = resp.json()
+        msg = data.get("error") or data.get("detail") or data.get("message")
+        if msg:
+            return str(msg)[:300]
+    except Exception:
+        pass
+
+    text = body.strip()
+    if "<" in text and ">" in text:
+        return f"HTTP {status} — unexpected non-JSON response ({len(body)} bytes)"
+    return text[:300] or f"HTTP {status}"
+
+
 async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     """Upload benchmark results to omlx.ai community benchmarks.
 
@@ -393,6 +442,21 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         get_total_memory_gb,
         parse_chip_info,
     )
+
+    # Skip upload when experimental features were active during the run.
+    # These features (DFlash, SpecPrefill, TurboQuant KV) skew throughput
+    # and would pollute the community leaderboard if mixed in unmarked.
+    if run.experimental_features:
+        await _send_event(run, {
+            "type": "upload_skipped",
+            "reason": "experimental_features",
+            "features": list(run.experimental_features),
+        })
+        logger.info(
+            f"Benchmark upload skipped: experimental features active: "
+            f"{run.experimental_features}"
+        )
+        return
 
     await _send_event(run, {
         "type": "progress",
@@ -518,11 +582,7 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                 })
             else:
                 failed_count += 1
-                error_msg = ""
-                try:
-                    error_msg = resp.json().get("error", resp.text)
-                except Exception:
-                    error_msg = resp.text
+                error_msg = _sanitize_upload_error(resp)
                 await _send_event(run, {
                     "type": "upload",
                     "data": {
@@ -530,10 +590,18 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                         "error": error_msg,
                     },
                 })
+                # Surface the sanitized message to ops; the full body
+                # (truncated) goes to debug so it can still be retrieved
+                # from the log file if needed.
                 logger.warning(
                     f"Benchmark upload failed for pp{context_length}: "
                     f"{resp.status_code} {error_msg}"
                 )
+                if (resp.text or "")[:1] not in ("{", "["):
+                    logger.debug(
+                        "Benchmark upload non-JSON body (truncated): %r",
+                        (resp.text or "")[:500],
+                    )
 
         except Exception as e:
             failed_count += 1
@@ -577,6 +645,25 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     overall_start = time.perf_counter()
 
     try:
+        # Snapshot experimental flags at run start. Settings can change mid-run
+        # (user toggling DFlash/SpecPrefill/TurboQuant), and the produced
+        # numbers are tied to whatever was active when generation actually ran.
+        sm = getattr(engine_pool, "_settings_manager", None)
+        if sm is not None:
+            try:
+                s = sm.get_settings(request.model_id)
+                if getattr(s, "dflash_enabled", False):
+                    run.experimental_features.append("dflash")
+                if getattr(s, "specprefill_enabled", False):
+                    run.experimental_features.append("specprefill")
+                if getattr(s, "turboquant_kv_enabled", False):
+                    run.experimental_features.append("turboquant")
+            except Exception as e:
+                logger.warning(
+                    f"Benchmark: failed to read experimental flags for "
+                    f"{request.model_id}: {e}"
+                )
+
         # Phase 1: Unload all loaded models
         loaded_ids = engine_pool.get_loaded_model_ids()
         if loaded_ids:

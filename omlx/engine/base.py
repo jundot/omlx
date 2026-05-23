@@ -4,6 +4,8 @@ Base engine interface for oMLX inference.
 """
 
 import threading
+import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -257,16 +259,106 @@ class BaseNonStreamingEngine(ABC):
     def __init__(self):
         self._active_count = 0
         self._active_lock = threading.Lock()
+        self._activities: Dict[str, Dict[str, Any]] = {}
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
-        return self._active_count > 0
-
-    def _decrement_active(self) -> bool:
-        """Decrement active count and return True if cache should be cleared."""
         with self._active_lock:
+            return self._active_count > 0
+
+    _ACTIVITY_RESERVED_KEYS = {
+        "request_id",
+        "kind",
+        "detail",
+        "started_at",
+        "last_activity_at",
+        "total_items",
+    }
+
+    def _sanitize_activity_metadata(
+        self, metadata: Dict[str, Any] | None
+    ) -> Dict[str, Any]:
+        """Drop reserved activity keys from caller-provided metadata.
+
+        Timing keys are owned by the tracker: _begin_activity sets them and
+        _update_activity always advances last_activity_at to "now".
+        """
+        if not metadata:
+            return {}
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key not in self._ACTIVITY_RESERVED_KEYS
+        }
+
+    def _begin_activity(
+        self,
+        kind: str,
+        detail: str | None = None,
+        total_items: int | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        """Track a non-streaming operation for admin visibility."""
+        activity_id = str(uuid.uuid4())
+        now = time.monotonic()
+        with self._active_lock:
+            self._active_count += 1
+            activity = {
+                "request_id": activity_id,
+                "kind": kind,
+                "detail": detail or kind,
+                "started_at": now,
+                "last_activity_at": now,
+                "total_items": total_items,
+            }
+            activity.update(self._sanitize_activity_metadata(metadata))
+            self._activities[activity_id] = activity
+        return activity_id
+
+    def _update_activity(self, activity_id: str, **updates: Any) -> None:
+        """Update tracked non-streaming operation metadata."""
+        with self._active_lock:
+            activity = self._activities.get(activity_id)
+            if activity is None:
+                return
+            activity.update(self._sanitize_activity_metadata(updates))
+            activity["last_activity_at"] = time.monotonic()
+
+    def _end_activity(self, activity_id: str) -> bool:
+        """End an activity and return True if cache should be cleared."""
+        with self._active_lock:
+            removed = self._activities.pop(activity_id, None)
+            if removed is None:
+                raise RuntimeError(
+                    f"Activity {activity_id} ended more than once or was never started"
+                )
             self._active_count -= 1
+            if self._active_count < 0:
+                raise RuntimeError("Active request count became negative")
             return self._active_count == 0
+
+    def get_activity_snapshot(self) -> Dict[str, Any]:
+        """Return active non-streaming operations for admin display."""
+        now = time.monotonic()
+        with self._active_lock:
+            activities = []
+            for activity in self._activities.values():
+                item = dict(activity)
+                started_at = item.pop("started_at", None)
+                last_activity_at = item.pop("last_activity_at", None)
+                item["elapsed_seconds"] = (
+                    max(0.0, now - started_at) if started_at is not None else None
+                )
+                item["last_activity_age_seconds"] = (
+                    max(0.0, now - last_activity_at)
+                    if last_activity_at is not None
+                    else None
+                )
+                activities.append(item)
+            return {
+                "active_requests": self._active_count,
+                "activities": activities,
+            }
 
     @property
     @abstractmethod

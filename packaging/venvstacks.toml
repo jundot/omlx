@@ -48,10 +48,10 @@ requirements = [
     "mcp>=1.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (e41cd25) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e41cd25565861500e48c076ab31aaeafee0ed80f",
-    # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    # mlx-vlm from commit (f96138e) - aligned with pyproject.toml
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@1ba671372b289c025b435c1a13aabb4bfb80b183",
     "Pillow>=9.0.0",
     # ModelScope SDK for downloading models from ModelScope Hub
     "modelscope>=1.10.0",
@@ -71,7 +71,11 @@ requirements = [
     "phonemizer-fork>=3.3.2",
     "espeakng-loader>=0.2.4",
     # mlx-audio [stt] extra deps
-    "mistral-common[audio]>=0.4.2",
+    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
+    # which only exists in mistral-common>=1.10. Without this floor, the
+    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
+    # fails (#1072, #1116).
+    "mistral-common[audio]>=1.10",
     # mlx-audio [sts] extra deps
     "webrtcvad>=2.0.10",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py

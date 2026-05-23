@@ -471,6 +471,12 @@ class PreferencesWindowController(NSObject):
         new_model_dir = str(self.model_dir_label.stringValue())
         port_str = str(self.port_field.stringValue()).strip()
 
+        # Snapshot the effective model dir the form was populated with. We only
+        # push to the server when this changes, otherwise an unrelated save
+        # (API key, port, launch-at-login) would collapse a multi-dir setup
+        # made through the web admin to whatever single dir the form shows.
+        original_effective_model_dir = self.config.get_effective_model_dir()
+
         try:
             port = int(port_str)
             if not (1024 <= port <= 65535):
@@ -508,10 +514,10 @@ class PreferencesWindowController(NSObject):
         self.config.start_server_on_launch = bool(self.auto_start_checkbox.state())
         self.config.save()
 
+        from .server_manager import ServerStatus
+
         # Save API key
         if api_key:
-            from .server_manager import ServerStatus
-
             if self.server_manager.status == ServerStatus.RUNNING:
                 # Update running server via admin API (also saves to settings.json)
                 if not self.config.update_server_api_key_runtime(api_key):
@@ -519,6 +525,18 @@ class PreferencesWindowController(NSObject):
                     self.config.set_server_api_key(api_key)
             else:
                 self.config.set_server_api_key(api_key)
+
+        # Keep the server settings in sync with the DMG app's single model
+        # directory preference. The server reads settings.json on startup and
+        # keeps an in-memory copy while running. Only sync when the value
+        # actually changed so unrelated saves don't overwrite multi-dir setups.
+        new_effective_model_dir = self.config.get_effective_model_dir()
+        if new_effective_model_dir != original_effective_model_dir:
+            if self.server_manager.status == ServerStatus.RUNNING:
+                if not self.config.update_model_dir_runtime(new_effective_model_dir):
+                    self.config.sync_model_dir_to_server_settings(overwrite=True)
+            else:
+                self.config.sync_model_dir_to_server_settings(overwrite=True)
 
         self._apply_launch_at_login(self.config.launch_at_login)
 

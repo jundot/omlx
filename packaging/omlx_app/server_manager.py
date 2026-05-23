@@ -15,7 +15,13 @@ from typing import Callable, Optional, Union
 
 import requests
 
-from .config import ServerConfig, get_log_path
+from .config import (
+    ServerConfig,
+    get_log_path,
+    resolve_local_server_base_url,
+    resolve_local_server_health_url,
+    tcp_probe_connection_targets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +73,13 @@ class ServerManager:
         self._stop_health_check = threading.Event()
         self._adopted = False
 
+        # Persistent session for health checks. Reused across every poll so
+        # the underlying TCP connection is kept alive instead of opening a
+        # fresh socket per check (which lands in TIME_WAIT and, under server
+        # slowdown, can exhaust the host's ephemeral port range).
+        self._health_session = requests.Session()
+        self._health_session.trust_env = False
+
         # Health check failure tracking
         self._consecutive_health_failures: int = 0
         self._max_health_failures: int = 3  # 3 consecutive failures → UNRESPONSIVE
@@ -98,16 +111,18 @@ class ServerManager:
                 logger.error(f"Status callback error: {e}")
 
     def _get_health_url(self) -> str:
-        return f"http://127.0.0.1:{self.config.port}/health"
+        return resolve_local_server_health_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
 
     def get_api_url(self) -> str:
-        return f"http://127.0.0.1:{self.config.port}"
+        return resolve_local_server_base_url(
+            self.config.get_server_bind_host(), self.config.port
+        )
 
     def check_health(self) -> bool:
         try:
-            session = requests.Session()
-            session.trust_env = False
-            response = session.get(self._get_health_url(), timeout=2)
+            response = self._health_session.get(self._get_health_url(), timeout=2)
             return response.status_code == 200
         except requests.RequestException:
             return False
@@ -223,13 +238,16 @@ class ServerManager:
 
     def _is_port_in_use(self) -> bool:
         """Check if the configured port is already in use."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                s.connect(("127.0.0.1", self.config.port))
-                return True
-        except (ConnectionRefusedError, OSError):
-            return False
+        if self._find_port_owner_pid() is not None:
+            return True
+        bind = self.config.get_server_bind_host()
+        for host, port in tcp_probe_connection_targets(bind, self.config.port):
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _is_omlx_server(self) -> bool:
         """Check if the process on the port is an oMLX server."""
@@ -307,6 +325,9 @@ class ServerManager:
 
         self._adopted = False
         self._consecutive_health_failures = 0
+        # Mirror the app's port into the server's settings.json so `omlx launch`
+        # picks up the right port instead of falling back to a stale 8000.
+        self.config.sync_port_to_server_settings()
         args = self.config.build_serve_args()
 
         try:
@@ -334,6 +355,14 @@ class ServerManager:
                 if p not in current:
                     current = p + ":" + current
             env["PATH"] = current
+
+            # Tell the server it is running under the menubar supervisor.
+            # The admin restart endpoint reads this to know whether the
+            # process will be revived after a self-SIGTERM. Set to a
+            # supervisor identifier rather than a bare "1" so future
+            # supervisor types (launchd, systemd, etc.) can advertise
+            # themselves independently.
+            env["OMLX_SUPERVISED"] = "menubar"
 
             self._process = subprocess.Popen(
                 cmd,

@@ -15,13 +15,14 @@ from omlx.api.responses_models import (
     TextFormatConfig,
 )
 from omlx.api.responses_utils import (
-    ResponseStore,
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
+    ResponseStore,
     build_function_call_output_item,
     build_message_output_item,
-    build_response_usage,
+    build_reasoning_output_item,
     build_response_store_record,
+    build_response_usage,
     convert_responses_input_to_messages,
     convert_responses_tools,
     convert_stored_response_to_messages,
@@ -46,6 +47,11 @@ class TestIDGeneration:
         fid = generate_id(IDPrefix.FUNCTION_CALL)
         assert fid.startswith("fc_")
         assert len(fid) == 11  # "fc_" + 8 hex chars
+
+    def test_reasoning_id_prefix(self):
+        rid = generate_id(IDPrefix.REASONING)
+        assert rid.startswith("rs_")
+        assert len(rid) == 27  # "rs_" + 24 hex chars
 
     def test_unique_ids(self):
         ids = {generate_id(IDPrefix.RESPONSE) for _ in range(100)}
@@ -441,6 +447,80 @@ class TestConvertResponsesInput:
         assert messages[0]["content"] == "Previous answer"
         assert messages[1]["tool_calls"][0]["id"] == "call_next"
 
+    def test_reasoning_then_message_attaches_reasoning_content(self):
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "step-by-step"}],
+            ),
+            InputItem(type="message", role="assistant", content="Final answer"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["content"] == "Final answer"
+        assert messages[0]["reasoning_content"] == "step-by-step"
+
+    def test_reasoning_then_function_call_attaches_reasoning_content(self):
+        # Tool-call sequence: reasoning → function_call → function_call_output.
+        # Reasoning must survive into the synthesized assistant tool_calls
+        # message instead of being dropped on the floor.
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "need weather"}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_w",
+                name="get_weather",
+                arguments='{"city":"Paris"}',
+            ),
+            InputItem(type="function_call_output", call_id="call_w", output="sunny"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 2
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert messages[0]["reasoning_content"] == "need weather"
+        assert messages[1]["role"] == "tool"
+        assert messages[1]["content"] == "sunny"
+
+    def test_reasoning_with_multi_part_summary_joined(self):
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[
+                    {"type": "summary_text", "text": "line1"},
+                    {"type": "summary_text", "text": "line2"},
+                ],
+            ),
+            InputItem(type="message", role="assistant", content="ok"),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["reasoning_content"] == "line1\nline2"
+
+    def test_reasoning_orphan_then_tool_calls_only(self):
+        # reasoning followed by function_call but no function_call_output
+        # in the same input — reasoning still lands on the tool_calls message
+        # when the final flush runs.
+        items = [
+            InputItem(
+                type="reasoning",
+                summary=[{"type": "summary_text", "text": "thinking"}],
+            ),
+            InputItem(
+                type="function_call",
+                call_id="call_x",
+                name="lookup",
+                arguments="{}",
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert len(messages) == 1
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert messages[0]["reasoning_content"] == "thinking"
+
 
 # =============================================================================
 # Tool Conversion Tests
@@ -577,6 +657,33 @@ class TestBuildOutputItems:
         assert usage.input_tokens == 100
         assert usage.output_tokens == 50
         assert usage.total_tokens == 150
+        assert usage.input_tokens_details.cached_tokens == 0
+        assert usage.output_tokens_details.reasoning_tokens == 0
+
+    def test_response_usage_with_cached_tokens(self):
+        usage = build_response_usage(100, 50, cached_tokens=30)
+        assert usage.input_tokens == 100
+        assert usage.input_tokens_details.cached_tokens == 30
+
+    def test_response_usage_with_reasoning_tokens(self):
+        usage = build_response_usage(100, 50, reasoning_tokens=20, cached_tokens=30)
+        assert usage.output_tokens == 50
+        assert usage.output_tokens_details.reasoning_tokens == 20
+        assert usage.input_tokens_details.cached_tokens == 30
+
+    def test_build_reasoning_output_item(self):
+        item = build_reasoning_output_item("Step 1: foo. Step 2: bar.")
+        assert item.type == "reasoning"
+        assert item.status == "completed"
+        assert item.id.startswith("rs_")
+        assert len(item.summary) == 1
+        assert item.summary[0].type == "summary_text"
+        assert item.summary[0].text == "Step 1: foo. Step 2: bar."
+
+    def test_build_reasoning_output_item_empty_text(self):
+        item = build_reasoning_output_item("")
+        assert item.type == "reasoning"
+        assert item.summary == []
 
 
 class TestResponseObject:
@@ -831,6 +938,44 @@ class TestConvertStoredResponse:
         assert len(messages) == 1
         assert messages[0]["content"] == "Let me check."
         assert messages[0]["tool_calls"][0]["id"] == "call_abc"
+
+    def test_normalize_reasoning_then_message(self):
+        output_items = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "thinking"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}],
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert len(messages) == 1
+        assert messages[0]["content"] == "answer"
+        assert messages[0]["reasoning_content"] == "thinking"
+
+    def test_normalize_reasoning_then_function_call(self):
+        # Tool-call output sequence — reasoning must attach to the
+        # synthesized assistant tool_calls message.
+        output_items = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "deciding"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_xyz",
+                "name": "lookup",
+                "arguments": '{"q":"foo"}',
+            },
+        ]
+        messages = normalize_response_output_to_messages(output_items)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "assistant"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert messages[0]["reasoning_content"] == "deciding"
 
 
 # =============================================================================

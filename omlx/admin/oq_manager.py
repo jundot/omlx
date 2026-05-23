@@ -22,6 +22,8 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from ..model_discovery import _has_vision_subconfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +76,8 @@ class QuantTask:
     sensitivity_model_path: str = ""
     text_only: bool = False
     dtype: str = "bfloat16"
+    preserve_mtp: bool = False
+    auto_proxy_sensitivity: bool = True
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -186,6 +190,13 @@ class OQManager:
                             if size == 0:
                                 continue
                             tc = config.get("text_config", {})
+                            # has_mtp_heads: top-level OR text_config nested
+                            has_mtp = (
+                                int(config.get("mtp_num_hidden_layers", 0) or 0) > 0
+                                or int(config.get("num_nextn_predict_layers", 0) or 0) > 0
+                                or int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
+                                or int(tc.get("num_nextn_predict_layers", 0) or 0) > 0
+                            )
                             info = {
                                 "name": path.name,
                                 "path": str(path),
@@ -193,7 +204,11 @@ class OQManager:
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "") or tc.get("model_type", ""),
                                 "is_quantized": "quantization" in config,
-                                "is_vlm": "vision_config" in config,
+                                # Treat vision_config / vit_config / mm_vision_tower as VLM
+                                # evidence (Molmo / Molmo2 use vit_config; FastVLM uses
+                                # mm_vision_tower). Same predicate as model_discovery.
+                                "is_vlm": _has_vision_subconfig(config),
+                                "has_mtp_heads": has_mtp,
                             }
                             all_models.append(info)
                             if validate_quantizable(config):
@@ -222,6 +237,8 @@ class OQManager:
         sensitivity_model_path: str = "",
         text_only: bool = False,
         dtype: str = "bfloat16",
+        preserve_mtp: bool = False,
+        auto_proxy_sensitivity: bool = True,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -253,7 +270,9 @@ class OQManager:
             raise ValueError(f"Model not found: {model_path}")
 
         model_name = source.name
-        output_name = resolve_output_name(model_name, oq_level, dtype)
+        output_name = resolve_output_name(
+            model_name, oq_level, dtype, preserve_mtp=preserve_mtp
+        )
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -294,6 +313,8 @@ class OQManager:
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
             dtype=dtype,
+            preserve_mtp=preserve_mtp,
+            auto_proxy_sensitivity=auto_proxy_sensitivity,
         )
         self._tasks[task_id] = task
 
@@ -450,6 +471,8 @@ class OQManager:
                     None,  # hard_cap_bpw
                     task.sensitivity_model_path,
                     task.dtype,
+                    task.preserve_mtp,
+                    task.auto_proxy_sensitivity,
                 )
 
                 if task_id in self._cancelled:

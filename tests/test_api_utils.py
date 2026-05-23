@@ -6,8 +6,13 @@ Tests utility functions from api/utils.py and api/anthropic_utils.py for
 text processing, content extraction, and format conversion.
 """
 
+import logging
+
+import pytest
+
 from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    _chat_template_supports_tool_role,
     _consolidate_system_messages,
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
@@ -1300,6 +1305,83 @@ class TestConvertAnthropicToolsToInternal:
 
         assert result[0]["function"]["name"] == "search"
 
+    def test_drops_server_side_web_search(self):
+        """Anthropic web_search server-side tool is dropped (not executable)."""
+        tools = [AnthropicTool(type="web_search_20250305", name="web_search")]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    def test_drops_server_side_code_execution(self):
+        """Anthropic code_execution server-side tool is dropped."""
+        tools = [
+            AnthropicTool(type="code_execution_20250825", name="code_execution"),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "tool_type,name",
+        [
+            ("bash_20250124", "bash"),
+            ("text_editor_20250728", "str_replace_editor"),
+            ("computer_20250124", "computer"),
+        ],
+    )
+    def test_drops_bash_text_editor_computer(self, tool_type, name):
+        """Computer-use tool family (bash/text_editor/computer) is dropped."""
+        tools = [AnthropicTool(type=tool_type, name=name)]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert result is None
+
+    def test_keeps_user_tools_drops_server_side(self):
+        """Mixed: user tool is forwarded, server-side tool is dropped."""
+        tools = [
+            AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+            AnthropicTool(type="web_search_20250305", name="web_search"),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "get_weather"
+
+    def test_drop_logs_at_info(self, caplog):
+        """Dropping server-side tools emits an INFO log naming each one."""
+        tools = [
+            AnthropicTool(type="web_search_20250305", name="web_search"),
+            AnthropicTool(type="code_execution_20250825", name="code_execution"),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="omlx.api.anthropic_utils"):
+            convert_anthropic_tools_to_internal(tools)
+
+        joined = "\n".join(caplog.messages)
+        assert "Dropped 2" in joined
+        assert "web_search_20250305:web_search" in joined
+        assert "code_execution_20250825:code_execution" in joined
+
+    def test_unknown_type_prefix_is_treated_as_user_tool(self):
+        """Unknown type with input_schema is forwarded as a user tool."""
+        tools = [
+            AnthropicTool(
+                name="custom",
+                type="unknown_kind_v1",
+                input_schema={"type": "object"},
+            ),
+        ]
+
+        result = convert_anthropic_tools_to_internal(tools)
+
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "custom"
+        assert result[0]["function"]["parameters"] == {"type": "object"}
+
 
 class TestConvertInternalToAnthropicResponse:
     """Tests for convert_internal_to_anthropic_response function."""
@@ -2250,6 +2332,36 @@ class TestExtractTextContentPreservesNamePartial:
         result = extract_text_content(messages)
         assert result[0].get("name") == "Kimi"
 
+    def test_preserves_partial_on_tool_call_message(self):
+        """partial field preserved on assistant message with tool_calls."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                partial=True,
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert result[0].get("partial") is True
+
+    def test_preserves_partial_on_tool_call_message_multimodal(self):
+        """partial field preserved on assistant+tool_calls (multimodal path)."""
+        messages = [
+            Message(
+                role="assistant",
+                content="Let me call a tool",
+                partial=True,
+                tool_calls=[
+                    {"id": "1", "function": {"name": "search", "arguments": "{}"}}
+                ],
+            ),
+        ]
+        result = extract_multimodal_content(messages)
+        assert result[0].get("partial") is True
+
     def test_preserves_name_in_multimodal_extraction(self):
         """name field survives multimodal extraction."""
         messages = [
@@ -2458,3 +2570,153 @@ class TestDropVoidAssistantMessages:
         assert result[1]["content"] == "reply"
         assert result[2]["role"] == "user"
         assert "c" in result[2]["content"] and "d" in result[2]["content"]
+
+
+class TestChatTemplateSupportsToolRole:
+    """Tests for the chat-template tool-role probe (issue #1290)."""
+
+    def test_returns_true_when_has_tool_calling_set(self):
+        """Tokenizers flagged by mlx-lm/mlx-vlm pass through immediately."""
+
+        class _Tok:
+            has_tool_calling = True
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_true_when_has_tool_calling_set_even_without_template(self):
+        """Trust the upstream flag even if chat_template attr is missing."""
+
+        class _Tok:
+            has_tool_calling = True
+            chat_template = None
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_true_for_template_with_tool_role_branch(self):
+        """Templates that branch on role == "tool" and emit tool_calls pass."""
+        template = (
+            "{%- for msg in messages %}"
+            '{%- if msg.role == "tool" %}<tool>{{ msg.content }}</tool>'
+            '{%- elif msg.role == "assistant" and msg.tool_calls %}'
+            "{%- for tc in msg.tool_calls %}<tool_call>{{ tc }}</tool_call>{%- endfor %}"
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is True
+
+    def test_returns_false_for_template_without_tool_role(self):
+        """Plain user/assistant templates must keep falling back to user."""
+        template = (
+            "{%- for msg in messages %}"
+            '{%- if msg.role == "user" %}USER: {{ msg.content }}'
+            '{%- elif msg.role == "assistant" %}AGENT: {{ msg.content }}'
+            "{%- endif %}"
+            "{%- endfor %}"
+        )
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+    def test_returns_false_when_only_tool_role_present(self):
+        """Both the tool-role check and tool_calls must appear (false-positive guard)."""
+        template = '{%- if msg.role == "tool" %}{{ msg.content }}{%- endif %}'
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = template
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+    def test_returns_false_for_none_tokenizer(self):
+        assert _chat_template_supports_tool_role(None) is False
+
+    def test_returns_false_for_non_string_template(self):
+        """chat_template may be a callable in mlx-lm — treat as unsupported."""
+
+        class _Tok:
+            has_tool_calling = False
+            chat_template = lambda *a, **k: ""  # noqa: E731
+
+        assert _chat_template_supports_tool_role(_Tok()) is False
+
+
+class TestToolResultWithToolAwareTokenizer:
+    """Tool results are kept as role:tool when the probe matches (#1290)."""
+
+    @staticmethod
+    def _tool_aware_tokenizer():
+        class _Tok:
+            has_tool_calling = False
+            chat_template = (
+                '{%- if msg.role == "tool" %}{{ msg.content }}'
+                "{%- elif msg.tool_calls %}{{ msg.tool_calls }}{%- endif %}"
+            )
+
+        return _Tok()
+
+    def test_extract_text_content_preserves_tool_role(self):
+        messages = [
+            Message(
+                role="tool",
+                content='{"result": "ok"}',
+                tool_call_id="call_xyz",
+            )
+        ]
+        result = extract_text_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_xyz"
+        assert result[0]["content"] == '{"result": "ok"}'
+
+    def test_extract_multimodal_content_preserves_tool_role(self):
+        messages = [
+            Message(
+                role="tool",
+                content=[ContentPart(type="text", text='{"result": "ok"}')],
+                tool_call_id="call_xyz",
+            )
+        ]
+        result = extract_multimodal_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_xyz"
+
+    def test_assistant_tool_calls_kept_structured(self):
+        messages = [
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "call_xyz",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Seoul"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result = extract_text_content(
+            messages, tokenizer=self._tool_aware_tokenizer()
+        )
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert "tool_calls" in result[0]
+        assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        # Arguments are parsed into dict for the chat template.
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
+            "city": "Seoul"
+        }

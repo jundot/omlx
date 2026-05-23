@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import shutil
+import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,8 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from omlx.model_discovery import _has_vision_subconfig
+
 logger = logging.getLogger(__name__)
 
 OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
@@ -32,6 +35,14 @@ OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
+
+_MAX_MODEL_RAM_FRACTION = 0.8
+
+# Auto-built proxy for sensitivity measurement when the source model
+# exceeds available RAM. Uniform 4-bit affine quant — same shape as a
+# user-supplied --sensitivity-model, but built on demand.
+_PROXY_QUANT_BITS = 4
+_PROXY_QUANT_GROUP_SIZE = 64
 
 _LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
 
@@ -135,6 +146,9 @@ def universal_quant_predicate(
         return {"bits": 8, "group_size": 64, "mode": "affine"}
 
     if _is_vision_tensor(path):
+        return False
+
+    if _is_audio_tensor(path):
         return False
 
     if any(
@@ -285,6 +299,16 @@ def _is_vision_tensor(name: str) -> bool:
             "image_norm", "temporal_embed",
         )
     )
+
+
+def _is_audio_tensor(name: str) -> bool:
+    """Check if a tensor belongs to the audio encoder.
+
+    Mirrors `_is_vision_tensor`: matches `audio_tower.*` only, not
+    `embed_audio.*` (the projection from audio output to text hidden size,
+    which is quantized like `embed_vision.embedding_projection`).
+    """
+    return "audio_tower" in name
 
 
 def _is_moe_router(path: str) -> bool:
@@ -684,20 +708,26 @@ def _build_quant_plan(
 
 
 def resolve_output_name(
-    model_name: str, oq_level: int, dtype: str = "bfloat16"
+    model_name: str,
+    oq_level: int,
+    dtype: str = "bfloat16",
+    preserve_mtp: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
     Appends `-fp16` suffix when dtype is float16. bfloat16 is the default and
-    produces no dtype suffix (backwards compatible).
+    produces no dtype suffix (backwards compatible). When preserve_mtp is True,
+    appends `-mtp` so the resulting name reflects that mtp.* tensors and
+    config fields were preserved through quantization.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
+        "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -710,6 +740,8 @@ def resolve_output_name(
     suffix = f"-oQ{level_str}"
     if dtype == "float16":
         suffix += "-fp16"
+    if preserve_mtp:
+        suffix += "-mtp"
     return f"{base}{suffix}"
 
 
@@ -752,32 +784,89 @@ class _TrackedTensor:
     def __truediv__(self, other):
         return self._clone(transform="div")
 
-    # Indexing: handle slice + None (broadcast) + tuple variants
+    @staticmethod
+    def _slice_length(dim, sl):
+        start, stop, step = sl.indices(dim)
+        return len(range(start, stop, step))
+
+    @staticmethod
+    def _detect_half_split(dim, sl):
+        start, stop, step = sl.indices(dim)
+        if step != 1 or dim <= 0 or dim % 2 != 0:
+            return None
+        length = len(range(start, stop, step))
+        if length != dim // 2:
+            return None
+        if start == 0:
+            return 0
+        if start == dim // 2:
+            return 1
+        return None
+
     def __getitem__(self, idx):
         new_shape = list(self.shape)
-        # Handle None-broadcasting like scale[:, None, :, None]
         if isinstance(idx, tuple):
+            if Ellipsis in idx:
+                # Expand Ellipsis to explicit slice(None) for the missing axes
+                # so the tuple-handling branch below (incl. half-split detection)
+                # works for sanitize patterns like gate_up[..., :mid, :].
+                rank = len(new_shape)
+                explicit = sum(
+                    1 for p in idx if p is not Ellipsis and p is not None
+                )
+                pad = max(0, rank - explicit)
+                expanded: list = []
+                seen = False
+                for part in idx:
+                    if part is Ellipsis:
+                        if seen:
+                            raise ValueError(
+                                "only one Ellipsis allowed in index"
+                            )
+                        seen = True
+                        expanded.extend([slice(None)] * pad)
+                    else:
+                        expanded.append(part)
+                idx = tuple(expanded)
             result_shape = []
             axis = 0
+            split_info = None
             for part in idx:
                 if part is None:
                     result_shape.append(1)
                 elif isinstance(part, slice):
                     if axis < len(new_shape):
-                        result_shape.append(new_shape[axis])
+                        dim = new_shape[axis]
+                        length = self._slice_length(dim, part)
+                        result_shape.append(length)
+                        half = self._detect_half_split(dim, part)
+                        if half is not None:
+                            split_info = (axis, half, 2)
                         axis += 1
                     else:
                         result_shape.append(1)
                 else:
-                    # int index → dimension removed
                     if axis < len(new_shape):
                         axis += 1
             while axis < len(new_shape):
                 result_shape.append(new_shape[axis])
                 axis += 1
+            if split_info is not None:
+                ax, idx_n, total = split_info
+                return _TrackedTensor(result_shape, self.dtype, list(self.sources),
+                                     f"split_{idx_n}_{total}", axis=ax)
             return _TrackedTensor(result_shape, self.dtype, list(self.sources), "slice")
         if isinstance(idx, slice):
-            return self._clone(transform="slice")
+            dim = new_shape[0] if new_shape else 0
+            length = self._slice_length(dim, idx) if dim > 0 else 0
+            half = self._detect_half_split(dim, idx) if dim > 0 else None
+            if half is not None:
+                return _TrackedTensor([length] + new_shape[1:], self.dtype,
+                                     list(self.sources), f"split_{half}_2", axis=0)
+            result = list(new_shape)
+            if result:
+                result[0] = length
+            return _TrackedTensor(result, self.dtype, list(self.sources), "slice")
         # int or other
         if new_shape:
             return _TrackedTensor(new_shape[1:], self.dtype, list(self.sources), "slice")
@@ -807,6 +896,27 @@ class _TrackedTensor:
     def astype(self, dtype):
         return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
 
+    def moveaxis(self, src_ax, dst_ax):
+        src_ax = src_ax % self.ndim if src_ax < 0 else src_ax
+        dst_ax = dst_ax % self.ndim if dst_ax < 0 else dst_ax
+        dims = list(range(self.ndim))
+        dims.insert(dst_ax, dims.pop(src_ax))
+        new_shape = tuple(self.shape[d] for d in dims)
+        return _TrackedTensor(new_shape, self.dtype, list(self.sources),
+                              f"moveaxis_{src_ax}_{dst_ax}")
+
+    def transpose(self, *axes):
+        if not axes:
+            axes_list = list(reversed(range(self.ndim)))
+        elif len(axes) == 1 and isinstance(axes[0], (list, tuple)):
+            axes_list = list(axes[0])
+        else:
+            axes_list = list(axes)
+        axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
+        new_shape = tuple(self.shape[a] for a in axes_list)
+        return _TrackedTensor(new_shape, self.dtype, list(self.sources),
+                              "transpose_" + "_".join(str(a) for a in axes_list))
+
     @property
     def T(self):
         return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
@@ -820,117 +930,50 @@ class _TrackedTensor:
 
 
 
-def _streaming_fp8_dequant(lazy_index, scratch_dir=None, shard_bytes=4_000_000_000):
-    """Streaming FP8 dequant with disk spill. For each (weight, weight_scale_inv)
-    pair, materialize both, run block-scaled dequant to bf16, append to a
-    scratch safetensors shard, and re-point the lazy index at it. Peak RAM
-    bounded to one weight + scale + current shard buffer."""
-    import tempfile, struct, json as _json
-    import numpy as _np
-    from pathlib import Path as _Path
+_FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E5M2", "I8"))
 
-    scale_suffix = "_scale_inv"
-    scale_keys = [k for k in lazy_index._index if k.endswith(scale_suffix)]
-    if not scale_keys:
-        return 0
 
-    if scratch_dir is None:
-        scratch_dir = tempfile.mkdtemp(prefix="oq_fp8_dequant_")
-    scratch_dir = _Path(scratch_dir)
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"FP8 dequant scratch dir: {scratch_dir}")
+def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
+    """Block-scaled dequant of a single FP8/I8 weight+scale pair to BF16."""
+    if s_dtype == "F8_E8M0":
+        scale = mx.power(mx.array(2.0), scale_raw.astype(mx.float32) - 127.0)
+    else:
+        scale = scale_raw
 
-    shard_idx = 0
-    shard_path = None
-    shard_fh = None
-    shard_header = {}
-    shard_data_bytes = 0
+    if w_dtype in ("F8_E4M3", "F8_E5M2"):
+        weight = mx.from_fp8(weight_raw, dtype=mx.bfloat16)
+    else:
+        weight = weight_raw.astype(mx.bfloat16)
 
-    def _flush_shard():
-        nonlocal shard_fh
-        if shard_fh is None:
-            return
-        shard_fh.close()
-        tmp_path = shard_path.with_suffix(".tmp")
-        hdr_bytes = _json.dumps(shard_header, separators=(",", ":")).encode("utf-8")
-        hlen = len(hdr_bytes)
-        with open(shard_path, "rb") as src, open(tmp_path, "wb") as dst:
-            dst.write(struct.pack("<Q", hlen))
-            dst.write(hdr_bytes)
-            dst.write(src.read())
-        tmp_path.replace(shard_path)
-        data_offset = 8 + hlen
-        for k, meta in shard_header.items():
-            start, end = meta["data_offsets"]
-            lazy_index._index[k] = (
-                str(shard_path), data_offset, start, end,
-                tuple(meta["shape"]), meta["dtype"],
-            )
-
-    def _open_new_shard():
-        nonlocal shard_idx, shard_path, shard_fh, shard_header, shard_data_bytes
-        shard_idx += 1
-        shard_path = scratch_dir / f"dequant-{shard_idx:04d}.safetensors"
-        shard_fh = open(shard_path, "wb")
-        shard_header = {}
-        shard_data_bytes = 0
-
-    _open_new_shard()
-    count = 0
-
-    for sk in scale_keys:
-        wk = sk.replace(scale_suffix, "")
-        if wk not in lazy_index._index:
-            continue
-        w_meta = lazy_index._index[wk]
-        s_meta = lazy_index._index[sk]
-        w_lt = _LazyTensor(w_meta[0], w_meta[1], w_meta[2], w_meta[3], w_meta[4], w_meta[5])
-        s_lt = _LazyTensor(s_meta[0], s_meta[1], s_meta[2], s_meta[3], s_meta[4], s_meta[5])
-        weight_u8 = w_lt[:]
-        scale_inv = s_lt[:]
-        mx.eval(weight_u8, scale_inv)
-
-        weight = mx.from_fp8(weight_u8, dtype=mx.bfloat16)
-        bs = 128
-        m, n = weight.shape
-        pad_bottom = (-m) % bs
-        pad_side = (-n) % bs
-        weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
-        weight = weight.reshape(
-            ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
+    m, n = weight.shape
+    sm, sn = scale.shape
+    if sm == 0 or sn == 0:
+        raise ValueError(f"degenerate scale shape {scale.shape}")
+    if m % sm != 0 or n % sn != 0:
+        raise ValueError(
+            f"weight shape ({m},{n}) not divisible by scale shape ({sm},{sn})"
         )
-        weight = (weight * scale_inv[:, None, :, None]).reshape(
+    bs_row = m // sm
+    bs_col = n // sn
+
+    if bs_row > 1:
+        pad_bottom = (-m) % bs_row
+        pad_side = (-n) % bs_col
+        if pad_bottom or pad_side:
+            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
+        weight = weight.reshape(sm, bs_row, sn, bs_col)
+        weight = (weight * scale[:, None, :, None]).reshape(
             m + pad_bottom, n + pad_side
         )
-        weight = weight[:m, :n].astype(mx.bfloat16)
-        mx.eval(weight)
+        if pad_bottom or pad_side:
+            weight = weight[:m, :n]
+    else:
+        weight = weight.reshape(m, sn, bs_col)
+        weight = (weight * scale[:, :, None]).reshape(m, n)
 
-        raw = bytes(_np.asarray(weight.view(mx.uint16)))
-        tensor_bytes = len(raw)
-        if shard_data_bytes > 0 and shard_data_bytes + tensor_bytes > shard_bytes:
-            _flush_shard()
-            _open_new_shard()
-
-        start = shard_data_bytes
-        end = start + tensor_bytes
-        shard_fh.write(raw)
-        shard_data_bytes = end
-        shard_header[wk] = {
-            "dtype": "BF16",
-            "shape": list(weight.shape),
-            "data_offsets": [start, end],
-        }
-        lazy_index._index.pop(wk, None)
-        lazy_index._index.pop(sk, None)
-        del weight_u8, scale_inv, weight, raw
-        mx.clear_cache()
-        count += 1
-        if count % 50 == 0:
-            logger.info(f"FP8 dequant: {count} tensors processed")
-
-    _flush_shard()
-    logger.info(f"FP8 dequant complete: {count} tensors spilled to {scratch_dir}")
-    return count
+    weight = weight.astype(mx.bfloat16)
+    mx.eval(weight)
+    return weight
 
 
 def _discover_sanitize_plan(sanitize_fn, lazy_index):
@@ -942,12 +985,18 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     """
     import mlx.core as mx
 
-    # Build tracked dict mirroring the lazy index
+    # Build tracked dict mirroring the lazy index (logical view hides scale
+    # keys and reports FP8 weights as BF16 so sanitize won't call from_fp8)
     tracked = {}
-    for k in lazy_index._index:
-        meta = lazy_index._index[k]
-        shape, dtype = meta[4], meta[5]
-        tracked[k] = _TrackedTensor(shape, dtype, sources=[k])
+    if hasattr(lazy_index, "logical_metadata"):
+        logical = lazy_index.logical_metadata()
+        for k, (shape, dtype) in logical.items():
+            tracked[k] = _TrackedTensor(shape, dtype, sources=[k])
+    else:
+        for k in lazy_index._index:
+            meta = lazy_index._index[k]
+            shape, dtype = meta[4], meta[5]
+            tracked[k] = _TrackedTensor(shape, dtype, sources=[k])
 
     # Monkey-patch mx ops to work on tracked tensors
     _orig = {
@@ -1009,18 +1058,23 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
+            src_ax = src_ax % tensor.ndim if src_ax < 0 else src_ax
+            dst_ax = dst_ax % tensor.ndim if dst_ax < 0 else dst_ax
             dims = list(range(tensor.ndim))
             dims.insert(dst_ax, dims.pop(src_ax))
             new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "moveaxis")
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources),
+                                  f"moveaxis_{src_ax}_{dst_ax}")
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
         if isinstance(tensor, _TrackedTensor):
             if axes is None:
                 axes = list(reversed(range(tensor.ndim)))
+            axes = [a % tensor.ndim if a < 0 else a for a in axes]
             new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "transpose")
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources),
+                                  "transpose_" + "_".join(str(a) for a in axes))
         return _orig["transpose"](tensor, axes=axes)
 
     def _noop(*a, **kw): pass
@@ -1063,17 +1117,26 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             setattr(mx, name, fn)
 
     # Extract plan
+    _REPLAYABLE_PREFIXES = (
+        "passthrough", "literal", "stack", "concatenate", "add",
+        "transpose_", "moveaxis_", "split_",
+    )
     plan = {}
     for k, v in result.items():
         if isinstance(v, _TrackedTensor):
+            t = v.transform
+            if not any(t == p or t.startswith(p) for p in _REPLAYABLE_PREFIXES):
+                raise ValueError(
+                    f"non-replayable transform {t!r} for {k!r} — "
+                    "falling back to eager sanitize"
+                )
             plan[k] = {
                 "sources": v.sources,
-                "transform": v.transform,
+                "transform": t,
                 "shape": v.shape,
                 "axis": v.axis,
             }
         else:
-            # sanitize returned a real value (rare — e.g. a scalar override)
             plan[k] = {
                 "sources": [],
                 "transform": "literal",
@@ -1123,11 +1186,12 @@ class _DiscoveredPlan:
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
+        if hasattr(self._lazy, '_fp8_pairs') and src_key in self._lazy._fp8_pairs:
+            return self._lazy._dequant_one(src_key)
         meta = self._lazy._index.get(src_key)
         if meta is None:
             raise KeyError(f"source tensor {src_key!r} not in lazy index")
         sf_path, data_offset, start, end, shape, dtype = meta
-        # Scalars (0-dim tensors) need special handling
         if len(shape) == 0:
             import numpy as _np
             with open(sf_path, "rb") as f:
@@ -1191,21 +1255,20 @@ class _DiscoveredPlan:
             mx.clear_cache()
             return result
 
-        # NOTE: discovery records transform TYPE but not parameters.
-        # These hardcoded values cover all current mlx-lm/mlx-vlm sanitize
-        # patterns. If a future model uses different parameters, discovery
-        # will fail and the eager sanitize fallback handles it safely.
         if transform == "add":
             arr = self._materialize_source(sources[0])
             return arr + 1.0  # norm weight += 1.0 pattern
 
-        if transform == "transpose":
+        if transform.startswith("transpose_"):
+            axes = [int(a) for a in transform.split("_")[1:]]
             arr = self._materialize_source(sources[0])
-            return mx.transpose(arr)  # full axis reverse
+            return mx.transpose(arr, axes=axes)
 
-        if transform == "moveaxis":
+        if transform.startswith("moveaxis_"):
+            parts = transform.split("_")
+            src_ax, dst_ax = int(parts[1]), int(parts[2])
             arr = self._materialize_source(sources[0])
-            return mx.moveaxis(arr, 2, 1)  # conv1d weight permute
+            return mx.moveaxis(arr, src_ax, dst_ax)
 
         if "split_" in transform:
             # split_N_M means take part N of M
@@ -1223,9 +1286,16 @@ class _DiscoveredPlan:
             # split_idx (index-based split) — less common
             return arr
 
-        # Fallback: just load first source
-        if sources:
+        if transform == "slice":
+            raise ValueError(
+                f"cannot replay arbitrary slice for {key!r} — "
+                "discovery should fall back to eager sanitize"
+            )
+
+        # Fallback: passthrough (identity) — load first source unchanged
+        if transform == "passthrough" and sources:
             return self._materialize_source(sources[0])
+
         raise ValueError(f"cannot materialize {key!r}: transform={transform}, no sources")
 
 
@@ -1256,7 +1326,12 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
-def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) -> dict:
+def estimate_bpw_and_size(
+    model_path: str,
+    oq_level: int,
+    group_size: int = 64,
+    preserve_mtp: bool = False,
+) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
     Applies the universal predicate to each tensor to determine its bit width,
@@ -1264,6 +1339,9 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
 
     Args:
         model_path: Path to source model directory.
+        preserve_mtp: When True, mtp.* tensors are kept (counted toward
+            output size) instead of being skipped. Mirrors the matching
+            argument in ``quantize_oq_streaming``.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
@@ -1332,7 +1410,7 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
                 total_output_bytes += n_elements * 2
                 continue
 
-            if _should_skip_tensor(name):
+            if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
                 continue
 
             bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
@@ -1427,14 +1505,41 @@ _SKIP_QUANT_PATTERNS = (
 )
 
 
-def _should_skip_tensor(name: str) -> bool:
+def _should_skip_tensor(name: str, preserve_mtp: bool = False) -> bool:
     """Check if a tensor should be completely excluded from output.
 
-    These tensors are removed by mlx-lm sanitize() and should not be saved.
+    By default mtp.* tensors are stripped because mlx-lm's stock sanitize()
+    removes them when the model has no MTP head. When ``preserve_mtp`` is
+    True the caller has stashed mtp.* tensors around the sanitize call and
+    re-merged them, so we must keep them in the output shards.
     """
     if ".mtp." in name or name.startswith("mtp."):
-        return True
+        return not preserve_mtp
     return False
+
+
+def _is_mtp_tensor(name: str) -> bool:
+    """Return True iff the tensor key belongs to an MTP head."""
+    return name.startswith("mtp.") or ".mtp." in name
+
+
+def _normalize_mtp_in_config(config: dict) -> None:
+    """Zero out MTP layer counts in the output config (in place).
+
+    Used when preserve_mtp is False so the resulting quantized model
+    presents itself as MTP-free. Without this, the source config's
+    mtp_num_hidden_layers / num_nextn_predict_layers values would survive
+    while the actual mtp.* tensors are stripped, producing the
+    "Missing N parameters" load error we hit on Qwen3.5-27B.
+    """
+    for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+        if key in config and config[key]:
+            config[key] = 0
+    text_cfg = config.get("text_config")
+    if isinstance(text_cfg, dict):
+        for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+            if key in text_cfg and text_cfg[key]:
+                text_cfg[key] = 0
 
 
 def _should_quantize_tensor(name: str, shape: tuple) -> bool:
@@ -1449,22 +1554,53 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
-def _build_model_sanitizer(config: dict):
+def _build_model_sanitizer(config: dict, text_only: bool = False):
     """Build a sanitize function from the model class.
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
     For LLM models, uses mlx-lm's model class.
+    When text_only is True, always uses the LLM path even for VLM
+    architectures so that mlx_lm_mtp patches (which handle MTP sanitize
+    for both dense and MoE) are used instead of the VLM path whose
+    _Proxy-based sanitize drops the MTP head.
 
     Returns:
         A function that takes a dict of weights and returns sanitized weights,
         or None if the model class can't be loaded.
     """
     architectures = config.get("architectures", [])
-    is_vlm = any("ForConditionalGeneration" in a for a in architectures)
+    is_vlm = any("ForConditionalGeneration" in a for a in architectures) and not text_only
 
     if is_vlm:
         try:
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
+
+            # Apply mlx-vlm MTP sanitize patch so qwen3_5/qwen3_5_moe Model
+            # classes keep ``mtp.*`` weights and shift the MTP-specific
+            # RMSNorm tensors by +1 (matching mlx_lm_mtp/qwen35_model.py).
+            # Without this, oQ output ships raw MTP norm weights, the
+            # mlx-lm patched sanitize on load doesn't re-shift (it guards on
+            # the unsanitized conv1d marker, which is False after oQ), and
+            # the MTP head produces garbage logits — 0% accept rate.
+            try:
+                from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+                apply_mlx_vlm_mtp_patch()
+            except Exception as patch_err:
+                logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
+
+            # Remap language_model.model.visual.* -> vision_tower.* for
+            # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
+            # Model.sanitize is current; no-op when already installed or
+            # when upstream mlx-vlm grows the rule itself.
+            try:
+                from omlx.patches.qwen3_6_nested_visual import (
+                    apply_qwen3_6_nested_visual_patch,
+                )
+                apply_qwen3_6_nested_visual_patch()
+            except Exception as patch_err:
+                logger.debug(
+                    f"qwen3_6 nested-visual patch not applied: {patch_err}"
+                )
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
@@ -1480,9 +1616,17 @@ def _build_model_sanitizer(config: dict):
             model_config.vision_config = vision_config
             model_config.text_config = text_config
 
+            # Some VLM Model.sanitize implementations (e.g. Gemma 4) drop
+            # `audio_tower.*` / `embed_audio.*` weights when `self.audio_tower`
+            # is None. Set a truthy sentinel iff the source config carries an
+            # `audio_config` so the audio modality survives sanitize and stays
+            # in the quantization pipeline.
+            has_audio = config.get("audio_config") is not None
+            _AUDIO_SENTINEL = object() if has_audio else None
+
             def _vlm_sanitize(weights):
                 class _Proxy:
-                    audio_tower = None
+                    audio_tower = _AUDIO_SENTINEL
                 proxy = _Proxy()
                 proxy.config = model_config
                 w = model_module.Model.sanitize(proxy, weights)
@@ -1497,7 +1641,8 @@ def _build_model_sanitizer(config: dict):
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
-                f"{model_module.Model.__name__} (preserves vision weights)"
+                f"{model_module.Model.__name__} "
+                f"(preserves vision{', audio' if has_audio else ''} weights)"
             )
             return _vlm_sanitize
         except Exception as e:
@@ -1506,9 +1651,50 @@ def _build_model_sanitizer(config: dict):
     try:
         from mlx_lm.utils import _get_classes
 
+        # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
+        # into ``sys.modules`` by oMLX's base patch. Trigger that here so
+        # ``_get_classes(config)`` for model_type=="deepseek_v4" succeeds.
+        # No-op for other model types.
+        if config.get("model_type") == "deepseek_v4":
+            try:
+                from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+                apply_deepseek_v4_patch()
+            except Exception as patch_err:
+                logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+
+        # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
+        # mtp.* tensors correctly. Idempotent — apply() is a no-op once
+        # patched.
+        try:
+            from omlx.patches.mlx_lm_mtp import (
+                apply_mlx_lm_mtp_patch,
+                is_mtp_active,
+                set_mtp_active,
+            )
+            apply_mlx_lm_mtp_patch()
+            _have_mtp_patch = True
+        except Exception as patch_err:
+            logger.debug(f"mlx-lm MTP patch not applied: {patch_err}")
+            _have_mtp_patch = False
+
         model_class, model_args_class = _get_classes(config)
         args = model_args_class.from_dict(config)
-        model = model_class(args)
+
+        # Force MTP active during model instantiation so the patched
+        # ``__init__`` attaches ``self.mtp``. With ``self.mtp`` attached,
+        # the patched ``Model.sanitize`` keeps ``mtp.*`` weights and applies
+        # the +1 RMSNorm shift to MTP norms (matching backbone). Without
+        # this, mtp.* would be stripped and MTP norms would never receive
+        # the shift, producing 0% accept rate after quantization.
+        if _have_mtp_patch:
+            prev_active = is_mtp_active()
+            try:
+                set_mtp_active(True)
+                model = model_class(args)
+            finally:
+                set_mtp_active(prev_active)
+        else:
+            model = model_class(args)
 
         if hasattr(model, "sanitize"):
             logger.info(
@@ -1556,6 +1742,36 @@ def _build_non_quantizable_set(config: dict) -> set:
         return set()
 
 
+def _is_mtp_protected_tensor(name: str) -> bool:
+    """Tensors inside the MTP head that must stay in full precision.
+
+    Aggressive quantization of the MTP head's fusion projection or final
+    hyper-head collapses draft acceptance to ~0% (oQ4 of an MTP-preserved
+    Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
+    Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
+    semantics under different names (``e_proj`` + ``h_proj`` for the
+    embedding/hidden fusion; ``hc_head.*`` for the final projection).
+    All of these stay in full precision; the MTP block's internal
+    DeepseekV4Block (attn/ffn) gets the same quantization as the
+    backbone's other layers.
+    """
+    if not (name.startswith("mtp.") or ".mtp." in name):
+        return False
+    # Qwen3.5/3.6 fusion projection
+    if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
+        return True
+    # DeepSeek-V4 MTPBlock fusion projections
+    if name.endswith(".e_proj.weight") or name.endswith(".h_proj.weight"):
+        return True
+    # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
+    # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
+    if ".hc_head." in name:
+        return True
+    if name.endswith(".hc_head_fn") or name.endswith(".hc_head_base") or name.endswith(".hc_head_scale"):
+        return True
+    return False
+
+
 def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
                         group_size: int) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
@@ -1563,6 +1779,10 @@ def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
     Returns:
         (bits, group_size, mode) or (None, None, None) if not quantized.
     """
+    # See _is_mtp_protected_tensor for why these tensors stay full precision.
+    if _is_mtp_protected_tensor(tensor_name):
+        return None, None, None
+
     base_bits = _base_bits_for_level(oq_level)
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
@@ -1611,7 +1831,7 @@ _LOAD_CHUNK_BYTES     = max(1 << 20, _METAL_MAX_BUFFER // 2)
 class _LazyTensorIndex:
     _DTYPE_BYTES = {"BF16":2,"F16":2,"F32":4,"F64":8,"I8":1,"U8":1,
                     "I16":2,"U16":2,"I32":4,"U32":4,"I64":8,"U64":8,"BOOL":1,
-                    "F8_E4M3":1,"F8_E5M2":1}
+                    "F8_E4M3":1,"F8_E5M2":1,"F8_E8M0":1}
 
     def __init__(self, weight_files):
         self._index = {}
@@ -1626,38 +1846,102 @@ class _LazyTensorIndex:
                     self._index[k] = (sf_path, data_offset,
                                       meta["data_offsets"][0], meta["data_offsets"][1],
                                       tuple(meta["shape"]), meta["dtype"])
+        self._fp8_pairs = {}
+        self._fp8_scale_keys = set()
+        self._discover_fp8_pairs()
+
+    def _discover_fp8_pairs(self):
+        seen = set()
+        for k in list(self._index):
+            if k.endswith("_scale_inv"):
+                wk = k[:-len("_scale_inv")]
+                if (wk in self._index and wk not in seen
+                        and self._index[wk][5] in _FP8_WEIGHT_DTYPES):
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
+            elif k.endswith(".scale"):
+                wk = k[:-len(".scale")] + ".weight"
+                if (wk in self._index and wk not in seen
+                        and self._index[wk][5] in _FP8_WEIGHT_DTYPES):
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
+        self._fp8_scale_keys = set(self._fp8_pairs.values())
+        if self._fp8_pairs:
+            logger.info(
+                f"FP8 on-the-fly dequant: {len(self._fp8_pairs)} weight+scale pairs detected"
+            )
+
+    def _dequant_one(self, wk):
+        sk = self._fp8_pairs[wk]
+        w_meta = self._index[wk]
+        s_meta = self._index[sk]
+        w_lt = _LazyTensor(w_meta[0], w_meta[1], w_meta[2], w_meta[3], w_meta[4], w_meta[5])
+        s_lt = _LazyTensor(s_meta[0], s_meta[1], s_meta[2], s_meta[3], s_meta[4], s_meta[5])
+        weight_raw = w_lt[:]
+        scale_raw = s_lt[:]
+        mx.eval(weight_raw, scale_raw)
+        weight = _block_dequant_fp8(weight_raw, scale_raw, w_meta[5], s_meta[5])
+        del weight_raw, scale_raw
+        mx.clear_cache()
+        return weight
+
+    def _is_visible(self, k):
+        return k not in self._fp8_scale_keys
+
+    def logical_metadata(self):
+        """Metadata for plan discovery: FP8 weights report as BF16, scale keys hidden."""
+        result = {}
+        for k, meta in self._index.items():
+            if k in self._fp8_scale_keys:
+                continue
+            shape, dtype = meta[4], meta[5]
+            if k in self._fp8_pairs:
+                dtype = "BF16"
+            result[k] = (shape, dtype)
+        return result
 
     def keys(self):
+        base = [k for k in self._index if self._is_visible(k)]
         if hasattr(self, "_overrides"):
-            return list(self._index.keys()) + list(self._overrides.keys())
-        return self._index.keys()
+            base.extend(self._overrides.keys())
+        return base
     def __len__(self):
-        n = len(self._index)
+        n = sum(1 for k in self._index if self._is_visible(k))
         if hasattr(self, "_overrides"): n += len(self._overrides)
         return n
     def __contains__(self, k):
-        if k in self._index: return True
+        if k in self._index and self._is_visible(k): return True
         return hasattr(self, "_overrides") and k in self._overrides
     def __iter__(self):
-        yield from self._index
+        for k in self._index:
+            if self._is_visible(k):
+                yield k
         if hasattr(self, "_overrides"):
             for k in self._overrides:
                 if k not in self._index:
                     yield k
-    def nbytes(self):         return sum(e - s for _,_,s,e,_,_ in self._index.values())
+    def nbytes(self):
+        return sum(e - s for k, (_,_,s,e,_,_) in self._index.items()
+                   if self._is_visible(k))
 
-    def __getitem__(self, key):
-        if key not in self._index:
-            raise KeyError(key)
+    def _load_raw(self, key):
         sf_path, data_offset, start, end, shape, dtype = self._index[key]
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        # Materialize as a real mx.array; _load_rows handles chunking internally.
-        arr = lt[:]
-        return arr
+        return lt[:]
+
+    def __getitem__(self, key):
+        if hasattr(self, "_overrides") and key in self._overrides:
+            return self._overrides[key]
+        if key not in self._index:
+            raise KeyError(key)
+        if key in self._fp8_pairs:
+            return self._dequant_one(key)
+        return self._load_raw(key)
 
     def items(self):
-        # Materialize tensors one at a time so sanitize sees real arrays.
         for k in list(self._index.keys()):
+            if not self._is_visible(k):
+                continue
             yield k, self[k]
             mx.clear_cache()
         if hasattr(self, "_overrides"):
@@ -1665,19 +1949,22 @@ class _LazyTensorIndex:
                 yield k, v
 
     def get(self, key, default=None):
-        if key in self._index:
+        if key in self:
             return self[key]
         return default
 
     def __setitem__(self, key, value):
-        # Sanitize may write back transformed tensors. Store as in-memory
-        # override; remove from lazy index so we don't re-load from disk.
         if not hasattr(self, "_overrides"):
             self._overrides = {}
         self._overrides[key] = value
         self._index.pop(key, None)
+        self._fp8_pairs.pop(key, None)
 
     def __delitem__(self, key):
+        if key in self._fp8_pairs:
+            sk = self._fp8_pairs.pop(key)
+            self._fp8_scale_keys.discard(sk)
+            self._index.pop(sk, None)
         self._index.pop(key, None)
         if hasattr(self, "_overrides"):
             self._overrides.pop(key, None)
@@ -1696,6 +1983,13 @@ class _LazyTensorIndex:
         if key not in self._index:
             if default: return default[0]
             raise KeyError(key)
+        if key in self._fp8_pairs:
+            result = self._dequant_one(key)
+            sk = self._fp8_pairs.pop(key)
+            self._fp8_scale_keys.discard(sk)
+            self._index.pop(key, None)
+            self._index.pop(sk, None)
+            return result
         sf_path, data_offset, start, end, shape, dtype = self._index.pop(key)
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
         arr = lt[:]
@@ -1728,17 +2022,31 @@ class _LazyTensor:
     def nbytes(self):
         return self._end - self._start
 
+    _SF_TO_MLX = {
+        "BF16": mx.bfloat16, "F16": mx.float16, "F32": mx.float32,
+        "I8": mx.int8, "U8": mx.uint8,
+        "I16": mx.int16, "U16": mx.uint16,
+        "I32": mx.int32, "U32": mx.uint32,
+        "I64": mx.int64, "U64": mx.uint64,
+        "F8_E4M3": mx.uint8, "F8_E5M2": mx.uint8, "F8_E8M0": mx.uint8,
+        "BOOL": mx.bool_,
+    }
+
+    _SF_TO_NP = {
+        "BF16": _np.uint16, "F16": _np.float16, "F32": _np.float32, "F64": _np.float64,
+        "I8": _np.int8, "U8": _np.uint8,
+        "I16": _np.int16, "U16": _np.uint16,
+        "I32": _np.int32, "U32": _np.uint32,
+        "I64": _np.int64, "U64": _np.uint64,
+        "F8_E4M3": _np.uint8, "F8_E5M2": _np.uint8, "F8_E8M0": _np.uint8,
+        "BOOL": _np.bool_,
+    }
+
     def _mlx_dtype(self):
-        # FP8 variants are loaded as uint8; sanitize calls mx.from_fp8 to convert
-        if self._dtype in ("F8_E4M3", "F8_E5M2"):
-            return mx.uint8
-        return {"BF16":mx.bfloat16,"F16":mx.float16,"F32":mx.float32}.get(self._dtype, mx.bfloat16)
+        return self._SF_TO_MLX.get(self._dtype, mx.bfloat16)
 
     def _np_view_dtype(self):
-        if self._dtype in ("F8_E4M3", "F8_E5M2"):
-            return _np.uint8
-        if self._bpe == 2: return _np.uint16
-        return _np.dtype({"F32":"<f4","F64":"<f8","I32":"<i4","I64":"<i8"}.get(self._dtype, "<u2"))
+        return self._SF_TO_NP.get(self._dtype, _np.uint16)
 
     def _load_rows(self, r0, r1):
         n = r1 - r0
@@ -1846,6 +2154,8 @@ def quantize_oq_streaming(
     hard_cap_bpw: float | None = None,
     sensitivity_model_path: str = "",
     dtype: str = "bfloat16",
+    preserve_mtp: bool = False,
+    auto_proxy_sensitivity: bool = True,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -1862,6 +2172,20 @@ def quantize_oq_streaming(
         dtype: Target fp dtype for non-quantized weights and quant scales/biases.
             Must be "bfloat16" (default) or "float16". float16 yields ~20%
             faster prefill on M1/M2 Apple Silicon (native fp16 support).
+        preserve_mtp: Keep mtp.* tensors and config fields in the output so
+            the Native MTP toggle works after quantization. Stashes mtp.*
+            keys around the model.sanitize() call (which would otherwise
+            strip them) and re-merges. When False (default), mtp.* tensors
+            are stripped *and* the output config's mtp_num_hidden_layers /
+            num_nextn_predict_layers are normalized to 0 to keep the
+            quantized model self-consistent.
+        auto_proxy_sensitivity: When True (default) and the source model
+            exceeds available RAM, automatically build a temporary uniform
+            4-bit proxy on disk and run sensitivity measurement on it,
+            preserving oQ's data-driven mixed-precision allocation. When
+            False, the quantization aborts on RAM-exceeding models with a
+            RuntimeError so callers always get a real sensitivity-driven
+            output. Ignored if sensitivity_model_path is set explicitly.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -1886,6 +2210,27 @@ def quantize_oq_streaming(
         config = json.load(f)
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
+    # TEMP: DeepSeek V4 sensitivity measurement is unsupported.
+    # - Raw self-sensitivity load_weights fails on missing mtp.0.{e,h}_proj.biases
+    #   because mlx-lm's deepseek_v4 patch attaches MTP projections in
+    #   quantized form while raw checkpoints ship .weight + .scale only.
+    # - Proxy sensitivity (sensitivity_model_path=<8bit>) fails because
+    #   ``_forward_layer`` does not recognize ``DeepseekV4Block.__call__``'s
+    #   (x, mask, cache, input_ids) signature.
+    # Fixing both requires changes outside the oq.py / VLM-MTP scope of
+    # this fix, so abort early with a clear message until that follow-up
+    # lands. Remove this guard once the deepseek_v4 patch + _forward_layer
+    # support land.
+    if config.get("model_type") == "deepseek_v4":
+        raise RuntimeError(
+            "oQ quantization for deepseek_v4 (DeepSeek-V4-Flash) is not "
+            "supported yet: sensitivity measurement fails on both raw load "
+            "(missing mtp.0.{e,h}_proj.biases — model class expects quantized "
+            "form) and proxy load (_forward_layer can't match DeepseekV4Block "
+            "signature). Pending follow-up in mlx-lm deepseek_v4 patch + "
+            "oq.py _forward_layer."
+        )
+
     cb("loading", 5.0)
 
     weight_files = sorted(source.glob("*.safetensors"))
@@ -1901,78 +2246,153 @@ def quantize_oq_streaming(
         f"{len(weight_files)} shards"
     )
 
+    sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
+
     cb("loading", 12.0)
 
-    sanitize_fn = _build_model_sanitizer(config)
-    if sanitize_fn is not None:
-        # Try discovery-based streaming sanitize first (works for any model,
-        # bounds peak memory by materializing one tensor at a time)
-        # Check if source contains FP8 weights — discovery can't capture the
-        # multi-op dequant chain (from_fp8 + pad + reshape + mul + slice + astype)
-        # as a single replayable transform. Fall back to eager sanitize for those.
-        has_fp8 = False
-        if hasattr(all_weights, "_index"):
-            for _k, _meta in all_weights._index.items():
-                if _meta[5] in ("F8_E4M3", "F8_E5M2"):
-                    has_fp8 = True
-                    break
-        if has_fp8:
+    if sensitivity_map_path.exists():
+        sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
+        logger.info(f"{sensitivity_map_path} found, skipping measuring.")
+    else:
+        from omlx.settings import get_system_memory as _get_system_memory
+        _model_bytes = all_weights.nbytes()
+        _system_ram = _get_system_memory()
+        _model_exceeds_ram = _model_bytes > int(_system_ram * _MAX_MODEL_RAM_FRACTION)
+        if _model_exceeds_ram:
             logger.info(
-                f"oQ{oq_level:g}: FP8 source detected, streaming dequant to scratch shards"
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
+                f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
+                "OOM-prone paths will be skipped"
             )
-            try:
-                n_deq = _streaming_fp8_dequant(all_weights)
-                logger.info(f"oQ{oq_level:g}: FP8 dequant complete ({n_deq} tensors)")
-                all_weights = sanitize_fn(all_weights)
-                logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                logger.warning(f"FP8 sanitize failed ({e}), aborting")
-                raise
-        else:
-            try:
-                plan = _discover_sanitize_plan(sanitize_fn, all_weights)
-                all_weights = _DiscoveredPlan(plan, all_weights)
-                logger.info(
-                    f"oQ{oq_level:g}: discovered streaming sanitize plan, "
-                    f"{len(all_weights)} output tensors"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Streaming discovery failed ({e}), falling back to eager sanitize"
-                )
-                try:
-                    all_weights = sanitize_fn(all_weights)
-                    logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
-                except Exception as e2:
-                    logger.warning(f"Sanitize failed ({e2}), using original names")
 
-    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
+        # --- Sensitivity measurement (before sanitize-plan discovery) ---------
+        # Must run before _build_model_sanitizer + _discover_sanitize_plan,
+        # because the discovery pass feeds _TrackedTensor proxies through
+        # Model.sanitize which corrupts mutable state in the MTP sanitize
+        # patch (weights.pop on tracked objects). Running sensitivity first
+        # ensures vlm_load_model sees a pristine patch chain.
+        if sensitivity_model_path:
+            logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
+            sensitivity_map = _measure_sensitivity_from_quantized_model(
+                sensitivity_model_path, config, oq_level,
+                num_samples=128, seq_length=256,
+            )
+        elif _model_exceeds_ram and auto_proxy_sensitivity:
+            logger.warning(
+                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
+                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
+                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
+                "measurement stays data-driven."
+            )
+            _proxy_dir: Path | None = None
+            try:
+                _proxy_dir = _build_proxy_for_sensitivity(
+                    model_path, dtype=dtype, working_dir=str(output.parent),
+                )
+                logger.info(
+                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
+                )
+                sensitivity_map = _measure_sensitivity_from_quantized_model(
+                    str(_proxy_dir), config, oq_level,
+                    num_samples=128, seq_length=256,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "
+                    "Pass sensitivity_model_path with a pre-quantized version "
+                    "of this model, or run on a machine with enough RAM for "
+                    "full-fp16 sensitivity measurement."
+                ) from e
+            finally:
+                if _proxy_dir is not None and _proxy_dir.exists():
+                    shutil.rmtree(_proxy_dir, ignore_errors=True)
+                    logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
+        elif _model_exceeds_ram:
+            raise RuntimeError(
+                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
+                "of system RAM and auto_proxy_sensitivity is disabled. "
+                "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
+                "with a pre-quantized version of this model, or run on a "
+                "machine with enough RAM."
+            )
+        else:
+            logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
+            sensitivity_map = _measure_sensitivity(
+                model_path, config, oq_level,
+                num_samples=128, seq_length=256,
+            )
+
+    # Single enforcement point. Inner measurement helpers may return {} on
+    # load / calibration / layer-discovery failure; treat that as a hard
+    # error here so the rest of quantize_oq_streaming never runs without a
+    # data-driven sensitivity map.
+    if not sensitivity_map:
+        raise RuntimeError(
+            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
+            "Check the preceding log lines for the root cause (model load, "
+            "calibration data, or layer discovery), and either fix it or "
+            "pass an explicit sensitivity_model_path."
+        )
 
     cb("loading", 15.0)
 
-    if sensitivity_model_path:
-        logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
-        sensitivity_map = _measure_sensitivity_from_quantized_model(
-            sensitivity_model_path, config, oq_level,
-            num_samples=128, seq_length=256,
-        )
-    else:
-        logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
-        sensitivity_map = _measure_sensitivity(
-            model_path, config, oq_level,
-            num_samples=128, seq_length=256,
-        )
-    if sensitivity_map:
-        config["_oq_sensitivity_map"] = {
-            str(k): v for k, v in sensitivity_map.items()
-        }
-        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+    # --- Sanitize-plan discovery ------------------------------------------
+    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
+    # When preserve_mtp is True, the patched sanitize functions
+    # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
+    # keep mtp.* in the output and apply the +1 RMSNorm shift to MTP
+    # norms. No stash/merge wrapper needed — the patch covers both paths.
+    if sanitize_fn is not None:
+        try:
+            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+            all_weights = _DiscoveredPlan(plan, all_weights)
+            logger.info(
+                f"oQ{oq_level:g}: discovered streaming sanitize plan, "
+                f"{len(all_weights)} output tensors"
+            )
+        except Exception as e:
+            if _model_exceeds_ram:
+                raise RuntimeError(
+                    f"oQ{oq_level:g}: streaming sanitize-plan discovery "
+                    f"failed ({e}) and the eager fallback is unsafe with "
+                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
+                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
+                    "enough RAM, or extend _TrackedTensor to cover the "
+                    "indexing pattern the sanitize uses."
+                ) from e
+            logger.warning(
+                f"Streaming discovery failed ({e}), falling back to eager sanitize"
+            )
+            try:
+                all_weights = sanitize_fn(all_weights)
+                logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
+            except Exception as e2:
+                logger.warning(f"Sanitize failed ({e2}), using original names")
+
+    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
+    config["_oq_sensitivity_map"] = {
+        str(k): v for k, v in sensitivity_map.items()
+    }
+    logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
         named_shapes = {
-            k: v for k, v in named_shapes.items() if not _is_vision_tensor(k)
+            k: v for k, v in named_shapes.items()
+            if not _is_vision_tensor(k) and not _is_audio_tensor(k)
+        }
+    if not preserve_mtp:
+        # Match the eager path (_should_skip_tensor): when MTP heads are
+        # not being preserved, drop ``mtp.*`` tensors from the plan so the
+        # quantizer doesn't reserve bits for them and the output shards
+        # don't include them. Otherwise the output would carry the source
+        # mtp.* weights while the config's mtp_num_hidden_layers gets
+        # zeroed by _normalize_mtp_in_config — a config/weights mismatch
+        # that breaks VLM load with "Received N parameters not in model".
+        named_shapes = {
+            k: v for k, v in named_shapes.items() if not _is_mtp_tensor(k)
         }
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
@@ -2013,7 +2433,17 @@ def quantize_oq_streaming(
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
-        if text_only and _is_vision_tensor(tensor_name):
+        if text_only and (
+            _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
+        ):
+            del w_mx
+            processed_bytes += tensor_bytes
+            continue
+
+        if not preserve_mtp and _is_mtp_tensor(tensor_name):
+            # Strip MTP tensors when the caller asked not to preserve them.
+            # _normalize_mtp_in_config will zero mtp_num_hidden_layers in
+            # the output config so the result stays self-consistent.
             del w_mx
             processed_bytes += tensor_bytes
             continue
@@ -2146,8 +2576,19 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         for key in ("vision_config", "image_token_id", "video_token_id",
-                     "vision_start_token_id", "vision_end_token_id"):
+                     "vision_start_token_id", "vision_end_token_id",
+                     "audio_config", "audio_token_id",
+                     "boa_token_id", "eoa_token_id", "eoa_token_index"):
             output_config.pop(key, None)
+    if not preserve_mtp:
+        # Default path: zero out MTP layer counts so the quantized model
+        # doesn't claim to have an MTP head while its weights have been
+        # stripped. This keeps the output self-consistent — mtp_enabled
+        # toggle's compatibility check (_has_mtp_heads) reads these
+        # fields and will correctly report "no MTP heads" instead of
+        # crashing during model.load_weights() with the cryptic
+        # "Missing N parameters" error.
+        _normalize_mtp_in_config(output_config)
     # Ensure eos_token_id is present (mlx-lm adds it from tokenizer)
     if "eos_token_id" not in output_config:
         try:
@@ -2214,7 +2655,7 @@ CALIB_DATASETS = {
     "c4": "C4 (Web Crawl)",
     "code": "Code (StarCoder)",
     "multilingual": "Multilingual (CulturaX)",
-    "code_multilingual": "Code + Multilingual",
+    "code_multilingual": "Code + Multilingual + Reasoning",
 }
 
 
@@ -2281,7 +2722,7 @@ def _load_builtin_calibration(tokenizer, dataset: str, num_samples: int,
 
     if dataset == "code_multilingual":
         texts = []
-        for key in ("code", "en", "ko", "zh", "ja", "tool_calling"):
+        for key in ("code", "en", "ko", "zh", "ja", "tool_calling", "reasoning"):
             texts.extend(all_data.get(key, []))
     elif dataset == "code":
         texts = all_data.get("code", []) + all_data.get("en", [])
@@ -2625,26 +3066,65 @@ def _measure_sensitivity(
     num_samples=32, seq_length=256,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
-    is_vlm = "vision_config" in config
+    from omlx.utils.model_loading import (
+        _has_mtp_heads,
+        maybe_apply_pre_load_patches,
+    )
+
+    # Reuse the centralised pre-load dispatch so every current and future
+    # patch (MTP sanitize, DeepSeek V4, nested-visual, load_config, …) is
+    # applied exactly as in the production load path.
+    maybe_apply_pre_load_patches(model_path)
+
+    # Treat any model with a vision sub-config (vision_config / vit_config /
+    # mm_vision_tower) as a VLM for the MTP attach decision. The classifier
+    # in model_discovery._has_vision_subconfig owns the canonical predicate.
+    is_vlm = _has_vision_subconfig(config)
+
+    # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
+    # for the text path: the patched qwen35_model.sanitize self-consistently
+    # strips mtp.* when no head is attached. The VLM path needs both patches.
+    # apply_mlx_vlm_mtp_patch fixes Model.sanitize so language_model.mtp.*
+    # weights survive the load with the correct keys (stock mlx-vlm sanitize
+    # strips them, which is what made the strict load fail with "Missing N
+    # parameters" and the measurement silently return {}). The runtime patch
+    # then attaches the MTP head so the checkpoint matches the model. Both
+    # are idempotent. Sensitivity only reads backbone decoder layers, so this
+    # is load-only.
+    restore_mtp_active = None
+    if is_vlm and _has_mtp_heads(config):
+        try:
+            from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+            from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch, apply_mlx_vlm_mtp_runtime_patch
+
+            apply_mlx_vlm_mtp_patch()
+            apply_mlx_vlm_mtp_runtime_patch()
+            prev_active = is_mtp_active()
+            set_mtp_active(True)
+            restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
+        except Exception as e:
+            logger.debug(f"mlx-vlm MTP runtime patch skipped for sensitivity: {e}")
 
     try:
         if is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
             model = vlm_load_model(Path(model_path), lazy=True)
-            from mlx_lm import load as lm_load
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
 
-            _, tokenizer = lm_load(model_path, lazy=True)
+            tokenizer = load_tokenizer(Path(model_path))
         else:
             from mlx_lm import load as lm_load
 
             model, tokenizer = lm_load(model_path, lazy=True)
     except Exception as e:
-        logger.warning(
-            f"Sensitivity measurement: model load failed ({e}), "
-            "using position-based"
+        logger.error(
+            f"Sensitivity measurement: model load failed ({e})"
         )
         return {}
+    finally:
+        if restore_mtp_active is not None:
+            restore_mtp_active()
 
     sensitivity = _measure_sensitivity_from_model(
         model, tokenizer, config, oq_level,
@@ -2661,6 +3141,67 @@ def _measure_sensitivity(
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
 
 
+def _build_proxy_for_sensitivity(
+    model_path: str,
+    *,
+    dtype: str,
+    working_dir: str | None = None,
+    trust_remote_code: bool = False,
+) -> Path:
+    """Build a temporary uniform 4-bit proxy for sensitivity measurement.
+
+    Used when the source model exceeds available RAM and full-fp16
+    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
+    without it, quantize_oq_streaming aborts the run with a RuntimeError.
+
+    ``working_dir`` controls where the proxy is written. Defaults to the
+    system temp dir when None, but callers should pass the parent of the
+    output directory so the proxy lands on the same volume the user has
+    already provisioned for the quantized output. This avoids the trap of
+    Linux ``/tmp`` being tmpfs (RAM-backed), which would defeat the whole
+    point of the OOM-driven proxy.
+
+    The caller is responsible for deleting the returned directory.
+    """
+    try:
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+
+        from mlx_lm import convert
+
+        # mlx-lm's convert() refuses to write into a pre-existing directory,
+        # so reserve a unique temp name and let convert() create it.
+        proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
+        shutil.rmtree(proxy_dir)
+        convert(
+            hf_path=model_path,
+            mlx_path=str(proxy_dir),
+            quantize=True,
+            q_bits=_PROXY_QUANT_BITS,
+            q_group_size=_PROXY_QUANT_GROUP_SIZE,
+            q_mode="affine",
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        return proxy_dir
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
+
+
 def _measure_sensitivity_from_quantized_model(
     model_path: str, config: dict, oq_level,
     calib_dataset="code_multilingual",
@@ -2674,11 +3215,35 @@ def _measure_sensitivity_from_quantized_model(
     """
     from mlx_lm import load as lm_load
 
+    # Mirror the main quantize path's MTP patch sequence so an
+    # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
+    # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
+    # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
+    # ``mtp.*`` weights present in the proxy.
     try:
-        model, tokenizer = lm_load(model_path, lazy=True)
-    except Exception as e:
-        logger.warning(f"Sensitivity proxy load failed ({e}), using position-based")
-        return {}
+        from omlx.patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            is_mtp_active,
+            set_mtp_active,
+        )
+        _have_lm_patch = apply_mlx_lm_mtp_patch()
+    except Exception:
+        _have_lm_patch = False
+        is_mtp_active = None
+        set_mtp_active = None
+
+    prev_active = is_mtp_active() if _have_lm_patch else False
+    try:
+        if _have_lm_patch:
+            set_mtp_active(True)
+        try:
+            model, tokenizer = lm_load(model_path, lazy=True)
+        except Exception as e:
+            logger.error(f"Sensitivity proxy load failed ({e})")
+            return {}
+    finally:
+        if _have_lm_patch:
+            set_mtp_active(prev_active)
 
     calib_data = _load_calibration_data(
         tokenizer, dataset=calib_dataset,
@@ -2707,6 +3272,10 @@ def _measure_sensitivity_from_quantized_model(
         out_baseline = _forward_layer(block, inputs, layer_mask, position_ids)
         if out_baseline is None:
             continue
+        # Materialize the baseline before mutating module weights below.
+        # Without this, the lazy graph would resolve baseline against the
+        # already-perturbed weights and the MSE would always be ~0.
+        mx.eval(out_baseline)
 
         saved = {}
         for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
@@ -2714,13 +3283,12 @@ def _measure_sensitivity_from_quantized_model(
                 continue
             bits = getattr(m, "bits", 4)
             gs = getattr(m, "group_size", 64)
-            mode = getattr(m, "mode", "affine")
             perturb_bits = bits - 1
             if perturb_bits not in _REQUANT_VALID_BITS:
                 continue
             w_float = mx.dequantize(
                 m.weight, m.scales, getattr(m, "biases", None),
-                group_size=gs, bits=bits, mode=mode,
+                group_size=gs, bits=bits,
             )
             saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits)
             qw, sc, *rest = mx.quantize(w_float, group_size=gs, bits=perturb_bits, mode="affine")
@@ -2728,6 +3296,12 @@ def _measure_sensitivity_from_quantized_model(
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
+            # Force re-quant materialization so the next forward sees the
+            # perturbed weights instead of the lazy reference to the originals.
+            if m.biases is not None:
+                mx.eval(m.weight, m.scales, m.biases)
+            else:
+                mx.eval(m.weight, m.scales)
 
         out_perturbed = _forward_layer(block, inputs, layer_mask, position_ids)
 
@@ -2741,11 +3315,17 @@ def _measure_sensitivity_from_quantized_model(
                 mod.scales = s
                 if b is not None:
                     mod.biases = b
+                elif hasattr(mod, "biases"):
+                    del mod.biases
                 mod.bits = orig_bits
 
         if out_perturbed is not None:
-            raw_mse = ((out_baseline - out_perturbed) ** 2).mean()
-            out_mag = (out_baseline ** 2).mean()
+            # Cast to float32 first: float16 squared differences overflow
+            # easily on long sequences, producing NaN sensitivity scores.
+            ob32 = out_baseline.astype(mx.float32)
+            op32 = out_perturbed.astype(mx.float32)
+            raw_mse = ((ob32 - op32) ** 2).mean()
+            out_mag = (ob32 ** 2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()

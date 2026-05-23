@@ -110,7 +110,7 @@ class Request:
     request_id: str
     prompt: Union[str, List[int]]
     sampling_params: SamplingParams
-    arrival_time: float = field(default_factory=time.time)
+    arrival_time: float = field(default_factory=time.monotonic)
     priority: int = 0  # Lower is higher priority
 
     # Set after tokenization
@@ -122,6 +122,8 @@ class Request:
     num_computed_tokens: int = 0
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
+    generation_started_at: Optional[float] = None
+    last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator

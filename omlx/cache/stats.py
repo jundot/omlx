@@ -88,6 +88,8 @@ class PrefixCacheStats(BaseCacheStats):
     block_size: int = 0
     last_partial_tokens_skipped: int = 0
     last_tokens_to_next_block: int = 0
+    tokens_matched_total: int = 0
+    tokens_requested_total: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -111,6 +113,8 @@ class PrefixCacheStats(BaseCacheStats):
         self.partial_tokens_skipped = 0
         self.last_partial_tokens_skipped = 0
         self.last_tokens_to_next_block = 0
+        self.tokens_matched_total = 0
+        self.tokens_requested_total = 0
         self._total_queries = 0
 
 

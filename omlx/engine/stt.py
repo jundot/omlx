@@ -11,7 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 import mlx.core as mx
 
@@ -19,6 +19,93 @@ from ..engine_core import get_mlx_executor
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+
+# Lowercase full-names work for both Qwen3-ASR (its _build_prompt lowercases
+# the supported-language list before lookup) and Whisper (its TO_LANGUAGE_CODE
+# normalizer maps lowercase names to ISO codes). Capitalized names would break
+# Whisper because `<|Chinese|>` is not a valid language token.
+_ISO_TO_STT_LANG: dict[str, str] = {
+    "zh": "chinese",
+    "yue": "cantonese",
+    "en": "english",
+    "de": "german",
+    "es": "spanish",
+    "fr": "french",
+    "it": "italian",
+    "pt": "portuguese",
+    "ru": "russian",
+    "ko": "korean",
+    "ja": "japanese",
+}
+
+
+def _normalize_stt_generate_language(language: str | None) -> str | None:
+    """Map OpenAI-style ISO codes to language names accepted by mlx-audio backends."""
+    if language is None:
+        return None
+
+    normalized = language.strip()
+    if not normalized:
+        return None
+
+    return _ISO_TO_STT_LANG.get(normalized.lower(), normalized)
+
+
+# ---------------------------------------------------------------------------
+# Error helpers (#800): turn opaque mlx-audio/HF processor failures into
+# actionable RuntimeErrors that tell users which file is missing and where
+# to find a compatible variant.
+# ---------------------------------------------------------------------------
+
+
+_MISSING_PROCESSOR_HINTS = (
+    "preprocessor_config.json",
+    "feature extractor",
+    "featureextractor",
+)
+
+
+def _looks_like_missing_processor(message: str) -> bool:
+    """True if the error text from mlx-audio / HF points at a missing processor."""
+    lowered = message.lower()
+    return any(h in lowered for h in _MISSING_PROCESSOR_HINTS)
+
+
+def _missing_processor_hint(model_name: str) -> str:
+    return (
+        f"STT model '{model_name}' is missing the HuggingFace processor / "
+        "feature-extractor configuration (preprocessor_config.json and/or "
+        "tokenizer files). MLX-converted repositories sometimes omit these. "
+        "Fix: either use an HF-compatible variant of the model or copy "
+        "preprocessor_config.json, tokenizer.json and special_tokens_map.json "
+        "from the upstream HuggingFace repo into the local model directory."
+    )
+
+
+def _wrap_stt_load_error(model_name: str, exc: Exception) -> Exception:
+    """Return a clearer exception for known mlx-audio STT load failures."""
+    message = str(exc)
+    if _looks_like_missing_processor(message):
+        return RuntimeError(
+            f"{_missing_processor_hint(model_name)} Original error: {message}"
+        )
+    return exc
+
+
+def _validate_stt_processor(model_name: str, model: Any) -> None:
+    """Fail fast if a Whisper-family mlx-audio model loaded without a processor."""
+    module_name = type(model).__module__ or ""
+    is_whisper_like = "whisper" in module_name.lower()
+    if not is_whisper_like:
+        return
+    # mlx-audio Whisper attaches a HF processor to ``_processor``; it's set
+    # to None when WhisperProcessor.from_pretrained() failed on load.
+    if not hasattr(model, "_processor"):
+        return
+    if model._processor is not None:
+        return
+    raise RuntimeError(_missing_processor_hint(model_name))
 
 
 class STTEngine(BaseNonStreamingEngine):
@@ -78,9 +165,23 @@ class STTEngine(BaseNonStreamingEngine):
             return _load_model(model_name)
 
         loop = asyncio.get_running_loop()
-        self._model = await loop.run_in_executor(
-            get_mlx_executor(), _load_sync
-        )
+        try:
+            model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
+        except Exception as exc:
+            # #800: MLX-packaged repos (Qwen3-ASR-*-MLX-*, some mlx-community
+            # whisper variants) often omit preprocessor_config.json, which
+            # mlx-audio / HuggingFace AutoFeatureExtractor reports with an
+            # opaque OSError. Re-raise with an actionable message instead.
+            raise _wrap_stt_load_error(model_name, exc) from exc
+
+        # #800: Whisper models in mlx-audio load silently without a
+        # HuggingFace processor when preprocessor_config.json is missing
+        # (mlx-audio only emits a warning). Fail fast at start so callers
+        # see the real problem instead of a downstream "Processor not found"
+        # 500 during transcribe.
+        _validate_stt_processor(model_name, model)
+
+        self._model = model
         logger.info(f"STT engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -101,9 +202,9 @@ class STTEngine(BaseNonStreamingEngine):
     async def transcribe(
         self,
         audio_path: str,
-        language: Optional[str] = None,
+        language: str | None = None,
         **kwargs,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Transcribe an audio file.
 
@@ -158,7 +259,12 @@ class STTEngine(BaseNonStreamingEngine):
         def _transcribe_sync():
             # Call model.generate() directly instead of
             # generate_transcription() which writes files to disk.
-            result = model.generate(audio_path, **kwargs)
+            gen_kwargs = dict(kwargs)
+            generate_language = _normalize_stt_generate_language(language)
+            if generate_language is not None:
+                gen_kwargs["language"] = generate_language
+
+            result = model.generate(audio_path, **gen_kwargs)
 
             # result is typically an STTOutput dataclass with:
             # text, segments, language, total_time, etc.
@@ -190,8 +296,11 @@ class STTEngine(BaseNonStreamingEngine):
                 "duration": 0.0,
             }
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "transcribing",
+            detail="Transcribing",
+            metadata={"file_size_bytes": file_size},
+        )
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -206,14 +315,14 @@ class STTEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         return {
             "model_name": self._model_name,

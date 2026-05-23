@@ -10,7 +10,7 @@ These models define the request and response schemas for:
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -112,12 +112,35 @@ class AnthropicMessage(BaseModel):
 
 
 class AnthropicTool(BaseModel):
-    """Tool definition in Anthropic format."""
+    """Tool definition in Anthropic format.
+
+    Supports two shapes:
+      1. User-defined tool: requires ``input_schema``.
+      2. Anthropic server-side tool (web_search, code_execution, bash,
+         text_editor, computer): carries a versioned ``type`` like
+         ``web_search_20250305`` and no ``input_schema``. oMLX cannot execute
+         these locally; they are accepted for compatibility with clients such
+         as Claude for Excel/PowerPoint/Word and dropped before inference.
+    """
 
     name: str
     description: str | None = None
-    input_schema: dict[str, Any]
+    input_schema: dict[str, Any] | None = None
+    type: str | None = None
     cache_control: dict[str, str] | None = None
+
+    # Forward-compat with extra fields Anthropic may attach to server-side
+    # tools (e.g. max_uses, allowed_domains, user_location for web_search).
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _require_schema_or_type(self) -> "AnthropicTool":
+        if self.input_schema is None and self.type is None:
+            raise ValueError(
+                "AnthropicTool requires either 'input_schema' (user-defined "
+                "tool) or 'type' (Anthropic server-side tool)."
+            )
+        return self
 
 
 class ToolChoice(BaseModel):

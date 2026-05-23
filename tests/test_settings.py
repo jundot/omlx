@@ -43,6 +43,7 @@ class TestServerSettings:
         assert settings.port == 8000
         assert settings.log_level == "info"
         assert settings.cors_origins == ["*"]
+        assert settings.sse_keepalive_mode == "chunk"
 
     def test_custom_values(self):
         """Test custom values."""
@@ -67,7 +68,15 @@ class TestServerSettings:
             "log_level": "info",
             "cors_origins": ["*"],
             "server_aliases": [],
+            "sse_keepalive_mode": "chunk",
         }
+
+    def test_from_dict_sse_keepalive_mode(self):
+        """sse_keepalive_mode round-trips through from_dict / to_dict."""
+        for mode in ("chunk", "comment", "off"):
+            settings = ServerSettings.from_dict({"sse_keepalive_mode": mode})
+            assert settings.sse_keepalive_mode == mode
+            assert settings.to_dict()["sse_keepalive_mode"] == mode
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -264,6 +273,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "chunked_prefill": False,
         }
 
     def test_from_dict(self):
@@ -664,7 +674,12 @@ class TestMemorySettings:
         """Test serialization."""
         settings = MemorySettings(max_process_memory="75%")
         d = settings.to_dict()
-        assert d == {"max_process_memory": "75%", "prefill_memory_guard": True}
+        assert d == {
+            "max_process_memory": "75%",
+            "prefill_memory_guard": True,
+            "soft_threshold": 0.85,
+            "hard_threshold": 0.95,
+        }
 
     def test_to_dict_guard_disabled(self):
         """Test serialization with prefill guard disabled."""
@@ -935,6 +950,21 @@ class TestGlobalSettings:
         for level in ["trace", "debug", "info", "warning", "error", "critical"]:
             settings = GlobalSettings()
             settings.server.log_level = level
+            errors = settings.validate()
+            assert errors == []
+
+    def test_validate_invalid_sse_keepalive_mode(self):
+        """Validation rejects unknown sse_keepalive_mode values."""
+        settings = GlobalSettings()
+        settings.server.sse_keepalive_mode = "bogus"
+        errors = settings.validate()
+        assert any("sse_keepalive_mode" in e for e in errors)
+
+    def test_validate_valid_sse_keepalive_modes(self):
+        """Validation accepts chunk / comment / off."""
+        for mode in ("chunk", "comment", "off"):
+            settings = GlobalSettings()
+            settings.server.sse_keepalive_mode = mode
             errors = settings.validate()
             assert errors == []
 

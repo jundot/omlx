@@ -110,12 +110,17 @@
                             <div class="flex items-center gap-3">
                                 <!-- Memory progress bar -->
                                 <div class="flex items-center gap-2">
-                                    <div class="w-24 h-2 bg-neutral-200 rounded-full overflow-hidden">
-                                        <div class="h-full bg-neutral-700 rounded-full transition-all duration-500"
-                                             :style="'width: ' + activeModelsMemoryPercent + '%'"></div>
+                                    <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                                        <div class="rounded-full transition-all duration-300"
+                                             :style="activeModelsPressureBarStyle"></div>
+                                        <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
+                                             x-cloak
+                                             class="absolute inset-y-0"
+                                             :style="activeModelsSoftMarkerStyle">
+                                        </div>
                                     </div>
                                     <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                                          x-text="formatSizeBytes(stats.active_models.model_memory_used) + ' / ' + formatSizeBytes(stats.active_models.model_memory_max)"></span>
+                                          x-text="activeModelsPressureLabel()"></span>
                                 </div>
                             </div>
                         </div>
@@ -143,7 +148,7 @@
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5">
                                                         <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                                        <span class="text-xs text-blue-500 font-medium">loading</span>
+                                                        <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
                                                     </div>
                                                 </template>
                                                 <!-- Prefilling -->
@@ -169,7 +174,7 @@
                                                 </template>
                                             </div>
                                             <!-- Memory size -->
-                                            <span class="text-xs text-neutral-400 font-mono w-16 text-right" x-text="m.estimated_size_formatted"></span>
+                                            <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="modelSizeLabel(m)"></span>
                                             <!-- Unload button -->
                                             <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
                                                  x-data="{ showTip: false }"
@@ -195,7 +200,10 @@
                                                              :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
                                                     </div>
                                                     <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                                    <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
+                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                                    <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
                                                     <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
                                                           x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
                                                 </div>
@@ -206,10 +214,48 @@
                                     <template x-if="m.generating && m.generating.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">
                                             <template x-for="gen in m.generating" :key="gen.request_id">
-                                                <div class="flex items-center gap-2">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
                                                     <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
-                                                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-                                                    <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                                    </span>
+                                                    <span class="text-[10px] text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
+                                                    <span x-show="gen.tokens_per_second > 0" class="text-[10px] text-neutral-400 w-20 whitespace-nowrap"
+                                                          x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
+                                                    <span x-show="gen.last_activity_age_seconds >= 3" class="text-[10px] text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
+                                                    <span x-show="gen.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap"
+                                                          x-text="formatDurationShort(gen.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Non-streaming activity sub-rows -->
+                                    <template x-if="m.activities && m.activities.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="activity in m.activities" :key="activity.request_id">
+                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                                    </span>
+                                                    <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
+                                                    <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Waiting sub-rows -->
+                                    <template x-if="m.waiting && m.waiting.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="wait in m.waiting" :key="wait.request_id">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
+                                                    <span class="w-2 h-2 rounded-full bg-amber-300"></span>
+                                                    <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
+                                                    <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -241,8 +287,47 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
                             </div>
                             <div class="flex items-center gap-2">
-                                <span class="text-xs text-neutral-500"
-                                      x-text="formatNumber((stats.runtime_cache?.total_num_files || 0)) + ' files · ' + formatSizeBytes((stats.runtime_cache?.total_size_bytes || 0))"></span>
+                                <!-- Memory gauge (only when hot cache is enabled AND models are loaded) -->
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">Memory</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeHotCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache.hot_cache_size_bytes) + ' / ' + formatSizeBytes(stats.runtime_cache.hot_cache_max_bytes) + ' · ' + (stats.runtime_cache.hot_cache_entries || 0) + ' entries'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
+                                                @click="showClearHotCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                title="Clear memory cache">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <button @click="clearHotCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearHotCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Separator (only when both tiers visible) -->
+                                <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
+                                <!-- SSD gauge (always visible) -->
+                                <div class="flex items-center gap-2">
+                                    <span class="text-xs text-neutral-400">SSD</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
+                                          x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                                </div>
                                 <div class="flex items-center gap-1.5">
                                     <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
                                             @click="showClearSsdCacheConfirm = true"
@@ -286,6 +371,33 @@
                                 </div>
                             </div>
 
+                            <!-- Cache rates (visible when models are loaded, session scope only) -->
+                            <div x-show="statsScope !== 'alltime' && stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
+                                 x-data="{ get c() { return cacheObsCumulative(stats, selectedStatsModel) } }"
+                                 :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
+                                 class="grid gap-3 border border-neutral-100 rounded-lg p-3">
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Hit Rate</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Hit Rate</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
+                                </div>
+                                <div>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Evictions</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.evictions || 0).toLocaleString()"></p>
+                                </div>
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Evictions</p>
+                                    <p class="text-lg font-bold text-neutral-900"
+                                       x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
+                                </div>
+                            </div>
+
                             <div x-show="stats.runtime_cache?.models && stats.runtime_cache.models.length > 0" x-cloak
                                  class="overflow-x-auto border border-neutral-100 rounded-lg">
                                 <table class="min-w-full text-xs">
@@ -295,8 +407,10 @@
                                             <th class="px-3 py-2 text-right">Block Size</th>
                                             <th class="px-3 py-2 text-right">Indexed Blocks</th>
                                             <th class="px-3 py-2 text-right">Sub-block Cache</th>
-                                            <th class="px-3 py-2 text-right">Cache Files</th>
-                                            <th class="px-3 py-2 text-right">Cache Size</th>
+                                            <th class="px-3 py-2 text-right">SSD Files</th>
+                                            <th class="px-3 py-2 text-right">SSD Size</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Entries</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Size</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-neutral-100 text-neutral-700">
@@ -317,6 +431,8 @@
                                                 </td>
                                                 <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
                                                 <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
+                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -520,199 +636,157 @@
                         </div>
                     </div>
 
-                    <!-- Other Integrations -->
+                    <!-- Applications -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
-                                <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
+                                <i data-lucide="layout-grid" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.integrations.section_label') }}</span>
                             </div>
                         </div>
-                        <div class="px-6 py-5 space-y-6">
-                            <!-- Codex -->
-                            <div>
-                                <div class="flex items-center gap-2 mb-3">
-                                    <span class="text-base font-bold text-neutral-800">Codex</span>
-                                    <span class="text-xs text-neutral-400">OpenAI Codex CLI</span>
+                        <div class="divide-y divide-neutral-100">
+
+                            <!-- Claude Code -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/claude.png" alt="Claude Code" class="w-full h-full object-cover">
                                 </div>
-                                <div class="flex flex-col sm:flex-row gap-4 items-start">
-                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
-                                        <select x-model="globalSettings.integrations.codex_model"
-                                                @change="globalSettings.integrations.codex_model = globalSettings.integrations.codex_model || null; saveIntegrationSettings()"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                            <option value="">{{ t('status.integrations.select_model') }}</option>
-                                            <template x-for="m in llmModels" :key="m.id">
-                                                <option :value="m.id" x-text="m.id"></option>
-                                            </template>
-                                        </select>
-                                        <div x-show="globalSettings.integrations.codex_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.codex_model)"
-                                             x-cloak
-                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
-                                        </div>
-                                    </div>
-                                    <div class="flex-1 min-w-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
-                                        <div class="relative group">
-                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
-                                                 x-text="codexCommand"></pre>
-                                            <button x-data="{ copied: false }"
-                                                    @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
-                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
-                                                    :title="window.t('status.integrations.copy_command_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                    </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Claude Code</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="claudeCommand"></code>
                                 </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(claudeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
                             </div>
 
-                            <div class="border-t border-neutral-100 my-2"></div>
+                            <!-- Codex -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/codex.png" alt="Codex" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Codex</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="codexCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
 
                             <!-- OpenCode -->
-                            <div>
-                                <div class="flex items-center gap-2 mb-3">
-                                    <span class="text-base font-bold text-neutral-800">OpenCode</span>
-                                    <span class="text-xs text-neutral-400">{{ t('status.integrations.opencode_desc') }}</span>
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/opencode.png" alt="OpenCode" class="w-full h-full object-cover">
                                 </div>
-                                <div class="flex flex-col sm:flex-row gap-4 items-start">
-                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
-                                        <select x-model="globalSettings.integrations.opencode_model"
-                                                @change="globalSettings.integrations.opencode_model = globalSettings.integrations.opencode_model || null; saveIntegrationSettings()"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                            <option value="">{{ t('status.integrations.select_model') }}</option>
-                                            <template x-for="m in llmModels" :key="m.id">
-                                                <option :value="m.id" x-text="m.id"></option>
-                                            </template>
-                                        </select>
-                                        <div x-show="globalSettings.integrations.opencode_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.opencode_model)"
-                                             x-cloak
-                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
-                                        </div>
-                                    </div>
-                                    <div class="flex-1 min-w-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
-                                        <div class="relative group">
-                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
-                                                 x-text="opencodeCommand"></pre>
-                                            <button x-data="{ copied: false }"
-                                                    @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
-                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
-                                                    :title="window.t('status.integrations.copy_command_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                    </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">OpenCode</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="opencodeCommand"></code>
                                 </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(opencodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
                             </div>
-
-                            <div class="border-t border-neutral-100 my-2"></div>
 
                             <!-- OpenClaw -->
-                            <div>
-                                <div class="flex items-center gap-2 mb-3">
-                                    <span class="text-base font-bold text-neutral-800">OpenClaw</span>
-                                    <span class="text-xs text-neutral-400">{{ t('status.integrations.openclaw_desc') }}</span>
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/openclaw.png" alt="OpenClaw" class="w-full h-full object-cover">
                                 </div>
-                                <div class="flex flex-col sm:flex-row gap-4 items-start">
-                                    <div class="w-full sm:w-48 sm:flex-shrink-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
-                                        <select x-model="globalSettings.integrations.openclaw_model"
-                                                @change="globalSettings.integrations.openclaw_model = globalSettings.integrations.openclaw_model || null; saveIntegrationSettings()"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                            <option value="">{{ t('status.integrations.select_model') }}</option>
-                                            <template x-for="m in llmModels" :key="m.id">
-                                                <option :value="m.id" x-text="m.id"></option>
-                                            </template>
-                                        </select>
-                                        <div x-show="globalSettings.integrations.openclaw_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.openclaw_model)"
-                                             x-cloak
-                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
-                                        </div>
-                                    </div>
-                                    <div class="w-full sm:w-36 sm:flex-shrink-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.openclaw_tools_profile') }}</label>
-                                        <select x-model="globalSettings.integrations.openclaw_tools_profile"
-                                                @change="saveIntegrationSettings()"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                            <option value="minimal">Minimal</option>
-                                            <option value="coding">Coding</option>
-                                            <option value="messaging">Messaging</option>
-                                            <option value="full">Full</option>
-                                        </select>
-                                    </div>
-                                    <div class="flex-1 min-w-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
-                                        <div class="relative group">
-                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
-                                                 x-text="openclawCommand"></pre>
-                                            <button x-data="{ copied: false }"
-                                                    @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
-                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
-                                                    :title="window.t('status.integrations.copy_command_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                    </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">OpenClaw</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="openclawCommand"></code>
                                 </div>
+                                <select x-model="globalSettings.integrations.openclaw_tools_profile"
+                                        @change="saveIntegrationSettings()"
+                                        class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
+                                    <option value="minimal">Minimal</option>
+                                    <option value="coding">Coding</option>
+                                    <option value="messaging">Messaging</option>
+                                    <option value="full">Full</option>
+                                </select>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
                             </div>
 
-                            <div class="border-t border-neutral-100 my-2"></div>
+                            <!-- Hermes Agent -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/hermes.svg" alt="Hermes Agent" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Hermes Agent</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="hermesCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(hermesCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
 
                             <!-- Pi -->
-                            <div>
-                                <div class="flex items-center gap-2 mb-3">
-                                    <span class="text-base font-bold text-neutral-800">Pi</span>
-                                    <span class="text-xs text-neutral-400">{{ t('status.integrations.pi_desc') }}</span>
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/pi.svg" alt="Pi" class="w-full h-full object-cover">
                                 </div>
-                                <div class="flex flex-col sm:flex-row gap-4 items-start">
-                                    <div class="w-full sm:w-64 sm:flex-shrink-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.model') }}</label>
-                                        <select x-model="globalSettings.integrations.pi_model"
-                                                @change="globalSettings.integrations.pi_model = globalSettings.integrations.pi_model || null; saveIntegrationSettings()"
-                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                            <option value="">{{ t('status.integrations.select_model') }}</option>
-                                            <template x-for="m in llmModels" :key="m.id">
-                                                <option :value="m.id" x-text="m.id"></option>
-                                            </template>
-                                        </select>
-                                        <div x-show="globalSettings.integrations.pi_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.integrations.pi_model)"
-                                             x-cloak
-                                             class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
-                                            <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
-                                            <span>{{ t('status.integrations.model_unavailable') }}</span>
-                                        </div>
-                                    </div>
-                                    <div class="flex-1 min-w-0">
-                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.integrations.command') }}</label>
-                                        <div class="relative group">
-                                            <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
-                                                 x-text="piCommand"></pre>
-                                            <button x-data="{ copied: false }"
-                                                    @click="copyToClipboard(piCommand); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="absolute top-2.5 right-2.5 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100"
-                                                    :class="copied ? 'text-green-500 opacity-100' : 'bg-white/80 text-neutral-400 hover:text-neutral-700'"
-                                                    :title="window.t('status.integrations.copy_command_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                    </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Pi</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="piCommand"></code>
                                 </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(piCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
                             </div>
+
+                            <!-- Copilot CLI -->
+                            <div class="flex items-center gap-4 px-6 py-4 group">
+                                <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
+                                    <img src="/admin/static/img/integrations/copilot.svg" alt="Copilot CLI" class="w-full h-full object-cover">
+                                </div>
+                                <div class="flex-1 min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-800">Copilot CLI</div>
+                                    <code class="text-xs text-neutral-500 font-mono" x-text="copilotCommand"></code>
+                                </div>
+                                <button x-data="{ copied: false }"
+                                        @click="copyToClipboard(copilotCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                                        class="p-2 rounded-lg transition-all opacity-0 group-hover:opacity-100 flex-shrink-0"
+                                        :class="copied ? 'text-green-500 opacity-100' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                        :title="window.t('status.integrations.copy_command_tooltip')">
+                                    <svg x-show="!copied" class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                    <svg x-show="copied" x-cloak class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                </button>
+                            </div>
+
                         </div>
                     </div>
 

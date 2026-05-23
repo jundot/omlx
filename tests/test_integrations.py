@@ -6,25 +6,40 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from omlx.integrations import get_integration, list_integrations
+from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
+from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
-from omlx.integrations.pi import PiIntegration
+from omlx.integrations.pi import PiIntegration, _get_agent_dir
 
 
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 4
+        assert len(integrations) == 7
         names = {i.name for i in integrations}
-        assert names == {"codex", "opencode", "openclaw", "pi"}
+        assert names == {
+            "claude",
+            "copilot",
+            "codex",
+            "opencode",
+            "openclaw",
+            "hermes",
+            "pi",
+        }
 
     def test_get_integration(self):
+        assert get_integration("claude") is not None
+        assert get_integration("copilot") is not None
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
+        assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
         assert get_integration("nonexistent") is None
 
@@ -143,6 +158,39 @@ name = "old-omlx"
         content = config_path.read_text()
         assert 'model = "llama-3.1-8b"' in content
         assert "model_reasoning_effort" not in content
+
+    def test_launch_forwards_extra_args(self, tmp_path):
+        codex = CodexIntegration()
+        config_path = tmp_path / "codex" / "config.toml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(CodexIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex.os.environ", base_env),
+            patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
+        ):
+            codex.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["--yolo"],
+            )
+
+        assert captured["argv"] == ["codex", "-m", "qwen3.5", "--yolo"]
+        assert captured["env"]["OMLX_API_KEY"] == "key"
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
 
 
 class TestOpenCodeIntegration:
@@ -295,6 +343,33 @@ class TestOpenCodeIntegration:
         model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
         assert "limit" not in model_config
 
+    def test_launch_scrubs_python_env(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.opencode.os.environ", base_env),
+            patch("omlx.integrations.opencode.os.execvpe", side_effect=fake_execvpe),
+        ):
+            oc.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["opencode"]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
     def test_type(self):
         oc = OpenCodeIntegration()
         assert oc.type == "config_file"
@@ -404,13 +479,279 @@ class TestOpenClawIntegration:
         config = json.loads(config_path.read_text())
         assert config["tools"]["profile"] == "full"
 
+    def test_launch_scrubs_python_env(self, tmp_path):
+        ocl = OpenClawIntegration()
+        config_path = tmp_path / "openclaw.json"
+        approvals_path = tmp_path / "exec-approvals.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["exec_env"] = env
+
+        def fake_run(args, **kwargs):
+            captured["run_env"] = kwargs.get("env")
+            return None
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(OpenClawIntegration, "CONFIG_PATH", config_path),
+            patch.object(OpenClawIntegration, "EXEC_APPROVALS_PATH", approvals_path),
+            patch.object(OpenClawIntegration, "_is_onboarded", return_value=True),
+            patch.object(
+                OpenClawIntegration, "_gateway_info", return_value=("localhost", 9999)
+            ),
+            # Gateway already running: hits the daemon-restart subprocess.run
+            # branch and skips gateway start, so execvpe is reached.
+            patch.object(OpenClawIntegration, "_port_open", return_value=True),
+            patch.object(OpenClawIntegration, "_wait_for_port", return_value=True),
+            patch("omlx.integrations.openclaw.os.environ", base_env),
+            patch("omlx.integrations.openclaw.subprocess.run", side_effect=fake_run),
+            patch("omlx.integrations.openclaw.os.execvpe", side_effect=fake_execvpe),
+        ):
+            ocl.launch(port=8000, api_key="key", model="qwen3.5")
+
+        # Both the daemon-restart subprocess and the TUI exec get scrubbed env.
+        for env in (captured["run_env"], captured["exec_env"]):
+            assert "PYTHONHOME" not in env
+            assert "PYTHONPATH" not in env
+            assert "PYTHONDONTWRITEBYTECODE" not in env
+
     def test_type(self):
         ocl = OpenClawIntegration()
         assert ocl.type == "config_file"
         assert ocl.display_name == "OpenClaw"
 
 
+class TestHermesIntegration:
+    def test_get_command(self):
+        hermes = HermesIntegration()
+        cmd = hermes.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch hermes" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        hermes = HermesIntegration()
+        cmd = hermes.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_configure_new_file(self, tmp_path):
+        config_path = tmp_path / "hermes" / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="test-key",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        assert config_path.exists()
+        config = yaml.safe_load(config_path.read_text())
+        provider = config["providers"]["omlx"]
+        assert provider["name"] == "oMLX"
+        assert provider["base_url"] == "http://127.0.0.1:8000/v1"
+        assert provider["api_key"] == "test-key"
+        assert provider["api_mode"] == "chat_completions"
+        assert provider["default_model"] == "qwen3.5"
+        assert config["model"]["provider"] == "omlx"
+        assert config["model"]["default"] == "qwen3.5"
+        assert config["model"]["context_length"] == 131072
+        assert config["model"]["max_tokens"] == 8192
+
+    def test_configure_custom_host(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=9000, api_key="", model="llama", host="10.0.0.5")
+
+        provider = yaml.safe_load(config_path.read_text())["providers"]["omlx"]
+        assert provider["base_url"] == "http://10.0.0.5:9000/v1"
+        assert provider["api_key"] == "omlx"
+
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "theme": "dark",
+                    "providers": {
+                        "anthropic": {"base_url": "https://api.anthropic.com"},
+                        "omlx": {"timeout": 120},
+                    },
+                    "model": {
+                        "temperature": 0.2,
+                        "base_url": "https://inference-api.nousresearch.com/v1",
+                        "api_key": "old-key",
+                    },
+                },
+                sort_keys=False,
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="key", model="qwen3.5")
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["theme"] == "dark"
+        assert config["providers"]["anthropic"]["base_url"] == "https://api.anthropic.com"
+        assert config["providers"]["omlx"]["timeout"] == 120
+        assert config["providers"]["omlx"]["base_url"] == "http://127.0.0.1:8000/v1"
+        assert config["model"]["temperature"] == 0.2
+        assert config["model"]["provider"] == "omlx"
+        assert config["model"]["default"] == "qwen3.5"
+        assert "base_url" not in config["model"]
+        assert "api_key" not in config["model"]
+
+    def test_configure_creates_backup(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("existing: true\n")
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="", model="test")
+
+        backups = list(tmp_path.glob("config.*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "existing: true\n"
+
+    def test_configure_clears_stale_limits_when_unknown(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "provider": "omlx",
+                        "default": "old",
+                        "context_length": 32768,
+                        "max_tokens": 8192,
+                    }
+                }
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(port=8000, api_key="key", model="new")
+
+        model_config = yaml.safe_load(config_path.read_text())["model"]
+        assert model_config["default"] == "new"
+        assert "context_length" not in model_config
+        assert "max_tokens" not in model_config
+
+    def test_configure_uses_hermes_min_context_length(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                context_window=32768,
+            )
+
+        model_config = yaml.safe_load(config_path.read_text())["model"]
+        assert model_config["context_length"] == 64000
+
+    def test_launch_sets_config_and_execs(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", base_env),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        assert captured["binary"] == "hermes"
+        assert captured["argv"] == [
+            "hermes",
+            "--provider",
+            "omlx",
+            "--tui",
+            "--model",
+            "qwen3.5",
+        ]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["providers"]["omlx"]["api_key"] == "secret"
+        assert config["model"]["context_length"] == 131072
+        assert config["model"]["max_tokens"] == 8192
+
+    def test_launch_without_model(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(port=8000, api_key="", model="")
+
+        assert captured["argv"] == ["hermes", "--provider", "omlx", "--tui"]
+
+    def test_type(self):
+        hermes = HermesIntegration()
+        assert hermes.type == "config_file"
+        assert hermes.display_name == "Hermes Agent"
+        assert hermes.install_check == "hermes"
+
+
 class TestPiIntegration:
+    def test_get_agent_dir_default(self, tmp_path, monkeypatch):
+        """Default agent dir is ~/.pi/agent when env var is not set."""
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        result = _get_agent_dir()
+        assert result == Path.home() / ".pi" / "agent"
+
+    def test_get_agent_dir_custom_env(self, tmp_path, monkeypatch):
+        """PI_CODING_AGENT_DIR env var overrides the default path."""
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "custom_pi"))
+        result = _get_agent_dir()
+        assert result == tmp_path / "custom_pi"
+
+    def test_get_agent_dir_expands_user(self, tmp_path, monkeypatch):
+        """PI_CODING_AGENT_DIR ~ is expanded to the home directory."""
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/my-agent")
+        result = _get_agent_dir()
+        assert result == Path.home() / "my-agent"
+
     def test_get_command(self):
         pi = PiIntegration()
         cmd = pi.get_command(port=8000, api_key="key", model="qwen3.5")
@@ -526,10 +867,318 @@ class TestPiIntegration:
         assert settings_config["defaultProvider"] == "omlx"
         assert settings_config["defaultModel"] == "llama"
 
+    def test_launch_scrubs_python_env(self, tmp_path):
+        pi = PiIntegration()
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+            patch("omlx.integrations.pi.os.environ", base_env),
+            patch("omlx.integrations.pi.os.execvpe", side_effect=fake_execvpe),
+        ):
+            pi.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["pi", "--model", "omlx/qwen3.5"]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
     def test_type(self):
         pi = PiIntegration()
         assert pi.type == "config_file"
         assert pi.display_name == "Pi"
+
+
+class TestClaudeCodeIntegration:
+    def test_get_command(self):
+        cc = ClaudeCodeIntegration()
+        cmd = cc.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch claude" in cmd
+
+    def test_get_command_ignores_model(self):
+        # Claude integration uses TUI selection so the rendered command
+        # is the same regardless of model arg.
+        cc = ClaudeCodeIntegration()
+        assert cc.get_command(port=8000, api_key="", model="") == cc.get_command(
+            port=8000, api_key="key", model="qwen3.5"
+        )
+
+    def test_type(self):
+        cc = ClaudeCodeIntegration()
+        assert cc.type == "env_var"
+        assert cc.display_name == "Claude Code"
+        assert cc.install_check == "claude"
+
+    def test_find_claude_binary_in_path(self):
+        cc = ClaudeCodeIntegration()
+        with patch("omlx.integrations.claude.shutil.which", return_value="/usr/bin/claude"):
+            assert cc._find_claude_binary() == "claude"
+
+    def test_find_claude_binary_local_fallback(self, tmp_path):
+        cc = ClaudeCodeIntegration()
+        local_claude = tmp_path / ".claude" / "local" / "claude"
+        local_claude.parent.mkdir(parents=True)
+        local_claude.write_text("#!/bin/sh\n")
+        with (
+            patch("omlx.integrations.claude.shutil.which", return_value=None),
+            patch("omlx.integrations.claude.Path.home", return_value=tmp_path),
+        ):
+            assert cc._find_claude_binary() == str(local_claude)
+
+    def test_find_claude_binary_not_found(self, tmp_path):
+        cc = ClaudeCodeIntegration()
+        with (
+            patch("omlx.integrations.claude.shutil.which", return_value=None),
+            patch("omlx.integrations.claude.Path.home", return_value=tmp_path),
+        ):
+            # Falls back to the bare name so the os.execvpe error surfaces clearly.
+            assert cc._find_claude_binary() == "claude"
+
+    def test_launch_sets_anthropic_env(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.claude.os.environ", base_env),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+            )
+
+        env = captured["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "secret"
+        assert env["ANTHROPIC_API_KEY"] == ""
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "qwen3.5"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "qwen3.5"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
+        assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
+        # Bundled-python vars must be stripped so claude code subprocess hooks
+        # don't inherit our cpython-3.11 stack.
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_open_server_uses_omlx_token(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="", model="qwen3.5")
+
+        # Empty api_key means an open server, claude code still needs
+        # *some* token so we ship a placeholder.
+        assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == "omlx"
+
+    def test_launch_without_model(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="key", model="")
+
+        env = captured["env"]
+        assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+        assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+
+    def test_launch_default_argv_has_no_extra(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(port=8000, api_key="key", model="qwen3.5")
+
+        assert captured["argv"] == ["claude"]
+
+    def test_launch_forwards_extra_args(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["--resume", "abc123"],
+            )
+
+        assert captured["argv"] == ["claude", "--resume", "abc123"]
+
+    def test_launch_forwards_short_resume(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"),
+        ):
+            cc.launch(
+                port=8000,
+                api_key="key",
+                model="qwen3.5",
+                extra_args=["-r", "xyz"],
+            )
+
+        assert captured["argv"] == ["claude", "-r", "xyz"]
+
+
+class TestCopilotIntegration:
+    def test_get_command(self):
+        copilot = CopilotIntegration()
+        cmd = copilot.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch copilot" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        copilot = CopilotIntegration()
+        cmd = copilot.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_type(self):
+        copilot = CopilotIntegration()
+        assert copilot.type == "env_var"
+        assert copilot.display_name == "Copilot CLI"
+        assert copilot.install_check == "copilot"
+
+    def test_launch_sets_provider_env(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.copilot.os.environ", base_env),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(
+                port=8000,
+                api_key="secret",
+                model="qwen3.5",
+                context_window=131072,
+                max_tokens=8192,
+            )
+
+        env = captured["env"]
+        assert captured["binary"] == "copilot"
+        assert captured["argv"] == ["copilot"]
+        assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8000/v1"
+        assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+        assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
+        assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "secret"
+        assert env["COPILOT_MODEL"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_MODEL_ID"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_WIRE_MODEL"] == "qwen3.5"
+        assert env["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] == "131072"
+        assert env["COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"] == "8192"
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_open_server_uses_omlx_token(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(port=8000, api_key="", model="qwen3.5")
+
+        assert captured["env"]["COPILOT_PROVIDER_BEARER_TOKEN"] == "omlx"
+
+    def test_launch_without_model_or_limits(self):
+        copilot = CopilotIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+        ):
+            copilot.launch(port=8000, api_key="key", model="")
+
+        env = captured["env"]
+        assert "COPILOT_MODEL" not in env
+        assert "COPILOT_PROVIDER_MODEL_ID" not in env
+        assert "COPILOT_PROVIDER_WIRE_MODEL" not in env
+        assert "COPILOT_PROVIDER_MAX_PROMPT_TOKENS" not in env
+        assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
 
 
 class TestIntegrationSettings:
@@ -537,9 +1186,11 @@ class TestIntegrationSettings:
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings()
+        assert settings.copilot_model is None
         assert settings.codex_model is None
         assert settings.opencode_model is None
         assert settings.openclaw_model is None
+        assert settings.hermes_model is None
         assert settings.pi_model is None
         assert settings.openclaw_tools_profile == "coding"
 
@@ -548,8 +1199,10 @@ class TestIntegrationSettings:
 
         settings = IntegrationSettings(codex_model="qwen3.5")
         d = settings.to_dict()
+        assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
+        assert d["hermes_model"] is None
         assert d["pi_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
@@ -557,11 +1210,18 @@ class TestIntegrationSettings:
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict(
-            {"codex_model": "llama", "opencode_model": "qwen"}
+            {
+                "copilot_model": "gpt-oss",
+                "codex_model": "llama",
+                "opencode_model": "qwen",
+                "hermes_model": "hermes-qwen",
+            }
         )
+        assert settings.copilot_model == "gpt-oss"
         assert settings.codex_model == "llama"
         assert settings.opencode_model == "qwen"
         assert settings.openclaw_model is None
+        assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
 
     def test_from_dict_empty(self):

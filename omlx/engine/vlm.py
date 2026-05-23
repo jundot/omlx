@@ -24,9 +24,13 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import copy
+import importlib
+import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -105,29 +109,14 @@ def _patch_video_processor_bug():
        which requires torchvision. Removing ``video_processor`` from the
        MODALITY mapping prevents transformers from attempting to load it.
 
-    2. When mlx-vlm's custom processor patch fails (e.g. due to a stale
-       mistral_common dependency), it falls back to HF's ProcessorMixin
-       which passes ``video_processor`` as a kwarg. HF's own
-       ProcessorMixin.__init__ rejects unexpected kwargs. We patch it to
-       silently drop ``video_processor``.
+    2. When mlx-vlm's custom processor patch fails, it falls back to HF's
+       ProcessorMixin which passes ``video_processor`` as a kwarg. HF's
+       own ProcessorMixin.__init__ rejects unexpected kwargs, so it is
+       patched to silently drop ``video_processor``.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
-
-    try:
-        from mistral_common.protocol.instruct.request import ReasoningEffort  # noqa: F401
-    except ImportError:
-        try:
-            import mistral_common.protocol.instruct.request as _mcpir
-
-            class _ReasoningEffort:
-                pass
-
-            _mcpir.ReasoningEffort = _ReasoningEffort
-            logger.debug("Stubbed missing mistral_common.ReasoningEffort")
-        except (ImportError, AttributeError):
-            pass
 
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
@@ -155,6 +144,159 @@ def _patch_video_processor_bug():
     _video_processor_patched = True
 
 
+_torch_free_ip_patched = False
+
+
+def _patch_torch_free_image_processor():
+    """Route mlx-vlm OCR processors around torch-gated AutoImageProcessor.
+
+    transformers 5.5+ ships ``AutoImageProcessor`` as a ``DummyObject`` that
+    raises ``ImportError`` on attribute access without torch+torchvision
+    installed. mlx-vlm's ``GlmOcrProcessor.from_pretrained`` and
+    ``DotsOcrProcessor.from_pretrained`` call ``AutoImageProcessor.from_pretrained``
+    directly, so they raise on oMLX's torch-free env.
+    ``install_auto_processor_patch`` then silently swallows the ``ImportError``
+    and falls back to a ``TokenizersBackend`` with no ``image_processor`` —
+    image content is dropped at ``prepare_inputs()``. See #1131, #1175.
+
+    transformers ships torch-free PIL-backend variants of these image
+    processors (e.g. ``Glm46VImageProcessorPil``, ``Qwen2VLImageProcessorPil``).
+    This patch wraps the affected mlx-vlm processors' ``from_pretrained`` so
+    they substitute the PIL class when ``AutoImageProcessor`` raises.
+    """
+    global _torch_free_ip_patched
+    if _torch_free_ip_patched:
+        return
+
+    try:
+        import transformers
+    except ImportError:
+        return
+
+    if not getattr(transformers.AutoImageProcessor, "is_dummy", False):
+        # torch+torchvision available, AutoImageProcessor works as-is.
+        _torch_free_ip_patched = True
+        return
+
+    for module_path, cls_name in (
+        ("mlx_vlm.models.glm_ocr.processing", "GlmOcrProcessor"),
+        ("mlx_vlm.models.dots_ocr.processing_dots_ocr", "DotsVLProcessor"),
+    ):
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, cls_name)
+            _wrap_from_pretrained_with_pil_image_processor(cls)
+            logger.debug("Wrapped %s.from_pretrained with PIL fallback", cls_name)
+        except (ImportError, AttributeError) as exc:
+            logger.debug(
+                "Skipped torch-free image processor patch for %s: %s",
+                cls_name,
+                exc,
+            )
+
+    _torch_free_ip_patched = True
+
+
+def _wrap_from_pretrained_with_pil_image_processor(cls):
+    """Wrap a ProcessorMixin subclass's ``from_pretrained`` so an ``ImportError``
+    from ``AutoImageProcessor`` triggers PIL fallback instantiation."""
+    if getattr(cls.from_pretrained, "_omlx_torch_free_patched", False):
+        return
+
+    orig = cls.from_pretrained
+
+    @classmethod
+    def patched(cls_inner, path, **kwargs):
+        try:
+            return orig(path, **kwargs)
+        except ImportError as exc:
+            msg = str(exc)
+            if "Torchvision" not in msg and "PyTorch" not in msg:
+                raise
+            logger.info(
+                "AutoImageProcessor unavailable (torch-free env); routing %s "
+                "to PIL image processor",
+                cls_inner.__name__,
+            )
+            return _build_processor_via_pil_image_processor(cls_inner, path, **kwargs)
+
+    patched.__func__._omlx_torch_free_patched = True
+    cls.from_pretrained = patched
+
+
+def _build_processor_via_pil_image_processor(cls, path, **kwargs):
+    """Construct a ProcessorMixin instance using transformers' PIL-backend
+    image processor (looked up via ``IMAGE_PROCESSOR_MAPPING_NAMES``) instead
+    of the torch-gated ``AutoImageProcessor``."""
+    from transformers import AutoTokenizer
+    from transformers.models.auto.auto_mappings import IMAGE_PROCESSOR_MAPPING_NAMES
+
+    trust = kwargs.pop("trust_remote_code", True)
+
+    # Look up image_processor_type from processor_config.json (preferred,
+    # nested under "image_processor") or preprocessor_config.json (legacy).
+    p = Path(path)
+    ip_type = None
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        ip_type = (
+            cfg.get("image_processor", {}).get("image_processor_type")
+            or cfg.get("image_processor_type")
+        )
+        if ip_type:
+            break
+
+    if not ip_type:
+        raise ImportError(
+            f"Cannot determine image_processor_type for {path}; install "
+            "torch+torchvision or upgrade mlx-vlm."
+        )
+
+    pil_cls = _resolve_pil_image_processor_class(ip_type, IMAGE_PROCESSOR_MAPPING_NAMES)
+    if pil_cls is None:
+        raise ImportError(
+            f"No torch-free PIL image processor for image_processor_type={ip_type}."
+        )
+
+    image_processor = pil_cls.from_pretrained(str(path), trust_remote_code=trust)
+    tokenizer = AutoTokenizer.from_pretrained(str(path), trust_remote_code=trust, **kwargs)
+
+    # mlx-vlm helper: load chat_template.jinja into tokenizer if present.
+    try:
+        from mlx_vlm.models.base import load_chat_template
+        load_chat_template(tokenizer, str(path))
+    except (ImportError, AttributeError):
+        pass
+
+    return cls(image_processor=image_processor, tokenizer=tokenizer)
+
+
+def _resolve_pil_image_processor_class(ip_type, mapping_names):
+    """Find a non-dummy PIL backend class matching ``ip_type`` via
+    ``IMAGE_PROCESSOR_MAPPING_NAMES``."""
+    for model_type, mapping in mapping_names.items():
+        if mapping.get("torchvision") != ip_type and mapping.get("pil") != ip_type:
+            continue
+        pil_name = mapping.get("pil")
+        if not pil_name:
+            continue
+        module_name = (
+            f"transformers.models.{model_type}.image_processing_pil_{model_type}"
+        )
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        candidate = getattr(mod, pil_name, None)
+        if candidate is not None and not getattr(candidate, "is_dummy", False):
+            return candidate
+    return None
+
+
 def _fix_processor_none_pixels(processor):
     """Set sensible defaults when preprocessor_config.json has null pixels.
 
@@ -171,6 +313,151 @@ def _fix_processor_none_pixels(processor):
     if getattr(ip, "min_pixels", None) is None and hasattr(ip, "min_pixels"):
         ip.min_pixels = 56 * 56
         logger.debug("Fixed image_processor.min_pixels: None → %d", ip.min_pixels)
+
+
+# Config keys to strip when audio_tower weights are missing but config still
+# advertises audio support. See `_strip_audio_config_if_orphaned`.
+_AUDIO_CONFIG_KEYS = (
+    "audio_config",
+    "audio_token_id",
+    "boa_token_id",
+    "eoa_token_id",
+    "eoa_token_index",
+)
+
+
+def _has_audio_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    import safetensors
+
+    for sf in model_dir.glob("*.safetensors"):
+        try:
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                for k in f.keys():
+                    if k.startswith(("audio_tower.", "embed_audio.")):
+                        return True
+        except Exception:
+            # Corrupt or unreadable shard — treat as no audio info, let
+            # downstream loader produce its own error.
+            return False
+    return False
+
+
+@contextlib.contextmanager
+def _strip_audio_config_if_orphaned(model_dir: Path):
+    """Drop `audio_config` from `mlx_vlm.utils.load_config` results when the
+    safetensors shards lack audio_tower / embed_audio weights.
+
+    Some quantization tooling (notably oMLX's pre-fix oQ pipeline) writes
+    multimodal Gemma 4 checkpoints without audio weights but leaves
+    `audio_config` in `config.json`. mlx-vlm then instantiates `AudioEncoder`
+    and `model.load_weights(strict=True)` fails with "Missing 752 parameters".
+
+    This wrap is scoped to a single `mlx_vlm.utils.load(...)` call: it swaps
+    `load_config` on entry and restores it on exit. Other code paths that
+    read config (model_discovery, admin UI) bypass mlx-vlm entirely so they
+    are unaffected.
+    """
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_config
+    warned = set()
+
+    def _patched(path, **kwargs):
+        cfg = original(path, **kwargs)
+
+        from ..utils.model_loading import expand_per_layer_quant_keys
+
+        expand_per_layer_quant_keys(cfg)
+
+        if cfg.get("audio_config") is None:
+            return cfg
+        try:
+            p = Path(path) if not isinstance(path, Path) else path
+            if not p.is_dir():
+                return cfg
+            if _has_audio_weights(p):
+                return cfg
+        except Exception:
+            return cfg
+        cfg = dict(cfg)
+        # Explicit None instead of pop: mlx-vlm's load_model runs
+        # `config.setdefault("audio_config", {})` which would otherwise
+        # repopulate audio_config with `{}` and cause AudioEncoder to be
+        # instantiated with default values.
+        cfg["audio_config"] = None
+        for k in _AUDIO_CONFIG_KEYS:
+            if k != "audio_config":
+                cfg.pop(k, None)
+        if str(p) not in warned:
+            warned.add(str(p))
+            logger.warning(
+                "audio_tower weights missing for %s; loading without audio support",
+                p.name,
+            )
+        return cfg
+
+    _vu.load_config = _patched
+    try:
+        yield
+    finally:
+        _vu.load_config = original
+
+
+_NESTED_VIS_PREFIX = "language_model.model.visual."
+_VISION_TOWER_PREFIX = "vision_tower."
+
+
+@contextlib.contextmanager
+def _remap_nested_visual_on_load(model_dir: Path):
+    """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
+    ``load_model`` for MLX-format models where sanitize is skipped.
+
+    mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
+    metadata declares ``format=mlx``. oQ output is MLX-format, so the
+    nested-visual key fixup that sanitize normally applies never fires.
+    This context manager wraps ``load_model`` to intercept the weight dict
+    and perform the remap before ``nn.Module.load_weights`` is called.
+
+    Scoped to a single ``vlm_load(...)`` call.
+    """
+    import mlx_vlm.utils as _vu
+
+    original_load_model = _vu.load_model
+
+    def _patched_load_model(model_path, lazy=False, **kwargs):
+        import mlx.nn as _nn
+
+        orig_load_weights = _nn.Module.load_weights
+        def _remapping_load_weights(self, weights_items, *args, **kw):
+            if isinstance(weights_items, str):
+                return orig_load_weights(self, weights_items, *args, **kw)
+            remapped = []
+            n = 0
+            for k, v in weights_items:
+                if k.startswith(_NESTED_VIS_PREFIX):
+                    k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX):]
+                    n += 1
+                remapped.append((k, v))
+            if n:
+                logger.info(
+                    "remap_nested_visual_on_load: remapped %d keys "
+                    "'language_model.model.visual.*' -> 'vision_tower.*'",
+                    n,
+                )
+            return orig_load_weights(self, remapped, *args, **kw)
+
+        _nn.Module.load_weights = _remapping_load_weights
+        try:
+            return original_load_model(model_path, lazy, **kwargs)
+        finally:
+            _nn.Module.load_weights = orig_load_weights
+
+    _vu.load_model = _patched_load_model
+    try:
+        yield
+    finally:
+        _vu.load_model = original_load_model
 
 
 # Models that only support a single image per request
@@ -245,6 +532,9 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
+        # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
+        # Phase 2A: attached but not yet wired into the decode path.
+        self._vlm_mtp_drafter: Any | None = None
 
     @property
     def model_name(self) -> str:
@@ -356,6 +646,18 @@ class VLMBatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
+        from ..utils.model_loading import maybe_load_custom_quantization
+
+        # Apply pre-load patches (MTP runtime patch, etc.) before the model
+        # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
+        # is a no-op when the model is incompatible.
+        try:
+            from ..utils.model_loading import maybe_apply_pre_load_patches
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+        except Exception as e:
+            logger.debug(f"pre-load patches skipped: {e}")
 
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -363,9 +665,20 @@ class VLMBatchedEngine(BaseEngine):
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
-            return vlm_load(
-                self._model_name, trust_remote_code=self._trust_remote_code
-            )
+            _patch_torch_free_image_processor()
+            with _strip_audio_config_if_orphaned(Path(self._model_name)), \
+                 _remap_nested_visual_on_load(Path(self._model_name)):
+                custom_loaded = maybe_load_custom_quantization(
+                    self._model_name,
+                    is_vlm=True,
+                )
+                if custom_loaded is not None:
+                    model, processor = custom_loaded
+                    return model, processor
+
+                return vlm_load(
+                    self._model_name, trust_remote_code=self._trust_remote_code
+                )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -379,9 +692,7 @@ class VLMBatchedEngine(BaseEngine):
         if self._scheduler_config and getattr(
             self._scheduler_config, "paged_ssd_cache_dir", None
         ):
-            from pathlib import Path as _Path
-
-            vision_ssd_dir = _Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+            vision_ssd_dir = Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
         self._vision_cache = VisionFeatureSSDCache(
             cache_dir=vision_ssd_dir,
             max_memory_entries=20,
@@ -458,9 +769,31 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
+                    from ..utils.model_loading import maybe_load_custom_quantization
+
                     def _load_draft():
-                        draft_model, _ = mlx_lm_load(specprefill_draft)
-                        return draft_model
+                        from ..patches.mlx_lm_mtp import set_mtp_active
+
+                        was_mtp = False
+                        try:
+                            from ..patches.mlx_lm_mtp import is_mtp_active
+
+                            was_mtp = is_mtp_active()
+                        except Exception:
+                            pass
+                        set_mtp_active(False)
+                        try:
+                            custom_loaded = maybe_load_custom_quantization(
+                                specprefill_draft,
+                                is_vlm=False,
+                            )
+                            if custom_loaded is not None:
+                                draft_model, _ = custom_loaded
+                                return draft_model
+                            draft_model, _ = mlx_lm_load(specprefill_draft)
+                            return draft_model
+                        finally:
+                            set_mtp_active(was_mtp)
                     draft_model = await loop.run_in_executor(get_mlx_executor(), _load_draft)
                     self._engine.engine.scheduler.set_specprefill_draft_model(
                         draft_model, draft_model_name=specprefill_draft
@@ -474,6 +807,32 @@ class VLMBatchedEngine(BaseEngine):
 
         self._loaded = True
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
+
+    def set_vlm_mtp_drafter(self, drafter: Any) -> None:
+        """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
+
+        Passes the drafter (and the configured draft-block size) down to
+        the scheduler so eligible requests get routed to mlx-vlm's MTP
+        round loop at decode time.
+        """
+        self._vlm_mtp_drafter = drafter
+        block_size = None
+        if self._model_settings is not None:
+            block_size = getattr(self._model_settings, "vlm_mtp_draft_block_size", None)
+        scheduler = None
+        if self._engine is not None and hasattr(self._engine, "engine"):
+            scheduler = getattr(self._engine.engine, "scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "set_vlm_mtp_drafter"):
+            scheduler.set_vlm_mtp_drafter(drafter, draft_block_size=block_size)
+        logger.info(
+            "VLM MTP drafter attached to engine: %s (block_size=%s)",
+            self._model_name,
+            block_size,
+        )
+
+    @property
+    def vlm_mtp_drafter(self) -> Any | None:
+        return self._vlm_mtp_drafter
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -492,6 +851,7 @@ class VLMBatchedEngine(BaseEngine):
         self._processor = None
         self._adapter = None
         self._tokenizer = None
+        self._vlm_mtp_drafter = None
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
@@ -1122,11 +1482,22 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
-        """Apply chat template for text-only messages (no images)."""
+        """Apply chat template for text-only messages (no images).
+
+        Args:
+            is_partial: Accepted for API parity with BatchedEngine but not
+                acted upon — VLM always uses ``add_generation_prompt=True``.
+                The ``partial`` key is still cleaned from message dicts.
+        """
         if hasattr(self._tokenizer, "apply_chat_template"):
             # Strip partial field (VLM always uses add_generation_prompt=True)
-            detect_and_strip_partial(messages)
+            if is_partial is None:
+                detect_and_strip_partial(messages)
+            else:
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -1281,7 +1652,8 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -1294,7 +1666,7 @@ class VLMBatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -1315,7 +1687,7 @@ class VLMBatchedEngine(BaseEngine):
         finally:
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
 
     async def chat(
         self,
@@ -1528,6 +1900,7 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
         """Count prompt tokens for chat messages (text-only approximation).
 
@@ -1540,7 +1913,9 @@ class VLMBatchedEngine(BaseEngine):
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            text_messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         return len(self._tokenizer.encode(prompt))
 

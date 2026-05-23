@@ -22,7 +22,15 @@ import pytest
 
 # Import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "packaging"))
-from omlx_app.config import ServerConfig, get_app_support_dir, get_config_path, get_log_path
+from omlx_app.config import (
+    ServerConfig,
+    get_app_support_dir,
+    get_config_path,
+    get_log_path,
+    resolve_local_server_base_url,
+    resolve_local_server_health_url,
+    tcp_probe_connection_targets,
+)
 from omlx_app.server_manager import PortConflict, ServerManager, ServerStatus
 
 
@@ -234,6 +242,49 @@ class TestServerConfig:
         result = config.load_server_settings()
         assert result["model_dir"] == "/server/models"
         assert result["port"] == 9000
+        assert result.get("host") is None
+
+    def test_load_server_settings_includes_host(self, tmp_path: Path):
+        """Test server host is loaded from settings.json."""
+        config = ServerConfig(base_path=str(tmp_path))
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"port": 8000, "host": "100.64.0.2"},
+        }))
+
+        result = config.load_server_settings()
+        assert result["host"] == "100.64.0.2"
+
+    def test_get_server_bind_host(self, tmp_path: Path):
+        """Test bind host reader."""
+        config = ServerConfig(base_path=str(tmp_path))
+        assert config.get_server_bind_host() == ""
+
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"host": "100.64.0.2", "port": 8000},
+        }))
+        assert config.get_server_bind_host() == "100.64.0.2"
+
+    def test_load_server_settings_prefers_model_dirs(self, tmp_path: Path):
+        """Test loading primary model_dirs entry from server settings.json."""
+        config = ServerConfig(base_path=str(tmp_path))
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "model_dirs": ["/primary/models", "/secondary/models"],
+                        "model_dir": "/legacy/models",
+                    },
+                    "server": {"port": 9000},
+                }
+            )
+        )
+
+        result = config.load_server_settings()
+        assert result["model_dir"] == "/primary/models"
+        assert result["port"] == 9000
 
     def test_load_server_settings_missing_file(self, tmp_path: Path):
         """Test load_server_settings returns empty dict when no file."""
@@ -259,6 +310,152 @@ class TestServerConfig:
         config.sync_from_server_settings()
         assert config.port == 8000
         assert config.model_dir == ""
+
+    def test_sync_port_to_server_settings_new_file(self, tmp_path: Path):
+        """Test syncing port creates settings.json if missing."""
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+
+    def test_sync_port_to_server_settings_overwrites_stale(self, tmp_path: Path):
+        """Test syncing overwrites stale port and preserves other keys."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({
+            "server": {"port": 8000},
+            "auth": {"api_key": "preserved"},
+            "model": {"model_dir": "/keep"},
+        }))
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dir"] == "/keep"
+
+    def test_sync_port_to_server_settings_noop_when_match(self, tmp_path: Path):
+        """Test sync skips disk write when port already matches."""
+        settings_file = tmp_path / "settings.json"
+        original = json.dumps({"server": {"port": 7999}, "marker": "untouched"})
+        settings_file.write_text(original)
+        mtime_before = settings_file.stat().st_mtime_ns
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        mtime_after = settings_file.stat().st_mtime_ns
+        assert mtime_before == mtime_after
+
+    def test_sync_port_to_server_settings_recovers_from_corrupt_json(
+        self, tmp_path: Path
+    ):
+        """Test sync rewrites file when existing JSON is corrupt."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text("{ not valid json")
+
+        config = ServerConfig(base_path=str(tmp_path), port=7999)
+        config.sync_port_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["server"]["port"] == 7999
+
+    def test_sync_model_dir_to_server_settings_new_file(self, tmp_path: Path):
+        """Test syncing model directory creates settings.json if missing."""
+        model_dir = str(tmp_path / "models")
+        config = ServerConfig(base_path=str(tmp_path), model_dir=model_dir)
+        config.sync_model_dir_to_server_settings()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["model"]["model_dirs"] == [model_dir]
+        assert data["model"]["model_dir"] == model_dir
+
+    def test_sync_model_dir_to_server_settings_preserves_existing_by_default(
+        self, tmp_path: Path
+    ):
+        """Test conservative sync preserves existing server model directories."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "auth": {"api_key": "preserved"},
+                    "model": {
+                        "model_dirs": ["/keep/models", "/keep/other"],
+                        "model_dir": "/keep/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="/new/models")
+        config.sync_model_dir_to_server_settings()
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dirs"] == ["/keep/models", "/keep/other"]
+        assert data["model"]["model_dir"] == "/keep/models"
+
+    def test_sync_model_dir_to_server_settings_overwrites_when_requested(
+        self, tmp_path: Path
+    ):
+        """Test Preferences-style sync overwrites stale server model directory."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "auth": {"api_key": "preserved"},
+                    "model": {
+                        "model_dirs": ["/old/models"],
+                        "model_dir": "/old/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="/new/models")
+        config.sync_model_dir_to_server_settings(overwrite=True)
+
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["auth"]["api_key"] == "preserved"
+        assert data["model"]["model_dirs"] == ["/new/models"]
+        assert data["model"]["model_dir"] == "/new/models"
+
+    def test_sync_model_dir_to_server_settings_overwrites_with_default(
+        self, tmp_path: Path
+    ):
+        """Test overwrite sync persists the default base_path/models directory."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "model": {
+                        "model_dirs": ["/old/models"],
+                        "model_dir": "/old/models",
+                    },
+                }
+            )
+        )
+
+        config = ServerConfig(base_path=str(tmp_path), model_dir="")
+        config.sync_model_dir_to_server_settings(overwrite=True)
+
+        default_model_dir = str(tmp_path / "models")
+        with open(settings_file) as f:
+            data = json.load(f)
+        assert data["model"]["model_dirs"] == [default_model_dir]
+        assert data["model"]["model_dir"] == default_model_dir
 
     def test_set_server_api_key_new_file(self, tmp_path: Path):
         """Test setting API key creates settings.json if not exists."""
@@ -324,6 +521,97 @@ class TestServerConfig:
 
         result = config.update_server_api_key_runtime("new-key")
         assert result is False
+
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_success(self, mock_session_cls, tmp_path):
+        """Test runtime model directory update on running server."""
+        config = ServerConfig(base_path=str(tmp_path))
+        config.set_server_api_key("current-key")
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = [
+            Mock(status_code=200),  # login
+            Mock(status_code=200),  # settings update
+        ]
+
+        result = config.update_model_dir_runtime("/new/models")
+        assert result is True
+        assert mock_session.post.call_count == 2
+        mock_session.post.assert_any_call(
+            "http://127.0.0.1:8000/admin/api/global-settings",
+            json={"model_dirs": ["/new/models"]},
+            timeout=2,
+        )
+
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_server_down(self, mock_session_cls, tmp_path):
+        """Test runtime model directory update returns False when unreachable."""
+        import requests as req
+
+        config = ServerConfig(base_path=str(tmp_path))
+        config.set_server_api_key("current-key")
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = req.ConnectionError("refused")
+
+        result = config.update_model_dir_runtime("/new/models")
+        assert result is False
+
+    @patch("omlx_app.config.requests.Session")
+    def test_update_model_dir_runtime_custom_bind(self, mock_session_cls, tmp_path):
+        """Runtime model dir update hits custom bind host, not 127.0.0.1."""
+        config = ServerConfig(base_path=str(tmp_path), port=8000)
+        config.set_server_api_key("current-key")
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5", "port": 8000}})
+        )
+
+        mock_session = Mock()
+        mock_session_cls.return_value = mock_session
+        mock_session.post.side_effect = [
+            Mock(status_code=200),  # login
+            Mock(status_code=200),  # settings update
+        ]
+
+        result = config.update_model_dir_runtime("/new/models")
+        assert result is True
+        posted_urls = [c.args[0] for c in mock_session.post.call_args_list]
+        assert all("100.64.0.5" in u for u in posted_urls)
+        assert not any("127.0.0.1" in u for u in posted_urls)
+
+
+class TestResolveLocalServerUrls:
+    """Tests for bind-host-aware local URL resolution."""
+
+    def test_unspecified_uses_loopback(self):
+        assert resolve_local_server_base_url("", 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url(None, 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url("0.0.0.0", 8000) == "http://127.0.0.1:8000"
+        assert resolve_local_server_base_url("::", 8000) == "http://127.0.0.1:8000"
+
+    def test_localhost_aliases(self):
+        assert resolve_local_server_base_url("127.0.0.1", 9000) == "http://127.0.0.1:9000"
+        assert resolve_local_server_base_url("localhost", 9000) == "http://127.0.0.1:9000"
+
+    def test_custom_ipv4(self):
+        assert resolve_local_server_base_url("100.64.0.5", 8765) == "http://100.64.0.5:8765"
+
+    def test_ipv6_brackets_in_url(self):
+        assert resolve_local_server_base_url(
+            "2001:db8::1", 8080
+        ) == "http://[2001:db8::1]:8080"
+
+    def test_health_url(self):
+        assert resolve_local_server_health_url(
+            "100.64.0.5", 8765
+        ) == "http://100.64.0.5:8765/health"
+
+    def test_tcp_probe_targets(self):
+        assert tcp_probe_connection_targets("", 8000) == [("127.0.0.1", 8000)]
+        assert tcp_probe_connection_targets("0.0.0.0", 8000) == [("127.0.0.1", 8000)]
+        assert tcp_probe_connection_targets("100.64.0.5", 8000) == [("100.64.0.5", 8000)]
 
 
 class TestServerStatus:
@@ -416,10 +704,27 @@ class TestServerManager:
         url = manager._get_health_url()
         assert url == "http://127.0.0.1:8765/health"
 
+    def test_get_health_url_custom_bind(self, manager: ServerManager):
+        """Health URL follows server.host when not loopback / all-interfaces."""
+        base = Path(manager.config.base_path)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5", "port": 8765}})
+        )
+        assert manager._get_health_url() == "http://100.64.0.5:8765/health"
+
     def test_get_api_url(self, manager: ServerManager):
         """Test API URL generation."""
         url = manager.get_api_url()
         assert url == "http://127.0.0.1:8765"
+
+    def test_get_api_url_custom_bind(self, manager: ServerManager):
+        base = Path(manager.config.base_path)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "settings.json").write_text(
+            json.dumps({"server": {"host": "100.64.0.5"}})
+        )
+        assert manager.get_api_url() == "http://100.64.0.5:8765"
 
     def test_update_config(self, manager: ServerManager):
         """Test config update."""
@@ -451,7 +756,7 @@ class TestServerManager:
         assert manager.is_running() is False
 
     @patch("omlx_app.server_manager.requests.Session")
-    def test_check_health_success(self, mock_session_cls, manager: ServerManager):
+    def test_check_health_success(self, mock_session_cls, config: ServerConfig):
         """Test successful health check."""
         mock_session = Mock()
         mock_response = Mock()
@@ -459,12 +764,14 @@ class TestServerManager:
         mock_session.get.return_value = mock_response
         mock_session_cls.return_value = mock_session
 
+        manager = ServerManager(config)
+
         assert manager.check_health() is True
         mock_session.get.assert_called_once_with("http://127.0.0.1:8765/health", timeout=2)
         assert mock_session.trust_env is False
 
     @patch("omlx_app.server_manager.requests.Session")
-    def test_check_health_failure(self, mock_session_cls, manager: ServerManager):
+    def test_check_health_failure(self, mock_session_cls, config: ServerConfig):
         """Test failed health check (non-200 status)."""
         mock_session = Mock()
         mock_response = Mock()
@@ -472,17 +779,42 @@ class TestServerManager:
         mock_session.get.return_value = mock_response
         mock_session_cls.return_value = mock_session
 
+        manager = ServerManager(config)
+
         assert manager.check_health() is False
 
     @patch("omlx_app.server_manager.requests.Session")
-    def test_check_health_connection_error(self, mock_session_cls, manager: ServerManager):
+    def test_check_health_connection_error(self, mock_session_cls, config: ServerConfig):
         """Test health check with connection error."""
         import requests
         mock_session = Mock()
         mock_session.get.side_effect = requests.RequestException("Connection refused")
         mock_session_cls.return_value = mock_session
 
+        manager = ServerManager(config)
+
         assert manager.check_health() is False
+
+    @patch("omlx_app.server_manager.requests.Session")
+    def test_check_health_reuses_session(self, mock_session_cls, config: ServerConfig):
+        """Session is created once and reused across health checks.
+
+        Without reuse, every poll opens a fresh TCP connection that lands
+        in TIME_WAIT. The background loop polls every 5s; under server
+        slowdown this can exhaust the host's ephemeral port range and
+        wedge unrelated outbound TCP.
+        """
+        mock_session = Mock()
+        mock_session.get.return_value = Mock(status_code=200)
+        mock_session_cls.return_value = mock_session
+
+        manager = ServerManager(config)
+        manager.check_health()
+        manager.check_health()
+        manager.check_health()
+
+        assert mock_session_cls.call_count == 1
+        assert mock_session.get.call_count == 3
 
     def test_start_already_running(self, manager: ServerManager):
         """Test start returns False when already running."""

@@ -30,7 +30,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -149,6 +149,13 @@
                     models: [],
                     model_memory_used: 0,
                     model_memory_max: 0,
+                    memory_pressure: {
+                        enabled: false,
+                        current_bytes: 0,
+                        soft_bytes: 0,
+                        hard_bytes: 0,
+                        pressure_level: 'ok',
+                    },
                     total_active_requests: 0,
                     total_waiting_requests: 0,
                 },
@@ -160,6 +167,10 @@
                     total_num_files: 0,
                     total_size_bytes: 0,
                     effective_block_sizes: [],
+                    hot_cache_size_bytes: 0,
+                    hot_cache_entries: 0,
+                    hot_cache_max_bytes: 0,
+                    disk_max_bytes: 0,
                 },
             },
             alltimeStats: {
@@ -174,11 +185,23 @@
             serverAliases: [],
             selectedAlias: '',
 
+            // Server-restart state machine (driven by Settings > Server > Restart).
+            // status transitions: idle → restarting → waiting → idle (success)
+            //                   |                   |
+            //                   |                   └─→ error (timeout / non-200)
+            //                   └─→ unsupported (no menubar supervisor)
+            //                   └─→ error (POST failed)
+            restartServer: {
+                status: 'idle',
+                message: '',
+            },
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
             showClearSsdCacheConfirm: false,
+            showClearHotCacheConfirm: false,
             _statsRefreshTimer: null,
 
             // Log viewer state
@@ -193,6 +216,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -241,6 +265,20 @@
             hfSearchLoading: false,
             hfSearchLoaded: false,
             hfSearchDebounceTimer: null,
+            // Search filters
+            hfSearchFiltersOpen: false,
+            hfSearchMinParams: '',
+            hfSearchMaxParams: '',
+            hfSearchMaxSize: '',
+            hfSearchMinSize: '',
+            // Table sort state for Browse Models
+            hfTableSort: 'downloads',
+            hfTableSortDir: 'desc',
+
+            // Computed: check if any filters are active
+            get hfSearchFiltersActive() {
+                return this.hfSearchMinParams || this.hfSearchMaxParams || this.hfSearchMaxSize || this.hfSearchMinSize;
+            },
 
             // Search history
             hfSearchHistory: JSON.parse(localStorage.getItem('hfSearchHistory') || '[]'),
@@ -303,6 +341,7 @@
             oqTextOnly: false,
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
+            oqPreserveMtp: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -347,6 +386,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
+            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -734,12 +774,14 @@
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
+                            sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
                             model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
+                            chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1571,7 +1613,34 @@
                     specprefill_threshold: settings.specprefill_threshold || null,
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_draft_quant_enabled: settings.dflash_draft_quant_enabled || false,
+                    dflash_draft_quant_weight_bits: settings.dflash_draft_quant_weight_bits || 4,
+                    dflash_draft_quant_activation_bits: settings.dflash_draft_quant_activation_bits || 16,
+                    dflash_draft_quant_group_size: settings.dflash_draft_quant_group_size || 64,
+                    dflash_max_ctx: settings.dflash_max_ctx ?? null,
+                    dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
+                    dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
+                        ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
+                        : 8,
+                    dflash_ssd_cache: settings.dflash_ssd_cache || false,
+                    dflash_ssd_cache_max_gib: settings.dflash_ssd_cache_max_bytes
+                        ? Math.round(settings.dflash_ssd_cache_max_bytes / (1024 ** 3))
+                        : 20,
+                    dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
+                    dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
+                    dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
+                    dflash_compatible: model.dflash_compatible !== false,
+                    dflash_compatibility_reason: model.dflash_compatibility_reason || '',
+                    dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
+                    mtp_enabled: settings.mtp_enabled || false,
+                    mtp_compatible: model.mtp_compatible === true,
+                    mtp_compatibility_reason: model.mtp_compatibility_reason || '',
+                    is_paroquant: model.is_paroquant === true,
+                    paroquant_reason: model.paroquant_reason || '',
+                    vlm_mtp_enabled: settings.vlm_mtp_enabled || false,
+                    vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
+                    vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1654,8 +1723,57 @@
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
+                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
+                                    : null,
+                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
+                                    : null,
+                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
+                                    : null,
+                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
+                                    ? parseInt(this.modelSettings.dflash_max_ctx)
+                                    : null,
+                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
+                                    ? !!this.modelSettings.dflash_in_memory_cache
+                                    : true,
+                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
+                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
+                                    : 4,
+                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
+                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
+                                    : 8 * (1024 ** 3),
+                                dflash_ssd_cache: this.modelSettings.dflash_enabled
+                                    && !!this.modelSettings.dflash_in_memory_cache
+                                    && !!this.modelSettings.dflash_ssd_cache_available
+                                    && !!this.modelSettings.dflash_ssd_cache,
+                                dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
+                                    ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
+                                    : 20 * (1024 ** 3),
+                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                dflash_draft_window_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_window_size
+                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
+                                    : null,
+                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_draft_sink_size !== null
+                                    && this.modelSettings.dflash_draft_sink_size !== undefined
+                                    && this.modelSettings.dflash_draft_sink_size !== ''
+                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : null,
+                                dflash_verify_mode: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
+                                    : null,
+                                mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
+                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
+                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
+                                    : null,
+                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
+                                    && this.modelSettings.vlm_mtp_draft_block_size
+                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
@@ -1668,7 +1786,13 @@
                         const data = await response.json();
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
-                            alert(window.t('js.info.model_type_reload_required'));
+                            if (data.auto_reloaded) {
+                                alert(window.t('js.info.model_settings_auto_reloaded'));
+                            } else if (data.auto_unloaded) {
+                                alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else {
+                                alert(window.t('js.info.model_type_reload_required'));
+                            }
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -1721,7 +1845,20 @@
                         this.modelSettings.specprefill_threshold = null;
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
-                        this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_draft_quant_enabled = false;
+                        this.modelSettings.dflash_draft_quant_weight_bits = null;
+                        this.modelSettings.dflash_draft_quant_activation_bits = null;
+                        this.modelSettings.dflash_draft_quant_group_size = null;
+                        this.modelSettings.dflash_max_ctx = null;
+                        this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
+                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
+                        this.modelSettings.dflash_ssd_cache = false;
+                        this.modelSettings.dflash_ssd_cache_max_gib = 20;
+                        this.modelSettings.dflash_draft_window_size = null;
+                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -1799,6 +1936,109 @@
                 }
             },
 
+            async restartServerStart() {
+                if (this.restartServer.status === 'restarting'
+                    || this.restartServer.status === 'waiting') {
+                    return;
+                }
+                if (!window.confirm(window.t('settings.server.restart_confirm'))) {
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'restarting',
+                    message: window.t('settings.server.restart_status_sending'),
+                };
+
+                let response;
+                try {
+                    response = await fetch('/admin/api/server/restart', { method: 'POST' });
+                } catch (err) {
+                    // Network errors mid-restart are expected if the server
+                    // dies before sending the 202; fall through to polling.
+                    this.restartServer = {
+                        status: 'waiting',
+                        message: window.t('settings.server.restart_status_waiting'),
+                    };
+                    this._restartServerPoll();
+                    return;
+                }
+
+                if (response.status === 503) {
+                    let msg = window.t('settings.server.restart_status_unavailable');
+                    try {
+                        const data = await response.json();
+                        if (data && data.detail) msg = data.detail;
+                    } catch (e) { /* ignore */ }
+                    this.restartServer = { status: 'unsupported', message: msg };
+                    return;
+                }
+
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return;
+                }
+
+                if (response.status !== 202) {
+                    this.restartServer = {
+                        status: 'error',
+                        message: window.t('settings.server.restart_status_unexpected')
+                            .replace('{status}', String(response.status)),
+                    };
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'waiting',
+                    message: window.t('settings.server.restart_status_waiting'),
+                };
+                this._restartServerPoll();
+            },
+
+            _restartServerPoll() {
+                const deadline = Date.now() + 60000;  // 60s max wait
+                let sawDownAt = 0;
+                const tick = async () => {
+                    if (Date.now() > deadline) {
+                        this.restartServer = {
+                            status: 'error',
+                            message: window.t('settings.server.restart_status_timeout'),
+                        };
+                        return;
+                    }
+                    let alive = false;
+                    try {
+                        const r = await fetch('/health', { cache: 'no-store' });
+                        alive = r.ok;
+                    } catch (e) {
+                        alive = false;
+                    }
+                    if (!alive) {
+                        // First time we see it down — record it. We require a
+                        // down-then-up transition before declaring success, so
+                        // a fast supervisor that hasn't killed the old process
+                        // yet doesn't trick us into "instant success".
+                        if (!sawDownAt) sawDownAt = Date.now();
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    // Alive again. If we never observed the down state, the
+                    // restart hasn't actually fired yet — keep polling.
+                    if (!sawDownAt) {
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    this.restartServer = {
+                        status: 'idle',
+                        message: window.t('settings.server.restart_status_back'),
+                    };
+                    // Small delay so the user sees the success state, then
+                    // reload to ensure all caches/sessions re-sync.
+                    setTimeout(() => window.location.reload(), 500);
+                };
+                tick();
+            },
+
             get llmModels() {
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
@@ -1859,46 +2099,41 @@
                 }
             },
 
-            get codexCommand() {
+            _launchCmd(tool) {
+                // cli_prefix is always "omlx" or an app-bundle path with no
+                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
+                // in the dashboard command display.
                 const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.codex_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch codex --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return `${cli} launch ${tool}`;
+            },
+
+            get claudeCommand() {
+                return this._launchCmd('claude');
+            },
+
+            get codexCommand() {
+                return this._launchCmd('codex');
+            },
+
+            get copilotCommand() {
+                return this._launchCmd('copilot');
             },
 
             get opencodeCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.opencode_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch opencode --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('opencode');
             },
 
             get openclawCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.openclaw_model || 'select-a-model';
-                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'full';
-                const parts = [`${this.shellQuote(cli)} launch openclaw --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                parts.push(`--tools-profile ${this.shellQuote(profile)}`);
-                return parts.join(' ');
+                const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
+                return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
+            },
+
+            get hermesCommand() {
+                return this._launchCmd('hermes');
             },
 
             get piCommand() {
-                const cli = this.stats.cli_prefix || 'omlx';
-                const model = this.globalSettings.integrations.pi_model || 'select-a-model';
-                const parts = [`${this.shellQuote(cli)} launch pi --model ${this.shellQuote(model)}`];
-                if (this.stats.api_key) {
-                    parts.push(`--api-key ${this.shellQuote(this.stats.api_key)}`);
-                }
-                return parts.join(' ');
+                return this._launchCmd('pi');
             },
 
             async saveIntegrationSettings() {
@@ -1907,9 +2142,11 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            integrations_copilot_model: this.globalSettings.integrations.copilot_model,
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
@@ -1939,7 +2176,7 @@
                 }
             },
 
-            async loadStats() {
+            async loadStats(includeAlltime = true) {
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -1952,6 +2189,10 @@
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    }
+
+                    if (!includeAlltime) {
+                        return;
                     }
 
                     // Load all-time stats
@@ -1994,7 +2235,8 @@
 
             async clearSsdCache() {
                 try {
-                    await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
@@ -2003,11 +2245,24 @@
                 }
             },
 
+            async clearHotCache() {
+                try {
+                    const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
+                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
+                    this.showClearHotCacheConfirm = false;
+                    await this.loadStats();
+                } catch (err) {
+                    console.error('Failed to clear hot cache:', err);
+                    this.showClearHotCacheConfirm = false;
+                }
+            },
+
             startStatsRefresh() {
                 this.stopStatsRefresh();
+                this.loadStats();
                 this._statsRefreshTimer = setInterval(() => {
-                    this.loadStats();
-                }, 1000);
+                    this.loadStats(false);
+                }, 500);
             },
 
             stopStatsRefresh() {
@@ -2023,6 +2278,36 @@
                 return num.toLocaleString();
             },
 
+            cacheObsCumulative(stats, selectedModel) {
+                const entries = stats.runtime_cache?.models || [];
+                if (entries.length === 0) return {};
+
+                if (selectedModel) {
+                    const entry = entries.find(m => m.id === selectedModel);
+                    return entry?.cache_rates?.cumulative || {};
+                }
+
+                const sumKeys = ['prefix_hits', 'prefix_misses', 'evictions', 'ssd_hot_hits', 'ssd_disk_loads', 'ssd_saves', 'hot_cache_evictions', 'hot_cache_promotions'];
+                let agg = {};
+
+                for (const m of entries) {
+                    const c = m.cache_rates?.cumulative;
+                    if (!c || Object.keys(c).length === 0) continue;
+                    for (const k of sumKeys) {
+                        agg[k] = (agg[k] || 0) + (c[k] || 0);
+                    }
+                }
+
+                const ph = agg.prefix_hits || 0;
+                const pm = agg.prefix_misses || 0;
+                const sh = agg.ssd_hot_hits || 0;
+                const sd = agg.ssd_disk_loads || 0;
+                agg.prefix_hit_rate = (ph + pm) > 0 ? ph / (ph + pm) : 0;
+                agg.ssd_hot_rate = (sh + sd) > 0 ? sh / (sh + sd) : 0;
+
+                return agg;
+            },
+
             getStatFontClass(value) {
                 if (value >= 1000000000) return 'text-2xl';
                 if (value >= 1000000) return 'text-3xl';
@@ -2035,16 +2320,121 @@
                 return '0';
             },
 
+            formatByteCount(bytes) {
+                if (bytes == null || !Number.isFinite(bytes)) return '';
+                if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return Math.max(0, Math.round(bytes)) + ' B';
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
             },
 
-            get activeModelsMemoryPercent() {
-                const am = this.stats.active_models;
-                if (!am || !am.model_memory_max) return 0;
-                return Math.min(100, (am.model_memory_used / am.model_memory_max) * 100);
+            formatDurationShort(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '—';
+                if (seconds < 1) return seconds.toFixed(1) + 's';
+                if (seconds < 60) return Math.round(seconds) + 's';
+                const minutes = Math.floor(seconds / 60);
+                const rem = Math.round(seconds % 60);
+                if (minutes < 60) return minutes + 'm ' + rem + 's';
+                const hours = Math.floor(minutes / 60);
+                return hours + 'h ' + (minutes % 60) + 'm';
+            },
+
+            formatActivityAge(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '';
+                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+            },
+
+            formatActivityMetadata(activity) {
+                const parts = [];
+                if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
+                if (activity.document_count != null) parts.push(activity.document_count + ' docs');
+                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.text_length != null) parts.push(activity.text_length + ' chars');
+                if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
+                if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
+                if (activity.file_size_bytes != null && activity.file_size_bytes > 0) parts.push(this.formatByteCount(activity.file_size_bytes));
+                return parts.join(' · ');
+            },
+
+            activityDotClass(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return 'bg-green-400 animate-pulse';
+                if (seconds < 15) return 'bg-green-400 animate-pulse';
+                if (seconds < 30) return 'bg-amber-400 animate-pulse';
+                return 'bg-red-400';
+            },
+
+            get runtimeHotCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.hot_cache_max_bytes) return 0;
+                return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+            },
+
+            get runtimeSsdCachePercent() {
+                const rc = this.stats.runtime_cache;
+                if (!rc || !rc.disk_max_bytes) return 0;
+                return Math.min(100, (rc.total_size_bytes / rc.disk_max_bytes) * 100);
+            },
+
+            get activeModelsPressurePercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes) return 0;
+                return Math.min(100, (mp.current_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsSoftPercent() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.hard_bytes || !mp.soft_bytes) return 0;
+                return Math.min(100, (mp.soft_bytes / mp.hard_bytes) * 100);
+            },
+
+            get activeModelsPressureBarColor() {
+                const pct = this.activeModelsPressurePercent;
+                if (pct >= 90) return '#ef4444';
+                if (pct >= 80) return '#f97316';
+                if (pct >= 70) return '#f59e0b';
+                if (pct >= 60) return '#facc15';
+                return '#22c55e';
+            },
+
+            get activeModelsPressureBarStyle() {
+                return `width: ${this.activeModelsPressurePercent}%; height: 100%; display: block; background-color: ${this.activeModelsPressureBarColor};`;
+            },
+
+            get activeModelsSoftMarkerStyle() {
+                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+            },
+
+            activeModelsPressureLabel() {
+                const mp = this.stats.active_models?.memory_pressure;
+                if (!mp || !mp.enabled || !mp.hard_bytes) {
+                    return window.t('status.active_models.enforcer_disabled');
+                }
+                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+            },
+
+            modelSizeLabel(model) {
+                if (!model) return '-';
+                const estimated = model.estimated_size_formatted || '-';
+                if (model.is_loading) {
+                    return estimated;
+                }
+                // actual_size is a rough phys_footprint delta captured at load
+                // time and can include neighboring KV growth — mark with ~obs
+                // so it doesn't read as exact.
+                const actual = model.actual_size_formatted;
+                if (!actual) {
+                    return estimated;
+                }
+                if (!estimated || estimated === actual) {
+                    return `~${actual} obs`;
+                }
+                return `~${actual} obs / ${estimated} est`;
             },
 
             copyToClipboard(text) {
@@ -2116,6 +2506,7 @@
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploading = false;
+                this.benchUploadSkipped = null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -2195,6 +2586,14 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                        } else if (data.type === 'upload_skipped') {
+                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploading = false;
+                            this.benchRunning = false;
+                            this.benchProgress = null;
+                            es.close();
+                            this.benchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -2728,6 +3127,28 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';
@@ -2822,7 +3243,7 @@
                     return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
                 }
                 // Handle percent format (e.g., "69%")
-                const percent = parseInt(value.replace('%', ''));
+                const percent = parseInt(value.replace(/%/g, ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
             },
@@ -3456,6 +3877,7 @@
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                             dtype: this.oqDtype,
+                            preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -3560,6 +3982,11 @@
                 return model?.is_vlm || false;
             },
 
+            oqSelectedModelHasMtp() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.has_mtp_heads || false;
+            },
+
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
@@ -3603,6 +4030,7 @@
                         const params = new URLSearchParams({
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
+                            preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {
@@ -3777,10 +4205,18 @@
                 try {
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
-                        this.hfRecommended = await response.json();
+                        const data = await response.json();
+                        // Attach original rank so the # column survives column-header re-sorts
+                        this.hfRecommended = {
+                            trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                            popular: (data.popular || []).map((m, i) => ({ ...m, rank: i + 1 })),
+                        };
                         this.hfRecommendedLoaded = true;
                         this.hfPage.trending = 1;
                         this.hfPage.popular = 1;
+                        // Default sort for trending/popular is original rank
+                        this.hfTableSort = 'rank';
+                        this.hfTableSortDir = 'asc';
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -3822,6 +4258,56 @@
                 return count.toString();
             },
 
+            // Table sort helpers for Browse Models
+            sortModels(list) {
+                const sortBy = this.hfTableSort;
+                const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
+                return [...list].sort((a, b) => {
+                    if (sortBy === 'rank') {
+                        return dir * ((a.rank || 0) - (b.rank || 0));
+                    } else if (sortBy === 'name') {
+                        return dir * (a.name || '').localeCompare(b.name || '');
+                    } else if (sortBy === 'downloads') {
+                        return dir * ((a.downloads || 0) - (b.downloads || 0));
+                    } else if (sortBy === 'likes') {
+                        return dir * ((a.likes || 0) - (b.likes || 0));
+                    } else if (sortBy === 'size') {
+                        return dir * ((a.size || 0) - (b.size || 0));
+                    } else if (sortBy === 'params') {
+                        return dir * ((a.params || 0) - (b.params || 0));
+                    }
+                    return 0;
+                });
+            },
+
+            toggleTableSort(column) {
+                if (this.hfTableSort === column) {
+                    this.hfTableSortDir = this.hfTableSortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.hfTableSort = column;
+                    // Name and rank read more naturally as ascending by default
+                    this.hfTableSortDir = (column === 'name' || column === 'rank') ? 'asc' : 'desc';
+                }
+            },
+
+            syncTableSortToDropdown() {
+                const map = {
+                    largest:      { col: 'size',      dir: 'desc' },
+                    smallest:     { col: 'size',      dir: 'asc'  },
+                    most_params:  { col: 'params',    dir: 'desc' },
+                    least_params: { col: 'params',    dir: 'asc'  },
+                    downloads:    { col: 'downloads', dir: 'desc' },
+                    trending:     { col: 'downloads', dir: 'desc' },
+                    created:      { col: 'downloads', dir: 'desc' },
+                    updated:      { col: 'downloads', dir: 'desc' },
+                };
+                const m = map[this.hfSearchSort];
+                if (m) {
+                    this.hfTableSort = m.col;
+                    this.hfTableSortDir = m.dir;
+                }
+            },
+
             // Pagination helpers
             getPagedModels(tab) {
                 const page = this.hfPage[tab] || 1;
@@ -3830,7 +4316,9 @@
                 if (tab === 'trending') list = this.hfRecommended.trending || [];
                 else if (tab === 'popular') list = this.hfRecommended.popular || [];
                 else list = this.hfSearchResults || [];
-                return list.slice((page - 1) * size, page * size);
+                // Apply table sorting
+                const sorted = this.sortModels(list);
+                return sorted.slice((page - 1) * size, page * size);
             },
 
             getTotalPages(tab) {
@@ -3852,6 +4340,9 @@
                 this.hfSearchLoading = true;
                 this.hfRecommendedTab = 'search';
                 this.hfPage.search = 1;
+                // Sync table sort with dropdown choice so the frontend re-sort
+                // does not override what the backend returned
+                this.syncTableSortToDropdown();
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
@@ -3861,6 +4352,23 @@
                         limit: '100',
                         mlx_only: this.hfMlxOnly,
                     });
+                    // Add filter parameters if set. Sizes use binary GiB to match
+                    // _format_model_size on the backend.
+                    const GIB = 1024 * 1024 * 1024;
+                    if (this.hfSearchMinParams) params.set('min_params', (parseFloat(this.hfSearchMinParams) * 1e9).toString());
+                    if (this.hfSearchMaxParams) params.set('max_params', (parseFloat(this.hfSearchMaxParams) * 1e9).toString());
+                    if (this.hfSearchMaxSize) params.set('max_size', (parseFloat(this.hfSearchMaxSize) * GIB).toString());
+                    if (this.hfSearchMinSize) params.set('min_size', (parseFloat(this.hfSearchMinSize) * GIB).toString());
+                    // Wire largest/smallest sort params to backend
+                    if (this.hfSearchSort === 'largest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'false');
+                    } else if (this.hfSearchSort === 'smallest') {
+                        params.set('sort_by_size', 'true');
+                        params.set('sort_ascending', 'true');
+                    }
+
+
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
@@ -3887,6 +4395,14 @@
                     clearTimeout(timeoutId);
                     this.hfSearchLoading = false;
                 }
+            },
+
+            clearHFSearchFilters() {
+                this.hfSearchMinParams = '';
+                this.hfSearchMaxParams = '';
+                this.hfSearchMaxSize = '';
+                this.hfSearchMinSize = '';
+                if (this.hfSearchQuery.trim()) this.immediateSearch();
             },
 
             debounceSearch() {

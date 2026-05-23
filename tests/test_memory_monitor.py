@@ -264,3 +264,104 @@ class TestMemoryMonitor:
         )
 
         assert monitor._check_interval == 5.0
+
+
+class TestEstimatePrefillPeakBytes:
+    """Tests for estimate_prefill_peak_bytes (KV + SDPA only)."""
+
+    def _make_monitor(self, head_dim=128, n_attn=32, n_kv=4, n_layers=62):
+        m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
+        m.set_model_info(
+            num_layers=n_layers,
+            num_kv_heads=n_kv,
+            head_dim=head_dim,
+            dtype_size=2,
+            num_attention_heads=n_attn,
+        )
+        return m
+
+    def test_returns_zero_when_model_info_missing(self):
+        m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
+        assert m.estimate_prefill_peak_bytes(32768, 2048) == 0
+
+    def test_fused_kernel_below_head_dim_128(self):
+        # head_dim<=128 → fused tiled kernel, SDPA peak is just output buffer
+        m = self._make_monitor(head_dim=128, n_attn=32, n_kv=4, n_layers=62)
+        peak = m.estimate_prefill_peak_bytes(32768, 2048)
+        # KV: 62 layers * 4 kv_heads * 128 dim * 2 bytes * 2 (k+v) * 32768 ≈ 4.0 GB
+        # SDPA fused: n_attn * chunk * head_dim * 4 = 32*2048*128*4 ≈ 32 MB
+        # Total ≈ 4 GB
+        assert 3 * 1024**3 < peak < 5 * 1024**3
+
+    def test_fallback_path_above_head_dim_128(self):
+        # head_dim>128 → full attention matrix materialized in float32
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        peak = m.estimate_prefill_peak_bytes(32768, 2048)
+        # SDPA fallback: n_attn * chunk * total_tokens * 4 = 8*2048*32768*4 = 2 GB
+        # + output buffer 8*2048*256*4 ≈ 16 MB
+        # KV: 48 * 4 * 256 * 2 * 2 * 32768 ≈ 6 GB
+        # Total ≈ 8 GB
+        assert 7 * 1024**3 < peak < 9 * 1024**3
+
+    def test_scales_linearly_with_token_count(self):
+        m = self._make_monitor()
+        p8k = m.estimate_prefill_peak_bytes(8 * 1024, 2048)
+        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
+        # KV grows linearly with tokens; SDPA fused doesn't depend on
+        # total_tokens. KV dominates here, so 32k/8k ≈ 4x.
+        assert p32k > p8k
+        ratio = p32k / p8k
+        assert 3.5 < ratio < 4.5
+
+    def test_sdpa_fallback_scales_quadratically(self):
+        # head_dim>128 fallback: SDPA peak ∝ chunk * total_tokens.
+        # When chunk is fixed (2048), peak grows linearly with total_tokens
+        # plus KV grows linearly too. Doubling tokens should ~double peak.
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        p16k = m.estimate_prefill_peak_bytes(16 * 1024, 2048)
+        p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
+        ratio = p32k / p16k
+        assert 1.8 < ratio < 2.2
+
+    def test_no_python_overhead_constant(self):
+        # estimator must NOT include cache_pool_overhead or python_overhead
+        # magic constants — those are absorbed by enforcer hard_threshold.
+        # If a small prompt returns >2 GB on a small model, that's a sign
+        # someone added back the magic constants.
+        m = self._make_monitor(head_dim=128, n_attn=8, n_kv=2, n_layers=8)
+        peak = m.estimate_prefill_peak_bytes(512, 2048)
+        # KV: 8*2*128*2*2*512 ≈ 4 MB. SDPA fused: 8*512*128*4 ≈ 2 MB. Total ≈ 6 MB.
+        assert peak < 100 * 1024**2, f"unexpected large peak: {peak / 1024**2:.1f} MB"
+
+    def test_cached_tokens_extends_sdpa_span(self):
+        # head_dim>128 fallback: the last chunk attends over cached+new tokens.
+        # A request with a big prefix-cache hit (small new suffix) must still
+        # estimate the SDPA transient over the full span, not just new_tokens.
+        m = self._make_monitor(head_dim=256, n_attn=16, n_kv=2, n_layers=40)
+        # 2k new on top of 30k cached → SDPA span is 32k, query is 2k.
+        with_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=30 * 1024)
+        # Same new_tokens, no cache → SDPA span is only 2k.
+        without_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=0)
+        # SDPA dominates: span 32k vs 2k → ~16x larger transient.
+        sdpa_with = 16 * 2048 * (2048 + 30 * 1024) * 4
+        sdpa_without = 16 * 2048 * 2048 * 4
+        assert with_cache - without_cache == sdpa_with - sdpa_without
+        assert with_cache > without_cache * 5
+
+    def test_cached_tokens_default_matches_no_cache(self):
+        # Omitting cached_tokens must reproduce the pre-change behavior so the
+        # no-cache path (cached=0) is a strict regression guard.
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_prefill_peak_bytes(
+            32768, 2048
+        ) == m.estimate_prefill_peak_bytes(32768, 2048, cached_tokens=0)
+
+    def test_query_len_capped_at_new_tokens(self):
+        # When new_tokens < chunk_size the last (only) chunk's query length is
+        # new_tokens, not the full step size.
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # 512 new on top of 10k cached: query=512, span=10k+512.
+        peak = m.estimate_prefill_peak_bytes(512, 2048, cached_tokens=10 * 1024)
+        expected_sdpa = 8 * 512 * (512 + 10 * 1024) * 4 + 8 * 512 * 256 * 4
+        expected_kv = m.estimate_prompt_kv_bytes(512)
+        assert peak == expected_sdpa + expected_kv
