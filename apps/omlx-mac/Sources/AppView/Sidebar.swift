@@ -13,7 +13,7 @@ import SwiftUI
 // MARK: - Section model
 
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
-    case server, network, performance, status, logs
+    case server, status, network, performance, logs
     case models, downloads, integrations, quantization
     case throughputBench, accuracyBench
     case security, about

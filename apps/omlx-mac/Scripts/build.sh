@@ -241,6 +241,60 @@ rsync -a \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
 
+# --- Compile AppIcon.icon (Tahoe Liquid Glass) ----------------------------
+#
+# Xcode 26.5's project build system does NOT route a standalone
+# `Resources/AppIcon.icon` bundle into the actool invocation for macOS
+# targets (despite folder.iconcomposer.icon being a declared input file
+# type in the AssetCatalogCompiler.xcspec). The icon ends up missing from
+# the bundle entirely.
+#
+# Workaround: invoke actool ourselves with both the asset catalog AND the
+# .icon bundle as positional inputs. The result is a real AppIcon.icns +
+# enriched Assets.car that macOS 26's Liquid Glass icon system picks up
+# natively — no system tile wrap around our brand mark.
+#
+# We also patch the staged Info.plist with CFBundleIconName +
+# CFBundleIconFile since the actool partial-info-plist isn't merged into
+# the final plist by the time we're staging.
+
+ICON_BUNDLE="$REPO_ROOT/apps/omlx-mac/Resources/AppIcon.icon"
+XCASSETS_DIR="$REPO_ROOT/apps/omlx-mac/Resources/Assets.xcassets"
+INFO_PLIST="$STAGED_APP/Contents/Info.plist"
+
+if [ -d "$ICON_BUNDLE" ] && [ -d "$XCASSETS_DIR" ]; then
+    log "Compiling AppIcon.icon via actool…"
+    ACTOOL=/Applications/Xcode.app/Contents/Developer/usr/bin/actool
+    ICON_TMP=$(mktemp -d)
+    if "$ACTOOL" \
+            "$XCASSETS_DIR" \
+            "$ICON_BUNDLE" \
+            --compile "$ICON_TMP" \
+            --app-icon AppIcon \
+            --target-device mac \
+            --minimum-deployment-target 26.0 \
+            --platform macosx \
+            --bundle-identifier app.omlx-next \
+            --output-format human-readable-text \
+            --output-partial-info-plist "$ICON_TMP/icon.plist" \
+            >/dev/null 2>&1; then
+        cp "$ICON_TMP/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+        cp "$ICON_TMP/Assets.car"   "$RESOURCES_DIR/Assets.car"
+        /usr/libexec/PlistBuddy \
+            -c "Delete :CFBundleIconName" "$INFO_PLIST" 2>/dev/null || true
+        /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleIconName string AppIcon" "$INFO_PLIST"
+        /usr/libexec/PlistBuddy \
+            -c "Delete :CFBundleIconFile" "$INFO_PLIST" 2>/dev/null || true
+        /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleIconFile string AppIcon" "$INFO_PLIST"
+        ok "  + AppIcon.icns + Assets.car (Tahoe icon-composer)"
+    else
+        warn "actool merge of AppIcon.icon failed; bundle ships legacy icon"
+    fi
+    rm -rf "$ICON_TMP"
+fi
+
 # --- Re-sign ad-hoc -------------------------------------------------------
 #
 # Even with CODE_SIGNING_ALLOWED=NO during xcodebuild, we re-sign the staged

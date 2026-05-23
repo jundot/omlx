@@ -37,12 +37,18 @@ private struct HeroCard: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            Squircle(gradient: SquircleGradient.server, size: 60) {
-                Text("oM")
-                    .font(.omlxText(26, weight: .heavy))
-                    .kerning(-0.6)
-                    .foregroundStyle(.white)
-            }
+            // Match the ServerHeroCard / StatusScreen hero — same rounded
+            // omlx mark as the Dock icon and README hero, light/dark
+            // variants ship with the AppLogo imageset.
+            //
+            // The AppLogo SVG embeds a 10pt transparent margin inside its
+            // 160pt viewBox (content occupies 140pt). Frame is scaled by
+            // 160/140 so the visible rounded-square reads at the same ~60pt
+            // size as the previous Squircle placeholder.
+            Image("AppLogo")
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 69, height: 69)
             VStack(alignment: .leading, spacing: 4) {
                 Text("oMLX")
                     .font(.omlxText(22, weight: .semibold))
