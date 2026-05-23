@@ -3932,6 +3932,12 @@ async def create_response(
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
 
+    # Wire request.reasoning → enable_thinking.
+    # reasoning.effort == "none" → disable; any other reasoning dict → enable.
+    if "enable_thinking" not in forced_keys and request.reasoning is not None:
+        disable = request.reasoning.get("effort") == "none"
+        merged_ct_kwargs["enable_thinking"] = not disable
+
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already
     # returns plain dicts in {"role": str, "content": str} format.
