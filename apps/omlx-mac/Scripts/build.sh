@@ -160,6 +160,29 @@ resolve_donor_layers() {
     esac
 }
 
+# --- Derive bundle version from omlx/_version.py --------------------------
+#
+# omlx/_version.py is the canonical source — pyproject.toml reads it via
+# `[tool.setuptools.dynamic] version = {attr = ...}`. Mirror that into the
+# Swift bundle so CFBundleShortVersionString (MARKETING_VERSION) tracks
+# the Python package without a second hand-maintained string.
+#
+# CURRENT_PROJECT_VERSION uses `git rev-list --count HEAD` so each commit
+# gives a monotonically-increasing CFBundleVersion — enough for Sparkle's
+# update comparisons.
+#
+# If either lookup fails the script bails rather than silently shipping
+# stale numbers; falling back to the pbxproj placeholders would mask a
+# real regression.
+
+VERSION_FILE="$REPO_ROOT/omlx/_version.py"
+[ -f "$VERSION_FILE" ] || die "missing $VERSION_FILE — cannot derive bundle version"
+APP_VERSION=$(grep -oE '__version__[[:space:]]*=[[:space:]]*"[^"]+"' "$VERSION_FILE" | \
+              sed -E 's/.*"([^"]+)".*/\1/')
+[ -n "$APP_VERSION" ] || die "could not parse __version__ from $VERSION_FILE"
+BUILD_NUMBER=$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 1)
+log "Bundle version: $APP_VERSION (build $BUILD_NUMBER) — from omlx/_version.py"
+
 # --- xcodebuild -----------------------------------------------------------
 
 log "Building oMLX-next ($CONFIG)…"
@@ -181,6 +204,8 @@ xcodebuild \
     CODE_SIGN_IDENTITY="-" \
     CODE_SIGNING_REQUIRED=NO \
     CODE_SIGNING_ALLOWED=NO \
+    MARKETING_VERSION="$APP_VERSION" \
+    CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
     build >"$BUILD_DIR/xcodebuild.log" 2>&1 \
         || { tail -40 "$BUILD_DIR/xcodebuild.log" >&2; die "xcodebuild failed; full log: $BUILD_DIR/xcodebuild.log"; }
 
