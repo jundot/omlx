@@ -10,6 +10,7 @@ import yaml
 
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.claude import ClaudeCodeIntegration
+from omlx.integrations.clnkr import ClnkrIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
@@ -21,10 +22,11 @@ from omlx.integrations.pi import PiIntegration, _get_agent_dir
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 7
+        assert len(integrations) == 8
         names = {i.name for i in integrations}
         assert names == {
             "claude",
+            "clnkr",
             "copilot",
             "codex",
             "opencode",
@@ -35,6 +37,7 @@ class TestIntegrationRegistry:
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
+        assert get_integration("clnkr") is not None
         assert get_integration("copilot") is not None
         assert get_integration("codex") is not None
         assert get_integration("opencode") is not None
@@ -1181,6 +1184,96 @@ class TestCopilotIntegration:
         assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
 
 
+class TestClnkrIntegration:
+    def test_get_command(self):
+        clnkr = ClnkrIntegration()
+        cmd = clnkr.get_command(port=8000, api_key="key", model="qwen3.5")
+        assert "omlx launch clnkr" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        clnkr = ClnkrIntegration()
+        cmd = clnkr.get_command(port=8000, api_key="", model="")
+        assert "select-a-model" in cmd
+
+    def test_type(self):
+        clnkr = ClnkrIntegration()
+        assert clnkr.type == "env_var"
+        assert clnkr.display_name == "clnkr"
+        assert clnkr.install_check == "clnkr"
+
+    def test_launch_sets_clnkr_env(self):
+        clnkr = ClnkrIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.clnkr.os.environ", base_env),
+            patch("omlx.integrations.clnkr.os.execvpe", side_effect=fake_execvpe),
+        ):
+            clnkr.launch(port=8000, api_key="secret", model="qwen3.5")
+
+        env = captured["env"]
+        assert captured["binary"] == "clnkr"
+        assert captured["argv"] == ["clnkr"]
+        assert env["CLNKR_API_KEY"] == "secret"
+        assert env["CLNKR_BASE_URL"] == "http://127.0.0.1:8000/v1"
+        assert env["CLNKR_MODEL"] == "qwen3.5"
+        assert env["CLNKR_PROVIDER"] == "openai"
+        assert env["CLNKR_PROVIDER_API"] == "openai-chat-completions"
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_open_server_uses_omlx_token(self):
+        clnkr = ClnkrIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.clnkr.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.clnkr.os.execvpe", side_effect=fake_execvpe),
+        ):
+            clnkr.launch(port=8000, api_key="", model="qwen3.5")
+
+        assert captured["env"]["CLNKR_API_KEY"] == "omlx"
+
+    def test_launch_custom_host_and_extra_args(self):
+        clnkr = ClnkrIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.clnkr.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.clnkr.os.execvpe", side_effect=fake_execvpe),
+        ):
+            clnkr.launch(
+                port=9000,
+                api_key="key",
+                model="qwen3.5",
+                host="192.168.1.100",
+                extra_args=["--full-send", "--max-steps", "3"],
+            )
+
+        assert captured["argv"] == ["clnkr", "--full-send", "--max-steps", "3"]
+        assert captured["env"]["CLNKR_BASE_URL"] == "http://192.168.1.100:9000/v1"
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
@@ -1192,6 +1285,7 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model is None
         assert settings.pi_model is None
+        assert settings.clnkr_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
@@ -1204,6 +1298,7 @@ class TestIntegrationSettings:
         assert d["opencode_model"] is None
         assert d["hermes_model"] is None
         assert d["pi_model"] is None
+        assert d["clnkr_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
     def test_from_dict(self):
@@ -1215,6 +1310,7 @@ class TestIntegrationSettings:
                 "codex_model": "llama",
                 "opencode_model": "qwen",
                 "hermes_model": "hermes-qwen",
+                "clnkr_model": "clnkr-qwen",
             }
         )
         assert settings.copilot_model == "gpt-oss"
@@ -1223,9 +1319,11 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
+        assert settings.clnkr_model == "clnkr-qwen"
 
     def test_from_dict_empty(self):
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict({})
         assert settings.codex_model is None
+        assert settings.clnkr_model is None

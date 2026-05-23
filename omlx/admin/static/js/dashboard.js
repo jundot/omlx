@@ -2091,6 +2091,10 @@
                 return this._launchCmd('copilot');
             },
 
+            get clnkrCommand() {
+                return this._launchCmd('clnkr');
+            },
+
             get opencodeCommand() {
                 return this._launchCmd('opencode');
             },
@@ -2120,6 +2124,7 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_clnkr_model: this.globalSettings.integrations.clnkr_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
                     });
