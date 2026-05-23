@@ -1095,3 +1095,31 @@ class TestResponsesRequest:
         assert len(req.tools) == 2
         assert req.tools[0].type == "local_shell"
         assert req.tools[1].name == "read_file"
+
+
+class TestResponsesRequestReasoning:
+    """reasoning field parsing on ResponsesRequest."""
+
+    def test_reasoning_none_by_default(self):
+        req = ResponsesRequest(model="test")
+        assert req.reasoning is None
+
+    def test_reasoning_effort_high(self):
+        req = ResponsesRequest(model="test", reasoning={"effort": "high"})
+        assert req.reasoning == {"effort": "high"}
+
+    def test_reasoning_summary_only(self):
+        req = ResponsesRequest(model="test", reasoning={"summary": "auto"})
+        assert req.reasoning == {"summary": "auto"}
+
+    def test_reasoning_empty_dict_is_not_none(self):
+        req = ResponsesRequest(model="test", reasoning={})
+        assert req.reasoning is not None
+
+    def test_reasoning_explicit_none(self):
+        req = ResponsesRequest(model="test", reasoning=None)
+        assert req.reasoning is None
+
+    def test_reasoning_effort_none_disables(self):
+        req = ResponsesRequest(model="test", reasoning={"effort": "none"})
+        assert req.reasoning.get("effort") == "none"
