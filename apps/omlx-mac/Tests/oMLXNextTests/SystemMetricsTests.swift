@@ -119,6 +119,8 @@ final class SystemMetricsTests: XCTestCase {
             uptimeSeconds: 0,
             host: nil,
             port: nil,
+            apiKey: nil,
+            cliPrefix: nil,
             activeModels: StatsDTO.ActiveModelsDTO(
                 models: [],
                 modelMemoryUsed: nil,

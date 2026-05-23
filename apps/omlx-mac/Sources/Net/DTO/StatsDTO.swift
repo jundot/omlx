@@ -18,6 +18,13 @@ struct StatsDTO: Codable, Equatable, Sendable {
 
     let host: String?
     let port: Int?
+    /// Server-configured API key, surfaced for the Integrations setup-command
+    /// builders. Empty string when the server has no key configured.
+    let apiKey: String?
+    /// Absolute CLI invocation prefix used for `omlx launch <tool>` strings.
+    /// `nil` on older servers; callers fall back to the bare `"omlx"` token
+    /// (matches the dashboard JS `_launchCmd`).
+    let cliPrefix: String?
 
     let activeModels: ActiveModelsDTO
     /// Disk-side SSD cache observability. Present on `scope=session` reads;

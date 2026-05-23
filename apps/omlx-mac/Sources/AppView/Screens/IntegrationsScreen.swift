@@ -1,11 +1,12 @@
 // PR 9 — Integrations.
 //
 // Routes Claude Code requests to local models or to the cloud, exposes the
-// other named integrations (Codex / OpenCode / OpenClaw / Pi) as model
-// popups, and renders a copyable `omlx launch claude` command derived from
-// the current selection. The model popups read their options from
-// /admin/api/models so the user can only pick something the server
-// actually has on disk.
+// other named integrations (Codex / OpenCode / OpenClaw / Hermes / Pi /
+// Copilot) as model popups with per-tool launch commands, and renders the
+// Claude Code setup command — both the simple `omlx launch claude` form and
+// an "Advanced" env-var recipe that targets the real `claude` binary
+// directly. The model popups read their options from /admin/api/models so
+// the user can only pick something the server actually has on disk.
 //
 // The OpenAI Compatibility section + Connected Apps from the design canvas
 // are skipped: there are no matching server fields. We keep every shipped
@@ -20,7 +21,7 @@ struct IntegrationsScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ClaudeCodeSection(vm: vm, client: services.client)
-            SetupCommandSection(command: vm.claudeLaunchCommand)
+            ClaudeSetupCommandSection(vm: vm)
             OtherIntegrationsSection(vm: vm, client: services.client)
             MCPSection(vm: vm, client: services.client)
 
@@ -119,15 +120,50 @@ private struct ClaudeCodeSection: View {
     }
 }
 
-// MARK: - Setup command
+// MARK: - Setup command (Claude Code)
 
-private struct SetupCommandSection: View {
-    let command: String
+/// Houses both the primary `omlx launch claude` block and the "Advanced"
+/// env-var recipe that points the real `claude` binary at the local server.
+/// Mirrors `claudeCodeCommand` in `omlx/admin/static/js/dashboard.js`.
+private struct ClaudeSetupCommandSection: View {
+    @ObservedObject var vm: IntegrationsScreenVM
+    @State private var showAdvanced = false
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         SectionHeader("Setup Command")
 
+        VStack(alignment: .leading, spacing: 10) {
+            CommandBlock(command: vm.claudeLaunchCommand)
+
+            DisclosureGroup(isExpanded: $showAdvanced) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(vm.claudeMode == "cloud"
+                         ? "Resets Anthropic env vars so the real `claude` binary talks to the cloud."
+                         : "Points the real `claude` binary at your local oMLX server.")
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.textSecondary)
+                    CommandBlock(command: vm.claudeEnvRecipe)
+                }
+                .padding(.top, 6)
+            } label: {
+                Text("Advanced — run `claude` directly")
+                    .font(.omlxText(12, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            .padding(.horizontal, 4)
+        }
+        .padding(.horizontal, 14)
+    }
+}
+
+/// Shared monospaced command block with a copy button. Used by both the
+/// Claude Code section and each per-tool row in OtherIntegrationsSection.
+private struct CommandBlock: View {
+    let command: String
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("$ Terminal")
@@ -148,11 +184,10 @@ private struct SetupCommandSection: View {
                 RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                     .strokeBorder(theme.groupBorder, lineWidth: 0.5)
             )
-            .padding(.horizontal, 14)
 
             CopyButton(value: command)
-                .padding(.top, 18)
-                .padding(.trailing, 22)
+                .padding(.top, 6)
+                .padding(.trailing, 8)
         }
     }
 }
@@ -192,78 +227,121 @@ private struct OtherIntegrationsSection: View {
     var body: some View {
         SectionHeader(
             "Other Integrations",
-            subtitle: "Default model used by each named integration's launcher"
+            subtitle: "Default model + launcher command for each named integration"
         )
 
         ListGroup {
-            Row(label: "Codex") {
-                Popup(
-                    selection: vm.bind($vm.codexModel, save: {
-                        Task { await vm.save(.codexModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
-            }
-            Row(label: "OpenCode") {
-                Popup(
-                    selection: vm.bind($vm.opencodeModel, save: {
-                        Task { await vm.save(.opencodeModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
-            }
-            Row(label: "OpenClaw") {
-                Popup(
-                    selection: vm.bind($vm.openclawModel, save: {
-                        Task { await vm.save(.openclawModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
-            }
-            Row(label: "OpenClaw tools profile",
-                sublabel: "Which built-in MCP tools the OpenClaw launcher exposes") {
-                Popup(
-                    selection: vm.bind($vm.openclawToolsProfile, save: {
-                        Task { await vm.save(.openclawToolsProfile, client: client) }
-                    }),
-                    width: 160,
-                    options: [
-                        ("minimal",    "Minimal"),
-                        ("coding",     "Coding"),
-                        ("messaging",  "Messaging"),
-                        ("full",       "Full"),
-                    ]
-                )
-            }
-            Row(label: "Hermes Agent") {
-                Popup(
-                    selection: vm.bind($vm.hermesModel, save: {
-                        Task { await vm.save(.hermesModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
-            }
-            Row(label: "Pi") {
-                Popup(
-                    selection: vm.bind($vm.piModel, save: {
-                        Task { await vm.save(.piModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
-            }
-            Row(label: "Copilot CLI", isLast: true) {
-                Popup(
-                    selection: vm.bind($vm.copilotModel, save: {
-                        Task { await vm.save(.copilotModel, client: client) }
-                    }),
-                    width: 220,
-                    options: vm.modelOptions
-                )
+            IntegrationRow(
+                name: "Codex",
+                modelBinding: vm.bind($vm.codexModel, save: {
+                    Task { await vm.save(.codexModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.codexCommand
+            )
+            IntegrationRow(
+                name: "OpenCode",
+                modelBinding: vm.bind($vm.opencodeModel, save: {
+                    Task { await vm.save(.opencodeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.opencodeCommand
+            )
+            IntegrationRow(
+                name: "OpenClaw",
+                modelBinding: vm.bind($vm.openclawModel, save: {
+                    Task { await vm.save(.openclawModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.openclawCommand,
+                profileBinding: vm.bind($vm.openclawToolsProfile, save: {
+                    Task { await vm.save(.openclawToolsProfile, client: client) }
+                }),
+                profileSublabel: "Built-in MCP tools the OpenClaw launcher exposes"
+            )
+            IntegrationRow(
+                name: "Hermes Agent",
+                modelBinding: vm.bind($vm.hermesModel, save: {
+                    Task { await vm.save(.hermesModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.hermesCommand
+            )
+            IntegrationRow(
+                name: "Pi",
+                modelBinding: vm.bind($vm.piModel, save: {
+                    Task { await vm.save(.piModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.piCommand
+            )
+            IntegrationRow(
+                name: "Copilot CLI",
+                modelBinding: vm.bind($vm.copilotModel, save: {
+                    Task { await vm.save(.copilotModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.copilotCommand,
+                isLast: true
+            )
+        }
+    }
+}
+
+/// Per-integration FreeRow: name + model picker on the top half, monospaced
+/// launcher command + copy button below. Optional OpenClaw tools-profile
+/// popup folds in under the model picker.
+private struct IntegrationRow: View {
+    let name: String
+    let modelBinding: Binding<String>
+    let modelOptions: [(String, String)]
+    let command: String
+    var profileBinding: Binding<String>? = nil
+    var profileSublabel: String? = nil
+    var isLast: Bool = false
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        FreeRow(isLast: isLast) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Text(name)
+                        .font(.omlxText(13, weight: .medium))
+                        .foregroundStyle(theme.text)
+                    Spacer(minLength: 12)
+                    Popup(
+                        selection: modelBinding,
+                        width: 220,
+                        options: modelOptions
+                    )
+                }
+                if let profileBinding {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Tools profile")
+                                .font(.omlxText(12))
+                                .foregroundStyle(theme.textSecondary)
+                            if let profileSublabel {
+                                Text(profileSublabel)
+                                    .font(.omlxText(11))
+                                    .foregroundStyle(theme.textTertiary)
+                            }
+                        }
+                        Spacer(minLength: 12)
+                        Popup(
+                            selection: profileBinding,
+                            width: 160,
+                            options: [
+                                ("minimal",   "Minimal"),
+                                ("coding",    "Coding"),
+                                ("messaging", "Messaging"),
+                                ("full",      "Full"),
+                            ]
+                        )
+                    }
+                }
+                CommandBlock(command: command)
             }
         }
     }
@@ -351,12 +429,17 @@ final class IntegrationsScreenVM: ObservableObject {
     /// has unsaved edits, converges on a successful save.
     @Published private(set) var mcpConfigLoaded: String = ""
 
-    var hasPendingMCPChanges: Bool {
-        mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
-    }
-
     @Published private(set) var availableModels: [String] = []
     @Published var lastError: String?
+
+    // Server-resolved fields used by the command builders. Populated from
+    // /admin/api/stats so the shell strings reflect whatever host/port/key
+    // the running server actually advertises (instead of the local config,
+    // which can drift after a hot-reload).
+    @Published private(set) var serverHost: String = "127.0.0.1"
+    @Published private(set) var serverPort: Int = 8000
+    @Published private(set) var serverApiKey: String = ""
+    @Published private(set) var cliPrefix: String = "omlx"
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
     var modelOptions: [(String, String)] {
@@ -371,12 +454,54 @@ final class IntegrationsScreenVM: ObservableObject {
     /// changes so the user sees their selection immediately.
     var claudeLaunchCommand: String {
         if claudeMode == "cloud" {
-            return "omlx launch claude"
+            return "\(cliPrefix) launch claude"
         }
         let opus   = opusModel.isEmpty   ? "<opus-model>"   : opusModel
         let sonnet = sonnetModel.isEmpty ? "<sonnet-model>" : sonnetModel
         let haiku  = haikuModel.isEmpty  ? "<haiku-model>"  : haikuModel
-        return "omlx launch claude --opus \(opus) --sonnet \(sonnet) --haiku \(haiku)"
+        return "\(cliPrefix) launch claude --opus \(opus) --sonnet \(sonnet) --haiku \(haiku)"
+    }
+
+    /// Env-var recipe that runs the real `claude` binary directly. Mirrors
+    /// `claudeCodeCommand` in dashboard.js — cloud form unsets the Anthropic
+    /// vars, local form sets them to point at the oMLX server.
+    var claudeEnvRecipe: String {
+        if claudeMode == "cloud" {
+            return "env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN "
+                 + "-u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL "
+                 + "-u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS "
+                 + "-u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude"
+        }
+        let opus   = opusModel.isEmpty   ? "select-a-model" : opusModel
+        let sonnet = sonnetModel.isEmpty ? "select-a-model" : sonnetModel
+        let haiku  = haikuModel.isEmpty  ? "select-a-model" : haikuModel
+        var parts: [String] = []
+        parts.append(Self.shellEnvAssign("ANTHROPIC_BASE_URL",
+                                         "http://\(formatDisplayHost(serverHost)):\(serverPort)"))
+        if !serverApiKey.isEmpty {
+            parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", serverApiKey))
+        }
+        parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_OPUS_MODEL",   opus))
+        parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_SONNET_MODEL", sonnet))
+        parts.append(Self.shellEnvAssign("ANTHROPIC_DEFAULT_HAIKU_MODEL",  haiku))
+        parts.append("API_TIMEOUT_MS=3000000")
+        parts.append("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
+        parts.append("claude")
+        return parts.joined(separator: " ")
+    }
+
+    var codexCommand: String    { "\(cliPrefix) launch codex" }
+    var opencodeCommand: String { "\(cliPrefix) launch opencode" }
+    var openclawCommand: String {
+        let profile = openclawToolsProfile.isEmpty ? "coding" : openclawToolsProfile
+        return "\(cliPrefix) launch openclaw --tools-profile \(profile)"
+    }
+    var hermesCommand: String   { "\(cliPrefix) launch hermes" }
+    var piCommand: String       { "\(cliPrefix) launch pi" }
+    var copilotCommand: String  { "\(cliPrefix) launch copilot" }
+
+    var hasPendingMCPChanges: Bool {
+        mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
     }
 
     func bind<T: Equatable>(
@@ -425,6 +550,18 @@ final class IntegrationsScreenVM: ObservableObject {
             // Available models
             let models = try await client.listModels().models
             self.availableModels = models.map { $0.id }
+
+            // Stats — host/port/api_key/cli_prefix for the command builders.
+            // Failure here is non-fatal: the screen still works against the
+            // default `omlx` prefix and 127.0.0.1:8000.
+            if let stats = try? await client.getStats() {
+                if let host = stats.host, !host.isEmpty { self.serverHost = host }
+                if let port = stats.port               { self.serverPort = port }
+                self.serverApiKey = stats.apiKey ?? ""
+                if let prefix = stats.cliPrefix, !prefix.isEmpty {
+                    self.cliPrefix = prefix
+                }
+            }
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -467,4 +604,25 @@ final class IntegrationsScreenVM: ObservableObject {
         }
     }
 
+    // MARK: - Shell helpers
+
+    /// POSIX single-quote escape — mirrors `shellQuote` in dashboard.js so
+    /// the rendered command can be copy-pasted into bash/zsh as-is.
+    private static func shellQuote(_ value: String) -> String {
+        if value.isEmpty { return "''" }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private static func shellEnvAssign(_ name: String, _ value: String) -> String {
+        "\(name)=\(shellQuote(value))"
+    }
+
+    /// Wrap an IPv6 host in brackets so the URL parses. IPv4 / hostnames
+    /// pass through unchanged.
+    private func formatDisplayHost(_ host: String) -> String {
+        let unwrapped = host.hasPrefix("[") && host.hasSuffix("]")
+            ? String(host.dropFirst().dropLast())
+            : host
+        return unwrapped.contains(":") ? "[\(unwrapped)]" : unwrapped
+    }
 }
