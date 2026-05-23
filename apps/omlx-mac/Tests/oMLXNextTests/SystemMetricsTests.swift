@@ -125,7 +125,8 @@ final class SystemMetricsTests: XCTestCase {
                 modelMemoryMax: nil,
                 totalActiveRequests: active,
                 totalWaitingRequests: 0
-            )
+            ),
+            runtimeCache: nil
         )
     }
 }
