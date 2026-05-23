@@ -24,6 +24,17 @@ enum OMLXClientError: Error, CustomStringConvertible {
     }
 }
 
+extension Error {
+    /// String suitable for the `lastError` / banner surface on screen VMs.
+    /// OMLXClientError formats via its `description` (HTTP status + body,
+    /// authentication state, etc.); other errors fall back to
+    /// `localizedDescription`. Replaces the per-VM `describe(_:)` helper.
+    var omlxDescription: String {
+        if let omlx = self as? OMLXClientError { return String(describing: omlx) }
+        return localizedDescription
+    }
+}
+
 @MainActor
 final class OMLXClient: ObservableObject {
     private(set) var host: String
@@ -461,10 +472,6 @@ final class OMLXClient: ObservableObject {
 
     private func delete<T: Decodable>(_ path: String) async throws -> T {
         try await request("DELETE", path: path, body: nil)
-    }
-
-    private func deleteQ<T: Decodable>(_ path: String, query: [URLQueryItem]) async throws -> T {
-        try await request("DELETE", path: path, query: query, body: nil)
     }
 
     /// DELETE with a JSON body. The /admin/api/sub-keys endpoint is the

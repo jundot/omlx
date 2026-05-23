@@ -956,7 +956,7 @@ final class DownloadsScreenVM: ObservableObject {
                 self.mirrorDraft = ""
                 self.lastError = nil
             } catch {
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -981,7 +981,7 @@ final class DownloadsScreenVM: ObservableObject {
                 self.msMirrorDraft = ""
                 self.lastError = nil
             } catch {
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -1132,7 +1132,7 @@ final class DownloadsScreenVM: ObservableObject {
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -1148,7 +1148,7 @@ final class DownloadsScreenVM: ObservableObject {
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -1164,7 +1164,7 @@ final class DownloadsScreenVM: ObservableObject {
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -1180,7 +1180,7 @@ final class DownloadsScreenVM: ObservableObject {
                 await self?.refreshTasks()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -1203,7 +1203,7 @@ final class DownloadsScreenVM: ObservableObject {
         } catch {
             // 502/504 are common (mirror unreachable, dev offline). Surface
             // but keep UI usable.
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1225,14 +1225,10 @@ final class DownloadsScreenVM: ObservableObject {
             }
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }
 
 // MARK: - Helpers

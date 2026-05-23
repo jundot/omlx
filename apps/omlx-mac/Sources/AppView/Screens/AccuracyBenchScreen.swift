@@ -792,7 +792,7 @@ final class AccuracyBenchScreenVM: ObservableObject {
             let resp = try await client.listModels()
             self.models = resp.models
         } catch {
-            self.lastError = "Failed to load models: \(describe(error))"
+            self.lastError = "Failed to load models: \(error.omlxDescription)"
         }
     }
 
@@ -871,7 +871,7 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to add to queue: \(self?.describe(error) ?? "")"
+                    self?.lastError = "Failed to add to queue: \(error.omlxDescription)"
                 }
             }
         }
@@ -884,7 +884,7 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await MainActor.run { self?.status = s }
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to remove: \(self?.describe(error) ?? "")"
+                    self?.lastError = "Failed to remove: \(error.omlxDescription)"
                 }
             }
         }
@@ -897,7 +897,7 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to cancel: \(self?.describe(error) ?? "")"
+                    self?.lastError = "Failed to cancel: \(error.omlxDescription)"
                 }
             }
         }
@@ -911,14 +911,10 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to clear results: \(self?.describe(error) ?? "")"
+                    self?.lastError = "Failed to clear results: \(error.omlxDescription)"
                 }
             }
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

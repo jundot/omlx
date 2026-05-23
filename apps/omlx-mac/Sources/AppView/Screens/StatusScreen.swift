@@ -653,7 +653,7 @@ final class StatusScreenVM: ObservableObject {
             self.stats = try await client.getStats(scope: scope)
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -670,7 +670,7 @@ final class StatusScreenVM: ObservableObject {
             }
             await tick()
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -682,14 +682,10 @@ final class StatusScreenVM: ObservableObject {
             _ = try await client.clearSsdCache()
             await tick()
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }
 
 // MARK: - Helpers

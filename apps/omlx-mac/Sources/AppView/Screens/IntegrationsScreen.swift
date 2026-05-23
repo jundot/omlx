@@ -427,7 +427,7 @@ final class IntegrationsScreenVM: ObservableObject {
             self.availableModels = models.map { $0.id }
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -463,12 +463,8 @@ final class IntegrationsScreenVM: ObservableObject {
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
             }
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

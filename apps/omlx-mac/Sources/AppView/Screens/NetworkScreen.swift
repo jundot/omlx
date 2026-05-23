@@ -173,7 +173,7 @@ final class NetworkScreenVM: ObservableObject {
             }
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -211,7 +211,7 @@ final class NetworkScreenVM: ObservableObject {
             self.loadedCaBundle   = trim(caBundle)
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -219,8 +219,4 @@ final class NetworkScreenVM: ObservableObject {
         s.trimmingCharacters(in: .whitespaces)
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

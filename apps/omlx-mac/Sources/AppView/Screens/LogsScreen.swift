@@ -257,12 +257,8 @@ final class LogsScreenVM: ObservableObject {
             }
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

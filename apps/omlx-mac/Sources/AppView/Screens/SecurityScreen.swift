@@ -384,7 +384,7 @@ final class SecurityScreenVM: ObservableObject {
             self.subKeys = settings.auth?.subKeys ?? []
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -397,7 +397,7 @@ final class SecurityScreenVM: ObservableObject {
             await load(client: client)
             return true
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
             return false
         }
     }
@@ -415,7 +415,7 @@ final class SecurityScreenVM: ObservableObject {
                 await load(client: client)
                 return true
             } catch {
-                self.lastError = describe(error)
+                self.lastError = error.omlxDescription
                 return false
             }
         } else {
@@ -435,7 +435,7 @@ final class SecurityScreenVM: ObservableObject {
             )
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -445,7 +445,7 @@ final class SecurityScreenVM: ObservableObject {
             await load(client: client)
             return true
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
             return false
         }
     }
@@ -455,12 +455,8 @@ final class SecurityScreenVM: ObservableObject {
             _ = try await client.deleteSubKey(key: key)
             await load(client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

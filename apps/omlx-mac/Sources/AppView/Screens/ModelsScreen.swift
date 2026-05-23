@@ -297,7 +297,7 @@ final class ModelsScreenVM: ObservableObject {
                 await self?.refresh()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -309,7 +309,7 @@ final class ModelsScreenVM: ObservableObject {
                 await self?.refresh()
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -325,7 +325,7 @@ final class ModelsScreenVM: ObservableObject {
                 self?.lastError = nil
             } catch {
                 guard let self else { return }
-                self.lastError = self.describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -336,14 +336,10 @@ final class ModelsScreenVM: ObservableObject {
             self.allModels = try await client.listModels().models
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }
 
 // MARK: - Helpers

@@ -899,7 +899,7 @@ final class ThroughputBenchScreenVM: ObservableObject {
             self.models = resp.models
         } catch {
             // Surface so the user can recover; polling does not depend on this.
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -945,7 +945,7 @@ final class ThroughputBenchScreenVM: ObservableObject {
                 await MainActor.run {
                     guard let self else { return }
                     self.running = false
-                    self.lastError = self.describe(error)
+                    self.lastError = error.omlxDescription
                 }
             }
         }
@@ -962,7 +962,7 @@ final class ThroughputBenchScreenVM: ObservableObject {
             do {
                 _ = try await client.cancelBench(benchId: benchId)
             } catch {
-                await MainActor.run { self?.lastError = self?.describe(error) }
+                await MainActor.run { self?.lastError = error.omlxDescription }
             }
             await MainActor.run {
                 self?.running = false
@@ -1024,7 +1024,7 @@ final class ThroughputBenchScreenVM: ObservableObject {
                     // Transient failures (server restart, dropped socket)
                     // shouldn't kill the poll — log and try again.
                     await MainActor.run {
-                        self.lastError = self.describe(error)
+                        self.lastError = error.omlxDescription
                     }
                 }
                 try? await Task.sleep(for: .seconds(1))
@@ -1058,8 +1058,4 @@ final class ThroughputBenchScreenVM: ObservableObject {
         self.batchResults = batches.sorted { ($0.batchSize ?? 0) < ($1.batchSize ?? 0) }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }

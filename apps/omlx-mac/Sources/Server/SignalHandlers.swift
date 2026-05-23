@@ -25,8 +25,24 @@ final class SignalHandlers {
 
     /// Install the handlers. Pass a synchronous `reap` closure that
     /// terminates the child (typically `ServerProcess.reapSync()`).
+    ///
+    /// Safe to call more than once — calling again replaces the `reap`
+    /// closure (e.g. when the welcome wizard finishes and the spawned
+    /// ServerProcess becomes the one we want to clean up) and tears
+    /// down any previously-registered DispatchSourceSignal handles
+    /// before re-installing fresh ones so we never end up with stacked
+    /// signal sources routing into stale closures.
     func install(reap: @escaping () -> Void) {
         self.reap = reap
+
+        // Cancel any previously-registered signal sources before
+        // re-installing. Without this, a second install() leaks a
+        // parallel set of DispatchSourceSignal handles attached to the
+        // same signals, all firing the (now-stale) closure.
+        for source in sources {
+            source.cancel()
+        }
+        sources.removeAll()
 
         let signals: [Int32] = [SIGTERM, SIGINT, SIGHUP, SIGQUIT]
         for sig in signals {

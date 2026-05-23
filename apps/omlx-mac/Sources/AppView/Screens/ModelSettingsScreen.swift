@@ -377,7 +377,7 @@ private struct ProfilesTab: View {
             await vm.load(modelID: vm.modelID, client: client)
         } catch {
             // Surfaces via the screen's lastError banner — set on the VM.
-            await MainActor.run { vm.lastError = describe(error) }
+            await MainActor.run { vm.lastError = error.omlxDescription }
         }
     }
 
@@ -392,10 +392,6 @@ private struct ProfilesTab: View {
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }
 
 /// Translate the server's typed SamplingDTO into the loose dict the
@@ -1260,7 +1256,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             self.profileDirty = false
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1360,7 +1356,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1540,7 +1536,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             }
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1556,7 +1552,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             )
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1572,7 +1568,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             )
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1598,7 +1594,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             _ = try await client.applyModelProfile(id: modelID, name: entry.name)
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1646,7 +1642,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             _ = try await client.applyModelProfile(id: modelID, name: cleanName)
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1688,7 +1684,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             }
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1726,7 +1722,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             _ = try await client.applyModelProfile(id: modelID, name: name)
             await load(modelID: modelID, client: client)
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1740,7 +1736,7 @@ final class ModelSettingsScreenVM: ObservableObject {
             )
             self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1753,7 +1749,7 @@ final class ModelSettingsScreenVM: ObservableObject {
                 activeProfileName = "default"
             }
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -1771,14 +1767,10 @@ final class ModelSettingsScreenVM: ObservableObject {
             )
             self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 
     /// `4.0` → `"4"`, `2.5` → `"2.5"`. The TurboQuant Popup options are
     /// declared as strings; preserving an integral display avoids the

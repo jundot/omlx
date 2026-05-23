@@ -557,7 +557,7 @@ final class ServerScreenVM: ObservableObject {
             self.lastError = nil
             self.hasLoaded = true
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
@@ -646,7 +646,7 @@ final class ServerScreenVM: ObservableObject {
                 try await services.applyServerEndpoint(host: next)
                 self.effectiveHost = next
             } catch {
-                self.lastError = describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -666,7 +666,7 @@ final class ServerScreenVM: ObservableObject {
                 try await services.applyServerEndpoint(port: port)
                 self.effectivePort = port
             } catch {
-                self.lastError = describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -712,7 +712,7 @@ final class ServerScreenVM: ObservableObject {
                 self.modelDirText = services.config.modelDir
                 self.lastError = nil
             } catch {
-                self.lastError = describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -787,7 +787,7 @@ final class ServerScreenVM: ObservableObject {
                     try await services.restartServer()
                 }
             } catch {
-                self.lastError = describe(error)
+                self.lastError = error.omlxDescription
             }
         }
     }
@@ -837,14 +837,10 @@ final class ServerScreenVM: ObservableObject {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
         } catch {
-            self.lastError = describe(error)
+            self.lastError = error.omlxDescription
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 
     private func canonicalize(level raw: String) -> String {
         switch raw.lowercased() {

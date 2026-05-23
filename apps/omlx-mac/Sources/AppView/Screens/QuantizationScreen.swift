@@ -1324,7 +1324,7 @@ final class QuantizationScreenVM: ObservableObject {
             self.uploadValidatedUsername = nil
             self.uploadOrgs = []
             self.uploadNamespace = ""
-            self.lastUploadError = "Validate failed: \(describe(error))"
+            self.lastUploadError = "Validate failed: \(error.omlxDescription)"
         }
     }
 
@@ -1344,7 +1344,7 @@ final class QuantizationScreenVM: ObservableObject {
             // if nothing else was running before this submission.
             startPollingIfNeeded()
         } catch {
-            lastUploadError = "Upload failed: \(describe(error))"
+            lastUploadError = "Upload failed: \(error.omlxDescription)"
         }
     }
 
@@ -1374,10 +1374,6 @@ final class QuantizationScreenVM: ObservableObject {
         }
     }
 
-    private func describe(_ error: Error) -> String {
-        if let omlx = error as? OMLXClientError { return String(describing: omlx) }
-        return error.localizedDescription
-    }
 }
 
 // MARK: - Keychain helper
