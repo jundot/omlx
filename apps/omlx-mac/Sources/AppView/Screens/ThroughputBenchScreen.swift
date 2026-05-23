@@ -43,7 +43,11 @@ struct ThroughputBenchScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HeaderSection()
+            ScreenHeader(
+                eyebrow: "Throughput Benchmark",
+                title: "Measure inference speed",
+                subtitle: "Single-request TTFT/TPOT + continuous-batching TPS, swept across context lengths and batch sizes. Results stay in memory until the screen unloads."
+            )
 
             if let device = vm.device {
                 DeviceChip(device: device)
@@ -67,7 +71,7 @@ struct ThroughputBenchScreen: View {
                 )
             }
 
-            BannerSection(error: vm.lastError)
+            MessageBanner(error: vm.lastError)
 
             if !vm.singleResults.isEmpty {
                 SingleResultsTable(results: vm.singleResults)
@@ -96,32 +100,6 @@ struct ThroughputBenchScreen: View {
         // across screen unloads (see VM .stop comment), so navigation
         // doesn't lose progress.
         .task { await vm.start(client: services.client) }
-    }
-}
-
-// MARK: - Header
-
-private struct HeaderSection: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Throughput Benchmark")
-                .font(.omlxText(11, weight: .semibold))
-                .foregroundStyle(theme.textSecondary)
-                .textCase(.uppercase)
-                .kerning(0.6)
-            Text("Measure inference speed")
-                .font(.omlxText(20, weight: .semibold))
-                .foregroundStyle(theme.text)
-            Text("Single-request TTFT/TPOT + continuous-batching TPS, swept across context lengths and batch sizes. Results stay in memory until the screen unloads.")
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 18)
-        .padding(.bottom, 10)
     }
 }
 
@@ -369,33 +347,6 @@ private struct LiveProgressCard: View {
 }
 
 // MARK: - Banner
-
-private struct BannerSection: View {
-    let error: String?
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        if let error, !error.isEmpty {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(theme.redDot)
-                    .font(.system(size: 11))
-                    .padding(.top, 1)
-                Text(error)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-            }
-            .padding(10)
-            .background(theme.redDot.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-        }
-    }
-}
 
 // MARK: - Single-request results
 

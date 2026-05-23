@@ -150,6 +150,12 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var mtpEnabled: Bool? = nil
 }
 
+/// Generic acknowledgment shape returned by non-streaming admin endpoints
+/// that just need to signal completion (model load/unload, settings patch,
+/// task cancel/remove, stats clear, sub-key CRUD, etc.). Server responses
+/// vary in which subset of `status`/`message`/`success` they populate, so
+/// all three are optional and callers typically only check that the call
+/// did not throw.
 struct SimpleStatusResponse: Codable, Sendable {
     let status: String?
     let message: String?

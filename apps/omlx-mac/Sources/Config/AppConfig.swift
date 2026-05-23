@@ -119,6 +119,28 @@ struct AppConfig: Sendable, Equatable, Codable {
         }
     }
 
+    /// Apply a basePath choice across every layer that contributes to
+    /// `currentBasePath()` resolution on the next launch:
+    ///   • process env via `setenv`/`unsetenv` (so the spawned child
+    ///     server inherits the choice immediately)
+    ///   • bootstrap file (so Finder relaunches see it; launchd does not
+    ///     inherit shell rc)
+    ///   • shell rc (so terminal-launched `omlx` invocations agree)
+    /// Pass `nil` (or an empty string) to clear every override — the
+    /// "reset to ~/.omlx default" flow. Callers should compare against
+    /// `defaultBasePath()` first and pass `nil` when the user chose the
+    /// default so a default install isn't left with stale state.
+    static func persistBasePath(_ path: String?) {
+        let value = (path?.isEmpty ?? true) ? nil : path
+        if let value {
+            setenv(ShellEnvWriter.variableName, value, 1)
+        } else {
+            unsetenv(ShellEnvWriter.variableName)
+        }
+        try? writeBootstrapBasePath(value)
+        ShellEnvWriter.apply(value: value)
+    }
+
     static func defaultBasePath() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home.appendingPathComponent(".omlx", isDirectory: true).path

@@ -298,7 +298,7 @@ final class OMLXClient: ObservableObject {
     // PR 9 — Security
 
     @discardableResult
-    func setupApiKey(_ key: String, confirm: String) async throws -> SimpleSuccessResponse {
+    func setupApiKey(_ key: String, confirm: String) async throws -> SimpleStatusResponse {
         try await post(AdminAPI.setupApiKey, body: SetupApiKeyRequest(
             apiKey: key, apiKeyConfirm: confirm
         ))
@@ -310,7 +310,7 @@ final class OMLXClient: ObservableObject {
     }
 
     @discardableResult
-    func deleteSubKey(key: String) async throws -> SimpleSuccessResponse {
+    func deleteSubKey(key: String) async throws -> SimpleStatusResponse {
         try await deleteWithBody(AdminAPI.subKeys, body: DeleteSubKeyRequest(key: key))
     }
 
@@ -351,12 +351,12 @@ final class OMLXClient: ObservableObject {
     }
 
     @discardableResult
-    func cancelOQTask(taskId: String) async throws -> SimpleSuccessResponse {
+    func cancelOQTask(taskId: String) async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.oqCancel(taskId))
     }
 
     @discardableResult
-    func removeOQTask(taskId: String) async throws -> SimpleSuccessResponse {
+    func removeOQTask(taskId: String) async throws -> SimpleStatusResponse {
         try await delete(AdminAPI.oqTask(taskId))
     }
 
@@ -380,12 +380,12 @@ final class OMLXClient: ObservableObject {
     }
 
     @discardableResult
-    func cancelHFUploadTask(taskId: String) async throws -> SimpleSuccessResponse {
+    func cancelHFUploadTask(taskId: String) async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.uploadCancel(taskId))
     }
 
     @discardableResult
-    func removeHFUploadTask(taskId: String) async throws -> SimpleSuccessResponse {
+    func removeHFUploadTask(taskId: String) async throws -> SimpleStatusResponse {
         try await delete(AdminAPI.uploadTask(taskId))
     }
 

@@ -24,6 +24,7 @@
 		2BB000000000000000000008 /* ListGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000008 /* ListGroup.swift */; };
 		2BB000000000000000000009 /* Row.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000009 /* Row.swift */; };
 		2BB00000000000000000000A /* SectionHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000A /* SectionHeader.swift */; };
+		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
@@ -120,6 +121,7 @@
 		2CC000000000000000000008 /* ListGroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListGroup.swift; sourceTree = "<group>"; };
 		2CC000000000000000000009 /* Row.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Row.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000A /* SectionHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionHeader.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000D /* ScreenScaffold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenScaffold.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
@@ -374,6 +376,7 @@
 				2CC00000000000000000000A /* SectionHeader.swift */,
 				2CC00000000000000000000B /* StatusPill.swift */,
 				2CC00000000000000000000C /* CodeChip.swift */,
+				2CC00000000000000000000D /* ScreenScaffold.swift */,
 			);
 			path = Components;
 			sourceTree = "<group>";
@@ -562,6 +565,7 @@
 				2BB000000000000000000008 /* ListGroup.swift in Sources */,
 				2BB000000000000000000009 /* Row.swift in Sources */,
 				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
+				2BB00000000000000000000D /* ScreenScaffold.swift in Sources */,
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,

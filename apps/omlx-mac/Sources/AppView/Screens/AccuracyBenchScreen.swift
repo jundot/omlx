@@ -43,7 +43,11 @@ struct AccuracyBenchScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HeaderSection()
+            ScreenHeader(
+                eyebrow: "Accuracy Benchmark",
+                title: "Measure model accuracy",
+                subtitle: "Queue benchmarks across models. Results accumulate until you reset them. Resume across app launches via the server-side queue."
+            )
 
             ConfigurationSection(
                 models: vm.models,
@@ -63,7 +67,7 @@ struct AccuracyBenchScreen: View {
                 onRemove: { idx in vm.removeFromQueue(client: services.client, index: idx) }
             )
 
-            BannerSection(error: vm.lastError)
+            MessageBanner(error: vm.lastError)
 
             ResultsSection(
                 results: vm.results,
@@ -79,32 +83,6 @@ struct AccuracyBenchScreen: View {
         // poll task continues across screen unloads since AppServices
         // owns the VM, so we don't tear it down on disappear.
         .task { await vm.start(client: services.client) }
-    }
-}
-
-// MARK: - Header
-
-private struct HeaderSection: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Accuracy Benchmark")
-                .font(.omlxText(11, weight: .semibold))
-                .foregroundStyle(theme.textSecondary)
-                .textCase(.uppercase)
-                .kerning(0.6)
-            Text("Measure model accuracy")
-                .font(.omlxText(20, weight: .semibold))
-                .foregroundStyle(theme.text)
-            Text("Queue benchmarks across models. Results accumulate until you reset them. Resume across app launches via the server-side queue.")
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 18)
-        .padding(.bottom, 10)
     }
 }
 
@@ -524,34 +502,6 @@ private struct QueuedRow: View {
     }
 }
 
-// MARK: - Error banner
-
-private struct BannerSection: View {
-    let error: String?
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        if let error, !error.isEmpty {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(theme.redDot)
-                    .font(.system(size: 11))
-                    .padding(.top, 1)
-                Text(error)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-            }
-            .padding(10)
-            .background(theme.redDot.opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-        }
-    }
-}
 
 // MARK: - Results
 

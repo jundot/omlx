@@ -29,11 +29,6 @@ struct DeleteSubKeyRequest: Encodable, Sendable {
     let key: String
 }
 
-struct SimpleSuccessResponse: Decodable, Sendable {
-    let success: Bool
-    let message: String?
-}
-
 struct SetupApiKeyRequest: Encodable, Sendable {
     let apiKey: String
     let apiKeyConfirm: String

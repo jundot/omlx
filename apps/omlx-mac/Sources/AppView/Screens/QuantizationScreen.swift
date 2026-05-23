@@ -46,7 +46,11 @@ struct QuantizationScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HeaderSection()
+            ScreenHeader(
+                eyebrow: "oQ Quantization",
+                title: "Quantize on device",
+                subtitle: "Pick a full-precision model, choose an oQ level, and oMLX builds a mixed-precision plan tuned to that model's per-layer sensitivity. Output is standard mlx-lm safetensors — usable in any MLX runtime."
+            )
 
             SourceModelSection(
                 models: vm.models,
@@ -76,7 +80,7 @@ struct QuantizationScreen: View {
                 dtype: $vm.dtype
             )
 
-            BannerSection(error: vm.lastError, success: vm.lastSuccess)
+            MessageBanner(error: vm.lastError, success: vm.lastSuccess)
 
             if vm.modelsLoaded && vm.models.isEmpty {
                 EmptyModelsBanner()
@@ -114,32 +118,6 @@ struct QuantizationScreen: View {
         .sheet(item: $vm.uploadTarget) { task in
             UploadModalView(task: task, vm: vm, client: services.client)
         }
-    }
-}
-
-// MARK: - Header
-
-private struct HeaderSection: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("oQ Quantization")
-                .font(.omlxText(11, weight: .semibold))
-                .foregroundStyle(theme.textSecondary)
-                .textCase(.uppercase)
-                .kerning(0.6)
-            Text("Quantize on device")
-                .font(.omlxText(20, weight: .semibold))
-                .foregroundStyle(theme.text)
-            Text("Pick a full-precision model, choose an oQ level, and oMLX builds a mixed-precision plan tuned to that model's per-layer sensitivity. Output is standard mlx-lm safetensors — usable in any MLX runtime.")
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 18)
-        .padding(.bottom, 10)
     }
 }
 
@@ -351,45 +329,6 @@ private struct AdvancedSection: View {
                 }
             }
         }
-    }
-}
-
-// MARK: - Status banners
-
-private struct BannerSection: View {
-    let error: String?
-    let success: String?
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let error, !error.isEmpty {
-                banner(icon: "exclamationmark.triangle.fill", text: error, color: theme.redDot)
-            }
-            if let success, !success.isEmpty {
-                banner(icon: "checkmark.circle.fill", text: success, color: theme.greenDot)
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, error == nil && success == nil ? 0 : 6)
-    }
-
-    private func banner(icon: String, text: String, color: Color) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-                .font(.system(size: 11))
-                .padding(.top, 1)
-            Text(text)
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.text)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .background(color.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

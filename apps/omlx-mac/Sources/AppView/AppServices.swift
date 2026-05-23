@@ -226,24 +226,10 @@ final class AppServices: NSObject, ObservableObject {
             throw BasePathChangeError.moveFailed(error.localizedDescription)
         }
 
-        // Persist the new basePath so every relaunch path resolves to it:
-        //   • setenv() — current Swift process + spawned child server
-        //   • bootstrap file — Finder relaunches (launchd env doesn't
-        //     inherit shell rc, so the env var alone isn't enough)
-        //   • shell rc — terminal-launched processes (`omlx serve` from
-        //     a shell, or relaunching the app via the CLI)
-        // When the user resets to the `~/.omlx` default, every override
-        // is cleared so a default install isn't left with stale state.
+        // When the user resets to the `~/.omlx` default, clear every
+        // override so a default install isn't left with stale state.
         let isDefault = (newPath == AppConfig.defaultBasePath())
-        if isDefault {
-            unsetenv(ShellEnvWriter.variableName)
-            try? AppConfig.writeBootstrapBasePath(nil)
-            ShellEnvWriter.apply(value: nil)
-        } else {
-            setenv(ShellEnvWriter.variableName, newPath, 1)
-            try? AppConfig.writeBootstrapBasePath(newPath)
-            ShellEnvWriter.apply(value: newPath)
-        }
+        AppConfig.persistBasePath(isDefault ? nil : newPath)
 
         var updated = config
         updated.basePath = newPath

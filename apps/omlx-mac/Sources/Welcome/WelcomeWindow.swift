@@ -278,22 +278,9 @@ final class WelcomeViewModel: ObservableObject {
             return false
         }
 
-        // Persist the basePath so every relaunch path resolves to it:
-        //   • setenv() for this process (and the child we're about to spawn)
-        //   • bootstrap file for Finder relaunches (launchd env doesn't
-        //     inherit shell rc, so the env var alone isn't enough)
-        //   • shell rc for terminal-launched processes
-        // When the user kept the default ~/.omlx, every override is cleared.
+        // When the user kept the default ~/.omlx, clear every override.
         let isDefault = (resolvedBase == AppConfig.defaultBasePath())
-        if isDefault {
-            unsetenv(ShellEnvWriter.variableName)
-            try? AppConfig.writeBootstrapBasePath(nil)
-            ShellEnvWriter.apply(value: nil)
-        } else {
-            setenv(ShellEnvWriter.variableName, resolvedBase, 1)
-            try? AppConfig.writeBootstrapBasePath(resolvedBase)
-            ShellEnvWriter.apply(value: resolvedBase)
-        }
+        AppConfig.persistBasePath(isDefault ? nil : resolvedBase)
 
         do {
             try config.save()

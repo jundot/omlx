@@ -234,7 +234,7 @@ final class MenubarController: NSObject {
         chatItem.isEnabled = isRunning
 
         // Icon swap — outline when not actively serving, filled otherwise
-        let serving = isRunning || isUnresponsive
+        let serving = state.isRunningLike
         statusItem.button?.image = serving ? iconFilled : iconOutline
         statusItem.button?.image?.isTemplate = true
     }

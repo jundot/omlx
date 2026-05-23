@@ -65,16 +65,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // First run: stand up the menubar without a server, then run the
             // wizard. The wizard's "Start Server" creates a ServerProcess via
             // `services.bind(server:)`; AppDelegate adopts it back on close.
-            self.menubar = MenubarController(
-                server: nil,
-                config: config,
-                openAppView: { [weak self] in self?.presentAppView() }
-            )
+            self.menubar = makeMenubar(server: nil, config: config)
             // Stay in .regular until the wizard closes so the user sees the
             // window in the Dock.
             NSApp.activate(ignoringOtherApps: true)
             presentWelcome()
         }
+    }
+
+    /// All three MenubarController construction sites (first-run, returning
+    /// user success, returning user failure) capture the same `openAppView`
+    /// closure and differ only in `server`/`lastError`.
+    private func makeMenubar(
+        server: ServerProcess?,
+        config: AppConfig,
+        lastError: Error? = nil
+    ) -> MenubarController {
+        MenubarController(
+            server: server,
+            config: config,
+            lastError: lastError,
+            openAppView: { [weak self] in self?.presentAppView() }
+        )
     }
 
     private func bootstrapServer(config: AppConfig) {
@@ -87,11 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
             )
             self.server = server
-            self.menubar = MenubarController(
-                server: server,
-                config: config,
-                openAppView: { [weak self] in self?.presentAppView() }
-            )
+            self.menubar = makeMenubar(server: server, config: config)
             services.bind(server: server)
 
             // Install signal handlers BEFORE the spawn so a fast crash of
@@ -112,12 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } catch {
             // Surface the failure in the menubar; in-app banner lands in PR 6.
-            self.menubar = MenubarController(
-                server: nil,
-                config: config,
-                lastError: error,
-                openAppView: { [weak self] in self?.presentAppView() }
-            )
+            self.menubar = makeMenubar(server: nil, config: config, lastError: error)
             NSLog("oMLX-next: server bootstrap failed — \(error)")
         }
     }
