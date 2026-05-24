@@ -263,19 +263,28 @@ swaps in real Sparkle.
 
 ## Welcome wizard
 
-Five steps, ported from `packaging/omlx_app/welcome.py`:
+Single page (`WelcomeWindow.swift`): logo + tagline at the top, then
+Storage rows (base directory, optional model-dir override, port), then
+API Key rows (key + confirm with eye/Generate buttons), then hints,
+then footer actions. The Generate button writes a fresh
+`sk-omlx-<32-hex>` value into both key fields via
+`SecRandomCopyBytes`.
 
-1. Welcome (project intro, hardware check)
-2. Hugging Face mirror (default `huggingface.co`; users in CN can pick
-   `hf-mirror.com` etc.)
-3. Pick a starter model (downloads via `/admin/api/hf/download`)
-4. Set or generate API key
-5. Ready (summary + finish)
+The wizard runs inside its own `NSWindow` (not a sheet) so AppView
+stays independently usable. Two terminal actions:
 
-PR 10 captures the Python wizard's exact state machine in
-`docs/welcome-spec.md` first, then ports against the spec. The wizard runs
-inside its own `NSWindow` (not a sheet) so the AppView remains independently
-usable.
+- **Start Server** — persist `AppConfig`, spawn `ServerProcess`,
+  `POST /admin/api/setup-api-key`, close.
+- **Open Admin Panel & Close** — same flow, then opens
+  `http://<host>:<port>/admin/dashboard` in the default browser.
+
+Skipping the wizard (title-bar close box) writes the current Storage
+values with an empty API key so the user lands on AppView with the
+API-key-not-configured banner; on next launch the wizard does not
+re-fire (`AppConfig.hasExistingConfig` gates it on
+`<basePath>/settings.json`). Returning users edit those same values
+from ServerScreen (storage, port) and SecurityScreen (API key) — the
+wizard is first-run-only.
 
 ---
 

@@ -1,10 +1,10 @@
-// PR 10 — first-run welcome wizard. Ports `packaging/omlx_app/welcome.py` to
-// SwiftUI; data flow + validation rules captured in `docs/welcome-spec.md`.
+// First-run welcome wizard. Single-page Storage + API-key setup; spawns
+// the server on confirm.
 //
 // Architecture
 //   • `WelcomeWindowController` is the AppKit owner of the NSWindow + the
 //     SwiftUI `WelcomeView` that drives the four pages. AppDelegate creates
-//     one on first run (and on later "Welcome…" menu re-entry).
+//     one on first run only — returning users never see this window.
 //   • `WelcomeViewModel` is a @MainActor ObservableObject holding the wizard
 //     state across pages, the validation, and the "Start Server" action.
 //   • Single window, four pages (Welcome → Storage → API Key → Ready);
@@ -14,6 +14,7 @@
 // already exists (re-entry), the Welcome page is skipped via VM init state.
 
 import AppKit
+import Security
 import SwiftUI
 
 // MARK: - Window controller
@@ -23,18 +24,22 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     static let willCloseNotification = Notification.Name("OMLXWelcomeWillClose")
 
     private var window: NSWindow?
+    private var vm: WelcomeViewModel?
     private weak var services: AppServices?
     private weak var server: ServerProcess?
     private let didFinish: (AppConfig, ServerProcess?) -> Void
+    private let didSkip: ((AppConfig) -> Void)?
 
     init(
         services: AppServices,
         server: ServerProcess?,
-        didFinish: @escaping (AppConfig, ServerProcess?) -> Void
+        didFinish: @escaping (AppConfig, ServerProcess?) -> Void,
+        didSkip: ((AppConfig) -> Void)? = nil
     ) {
         self.services = services
         self.server = server
         self.didFinish = didFinish
+        self.didSkip = didSkip
         super.init()
     }
 
@@ -46,16 +51,13 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         }
         guard let services else { return }
 
-        let vm = WelcomeViewModel(
-            services: services,
-            server: server,
-            isReentry: AppConfig.hasExistingConfig
-        )
+        let vm = WelcomeViewModel(services: services, server: server)
         vm.onFinish = { [weak self] config, server in
             guard let self else { return }
             self.didFinish(config, server)
             self.close()
         }
+        self.vm = vm
 
         let root = WelcomeView(vm: vm)
             .environmentObject(services)
@@ -88,11 +90,27 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
     nonisolated func windowWillClose(_ notification: Notification) {
         DispatchQueue.main.async {
-            NotificationCenter.default.post(
-                name: WelcomeWindowController.willCloseNotification,
-                object: nil
-            )
+            MainActor.assumeIsolated {
+                self.handleWillClose()
+            }
         }
+    }
+
+    /// Skip path: the user dismissed the wizard without running Start Server.
+    /// Spec §State machine says the current Storage values should be written
+    /// (with an empty API key when not validated) so the next launch lands
+    /// on AppView's API-key-not-configured banner instead of re-firing the
+    /// wizard. Triggered only when `vm.startCompleted` is false — otherwise
+    /// `onFinish` already wrote a complete config.
+    private func handleWillClose() {
+        if let vm, !vm.startCompleted, let didSkip {
+            let snapshot = vm.skipSnapshot()
+            didSkip(snapshot)
+        }
+        NotificationCenter.default.post(
+            name: WelcomeWindowController.willCloseNotification,
+            object: nil
+        )
     }
 }
 
@@ -100,24 +118,9 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
 @MainActor
 final class WelcomeViewModel: ObservableObject {
-    enum Page: Int, CaseIterable, Sendable {
-        case welcome, storage, apiKey, ready
-
-        var title: String {
-            switch self {
-            case .welcome: return "Welcome"
-            case .storage: return "Storage"
-            case .apiKey:  return "API Key"
-            case .ready:   return "Ready"
-            }
-        }
-    }
-
-    @Published var page: Page
     @Published var basePath: String
     @Published var modelDir: String
     @Published var portText: String
-    @Published var hfMirror: String
     @Published var apiKey: String = ""
     @Published var apiKeyConfirm: String = ""
     @Published var lastError: String?
@@ -129,43 +132,50 @@ final class WelcomeViewModel: ObservableObject {
     private weak var services: AppServices?
     private weak var server: ServerProcess?
 
-    init(services: AppServices, server: ServerProcess?, isReentry: Bool) {
+    init(services: AppServices, server: ServerProcess?) {
         self.services = services
         self.server = server
-        // Re-entry path skips the splash.
-        self.page = isReentry ? .storage : .welcome
         let cfg = services.config
         self.basePath = cfg.basePath.isEmpty ? AppConfig.defaultBasePath() : cfg.basePath
         self.modelDir = cfg.modelDir
         self.portText = String(cfg.port)
-        self.hfMirror = cfg.hfEndpoint
         self.apiKey = cfg.apiKey ?? ""
         self.apiKeyConfirm = cfg.apiKey ?? ""
     }
 
-    // MARK: Navigation
-
-    func next() {
-        switch page {
-        case .welcome: page = .storage
-        case .storage:
-            guard validateStorage() else { return }
-            page = .apiKey
-        case .apiKey:
-            guard validateApiKey() else { return }
-            page = .ready
-        case .ready:
-            break
-        }
+    /// Single-page validation gate — runs Storage + API-key checks in
+    /// sequence and surfaces the first failure into `lastError`.
+    func validateSetup() -> Bool {
+        validateStorage() && validateApiKey()
     }
 
-    func back() {
-        switch page {
-        case .welcome: break
-        case .storage: page = .welcome
-        case .apiKey:  page = .storage
-        case .ready:   page = .apiKey
+    // MARK: API key generation
+
+    /// Build a fresh API key of the form `sk-omlx-<32 hex chars>`. Uses
+    /// `SecRandomCopyBytes` for cryptographic randomness (16 bytes → 32 hex
+    /// chars + 8-char prefix = 40 chars total, comfortably above the
+    /// server-side ≥4 minimum). Writes the new value into both `apiKey` and
+    /// `apiKeyConfirm` so the confirm field stays in sync without forcing
+    /// the user to retype.
+    func generateApiKey() {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let result = bytes.withUnsafeMutableBytes { buf -> Int32 in
+            guard let base = buf.baseAddress else { return errSecAllocate }
+            return SecRandomCopyBytes(kSecRandomDefault, buf.count, base)
         }
+        let hex: String
+        if result == errSecSuccess {
+            hex = bytes.map { String(format: "%02x", $0) }.joined()
+        } else {
+            // Fallback (very unlikely): use Swift's RNG. Not crypto-grade
+            // but the wizard's threat model is "user types the same key on
+            // both fields", not "attacker predicts the key".
+            hex = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+        }
+        let key = "sk-omlx-\(hex)"
+        apiKey = key
+        apiKeyConfirm = key
+        lastError = nil
     }
 
     // MARK: Validation
@@ -262,7 +272,9 @@ final class WelcomeViewModel: ObservableObject {
         config.modelDir = trimmedDir.isEmpty
             ? AppConfig.defaultModelDir(forBasePath: resolvedBase)
             : trimmedDir
-        config.hfEndpoint = hfMirror.trimmingCharacters(in: .whitespaces)
+        // hf_endpoint is set later from Downloads → "HF Mirror" — we don't
+        // touch the existing value here so a returning user's mirror choice
+        // survives a re-entry into the wizard.
         config.apiKey = trimmedKey
 
         // Ensure the base directory exists before spawning the server. The
@@ -334,32 +346,71 @@ final class WelcomeViewModel: ObservableObject {
         await Task.sleep(seconds: 0.5)  // give the server a beat to bind
         await waitUntilHealthyOrTimeout(proc: proc, timeout: 8)
 
-        let setupOK = await setupServerApiKey(client: services.client, key: trimmedKey)
-        if setupOK, !config.hfEndpoint.isEmpty {
-            _ = try? await services.client.updateGlobalSettings(
-                GlobalSettingsPatch()
-                    // hf_endpoint isn't on GlobalSettingsPatch yet — extend
-                    // when the Server screen exposes the mirror row. For
-                    // now log + skip; the user can set it via the admin
-                    // panel.
-            )
-        }
+        _ = await setupServerApiKey(client: services.client, key: trimmedKey)
 
         startCompleted = true
         onFinish?(config, proc)
         return true
     }
 
+    /// Drives Start Server **and** opens the admin dashboard in the user's
+    /// default browser. Spec §Flow page 4 splits the Ready action into two:
+    /// "Start Server" (Welcome closes; AppView opens) and "Open Admin Panel
+    /// & Close" (browser opens to the local dashboard). Implementation just
+    /// runs `startServer()` then hands the URL to NSWorkspace.
+    @discardableResult
+    func startServerAndOpenAdmin() async -> Bool {
+        let ok = await startServer()
+        guard ok, let services else { return ok }
+        let port = services.config.port
+        let host = services.config.host
+        guard let url = URL(string: "http://\(host):\(port)/admin/dashboard") else {
+            return ok
+        }
+        NSWorkspace.shared.open(url)
+        return ok
+    }
+
+    /// Spec §State machine — early close: write the current Storage values
+    /// (keep `apiKey` blank if not validated) so the user lands on AppView
+    /// with the API-key-not-configured banner instead of looping back into
+    /// the wizard. Called by `WelcomeWindowController` on `windowWillClose`
+    /// when `startCompleted` is false.
+    func skipSnapshot() -> AppConfig {
+        guard let services else { return AppConfig.default }
+        var cfg = services.config
+        let trimmedBase = ((basePath.trimmingCharacters(in: .whitespaces)
+                            as NSString).expandingTildeInPath as NSString)
+            .standardizingPath
+        if !trimmedBase.isEmpty { cfg.basePath = trimmedBase }
+        if let port = Int(portText.trimmingCharacters(in: .whitespaces)),
+           (1...65535).contains(port) {
+            cfg.port = port
+        }
+        let trimmedDir = modelDir.trimmingCharacters(in: .whitespaces)
+        cfg.modelDir = trimmedDir.isEmpty
+            ? AppConfig.defaultModelDir(forBasePath: cfg.basePath)
+            : trimmedDir
+        // Per spec: an unvalidated API key is dropped, so the user lands on
+        // the API-key-not-configured banner rather than persisting garbage.
+        if validateApiKey() {
+            cfg.apiKey = apiKey.trimmingCharacters(in: .whitespaces)
+        } else {
+            cfg.apiKey = ""
+        }
+        return cfg
+    }
+
     private func setupServerApiKey(client: OMLXClient, key: String) async -> Bool {
-        // Try setup-api-key first (new install). If the server already has
-        // one, fall back to a login so the cookie jar is populated.
+        // Try setup-api-key (fresh install). When the server already has a
+        // key set, the endpoint returns 400 — we swallow that and let
+        // `OMLXClient`'s 401 auto-login handle the next authenticated call.
+        // The server is local-only on first run, so we don't need an
+        // explicit login round-trip here.
         do {
             _ = try await client.setupApiKey(key, confirm: key)
             return true
         } catch {
-            // setup-api-key returns 400 if a key already exists; the
-            // OMLXClient's auto-login on 401 will handle subsequent calls,
-            // so we just swallow this here.
             return false
         }
     }
@@ -388,20 +439,13 @@ struct WelcomeView: View {
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         VStack(spacing: 0) {
-            StepIndicator(current: vm.page)
-                .padding(.top, 24)
-                .padding(.bottom, 18)
-
             ScrollView {
-                Group {
-                    switch vm.page {
-                    case .welcome: WelcomePage()
-                    case .storage: StoragePage(vm: vm)
-                    case .apiKey:  APIKeyPage(vm: vm)
-                    case .ready:   ReadyPage(vm: vm)
-                    }
+                VStack(spacing: 24) {
+                    WelcomeHeader()
+                    SetupBody(vm: vm)
                 }
                 .padding(.horizontal, 32)
+                .padding(.top, 28)
                 .padding(.bottom, 24)
             }
 
@@ -409,140 +453,170 @@ struct WelcomeView: View {
         }
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
-        .frame(width: 540, height: 600)
+        .frame(width: 540, height: 640)
     }
 }
 
-private struct StepIndicator: View {
-    let current: WelcomeViewModel.Page
+/// Top splash band — logo squircle, headline, tagline, and the three
+/// "what this app does" bullets. Static; appears on every wizard open
+/// (first-run and re-entry alike) since there's now only one page.
+private struct WelcomeHeader: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        HStack(spacing: 8) {
-            ForEach(WelcomeViewModel.Page.allCases, id: \.rawValue) { page in
-                let isCurrent = page == current
-                let isDone = page.rawValue < current.rawValue
-                Capsule()
-                    .fill(isCurrent ? theme.accent
-                          : (isDone ? theme.greenDot.opacity(0.6) : theme.controlBg))
-                    .frame(width: isCurrent ? 28 : 8, height: 8)
-                    .animation(.easeOut(duration: 0.18), value: current)
-            }
-        }
-    }
-}
-
-private struct WelcomePage: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(spacing: 18) {
-            Squircle(gradient: SquircleGradient.server, size: 72) {
-                Text("oM")
-                    .font(.omlxText(32, weight: .heavy))
-                    .kerning(-0.6)
-                    .foregroundStyle(.white)
-            }
-            VStack(spacing: 6) {
+        VStack(spacing: 12) {
+            // AppLogo's SVG has a 10pt margin inside a 160pt viewBox; the
+            // 73×73 frame (≈64 × 160/140) reads at the same visible ~64pt
+            // size the previous Squircle did. Matches AboutScreen/ServerScreen.
+            Image("AppLogo")
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 73, height: 73)
+            VStack(spacing: 4) {
                 Text("Welcome to oMLX")
-                    .font(.omlxText(24, weight: .semibold))
+                    .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text("LLM inference, optimized for your Mac")
-                    .font(.omlxText(13))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                bullet("Stores model weights + config under a folder you choose")
-                bullet("Talks to local apps over HTTP — no cloud round-trip")
-                bullet("Lives in the menubar; this window appears once")
-            }
-            .padding(.top, 8)
-            .padding(.horizontal, 4)
-        }
-        .padding(.top, 28)
-        .frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder
-    private func bullet(_ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(theme.greenDot)
-            Text(text)
-                .font(.omlxText(13))
-                .foregroundStyle(theme.text)
-        }
-    }
-}
-
-private struct StoragePage: View {
-    @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Storage")
-                    .font(.omlxText(20, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                Text("Where oMLX keeps model weights and runtime files.")
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)
             }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
 
-            ListGroup {
-                FreeRow {
-                    VStack(alignment: .leading, spacing: 6) {
-                        labelRow("Base Directory")
-                        HStack(spacing: 8) {
-                            Text(vm.basePath)
-                                .font(.omlxMono(11))
-                                .foregroundStyle(theme.textSecondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Button("Browse…") { vm.browseBaseDirectory() }
-                                .buttonStyle(.omlx(.normal, size: .small))
-                        }
-                    }
-                }
-                FreeRow {
-                    VStack(alignment: .leading, spacing: 6) {
-                        labelRow("Model Directory",
-                                 sub: "Optional — defaults to <base>/models")
-                        HStack(spacing: 8) {
-                            Text(vm.modelDir.isEmpty
-                                 ? "<\((vm.basePath as NSString).lastPathComponent)>/models"
-                                 : vm.modelDir)
-                                .font(.omlxMono(11))
-                                .foregroundStyle(theme.textSecondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            if !vm.modelDir.isEmpty {
-                                Button("Reset") { vm.modelDir = "" }
-                                    .buttonStyle(.omlx(.plain, size: .small))
+/// Single-page setup: Storage rows, API Key rows, hints. The footer's
+/// "Start Server" / "Open Admin Panel & Close" actions live on the
+/// outer `Footer` so this view is purely the editable body.
+private struct SetupBody: View {
+    @ObservedObject var vm: WelcomeViewModel
+    @Environment(\.omlxTheme) private var theme
+    @State private var keyVisible: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Confirm where weights live and pick an API key. You can change either later in Settings.")
+                .font(.omlxText(12))
+                .foregroundStyle(theme.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Storage
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("Storage")
+                ListGroup {
+                    FreeRow {
+                        VStack(alignment: .leading, spacing: 6) {
+                            labelRow("Base Directory")
+                            HStack(spacing: 8) {
+                                Text(vm.basePath)
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Button("Browse…") { vm.browseBaseDirectory() }
+                                    .buttonStyle(.omlx(.normal, size: .small))
                             }
-                            Button("Browse…") { vm.browseModelDirectory() }
-                                .buttonStyle(.omlx(.normal, size: .small))
                         }
                     }
-                }
-                Row(label: "Port",
-                    sublabel: "1024-65535 recommended; default 8080") {
-                    TextInput(text: $vm.portText, mono: true, width: 100)
-                }
-                Row(label: "HF Mirror",
-                    sublabel: "Optional. Use hf-mirror.com if huggingface.co is restricted.",
-                    isLast: true) {
-                    TextInput(text: $vm.hfMirror,
-                              placeholder: "https://hf-mirror.com",
-                              mono: true,
-                              width: 240)
+                    FreeRow {
+                        VStack(alignment: .leading, spacing: 6) {
+                            labelRow("Model Directory",
+                                     sub: "Optional — defaults to <base>/models")
+                            HStack(spacing: 8) {
+                                Text(vm.modelDir.isEmpty
+                                     ? "<\((vm.basePath as NSString).lastPathComponent)>/models"
+                                     : vm.modelDir)
+                                    .font(.omlxMono(11))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                if !vm.modelDir.isEmpty {
+                                    Button("Reset") { vm.modelDir = "" }
+                                        .buttonStyle(.omlx(.plain, size: .small))
+                                }
+                                Button("Browse…") { vm.browseModelDirectory() }
+                                    .buttonStyle(.omlx(.normal, size: .small))
+                            }
+                        }
+                    }
+                    Row(label: "Port",
+                        sublabel: "1024-65535 recommended; default 8080",
+                        isLast: true) {
+                        TextInput(text: $vm.portText, mono: true, width: 100)
+                    }
                 }
             }
+
+            // API Key
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("API Key")
+                ListGroup {
+                    FreeRow {
+                        VStack(alignment: .leading, spacing: 6) {
+                            labelRow("API Key",
+                                     sub: "At least 4 printable characters, no whitespace")
+                            HStack(spacing: 6) {
+                                keyField($vm.apiKey)
+                                Button {
+                                    keyVisible.toggle()
+                                } label: {
+                                    Image(systemName: keyVisible ? "eye.slash" : "eye")
+                                        .font(.system(size: 12))
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .help(keyVisible ? "Hide key" : "Show key")
+                                Button {
+                                    vm.generateApiKey()
+                                    keyVisible = true
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "sparkles")
+                                            .font(.system(size: 11))
+                                        Text("Generate")
+                                    }
+                                }
+                                .buttonStyle(.omlx(.normal, size: .small))
+                                .help("Generate a random 40-char API key")
+                            }
+                        }
+                    }
+                    FreeRow(isLast: true) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            labelRow("Confirm", sub: "Re-enter the key to catch typos")
+                            keyField($vm.apiKeyConfirm)
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                hint("Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.")
+                hint("Your model library starts empty — visit Downloads to fetch your first model.")
+                hint("You can re-open this wizard anytime from the menubar.")
+            }
         }
+    }
+
+    @ViewBuilder
+    private func keyField(_ binding: Binding<String>) -> some View {
+        if keyVisible {
+            TextInput(text: binding, placeholder: "sk-omlx-…", mono: true, width: 260)
+        } else {
+            TextInput(text: binding, placeholder: "sk-omlx-…",
+                      isSecure: true, mono: true, width: 260)
+        }
+    }
+
+    @ViewBuilder
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.omlxText(10, weight: .semibold))
+            .foregroundStyle(theme.textTertiary)
+            .textCase(.uppercase)
+            .kerning(0.6)
+            .padding(.horizontal, 14)
     }
 
     @ViewBuilder
@@ -555,130 +629,6 @@ private struct StoragePage: View {
                 Text(sub)
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
-            }
-        }
-    }
-}
-
-private struct APIKeyPage: View {
-    @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.omlxTheme) private var theme
-    @State private var visible: Bool = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("API Key")
-                    .font(.omlxText(20, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                Text("Required to authenticate /v1 requests. We'll save it on the server and remember it locally.")
-                    .font(.omlxText(12))
-                    .foregroundStyle(theme.textSecondary)
-            }
-
-            ListGroup {
-                Row(label: "API Key",
-                    sublabel: "At least 4 printable characters, no whitespace") {
-                    HStack(spacing: 6) {
-                        if visible {
-                            TextInput(text: $vm.apiKey,
-                                      placeholder: "sk-omlx-…",
-                                      mono: true,
-                                      width: 220)
-                        } else {
-                            TextInput(text: $vm.apiKey,
-                                      placeholder: "sk-omlx-…",
-                                      isSecure: true,
-                                      mono: true,
-                                      width: 220)
-                        }
-                        Button {
-                            visible.toggle()
-                        } label: {
-                            Image(systemName: visible ? "eye.slash" : "eye")
-                                .font(.system(size: 12))
-                        }
-                        .buttonStyle(.omlx(.plain, size: .small))
-                    }
-                }
-                Row(label: "Confirm",
-                    sublabel: "Re-enter the key to catch typos",
-                    isLast: true) {
-                    if visible {
-                        TextInput(text: $vm.apiKeyConfirm,
-                                  placeholder: "sk-omlx-…",
-                                  mono: true,
-                                  width: 220)
-                    } else {
-                        TextInput(text: $vm.apiKeyConfirm,
-                                  placeholder: "sk-omlx-…",
-                                  isSecure: true,
-                                  mono: true,
-                                  width: 220)
-                    }
-                }
-            }
-
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Image(systemName: "lock")
-                    .font(.system(size: 11))
-                    .foregroundStyle(theme.textTertiary)
-                Text("Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.")
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.textTertiary)
-            }
-        }
-    }
-}
-
-private struct ReadyPage: View {
-    @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Ready to start")
-                    .font(.omlxText(20, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                Text("Review your choices and start the server.")
-                    .font(.omlxText(12))
-                    .foregroundStyle(theme.textSecondary)
-            }
-
-            ListGroup {
-                Row(label: "Base Directory") {
-                    Text(vm.basePath)
-                        .font(.omlxMono(11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Row(label: "Model Directory") {
-                    Text(vm.modelDir.isEmpty ? "default (<base>/models)" : vm.modelDir)
-                        .font(.omlxMono(11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Row(label: "Port") {
-                    Text(vm.portText)
-                        .font(.omlxMono(12))
-                }
-                Row(label: "HF Mirror") {
-                    Text(vm.hfMirror.isEmpty ? "huggingface.co (default)" : vm.hfMirror)
-                        .font(.omlxMono(11))
-                        .foregroundStyle(.secondary)
-                }
-                Row(label: "API Key", isLast: true) {
-                    Text(String(repeating: "•", count: max(4, min(vm.apiKey.count, 16))))
-                        .font(.omlxMono(12))
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                hint("Your model library starts empty — visit Downloads to fetch your first model.")
-                hint("You can re-open this wizard anytime from the menubar's overflow.")
             }
         }
     }
@@ -712,37 +662,24 @@ private struct Footer: View {
                 Spacer()
             }
 
-            if vm.page != .welcome {
-                Button("Back") { vm.back() }
-                    .buttonStyle(.omlx(.plain))
-                    .disabled(vm.isStarting)
+            // Two actions side-by-side. "Open Admin Panel & Close" performs
+            // the same start, then redirects the user to the local
+            // /admin/dashboard. Sits to the left of the primary Start Server
+            // button (macOS HIG: alternative on the left of primary).
+            Button("Open Admin Panel & Close") {
+                Task {
+                    guard vm.validateSetup() else { return }
+                    _ = await vm.startServerAndOpenAdmin()
+                }
             }
-            primaryButton
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity)
-        .background(theme.toolbarBg)
-        .overlay(
-            Rectangle()
-                .fill(theme.toolbarBorder)
-                .frame(height: 0.5),
-            alignment: .top
-        )
-    }
+            .buttonStyle(.omlx(.normal))
+            .disabled(vm.isStarting)
 
-    @ViewBuilder
-    private var primaryButton: some View {
-        switch vm.page {
-        case .welcome:
-            Button("Get started") { vm.next() }
-                .buttonStyle(.omlx(.primary))
-        case .storage, .apiKey:
-            Button("Continue") { vm.next() }
-                .buttonStyle(.omlx(.primary))
-        case .ready:
             Button {
-                Task { _ = await vm.startServer() }
+                Task {
+                    guard vm.validateSetup() else { return }
+                    _ = await vm.startServer()
+                }
             } label: {
                 if vm.isStarting {
                     HStack(spacing: 6) {
@@ -756,5 +693,15 @@ private struct Footer: View {
             .buttonStyle(.omlx(.primary))
             .disabled(vm.isStarting)
         }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity)
+        .background(theme.toolbarBg)
+        .overlay(
+            Rectangle()
+                .fill(theme.toolbarBorder)
+                .frame(height: 0.5),
+            alignment: .top
+        )
     }
 }

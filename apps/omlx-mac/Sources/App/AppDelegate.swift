@@ -136,19 +136,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func presentWelcome() {
+        // First-run only — once `<basePath>/settings.json` exists,
+        // `applicationDidFinishLaunching` takes the returning-user path and
+        // this is never reached again.
         let controller = WelcomeWindowController(
             services: services,
-            server: server
-        ) { [weak self] _, finishedServer in
-            // The wizard returns the spawned ServerProcess. Adopt it so
-            // applicationWillTerminate can clean up correctly.
-            self?.server = finishedServer
-            if let proc = finishedServer {
-                SignalHandlers.shared.install { [weak proc] in
-                    proc?.reapSync()
+            server: server,
+            didFinish: { [weak self] _, finishedServer in
+                // The wizard returns the spawned ServerProcess. Adopt it so
+                // applicationWillTerminate can clean up correctly.
+                self?.server = finishedServer
+                if let proc = finishedServer {
+                    SignalHandlers.shared.install { [weak proc] in
+                        proc?.reapSync()
+                    }
+                }
+            },
+            didSkip: { [weak self] snapshot in
+                // Spec §State machine: write the current Storage values on
+                // close so the next launch lands on AppView with the
+                // API-key-not-configured banner instead of re-firing the
+                // wizard.
+                guard let self else { return }
+                do {
+                    try snapshot.save()
+                    self.services.updateConfig(snapshot)
+                } catch {
+                    NSLog("oMLX-next: welcome skip — failed to persist partial config: \(error)")
                 }
             }
-        }
+        )
         self.welcomeController = controller
 
         welcomeCloseObserver = NotificationCenter.default.addObserver(
