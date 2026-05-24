@@ -1281,15 +1281,11 @@ class TestParseToolCallsWithThinkingFallback:
     when small models emit them as reasoning instead of content.
     """
 
-    def _make_tokenizer(self):
-        tok = MagicMock(spec=[])
-        return tok
-
     def test_thinking_fallback_xml_tool_call(self):
         """Tool call only in thinking content is recovered via fallback."""
         thinking = '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
         regular = ""
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1305,7 +1301,7 @@ class TestParseToolCallsWithThinkingFallback:
         """When regular content has tool calls, thinking fallback is skipped."""
         thinking = '<tool_call>{"name": "wrong_tool", "arguments": {}}</tool_call>'
         regular = '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1320,7 +1316,7 @@ class TestParseToolCallsWithThinkingFallback:
         """No tool calls in either thinking or regular returns None."""
         thinking = "Let me think about this..."
         regular = "Here is my answer."
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1334,7 +1330,7 @@ class TestParseToolCallsWithThinkingFallback:
         """Empty thinking content skips fallback gracefully."""
         thinking = ""
         regular = "Just a regular response."
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1352,7 +1348,7 @@ class TestParseToolCallsWithThinkingFallback:
             "</tool_call>"
         )
         regular = ""
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1369,7 +1365,7 @@ class TestParseToolCallsWithThinkingFallback:
             'reasoning here <tool_call>{"name": "func", "arguments": {}}</tool_call>'
         )
         regular = "visible response text"
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         cleaned, tool_calls = parse_tool_calls_with_thinking_fallback(
             thinking,
@@ -1386,7 +1382,7 @@ class TestParseToolCallsWithThinkingFallback:
             '<tool_call>{"name": "read_file", "arguments": {"path": "/tmp/a.py"}}</tool_call>'
             "Then continue."
         )
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         result = extract_tool_calls_with_thinking(thinking, "", tokenizer=tok)
 
@@ -1409,7 +1405,7 @@ class TestParseToolCallsWithThinkingFallback:
             "Visible text"
             '<tool_call>{"name": "correct_tool", "arguments": {}}</tool_call>'
         )
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         result = extract_tool_calls_with_thinking(thinking, regular, tokenizer=tok)
 
@@ -1424,7 +1420,7 @@ class TestParseToolCallsWithThinkingFallback:
         """Tool calls in thinking are discarded when model produced regular text."""
         thinking = '<tool_call>{"name": "search", "arguments": {"q": "weather"}}</tool_call>'
         regular = "The weather is sunny today."
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
 
         result = extract_tool_calls_with_thinking(thinking, regular, tokenizer=tok)
 
@@ -1436,7 +1432,7 @@ class TestParseToolCallsWithThinkingFallback:
         """Tool calls with names not in provided tools list are discarded."""
         thinking = '<tool_call>{"name": "hallucinated_tool", "arguments": {}}</tool_call>'
         regular = ""
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
         tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
 
         result = extract_tool_calls_with_thinking(
@@ -1450,7 +1446,7 @@ class TestParseToolCallsWithThinkingFallback:
         """Tool calls matching provided tools are kept when regular is empty."""
         thinking = '<tool_call>{"name": "get_weather", "arguments": {"city": "Seoul"}}</tool_call>'
         regular = ""
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
         tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
 
         result = extract_tool_calls_with_thinking(
@@ -1469,7 +1465,7 @@ class TestParseToolCallsWithThinkingFallback:
             '<tool_call>{"name": "fake_tool", "arguments": {}}</tool_call>'
         )
         regular = ""
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
         tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
 
         result = extract_tool_calls_with_thinking(
@@ -1496,10 +1492,6 @@ class TestThinkingFallbackGuardRegression:
     See https://github.com/jundot/omlx/issues/1392
     """
 
-    def _make_tokenizer(self):
-        tok = MagicMock(spec=[])
-        return tok
-
     def test_known_tool_in_thinking_kept_with_preamble(self):
         """A tool call matching a provided tool should survive even when
         regular content is non-empty (short preamble).
@@ -1514,7 +1506,7 @@ class TestThinkingFallbackGuardRegression:
             '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/test.txt", "content": "hello"}}</tool_call>'
         )
         regular = "Let me create the file:"
-        tok = self._make_tokenizer()
+        tok = _make_tokenizer()
         tools = [{
             "type": "function",
             "function": {
@@ -1538,6 +1530,46 @@ class TestThinkingFallbackGuardRegression:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "write_file"
         assert result.tool_calls_from_thinking is True
+
+    def test_empty_tools_list_drops_thinking_calls_no_regular(self):
+        """tools=[] means 'no tools allowed' — drop thinking-embedded calls
+        even when regular content is empty."""
+        thinking = (
+            'I need to write a file. '
+            '<tool_call' + '>'
+            '{"name": "write_file", "arguments": {"path": "/tmp/test.txt", "content": "hello"}}'
+            '</tool_call' + '>'
+        )
+        regular = ""
+        tok = _make_tokenizer()
+        tools = []
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is None
+        assert result.tool_calls_from_thinking is False
+
+    def test_empty_tools_list_drops_thinking_calls_with_regular(self):
+        """tools=[] means 'no tools allowed' — drop thinking-embedded calls
+        when regular content is also present."""
+        thinking = (
+            'I need to write a file. '
+            '<tool_call' + '>'
+            '{"name": "write_file", "arguments": {"path": "/tmp/test.txt", "content": "hello"}}'
+            '</tool_call' + '>'
+        )
+        regular = "Let me create the file:"
+        tok = _make_tokenizer()
+        tools = []
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is None
+        assert result.tool_calls_from_thinking is False
 
 
 # ---------------------------------------------------------------------------

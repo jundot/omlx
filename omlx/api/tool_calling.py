@@ -612,7 +612,21 @@ def extract_tool_calls_with_thinking(
     tokenizer: Any,
     tools: Optional[List] = None,
 ) -> ToolCallExtraction:
-    """Extract tool calls while keeping a sanitized reasoning transcript."""
+    """Extract tool calls while keeping a sanitized reasoning transcript.
+
+    When tool calls are found in thinking content (not regular content),
+    the ``tools`` parameter controls validation:
+
+    * ``None`` (default) — no tools list was provided.  Thinking-embedded
+      calls are kept only when ``regular_content`` is empty (the model
+      produced no competing prose).  Otherwise they are dropped as
+      potential hallucinated reasoning.
+    * ``[]`` — "no tools allowed".  All thinking-embedded calls are
+      dropped regardless of ``regular_content``.
+    * Non-empty list — name matching is the sole discriminator.
+      Calls whose name matches a provided tool are promoted regardless
+      of whether regular text was also produced.
+    """
     cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
@@ -624,18 +638,19 @@ def extract_tool_calls_with_thinking(
         # Guard: validate thinking-embedded tool calls.
         #
         # Three cases:
-        # 1. No tools list AND regular text exists → drop.  The call is
-        #    unvalidated and could be hallucinated reasoning about tools.
-        # 2. No tools list AND no regular text → keep.  The model clearly
+        # 1. tools is None (not provided) AND regular text exists → drop.
+        #    The call is unvalidated and could be hallucinated reasoning.
+        # 2. tools is None AND no regular text → keep.  The model clearly
         #    intended a tool invocation (no competing prose).
-        # 3. Tools list provided → name matching is the sole discriminator.
-        #    If the call name matches a known tool, promote it regardless of
-        #    whether regular text was also produced.  The previous "regular
+        # 3. tools is a list (including empty) → name matching is the sole
+        #    discriminator.  An empty list means "no tools allowed" so all
+        #    calls are dropped.  A non-empty list filters by name, regardless
+        #    of whether regular text was also produced.  The previous "regular
         #    text means just reasoning" heuristic was wrong for models
         #    (Qwen3-Coder) that genuinely place tool calls in thinking.
         # See https://github.com/jundot/omlx/issues/1392
         if tool_calls:
-            if not tools:
+            if tools is None:
                 if regular_content.strip():
                     tool_calls = None
                     tool_calls_from_thinking = False
