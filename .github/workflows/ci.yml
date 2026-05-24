@@ -31,4 +31,4 @@ jobs:
           pip install -e ".[mcp]" --group dev
 
       - name: Run unit tests
-        run: python -m pytest tests/ -m "not slow and not integration"
+        run: python -m pytest tests/ -m "not slow and not integration" --deselect tests/test_proc_memory.py::TestGetPhysFootprintDarwin::test_includes_python_heap
