@@ -372,7 +372,15 @@ class EngineCore:
         finally block, NOT here -- calling _cleanup_request() immediately
         after put() would clear the output before the consumer can drain it.
         """
-        result = self.scheduler.abort_request(request_id)
+        scheduler = getattr(self, "scheduler", None)
+        if getattr(self, "_closed", False) or scheduler is None:
+            logger.debug(
+                "Skipping abort for request %s because engine is already closed",
+                request_id,
+            )
+            return False
+
+        result = scheduler.abort_request(request_id)
 
         # Signal consumer with abort error so any waiting
         # stream_outputs() / generate() can exit gracefully.
@@ -744,7 +752,7 @@ class AsyncEngineCore:
         return self
 
     async def __aexit__(self, *args) -> None:
-        await self.engine.stop()
+        await self.stop()
 
     def start(self) -> None:
         """Start engine (creates task in current loop)."""
@@ -752,7 +760,10 @@ class AsyncEngineCore:
 
     async def stop(self) -> None:
         """Stop the engine."""
-        await self.engine.stop()
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        await engine.stop()
 
     async def add_request(
         self,
@@ -771,11 +782,21 @@ class AsyncEngineCore:
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
-        return await self.engine.abort_request(request_id)
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            logger.debug(
+                "Skipping abort for request %s because async engine is closed",
+                request_id,
+            )
+            return False
+        return await engine.abort_request(request_id)
 
     async def abort_all_requests(self) -> int:
         """Abort all active requests without stopping the engine."""
-        return await self.engine.abort_all_requests()
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return 0
+        return await engine.abort_all_requests()
 
     async def stream_outputs(
         self,
