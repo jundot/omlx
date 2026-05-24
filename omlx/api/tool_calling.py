@@ -621,19 +621,30 @@ def extract_tool_calls_with_thinking(
         _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
         tool_calls_from_thinking = bool(tool_calls)
 
-        # Guard 1: if model produced regular text, the tool call in thinking
-        # is just reasoning, not an actual invocation request.
-        if tool_calls and regular_content.strip():
-            tool_calls = None
-            tool_calls_from_thinking = False
-
-        # Guard 2: only keep tool calls whose name matches a provided tool.
-        if tool_calls and tools:
-            valid_names = _extract_tool_names(tools)
-            tool_calls = [tc for tc in tool_calls if tc.function.name in valid_names]
-            if not tool_calls:
-                tool_calls = None
-                tool_calls_from_thinking = False
+        # Guard: validate thinking-embedded tool calls.
+        #
+        # Three cases:
+        # 1. No tools list AND regular text exists → drop.  The call is
+        #    unvalidated and could be hallucinated reasoning about tools.
+        # 2. No tools list AND no regular text → keep.  The model clearly
+        #    intended a tool invocation (no competing prose).
+        # 3. Tools list provided → name matching is the sole discriminator.
+        #    If the call name matches a known tool, promote it regardless of
+        #    whether regular text was also produced.  The previous "regular
+        #    text means just reasoning" heuristic was wrong for models
+        #    (Qwen3-Coder) that genuinely place tool calls in thinking.
+        # See https://github.com/jundot/omlx/issues/1392
+        if tool_calls:
+            if not tools:
+                if regular_content.strip():
+                    tool_calls = None
+                    tool_calls_from_thinking = False
+            else:
+                valid_names = _extract_tool_names(tools)
+                tool_calls = [tc for tc in tool_calls if tc.function.name in valid_names]
+                if not tool_calls:
+                    tool_calls = None
+                    tool_calls_from_thinking = False
 
     return ToolCallExtraction(
         cleaned_text=cleaned_text,

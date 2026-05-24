@@ -1482,6 +1482,65 @@ class TestParseToolCallsWithThinkingFallback:
 
 
 # ---------------------------------------------------------------------------
+# Guard 1 regression: valid tool calls dropped with preamble (#1392)
+
+class TestThinkingFallbackGuardRegression:
+    """Guard 1 drops valid tool calls when the model emits a preamble.
+
+    Qwen3-Coder places real tool invocations inside thinking and adds a
+    short narrative preamble as regular content.  Guard 1 assumed regular
+    text means the thinking tool call is "just reasoning", but for these
+    models it's a genuine invocation.  Guard 2 (name matching) is the
+    correct discriminator.
+
+    See https://github.com/jundot/omlx/issues/1392
+    """
+
+    def _make_tokenizer(self):
+        tok = MagicMock(spec=[])
+        return tok
+
+    def test_known_tool_in_thinking_kept_with_preamble(self):
+        """A tool call matching a provided tool should survive even when
+        regular content is non-empty (short preamble).
+
+        Qwen3-Coder with thinking enabled places real tool calls inside
+        thinking and emits a preamble like "Let me create the file:" as
+        regular content. Guard 1 drops these; Guard 2 (name matching)
+        should preserve them.
+        """
+        thinking = (
+            'I need to write a file. '
+            '<tool_call>{"name": "write_file", "arguments": {"path": "/tmp/test.txt", "content": "hello"}}</tool_call>'
+        )
+        regular = "Let me create the file:"
+        tok = self._make_tokenizer()
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        }]
+
+        result = extract_tool_calls_with_thinking(
+            thinking, regular, tokenizer=tok, tools=tools,
+        )
+
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "write_file"
+        assert result.tool_calls_from_thinking is True
+
+
+# ---------------------------------------------------------------------------
 # Gemma 4 robust fallback parser tests
 # ---------------------------------------------------------------------------
 
