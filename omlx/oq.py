@@ -1609,6 +1609,12 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             vision_config = model_config.vision_config
             if isinstance(vision_config, dict):
                 vision_config = model_module.VisionConfig.from_dict(vision_config)
+            if hasattr(vision_config, "model_type") and isinstance(
+                vision_config.model_type, str
+            ) and vision_config.model_type.endswith("_vision"):
+                vision_config.model_type = vision_config.model_type.removesuffix(
+                    "_vision"
+                )
             text_config = model_config.text_config
             if isinstance(text_config, dict):
                 text_config = model_module.TextConfig.from_dict(text_config)

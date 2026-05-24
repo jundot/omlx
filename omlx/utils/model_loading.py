@@ -16,6 +16,46 @@ logger = logging.getLogger(__name__)
 _VLM_TEXT_PREFIX = "language_model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_VLM_VISION_CONFIG_MT_PATCHED = False
+
+
+def _patch_vlm_vision_config_model_type() -> None:
+    """Strip ``_vision`` suffix from ``VisionConfig.model_type``.
+
+    HuggingFace transformers auto-generates ``vision_config.model_type`` by
+    appending ``_vision`` to the base model type (e.g. ``qwen3_5_moe_vision``).
+    mlx-vlm's ``VisionModel.__init__`` has a hardcoded allowlist that only
+    accepts the base name. Normalise here so VLM checkpoints with the HF
+    convention load without error.
+
+    Patched at the ``BaseModelConfig`` level so every VisionConfig subclass
+    (qwen3_vl, qwen3_5_moe, future families) inherits the fix automatically.
+    """
+    global _VLM_VISION_CONFIG_MT_PATCHED
+    if _VLM_VISION_CONFIG_MT_PATCHED:
+        return
+
+    try:
+        from mlx_vlm.models.base import BaseModelConfig
+    except ImportError:
+        return
+
+    if getattr(BaseModelConfig, "_omlx_vision_mt_patched", False):
+        _VLM_VISION_CONFIG_MT_PATCHED = True
+        return
+
+    original = BaseModelConfig.from_dict.__func__
+
+    def patched(cls, params):
+        if params and isinstance(params, dict):
+            mt = params.get("model_type", "")
+            if isinstance(mt, str) and mt.endswith("_vision"):
+                params = {**params, "model_type": mt.removesuffix("_vision")}
+        return original(cls, params)
+
+    BaseModelConfig.from_dict = classmethod(patched)
+    BaseModelConfig._omlx_vision_mt_patched = True
+    _VLM_VISION_CONFIG_MT_PATCHED = True
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -112,6 +152,7 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+    _patch_vlm_vision_config_model_type()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
