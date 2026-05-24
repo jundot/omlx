@@ -484,11 +484,13 @@
                                                             <div class="flex items-center gap-2 md:hidden">
                                                                 <span class="text-xs text-neutral-400 tabular-nums" x-text="'#' + model.rank"></span>
                                                                 <button @click="openModelDetail(model.repo_id)"
+                                                                        :title="model.name"
                                                                         class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer flex-1 min-w-0" x-text="model.name"></button>
                                                             </div>
                                                             <!-- Desktop: name -->
                                                             <button @click="openModelDetail(model.repo_id)"
-                                                                    class="max-md:hidden block text-sm font-medium text-neutral-900 hover:text-blue-600 truncate transition-colors text-left cursor-pointer max-w-[200px] lg:max-w-[300px]" x-text="model.name"></button>
+                                                                    :title="model.name"
+                                                                    class="max-md:hidden block text-sm font-medium text-neutral-900 hover:text-blue-600 truncate transition-colors text-left cursor-pointer max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.name"></button>
                                                             <!-- Desktop: only params shown below name -->
                                                             <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                             <!-- Mobile: inline params + size + downloads + likes -->
@@ -624,7 +626,8 @@
                                                         <tr class="hover:bg-neutral-50 transition-colors">
                                                             <td class="px-4 py-3">
                                                                 <button @click="openModelDetail(model.repo_id)"
-                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[200px] lg:max-w-[300px]" x-text="model.repo_id"></button>
+                                                                        :title="model.repo_id"
+                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.repo_id"></button>
                                                                 <!-- Desktop: only params shown below name -->
                                                                 <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                                 <!-- Mobile: inline params + size + downloads + likes -->
