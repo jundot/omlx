@@ -324,10 +324,9 @@ class TestDeepseekV4Model:
         from omlx.patches.mlx_lm_mtp import deepseek_v4_model
 
         # Simulate the base patch not having run by removing the module.
+        # No module-level _PATCHED to reset anymore — sub-patcher does its
+        # own marker-based idempotency check against the live class state.
         monkeypatch.setitem(__import__("sys").modules, "mlx_lm.models.deepseek_v4", None)
-        # Reset the module-level _PATCHED flag so apply() actually runs the
-        # gating check rather than short-circuiting on idempotency.
-        monkeypatch.setattr(deepseek_v4_model, "_PATCHED", False)
         # When the module is None / missing, apply() returns False without
         # raising — that's the contract for non-DeepSeek models.
         applied = deepseek_v4_model.apply()
@@ -965,3 +964,107 @@ class TestIsGreedy:
 
         batch = self._make_batch(samplers=None, fallback_sampler=None)
         assert _is_greedy(batch) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #1388 — mtp patch must self-heal when dflash overwrote __call__
+# ---------------------------------------------------------------------------
+
+class TestMTPPatchSelfHealing:
+    """Process-wide regression for #1388.
+
+    dflash patches linear_attn.__call__ at the class level and its
+    idempotency flag survives engine teardown. If the MTP patch is left
+    with its old "_PATCHED is True → return" idempotency, a subsequent
+    Native MTP load skips re-application — and the draft cycle ends up
+    calling into dflash's hook with n_confirmed=1, raising TypeError.
+    """
+
+    def _simulate_dflash_overwrite(self, cls):
+        """Replace cls.__call__ with a dflash-shaped hook that rejects n_confirmed."""
+        def dflash_like_call(self, inputs, mask=None, cache=None):
+            return inputs
+        cls.__call__ = dflash_like_call
+        cls._dflash_speculative_call_installed = True
+
+    def test_gated_delta_net_reapplies_after_class_overwrite(self):
+        """Apply MTP patch, simulate dflash overwriting __call__, then re-apply
+        the MTP patch — the class must end up with an n_confirmed-aware __call__
+        again."""
+        from omlx.patches.mlx_lm_mtp import qwen35_model
+        assert qwen35_model.apply()
+        from mlx_lm.models.qwen3_5 import GatedDeltaNet
+
+        self._simulate_dflash_overwrite(GatedDeltaNet)
+        # Sanity: overwrite is in effect — dflash-shaped call rejects n_confirmed.
+        with pytest.raises(TypeError):
+            GatedDeltaNet.__call__(
+                SimpleNamespace(), 0.0, mask=None, cache=None, n_confirmed=1
+            )
+
+        # Re-apply must restore an n_confirmed-accepting __call__.
+        qwen35_model.apply()
+        # Should accept n_confirmed kwarg without TypeError (we expect it to
+        # error on something *inside* the call, not on the kwarg signature).
+        try:
+            GatedDeltaNet.__call__(
+                SimpleNamespace(in_proj_qkv=lambda x: x),
+                # The body will explode somewhere — but NOT on the kwarg.
+                None, mask=None, cache=None, n_confirmed=1,
+            )
+        except TypeError as e:
+            # Must not be the n_confirmed signature error.
+            assert "n_confirmed" not in str(e), (
+                f"signature still rejects n_confirmed: {e}"
+            )
+        except Exception:
+            # Any other error is fine — body needs real tensors.
+            pass
+
+    def test_decoder_layer_reapplies_after_class_overwrite(self):
+        """Same scenario for DecoderLayer.__call__."""
+        from omlx.patches.mlx_lm_mtp import qwen35_model
+        assert qwen35_model.apply()
+        from mlx_lm.models.qwen3_5 import DecoderLayer
+
+        def dflash_unrelated_call(self, x, mask=None, cache=None):
+            return x
+        DecoderLayer.__call__ = dflash_unrelated_call
+
+        qwen35_model.apply()
+
+        # After re-apply, DecoderLayer.__call__ must accept n_confirmed again
+        # (used by the MTP draft/verify path).
+        seen = {"n_confirmed": None}
+        def linear_attn_with_kwarg(h, mask=None, cache=None, n_confirmed=0):
+            seen["n_confirmed"] = n_confirmed
+            return h
+        fake = SimpleNamespace(
+            is_linear=True,
+            input_layernorm=lambda x: x,
+            post_attention_layernorm=lambda x: x,
+            linear_attn=linear_attn_with_kwarg,
+            mlp=lambda x: 0.0,
+        )
+        DecoderLayer.__call__(fake, 0.0, mask=None, cache=None, n_confirmed=3)
+        assert seen["n_confirmed"] == 3
+
+    def test_apply_orchestrator_reapplies_after_overwrite(self):
+        """Top-level apply_mlx_lm_mtp_patch must also re-run sub-patches when
+        the underlying classes have been clobbered by another patch (dflash).
+        """
+        from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+        assert apply_mlx_lm_mtp_patch() is True
+        from mlx_lm.models.qwen3_5 import GatedDeltaNet
+
+        self._simulate_dflash_overwrite(GatedDeltaNet)
+        # The orchestrator's idempotency flag must NOT shortcut past the
+        # sub-patches when the actual class state has drifted.
+        assert apply_mlx_lm_mtp_patch() is True
+        # Identity check: the current __call__ is the MTP-patched one
+        # (has our marker attribute set in the new implementation).
+        current_call = GatedDeltaNet.__dict__.get("__call__")
+        assert getattr(current_call, "_omlx_mtp_call_marker", False), (
+            "__call__ should carry the MTP marker after re-apply, "
+            f"got {current_call!r}"
+        )

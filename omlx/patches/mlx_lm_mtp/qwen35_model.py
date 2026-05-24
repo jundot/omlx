@@ -55,15 +55,29 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
+def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
+    """True iff ``cls.<attr>`` is the function we previously installed.
+
+    Used as a self-healing idempotency check: when another patch (e.g.
+    dflash's speculative hook) overwrites ``__call__`` between two
+    Native-MTP loads in the same process, the marker disappears and the
+    caller knows to re-apply. Reading from ``cls.__dict__`` instead of
+    ``getattr`` avoids resolving inherited attributes — only what is
+    actually defined on this class counts.
+    """
+    existing = cls.__dict__.get(attr)
+    return getattr(existing, marker, False)
 
 
 def apply() -> bool:
-    """Apply PR 990 model-side patches to mlx_lm.models.qwen3_5. Idempotent."""
-    global _PATCHED
-    if _PATCHED:
-        return True
+    """Apply PR 990 model-side patches to mlx_lm.models.qwen3_5.
 
+    Self-healing. Each sub-patcher decides for itself whether the class
+    still carries our installed method (marker-based identity check)
+    and re-applies if something has clobbered it since the last call.
+    No module-level "patched once" flag so dflash → mtp transitions in
+    the same process re-establish ownership (issue #1388).
+    """
     try:
         from mlx_lm.models import qwen3_5 as q35
     except ImportError:
@@ -74,7 +88,6 @@ def apply() -> bool:
     if hasattr(q35.TextModel, "mtp_forward") and not hasattr(
         q35.TextModel, "_omlx_mtp_patched"
     ):
-        _PATCHED = True
         q35.TextModel._omlx_mtp_patched = "upstream"
         return True
 
@@ -87,9 +100,9 @@ def apply() -> bool:
     _patch_outer_model(q35)
     _patch_qwen3_5_moe()
 
-    _PATCHED = True
-    q35.TextModel._omlx_mtp_patched = "patch"
-    logger.info("Qwen3.5/3.6 MTP model patch applied (PR 990)")
+    if not hasattr(q35.TextModel, "_omlx_mtp_patched"):
+        q35.TextModel._omlx_mtp_patched = "patch"
+        logger.info("Qwen3.5/3.6 MTP model patch applied (PR 990)")
     return True
 
 
@@ -222,7 +235,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
     between for rollback on draft rejection.
     """
     cls = q35.GatedDeltaNet
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
     import mlx.core as mx
@@ -348,8 +361,8 @@ def _patch_gated_delta_net(q35: Any) -> None:
         return out
 
     cls._process_chunk = _process_chunk
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
-    cls._omlx_mtp_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +371,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
 def _patch_decoder_layer(q35: Any) -> None:
     cls = q35.DecoderLayer
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
@@ -380,8 +393,8 @@ def _patch_decoder_layer(q35: Any) -> None:
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
 
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
-    cls._omlx_mtp_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +403,7 @@ def _patch_decoder_layer(q35: Any) -> None:
 
 def _patch_qwen3_5_text_model(q35: Any) -> None:
     cls = q35.Qwen3_5TextModel
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
     create_attention_mask = q35.create_attention_mask
@@ -425,8 +438,8 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         # to produce logits.
         return hidden_states
 
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
-    cls._omlx_mtp_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +449,13 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
 
 def _patch_text_model(q35: Any) -> None:
     cls = q35.TextModel
-    if "_omlx_mtp_patched" in cls.__dict__:
+    # __call__ / sanitize / mtp_forward / make_mtp_cache / quant_predicate
+    # are all *replacements* — safe to self-heal. __init__ is a wrap (captures
+    # original_init in a closure), so re-wrapping after another patch would
+    # chain wraps and cause double-init. Gate them separately:
+    init_wrapped = getattr(cls, "_omlx_mtp_init_wrapped", False)
+    call_owned = _is_our_method(cls, "__call__", "_omlx_mtp_call_marker")
+    if init_wrapped and call_owned:
         return
 
     from mlx_lm.models.cache import KVCache
@@ -566,13 +585,15 @@ def _patch_text_model(q35: Any) -> None:
             return None
         return predicate
 
-    cls.__init__ = __init__
+    if not init_wrapped:
+        cls.__init__ = __init__
+        cls._omlx_mtp_init_wrapped = True
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
-    cls._omlx_mtp_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +604,7 @@ def _patch_text_model(q35: Any) -> None:
 
 def _patch_outer_model(q35: Any) -> None:
     cls = q35.Model
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
     def __call__(
@@ -610,9 +631,13 @@ def _patch_outer_model(q35: Any) -> None:
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
 
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    # Informational marker for external code that just wants to know "is
+    # this class touched by the MTP patch". Idempotency itself uses the
+    # function-level _omlx_mtp_call_marker above.
     cls._omlx_mtp_patched = True
 
 
@@ -638,7 +663,7 @@ def _patch_qwen3_5_moe() -> None:
         return
 
     cls = moe.Model
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "sanitize", "_omlx_mtp_call_marker"):
         return
 
     import mlx.core as mx
@@ -736,5 +761,5 @@ def _patch_qwen3_5_moe() -> None:
 
         return self.language_model.sanitize(new_weights)
 
+    sanitize._omlx_mtp_call_marker = True
     cls.sanitize = sanitize
-    cls._omlx_mtp_patched = True
