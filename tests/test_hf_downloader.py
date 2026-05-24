@@ -407,6 +407,20 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
         assert "Failed to clean up cancelled download owner/model: boom" in caplog.text
 
+    def test_xet_disabled_for_cancel_compat(self):
+        """hf_xet's Rust ``download_files`` swallows the Python exception our
+        tqdm cancel raises, so on xet-enabled repos cancellation is a no-op.
+        Importing the downloader module must force the xet path off so all
+        downloads go through ``http_get`` where cooperative cancel works.
+        See #1322.
+        """
+        import huggingface_hub.constants as hc
+        from huggingface_hub.file_download import is_xet_available
+
+        # Importing omlx.admin.hf_downloader (above) flips this.
+        assert hc.HF_HUB_DISABLE_XET is True
+        assert is_xet_available() is False
+
     def test_cancellable_tqdm_raises_only_after_cancel(self):
         """The injected tqdm aborts on update() once the cancel flag is set."""
         cancelled = {"v": False}
