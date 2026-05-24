@@ -292,6 +292,19 @@ class TestEngineCoreAbortRequest:
     """Tests for EngineCore.abort_request()."""
 
     @pytest.mark.asyncio
+    async def test_abort_request_after_close_returns_false(self):
+        """Late aborts after close should not touch a cleared scheduler."""
+        engine = EngineCore.__new__(EngineCore)
+        engine._closed = True
+        engine.scheduler = None
+        engine._output_collectors = {}
+        engine._finished_events = {}
+
+        result = await engine.abort_request("request-after-close")
+
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_abort_request(self, mock_model, mock_tokenizer):
         """Test abort_request() returns True for existing request."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -800,6 +813,40 @@ class TestAsyncEngineCore:
                 result = await engine.abort_request(request_id)
 
                 assert result is True
+
+    @pytest.mark.asyncio
+    async def test_abort_request_after_close_returns_false(self):
+        """Late stream cleanup should no-op if unload already closed the core.
+
+        Streaming generators keep an AsyncEngineCore reference. A concurrent
+        unload can close that wrapper before the generator's finally block
+        calls abort_request(), clearing ``engine`` to None. The wrapper must
+        not raise AttributeError in that late-cleanup path.
+        """
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        setattr(async_engine, "engine", None)
+
+        result = await async_engine.abort_request("request-after-close")
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_context_manager_exit_after_close_does_not_raise(self):
+        """Context-manager cleanup should tolerate an already-closed wrapper."""
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        setattr(async_engine, "engine", None)
+
+        await async_engine.__aexit__(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_after_close_returns_zero(self):
+        """Bulk abort should no-op if the async wrapper is already closed."""
+        async_engine = AsyncEngineCore.__new__(AsyncEngineCore)
+        setattr(async_engine, "engine", None)
+
+        count = await async_engine.abort_all_requests()
+
+        assert count == 0
 
     @pytest.mark.asyncio
     async def test_get_stats(self, mock_model, mock_tokenizer):
