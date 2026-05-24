@@ -1018,6 +1018,10 @@
                         if (ms.enableIndexCache) out.index_cache_freq = ms.index_cache_freq || 4;
                         continue;
                     }
+                    if (k === 'prefill_step_size') {
+                        out.prefill_step_size = ms.prefill_step_size ? parseInt(ms.prefill_step_size) : null;
+                        continue;
+                    }
                     if (k === 'max_tool_result_tokens') {
                         if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
                         continue;
@@ -1314,6 +1318,8 @@
                     } else if (k === 'index_cache_freq') {
                         ms.enableIndexCache = !!s[k];
                         ms.index_cache_freq = s[k] || null;
+                    } else if (k === 'prefill_step_size') {
+                        ms.prefill_step_size = s[k] ? String(s[k]) : '';
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = !!s[k];
                         ms.max_tool_result_tokens = s[k] || null;
@@ -1589,6 +1595,7 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
+                    prefill_step_size: settings.prefill_step_size ? String(settings.prefill_step_size) : '',
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_enabled: settings.dflash_draft_quant_enabled || false,
@@ -1694,6 +1701,9 @@
                                     : null,
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
+                                    : null,
+                                prefill_step_size: this.modelSettings.prefill_step_size
+                                    ? parseInt(this.modelSettings.prefill_step_size)
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,

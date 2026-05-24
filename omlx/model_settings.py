@@ -60,6 +60,7 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        prefill_step_size: Override per-step prefill chunk size (None = scheduler default 2048).
         dflash_enabled: Enable DFlash speculative decoding.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
@@ -129,6 +130,13 @@ class ModelSettings:
     specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
+
+    # Per-step prefill chunk size (overrides SchedulerConfig.prefill_step_size).
+    # Chunked prefill materialises a (chunk × ctx × num_heads × dtype_bytes)
+    # intermediate per attention layer, which dominates peak memory at long
+    # context. Lowering this from the default 2048 to 512/256 cuts that spike
+    # ~4-8x at the potential cost of some throughput speed. None = scheduler default.
+    prefill_step_size: Optional[int] = None
 
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False

@@ -128,6 +128,8 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
+    # Prefill chunk size override (overrides SchedulerConfig.prefill_step_size)
+    prefill_step_size: int | None = None
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
@@ -1888,6 +1890,13 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    if "prefill_step_size" in sent:
+        # 0/None means "scheduler default" — no override.
+        current_settings.prefill_step_size = (
+            request.prefill_step_size
+            if request.prefill_step_size and request.prefill_step_size > 0
+            else None
+        )
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = bool(request.dflash_enabled)
@@ -2160,6 +2169,7 @@ async def update_model_settings(
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            or "prefill_step_size" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
             or "dflash_draft_quant_enabled" in sent

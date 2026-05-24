@@ -273,6 +273,19 @@ class BatchedEngine(BaseEngine):
         scheduler_config.model_name = (
             self._model_name
         )  # Ensure cache isolation per model
+
+        # Per-model prefill chunk size override. Smaller step size  help cut chunked-prefill
+        # attention-compute memory spike (chunk × ctx × heads × dtype per layer) at the
+        # potential cost of reduced throughput speed.
+        if self._model_settings is not None:
+            prefill_step = getattr(self._model_settings, "prefill_step_size", None)
+            if prefill_step:
+                scheduler_config.prefill_step_size = int(prefill_step)
+                logger.info(
+                    f"prefill_step_size override: {scheduler_config.prefill_step_size} "
+                    f"(default {SchedulerConfig.prefill_step_size})"
+                )
+
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
