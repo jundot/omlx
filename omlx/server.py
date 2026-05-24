@@ -2133,11 +2133,15 @@ async def create_chat_completion(
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
-    elif is_vlm:
-        # VLM: preserve image_url content parts for vision processing
+    elif is_vlm or is_dflash_vlm:
+        # VLM or DFlash with VLM fallback: preserve image_url content parts
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,
@@ -3482,6 +3486,10 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
@@ -3491,7 +3499,7 @@ async def create_anthropic_message(
     else:
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
-            preserve_images=is_vlm,
+            preserve_images=is_vlm or is_dflash_vlm,
             native_reasoning_content=native_reasoning,
         )
 
