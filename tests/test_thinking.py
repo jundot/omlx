@@ -89,28 +89,21 @@ class TestExtractThinking:
         assert "Let me reason..." in thinking
         assert "Final answer." in content
 
-    def test_native_reasoning_no_tags_treated_as_thinking(self):
-        """start_in_thinking=True: prompt pre-opened <think> and the model
-        emitted no tags at all — treat the whole body as thinking."""
-        thinking, content = extract_thinking(
-            "just the reasoning", start_in_thinking=True
-        )
-        assert thinking == "just the reasoning"
-        assert content == ""
-
-    def test_native_reasoning_default_mode_unchanged(self):
-        """Regression guard: default start_in_thinking=False classifies
-        tag-free text as content, not thinking."""
+    def test_tag_free_text_always_classified_as_content(self):
+        """Tag-free text is content, never thinking. Regression guard for
+        issue #1348: in 0.3.9 the Responses API passed
+        ``start_in_thinking=True`` here, which misclassified short tool-turn
+        answers (no ``</think>``) as thinking and left ``output_text`` empty.
+        Mirrors ``ThinkingParser.finish()`` recovery semantics."""
         thinking, content = extract_thinking("just the reasoning")
         assert thinking == ""
         assert content == "just the reasoning"
 
-    def test_native_reasoning_with_close_tag_only(self):
-        """start_in_thinking=True with model emitting `body</think>answer`
-        (no opening tag because prompt pre-opened it) — partial-tail
-        branch handles this regardless of start_in_thinking."""
+    def test_close_tag_only_partial_tail_branch(self):
+        """Prompt pre-opened ``<think>``; model emits ``body</think>answer``
+        (no opening tag in output). Partial-tail branch splits correctly."""
         thinking, content = extract_thinking(
-            "thought process</think>visible answer", start_in_thinking=True
+            "thought process</think>visible answer"
         )
         assert thinking == "thought process"
         assert content == "visible answer"

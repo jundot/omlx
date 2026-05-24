@@ -4052,9 +4052,7 @@ async def create_response(
 
         # Process output text
         raw_text = clean_special_tokens(output.text) if output.text else ""
-        thinking_content, regular_content = extract_thinking(
-            raw_text, start_in_thinking=native_reasoning
-        )
+        thinking_content, regular_content = extract_thinking(raw_text)
 
         # Parse tool calls
         if engine.model_type == "gpt_oss" and output.tool_calls:
@@ -4450,9 +4448,7 @@ async def stream_responses_api(
         tool_calls = last_output.tool_calls
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(
-            accumulated_text, start_in_thinking=native_reasoning
-        )
+        thinking_content, regular_content = extract_thinking(accumulated_text)
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -4472,10 +4468,8 @@ async def stream_responses_api(
                 "sequence_number": seq,
             })
     else:
-        # No tools — use raw accumulated text minus thinking
-        thinking_content, regular_content = extract_thinking(
-            accumulated_text, start_in_thinking=native_reasoning
-        )
+        # No tools — use raw accumulated text minus thinking.
+        thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     # Reverse Gemma 4 parameter renaming
