@@ -20,6 +20,7 @@ from .hf_downloader import (
     DownloadStatus,
     DownloadTask,
     _format_model_size,
+    _format_param_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,219 @@ def _extract_model_size_from_files(file_list: list) -> int:
         if isinstance(size, (int, float)):
             total += int(size)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Per-model enrichment (size + param count)
+#
+# ModelScope's list_models endpoint returns Path/Name/Downloads/Likes/Stars
+# but rarely populates StorageSize, and never returns a parameter count.
+# To match HuggingFace's recommended-models card data, we enrich each entry
+# with a config.json fetch (for params) and — when StorageSize was missing —
+# a model-detail fetch (for size).
+#
+# Cached in-process for 24 hours since config.json content for a model
+# doesn't change in practice; this keeps subsequent page loads of the
+# Downloads tab essentially free.
+
+_ENRICH_CACHE: dict[str, tuple[float, dict]] = {}
+_ENRICH_CACHE_TTL = 24 * 3600  # 24h — config.json is effectively immutable
+_ENRICH_CACHE_MAX = 1024       # bound memory under aggressive search/list use
+_ENRICH_CONCURRENCY = 8        # parallel fetches per recommended/search call
+
+
+def _enrich_cache_get(model_id: str) -> Optional[dict]:
+    entry = _ENRICH_CACHE.get(model_id)
+    if entry is None:
+        return None
+    ts, data = entry
+    if time.time() - ts > _ENRICH_CACHE_TTL:
+        _ENRICH_CACHE.pop(model_id, None)
+        return None
+    return data
+
+
+def _enrich_cache_put(model_id: str, data: dict) -> None:
+    if len(_ENRICH_CACHE) >= _ENRICH_CACHE_MAX:
+        # Drop the oldest entry. O(N) on eviction but N is bounded at MAX
+        # and evictions are rare in practice (24h TTL >> page-load rate).
+        oldest = min(_ENRICH_CACHE, key=lambda k: _ENRICH_CACHE[k][0])
+        _ENRICH_CACHE.pop(oldest, None)
+    _ENRICH_CACHE[model_id] = (time.time(), data)
+
+
+def _estimate_params_from_config(config: Optional[dict]) -> int:
+    """Estimate decoder-transformer parameter count from a HF-style config.
+
+    Handles dense Llama/Qwen/Mistral families and MoE variants
+    (num_local_experts / num_experts). Returns 0 when required fields are
+    missing — caller should render a blank rather than display a wrong
+    number. The estimate is intentionally a rough headline figure (≈±5%);
+    the goal is to surface "~7B" vs "~14B", not to match the checkpoint
+    byte-for-byte.
+    """
+    if not isinstance(config, dict):
+        return 0
+    try:
+        vocab_size = int(config.get("vocab_size", 0))
+        hidden_size = int(config.get("hidden_size", 0))
+        num_layers = int(config.get("num_hidden_layers", 0))
+    except (TypeError, ValueError):
+        return 0
+
+    if not (vocab_size and hidden_size and num_layers):
+        return 0
+
+    try:
+        intermediate_size = int(config.get("intermediate_size", 0))
+        num_heads = int(config.get("num_attention_heads", 0))
+        num_kv = int(config.get("num_key_value_heads", num_heads))
+        head_dim = int(config.get("head_dim", 0)) or (
+            hidden_size // num_heads if num_heads else 0
+        )
+        num_experts = int(
+            config.get("num_local_experts")
+            or config.get("num_experts")
+            or 1
+        )
+        tie_embeddings = bool(config.get("tie_word_embeddings", True))
+    except (TypeError, ValueError):
+        return 0
+
+    embeddings = vocab_size * hidden_size
+
+    # Attention: Q + O are full hidden_size; K + V are reduced for GQA.
+    if num_heads and head_dim:
+        attn = (
+            2 * hidden_size * (num_heads * head_dim)
+            + 2 * hidden_size * (num_kv * head_dim)
+        )
+    else:
+        attn = 4 * hidden_size * hidden_size
+
+    # Gated MLP (Llama/Qwen style): gate + up + down projections.
+    # MoE multiplies the FFN by the number of experts.
+    if intermediate_size:
+        ffn = num_experts * 3 * hidden_size * intermediate_size
+    else:
+        ffn = 8 * hidden_size * hidden_size
+
+    layer_norms = 2 * hidden_size
+    per_layer = attn + ffn + layer_norms
+
+    total = embeddings + num_layers * per_layer + hidden_size
+    if not tie_embeddings:
+        total += vocab_size * hidden_size  # untied LM head
+
+    return total
+
+
+async def _fetch_model_config(model_id: str) -> Optional[dict]:
+    """Fetch and parse a model's config.json from ModelScope.
+
+    Returns None on any error (network, non-200, non-JSON) so callers can
+    treat the field as absent without raising.
+    """
+    if not model_id:
+        return None
+    import json
+
+    endpoint = _get_ms_endpoint()
+    url = (
+        f"{endpoint}/api/v1/models/{model_id}/repo"
+        f"?FilePath=config.json&Revision=master"
+    )
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(requests.get, url, timeout=_MS_API_TIMEOUT),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code != 200:
+            return None
+        return json.loads(resp.text)
+    except Exception as e:
+        logger.debug(f"config.json fetch failed for {model_id}: {e}")
+        return None
+
+
+async def _fetch_model_detail_size(model_id: str) -> int:
+    """Fetch a model's storage size via the detail endpoint.
+
+    Used as a fallback when list_models didn't populate StorageSize.
+    Prefers ModelInfos.safetensor.model_size (weights only) and falls
+    back to the repository StorageSize (weights + tokenizer + readme).
+    Returns 0 on any error.
+    """
+    if not model_id:
+        return 0
+    endpoint = _get_ms_endpoint()
+    url = f"{endpoint}/api/v1/models/{model_id}"
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(requests.get, url, timeout=_MS_API_TIMEOUT),
+            timeout=_MS_API_TIMEOUT + 5,
+        )
+        if resp.status_code != 200:
+            return 0
+        data = resp.json().get("Data") or {}
+        model_infos = data.get("ModelInfos") or {}
+        st = model_infos.get("safetensor") or {}
+        size = st.get("model_size") or data.get("StorageSize") or 0
+        return int(size) if isinstance(size, (int, float, str)) else 0
+    except (TypeError, ValueError):
+        return 0
+    except Exception as e:
+        logger.debug(f"model detail fetch failed for {model_id}: {e}")
+        return 0
+
+
+async def _enrich_ms_entry(entry: dict, sem: asyncio.Semaphore) -> dict:
+    """Add size + params to a parsed model entry.
+
+    Concurrent fetches are gated by `sem`; per-model results are cached
+    in-process for 24h so subsequent page loads don't re-issue requests.
+    Mutates and returns the same dict for ergonomic gather() pipelines.
+    """
+    model_id = entry.get("repo_id") or ""
+    if not model_id:
+        return entry
+
+    cached = _enrich_cache_get(model_id)
+    if cached is not None:
+        c_size = cached.get("size") or 0
+        c_params = cached.get("params") or 0
+        if c_size and not entry.get("size"):
+            entry["size"] = c_size
+            entry["size_formatted"] = _format_model_size(c_size)
+        if c_params:
+            entry["params"] = c_params
+            entry["params_formatted"] = _format_param_count(c_params)
+        return entry
+
+    async with sem:
+        config_task = asyncio.create_task(_fetch_model_config(model_id))
+        need_size = (entry.get("size") or 0) <= 0
+        detail_task = (
+            asyncio.create_task(_fetch_model_detail_size(model_id))
+            if need_size else None
+        )
+
+        config = await config_task
+        params = _estimate_params_from_config(config)
+
+        size = entry.get("size") or 0
+        if detail_task is not None:
+            size = await detail_task
+
+    _enrich_cache_put(model_id, {"size": size, "params": params})
+
+    if size and not entry.get("size"):
+        entry["size"] = size
+        entry["size_formatted"] = _format_model_size(size)
+    if params:
+        entry["params"] = params
+        entry["params_formatted"] = _format_param_count(params)
+    return entry
 
 
 def _parse_ms_model_entry(entry: dict) -> dict:
@@ -226,7 +440,8 @@ class MSDownloader:
                 # Filter by minimum downloads
                 if downloads < _MIN_DOWNLOADS:
                     continue
-                # Filter by memory size (only if size is available)
+                # Filter by memory size (only when list_models already had
+                # a size — enrichment may reveal more below).
                 if size > 0 and size > max_memory_bytes:
                     continue
                 results.append(m)
@@ -236,6 +451,27 @@ class MSDownloader:
             return results
 
         models = await _fetch()
+
+        # Enrich with size + params from per-model config.json / detail
+        # fetches. Bounded concurrency keeps the call to ~1–2s for a full
+        # page; results are cached in-process so subsequent loads are free.
+        if models:
+            sem = asyncio.Semaphore(_ENRICH_CONCURRENCY)
+            enriched = await asyncio.gather(
+                *(_enrich_ms_entry(m, sem) for m in models),
+                return_exceptions=True,
+            )
+            models = [m for m in enriched if isinstance(m, dict)]
+
+            # Re-apply the memory filter now that enrichment may have
+            # supplied a real size for entries that list_models reported
+            # as 0. Entries that still have no size are kept (better to
+            # show with a blank size than hide a candidate the user has
+            # enough RAM for).
+            models = [
+                m for m in models
+                if (m.get("size", 0) == 0) or (m["size"] <= max_memory_bytes)
+            ]
 
         # Sort by downloads for popular, keep original order for trending
         trending = models[:result_limit]
