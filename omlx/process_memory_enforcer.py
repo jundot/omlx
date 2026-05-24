@@ -198,22 +198,62 @@ class ProcessMemoryEnforcer:
                 self._clear_metal_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
+    @staticmethod
+    def _resolve_scheduler(entry: Any) -> Any | None:
+        """Resolve the Scheduler instance from an EnginePool entry.
+
+        Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
+        as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
+        EngineCore → Scheduler). Some non-streaming engines may expose
+        ``entry.engine.scheduler`` directly. Returns None if neither
+        path resolves.
+        """
+        eng = entry.engine
+        if eng is None:
+            return None
+        sched = getattr(eng, "scheduler", None)
+        if sched is not None:
+            return sched
+        inner = getattr(eng, "_engine", None)
+        if inner is None:
+            return None
+        inner_engine = getattr(inner, "engine", None)
+        if inner_engine is None:
+            return None
+        return getattr(inner_engine, "scheduler", None)
+
     def _propagate_memory_limit(self) -> None:
         """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
         hard_limit = self._get_hard_limit_bytes()
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
-            if entry.engine is not None:
-                scheduler = getattr(entry.engine, "scheduler", None)
-                if scheduler is not None:
-                    scheduler._memory_limit_bytes = self._max_bytes
-                    scheduler._memory_hard_limit_bytes = hard_limit
-                    scheduler._prefill_memory_guard = self._prefill_memory_guard
-                    scheduler._admission_paused = admission_paused
-                    bg = getattr(scheduler, "batch_generator", None)
-                    if bg is not None and hasattr(bg, "_memory_limit_bytes"):
-                        bg._memory_limit_bytes = self._max_bytes
-                        bg._memory_hard_limit_bytes = hard_limit
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is not None:
+                scheduler._memory_limit_bytes = self._max_bytes
+                scheduler._memory_hard_limit_bytes = hard_limit
+                scheduler._prefill_memory_guard = self._prefill_memory_guard
+                scheduler._admission_paused = admission_paused
+                bg = getattr(scheduler, "batch_generator", None)
+                if bg is not None and hasattr(bg, "_memory_limit_bytes"):
+                    bg._memory_limit_bytes = self._max_bytes
+                    bg._memory_hard_limit_bytes = hard_limit
+
+    def _walk_store_cache_caps(self) -> None:
+        """Walk each scheduler's store-cache gate one step per poll (#1383).
+
+        Driven on every enforcement tick, not just on pressure transitions,
+        so the cap converges ±1 per poll toward its pressure-driven target
+        (ok -> max_num_seqs, soft/hard -> 1). Decoupled from
+        `_propagate_memory_limit` to avoid double-stepping the cap when
+        a transition fires.
+        """
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            adjust = getattr(scheduler, "adjust_store_cache_cap", None)
+            if adjust is not None:
+                adjust(self._pressure_level)
 
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
@@ -293,6 +333,9 @@ class ProcessMemoryEnforcer:
             )
 
         if new_level == "ok":
+            # Still walk the store-cache cap so it can recover toward
+            # max_num_seqs while pressure stays low (#1383).
+            self._walk_store_cache_caps()
             return
 
         # Recover below soft regardless of level — prevents oscillation
@@ -391,6 +434,10 @@ class ProcessMemoryEnforcer:
                 f"Memory pressure post-eviction: {new_level} -> {post_level} "
                 f"(current={_format_gb(post_current)})"
             )
+
+        # Walk each scheduler's store-cache gate ±1 toward its
+        # pressure-driven target every poll (#1383).
+        self._walk_store_cache_caps()
 
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints.
