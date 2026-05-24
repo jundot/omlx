@@ -1,8 +1,7 @@
 # Native oMLX.app Architecture
 
-Deep-dive on the Swift menubar + AppView rewrite. The high-level roadmap lives
-in [`plan.md`](../plan.md); this document covers the architectural detail a new
-contributor needs before touching code.
+Deep-dive on the Swift menubar + AppView rewrite. This document covers the
+architectural detail a new contributor needs before touching code.
 
 ---
 
@@ -66,7 +65,7 @@ Identical to today's browser flow, simplified by being in-process.
 ### Endpoint coverage
 
 The 76 `/admin/api/*` endpoints already cover every screen we ship. **Zero
-server changes are required.** See `plan.md` §6 for the full mapping.
+server changes are required.**
 
 `OMLXClient` exposes typed methods (`getGlobalSettings()`,
 `updateGlobalSettings(_:)`, `listModels()`, `loadModel(id:)`, …) backed by
@@ -334,7 +333,6 @@ still hit `http://127.0.0.1:{port}/admin/dashboard` directly.
 
 ## References
 
-- [`plan.md`](../plan.md) — phase-by-phase roadmap and progress tracker.
 - [`packaging/README.md`](../packaging/README.md) — build pipeline.
 - [`packaging/venvstacks.toml`](../packaging/venvstacks.toml) — Python layer
   configuration.

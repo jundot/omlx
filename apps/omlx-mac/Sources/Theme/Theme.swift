@@ -2,8 +2,8 @@
 //
 // Lifted verbatim from omlx-components.jsx:10-94 in the design bundle.
 // Both light and dark variants must stay in sync with the canvas; mismatches
-// are caught by the manual visual diff each PR runs (see plan.md §7) and,
-// once PR 7 lands snapshot tests, by xcodebuild test.
+// are caught by manual visual diffs and the snapshot tests in the test
+// target.
 
 import SwiftUI
 

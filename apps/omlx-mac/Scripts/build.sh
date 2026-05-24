@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # build.sh — produce a runnable oMLX-next.app for local manual testing.
 #
-# This is the side-by-side Swift bundle path called out in plan.md §5.
+# Side-by-side Swift bundle path: this builds `oMLX-next.app` alongside the
+# legacy Python/PyObjC `oMLX.app` until the Swift app becomes the primary
+# release channel.
 # Pipeline:
 #   1. xcodebuild with `-resolvePackageDependencies` so SPM deps pick up
 #      any new minor/patch within the pin range each build
