@@ -967,6 +967,7 @@
                                                                    class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
                                                                 <div class="flex items-center gap-3 mt-0.5">
                                                                     <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                                    <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                                     <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                                     <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                                 </div>
@@ -1020,6 +1021,7 @@
                                                                    class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
                                                                 <div class="flex items-center gap-3 mt-0.5">
                                                                     <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                                    <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                                     <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                                     <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                                 </div>
@@ -1082,6 +1084,7 @@
                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs" x-text="model.repo_id"></button>
                                                                     <div class="flex items-center gap-3 mt-0.5 flex-wrap">
                                                                         <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
+                                                                        <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                                         <span class="text-xs text-neutral-400" x-text="'&#11015; ' + formatDownloads(model.downloads)"></span>
                                                                         <span class="text-xs text-neutral-400" x-text="'&#9829; ' + model.likes"></span>
                                                                     </div>
@@ -1979,6 +1982,7 @@
                                             <h3 class="text-lg font-bold text-neutral-900 truncate" x-text="msModelDetail.repo_id"></h3>
                                             <div class="flex items-center gap-3 mt-1.5 flex-wrap">
                                                 <span x-show="msModelDetail.size_formatted" x-cloak class="text-xs text-neutral-500" x-text="msModelDetail.size_formatted"></span>
+                                                <span x-show="msModelDetail.params" x-cloak class="text-xs text-neutral-500" x-text="msModelDetail.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                 <span class="text-xs text-neutral-500" x-text="'&#11015; ' + formatDownloads(msModelDetail.downloads)"></span>
                                                 <span class="text-xs text-neutral-500" x-text="'&#9829; ' + msModelDetail.likes"></span>
                                             </div>
