@@ -26,7 +26,7 @@
 //   Upload sheet          — credentials + repo + README configuration, then
 //                            POST /admin/api/upload/start. The HF token
 //                            lives only in the macOS Keychain (service
-//                            "app.omlx-next.hf-upload"); never persisted to
+//                            "app.omlx.hf-upload"); never persisted to
 //                            UserDefaults or files.
 //
 //   Upload Tasks          — mirror of the Queue section for upload jobs.
@@ -1383,7 +1383,7 @@ final class QuantizationScreenVM: ObservableObject {
 // happen on the main actor (called from the VM); the SecItem APIs are
 // thread-safe so we don't need additional locking.
 enum Keychain {
-    private static let service = "app.omlx-next.hf-upload"
+    private static let service = "app.omlx.hf-upload"
     private static let account = "huggingface-token"
 
     /// Returns the stored token or `nil` if no item exists / the read fails.

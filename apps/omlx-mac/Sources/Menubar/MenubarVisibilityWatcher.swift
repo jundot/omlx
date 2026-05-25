@@ -82,24 +82,24 @@ final class MenubarVisibilityWatcher {
         if isTahoeOrNewer {
             alert.informativeText = """
             macOS Tahoe added per-app menu-bar visibility controls. Open \
-            System Settings → Menu Bar and confirm oMLX-next is enabled.
+            System Settings → Menu Bar and confirm oMLX is enabled.
 
             If a menu-bar manager (Bartender, Ice) is filtering items, \
-            oMLX-next may be excluded by its rules. Bartender in particular \
+            oMLX may be excluded by its rules. Bartender in particular \
             tends to hide PyObjC-style status items and now Swift apps \
             built the same way.
             """
             alert.addButton(withTitle: "Open Menu Bar Settings…")
-            alert.addButton(withTitle: "Quit oMLX-next")
+            alert.addButton(withTitle: "Quit oMLX")
             alert.addButton(withTitle: "OK")
         } else {
             alert.informativeText = """
-            Try quitting and relaunching oMLX-next. If the icon still \
+            Try quitting and relaunching oMLX. If the icon still \
             doesn't appear, check your menu-bar manager (Bartender, Ice, \
             etc.) — third-party apps sometimes filter status items by \
-            category and may exclude oMLX-next.
+            category and may exclude oMLX.
             """
-            alert.addButton(withTitle: "Quit oMLX-next")
+            alert.addButton(withTitle: "Quit oMLX")
             alert.addButton(withTitle: "OK")
         }
 

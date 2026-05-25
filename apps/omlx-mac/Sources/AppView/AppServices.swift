@@ -256,7 +256,7 @@ final class AppServices: NSObject, ObservableObject {
             try Self.relocateOrphanPaths(in: AppConfig.settingsURL(basePath: newPath),
                                          oldBase: oldPath, newBase: newPath)
         } catch {
-            NSLog("oMLX-next: relocateOrphanPaths failed: %@", String(describing: error))
+            NSLog("oMLX: relocateOrphanPaths failed: %@", String(describing: error))
         }
     }
 
@@ -284,16 +284,16 @@ final class AppServices: NSObject, ObservableObject {
     /// AppConfig doesn't own (model.model_dirs, cache.ssd_cache_dir,
     /// logging.log_dir). Paths outside the migrated tree are left alone.
     nonisolated static func relocateOrphanPaths(in url: URL, oldBase: String, newBase: String) throws {
-        NSLog("oMLX-next: relocateOrphanPaths in=%@ old=%@ new=%@",
+        NSLog("oMLX: relocateOrphanPaths in=%@ old=%@ new=%@",
               url.path, oldBase, newBase)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            NSLog("oMLX-next: relocateOrphanPaths skipped — file does not exist")
+            NSLog("oMLX: relocateOrphanPaths skipped — file does not exist")
             return
         }
         let data = try Data(contentsOf: url)
         guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            NSLog("oMLX-next: relocateOrphanPaths skipped — root is not an object")
+            NSLog("oMLX: relocateOrphanPaths skipped — root is not an object")
             return
         }
 
@@ -325,7 +325,7 @@ final class AppServices: NSObject, ObservableObject {
 
         let out = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
         try out.write(to: url, options: [.atomic])
-        NSLog("oMLX-next: relocateOrphanPaths wrote %d bytes", out.count)
+        NSLog("oMLX: relocateOrphanPaths wrote %d bytes", out.count)
     }
 
     nonisolated private static func normalize(_ path: String) -> String {

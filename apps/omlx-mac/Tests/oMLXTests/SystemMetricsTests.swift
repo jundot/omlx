@@ -5,7 +5,7 @@
 // a stray locale tweak can't change what the UI prints.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class SystemMetricsTests: XCTestCase {
 

@@ -15,8 +15,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "1AAAAAAAAAAAAAAAAAAAAAA2"
-               BuildableName = "oMLX-next.app"
-               BlueprintName = "oMLX-next"
+               BuildableName = "oMLX.app"
+               BlueprintName = "oMLX"
                ReferencedContainer = "container:oMLX.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -33,8 +33,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "DAA000000000000000000001"
-               BuildableName = "oMLXNextTests.xctest"
-               BlueprintName = "oMLXNextTests"
+               BuildableName = "oMLXTests.xctest"
+               BlueprintName = "oMLXTests"
                ReferencedContainer = "container:oMLX.xcodeproj">
             </BuildableReference>
          </TestableReference>
@@ -55,8 +55,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "1AAAAAAAAAAAAAAAAAAAAAA2"
-            BuildableName = "oMLX-next.app"
-            BlueprintName = "oMLX-next"
+            BuildableName = "oMLX.app"
+            BlueprintName = "oMLX"
             ReferencedContainer = "container:oMLX.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -72,8 +72,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "1AAAAAAAAAAAAAAAAAAAAAA2"
-            BuildableName = "oMLX-next.app"
-            BlueprintName = "oMLX-next"
+            BuildableName = "oMLX.app"
+            BlueprintName = "oMLX"
             ReferencedContainer = "container:oMLX.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

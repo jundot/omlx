@@ -57,7 +57,7 @@ No application layer — the Swift app is the application surface.
 ## Installation
 
 1. Open the DMG produced by the Swift build.
-2. Drag `oMLX-next.app` to Applications.
+2. Drag `oMLX.app` to Applications.
 3. Launch the app (appears in the menubar).
 4. Walk through the first-run wizard (Storage + API key), then Start
    Server.

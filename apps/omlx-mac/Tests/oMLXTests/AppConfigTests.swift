@@ -7,7 +7,7 @@
 // real ~/.omlx or Library/Application Support state.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class AppConfigTests: XCTestCase {
 

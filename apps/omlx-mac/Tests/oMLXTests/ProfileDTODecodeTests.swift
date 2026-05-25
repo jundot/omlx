@@ -7,7 +7,7 @@
 // because user templates may persist without stamps in legacy state.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class ProfileDTODecodeTests: XCTestCase {
 

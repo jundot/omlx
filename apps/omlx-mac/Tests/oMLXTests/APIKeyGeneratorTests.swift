@@ -6,7 +6,7 @@
 // will reject.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class APIKeyGeneratorTests: XCTestCase {
 

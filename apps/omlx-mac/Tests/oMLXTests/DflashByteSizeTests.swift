@@ -5,7 +5,7 @@
 // magnitude off.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class DflashByteSizeTests: XCTestCase {
 

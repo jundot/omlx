@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# build.sh — produce a runnable oMLX-next.app for local manual testing.
+# build.sh — produce a runnable oMLX.app for local manual testing.
 #
-# Side-by-side Swift bundle path: this builds `oMLX-next.app` alongside the
+# Side-by-side Swift bundle path: this builds `oMLX.app` alongside the
 # legacy Python/PyObjC `oMLX.app` until the Swift app becomes the primary
 # release channel.
 # Pipeline:
@@ -187,19 +187,19 @@ log "Bundle version: $APP_VERSION (build $BUILD_NUMBER) — from omlx/_version.p
 
 # --- xcodebuild -----------------------------------------------------------
 
-log "Building oMLX-next ($CONFIG)…"
+log "Building oMLX ($CONFIG)…"
 mkdir -p "$BUILD_DIR"
 
 log "Resolving Swift package dependencies…"
 xcodebuild -resolvePackageDependencies \
     -project "$PROJECT_DIR/oMLX.xcodeproj" \
-    -scheme oMLX-next \
+    -scheme oMLX \
     >"$BUILD_DIR/spm-resolve.log" 2>&1 \
         || warn "SPM resolve emitted warnings; continuing with existing Package.resolved (see $BUILD_DIR/spm-resolve.log)."
 
 xcodebuild \
     -project "$PROJECT_DIR/oMLX.xcodeproj" \
-    -scheme oMLX-next \
+    -scheme oMLX \
     -configuration "$CONFIG" \
     -destination 'platform=macOS' \
     -derivedDataPath "$BUILD_DIR" \
@@ -211,14 +211,14 @@ xcodebuild \
     build >"$BUILD_DIR/xcodebuild.log" 2>&1 \
         || { tail -40 "$BUILD_DIR/xcodebuild.log" >&2; die "xcodebuild failed; full log: $BUILD_DIR/xcodebuild.log"; }
 
-XCODE_APP="$BUILD_DIR/Build/Products/$CONFIG/oMLX-next.app"
+XCODE_APP="$BUILD_DIR/Build/Products/$CONFIG/oMLX.app"
 [ -d "$XCODE_APP" ] || die "Expected $XCODE_APP — check build log."
 ok "Built $XCODE_APP"
 
 # --- Stage --------------------------------------------------------------
 
 mkdir -p "$OUTPUT_DIR"
-STAGED_APP="$OUTPUT_DIR/oMLX-next.app"
+STAGED_APP="$OUTPUT_DIR/oMLX.app"
 
 log "Staging bundle at $STAGED_APP"
 rm -rf "$STAGED_APP"
@@ -301,7 +301,7 @@ if [ -d "$ICON_BUNDLE" ] && [ -d "$XCASSETS_DIR" ]; then
             --target-device mac \
             --minimum-deployment-target 26.0 \
             --platform macosx \
-            --bundle-identifier app.omlx-next \
+            --bundle-identifier app.omlx \
             --output-format human-readable-text \
             --output-partial-info-plist "$ICON_TMP/icon.plist" \
             >/dev/null 2>&1; then
@@ -361,4 +361,4 @@ echo "To launch:"
 echo "  open '$STAGED_APP'"
 echo
 echo "Server log will appear at:"
-echo "  ~/Library/Application Support/oMLX-next/logs/server.log"
+echo "  ~/Library/Application Support/oMLX/logs/server.log"

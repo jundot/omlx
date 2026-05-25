@@ -1,7 +1,7 @@
 // Source of truth for the per-model settings "Preset" chip strip. Mirrors
 // HTML's localStorage-cached preset bundle:
 //
-//   1. Disk cache (~/Library/Application Support/oMLX-next/preset_cache.json)
+//   1. Disk cache (~/Library/Application Support/oMLX/preset_cache.json)
 //   2. Bundled fixture (Contents/Resources/omlx/admin/static/omlx_preset.json)
 //      — staged into the .app by Scripts/build.sh from the omlx package.
 //   3. Remote refresh via POST /admin/api/presets/refresh (omlx.ai proxy).
@@ -61,7 +61,7 @@ final class PresetBundleStore: ObservableObject {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("oMLX-next", isDirectory: true)
+        let dir = base.appendingPathComponent("oMLX", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("preset_cache.json")
     }

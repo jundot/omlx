@@ -5,7 +5,7 @@
 // server defaults the Profiles tab and Server screen depend on.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class GlobalSettingsSamplingTests: XCTestCase {
 

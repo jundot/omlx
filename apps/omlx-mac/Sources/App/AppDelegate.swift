@@ -121,7 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             // Surface the failure in the menubar; in-app banner lands in PR 6.
             self.menubar = makeMenubar(server: nil, config: config, lastError: error)
-            NSLog("oMLX-next: server bootstrap failed — \(error)")
+            NSLog("oMLX: server bootstrap failed — \(error)")
         }
     }
 
@@ -162,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     try snapshot.save()
                     self.services.updateConfig(snapshot)
                 } catch {
-                    NSLog("oMLX-next: welcome skip — failed to persist partial config: \(error)")
+                    NSLog("oMLX: welcome skip — failed to persist partial config: \(error)")
                 }
             }
         )

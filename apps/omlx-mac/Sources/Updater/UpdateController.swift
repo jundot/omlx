@@ -3,7 +3,7 @@
 // Drives three observable bits the AppView's Status screen renders: the
 // check state (idle / checking / available), the channel (Stable / Beta /
 // Nightly), and two background prefs (autoCheck + autoDownload). Channel +
-// prefs persist to ~/Library/Application Support/oMLX-next/update-prefs.json
+// prefs persist to ~/Library/Application Support/oMLX/update-prefs.json
 // so they survive a relaunch.
 //
 // PR 11 swaps the body of `checkForUpdates()` and `installAndRestart()` for
@@ -128,7 +128,7 @@ final class UpdateController: ObservableObject {
         case .available(let version, let sizeText):
             state = .available(AvailableUpdate(version: version, sizeText: sizeText))
         case .error(let message):
-            NSLog("oMLX-next: update check failed — %@", message)
+            NSLog("oMLX: update check failed — %@", message)
             state = .idle(lastChecked: Date())
         }
     }

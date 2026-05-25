@@ -162,14 +162,14 @@ final class MenubarController: NSObject {
 
         menu.addItem(.separator())
 
-        let about = item("About oMLX-next",
+        let about = item("About oMLX",
                          action: #selector(showAbout),
                          symbol: "info.circle")
         menu.addItem(about)
 
         menu.addItem(.separator())
 
-        let quit = item("Quit oMLX-next",
+        let quit = item("Quit oMLX",
                         action: #selector(quitApp),
                         symbol: "power",
                         keyEquivalent: "q")
@@ -354,7 +354,7 @@ final class MenubarController: NSObject {
                 presentPortConflictAlert(conflict)
             }
         } catch {
-            NSLog("oMLX-next: start failed — \(error)")
+            NSLog("oMLX: start failed — \(error)")
         }
     }
 
@@ -371,7 +371,7 @@ final class MenubarController: NSObject {
             do {
                 _ = try await server.forceRestart()
             } catch {
-                NSLog("oMLX-next: force-restart failed — \(error)")
+                NSLog("oMLX: force-restart failed — \(error)")
             }
         }
     }

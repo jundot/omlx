@@ -96,7 +96,7 @@
 			containerPortal = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 1AAAAAAAAAAAAAAAAAAAAAA2;
-			remoteInfo = "oMLX-next";
+			remoteInfo = "oMLX";
 		};
 /* End PBXContainerItemProxy section */
 
@@ -106,9 +106,9 @@
 		1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppViewWindowController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX-next.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX-next.entitlements"; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX.entitlements"; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX-next.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
 		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -184,7 +184,7 @@
 		DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalSettingsSamplingTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000A /* ProfileScopeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileScopeTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000B /* SystemMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsTests.swift; sourceTree = "<group>"; };
-		DCC000000000000000000010 /* oMLXNextTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXNextTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -206,7 +206,7 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		1BBBBBBBBBBBBBBBBBBBBBB1 /* oMLX-next */ = {
+		1BBBBBBBBBBBBBBBBBBBBBB1 /* oMLX */ = {
 			isa = PBXGroup;
 			children = (
 				1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */,
@@ -219,12 +219,12 @@
 		DEE000000000000000000001 /* Tests */ = {
 			isa = PBXGroup;
 			children = (
-				DEE000000000000000000002 /* oMLXNextTests */,
+				DEE000000000000000000002 /* oMLXTests */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
 		};
-		DEE000000000000000000002 /* oMLXNextTests */ = {
+		DEE000000000000000000002 /* oMLXTests */ = {
 			isa = PBXGroup;
 			children = (
 				DCC000000000000000000001 /* AppServicesPathTests.swift */,
@@ -239,7 +239,7 @@
 				DCC00000000000000000000A /* ProfileScopeTests.swift */,
 				DCC00000000000000000000B /* SystemMetricsTests.swift */,
 			);
-			path = oMLXNextTests;
+			path = oMLXTests;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
@@ -416,7 +416,7 @@
 			isa = PBXGroup;
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */,
-				1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX-next.entitlements */,
+				1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */,
 				1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */,
 				BCC000000000000000000002 /* Localizable.xcstrings */,
 			);
@@ -426,8 +426,8 @@
 		1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */,
-				DCC000000000000000000010 /* oMLXNextTests.xctest */,
+				1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */,
+				DCC000000000000000000010 /* oMLXTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -435,9 +435,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX-next */ = {
+		1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX-next" */;
+			buildConfigurationList = 1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX" */;
 			buildPhases = (
 				1EEEEEEEEEEEEEEEEEEEEEE1 /* Sources */,
 				1EEEEEEEEEEEEEEEEEEEEEE2 /* Frameworks */,
@@ -447,17 +447,17 @@
 			);
 			dependencies = (
 			);
-			name = "oMLX-next";
+			name = "oMLX";
 			packageProductDependencies = (
 				BDD000000000000000000001 /* Sparkle */,
 			);
-			productName = "oMLX-next";
-			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX-next.app */;
+			productName = "oMLX";
+			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */;
 			productType = "com.apple.product-type.application";
 		};
-		DAA000000000000000000001 /* oMLXNextTests */ = {
+		DAA000000000000000000001 /* oMLXTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXNextTests" */;
+			buildConfigurationList = DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXTests" */;
 			buildPhases = (
 				DAA000000000000000000005 /* Sources */,
 				DAA000000000000000000006 /* Frameworks */,
@@ -467,9 +467,9 @@
 			dependencies = (
 				DAA000000000000000000007 /* PBXTargetDependency */,
 			);
-			name = oMLXNextTests;
-			productName = oMLXNextTests;
-			productReference = DCC000000000000000000010 /* oMLXNextTests.xctest */;
+			name = oMLXTests;
+			productName = oMLXTests;
+			productReference = DCC000000000000000000010 /* oMLXTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
@@ -507,8 +507,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX-next */,
-				DAA000000000000000000001 /* oMLXNextTests */,
+				1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */,
+				DAA000000000000000000001 /* oMLXTests */,
 			);
 		};
 /* End PBXProject section */
@@ -642,7 +642,7 @@
 /* Begin PBXTargetDependency section */
 		DAA000000000000000000007 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX-next */;
+			target = 1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */;
 			targetProxy = DAA000000000000000000008 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -771,7 +771,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX-next.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -786,7 +786,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next";
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -797,7 +797,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX-next.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -812,7 +812,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next";
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -828,11 +828,11 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX-next.app/Contents/MacOS/oMLX-next";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX.app/Contents/MacOS/oMLX";
 			};
 			name = Debug;
 		};
@@ -845,11 +845,11 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx-next.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX-next.app/Contents/MacOS/oMLX-next";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX.app/Contents/MacOS/oMLX";
 			};
 			name = Release;
 		};
@@ -865,7 +865,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX-next" */ = {
+		1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				1AAAAAAAAAAAAAAAAAAAAAA7 /* Debug */,
@@ -874,7 +874,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXNextTests" */ = {
+		DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				DAA000000000000000000003 /* Debug */,

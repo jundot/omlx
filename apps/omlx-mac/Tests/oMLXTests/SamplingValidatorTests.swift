@@ -4,7 +4,7 @@
 // the documented ranges so a future widening/narrowing has to update them.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class SamplingValidatorTests: XCTestCase {
 

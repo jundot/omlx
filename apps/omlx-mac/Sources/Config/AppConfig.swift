@@ -5,7 +5,7 @@
 //      launchd environment — not the user's shell env — so this is mostly
 //      relevant when the app was launched from a terminal or the user has
 //      `launchctl setenv` configured.
-//   2. ~/Library/Application Support/oMLX-next/base-path — a one-line
+//   2. ~/Library/Application Support/oMLX/base-path — a one-line
 //      bootstrap file Swift owns. Written when the user changes the base
 //      path through the in-app Storage row, so Finder relaunches still
 //      land on the right data root. This is the *only* Swift-side config
@@ -162,7 +162,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("oMLX-next", isDirectory: true)
+        let dir = base.appendingPathComponent("oMLX", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

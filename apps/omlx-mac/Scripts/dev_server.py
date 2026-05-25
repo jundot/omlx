@@ -8,7 +8,7 @@ this script via:
 
     OMLX_PYTHON_OVERRIDE=/usr/bin/python3 \\
     OMLX_DEV_SERVER_SCRIPT=$(pwd)/apps/omlx-mac/Scripts/dev_server.py \\
-    apps/omlx-mac/build/Build/Products/Debug/oMLX-next.app/Contents/MacOS/oMLX-next
+    apps/omlx-mac/build/Build/Products/Debug/oMLX.app/Contents/MacOS/oMLX
 
 Then `curl http://127.0.0.1:8080/health` should return 200 with
 `{"status":"ok","stub":true}`.

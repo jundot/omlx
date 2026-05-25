@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sparkle_loopback.sh — local appcast smoke test for the Sparkle wiring.
 #
-# Builds two oMLX-next bundles (v0.0.1 and v0.0.2), code-signs both with
+# Builds two oMLX bundles (v0.0.1 and v0.0.2), code-signs both with
 # a self-signed certificate held in a *temporary* keychain, EdDSA-signs
 # v0.0.2's zip, serves the appcast over http://localhost:8765/, and
 # launches v0.0.1. Re-run after the bundle-id rename to confirm Sparkle's
@@ -60,7 +60,7 @@ die()  { printf "${RED}[loopback ERROR]${RESET} %s\n" "$*" >&2; exit 1; }
 # --- preflight ------------------------------------------------------------
 
 [ -x "$BIN_DIR/generate_keys" ] || die "Sparkle CLI tools missing at $BIN_DIR.
-Run any debug build of oMLX-next first to resolve the SPM artifact."
+Run any debug build of oMLX first to resolve the SPM artifact."
 
 if lsof -i ":$PORT" >/dev/null 2>&1; then
     die "Port $PORT is already in use. Stop the listener and re-run, or edit PORT."
@@ -145,7 +145,7 @@ teardown_keychain() {
 }
 
 mint_signing_cert() {
-    local cn="oMLX-next Loopback ($(date +%H%M%S))"
+    local cn="oMLX Loopback ($(date +%H%M%S))"
     local conf="$TEST_DIR/openssl.cnf"
     local key="$TEST_DIR/cert.key"
     local pem="$TEST_DIR/cert.pem"
@@ -209,7 +209,7 @@ resign_bundle() {
     #
     # `codesign --deep` only recurses into Frameworks/ and PlugIns/, NOT into
     # loose Mach-O files in Contents/MacOS/. Xcode Debug builds emit sibling
-    # dylibs there (oMLX-next.debug.dylib, __preview.dylib) that keep their
+    # dylibs there (oMLX.debug.dylib, __preview.dylib) that keep their
     # original linker-signed identity after `--deep`. Fix: sign every nested
     # Mach-O inside-out — dylibs first, then the outer bundle.
 
@@ -264,7 +264,7 @@ build_version() {
     local logfile="$TEST_DIR/build-$short.log"
     xcodebuild \
         -project "$PROJECT_DIR/oMLX.xcodeproj" \
-        -scheme oMLX-next \
+        -scheme oMLX \
         -configuration Debug \
         -destination 'platform=macOS' \
         -derivedDataPath "$SHARED_BUILD" \
@@ -275,19 +275,19 @@ build_version() {
         CODE_SIGNING_ALLOWED=NO \
         build >"$logfile" 2>&1 \
         || { tail -40 "$logfile" >&2; die "xcodebuild failed for v$short (log: $logfile)"; }
-    local src="$SHARED_BUILD/Build/Products/Debug/oMLX-next.app"
+    local src="$SHARED_BUILD/Build/Products/Debug/oMLX.app"
     [ -d "$src" ] || die "xcodebuild reported success but $src is missing."
     rm -rf "$out_app"
     ditto "$src" "$out_app"
 }
 
 log "Building v0.0.1 (will run from here)…"
-V1_APP="$TEST_DIR/v0.0.1/oMLX-next.app"
+V1_APP="$TEST_DIR/v0.0.1/oMLX.app"
 mkdir -p "$(dirname "$V1_APP")"
 build_version "0.0.1" "1" "$V1_APP"
 
 log "Building v0.0.2 (the update target)…"
-V2_APP="$TEST_DIR/v0.0.2/oMLX-next.app"
+V2_APP="$TEST_DIR/v0.0.2/oMLX.app"
 mkdir -p "$(dirname "$V2_APP")"
 build_version "0.0.2" "2" "$V2_APP"
 
@@ -314,7 +314,7 @@ resign_bundle "$V2_APP"
 
 # --- zip + EdDSA-sign v0.0.2 ---------------------------------------------
 
-V2_ZIP="$FEED_DIR/oMLX-next-0.0.2.zip"
+V2_ZIP="$FEED_DIR/oMLX-0.0.2.zip"
 log "Zipping v0.0.2…"
 ditto -ck --rsrc --sequesterRsrc --keepParent "$V2_APP" "$V2_ZIP"
 
@@ -334,7 +334,7 @@ cat > "$FEED_DIR/appcast.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <title>oMLX-next local-loopback feed</title>
+    <title>oMLX local-loopback feed</title>
     <item>
       <title>v0.0.2 (loopback test)</title>
       <pubDate>$PUBDATE</pubDate>
@@ -342,7 +342,7 @@ cat > "$FEED_DIR/appcast.xml" <<XML
       <sparkle:version>2</sparkle:version>
       <sparkle:shortVersionString>0.0.2</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
-      <enclosure url="http://localhost:$PORT/oMLX-next-0.0.2.zip"
+      <enclosure url="http://localhost:$PORT/oMLX-0.0.2.zip"
                  length="$LEN"
                  type="application/octet-stream"
                  sparkle:edSignature="$EDSIG" />
@@ -384,11 +384,11 @@ echo "  Press Ctrl-C in this terminal to stop the HTTP server."
 echo "============================================================"
 echo
 
-# Kill any pre-existing app.omlx-next instance (e.g. the prior Stage build
+# Kill any pre-existing app.omlx instance (e.g. the prior Stage build
 # from build.sh) so LaunchServices doesn't activate that one when we open
 # the loopback path. `open -n` then forces a brand-new process from our
 # explicit bundle path.
-pkill -f "oMLX-next/Contents/MacOS/oMLX-next" 2>/dev/null || true
+pkill -f "oMLX/Contents/MacOS/oMLX" 2>/dev/null || true
 sleep 1
 open -n "$V1_APP"
 

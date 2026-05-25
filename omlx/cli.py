@@ -415,14 +415,14 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx-next")
+    print(f"Bundle ID:      app.omlx")
 
-    app_path = Path("/Applications/oMLX-next.app")
+    app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
 
     try:
         res = subprocess.run(
-            ["pgrep", "-af", "oMLX-next"],
+            ["pgrep", "-af", "oMLX"],
             capture_output=True, text=True, timeout=5,
         )
         running = bool(res.stdout.strip())
@@ -437,7 +437,7 @@ def diagnose_menubar() -> int:
     # The Swift app writes `server.log` (stdout/stderr of the Python child).
     # No separate menubar.log — visibility-probe lines are logged into the
     # same file via OSLog.
-    log_dir = Path.home() / "Library" / "Application Support" / "oMLX-next" / "logs"
+    log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
     log_candidates = [log_dir / "server.log"]
     print(f"Log dir:        {log_dir}")
 
@@ -474,8 +474,8 @@ def diagnose_menubar() -> int:
     print("If the icon is missing on macOS Tahoe (26.x):")
     print("  1. Open System Settings > Menu Bar")
     print("     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'")
-    print("  2. Find 'oMLX-next' and set it to 'Show in Menu Bar'")
-    print("  3. If oMLX-next isn't in the list, quit the app and relaunch oMLX-next.app")
+    print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
+    print("  3. If oMLX isn't in the list, quit the app and relaunch oMLX.app")
     print()
     print("Note: Apple's sandbox policy prevents third-party apps from")
     print("programmatically re-enabling their own menubar visibility on Tahoe.")

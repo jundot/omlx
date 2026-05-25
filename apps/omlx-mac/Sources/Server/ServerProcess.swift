@@ -15,7 +15,7 @@
 //
 // Spawn invocation:
 //   <python> -m omlx.cli serve --base-path <base> --port <port>
-//   stdout+stderr → ~/Library/Application Support/oMLX-next/logs/server.log
+//   stdout+stderr → ~/Library/Application Support/oMLX/logs/server.log
 //   PATH = parent + Homebrew prefixes
 //
 // Dev override: OMLX_DEV_SERVER_SCRIPT spawns <python> <script> --port …
@@ -312,7 +312,7 @@ final class ServerProcess: @unchecked Sendable {
         let attempt = autoRestartCount
         let backoff = TimeInterval(5 * (1 << (attempt - 1)))   // 5, 10, 20s
 
-        NSLog("oMLX-next: auto-restart \(attempt)/\(maxAutoRestarts) in \(Int(backoff))s — \(reason)")
+        NSLog("oMLX: auto-restart \(attempt)/\(maxAutoRestarts) in \(Int(backoff))s — \(reason)")
         update(.starting)
 
         Task { @MainActor [weak self] in

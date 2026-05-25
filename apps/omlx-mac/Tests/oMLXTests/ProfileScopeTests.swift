@@ -5,7 +5,7 @@
 // into the read-only group.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class ProfileScopeTests: XCTestCase {
 

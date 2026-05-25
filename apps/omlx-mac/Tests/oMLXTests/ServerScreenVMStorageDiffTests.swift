@@ -8,7 +8,7 @@
 // diff is reported.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 @MainActor
 final class ServerScreenVMStorageDiffTests: XCTestCase {
@@ -42,13 +42,13 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         let services = makeServices(basePath: "/Users/Fido/.omlx",
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
-        vm.basePathText = "/Users/Fido/.omlx-next"
+        vm.basePathText = "/Users/Fido/.omlx-other"
         vm.modelDirText = "/Users/Fido/.omlx/models"
 
         let diff = vm.storageDiff(services: services)
         XCTAssertTrue(diff.baseChanged)
         XCTAssertFalse(diff.dirChanged)
-        XCTAssertEqual(diff.normalizedBase, "/Users/Fido/.omlx-next")
+        XCTAssertEqual(diff.normalizedBase, "/Users/Fido/.omlx-other")
     }
 
     func testModelDirChangedOnly() {
@@ -68,7 +68,7 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         let services = makeServices(basePath: "/Users/Fido/.omlx",
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
-        vm.basePathText = "/Users/Fido/.omlx-next"
+        vm.basePathText = "/Users/Fido/.omlx-other"
         vm.modelDirText = "/Volumes/SSD/models"
 
         XCTAssertTrue(vm.storageDiff(services: services).hasChanges)

@@ -8,7 +8,7 @@
 // touches the filesystem — we feed it a settings.json in a per-test temp dir.
 
 import XCTest
-@testable import oMLX_next
+@testable import oMLX
 
 final class AppServicesPathTests: XCTestCase {
 
@@ -34,7 +34,7 @@ final class AppServicesPathTests: XCTestCase {
         XCTAssertEqual(
             AppServices.relocate(path: "/Volumes/SSD/models",
                                  oldBase: "/Users/Fido/.omlx",
-                                 newBase: "/Users/Fido/.omlx-next"),
+                                 newBase: "/Users/Fido/.omlx-other"),
             "/Volumes/SSD/models"
         )
     }
@@ -65,8 +65,8 @@ final class AppServicesPathTests: XCTestCase {
         XCTAssertEqual(
             AppServices.relocate(path: "~/.omlx/models",
                                  oldBase: "\(home)/.omlx",
-                                 newBase: "\(home)/.omlx-next"),
-            "\(home)/.omlx-next/models"
+                                 newBase: "\(home)/.omlx-other"),
+            "\(home)/.omlx-other/models"
         )
     }
 
@@ -74,7 +74,7 @@ final class AppServicesPathTests: XCTestCase {
 
     private func makeTempSettingsFile(contents: [String: Any]) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("oMLXNextTests-\(UUID().uuidString)")
+            .appendingPathComponent("oMLXTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("settings.json")
         let data = try JSONSerialization.data(withJSONObject: contents, options: [.prettyPrinted])
@@ -90,16 +90,16 @@ final class AppServicesPathTests: XCTestCase {
     func testRelocateOrphanPathsHappyPath() throws {
         let url = try makeTempSettingsFile(contents: [
             "model": [
-                "model_dirs": ["/Users/Fido/.omlx-next/models"],
-                "model_dir": "/Users/Fido/.omlx-next/models",
+                "model_dirs": ["/Users/Fido/.omlx-other/models"],
+                "model_dir": "/Users/Fido/.omlx-other/models",
                 "max_model_memory": "auto"
             ],
             "cache": [
-                "ssd_cache_dir": "/Users/Fido/.omlx-next/cache",
+                "ssd_cache_dir": "/Users/Fido/.omlx-other/cache",
                 "enabled": true
             ],
             "logging": [
-                "log_dir": "/Users/Fido/.omlx-next/logs",
+                "log_dir": "/Users/Fido/.omlx-other/logs",
                 "retention_days": 7
             ],
             "server": ["host": "127.0.0.1", "port": 8080]
@@ -107,7 +107,7 @@ final class AppServicesPathTests: XCTestCase {
 
         try AppServices.relocateOrphanPaths(
             in: url,
-            oldBase: "/Users/Fido/.omlx-next",
+            oldBase: "/Users/Fido/.omlx-other",
             newBase: "/Users/Fido/.omlx"
         )
 
