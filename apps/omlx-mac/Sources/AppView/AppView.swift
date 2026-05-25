@@ -18,41 +18,81 @@ struct AppView: View {
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
 
-        NavigationSplitView {
-            Sidebar(selection: bindingForSelection())
-                // Wider default + min so the longest section labels
-                // ("Performance", "Throughput", "Quantization") render
-                // without truncation at the resting width.
-                .navigationSplitViewColumnWidth(min: 250, ideal: 260, max: 320)
-                // Lock the sidebar always-visible — kills the show/hide
-                // animation that stuttered on macOS 26's NavigationSplitView
-                // and lets the sidebar's glass be the dominant top-left
-                // surface uninterrupted.
-                .toolbar(removing: .sidebarToggle)
-        } detail: {
-            ContentScaffold(section: selection, detailTitle: detailTitle) {
-                screen(for: selection)
+        // Experiment: TabView(.sidebarAdaptable). Tabs are top-level parallel
+        // destinations (fits our app better than NavSplit master-detail), and
+        // macOS 26 renders this style with the sidebar extending under the
+        // traffic-light buttons — what Settings.app uses.
+        TabView(selection: bindingForSelection()) {
+            TabSection {
+                Tab(AppSection.server.title, systemImage: AppSection.server.symbol, value: AppSection.server) {
+                    ContentScaffold(section: .server, detailTitle: detailTitle) { ServerScreen() }
+                }
+                Tab(AppSection.status.title, systemImage: AppSection.status.symbol, value: AppSection.status) {
+                    ContentScaffold(section: .status, detailTitle: detailTitle) { StatusScreen() }
+                }
+                Tab(AppSection.network.title, systemImage: AppSection.network.symbol, value: AppSection.network) {
+                    ContentScaffold(section: .network, detailTitle: detailTitle) { NetworkScreen() }
+                }
+                Tab(AppSection.performance.title, systemImage: AppSection.performance.symbol, value: AppSection.performance) {
+                    ContentScaffold(section: .performance, detailTitle: detailTitle) { PerformanceScreen() }
+                }
+                Tab(AppSection.logs.title, systemImage: AppSection.logs.symbol, value: AppSection.logs) {
+                    ContentScaffold(section: .logs, detailTitle: detailTitle) { LogsScreen() }
+                }
+            } header: {
+                Text("Server")
             }
-            .navigationSplitViewColumnWidth(min: 640, ideal: 920)
+            TabSection {
+                Tab(AppSection.models.title, systemImage: AppSection.models.symbol, value: AppSection.models) {
+                    ContentScaffold(section: .models, detailTitle: detailTitle) {
+                        if let id = services.modelDetailID {
+                            ModelSettingsScreen(modelID: id)
+                        } else {
+                            ModelsScreen()
+                        }
+                    }
+                }
+                Tab(AppSection.downloads.title, systemImage: AppSection.downloads.symbol, value: AppSection.downloads) {
+                    ContentScaffold(section: .downloads, detailTitle: detailTitle) { DownloadsScreen() }
+                }
+                Tab(AppSection.integrations.title, systemImage: AppSection.integrations.symbol, value: AppSection.integrations) {
+                    ContentScaffold(section: .integrations, detailTitle: detailTitle) { IntegrationsScreen() }
+                }
+                Tab(AppSection.quantization.title, systemImage: AppSection.quantization.symbol, value: AppSection.quantization) {
+                    ContentScaffold(section: .quantization, detailTitle: detailTitle) { QuantizationScreen() }
+                }
+            } header: {
+                Text("Models")
+            }
+            TabSection {
+                Tab(AppSection.throughputBench.title, systemImage: AppSection.throughputBench.symbol, value: AppSection.throughputBench) {
+                    ContentScaffold(section: .throughputBench, detailTitle: detailTitle) {
+                        ThroughputBenchScreen(vm: services.throughputBench)
+                    }
+                }
+                Tab(AppSection.accuracyBench.title, systemImage: AppSection.accuracyBench.symbol, value: AppSection.accuracyBench) {
+                    ContentScaffold(section: .accuracyBench, detailTitle: detailTitle) {
+                        AccuracyBenchScreen(vm: services.accuracyBench)
+                    }
+                }
+            } header: {
+                Text("Benchmark")
+            }
+            TabSection {
+                Tab(AppSection.security.title, systemImage: AppSection.security.symbol, value: AppSection.security) {
+                    ContentScaffold(section: .security, detailTitle: detailTitle) { SecurityScreen() }
+                }
+                Tab(AppSection.about.title, systemImage: AppSection.about.symbol, value: AppSection.about) {
+                    ContentScaffold(section: .about, detailTitle: detailTitle) { AboutScreen() }
+                }
+            } header: {
+                Text("General")
+            }
         }
-        .navigationSplitViewStyle(.balanced)
+        .tabViewStyle(.sidebarAdaptable)
         .frame(minWidth: 880, idealWidth: 1140, minHeight: 600, idealHeight: 760)
-        // Hide the SwiftUI-injected window toolbar entirely. This is the
-        // configuration System Settings.app uses on macOS 26 — no toolbar
-        // zone reserved at the window top, sidebar's glass surface extends
-        // up to under the traffic lights, and per-screen titles render
-        // inside the detail content (handled by ContentScaffold).
-        .toolbar(.hidden, for: .windowToolbar)
-        // Extend the entire NavSplit content to fill behind the titlebar
-        // area so the sidebar's glass (and DesktopWash on the detail) reach
-        // the window's top edge. Each column's content is positioned via its
-        // own .safeAreaInset(.top) so screen items stay below the traffic
-        // lights despite the safe-area being ignored at this level.
-        .ignoresSafeArea(.container, edges: .top)
-        // DesktopWash backdrop: the design's radial-gradient wash that the
-        // glass surfaces (sidebar, hero card) layer over. theme.windowBg
-        // stays painted behind the wash as the opaque base so non-glass
-        // areas keep a solid background.
+        // DesktopWash backdrop, kept on the outer container so it provides
+        // the radial-gradient background everywhere outside the sidebar.
         .background(DesktopWash())
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
