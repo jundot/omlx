@@ -1,4 +1,4 @@
-// PR 5 — full lifecycle port of packaging/omlx_app/server_manager.py.
+// Lifecycle owner for the `omlx serve` child process.
 //
 // State machine
 //   stopped ─start()→ starting ─/health 200→ running ─/health fail×3→ unresponsive
@@ -13,7 +13,7 @@
 //   crashes : auto-restart with 5s/10s/20s backoff, max 3 attempts, counter
 //             resets after 60s of stable .running
 //
-// Spawn invocation mirrors server_manager.py:341-347:
+// Spawn invocation:
 //   <python> -m omlx.cli serve --base-path <base> --port <port>
 //   stdout+stderr → ~/Library/Application Support/oMLX-next/logs/server.log
 //   PATH = parent + Homebrew prefixes

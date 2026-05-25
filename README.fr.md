@@ -210,7 +210,7 @@ Benchmarking en un clic depuis le panneau d'admin. Mesure le prefill (PP) et la 
 
 ### Application barre de menus macOS
 
-Application native PyObjC dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique intégrée.
+Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique via Sparkle.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">

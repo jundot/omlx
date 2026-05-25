@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
 """
-Build script for oMLX macOS app.
+Build the venvstacks Python layers embedded inside the Swift macOS bundle.
 
-This script:
-1. Builds venvstacks layers (runtime + framework + app)
-2. Creates macOS .app bundle
-3. Packages into DMG
+The PyObjC menubar `.app` and DMG pipeline this script used to drive
+retired with the Swift rewrite; the Swift bundle is now produced by
+`apps/omlx-mac/Scripts/build.sh`, which invokes this script with
+`--venvstacks-only` (or `--print-fingerprint`) to refresh the export.
 
 Usage:
-    python build.py              # Build everything
-    python build.py --skip-venv  # Skip venvstacks build (use existing)
-    python build.py --dmg-only   # Only create DMG from existing build
+    python build.py --venvstacks-only
+    python build.py --print-fingerprint
 """
 
 import argparse
 import os
-import platform
-import plistlib
+import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
-
-import re
 
 SCRIPT_DIR = Path(__file__).parent
 BUILD_DIR = SCRIPT_DIR / "_build"
@@ -31,7 +26,6 @@ EXPORT_DIR = SCRIPT_DIR / "_export"
 DIST_DIR = SCRIPT_DIR / "dist"
 WHEELS_DIR = SCRIPT_DIR / "_wheels"
 APP_NAME = "oMLX"
-APP_BUNDLE = f"{APP_NAME}.app"
 
 
 def _read_version() -> str:
@@ -892,561 +886,6 @@ def _strip_unused_packages(export_dir: Path):
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
 
-def _create_c_launcher(macos_dir: Path, app_name: str):
-    """Compile a native Mach-O launcher binary for macOS menubar app startup.
-
-    A compiled binary (not a bash script) is required as CFBundleExecutable
-    so that macOS LaunchServices properly grants WindowServer GUI access
-    to the process.
-
-    On macOS Tahoe, exec-trampoline launchers (CFBundleExecutable -> launcher
-    -> exec python3) can end up in a NotVisible state for status bar apps.
-    To avoid this, the launcher initializes Python in-process via Py_BytesMain
-    instead of replacing itself with exec().
-
-    The launcher:
-    - Detects both Python/ (release) and Frameworks/ (dev) directories
-    - Sets PYTHONHOME, PYTHONPATH, PYTHONDONTWRITEBYTECODE
-    - Loads bundled libpython3.11.dylib and calls Py_BytesMain("-m omlx_app")
-    - Shows an error dialog via osascript if startup fails
-    """
-    launcher_c = macos_dir / "_launcher.c"
-    launcher_c.write_text(r'''
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <limits.h>
-#include <errno.h>
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-
-typedef int (*py_bytes_main_fn)(int, char **);
-
-static void show_error(const char *msg) {
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-        "osascript -e 'display dialog \"%s\" buttons {\"OK\"} "
-        "default button 1 with icon stop with title \"oMLX\"'",
-        msg);
-    system(cmd);
-}
-
-int main(int argc, char *argv[]) {
-    char exe_buf[PATH_MAX];
-    char resolved[PATH_MAX];
-    uint32_t size = sizeof(exe_buf);
-
-    if (_NSGetExecutablePath(exe_buf, &size) != 0) {
-        show_error("Failed to get executable path.");
-        return 1;
-    }
-    if (!realpath(exe_buf, resolved)) {
-        show_error("Failed to resolve executable path.");
-        return 1;
-    }
-
-    /* Trim executable name to get MacOS/ directory */
-    char *slash = strrchr(resolved, '/');
-    if (!slash) { show_error("Invalid path."); return 1; }
-    *slash = '\0';
-    char macos_dir[PATH_MAX];
-    strncpy(macos_dir, resolved, sizeof(macos_dir) - 1);
-
-    /* Trim MacOS to get Contents/ directory */
-    slash = strrchr(resolved, '/');
-    if (!slash) { show_error("Invalid bundle structure."); return 1; }
-    *slash = '\0';
-    char contents_dir[PATH_MAX];
-    strncpy(contents_dir, resolved, sizeof(contents_dir) - 1);
-
-    /* Detect Python layer directory: Python/ (release) or Frameworks/ (dev) */
-    char layers_dir[PATH_MAX];
-    snprintf(layers_dir, sizeof(layers_dir), "%s/Python", contents_dir);
-    if (access(layers_dir, F_OK) != 0) {
-        snprintf(layers_dir, sizeof(layers_dir), "%s/Frameworks", contents_dir);
-        if (access(layers_dir, F_OK) != 0) {
-            show_error("Python runtime not found in app bundle.");
-            return 1;
-        }
-    }
-
-    /* Set PYTHONHOME */
-    char pythonhome[PATH_MAX];
-    snprintf(pythonhome, sizeof(pythonhome), "%s/cpython-3.11", layers_dir);
-    setenv("PYTHONHOME", pythonhome, 1);
-
-    /* Set PYTHONPATH */
-    char pythonpath[PATH_MAX * 4];
-    snprintf(pythonpath, sizeof(pythonpath),
-        "%s/Resources:%s/app-omlx-app/lib/python3.11/site-packages:"
-        "%s/framework-mlx-framework/lib/python3.11/site-packages",
-        contents_dir, layers_dir, layers_dir);
-    setenv("PYTHONPATH", pythonpath, 1);
-
-    /* Prevent .pyc generation at runtime */
-    setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
-
-    /* Ensure bundled python3 exists (used later by server subprocesses). */
-    char python_bin[PATH_MAX];
-    snprintf(python_bin, sizeof(python_bin), "%s/python3", macos_dir);
-    if (access(python_bin, X_OK) != 0) {
-        show_error("Python executable not found in app bundle.");
-        return 1;
-    }
-
-    /* Load bundled libpython and run -m omlx_app in-process (no exec trampoline). */
-    char libpython[PATH_MAX];
-    snprintf(libpython, sizeof(libpython), "%s/lib/libpython3.11.dylib", contents_dir);
-    void *py = dlopen(libpython, RTLD_NOW | RTLD_GLOBAL);
-    if (!py) {
-        char err[1024];
-        snprintf(err, sizeof(err), "Failed to load libpython: %s", dlerror());
-        show_error(err);
-        return 1;
-    }
-
-    py_bytes_main_fn py_bytes_main = (py_bytes_main_fn)dlsym(py, "Py_BytesMain");
-    if (!py_bytes_main) {
-        char err[1024];
-        snprintf(err, sizeof(err), "Failed to resolve Py_BytesMain: %s", dlerror());
-        show_error(err);
-        return 1;
-    }
-
-    char *py_argv[] = {"oMLX", "-m", "omlx_app", NULL};
-    int rc = py_bytes_main(3, py_argv);
-    return rc;
-}
-''')
-
-    launcher_bin = macos_dir / app_name
-    result = subprocess.run(
-        ["cc", "-arch", "arm64", "-mmacosx-version-min=15.0", "-O2",
-         "-o", str(launcher_bin), str(launcher_c)],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ✗ Launcher compilation failed: {result.stderr}")
-        sys.exit(1)
-
-    launcher_c.unlink()
-    launcher_bin.chmod(0o755)
-
-
-_MACOS_CODENAMES = {
-    "14": "sonoma",
-    "15": "sequoia",
-    "26": "tahoe",
-}
-
-
-def _write_build_info(omlx_pkg_dir: Path, macos_target: str | None = None):
-    """Write _build_info.py with build number for runtime display.
-
-    Format: YYMMDDHHmmSS-macosNN-codename
-    Example: 260313093001-macos15-sequoia
-    """
-    ts = datetime.now().strftime("%y%m%d%H%M%S")
-    if macos_target:
-        major = macos_target.split(".")[0]
-    else:
-        major = platform.mac_ver()[0].split(".")[0]
-    codename = _MACOS_CODENAMES.get(major, "")
-    tag = f"macos{major}-{codename}" if codename else f"macos{major}"
-    build_number = f"{ts}-{tag}"
-    build_info_file = omlx_pkg_dir / "_build_info.py"
-    build_info_file.write_text(f'build_number = "{build_number}"\n')
-    print(f"  Generated _build_info.py: {build_number}")
-
-
-def create_app_bundle():
-    """Create macOS .app bundle."""
-    print("\n[2/4] Creating app bundle...")
-
-    app_dir = DIST_DIR / APP_BUNDLE
-    contents_dir = app_dir / "Contents"
-    macos_dir = contents_dir / "MacOS"
-    resources_dir = contents_dir / "Resources"
-    frameworks_dir = contents_dir / "Frameworks"
-
-    # Clean and create directories
-    if app_dir.exists():
-        shutil.rmtree(app_dir)
-
-    macos_dir.mkdir(parents=True)
-    resources_dir.mkdir(parents=True)
-    frameworks_dir.mkdir(parents=True)
-
-    # Copy venvstacks environments to Frameworks
-    print("  Copying Python environment...")
-    for layer in ["cpython-3.11", "framework-mlx-framework", "app-omlx-app"]:
-        src = EXPORT_DIR / layer
-        if src.exists():
-            dst = frameworks_dir / layer
-            shutil.copytree(src, dst, symlinks=True)
-            print(f"    Copied {layer}")
-
-    # Copy venvstacks metadata
-    venvstacks_meta = EXPORT_DIR / "__venvstacks__"
-    if venvstacks_meta.exists():
-        shutil.copytree(venvstacks_meta, frameworks_dir / "__venvstacks__", symlinks=True)
-
-    # Copy omlx_app to Resources
-    print("  Copying omlx_app...")
-    omlx_app_src = SCRIPT_DIR / "omlx_app"
-    omlx_app_dst = resources_dir / "omlx_app"
-    shutil.copytree(omlx_app_src, omlx_app_dst, ignore=shutil.ignore_patterns(
-        "__pycache__", "*.pyc"
-    ))
-
-    # Copy omlx package to Resources
-    print("  Copying omlx package...")
-    omlx_src = SCRIPT_DIR.parent / "omlx"
-    omlx_dst = resources_dir / "omlx"
-    if omlx_src.exists():
-        shutil.copytree(omlx_src, omlx_dst, ignore=shutil.ignore_patterns(
-            "__pycache__", "*.pyc", ".git", "tests", "examples"
-        ))
-
-    # Generate _engine_commits.json for engine SHA display in admin dashboard
-    _write_engine_commits(omlx_dst)
-
-    # Copy SVG logo files to Resources for menubar icons
-    print("  Copying logo SVGs...")
-    admin_static = SCRIPT_DIR.parent / "omlx" / "admin" / "static"
-    svg_files = [
-        "navbar-logo-dark.svg",
-        "navbar-logo-light.svg",
-        "menubar-outline.svg",
-        "menubar-filled.svg",
-    ]
-    for svg_name in svg_files:
-        svg_src = admin_static / svg_name
-        if svg_src.exists():
-            shutil.copy2(svg_src, resources_dir / svg_name)
-            print(f"    Copied {svg_name}")
-
-    # Copy Python binary into MacOS/ so macOS recognizes it as a bundle executable
-    print("  Copying Python runtime into MacOS/...")
-    src_python = frameworks_dir / "cpython-3.11" / "bin" / "python3"
-    dst_python = macos_dir / "python3"
-    shutil.copy2(src_python, dst_python)
-    dst_python.chmod(0o755)
-
-    # Python binary references @executable_path/../lib/libpython3.11.dylib
-    # Create Contents/lib/ with symlink to the actual dylib in Frameworks
-    lib_dir = contents_dir / "lib"
-    lib_dir.mkdir(exist_ok=True)
-    (lib_dir / "libpython3.11.dylib").symlink_to(
-        "../Frameworks/cpython-3.11/lib/libpython3.11.dylib"
-    )
-
-    # Create compiled C launcher binary
-    print("  Creating launcher...")
-    _create_c_launcher(macos_dir, APP_NAME)
-
-    # Create CLI launcher script (for terminal use: oMLX.app/Contents/MacOS/omlx-cli)
-    # Named "omlx-cli" to avoid case-insensitive collision with "oMLX" on APFS.
-    print("  Creating CLI launcher script...")
-    cli_launcher = macos_dir / "omlx-cli"
-    cli_launcher.write_text(
-        '#!/bin/bash\n'
-        '# Resolve symlinks so this script keeps working when invoked through\n'
-        '# /usr/local/bin/omlx or ~/.local/bin/omlx, where $0 would otherwise\n'
-        '# point at the symlink directory and break the bundle path lookup.\n'
-        '# (macOS ships readlink without -f, so use a portable bash loop.)\n'
-        'SOURCE="$0"\n'
-        'while [ -L "$SOURCE" ]; do\n'
-        '    LINK_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"\n'
-        '    SOURCE="$(readlink "$SOURCE")"\n'
-        '    case "$SOURCE" in\n'
-        '        /*) ;;\n'
-        '        *) SOURCE="$LINK_DIR/$SOURCE" ;;\n'
-        '    esac\n'
-        'done\n'
-        'DIR="$(cd "$(dirname "$SOURCE")" && pwd)"\n'
-        'CONTENTS="$(dirname "$DIR")"\n'
-        'LAYERS="$CONTENTS/Frameworks"\n'
-        '[ ! -d "$LAYERS" ] && LAYERS="$CONTENTS/Python"\n'
-        'export PYTHONHOME="$LAYERS/cpython-3.11"\n'
-        'export PYTHONPATH="$CONTENTS/Resources:$LAYERS/app-omlx-app/lib/python3.11/site-packages:$LAYERS/framework-mlx-framework/lib/python3.11/site-packages"\n'
-        'export PYTHONDONTWRITEBYTECODE=1\n'
-        'exec "$DIR/python3" -m omlx.cli "$@"\n'
-    )
-    cli_launcher.chmod(0o755)
-
-    # Create Info.plist
-    # NOTE: do NOT add LSUIElement here. Dock icon visibility is controlled
-    # at runtime via setActivationPolicy_ in app.py. Combining LSUIElement
-    # with runtime policy switching causes ControlCenter to block the
-    # NSStatusItem (menubar icon) on macOS Sonoma+. See issue #725.
-    print("  Creating Info.plist...")
-    info_plist = {
-        "CFBundleName": APP_NAME,
-        "CFBundleDisplayName": APP_NAME,
-        "CFBundleIdentifier": "com.omlx.app",
-        "CFBundleVersion": VERSION,
-        "CFBundleShortVersionString": VERSION,
-        "CFBundleExecutable": APP_NAME,
-        "CFBundlePackageType": "APPL",
-        "CFBundleSignature": "????",
-        "CFBundleIconFile": "AppIcon",
-        "LSMinimumSystemVersion": "15.0",
-        # Xcode sets this automatically; our manual bundle was missing it.
-        # Aligns the launch metadata with native AppKit templates so tools
-        # that key off NSPrincipalClass (Accessibility enumerators among
-        # them) recognize the process as a standard NSApplication host.
-        "NSPrincipalClass": "NSApplication",
-        "NSHighResolutionCapable": True,
-        "LSArchitecturePriority": ["arm64"],
-        "NSHumanReadableCopyright": (
-            f"Copyright © {datetime.now().year} oMLX contributors.\n"
-            "Licensed under the Apache License 2.0."
-        ),
-    }
-
-    with open(contents_dir / "Info.plist", "wb") as f:
-        plistlib.dump(info_plist, f)
-
-    # Create placeholder icon
-    create_placeholder_icon(resources_dir)
-
-    print(f"  ✓ Created {app_dir}")
-    return app_dir
-
-
-def _create_composite_svg(dark_svg: Path) -> str:
-    """Create a composite SVG: white rounded-rect background + black logo."""
-    svg_content = dark_svg.read_text()
-    # Extract the <g> element (contains transform + path)
-    g_match = re.search(r"<g[^>]*>.*?</g>", svg_content, re.DOTALL)
-    g_element = g_match.group(0) if g_match else ""
-    # Change fill from white to black for white background
-    g_element = g_element.replace('fill="#ffffff"', 'fill="#000000"')
-
-    return f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <rect x="96" y="96" width="832" height="832" rx="186" ry="186" fill="#ffffff"/>
-  <svg x="180" y="180" width="664" height="664" viewBox="0 0 497.000000 497.000000">
-    {g_element}
-  </svg>
-</svg>'''
-
-
-def create_placeholder_icon(resources_dir: Path):
-    """Create app icon from SVG logo (dark logo on white background).
-
-    Rendering priority:
-    1. Exported venvstacks Python + AppKit (native SVG rendering)
-    2. cairosvg (if installed in build env)
-    3. Pillow placeholder (last resort)
-    """
-    icon_path = resources_dir / "AppIcon.icns"
-    dark_svg = SCRIPT_DIR.parent / "omlx" / "admin" / "static" / "navbar-logo-dark.svg"
-
-    if not dark_svg.exists():
-        print("    Warning: navbar-logo-dark.svg not found, skipping icon")
-        return
-
-    # Create composite SVG (white bg + black penguin)
-    composite_svg = _create_composite_svg(dark_svg)
-    tmp_svg = resources_dir / "_icon_tmp.svg"
-    tmp_png = resources_dir / "_icon_tmp.png"
-    tmp_svg.write_text(composite_svg)
-
-    try:
-        # Method 1: Use exported runtime Python with AppKit (native macOS SVG rendering)
-        runtime_python = EXPORT_DIR / "cpython-3.11" / "bin" / "python3"
-        if runtime_python.exists() and _render_svg_with_appkit(runtime_python, tmp_svg, tmp_png):
-            _png_to_icns(str(tmp_png), icon_path, resources_dir)
-            print("    Created app icon from SVG (AppKit)")
-        # Method 2: cairosvg
-        elif _render_svg_with_cairosvg(composite_svg, tmp_png):
-            _png_to_icns(str(tmp_png), icon_path, resources_dir)
-            print("    Created app icon from SVG (cairosvg)")
-        else:
-            print("    Warning: Could not render SVG, no icon created")
-    finally:
-        tmp_svg.unlink(missing_ok=True)
-        tmp_png.unlink(missing_ok=True)
-
-
-def _render_svg_with_appkit(python_exe: Path, svg_path: Path, png_path: Path) -> bool:
-    """Render SVG to PNG using AppKit's native NSImage (via subprocess).
-
-    Uses the venvstacks runtime Python with PYTHONHOME + layer site-packages
-    so that PyObjC (AppKit/Foundation) is available.
-    """
-    script = f'''
-import sys
-from Foundation import NSData
-from AppKit import NSImage, NSBitmapImageRep, NSPNGFileType, NSMakeRect, NSCompositingOperationSourceOver
-from AppKit import NSGraphicsContext, NSImageInterpolationHigh
-
-svg_data = NSData.dataWithContentsOfFile_("{svg_path}")
-if svg_data is None:
-    sys.exit(1)
-
-image = NSImage.alloc().initWithData_(svg_data)
-if image is None:
-    sys.exit(1)
-
-size = 1024
-out_image = NSImage.alloc().initWithSize_((size, size))
-out_image.lockFocus()
-ctx = NSGraphicsContext.currentContext()
-ctx.setImageInterpolation_(NSImageInterpolationHigh)
-image.drawInRect_fromRect_operation_fraction_(
-    NSMakeRect(0, 0, size, size),
-    NSMakeRect(0, 0, image.size().width, image.size().height),
-    NSCompositingOperationSourceOver,
-    1.0,
-)
-out_image.unlockFocus()
-
-rep = NSBitmapImageRep.alloc().initWithData_(out_image.TIFFRepresentation())
-png_data = rep.representationUsingType_properties_(NSPNGFileType, {{}})
-png_data.writeToFile_atomically_("{png_path}", True)
-'''
-    runtime_dir = python_exe.parent.parent
-    app_sp = EXPORT_DIR / "app-omlx-app" / "lib" / "python3.11" / "site-packages"
-    fw_sp = EXPORT_DIR / "framework-mlx-framework" / "lib" / "python3.11" / "site-packages"
-
-    env = os.environ.copy()
-    env["PYTHONHOME"] = str(runtime_dir)
-    env["PYTHONPATH"] = f"{app_sp}:{fw_sp}"
-
-    try:
-        result = subprocess.run(
-            [str(python_exe), "-c", script],
-            capture_output=True, timeout=30, env=env,
-        )
-        if result.returncode != 0:
-            print(f"    AppKit stderr: {result.stderr.decode()[:200]}")
-        return result.returncode == 0 and png_path.exists()
-    except Exception as e:
-        print(f"    AppKit rendering failed: {e}")
-        return False
-
-
-def _render_svg_with_cairosvg(svg_content: str, png_path: Path) -> bool:
-    """Render SVG to PNG using cairosvg."""
-    try:
-        import cairosvg
-        cairosvg.svg2png(
-            bytestring=svg_content.encode(),
-            write_to=str(png_path),
-            output_width=1024, output_height=1024,
-        )
-        return png_path.exists()
-    except ImportError:
-        return False
-    except Exception as e:
-        print(f"    cairosvg rendering failed: {e}")
-        return False
-
-
-def _png_to_icns(png_path: str, icon_path: Path, resources_dir: Path):
-    """Convert a 1024x1024 PNG to .icns via iconset using sips (macOS built-in)."""
-    iconset_dir = resources_dir / "AppIcon.iconset"
-    iconset_dir.mkdir(exist_ok=True)
-
-    sizes = [
-        (16, "icon_16x16.png"),
-        (32, "icon_16x16@2x.png"),
-        (32, "icon_32x32.png"),
-        (64, "icon_32x32@2x.png"),
-        (128, "icon_128x128.png"),
-        (256, "icon_128x128@2x.png"),
-        (256, "icon_256x256.png"),
-        (512, "icon_256x256@2x.png"),
-        (512, "icon_512x512.png"),
-        (1024, "icon_512x512@2x.png"),
-    ]
-
-    for s, name in sizes:
-        out = iconset_dir / name
-        shutil.copy2(png_path, str(out))
-        subprocess.run(
-            ["sips", "-z", str(s), str(s), str(out)],
-            capture_output=True,
-        )
-
-    subprocess.run(
-        ["iconutil", "-c", "icns", str(iconset_dir), "-o", str(icon_path)],
-        capture_output=True,
-    )
-
-    shutil.rmtree(iconset_dir)
-
-
-def sign_app(app_dir: Path):
-    """Ad-hoc sign the app bundle for development.
-
-    Uses --deep to recursively sign subcomponents. This may fail on
-    venvstacks layers (e.g. cpython-3.11 in Frameworks/) because codesign
-    treats dotted directory names as framework bundles.
-
-    If signing fails, the broken _CodeSignature is removed so the app
-    can still run unsigned on the developer's machine. Release builds
-    use build_release.py which relocates Frameworks/ to Python/ first.
-    """
-    print("\n[3/4] Signing app bundle...")
-
-    result = subprocess.run(
-        ["codesign", "--force", "--deep", "--sign", "-", str(app_dir)],
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        # --deep signing failed (likely due to dotted dir names in Frameworks/).
-        # Remove the broken _CodeSignature so macOS doesn't show "damaged" error.
-        codesig = app_dir / "Contents" / "_CodeSignature"
-        if codesig.exists():
-            shutil.rmtree(codesig)
-        print("  ⚠ Deep signing failed (expected for dev builds), running unsigned")
-    else:
-        print(f"  ✓ Signed {app_dir}")
-
-
-def create_dmg(app_dir: Path):
-    """Create DMG installer with Applications symlink for drag-and-drop."""
-    print("\n[4/4] Creating DMG...")
-
-    dmg_path = DIST_DIR / f"{APP_NAME}-{VERSION}.dmg"
-    dmg_staging = DIST_DIR / "_dmg_staging"
-
-    # Remove existing
-    if dmg_path.exists():
-        dmg_path.unlink()
-    if dmg_staging.exists():
-        shutil.rmtree(dmg_staging)
-
-    # Create staging directory
-    dmg_staging.mkdir(parents=True)
-
-    # Copy app bundle to staging
-    shutil.copytree(app_dir, dmg_staging / APP_BUNDLE, symlinks=True)
-
-    # Create Applications symlink
-    applications_link = dmg_staging / "Applications"
-    applications_link.symlink_to("/Applications")
-
-    print("  Creating DMG with Applications shortcut...")
-    run_cmd([
-        "hdiutil", "create",
-        "-volname", APP_NAME,
-        "-srcfolder", str(dmg_staging),
-        "-ov", "-format", "UDZO",
-        str(dmg_path)
-    ])
-
-    # Cleanup staging
-    shutil.rmtree(dmg_staging)
-
-    print(f"  ✓ Created {dmg_path}")
-    return dmg_path
 
 
 def _compute_donor_fingerprint() -> str:
@@ -1480,24 +919,25 @@ def _write_export_fingerprint():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build oMLX macOS app")
-    parser.add_argument("--skip-venv", action="store_true",
-                        help="Skip venvstacks build")
-    parser.add_argument("--dmg-only", action="store_true",
-                        help="Only create DMG from existing build")
+    parser = argparse.ArgumentParser(
+        description="Build venvstacks Python layers consumed by the Swift "
+                    "macOS bundle. The legacy PyObjC menubar `.app` and DMG "
+                    "pipeline lived here too; both retired with the Swift "
+                    "rewrite. Today this script is invoked by "
+                    "`apps/omlx-mac/Scripts/build.sh` to produce / fingerprint "
+                    "the export layers — there is no full-app path anymore."
+    )
     parser.add_argument("--venvstacks-only", action="store_true",
                         help="Run venvstacks lock+build+export and stop. "
-                             "Used by the Swift dev build (build.sh) to "
-                             "produce a fresh donor without going through "
-                             "the full app+DMG pipeline.")
+                             "Currently the only supported run mode.")
     parser.add_argument("--print-fingerprint", action="store_true",
-                        help="Print the donor fingerprint and exit. The "
-                             "Swift dev build uses this to detect drift "
-                             "between sources and the cached _export/.")
+                        help="Print the donor fingerprint and exit. "
+                             "`build.sh` uses this to detect drift between "
+                             "sources and the cached `_export/`.")
     parser.add_argument("--macos-target",
                         help="Target macOS version for mlx/mlx-metal wheels "
-                        "(e.g. 26.0). Downloads platform-specific wheels "
-                        "with M5 Neural Accelerator support.")
+                             "(e.g. 26.0). Downloads platform-specific wheels "
+                             "with M5 Neural Accelerator support.")
     args = parser.parse_args()
 
     if args.print_fingerprint:
@@ -1507,54 +947,20 @@ def main():
     print(f"Building {APP_NAME} v{VERSION}")
     print("=" * 50)
 
-    if args.venvstacks_only:
-        # Honor --skip-venv for the unusual case where someone wants to
-        # reuse an in-place export but refresh the fingerprint.
-        if not args.skip_venv or not EXPORT_DIR.exists():
-            build_venvstacks()
-        if args.macos_target:
-            swap_platform_wheels(EXPORT_DIR, args.macos_target)
-        _write_export_fingerprint()
-        print("\n" + "=" * 50)
-        print("venvstacks export ready at:")
-        print(f"  {EXPORT_DIR}")
-        return
+    if not args.venvstacks_only:
+        parser.error(
+            "Pass --venvstacks-only. The Swift bundle is built by "
+            "apps/omlx-mac/Scripts/build.sh; this script only produces "
+            "the Python layers it embeds."
+        )
 
-    # Clean build artifacts before starting (unless dmg-only)
-    if not args.dmg_only:
-        clean_all(preserve_venv=args.skip_venv)
-
-    DIST_DIR.mkdir(parents=True, exist_ok=True)
-
-    if args.dmg_only:
-        app_dir = DIST_DIR / APP_BUNDLE
-        if not app_dir.exists():
-            print(f"Error: {app_dir} not found. Run full build first.")
-            sys.exit(1)
-        create_dmg(app_dir)
-    else:
-        if not args.skip_venv:
-            build_venvstacks()
-        elif not EXPORT_DIR.exists():
-            print("Warning: No existing envs found, building venvstacks...")
-            build_venvstacks()
-
-        _write_export_fingerprint()
-
-        # Swap mlx/mlx-metal wheels for target macOS version
-        if args.macos_target:
-            swap_platform_wheels(EXPORT_DIR, args.macos_target)
-
-        app_dir = create_app_bundle()
-        omlx_pkg_dir = app_dir / "Contents" / "Resources" / "omlx"
-        _write_build_info(omlx_pkg_dir, args.macos_target)
-        sign_app(app_dir)
-        create_dmg(app_dir)
-
+    build_venvstacks()
+    if args.macos_target:
+        swap_platform_wheels(EXPORT_DIR, args.macos_target)
+    _write_export_fingerprint()
     print("\n" + "=" * 50)
-    print("Build complete!")
-    print(f"  App: {DIST_DIR / APP_BUNDLE}")
-    print(f"  DMG: {DIST_DIR / f'{APP_NAME}-{VERSION}.dmg'}")
+    print("venvstacks export ready at:")
+    print(f"  {EXPORT_DIR}")
 
 
 if __name__ == "__main__":

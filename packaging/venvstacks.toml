@@ -7,10 +7,8 @@
 # this file does not list package versions. Single source of truth for
 # Python deps is pyproject.toml.
 #
-# The Swift bundle does not ship the PyObjC menubar app — that retired
-# with the Swift app rewrite — so no [[applications]] block is declared
-# here. Jun's release path (if still building the Python menubar) can
-# reintroduce it locally without affecting this template.
+# No [[applications]] block: the Swift app is the application surface,
+# so the venvstacks export only ships a runtime + framework layer.
 
 [[runtimes]]
 name = "cpython-3.11"
