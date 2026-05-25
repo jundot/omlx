@@ -1525,17 +1525,6 @@
         }
       }
     },
-    "common.back": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Back"
-          }
-        }
-      }
-    },
     "common.cancel": {
       "extractionState": "manual",
       "localizations": {
@@ -1571,17 +1560,6 @@
         }
       }
     },
-    "common.continue": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Continue"
-          }
-        }
-      }
-    },
     "common.copy": {
       "extractionState": "manual",
       "localizations": {
@@ -1600,17 +1578,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Create"
-          }
-        }
-      }
-    },
-    "common.delete": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Delete"
           }
         }
       }
@@ -7164,17 +7131,6 @@
         }
       }
     },
-    "server.row.max_concurrent": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Max Concurrent Requests"
-          }
-        }
-      }
-    },
     "server.row.models_directory": {
       "comment": "Row label for the Models Directory text input",
       "extractionState": "manual",
@@ -8988,74 +8944,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "下載工具"
-          }
-        }
-      }
-    },
-    "sidebar.group.benchmark": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Benchmark"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ベンチマーク"
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "벤치마크"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "基准测试"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "基準測試"
-          }
-        }
-      }
-    },
-    "sidebar.group.general": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "General"
-          }
-        }
-      }
-    },
-    "sidebar.group.models": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Models"
-          }
-        }
-      }
-    },
-    "sidebar.group.server": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Server"
           }
         }
       }

@@ -18,18 +18,16 @@ import XCTest
 
 final class LocalizationSmokeTests: XCTestCase {
 
-    /// Hard-coded baseline of common.* keys → English values. These haven't
-    /// moved since the catalog was created; any drift means someone touched
-    /// the catalog without updating call sites (or vice versa).
+    /// Hard-coded baseline of common.* keys → English values. Only the
+    /// primitives actually used by at least one wrapped call site live here;
+    /// any drift means someone touched the catalog without updating call
+    /// sites (or vice versa).
     private static let commonBaseline: [(key: String, en: String)] = [
-        ("common.back",     "Back"),
-        ("common.cancel",   "Cancel"),
-        ("common.continue", "Continue"),
-        ("common.copy",     "Copy"),
-        ("common.create",   "Create"),
-        ("common.delete",   "Delete"),
-        ("common.open",     "Open"),
-        ("common.save",     "Save"),
+        ("common.cancel", "Cancel"),
+        ("common.copy",   "Copy"),
+        ("common.create", "Create"),
+        ("common.open",   "Open"),
+        ("common.save",   "Save"),
     ]
 
     /// Sentinel keys from every wrapped screen / surface. Presence-only check —

@@ -1,11 +1,7 @@
-// PR 3 — translucent surface modifier.
-//
-// macOS 15 baseline: SwiftUI's `.regularMaterial` / `.ultraThinMaterial` ship
-// approximation good enough for non-shell surfaces. macOS 26 (Tahoe) brings
-// genuine liquid-glass APIs (e.g. `.glassEffect()`); the exact signature is
-// confirmed at PR 6 when the SDK header is in front of us. The TODO branch is
-// already gated on `if #available(macOS 26.0, *)` so the rewrite lands today
-// without that confirmation.
+// Translucent surface modifier. SwiftUI's `.regularMaterial` /
+// `.thickMaterial` approximate Tahoe liquid-glass closely enough for
+// every surface we currently use. If a future macOS gets a richer
+// `.glassEffect()`-style API worth gating on, gate it here.
 
 import SwiftUI
 
@@ -20,13 +16,7 @@ private struct AppGlassModifier: ViewModifier {
     let strength: GlassStrength
 
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            // TODO(PR 6): swap in `.glassEffect()` once we confirm the SDK API.
-            // The fallback below stays as a safety net.
-            content.background(material)
-        } else {
-            content.background(material)
-        }
+        content.background(material)
     }
 
     private var material: Material {
