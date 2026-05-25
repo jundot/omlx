@@ -196,7 +196,7 @@ class TestVlmMtpPreLoadDispatch:
         )
         settings = types.SimpleNamespace(mtp_enabled=True)
 
-        maybe_apply_pre_load_patches(path, model_settings=settings)
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_called_once()
@@ -204,7 +204,12 @@ class TestVlmMtpPreLoadDispatch:
         # already installed by apply_mlx_vlm_mtp_patch.
         assert calls == ["sanitize", "runtime"]
 
-    def test_sanitize_patch_skipped_when_mtp_disabled(self, tmp_path, monkeypatch):
+    def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
+        # Issue #1404: persisted ``mtp.*`` weights must still get a binding
+        # site on the LanguageModel tree when entering through VLMBatchedEngine
+        # even with mtp_enabled=False. Otherwise mlx-vlm's strict load_weights
+        # fails with "parameters not in model" and the engine falls back to
+        # LLM, silently dropping vision.
         calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
@@ -212,6 +217,25 @@ class TestVlmMtpPreLoadDispatch:
             '"text_config": {"mtp_num_hidden_layers": 1}}',
         )
         settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        assert calls == ["sanitize", "runtime"]
+
+    def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
+        # BatchedEngine / DFlashEngine / LLM loader paths must NOT touch
+        # mlx-vlm classes even when the model declares MTP heads. for_vlm
+        # defaults to False so they pass through without invoking mlx-vlm
+        # patches.
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=True)
 
         maybe_apply_pre_load_patches(path, model_settings=settings)
 
