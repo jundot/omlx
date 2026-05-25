@@ -28,7 +28,21 @@ final class AppViewWindowController: NSWindowController, NSWindowDelegate {
         window.title = "oMLX"
         window.minSize = NSSize(width: 880, height: 600)
         window.isReleasedWhenClosed = false
-        window.titlebarAppearsTransparent = false
+        // `fullSizeContentView` already routes content behind the titlebar; flipping
+        // titlebarAppearsTransparent lets the sidebar's glass material extend up
+        // through the titlebar area instead of being clipped by the toolbar's
+        // own opaque background. `.unified` toolbar style merges the
+        // SwiftUI-injected window toolbar (which carries the sidebar-toggle
+        // button) into the titlebar, so the whole top strip shares one
+        // transparent surface — matches Finder's behaviour where traffic
+        // lights and sidebar-toggle float directly on the sidebar's glass.
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unified
+        // Hide the "oMLX" titlebar text — each screen renders its own large
+        // title in the content area (see ContentScaffold.sectionTitleHeader),
+        // so the system title is redundant. Matches Settings.app where the
+        // window has no visible title text.
+        window.titleVisibility = .hidden
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.center()
 

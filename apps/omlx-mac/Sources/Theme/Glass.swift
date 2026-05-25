@@ -18,12 +18,32 @@ enum GlassStrength {
 private struct AppGlassModifier<S: Shape>: ViewModifier {
     let strength: GlassStrength
     let shape: S
+    let tint: Color?
 
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: shape)
+            // Bake the tint into the glass material so the surface composites
+            // in a single pass — separate `.background(tint)` + `.glassEffect`
+            // doubles the per-frame work and shows up as stutter at the end of
+            // ancestor animations (e.g. NavigationSplitView sidebar slide).
+            // `.glassEffectTransition(.identity)` similarly suppresses the
+            // glass-materialize animation that would otherwise compound on
+            // top of the geometry change.
+            let glass: Glass = tint.map { Glass.regular.tint($0) } ?? .regular
+            content
+                .glassEffect(glass, in: shape)
+                .glassEffectTransition(.identity)
         } else {
-            content.background(material, in: shape)
+            // macOS 15 fallback path. No native tinted-material API here, so
+            // composite the tint and material separately. This path isn't on
+            // the perf-critical track for the macOS 26 sidebar stutter.
+            if let tint {
+                content
+                    .background(material, in: shape)
+                    .background(tint, in: shape)
+            } else {
+                content.background(material, in: shape)
+            }
         }
     }
 
@@ -38,14 +58,18 @@ private struct AppGlassModifier<S: Shape>: ViewModifier {
 extension View {
     /// Background material that approximates Tahoe liquid glass. Use for
     /// sidebar, toolbar, and group surfaces. Hero cards use `.strong`.
-    /// Default shape is `Rectangle()` — pass an explicit shape for rounded
+    /// Default shape is `Rectangle()`; pass an explicit shape for rounded
     /// surfaces (e.g. `RoundedRectangle(cornerRadius: 12)` for hero cards).
-    func appGlass(_ strength: GlassStrength = .regular) -> some View {
-        modifier(AppGlassModifier(strength: strength, shape: Rectangle()))
+    /// `tint:` bakes a color into the glass material — preferred over
+    /// stacking a separate `.background(_:)` for perf reasons.
+    func appGlass(_ strength: GlassStrength = .regular, tint: Color? = nil) -> some View {
+        modifier(AppGlassModifier(strength: strength, shape: Rectangle(), tint: tint))
     }
 
-    func appGlass<S: Shape>(_ strength: GlassStrength = .regular, in shape: S) -> some View {
-        modifier(AppGlassModifier(strength: strength, shape: shape))
+    func appGlass<S: Shape>(_ strength: GlassStrength = .regular,
+                            in shape: S,
+                            tint: Color? = nil) -> some View {
+        modifier(AppGlassModifier(strength: strength, shape: shape, tint: tint))
     }
 }
 

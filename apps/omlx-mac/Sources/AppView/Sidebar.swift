@@ -189,19 +189,27 @@ struct Sidebar: View {
                     }
                 }
             }
-            .padding(.top, 6)
             .padding(.bottom, 10)
         }
-        // Translucent glass surface on macOS 26 (Tahoe liquid glass) with a
-        // material approximation fallback on macOS 15. Painting theme.sidebarBg
-        // first preserves the existing tint as the base layer behind the glass.
-        .background(theme.sidebarBg)
-        .appGlass(.regular)
+        // Reserve room for the traffic-light buttons that float on top of
+        // the sidebar's glass. The clear inset gives the scroll content a
+        // virtual "safe area" at the top even though .ignoresSafeArea below
+        // lets the glass surface extend up under the window controls.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            Color.clear.frame(height: 32)
+        }
+        // Tinted glass surface (macOS 26 liquid glass; .regularMaterial on
+        // 15). Pairing .ignoresSafeArea(.container, edges: .top) below with
+        // the safeAreaInset above is the Settings.app pattern — the glass
+        // surface paints under the traffic-light region while the section
+        // list stays positioned below them.
+        .appGlass(.regular, tint: theme.sidebarBg)
         .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(theme.sidebarBorder)
                 .frame(width: 0.5)
         }
+        .ignoresSafeArea(.container, edges: .top)
     }
 }
 
