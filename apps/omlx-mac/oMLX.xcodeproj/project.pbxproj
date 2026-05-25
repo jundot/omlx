@@ -36,7 +36,6 @@
 		4BB000000000000000000002 /* SignalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000002 /* SignalHandlers.swift */; };
 		6BB000000000000000000001 /* AppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000001 /* AppView.swift */; };
 		6BB000000000000000000002 /* Sidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000002 /* Sidebar.swift */; };
-		6BB000000000000000000003 /* PlaceholderScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000003 /* PlaceholderScreen.swift */; };
 		6BB000000000000000000004 /* ServerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000004 /* ServerScreen.swift */; };
 		6BB000000000000000000005 /* StatusScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000005 /* StatusScreen.swift */; };
 		6BB000000000000000000006 /* LogsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000006 /* LogsScreen.swift */; };
@@ -138,7 +137,6 @@
 		4CC000000000000000000002 /* SignalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalHandlers.swift; sourceTree = "<group>"; };
 		6CC000000000000000000001 /* AppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppView.swift; sourceTree = "<group>"; };
 		6CC000000000000000000002 /* Sidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sidebar.swift; sourceTree = "<group>"; };
-		6CC000000000000000000003 /* PlaceholderScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaceholderScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000004 /* ServerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000005 /* StatusScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusScreen.swift; sourceTree = "<group>"; };
 		6CC000000000000000000006 /* LogsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsScreen.swift; sourceTree = "<group>"; };
@@ -334,7 +332,6 @@
 		6EE000000000000000000002 /* Screens */ = {
 			isa = PBXGroup;
 			children = (
-				6CC000000000000000000003 /* PlaceholderScreen.swift */,
 				6CC000000000000000000004 /* ServerScreen.swift */,
 				6CC000000000000000000005 /* StatusScreen.swift */,
 				6CC000000000000000000006 /* LogsScreen.swift */,
@@ -592,7 +589,6 @@
 				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
 				6BB000000000000000000001 /* AppView.swift in Sources */,
 				6BB000000000000000000002 /* Sidebar.swift in Sources */,
-				6BB000000000000000000003 /* PlaceholderScreen.swift in Sources */,
 				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
 				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
 				6BB000000000000000000006 /* LogsScreen.swift in Sources */,

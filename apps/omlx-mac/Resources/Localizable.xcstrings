@@ -3881,54 +3881,6 @@
         }
       }
     },
-    "placeholder.headline.pr11": {
-      "comment": "Placeholder section header for the Updates surface that wires up in PR 11",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Updater wires up in PR 11"
-          }
-        }
-      }
-    },
-    "placeholder.headline.pr7": {
-      "comment": "Placeholder section header for a screen whose real content ships in PR 7",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Lands in PR 7"
-          }
-        }
-      }
-    },
-    "placeholder.headline.pr8": {
-      "comment": "Placeholder section header for a screen whose real content ships in PR 8",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Lands in PR 8"
-          }
-        }
-      }
-    },
-    "placeholder.headline.pr9": {
-      "comment": "Placeholder section header for a screen whose real content ships in PR 9",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Lands in PR 9"
-          }
-        }
-      }
-    },
     "profile.banner.action.discard": {
       "comment": "Profile banner action that discards working edits when there's no base profile",
       "extractionState": "manual",
