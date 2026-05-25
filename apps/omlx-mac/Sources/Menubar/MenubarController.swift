@@ -28,6 +28,7 @@ final class MenubarController: NSObject {
     private let config: AppConfig
     private let bootstrapError: Error?
     private let openAppView: () -> Void
+    private let requestQuit: () -> Void
 
     private var statusItem: NSStatusItem
     private let menu = NSMenu()
@@ -56,12 +57,14 @@ final class MenubarController: NSObject {
         server: ServerProcess?,
         config: AppConfig,
         lastError: Error? = nil,
-        openAppView: @escaping () -> Void = {}
+        openAppView: @escaping () -> Void = {},
+        requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
         self.config = config
         self.bootstrapError = lastError
         self.openAppView = openAppView
+        self.requestQuit = requestQuit
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -517,7 +520,11 @@ final class MenubarController: NSObject {
     }
 
     @objc private func quitApp() {
-        NSApp.terminate(nil)
+        // Real quit (menubar item) — calls AppDelegate.requestQuit which
+        // sets the explicit-quit flag and then terminates. Cmd-Q / Dock →
+        // Quit go through `applicationShouldTerminate` and are intercepted
+        // to close the window only.
+        requestQuit()
     }
 
     // MARK: - Helpers

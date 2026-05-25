@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */; };
-		1DDDDDDDDDDDDDDDDDDDDDD7 /* AppViewWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */; };
 		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
@@ -107,7 +106,6 @@
 /* Begin PBXFileReference section */
 		1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = oMLXApp.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppViewWindowController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX.entitlements"; sourceTree = "<group>"; };
@@ -409,7 +407,6 @@
 			children = (
 				1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */,
 				1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */,
-				1CCCCCCCCCCCCCCCCCCCCCCA /* AppViewWindowController.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -563,7 +560,6 @@
 			files = (
 				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
-				1DDDDDDDDDDDDDDDDDDDDDD7 /* AppViewWindowController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,

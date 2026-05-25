@@ -57,6 +57,24 @@
 		<string>beta</string>
 		<string>nightly</string>
 	</array>
+	<!--
+	  URL scheme used by AppDelegate.presentAppView() to ask SwiftUI's
+	  Window scene (id "main") to instantiate on first invocation.
+	  The scene's `.handlesExternalEvents(matching: ["main"])` consumes
+	  `omlxapp://main`. Once the NSWindow exists, subsequent shows go
+	  through `makeKeyAndOrderFront` directly.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>app.omlx.url</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>omlxapp</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
