@@ -37,6 +37,13 @@ final class MenubarStatsPoller {
     private let interval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
+    /// Number of ticks between all-time fetches. Session stats need
+    /// sub-second freshness for the live tok/s display in the header;
+    /// all-time stats only show in the "All-Time" submenu and don't
+    /// jitter, so polling them at the same rate burns server CPU for
+    /// no UX benefit. At interval=1s this fetches every 10s.
+    private let alltimeEveryNTicks = 10
+    private var tickCount = 0
 
     private(set) var sessionStats: Stats?
     private(set) var alltimeStats: Stats?
@@ -86,13 +93,14 @@ final class MenubarStatsPoller {
     // MARK: - Polling
 
     private func tick() async {
+        let fetchAlltime = (tickCount % alltimeEveryNTicks == 0)
+        tickCount &+= 1
         do {
-            async let session = fetchStats(scope: nil)
-            async let alltime = fetchStats(scope: "alltime")
-            let s = try await session
-            let a = try await alltime
+            let s = try await fetchStats(scope: nil)
             self.sessionStats = s
-            self.alltimeStats = a
+            if fetchAlltime {
+                self.alltimeStats = try await fetchStats(scope: "alltime")
+            }
             NotificationCenter.default.post(
                 name: Self.didUpdateNotification, object: self
             )

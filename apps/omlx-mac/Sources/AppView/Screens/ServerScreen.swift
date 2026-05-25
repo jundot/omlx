@@ -480,14 +480,7 @@ private struct HintFooter: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Image(systemName: "info.circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(theme.textTertiary)
-                Text("Endpoints update live as you change Listen Address and Port. Some changes (host, port) take effect after a server restart.")
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.textTertiary)
-            }
+            HintLine(text: "Endpoints update live as you change Listen Address and Port. Some changes (host, port) take effect after a server restart.")
             if let error {
                 Text(error)
                     .font(.omlxText(11))

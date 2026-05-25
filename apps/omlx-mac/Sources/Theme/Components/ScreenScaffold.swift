@@ -87,3 +87,25 @@ struct MessageBanner: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
+
+/// Single-line tertiary hint with a leading info icon. Used wherever a
+/// screen wants to drop an inline tip below a section (Welcome's
+/// Storage/API-key reminders, ServerScreen's "restart to apply" note,
+/// QuantizationScreen's empty-state pointer to Downloads).
+struct HintLine: View {
+    let text: String
+    var icon: String = "info.circle"
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textTertiary)
+            Text(text)
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textTertiary)
+        }
+    }
+}

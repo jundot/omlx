@@ -326,7 +326,10 @@ final class WelcomeViewModel: ObservableObject {
         // server already had one) + hf_endpoint patch. None of these are
         // fatal on first run — the user can re-do them in Security /
         // Server screens.
-        await Task.sleep(seconds: 0.5)  // give the server a beat to bind
+        // Give the server a beat to bind, then wait until the health-check
+        // loop has confirmed /health 200 (cap 8s so a hung server doesn't
+        // freeze the wizard).
+        try? await Task.sleep(for: .milliseconds(500))
         await waitUntilHealthyOrTimeout(proc: proc, timeout: 8)
 
         _ = await setupServerApiKey(client: services.client, key: trimmedKey)
@@ -404,12 +407,6 @@ final class WelcomeViewModel: ObservableObject {
             if case .running = proc.state { return }
             try? await Task.sleep(for: .milliseconds(200))
         }
-    }
-}
-
-private extension Task where Success == Never, Failure == Never {
-    static func sleep(seconds: Double) async {
-        try? await Task.sleep(for: .seconds(seconds))
     }
 }
 
@@ -575,9 +572,9 @@ private struct SetupBody: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                hint("Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.")
-                hint("Your model library starts empty — visit Downloads to fetch your first model.")
-                hint("You can re-open this wizard anytime from the menubar.")
+                HintLine(text: "Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.")
+                HintLine(text: "Your model library starts empty — visit Downloads to fetch your first model.")
+                HintLine(text: "You can re-open this wizard anytime from the menubar.")
             }
         }
     }
@@ -616,17 +613,6 @@ private struct SetupBody: View {
         }
     }
 
-    @ViewBuilder
-    private func hint(_ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 11))
-                .foregroundStyle(theme.textTertiary)
-            Text(text)
-                .font(.omlxText(11))
-                .foregroundStyle(theme.textTertiary)
-        }
-    }
 }
 
 private struct Footer: View {
