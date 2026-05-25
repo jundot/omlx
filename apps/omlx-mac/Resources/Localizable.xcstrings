@@ -73,18 +73,6 @@
         }
       }
     },
-    "about.hero.version": {
-      "comment": "Version + build line on the About screen hero card; placeholders are the bundle short version string and bundle version",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Version %@ · build %@"
-          }
-        }
-      }
-    },
     "about.license.name": {
       "comment": "Name of the open-source license shown on the About screen",
       "extractionState": "manual",
@@ -237,18 +225,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Project"
-          }
-        }
-      }
-    },
-    "bench.accuracy.benchmarks.subtitle.count": {
-      "comment": "Subtitle next to the Benchmarks grid showing the selected count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ selected"
           }
         }
       }
@@ -409,66 +385,6 @@
         }
       }
     },
-    "bench.accuracy.error.add_queue": {
-      "comment": "Accuracy Bench error when adding to queue fails; placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to add to queue: %@"
-          }
-        }
-      }
-    },
-    "bench.accuracy.error.cancel": {
-      "comment": "Accuracy Bench error when cancelling the running bench fails; placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to cancel: %@"
-          }
-        }
-      }
-    },
-    "bench.accuracy.error.clear_results": {
-      "comment": "Accuracy Bench error when clearing accumulated results fails; placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to clear results: %@"
-          }
-        }
-      }
-    },
-    "bench.accuracy.error.load_models": {
-      "comment": "Accuracy Bench error when listing models fails; placeholder is the underlying error description",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to load models: %@"
-          }
-        }
-      }
-    },
-    "bench.accuracy.error.remove": {
-      "comment": "Accuracy Bench error when removing a queue entry fails; placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to remove: %@"
-          }
-        }
-      }
-    },
     "bench.accuracy.header.eyebrow": {
       "comment": "Eyebrow label above the Accuracy Bench screen header",
       "extractionState": "manual",
@@ -565,30 +481,6 @@
         }
       }
     },
-    "bench.accuracy.queue.subtitle.queued": {
-      "comment": "Accuracy Bench queue subtitle fragment showing queued count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ queued"
-          }
-        }
-      }
-    },
-    "bench.accuracy.queue.subtitle.with_running": {
-      "comment": "Accuracy Bench queue subtitle when one bench is running; placeholder is the queued-count fragment",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ · 1 running"
-          }
-        }
-      }
-    },
     "bench.accuracy.result.categories": {
       "comment": "Disclosure label on an Accuracy Bench result card revealing per-category breakdowns",
       "extractionState": "manual",
@@ -621,18 +513,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Clear all"
-          }
-        }
-      }
-    },
-    "bench.accuracy.results.subtitle": {
-      "comment": "Subtitle showing the number of accumulated Accuracy Bench results",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ result%@"
           }
         }
       }
@@ -793,18 +673,6 @@
         }
       }
     },
-    "bench.accuracy.subtitle.selected_count": {
-      "comment": "Accuracy Bench section subtitle showing how many benchmarks the user has picked; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ benchmark%@ selected"
-          }
-        }
-      }
-    },
     "bench.accuracy.text_export.copied": {
       "comment": "Transient confirmation label after copying the Accuracy Bench text dump",
       "extractionState": "manual",
@@ -949,30 +817,6 @@
         }
       }
     },
-    "bench.throughput.device.gpu_cores": {
-      "comment": "Device chip GPU-cores fragment; placeholder is the core count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ GPU cores"
-          }
-        }
-      }
-    },
-    "bench.throughput.device.memory": {
-      "comment": "Device chip memory fragment; placeholder is the GB count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ GB"
-          }
-        }
-      }
-    },
     "bench.throughput.header.eyebrow": {
       "comment": "Eyebrow label above the Throughput Bench screen header",
       "extractionState": "manual",
@@ -1017,18 +861,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Select a model…"
-          }
-        }
-      }
-    },
-    "bench.throughput.progress.running": {
-      "comment": "Throughput Bench progress label with how many results have arrived; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Running… (%@ result%@ so far)"
           }
         }
       }
@@ -1285,30 +1117,6 @@
         }
       }
     },
-    "bench.throughput.single.subtitle": {
-      "comment": "Subtitle for the single-request results table; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ trial%@"
-          }
-        }
-      }
-    },
-    "bench.throughput.single.test_label": {
-      "comment": "Single-request row identifier showing prompt-processing and token-generation counts; placeholders are pp and tg integer counts",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "pp %@ / tg %@"
-          }
-        }
-      }
-    },
     "bench.throughput.subtitle.loading_models": {
       "comment": "Throughput Bench section subtitle while models are loading",
       "extractionState": "manual",
@@ -1321,18 +1129,6 @@
         }
       }
     },
-    "bench.throughput.subtitle.model_count": {
-      "comment": "Throughput Bench section subtitle showing how many models are available; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ model%@ available"
-          }
-        }
-      }
-    },
     "bench.throughput.text_export.title": {
       "comment": "Disclosure header for the Throughput Bench text export block",
       "extractionState": "manual",
@@ -1341,18 +1137,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Text export"
-          }
-        }
-      }
-    },
-    "bench.throughput.upload.count_submitted": {
-      "comment": "Inline counter shown during community upload; placeholder is the submitted count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ submitted"
           }
         }
       }
@@ -1377,18 +1161,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Already submitted"
-          }
-        }
-      }
-    },
-    "bench.throughput.upload.row.context_length": {
-      "comment": "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "pp %@"
           }
         }
       }
@@ -1429,18 +1201,6 @@
         }
       }
     },
-    "bench.throughput.upload.skipped.experimental": {
-      "comment": "Skipped-upload reason when experimental features were active; placeholder is the comma-joined feature list",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Results were not submitted because %@ were active during the run. These features skew throughput and would pollute the leaderboard."
-          }
-        }
-      }
-    },
     "bench.throughput.upload.skipped.experimental_default": {
       "comment": "Fallback noun phrase listed in the skipped-upload reason when the server returned no feature names",
       "extractionState": "manual",
@@ -1461,30 +1221,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Skipped community upload"
-          }
-        }
-      }
-    },
-    "bench.throughput.upload.subtitle.done_all": {
-      "comment": "Community-leaderboard subtitle on success; placeholders are success count and total",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ of %@ submitted"
-          }
-        }
-      }
-    },
-    "bench.throughput.upload.subtitle.done_partial": {
-      "comment": "Community-leaderboard subtitle when some uploads failed; placeholders are success and failure counts",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ ok · %@ failed"
           }
         }
       }
@@ -1612,18 +1348,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "No active tasks"
-          }
-        }
-      }
-    },
-    "downloads.active.subtitle.running": {
-      "comment": "Subtitle for Active Downloads; placeholder is the count of running tasks",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ running"
           }
         }
       }
@@ -1768,30 +1492,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Add Model from ModelScope"
-          }
-        }
-      }
-    },
-    "downloads.progress.bytes": {
-      "comment": "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@% · %@ of %@"
-          }
-        }
-      }
-    },
-    "downloads.recent.subtitle": {
-      "comment": "Subtitle for Recent Tasks; placeholder is the count of recent terminal tasks",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ recent"
           }
         }
       }
@@ -2600,18 +2300,6 @@
         }
       }
     },
-    "logs.subtitle.line_count": {
-      "comment": "Section header subtitle on the Logs screen; placeholder is the total number of log lines",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ lines"
-          }
-        }
-      }
-    },
     "menubar.alert.ok": {
       "comment": "Default dismiss button on the port-conflict alert",
       "extractionState": "manual",
@@ -2620,18 +2308,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
-          }
-        }
-      }
-    },
-    "menubar.alert.pid_known": {
-      "comment": "Substring describing a known PID; placeholder is the PID number",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "PID %@"
           }
         }
       }
@@ -2648,66 +2324,6 @@
         }
       }
     },
-    "menubar.alert.port_in_use.omlx": {
-      "comment": "Port-conflict alert body when the conflicting process is another oMLX instance",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Another oMLX server is already running on this port (%@). Stop it before starting a new instance, or change the port in Settings."
-          }
-        }
-      }
-    },
-    "menubar.alert.port_in_use.other": {
-      "comment": "Port-conflict alert body when an unrelated process owns the port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Another process (%@) is listening on port %@. Choose a different port in Settings or terminate that process."
-          }
-        }
-      }
-    },
-    "menubar.alert.port_in_use.title": {
-      "comment": "Title of the port-conflict alert; placeholder is the port number",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Port %@ is in use."
-          }
-        }
-      }
-    },
-    "menubar.header.bootstrap_failed": {
-      "comment": "Menubar status header when the server bootstrap threw an error; placeholder is the error description",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Server: bootstrap failed (%@)"
-          }
-        }
-      }
-    },
-    "menubar.header.failed": {
-      "comment": "Menubar status header when the server failed; placeholder is the failure message",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Server: failed — %@"
-          }
-        }
-      }
-    },
     "menubar.header.loading": {
       "comment": "Initial menubar header text before the server state is known",
       "extractionState": "manual",
@@ -2716,18 +2332,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Server: …"
-          }
-        }
-      }
-    },
-    "menubar.header.running": {
-      "comment": "Menubar status header when the server is running; placeholders are PID and port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Server: running · pid %@ · :%@"
           }
         }
       }
@@ -2764,18 +2368,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Server: stopping…"
-          }
-        }
-      }
-    },
-    "menubar.header.unresponsive": {
-      "comment": "Menubar status header when the server is unresponsive; placeholder is PID",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Server: unresponsive · pid %@ (auto-recover or Force Restart)"
           }
         }
       }
@@ -3092,18 +2684,6 @@
         }
       }
     },
-    "models.active.subtitle": {
-      "comment": "Subtitle for the Active Models section. Placeholders: count of loaded models, total memory footprint",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ loaded · %@"
-          }
-        }
-      }
-    },
     "models.active.title": {
       "comment": "Section heading for the list of currently-loaded models",
       "extractionState": "manual",
@@ -3124,18 +2704,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Unload model"
-          }
-        }
-      }
-    },
-    "models.delete.confirm_button": {
-      "comment": "Destructive button label inside the delete-model confirmation dialog; placeholder is the model id",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Delete %@"
           }
         }
       }
@@ -3220,18 +2788,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Settings"
-          }
-        }
-      }
-    },
-    "models.library.subtitle": {
-      "comment": "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ models · %@ on disk"
           }
         }
       }
@@ -3884,18 +3440,6 @@
         }
       }
     },
-    "profile.banner.action.update_based_on": {
-      "comment": "Profile banner action to overwrite the base profile with working edits; placeholder is the base profile's name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Update %@"
-          }
-        }
-      }
-    },
     "profile.banner.defaults.subtitle": {
       "comment": "Profile banner subtitle when no profile is assigned",
       "extractionState": "manual",
@@ -3916,30 +3460,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "No profile"
-          }
-        }
-      }
-    },
-    "profile.banner.named.subtitle": {
-      "comment": "Profile banner subtitle when a named profile is active; placeholder is scope label",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ profile · active on this model"
-          }
-        }
-      }
-    },
-    "profile.banner.working.subtitle.based_on": {
-      "comment": "Profile banner subtitle for working state with a base profile; placeholders are profile name and scope label",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Unsaved · based on %@ (%@)"
           }
         }
       }
@@ -3980,42 +3500,6 @@
         }
       }
     },
-    "profile.detail.acceleration.dflash.with_drafter": {
-      "comment": "DFlash chip with drafter model id; placeholder is the model identifier",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "DFlash · %@"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.dflash_quant": {
-      "comment": "DFlash drafter quantization chip; placeholders are weight bits, activation bits, group size",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Drafter quant · W%@/A%@ G%@"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.index_cache": {
-      "comment": "Acceleration chip describing IndexCache frequency; placeholder is the integer frequency",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "IndexCache · every %@"
-          }
-        }
-      }
-    },
     "profile.detail.acceleration.mtp": {
       "comment": "Acceleration chip: native multi-token prediction",
       "extractionState": "manual",
@@ -4040,30 +3524,6 @@
         }
       }
     },
-    "profile.detail.acceleration.specprefill.threshold": {
-      "comment": "SpecPrefill threshold suffix; placeholder is the formatted token count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "≥%@ tk"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.specprefill.with_parts": {
-      "comment": "SpecPrefill chip with detail suffix; placeholder is the joined detail parts",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "SpecPrefill · %@"
-          }
-        }
-      }
-    },
     "profile.detail.acceleration.turboquant": {
       "comment": "Acceleration chip base name for TurboQuant KV-cache compression",
       "extractionState": "manual",
@@ -4072,54 +3532,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "TurboQuant KV"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.turboquant.bits_decimal": {
-      "comment": "TurboQuant bit-width suffix when fractional; %.1f gets the decimal width",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%.1fbit"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.turboquant.bits_int": {
-      "comment": "TurboQuant bit-width suffix when the value is an integer; placeholder is the int",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@bit"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.turboquant.skip": {
-      "comment": "TurboQuant skip-last-N suffix; placeholder is the layer count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "skip %@"
-          }
-        }
-      }
-    },
-    "profile.detail.acceleration.turboquant.with_parts": {
-      "comment": "TurboQuant chip with detail suffix; placeholder is the joined detail parts",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "TurboQuant KV · %@"
           }
         }
       }
@@ -4256,18 +3668,6 @@
         }
       }
     },
-    "profile.detail.behavior.thinking_budget.on": {
-      "comment": "Behavior chip when thinking budget is enabled; placeholder is the formatted token count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Budget · %@ tk"
-          }
-        }
-      }
-    },
     "profile.detail.capacity.context": {
       "comment": "Capacity stat label: max context window",
       "extractionState": "manual",
@@ -4292,30 +3692,6 @@
         }
       }
     },
-    "profile.detail.capacity.tokens": {
-      "comment": "Token count rendered next to a Capacity stat; placeholder is the formatted count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ tk"
-          }
-        }
-      }
-    },
-    "profile.detail.capacity.tokens.raw": {
-      "comment": "Raw token count for max tokens; placeholder is the integer count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ tk"
-          }
-        }
-      }
-    },
     "profile.detail.capacity.ttl": {
       "comment": "Capacity stat label: time-to-live for the model in memory",
       "extractionState": "manual",
@@ -4336,18 +3712,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Persistent"
-          }
-        }
-      }
-    },
-    "profile.detail.capacity.ttl.seconds": {
-      "comment": "TTL value in seconds; placeholder is the integer seconds",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@s"
           }
         }
       }
@@ -4532,18 +3896,6 @@
         }
       }
     },
-    "profile.detail.subtitle.named": {
-      "comment": "Profile detail card subtitle for a named profile; placeholders are scope label and a setting count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ profile · %@ setting%@"
-          }
-        }
-      }
-    },
     "profile.detail.subtitle.scope.profile": {
       "comment": "Fallback scope label in the profile detail subtitle when scope is unknown",
       "extractionState": "manual",
@@ -4556,18 +3908,6 @@
         }
       }
     },
-    "profile.detail.subtitle.working_based_on": {
-      "comment": "Profile detail card subtitle in working state with a base profile; placeholders are name and scope label",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Working profile · based on %@ (%@)"
-          }
-        }
-      }
-    },
     "profile.detail.subtitle.working_defaults": {
       "comment": "Profile detail card subtitle in working state without a base profile",
       "extractionState": "manual",
@@ -4576,54 +3916,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Working profile · based on server defaults"
-          }
-        }
-      }
-    },
-    "profile.detail.templates.chat_template": {
-      "comment": "Templates chip describing chat-template kwarg override count; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Chat template · %@ override%@"
-          }
-        }
-      }
-    },
-    "profile.detail.templates.forced_ct": {
-      "comment": "Templates chip describing forced chat-template key count; placeholder is the count with pluralization",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Forced CT · %@ key%@"
-          }
-        }
-      }
-    },
-    "profile.detail.templates.reasoning_parser": {
-      "comment": "Templates chip naming the active reasoning parser; placeholder is the parser identifier",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Reasoning · %@"
-          }
-        }
-      }
-    },
-    "profile.group.empty": {
-      "comment": "Placeholder text in an empty profile chip group; placeholder is the lowercased scope name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No %@ profiles yet."
           }
         }
       }
@@ -4892,42 +4184,6 @@
         }
       }
     },
-    "quant.error.cancel_failed": {
-      "comment": "Banner error when cancelling a quant task throws. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cancel failed: %@"
-          }
-        }
-      }
-    },
-    "quant.error.load_models": {
-      "comment": "Banner error message when listing OQ models fails. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to load models: %@"
-          }
-        }
-      }
-    },
-    "quant.error.remove_failed": {
-      "comment": "Banner error when removing a quant task throws. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Remove failed: %@"
-          }
-        }
-      }
-    },
     "quant.error.server_refused": {
       "comment": "Banner error when the server returned success=false for a quant start",
       "extractionState": "manual",
@@ -4940,30 +4196,6 @@
         }
       }
     },
-    "quant.error.start_failed": {
-      "comment": "Banner error when starting a quant job throws. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to start: %@"
-          }
-        }
-      }
-    },
-    "quant.estimate.bpw": {
-      "comment": "Estimate pill: effective bits-per-weight. Placeholder is the formatted bpw value",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Effective %@ bpw"
-          }
-        }
-      }
-    },
     "quant.estimate.calculating": {
       "comment": "Estimate pill placeholder shown while values are being computed",
       "extractionState": "manual",
@@ -4972,30 +4204,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Calculating…"
-          }
-        }
-      }
-    },
-    "quant.estimate.memory": {
-      "comment": "Estimate pill: peak memory required to quantize. Placeholder is the formatted byte string",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Est. memory: ~%@"
-          }
-        }
-      }
-    },
-    "quant.estimate.output_size": {
-      "comment": "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Output size: ~%@"
           }
         }
       }
@@ -5056,18 +4264,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Remove"
-          }
-        }
-      }
-    },
-    "quant.queue.subtitle": {
-      "comment": "Subtitle for the Queue section. Placeholders: count, plural suffix",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ task%@"
           }
         }
       }
@@ -5204,18 +4400,6 @@
         }
       }
     },
-    "quant.source.subtitle.available": {
-      "comment": "Subtitle for Source Model section. Placeholders: model count, plural suffix",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ full-precision model%@ available"
-          }
-        }
-      }
-    },
     "quant.source.subtitle.loading": {
       "comment": "Subtitle while the source model list is loading",
       "extractionState": "manual",
@@ -5324,30 +4508,6 @@
         }
       }
     },
-    "quant.success.started": {
-      "comment": "Success banner after a quant job starts. Placeholders: source model name, target oQ level",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Quantization started: %@ → %@"
-          }
-        }
-      }
-    },
-    "quant.upload.error.cancel_failed": {
-      "comment": "Error when cancelling an upload task throws. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cancel failed: %@"
-          }
-        }
-      }
-    },
     "quant.upload.error.empty_token": {
       "comment": "Validation error when the HF token field is empty before validation",
       "extractionState": "manual",
@@ -5360,18 +4520,6 @@
         }
       }
     },
-    "quant.upload.error.remove_failed": {
-      "comment": "Error when removing an upload task throws. Placeholder is the underlying error",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Remove failed: %@"
-          }
-        }
-      }
-    },
     "quant.upload.error.server_refused": {
       "comment": "Error when the server returned success=false for an upload start",
       "extractionState": "manual",
@@ -5380,42 +4528,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Server refused the request"
-          }
-        }
-      }
-    },
-    "quant.upload.error.start_failed": {
-      "comment": "Error when an upload start request throws. Placeholder is the underlying error description",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Upload failed: %@"
-          }
-        }
-      }
-    },
-    "quant.upload.error.validate_failed": {
-      "comment": "Error message when HF token validation throws. Placeholder is the underlying error description",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Validate failed: %@"
-          }
-        }
-      }
-    },
-    "quant.upload_modal.credentials.subtitle.logged_in": {
-      "comment": "Subtitle when a token has been validated. Placeholder is the HF username",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Logged in as @%@"
           }
         }
       }
@@ -5600,18 +4712,6 @@
         }
       }
     },
-    "quant.upload_modal.readme_source.copy_from": {
-      "comment": "README source option that copies an existing model's README. Placeholder is the source model name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Copy from %@"
-          }
-        }
-      }
-    },
     "quant.upload_modal.readme_source.label": {
       "comment": "Row label for the README source picker",
       "extractionState": "manual",
@@ -5656,18 +4756,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Repo name"
-          }
-        }
-      }
-    },
-    "quant.upload_modal.repo_name.sub": {
-      "comment": "Row sublabel previewing the full repo id. Placeholder is namespace or <namespace> sentinel",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Full repo id will be %@/<repo-name>"
           }
         }
       }
@@ -5860,18 +4948,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Remove"
-          }
-        }
-      }
-    },
-    "quant.uploads.subtitle": {
-      "comment": "Subtitle for Uploads section. Placeholders: active count, completed count",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ active / %@ completed"
           }
         }
       }
@@ -6076,30 +5152,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Issue scoped keys for individual apps or users. Sub keys cannot grant admin access."
-          }
-        }
-      }
-    },
-    "security.sub_keys.created_at": {
-      "comment": "Sub-key created-at text; placeholder is the formatted date and time",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Created · %@"
-          }
-        }
-      }
-    },
-    "security.sub_keys.created_raw": {
-      "comment": "Sub-key created-at text when the timestamp can't be parsed; placeholder is the raw ISO string",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Created · %@"
           }
         }
       }
@@ -6545,18 +5597,6 @@
         }
       }
     },
-    "server.hero.subtitle.listening": {
-      "comment": "Hero subtitle while server is running; placeholders are host and port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Listening on %@:%@"
-          }
-        }
-      }
-    },
     "server.hero.subtitle.not_running": {
       "comment": "Hero subtitle when server is stopped",
       "extractionState": "manual",
@@ -6565,18 +5605,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Not running"
-          }
-        }
-      }
-    },
-    "server.hero.subtitle.starting": {
-      "comment": "Hero subtitle while server is starting up; placeholders are host and port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Starting on %@:%@…"
           }
         }
       }
@@ -7291,18 +6319,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Add kwarg"
-          }
-        }
-      }
-    },
-    "settings.advanced.chat_template.count": {
-      "comment": "Count summary in the chat-template editor; placeholders are the entry count and an optional plural 's'",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ kwarg%@"
           }
         }
       }
@@ -8447,18 +7463,6 @@
         }
       }
     },
-    "settings.profiles.model.label": {
-      "comment": "Section label for the per-model profile chip group; placeholder is the model id",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Model Profiles · %@"
-          }
-        }
-      }
-    },
     "settings.profiles.no_profile.name": {
       "comment": "Display name shown in the profile detail card when no profile is active",
       "extractionState": "manual",
@@ -8743,30 +7747,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Min P must be in [0, 1]."
-          }
-        }
-      }
-    },
-    "settings.validator.must_be_number": {
-      "comment": "Validation error when a sampling field isn't a number; placeholder is the field name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ must be a number."
-          }
-        }
-      }
-    },
-    "settings.validator.penalty.range": {
-      "comment": "Validation error when a penalty field is outside [-2,2]; placeholder is the field name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ must be in [-2, 2]."
           }
         }
       }
@@ -9478,18 +8458,6 @@
         }
       }
     },
-    "status.runtime_cache.block_size": {
-      "comment": "Subtitle showing the effective KV cache block sizes; placeholder is a separator-joined list of numbers",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Block size · %@"
-          }
-        }
-      }
-    },
     "status.runtime_cache.clear_ssd": {
       "comment": "Destructive button to clear all SSD cache files",
       "extractionState": "manual",
@@ -9510,18 +8478,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "1 file"
-          }
-        }
-      }
-    },
-    "status.runtime_cache.file_count.other": {
-      "comment": "Plural cache file count; placeholder is the number of files",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ files"
           }
         }
       }
@@ -9703,18 +8659,6 @@
         }
       }
     },
-    "status.system.subtitle": {
-      "comment": "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ · macOS %@.%@"
-          }
-        }
-      }
-    },
     "status.tile.cached": {
       "extractionState": "manual",
       "localizations": {
@@ -9722,18 +8666,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cached"
-          }
-        }
-      }
-    },
-    "status.tile.cached.sub": {
-      "comment": "Sub-label showing cache efficiency percentage on the cached tile; placeholder is a formatted percentage",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@% efficiency"
           }
         }
       }
@@ -9768,18 +8700,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Requests"
-          }
-        }
-      }
-    },
-    "status.tile.requests.sub": {
-      "comment": "Sub-label showing in-flight request count; placeholder is the number of active requests",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ in flight"
           }
         }
       }
@@ -9851,30 +8771,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Download in the background, install on next launch"
-          }
-        }
-      }
-    },
-    "status.updates.available_primary": {
-      "comment": "Primary update status line when a new version is available; placeholder is the version string",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "oMLX %@ is available"
-          }
-        }
-      }
-    },
-    "status.updates.available_secondary": {
-      "comment": "Secondary update status line when a new version is available; placeholder is the download size or em dash",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "You have the current version · %@"
           }
         }
       }
@@ -9961,30 +8857,6 @@
         }
       }
     },
-    "status.updates.last_checked_date": {
-      "comment": "Last-checked text when the last check was before today; placeholder is the formatted date and time",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Last checked %@"
-          }
-        }
-      }
-    },
-    "status.updates.last_checked_today": {
-      "comment": "Last-checked text when the last check was today; placeholder is the local time",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Last checked today at %@"
-          }
-        }
-      }
-    },
     "status.updates.never_checked": {
       "comment": "Secondary update line when there is no prior check timestamp",
       "extractionState": "manual",
@@ -10016,18 +8888,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "oMLX is up to date"
-          }
-        }
-      }
-    },
-    "status.version.text": {
-      "comment": "Version row value combining marketing version and build number; placeholders are the version string and build string",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ · build %@"
           }
         }
       }
@@ -10356,42 +9216,6 @@
         }
       }
     },
-    "welcome.error.mkdir_failed": {
-      "comment": "Welcome wizard: mkdir on the base path failed; placeholder is the system error message",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cannot create base directory: %@"
-          }
-        }
-      }
-    },
-    "welcome.error.port_in_use": {
-      "comment": "Welcome wizard: bind() failed because some other process owns the port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Port %lld is already in use."
-          }
-        }
-      }
-    },
-    "welcome.error.port_in_use_omlx": {
-      "comment": "Welcome wizard: bind() failed because another oMLX instance owns the port",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Port %lld is already in use (oMLX server already running)."
-          }
-        }
-      }
-    },
     "welcome.error.port_out_of_range": {
       "comment": "Welcome wizard validation: port not in valid range",
       "extractionState": "manual",
@@ -10400,42 +9224,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Port must be a number between 1 and 65535."
-          }
-        }
-      }
-    },
-    "welcome.error.python_runtime_failed": {
-      "comment": "Welcome wizard: PythonRuntime.resolve() threw; placeholder is the system error message",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to locate Python runtime: %@"
-          }
-        }
-      }
-    },
-    "welcome.error.save_config_failed": {
-      "comment": "Welcome wizard: writing settings.json failed; placeholder is the system error message",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to save config: %@"
-          }
-        }
-      }
-    },
-    "welcome.error.start_server_failed": {
-      "comment": "Welcome wizard: ServerProcess.start() threw; placeholder is the system error message",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Failed to start server: %@"
           }
         }
       }
@@ -10532,18 +9320,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Model Directory"
-          }
-        }
-      }
-    },
-    "welcome.storage.model_dir.placeholder": {
-      "comment": "Placeholder string shown when Model Directory is unset; placeholder is the base path's leaf name",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "<%@>/models"
           }
         }
       }
