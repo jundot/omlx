@@ -8,6 +8,7 @@ with directory-size-based progress polling.
 import asyncio
 import enum
 import logging
+import os
 import shutil
 import time
 import uuid
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
@@ -23,6 +25,14 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
+
+# Force the xet download path off. hf_xet's Rust ``download_files`` invokes
+# the Python progress callback from a Rust frame and silently swallows any
+# Python exception raised inside it, so our tqdm-based cooperative cancel is
+# a no-op on xet-enabled repos. Falling back to ``http_get`` keeps cancel
+# working at chunk granularity. See issue #1322.
+_hf_constants.HF_HUB_DISABLE_XET = True
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 logger = logging.getLogger(__name__)
 

@@ -919,6 +919,7 @@ class TestStreamingHelperFunctions:
 
         thinking_deltas = []
         tool_use_blocks = []
+        block_start_indices = []
         stop_reasons = []
         for event in parsed_events:
             if event.get("type") == "content_block_delta":
@@ -926,6 +927,7 @@ class TestStreamingHelperFunctions:
                 if delta.get("type") == "thinking_delta":
                     thinking_deltas.append(delta["thinking"])
             elif event.get("type") == "content_block_start":
+                block_start_indices.append(event["index"])
                 content_block = event.get("content_block", {})
                 if content_block.get("type") == "tool_use":
                     tool_use_blocks.append(content_block)
@@ -939,6 +941,7 @@ class TestStreamingHelperFunctions:
         assert "</tool_call>" not in streamed_thinking
         assert "Need to inspect first." in streamed_thinking
         assert "Then continue." in streamed_thinking
+        assert block_start_indices == list(range(len(block_start_indices)))
         assert len(tool_use_blocks) == 1
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert "tool_use" in stop_reasons

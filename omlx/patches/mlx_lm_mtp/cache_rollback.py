@@ -18,15 +18,13 @@ import types
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
-
-
 def apply() -> bool:
-    """Attach ``rollback_state = None`` to ``ArraysCache`` (idempotent)."""
-    global _PATCHED
-    if _PATCHED:
-        return True
+    """Attach ``rollback_state = None`` to ``ArraysCache`` (idempotent).
 
+    Idempotency is checked against the live class attribute, not a
+    module-level flag — keeps the patch consistent with the rest of
+    mlx_lm_mtp after the #1388 self-healing refactor.
+    """
     root = sys.modules.get("mlx_lm")
     if root is not None and (
         not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
@@ -43,15 +41,14 @@ def apply() -> bool:
         logger.debug("mlx_lm.models.cache.ArraysCache is not a class; skipping rollback_state")
         return False
 
-    if hasattr(ArraysCache, "rollback_state") and not hasattr(
-        ArraysCache, "_omlx_rollback_attached"
-    ):
+    if hasattr(ArraysCache, "_omlx_rollback_attached"):
+        return True
+
+    if hasattr(ArraysCache, "rollback_state"):
         # Upstream may have added it natively (e.g. once PR 990 lands).
-        _PATCHED = True
         ArraysCache._omlx_rollback_attached = "upstream"
         return True
 
     ArraysCache.rollback_state = None
     ArraysCache._omlx_rollback_attached = "patch"
-    _PATCHED = True
     return True

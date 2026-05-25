@@ -29,15 +29,21 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
+def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
+    """True iff ``cls.<attr>`` carries our marker. Mirror of the helper
+    in qwen35_model — used for self-healing idempotency so a dflash
+    overwrite of ``__call__`` in between two Native-MTP loads doesn't
+    leave the class stuck on dflash's signature (issue #1388)."""
+    existing = cls.__dict__.get(attr)
+    return getattr(existing, marker, False)
 
 
 def apply() -> bool:
-    """Apply PR 15 model-side patches when the DeepSeek-V4 base patch is active."""
-    global _PATCHED
-    if _PATCHED:
-        return True
+    """Apply PR 15 model-side patches when the DeepSeek-V4 base patch is active.
 
+    Self-healing: re-runs sub-patches when class state has drifted (see
+    qwen35_model.apply for the same pattern).
+    """
     root = sys.modules.get("mlx_lm")
     if root is not None and (
         not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
@@ -60,19 +66,14 @@ def apply() -> bool:
         )
         return False
 
-    # Idempotency check.
-    if "_omlx_mtp_patched" in dsv4.Model.__dict__:
-        _PATCHED = True
-        return True
-
     _patch_model_args(dsv4)
     _register_mtp_block(dsv4)
     _patch_deepseek_v4_model_call(dsv4)
     _patch_model(dsv4)
 
-    _PATCHED = True
-    dsv4.Model._omlx_mtp_patched = "patch"
-    logger.info("DeepSeek-V4 MTP model patch applied (PR 15)")
+    if not hasattr(dsv4.Model, "_omlx_mtp_patched"):
+        dsv4.Model._omlx_mtp_patched = "patch"
+        logger.info("DeepSeek-V4 MTP model patch applied (PR 15)")
     return True
 
 
@@ -177,7 +178,7 @@ def _register_mtp_block(dsv4: Any) -> None:
 def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     """Replace ``DeepseekV4Model.__call__`` to optionally return the raw 4D hidden."""
     cls = dsv4.DeepseekV4Model
-    if "_omlx_mtp_patched" in cls.__dict__:
+    if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
     import mlx.core as mx
@@ -237,8 +238,8 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
             return out, h
         return out
 
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
-    cls._omlx_mtp_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +249,9 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 
 def _patch_model(dsv4: Any) -> None:
     cls = dsv4.Model
-    if "_omlx_mtp_patched" in cls.__dict__:
+    init_wrapped = getattr(cls, "_omlx_mtp_init_wrapped", False)
+    call_owned = _is_our_method(cls, "__call__", "_omlx_mtp_call_marker")
+    if init_wrapped and call_owned:
         return
 
     import mlx.core as mx
@@ -521,9 +524,11 @@ def _patch_model(dsv4: Any) -> None:
 
         return weights
 
-    cls.__init__ = __init__
+    if not init_wrapped:
+        cls.__init__ = __init__
+        cls._omlx_mtp_init_wrapped = True
+    __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.sanitize = sanitize
-    cls._omlx_mtp_patched = True

@@ -79,19 +79,18 @@ from typing import Any, Deque, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def apply() -> bool:
-    """Wrap ``GenerationBatch.__init__`` + ``GenerationBatch.next``."""
-    global _PATCHED
-    if _PATCHED:
-        return True
+    """Wrap ``GenerationBatch.__init__`` + ``GenerationBatch.next``.
 
+    One-shot by design: the wraps capture ``original_*`` in closures so
+    re-applying would chain wraps and double-init. ``GenerationBatch`` is
+    not touched by dflash so the leftover-class-patch risk that motivates
+    self-healing elsewhere doesn't apply here.
+    """
     root = sys.modules.get("mlx_lm")
     if root is not None and (
         not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
@@ -109,7 +108,6 @@ def apply() -> bool:
         return False
 
     if hasattr(GenerationBatch, "_omlx_mtp_patched"):
-        _PATCHED = True
         return True
 
     original_init = GenerationBatch.__init__
@@ -169,7 +167,6 @@ def apply() -> bool:
     GenerationBatch.filter = patched_filter
     GenerationBatch.extend = patched_extend
     GenerationBatch._omlx_mtp_patched = True
-    _PATCHED = True
     return True
 
 

@@ -3909,6 +3909,32 @@ def _build_active_models_data() -> dict:
                         0.0, loading_estimated_seconds - loading_elapsed_seconds
                     )
 
+        # Compute idle time and TTL remaining for loaded models.
+        is_loaded = model_info.get("loaded") and entry is not None and entry.engine is not None
+        last_access = model_info.get("last_access")
+        idle_seconds: float | None = None
+        ttl_remaining_seconds: float | None = None
+
+        if is_loaded and last_access is not None and last_access > 0:
+            idle_seconds = max(0.0, time.time() - last_access)
+
+        # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
+        effective_ttl: int | None = None
+        settings_manager = _get_settings_manager()
+        if is_loaded and settings_manager is not None:
+            model_settings = settings_manager.get_settings(model_id)
+            if model_settings is not None and getattr(model_settings, "ttl_seconds", None) is not None:
+                effective_ttl = model_settings.ttl_seconds
+        if effective_ttl is None:
+            global_settings = _get_global_settings()
+            if global_settings is not None:
+                gt = getattr(global_settings, "idle_timeout", None)
+                if gt is not None:
+                    effective_ttl = getattr(gt, "idle_timeout_seconds", None)
+
+        if is_loaded and effective_ttl is not None and idle_seconds is not None:
+            ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
+
         models.append({
             "id": model_id,
             "estimated_size": model_info.get("estimated_size", 0),
@@ -3932,6 +3958,8 @@ def _build_active_models_data() -> dict:
             "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
+            "idle_seconds": idle_seconds,
+            "ttl_remaining_seconds": ttl_remaining_seconds,
         })
 
         total_active += active_requests
