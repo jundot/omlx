@@ -23,7 +23,12 @@ struct OMLXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("oMLX", id: "main") {
+        // Empty title string keeps the toolbar zone free of "oMLX" text
+        // (SwiftUI macOS 26 renders the Window title in the unified toolbar
+        // regardless of NSWindow.titleVisibility). The Window menu / Dock
+        // right-click menu show the bundle display name ("oMLX") as a
+        // fallback when title is empty, so we don't lose the in-menu name.
+        Window("", id: "main") {
             AppView()
                 .environmentObject(appDelegate.services)
         }

@@ -95,6 +95,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         if let main = mainAppViewWindow() {
+            // Also apply on every show: the observer fires only on
+            // didBecomeMain, which may not run if the window was just
+            // reordered without becoming main.
+            main.titleVisibility = .hidden
             main.makeKeyAndOrderFront(nil)
             return
         }
@@ -234,6 +238,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func windowDidBecomeMainNotification(_ notif: Notification) {
         guard let win = notif.object as? NSWindow, isAppOwnedWindow(win) else { return }
+        // Hide the SwiftUI Window scene's title text in the title bar
+        // (the "oMLX" floating above the toolbar zone). The title string
+        // is still used by the Window menu / Dock-icon right-click menu —
+        // only the in-bar display is suppressed. Matches Settings.app's
+        // chrome where the title bar is left to the per-screen big title
+        // we render inside ContentScaffold.
+        if win.identifier?.rawValue.contains("main") == true,
+           win.titleVisibility != .hidden {
+            win.titleVisibility = .hidden
+        }
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }

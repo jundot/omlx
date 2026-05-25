@@ -40,7 +40,9 @@ struct AppView: View {
                     ContentScaffold(section: .logs, detailTitle: detailTitle) { LogsScreen() }
                 }
             } header: {
-                Text("Server")
+                Text(String(localized: "sidebar.group.server",
+                            defaultValue: "Server",
+                            comment: "Sidebar group heading for server-related screens"))
             }
             TabSection {
                 Tab(AppSection.models.title, systemImage: AppSection.models.symbol, value: AppSection.models) {
@@ -62,7 +64,9 @@ struct AppView: View {
                     ContentScaffold(section: .quantization, detailTitle: detailTitle) { QuantizationScreen() }
                 }
             } header: {
-                Text("Models")
+                Text(String(localized: "sidebar.group.models",
+                            defaultValue: "Models",
+                            comment: "Sidebar group heading for models/downloads/quant screens"))
             }
             TabSection {
                 Tab(AppSection.throughputBench.title, systemImage: AppSection.throughputBench.symbol, value: AppSection.throughputBench) {
@@ -76,7 +80,9 @@ struct AppView: View {
                     }
                 }
             } header: {
-                Text("Benchmark")
+                Text(String(localized: "sidebar.group.benchmark",
+                            defaultValue: "Benchmark",
+                            comment: "Sidebar group heading for accuracy + throughput bench screens"))
             }
             TabSection {
                 Tab(AppSection.security.title, systemImage: AppSection.security.symbol, value: AppSection.security) {
@@ -86,7 +92,9 @@ struct AppView: View {
                     ContentScaffold(section: .about, detailTitle: detailTitle) { AboutScreen() }
                 }
             } header: {
-                Text("General")
+                Text(String(localized: "sidebar.group.general",
+                            defaultValue: "General",
+                            comment: "Sidebar group heading for the about/integrations/logs screens"))
             }
         }
         .tabViewStyle(.sidebarAdaptable)
