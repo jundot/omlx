@@ -1,11 +1,10 @@
-// PR 6 — AppView shell. NavigationSplitView with the custom sidebar from
-// `Sidebar.swift` and an empty-stub content per section. Sized to the design
-// canvas (1140×760) with a sane minimum so the window survives a resize.
+// AppView shell. TabView(.sidebarAdaptable) backed by the `AppSection` enum,
+// one tab per screen, grouped into Server / Models / Benchmark / General
+// sections. Sized to the design canvas (1140×760) with a sane minimum so
+// the window survives a resize.
 //
-// The shell is the entry point for both `Cmd-,` (the SwiftUI `Settings` scene
-// declared in `oMLXApp.swift`) and the menubar's `Admin Panel` item. PR 7+
-// fills in real screens; for now each tab routes to a placeholder that names
-// its landing PR so reviewers can track progress in-app.
+// The shell is the entry point for the menubar's `Admin Panel` item and is
+// hosted in the SwiftUI `Window` scene declared in `oMLXApp.swift`.
 
 import SwiftUI
 

@@ -76,7 +76,7 @@ extension View {
 // MARK: - Desktop wash
 
 /// The Tahoe desktop background: two soft radial accents over a flat base.
-/// Apply at the AppView shell (PR 6) below the sidebar+content split.
+/// Apply at the AppView shell below the TabView content.
 struct DesktopWash: View {
     @Environment(\.omlxTheme) private var theme
 

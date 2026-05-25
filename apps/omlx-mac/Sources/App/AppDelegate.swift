@@ -196,7 +196,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 break
             }
         } catch {
-            // Surface the failure in the menubar; in-app banner lands in PR 6.
+            // Surface the failure in the menubar header so the user has a
+            // recovery affordance without needing to dig through logs.
             self.menubar = makeMenubar(server: nil, config: config, lastError: error)
             NSLog("oMLX: server bootstrap failed — \(error)")
         }

@@ -503,7 +503,7 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openAdminPanel() {
-        // The AppDelegate owns AppViewWindowController; we just ask it to
+        // AppDelegate owns the SwiftUI Window scene; we just ask it to
         // present. This avoids the Settings-scene + .accessory bug where
         // `showSettingsWindow:` silently no-ops when no window is up.
         openAppView()

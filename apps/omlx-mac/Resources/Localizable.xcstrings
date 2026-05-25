@@ -3426,9 +3426,6 @@
         }
       }
     },
-    "oMLX" : {
-
-    },
     "performance.button.apply" : {
       "comment" : "Apply button at the bottom of the Performance screen",
       "extractionState" : "manual",

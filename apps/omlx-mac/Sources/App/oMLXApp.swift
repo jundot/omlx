@@ -1,7 +1,6 @@
 // SwiftUI shell. The main AppView is a `Window` scene managed by SwiftUI
-// (state restoration, autosave, opt-in lifecycle) rather than the old
-// manually-built NSWindow in AppViewWindowController. AppDelegate stays
-// in charge of the menubar + server bootstrap + Welcome wizard.
+// (state restoration, autosave, opt-in lifecycle). AppDelegate stays in
+// charge of the menubar + server bootstrap + Welcome wizard.
 //
 // Window lifecycle
 //   • `.defaultLaunchBehavior(.suppressed)` keeps the window from appearing
