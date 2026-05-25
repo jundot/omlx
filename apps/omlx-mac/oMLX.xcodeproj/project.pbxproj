@@ -29,6 +29,7 @@
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
 		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
+		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
 		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
@@ -88,6 +89,7 @@
 		DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */; };
 		DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000A /* ProfileScopeTests.swift */; };
 		DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000B /* SystemMetricsTests.swift */; };
+		DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000C /* WelcomeViewModelTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -126,6 +128,7 @@
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
 		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
+		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
 		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
@@ -184,6 +187,7 @@
 		DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalSettingsSamplingTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000A /* ProfileScopeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileScopeTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000B /* SystemMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000C /* WelcomeViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeViewModelTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -238,6 +242,7 @@
 				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
 				DCC00000000000000000000A /* ProfileScopeTests.swift */,
 				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -349,6 +354,7 @@
 			children = (
 				3CC000000000000000000001 /* AppConfig.swift */,
 				3CC000000000000000000004 /* ShellEnvWriter.swift */,
+				3CC000000000000000000005 /* APIKeyGenerator.swift */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -570,6 +576,7 @@
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,
 				3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */,
+				3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */,
 				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
 				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
 				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
@@ -634,6 +641,7 @@
 				DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */,
 				DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */,
 				DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */,
+				DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

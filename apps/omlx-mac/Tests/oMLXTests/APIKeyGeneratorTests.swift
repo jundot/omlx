@@ -1,9 +1,9 @@
 // The random-key generator backs the regenerate button in the Security
-// screen. The server-side validator (`validate_api_key` in
-// `omlx/admin/routes.py`) requires ≥ 4 printable characters with no
-// whitespace. These tests pin the shape so a future tweak to the
-// alphabet, prefix, or length can't silently produce keys the server
-// will reject.
+// screen and the Generate button in the Welcome wizard. The server-side
+// validator (`validate_api_key` in `omlx/admin/routes.py`) requires ≥ 4
+// printable characters with no whitespace. These tests pin the shape so
+// a future tweak to the alphabet, prefix, or length can't silently
+// produce keys the server will reject.
 
 import XCTest
 @testable import oMLX

@@ -14,7 +14,6 @@
 // already exists (re-entry), the Welcome page is skipped via VM init state.
 
 import AppKit
-import Security
 import SwiftUI
 
 // MARK: - Window controller
@@ -151,28 +150,12 @@ final class WelcomeViewModel: ObservableObject {
 
     // MARK: API key generation
 
-    /// Build a fresh API key of the form `sk-omlx-<32 hex chars>`. Uses
-    /// `SecRandomCopyBytes` for cryptographic randomness (16 bytes → 32 hex
-    /// chars + 8-char prefix = 40 chars total, comfortably above the
-    /// server-side ≥4 minimum). Writes the new value into both `apiKey` and
-    /// `apiKeyConfirm` so the confirm field stays in sync without forcing
-    /// the user to retype.
+    /// Mint a fresh API key via the shared `APIKeyGenerator` and mirror it
+    /// into both fields so the Confirm row stays in sync. Shared with the
+    /// Security screen so both surfaces produce the same `sk-omlx-<...>`
+    /// shape.
     func generateApiKey() {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let result = bytes.withUnsafeMutableBytes { buf -> Int32 in
-            guard let base = buf.baseAddress else { return errSecAllocate }
-            return SecRandomCopyBytes(kSecRandomDefault, buf.count, base)
-        }
-        let hex: String
-        if result == errSecSuccess {
-            hex = bytes.map { String(format: "%02x", $0) }.joined()
-        } else {
-            // Fallback (very unlikely): use Swift's RNG. Not crypto-grade
-            // but the wizard's threat model is "user types the same key on
-            // both fields", not "attacker predicts the key".
-            hex = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
-        }
-        let key = "sk-omlx-\(hex)"
+        let key = APIKeyGenerator.random()
         apiKey = key
         apiKeyConfirm = key
         lastError = nil

@@ -195,23 +195,6 @@ private struct APIKeyEditorRow: View {
 
 }
 
-/// File-scoped so unit tests can exercise the shape without reaching into
-/// the View. Kept tiny — anything more elaborate (e.g. crypto-grade RNG,
-/// configurable prefix) earns its own type.
-enum APIKeyGenerator {
-    static let prefix = "sk-omlx-"
-    static let bodyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    static let bodyLength = 24
-
-    /// 24-char alphanumeric body — ~143 bits of entropy, comfortably above
-    /// the server's "≥ 4 printable, no whitespace" floor and short enough
-    /// to fit the editor row's field without truncation.
-    static func random() -> String {
-        let body = String((0..<bodyLength).map { _ in bodyAlphabet.randomElement()! })
-        return "\(prefix)\(body)"
-    }
-}
-
 // MARK: - Authentication
 
 private struct AuthenticationSection: View {
