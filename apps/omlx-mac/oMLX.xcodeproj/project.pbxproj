@@ -91,6 +91,7 @@
 		DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000B /* SystemMetricsTests.swift */; };
 		DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000C /* WelcomeViewModelTests.swift */; };
 		DBB00000000000000000000D /* DTOFixtureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000D /* DTOFixtureTests.swift */; };
+		DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -190,6 +191,7 @@
 		DCC00000000000000000000B /* SystemMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000C /* WelcomeViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeViewModelTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000D /* DTOFixtureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DTOFixtureTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -246,6 +248,7 @@
 				DCC00000000000000000000B /* SystemMetricsTests.swift */,
 				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
 				DCC00000000000000000000D /* DTOFixtureTests.swift */,
+				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -646,6 +649,7 @@
 				DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */,
 				DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */,
 				DBB00000000000000000000D /* DTOFixtureTests.swift in Sources */,
+				DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
