@@ -308,12 +308,12 @@ struct ServerHeroCard: View {
         switch services.serverState {
         case .running, .unresponsive:
             return String(localized: "server.hero.subtitle.listening",
-                          defaultValue: "Listening on \(host):\(port)",
-                          comment: "Hero subtitle while server is running; placeholders are host and port")
+                          defaultValue: "Listening on \(host):\(String(port))",
+                          comment: "Hero subtitle while server is running; placeholders are host and port (port is plain integer, no grouping)")
         case .starting:
             return String(localized: "server.hero.subtitle.starting",
-                          defaultValue: "Starting on \(host):\(port)…",
-                          comment: "Hero subtitle while server is starting up; placeholders are host and port")
+                          defaultValue: "Starting on \(host):\(String(port))…",
+                          comment: "Hero subtitle while server is starting up; placeholders are host and port (port is plain integer, no grouping)")
         case .stopping:
             return String(localized: "server.hero.subtitle.stopping",
                           defaultValue: "Stopping…",

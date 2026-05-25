@@ -345,10 +345,10 @@ final class WelcomeViewModel: ObservableObject {
             case .portConflict(let conflict):
                 lastError = conflict.isOMLX
                     ? String(localized: "welcome.error.port_in_use_omlx",
-                             defaultValue: "Port \(config.port) is already in use (oMLX server already running).",
+                             defaultValue: "Port \(String(config.port)) is already in use (oMLX server already running).",
                              comment: "Welcome wizard: bind() failed because another oMLX instance owns the port")
                     : String(localized: "welcome.error.port_in_use",
-                             defaultValue: "Port \(config.port) is already in use.",
+                             defaultValue: "Port \(String(config.port)) is already in use.",
                              comment: "Welcome wizard: bind() failed because some other process owns the port")
                 return false
             }

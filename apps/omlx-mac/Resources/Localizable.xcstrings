@@ -2665,7 +2665,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "PID %d"
+            "value" : "PID %@"
           }
         }
       }
@@ -2701,7 +2701,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Another process (%1$@) is listening on port %2$lld. Choose a different port in Settings or terminate that process."
+            "value" : "Another process (%1$@) is listening on port %2$@. Choose a different port in Settings or terminate that process."
           }
         }
       }
@@ -2713,7 +2713,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Port %lld is in use."
+            "value" : "Port %@ is in use."
           }
         }
       }
@@ -2761,7 +2761,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: running · pid %1$d · :%2$lld"
+            "value" : "Server: running · pid %1$@ · :%2$@"
           }
         }
       }
@@ -2809,7 +2809,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: unresponsive · pid %d (auto-recover or Force Restart)"
+            "value" : "Server: unresponsive · pid %@ (auto-recover or Force Restart)"
           }
         }
       }
@@ -6538,7 +6538,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Listening on %1$@:%2$lld"
+            "value" : "Listening on %1$@:%2$@"
           }
         }
       }
@@ -6562,7 +6562,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Starting on %1$@:%2$lld…"
+            "value" : "Starting on %1$@:%2$@…"
           }
         }
       }
@@ -10412,7 +10412,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Port %lld is already in use."
+            "value" : "Port %@ is already in use."
           }
         }
       }
@@ -10424,7 +10424,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Port %lld is already in use (oMLX server already running)."
+            "value" : "Port %@ is already in use (oMLX server already running)."
           }
         }
       }

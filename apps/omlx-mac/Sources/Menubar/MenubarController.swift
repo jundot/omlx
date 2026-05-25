@@ -293,8 +293,8 @@ final class MenubarController: NSObject {
         case .running(let pid):
             return (
                 String(localized: "menubar.header.running",
-                       defaultValue: "Server: running · pid \(pid) · :\(config.port)",
-                       comment: "Menubar status header when the server is running; placeholders are PID and port"),
+                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(config.port))",
+                       comment: "Menubar status header when the server is running; placeholders are PID and port (rendered as plain integers, no grouping)"),
                 .systemGreen
             )
         case .stopping:
@@ -307,8 +307,8 @@ final class MenubarController: NSObject {
         case .unresponsive(let pid):
             return (
                 String(localized: "menubar.header.unresponsive",
-                       defaultValue: "Server: unresponsive · pid \(pid) (auto-recover or Force Restart)",
-                       comment: "Menubar status header when the server is unresponsive; placeholder is PID"),
+                       defaultValue: "Server: unresponsive · pid \(String(pid)) (auto-recover or Force Restart)",
+                       comment: "Menubar status header when the server is unresponsive; placeholder is PID (plain integer, no grouping)"),
                 .systemOrange
             )
         case .failed(let msg):
@@ -479,12 +479,12 @@ final class MenubarController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = String(localized: "menubar.alert.port_in_use.title",
-                                   defaultValue: "Port \(config.port) is in use.",
-                                   comment: "Title of the port-conflict alert; placeholder is the port number")
+                                   defaultValue: "Port \(String(config.port)) is in use.",
+                                   comment: "Title of the port-conflict alert; placeholder is the port number (plain integer, no grouping)")
         let pidStr = conflict.pid.map {
             String(localized: "menubar.alert.pid_known",
-                   defaultValue: "PID \($0)",
-                   comment: "Substring describing a known PID; placeholder is the PID number")
+                   defaultValue: "PID \(String($0))",
+                   comment: "Substring describing a known PID; placeholder is the PID number (plain integer, no grouping)")
         } ?? String(localized: "menubar.alert.pid_unknown",
                     defaultValue: "unknown PID",
                     comment: "Substring used when the conflicting process PID couldn't be determined")
@@ -493,7 +493,7 @@ final class MenubarController: NSObject {
                      defaultValue: "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
                      comment: "Port-conflict alert body when the conflicting process is another oMLX instance")
             : String(localized: "menubar.alert.port_in_use.other",
-                     defaultValue: "Another process (\(pidStr)) is listening on port \(config.port). Choose a different port in Settings or terminate that process.",
+                     defaultValue: "Another process (\(pidStr)) is listening on port \(String(config.port)). Choose a different port in Settings or terminate that process.",
                      comment: "Port-conflict alert body when an unrelated process owns the port")
         alert.addButton(withTitle: String(localized: "menubar.alert.ok",
                                           defaultValue: "OK",
