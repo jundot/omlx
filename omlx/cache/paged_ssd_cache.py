@@ -652,6 +652,7 @@ class PagedSSDCacheManager(CacheManager):
             "preload_calls": 0,
             "preload_blocks_loaded": 0,
             "preload_time_ms": 0.0,
+            "ssd_write_drops": 0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -804,6 +805,7 @@ class PagedSSDCacheManager(CacheManager):
             )
             return True
         except queue.Full:
+            self._stats["ssd_write_drops"] += 1
             logger.warning(
                 f"SSD write queue full, dropping evicted block "
                 f"{block_hash.hex()[:16]}"
@@ -1140,6 +1142,7 @@ class PagedSSDCacheManager(CacheManager):
         # Check queue capacity before doing expensive GPU/disk work
         # (not needed for hot cache write-back mode)
         if not self._hot_cache_enabled and self._write_queue.full():
+            self._stats["ssd_write_drops"] += 1
             logger.warning(
                 f"SSD cache write queue full, skipping save for "
                 f"{block_hash.hex()[:16]}"
@@ -1377,6 +1380,7 @@ class PagedSSDCacheManager(CacheManager):
                     (block_hash, tensors_raw, metadata, file_path)
                 )
             except queue.Full:
+                self._stats["ssd_write_drops"] += 1
                 logger.warning(
                     f"SSD cache write queue full, dropping write for "
                     f"{block_hash.hex()[:16]}"
@@ -2282,6 +2286,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                ssd_write_drops=self._stats["ssd_write_drops"],
             )
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
@@ -2340,6 +2345,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                ssd_write_drops=self._stats["ssd_write_drops"],
             )
 
     def get_stats_dict(self) -> dict[str, Any]:
