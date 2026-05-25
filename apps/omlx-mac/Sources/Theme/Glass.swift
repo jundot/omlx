@@ -1,7 +1,10 @@
-// Translucent surface modifier. SwiftUI's `.regularMaterial` /
-// `.thickMaterial` approximate Tahoe liquid-glass closely enough for
-// every surface we currently use. If a future macOS gets a richer
-// `.glassEffect()`-style API worth gating on, gate it here.
+// Translucent surface modifier. macOS 26 (Tahoe) ships a real liquid-glass
+// API via `View.glassEffect(_:)` in SwiftUICore; earlier macOS versions
+// (15.0 deployment-target floor) fall back to the closest material we have.
+// The `Glass` type only exposes `.regular`/`.clear`/`.identity` — there's
+// no thick variant — so `GlassStrength.strong` maps to `Glass.regular`
+// on macOS 26 while the fallback still uses `.thickMaterial` for the same
+// approximation we shipped pre-Tahoe.
 
 import SwiftUI
 
@@ -16,7 +19,11 @@ private struct AppGlassModifier: ViewModifier {
     let strength: GlassStrength
 
     func body(content: Content) -> some View {
-        content.background(material)
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular)
+        } else {
+            content.background(material)
+        }
     }
 
     private var material: Material {
