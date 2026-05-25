@@ -15,14 +15,15 @@ enum GlassStrength {
     case strong
 }
 
-private struct AppGlassModifier: ViewModifier {
+private struct AppGlassModifier<S: Shape>: ViewModifier {
     let strength: GlassStrength
+    let shape: S
 
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular)
+            content.glassEffect(.regular, in: shape)
         } else {
-            content.background(material)
+            content.background(material, in: shape)
         }
     }
 
@@ -37,8 +38,14 @@ private struct AppGlassModifier: ViewModifier {
 extension View {
     /// Background material that approximates Tahoe liquid glass. Use for
     /// sidebar, toolbar, and group surfaces. Hero cards use `.strong`.
+    /// Default shape is `Rectangle()` — pass an explicit shape for rounded
+    /// surfaces (e.g. `RoundedRectangle(cornerRadius: 12)` for hero cards).
     func appGlass(_ strength: GlassStrength = .regular) -> some View {
-        modifier(AppGlassModifier(strength: strength))
+        modifier(AppGlassModifier(strength: strength, shape: Rectangle()))
+    }
+
+    func appGlass<S: Shape>(_ strength: GlassStrength = .regular, in shape: S) -> some View {
+        modifier(AppGlassModifier(strength: strength, shape: shape))
     }
 }
 

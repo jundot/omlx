@@ -213,7 +213,12 @@ struct ServerHeroCard: View {
             buttons
         }
         .padding(18)
+        // Hero card surface: subtle accent gradient over a glass/material
+        // fill that's clipped to the rounded-rect outline. The gradient stays
+        // on top so the green/blue accent reads on both macOS 15 (over
+        // .thickMaterial) and macOS 26 (over real liquid glass).
         .background(heroBackground)
+        .appGlass(.strong, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)

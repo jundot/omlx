@@ -178,7 +178,11 @@ struct Sidebar: View {
             .padding(.top, 6)
             .padding(.bottom, 10)
         }
+        // Translucent glass surface on macOS 26 (Tahoe liquid glass) with a
+        // material approximation fallback on macOS 15. Painting theme.sidebarBg
+        // first preserves the existing tint as the base layer behind the glass.
         .background(theme.sidebarBg)
+        .appGlass(.regular)
         .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(theme.sidebarBorder)

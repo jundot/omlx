@@ -29,6 +29,11 @@ struct AppView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 880, idealWidth: 1140, minHeight: 600, idealHeight: 760)
+        // DesktopWash backdrop: the design's radial-gradient wash that the
+        // glass surfaces (sidebar, hero card) layer over. theme.windowBg
+        // stays painted behind the wash as the opaque base so non-glass
+        // areas keep a solid background.
+        .background(DesktopWash())
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
         .onChange(of: services.requestedSection) { _, requested in
