@@ -77,12 +77,6 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Localized title key resolved against `Localizable.xcstrings`. Falls
-    /// back to the source-language `title` when a translation is missing.
-    var localizedTitle: LocalizedStringResource {
-        LocalizedStringResource(stringLiteral: "sidebar.\(rawValue)")
-    }
-
     var symbol: String {
         switch self {
         case .server:          return "server.rack"
@@ -150,7 +144,27 @@ enum SidebarGroup: String, CaseIterable, Hashable, Sendable {
     }
 
     var localizedTitle: LocalizedStringResource {
-        LocalizedStringResource(stringLiteral: "sidebar.group.\(rawValue.lowercased())")
+        // Static keys with explicit defaultValue so the catalog isn't
+        // load-bearing — a missing entry falls back to the English label
+        // instead of rendering the literal key string.
+        switch self {
+        case .server:
+            return LocalizedStringResource("sidebar.group.server",
+                                           defaultValue: "Server",
+                                           comment: "Sidebar group heading for server-related screens")
+        case .models:
+            return LocalizedStringResource("sidebar.group.models",
+                                           defaultValue: "Models",
+                                           comment: "Sidebar group heading for models/downloads/quant screens")
+        case .bench:
+            return LocalizedStringResource("sidebar.group.benchmark",
+                                           defaultValue: "Benchmark",
+                                           comment: "Sidebar group heading for accuracy + throughput bench screens")
+        case .general:
+            return LocalizedStringResource("sidebar.group.general",
+                                           defaultValue: "General",
+                                           comment: "Sidebar group heading for the about/integrations/logs screens")
+        }
     }
 }
 
@@ -222,7 +236,10 @@ private struct SidebarItem: View {
         Button(action: onTap) {
             HStack(spacing: 9) {
                 Squircle(systemSymbol: section.symbol, size: 20, gradient: section.gradient)
-                Text(section.localizedTitle)
+                // section.title already resolves via String(localized:) with a
+                // per-case defaultValue, so a missing catalog entry falls back
+                // to the English label instead of rendering the literal key.
+                Text(section.title)
                     .font(.omlxText(13, weight: isSelected ? .medium : .regular))
                     .foregroundStyle(theme.text)
                 Spacer(minLength: 0)
