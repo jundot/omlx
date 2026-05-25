@@ -4772,6 +4772,29 @@ class Scheduler:
                         done = self._step_prefill_chunk(state)
                     except _PrefillAbortedError:
                         raise
+                    except RuntimeError as e:
+                        # Hard memory limit hit on the first chunk.
+                        # _step_prefill_chunk updates the PrefillProgressTracker
+                        # before the limit check, so without this catch the
+                        # tracker entry leaks and stays in the dashboard
+                        # forever (#1405). Mirrors the cleanup in
+                        # _advance_chunked_prefills (d736bfd).
+                        logger.error(
+                            "Chunked prefill (first chunk) failed for %s: %s",
+                            request.request_id,
+                            e,
+                        )
+                        self.requests.pop(request.request_id, None)
+                        get_prefill_tracker().remove(request.request_id)
+                        rejected_outputs.append(
+                            RequestOutput(
+                                request_id=request.request_id,
+                                finished=True,
+                                finish_reason="error",
+                                error=str(e),
+                            )
+                        )
+                        continue
 
                     if done:
                         self._emit_final_boundary_if_needed(state)
@@ -4791,12 +4814,35 @@ class Scheduler:
                 self.request_id_to_uid[request.request_id] = temp_uid
                 self.uid_to_request_id[temp_uid] = request.request_id
 
-                prefilled_cache, last_token = self._do_external_prefill(
-                    request,
-                    tokens_to_process,
-                    cache_to_use,
-                    vlm_embeds=vlm_embeds,
-                )
+                try:
+                    prefilled_cache, last_token = self._do_external_prefill(
+                        request,
+                        tokens_to_process,
+                        cache_to_use,
+                        vlm_embeds=vlm_embeds,
+                    )
+                except RuntimeError as e:
+                    # Hard memory limit hit during external prefill. Without
+                    # this catch, the exception bubbles up to step() and then
+                    # engine_core's fail_all_requests(), which pops
+                    # self.requests but cannot reach the PrefillProgressTracker
+                    # singleton, so the dashboard entry leaks across model
+                    # reload (#1405). Mirrors the cleanup in
+                    # _advance_chunked_prefills (d736bfd).
+                    logger.error("Prefill failed for %s: %s", request.request_id, e)
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    self.request_id_to_uid.pop(request.request_id, None)
+                    self.requests.pop(request.request_id, None)
+                    get_prefill_tracker().remove(request.request_id)
+                    rejected_outputs.append(
+                        RequestOutput(
+                            request_id=request.request_id,
+                            finished=True,
+                            finish_reason="error",
+                            error=str(e),
+                        )
+                    )
+                    continue
 
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]
