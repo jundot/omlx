@@ -231,4 +231,7 @@ class TestTemplatesPersistence:
         m2 = ModelSettingsManager(tmp_path)
         names = {t["name"] for t in m2.list_templates()}
         assert names == {"custom"}
-        assert m2.get_template("custom")["is_builtin"] is False
+        # No `is_builtin` is emitted now that builtins are retired; preset
+        # vs user classification lives on the client (preset bundle), not
+        # on this response.
+        assert "is_builtin" not in m2.get_template("custom")
