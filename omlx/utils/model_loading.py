@@ -88,6 +88,13 @@ def maybe_apply_pre_load_patches(
       strict load fails on a Qwen3.6 *-mtp VLM and the engine falls back
       to LLM, losing vision). VLMBatchedEngine passes ``for_vlm=True``;
       BatchedEngine / DFlashEngine / LLM loaders keep the default.
+    - mlx-vlm MoE VLM sanitize patch when ``for_vlm`` is True and the
+      checkpoint is a Qwen3.6 MoE VLM without declared MTP heads.
+      Pre-converted mlx-lm exports ship ``switch_mlp`` weights; stock
+      mlx-vlm ``sanitize`` unconditionally pops ``experts.gate_up_proj``
+      and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
+      is installed first. ``for_vlm=True`` is only passed by
+      ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
 
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
@@ -223,6 +230,33 @@ def maybe_apply_pre_load_patches(
             model_type,
             _has_mtp_heads(config),
         )
+
+    # Pre-converted mlx-lm Qwen3.6 MoE VLMs (e.g. mlx-community mxfp4) ship
+    # switch_mlp weights under language_model.model.* and often declare
+    # mtp_num_hidden_layers=0. The mlx_vlm_mtp sanitize replacement skips
+    # unfuse when switch_mlp is already present; stock mlx-vlm sanitize
+    # unconditionally pops experts.gate_up_proj and VLM load fails with
+    # KeyError → LLM fallback (vision silently dropped, issue #1261). That
+    # sanitize patch was previously only wired through _is_mtp_compatible
+    # above; apply it here for non-MTP MoE VLMs. Runtime MTP patch stays in
+    # the branch above.
+    if (
+        for_vlm
+        and model_type
+        and model_type.startswith("qwen3_5_moe")
+        and not _is_mtp_compatible(config, model_type)
+    ):
+        try:
+            from ..patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+        except Exception as e:
+            logger.debug("qwen3_6 MoE VLM sanitize patch import failed: %s", e)
+        else:
+            if apply_mlx_vlm_mtp_patch():
+                logger.debug(
+                    "mlx-vlm qwen3_6 MoE VLM sanitize patch applied for %s "
+                    "(no MTP heads; switch_mlp load correctness)",
+                    model_name,
+                )
 
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*
