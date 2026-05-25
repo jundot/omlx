@@ -18,8 +18,12 @@ enum DownloadSource: String, CaseIterable, Hashable, Sendable {
 
     var label: String {
         switch self {
-        case .hf: return "Hugging Face"
-        case .ms: return "ModelScope"
+        case .hf: return String(localized: "downloads.source.hf",
+                                defaultValue: "Hugging Face",
+                                comment: "Source selector option label for Hugging Face")
+        case .ms: return String(localized: "downloads.source.ms",
+                                defaultValue: "ModelScope",
+                                comment: "Source selector option label for ModelScope")
         }
     }
 }
@@ -132,7 +136,9 @@ private struct SourceSwitcher: View {
             .frame(width: 280)
             .disabled(!msAvailable)
             if !msAvailable {
-                Text("ModelScope SDK unavailable in this build")
+                Text(String(localized: "downloads.source.ms_unavailable",
+                            defaultValue: "ModelScope SDK unavailable in this build",
+                            comment: "Inline note shown beside the source switcher when the ModelScope SDK isn't installed"))
                     .font(.omlxText(10.5))
                     .foregroundStyle(.secondary)
             }
@@ -171,7 +177,9 @@ private struct AddFromHFSection: View {
     }
 
     var body: some View {
-        SectionHeader("Add Model from Hugging Face")
+        SectionHeader(String(localized: "downloads.hf.section.title",
+                              defaultValue: "Add Model from Hugging Face",
+                              comment: "Section heading above the Hugging Face download form"))
 
         ListGroup {
             FreeRow(isLast: true) {
@@ -192,7 +200,10 @@ private struct AddFromHFSection: View {
                         Button {
                             onSubmit()
                         } label: {
-                            Label("Download", systemImage: "icloud.and.arrow.down")
+                            Label(String(localized: "downloads.button.download",
+                                         defaultValue: "Download",
+                                         comment: "Primary button that starts downloading the entered repo"),
+                                  systemImage: "icloud.and.arrow.down")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.primary))
@@ -221,14 +232,18 @@ private struct AddFromHFSection: View {
             Image(systemName: "globe")
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textTertiary)
-            Text("Mirror:")
+            Text(String(localized: "downloads.mirror.label",
+                        defaultValue: "Mirror:",
+                        comment: "Inline label preceding the mirror host on the Downloads screen"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
-                Text("custom")
+                Text(String(localized: "downloads.mirror.custom",
+                            defaultValue: "custom",
+                            comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
                     .font(.omlxText(10, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
@@ -237,7 +252,9 @@ private struct AddFromHFSection: View {
                     .clipShape(Capsule())
             }
             Spacer(minLength: 8)
-            Button("Configure mirror…") {
+            Button(String(localized: "downloads.mirror.configure",
+                          defaultValue: "Configure mirror…",
+                          comment: "Button that opens the inline mirror editor")) {
                 mirrorDraft = mirrorIsCustom ? mirrorHost : ""
                 isEditingMirror = true
             }
@@ -250,25 +267,33 @@ private struct AddFromHFSection: View {
         HStack(spacing: 8) {
             TextInput(
                 text: $mirrorDraft,
-                placeholder: "https://hf-mirror.com  (empty = huggingface.co)",
+                placeholder: String(localized: "downloads.hf.mirror.placeholder",
+                                    defaultValue: "https://hf-mirror.com  (empty = huggingface.co)",
+                                    comment: "Placeholder for the HF mirror endpoint input"),
                 mono: true
             )
             .frame(maxWidth: .infinity)
             .focused($mirrorFocused)
             .onSubmit { onSaveMirror() }
-            Button("Reset") {
+            Button(String(localized: "downloads.mirror.reset",
+                          defaultValue: "Reset",
+                          comment: "Button that clears the mirror endpoint back to the default")) {
                 mirrorDraft = ""
                 onResetMirror()
             }
             .buttonStyle(.omlx(.plain, size: .small))
             .disabled(mirrorBusy || (!mirrorIsCustom && mirrorDraft.isEmpty))
-            Button("Cancel") {
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button")) {
                 isEditingMirror = false
                 mirrorDraft = ""
             }
             .buttonStyle(.omlx(.normal, size: .small))
             .disabled(mirrorBusy)
-            Button("Save") { onSaveMirror() }
+            Button(String(localized: "common.save",
+                          defaultValue: "Save",
+                          comment: "Generic save button")) { onSaveMirror() }
                 .buttonStyle(.omlx(.primary, size: .small))
                 .disabled(mirrorBusy)
         }
@@ -306,7 +331,9 @@ private struct AddFromMSSection: View {
     }
 
     var body: some View {
-        SectionHeader("Add Model from ModelScope")
+        SectionHeader(String(localized: "downloads.ms.section.title",
+                              defaultValue: "Add Model from ModelScope",
+                              comment: "Section heading above the ModelScope download form"))
 
         ListGroup {
             FreeRow(isLast: true) {
@@ -327,7 +354,10 @@ private struct AddFromMSSection: View {
                         Button {
                             onSubmit()
                         } label: {
-                            Label("Download", systemImage: "icloud.and.arrow.down")
+                            Label(String(localized: "downloads.button.download",
+                                         defaultValue: "Download",
+                                         comment: "Primary button that starts downloading the entered repo"),
+                                  systemImage: "icloud.and.arrow.down")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.primary))
@@ -356,14 +386,18 @@ private struct AddFromMSSection: View {
             Image(systemName: "globe")
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textTertiary)
-            Text("Mirror:")
+            Text(String(localized: "downloads.mirror.label",
+                        defaultValue: "Mirror:",
+                        comment: "Inline label preceding the mirror host on the Downloads screen"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
-                Text("custom")
+                Text(String(localized: "downloads.mirror.custom",
+                            defaultValue: "custom",
+                            comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
                     .font(.omlxText(10, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
@@ -372,7 +406,9 @@ private struct AddFromMSSection: View {
                     .clipShape(Capsule())
             }
             Spacer(minLength: 8)
-            Button("Configure mirror…") {
+            Button(String(localized: "downloads.mirror.configure",
+                          defaultValue: "Configure mirror…",
+                          comment: "Button that opens the inline mirror editor")) {
                 mirrorDraft = mirrorIsCustom ? mirrorHost : ""
                 isEditingMirror = true
             }
@@ -385,25 +421,33 @@ private struct AddFromMSSection: View {
         HStack(spacing: 8) {
             TextInput(
                 text: $mirrorDraft,
-                placeholder: "https://modelscope.cn  (empty = ModelScope default)",
+                placeholder: String(localized: "downloads.ms.mirror.placeholder",
+                                    defaultValue: "https://modelscope.cn  (empty = ModelScope default)",
+                                    comment: "Placeholder for the ModelScope mirror endpoint input"),
                 mono: true
             )
             .frame(maxWidth: .infinity)
             .focused($mirrorFocused)
             .onSubmit { onSaveMirror() }
-            Button("Reset") {
+            Button(String(localized: "downloads.mirror.reset",
+                          defaultValue: "Reset",
+                          comment: "Button that clears the mirror endpoint back to the default")) {
                 mirrorDraft = ""
                 onResetMirror()
             }
             .buttonStyle(.omlx(.plain, size: .small))
             .disabled(mirrorBusy || (!mirrorIsCustom && mirrorDraft.isEmpty))
-            Button("Cancel") {
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button")) {
                 isEditingMirror = false
                 mirrorDraft = ""
             }
             .buttonStyle(.omlx(.normal, size: .small))
             .disabled(mirrorBusy)
-            Button("Save") { onSaveMirror() }
+            Button(String(localized: "common.save",
+                          defaultValue: "Save",
+                          comment: "Generic save button")) { onSaveMirror() }
                 .buttonStyle(.omlx(.primary, size: .small))
                 .disabled(mirrorBusy)
         }
@@ -430,7 +474,9 @@ private struct SearchDropdown: View {
         VStack(spacing: 0) {
             if results.isEmpty && isLoading {
                 HStack(spacing: 8) {
-                    Text("Searching…")
+                    Text(String(localized: "downloads.search.loading",
+                                defaultValue: "Searching…",
+                                comment: "Placeholder shown inside the autocomplete dropdown while a search is in flight"))
                         .font(.omlxText(11))
                         .foregroundStyle(theme.textTertiary)
                     Spacer()
@@ -509,8 +555,16 @@ private struct ActiveDownloadsSection: View {
 
     var body: some View {
         SectionHeader(
-            "Active Downloads",
-            subtitle: tasks.isEmpty ? "No active tasks" : "\(tasks.count) running"
+            String(localized: "downloads.active.title",
+                   defaultValue: "Active Downloads",
+                   comment: "Section heading for the list of in-progress downloads"),
+            subtitle: tasks.isEmpty
+                ? String(localized: "downloads.active.subtitle.empty",
+                         defaultValue: "No active tasks",
+                         comment: "Subtitle for Active Downloads when there are none")
+                : String(localized: "downloads.active.subtitle.running",
+                         defaultValue: "\(tasks.count) running",
+                         comment: "Subtitle for Active Downloads; placeholder is the count of running tasks")
         )
 
         if !tasks.isEmpty {
@@ -528,7 +582,9 @@ private struct ActiveDownloadsSection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
-                                Text("\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))")
+                                Text(String(localized: "downloads.progress.bytes",
+                                            defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
+                                            comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
                                 Button {
@@ -542,7 +598,9 @@ private struct ActiveDownloadsSection: View {
                                         .font(.system(size: 11))
                                 }
                                 .buttonStyle(.omlx(.plain, size: .small))
-                                .help("Cancel")
+                                .help(String(localized: "downloads.cancel.help",
+                                             defaultValue: "Cancel",
+                                             comment: "Tooltip on the X button that cancels or removes a download task"))
                             }
                             ProgressBar(progress: task.progress / 100)
                             HStack(spacing: 12) {
@@ -569,12 +627,30 @@ private struct StatusChip: View {
     var body: some View {
         let cfg: (Color, String) = {
             switch task.statusEnum {
-            case .downloading: return (theme.blueDot, "Downloading")
-            case .pending:     return (theme.amberDot, "Queued")
-            case .completed:   return (theme.greenDot, "Completed")
-            case .failed:      return (theme.redDot, "Failed")
-            case .cancelled:   return (theme.textTertiary, "Cancelled")
-            case .paused:      return (theme.amberDot, "Paused")
+            case .downloading: return (theme.blueDot,
+                                       String(localized: "downloads.status.downloading",
+                                              defaultValue: "Downloading",
+                                              comment: "Status chip label while a download is actively transferring bytes"))
+            case .pending:     return (theme.amberDot,
+                                       String(localized: "downloads.status.queued",
+                                              defaultValue: "Queued",
+                                              comment: "Status chip label for a download waiting to start"))
+            case .completed:   return (theme.greenDot,
+                                       String(localized: "downloads.status.completed",
+                                              defaultValue: "Completed",
+                                              comment: "Status chip label for a finished download"))
+            case .failed:      return (theme.redDot,
+                                       String(localized: "downloads.status.failed",
+                                              defaultValue: "Failed",
+                                              comment: "Status chip label for a download that errored out"))
+            case .cancelled:   return (theme.textTertiary,
+                                       String(localized: "downloads.status.cancelled",
+                                              defaultValue: "Cancelled",
+                                              comment: "Status chip label for a download cancelled by the user"))
+            case .paused:      return (theme.amberDot,
+                                       String(localized: "downloads.status.paused",
+                                              defaultValue: "Paused",
+                                              comment: "Status chip label for a paused download"))
             case .none:        return (theme.textTertiary, task.status.capitalized)
             }
         }()
@@ -618,7 +694,12 @@ private struct CompletedTasksSection: View {
 
     var body: some View {
         if tasks.isEmpty { EmptyView() } else {
-            SectionHeader("Recent Tasks", subtitle: "\(tasks.count) recent")
+            SectionHeader(String(localized: "downloads.recent.title",
+                                  defaultValue: "Recent Tasks",
+                                  comment: "Section heading for recently completed or failed downloads"),
+                          subtitle: String(localized: "downloads.recent.subtitle",
+                                           defaultValue: "\(tasks.count) recent",
+                                           comment: "Subtitle for Recent Tasks; placeholder is the count of recent terminal tasks"))
             ListGroup {
                 ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in
                     FreeRow(isLast: idx == tasks.count - 1) {
@@ -631,7 +712,9 @@ private struct CompletedTasksSection: View {
                                 .truncationMode(.middle)
                             Spacer(minLength: 4)
                             if task.statusEnum == .failed || task.statusEnum == .cancelled {
-                                Button("Retry") { onRetry(task.taskId) }
+                                Button(String(localized: "downloads.button.retry",
+                                              defaultValue: "Retry",
+                                              comment: "Button label that re-runs a failed or cancelled download")) { onRetry(task.taskId) }
                                     .buttonStyle(.omlx(.normal, size: .small))
                             }
                             Button {
@@ -661,7 +744,10 @@ private struct SuggestedSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("Suggested Models", subtitle: hint) {
+        SectionHeader(String(localized: "downloads.suggested.title",
+                              defaultValue: "Suggested Models",
+                              comment: "Section heading for the recommended-models section"),
+                      subtitle: hint) {
             HStack(spacing: 6) {
                 Popup(
                     selection: $sort,
@@ -683,7 +769,9 @@ private struct SuggestedSection: View {
                 FreeRow(isLast: true) {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("Loading recommendations…")
+                        Text(String(localized: "downloads.suggested.loading",
+                                    defaultValue: "Loading recommendations…",
+                                    comment: "Placeholder shown while the recommended-models list is fetching"))
                             .font(.omlxText(12))
                             .foregroundStyle(theme.textSecondary)
                     }
@@ -692,7 +780,9 @@ private struct SuggestedSection: View {
                 }
             } else if models.isEmpty {
                 FreeRow(isLast: true) {
-                    Text("No suggestions available right now.")
+                    Text(String(localized: "downloads.suggested.empty",
+                                defaultValue: "No suggestions available right now.",
+                                comment: "Empty-state message for the Suggested Models section"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -722,7 +812,10 @@ private struct SuggestedSection: View {
                             Button {
                                 onGet(m.repoId)
                             } label: {
-                                Label("Get", systemImage: "icloud.and.arrow.down")
+                                Label(String(localized: "downloads.suggested.get",
+                                             defaultValue: "Get",
+                                             comment: "Compact button label that starts downloading a suggested model"),
+                                      systemImage: "icloud.and.arrow.down")
                                     .labelStyle(.titleAndIcon)
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
@@ -734,7 +827,11 @@ private struct SuggestedSection: View {
     }
 
     private var hint: String? {
-        models.isEmpty ? nil : "Filtered by free RAM"
+        models.isEmpty
+            ? nil
+            : String(localized: "downloads.suggested.hint.filtered_by_ram",
+                     defaultValue: "Filtered by free RAM",
+                     comment: "Subtitle hint on the Suggested Models header explaining the filter")
     }
 
     private func secondaryLine(for m: HFModelInfo) -> String {
@@ -753,9 +850,15 @@ enum SuggestedSort: String, Hashable, CaseIterable {
 
     var label: String {
         switch self {
-        case .downloads: return "Most downloaded"
-        case .params:    return "Parameters: high to low"
-        case .size:      return "Size: high to low"
+        case .downloads: return String(localized: "downloads.suggested.sort.downloads",
+                                       defaultValue: "Most downloaded",
+                                       comment: "Sort option: rank suggested models by download count")
+        case .params:    return String(localized: "downloads.suggested.sort.params",
+                                       defaultValue: "Parameters: high to low",
+                                       comment: "Sort option: rank suggested models by parameter count, descending")
+        case .size:      return String(localized: "downloads.suggested.sort.size",
+                                       defaultValue: "Size: high to low",
+                                       comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
 }

@@ -29,7 +29,9 @@ struct PerformanceScreen: View {
 
             HStack {
                 Spacer()
-                Button("Apply") {
+                Button(String(localized: "performance.button.apply",
+                              defaultValue: "Apply",
+                              comment: "Apply button at the bottom of the Performance screen")) {
                     Task { await vm.save(client: services.client) }
                 }
                 .buttonStyle(.omlx(.primary))
@@ -57,20 +59,32 @@ private struct SchedulerSection: View {
 
     var body: some View {
         SectionHeader(
-            "Scheduler",
-            subtitle: "How many requests run at once and how the engine batches them."
+            String(localized: "performance.section.scheduler",
+                   defaultValue: "Scheduler",
+                   comment: "Section header for the scheduler rows"),
+            subtitle: String(localized: "performance.section.scheduler.sub",
+                             defaultValue: "How many requests run at once and how the engine batches them.",
+                             comment: "Subtitle for the Scheduler section")
         )
 
         ListGroup {
             Row(
-                label: "Max Concurrent Requests",
-                sublabel: "Cap on simultaneous /v1 requests."
+                label: String(localized: "performance.scheduler.max_concurrent",
+                              defaultValue: "Max Concurrent Requests",
+                              comment: "Row label for max concurrent requests"),
+                sublabel: String(localized: "performance.scheduler.max_concurrent.sub",
+                                 defaultValue: "Cap on simultaneous /v1 requests.",
+                                 comment: "Sublabel for max concurrent requests")
             ) {
                 TextInput(text: $vm.maxConcurrentText, mono: true, width: 90)
             }
             Row(
-                label: "Chunked Prefill",
-                sublabel: "Split long prompts across scheduler ticks so other requests can interleave.",
+                label: String(localized: "performance.scheduler.chunked_prefill",
+                              defaultValue: "Chunked Prefill",
+                              comment: "Row label for chunked prefill toggle"),
+                sublabel: String(localized: "performance.scheduler.chunked_prefill.sub",
+                                 defaultValue: "Split long prompts across scheduler ticks so other requests can interleave.",
+                                 comment: "Sublabel for chunked prefill toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: $vm.chunkedPrefill)
@@ -87,55 +101,85 @@ private struct MemoryLifecycleSection: View {
 
     var body: some View {
         SectionHeader(
-            "Memory & Lifecycle",
-            subtitle: "Ceilings + auto-unload behavior. Memory limits accept \"auto\", \"disabled\", \"24GB\", or \"50%\"."
+            String(localized: "performance.section.memory",
+                   defaultValue: "Memory & Lifecycle",
+                   comment: "Section header for memory and lifecycle settings"),
+            subtitle: String(localized: "performance.section.memory.sub",
+                             defaultValue: "Ceilings + auto-unload behavior. Memory limits accept \"auto\", \"disabled\", \"24GB\", or \"50%\".",
+                             comment: "Subtitle explaining accepted memory limit values")
         )
 
         ListGroup {
             Row(
-                label: "Max Process Memory",
-                sublabel: "Total resident memory ceiling for the server process."
+                label: String(localized: "performance.memory.max_process",
+                              defaultValue: "Max Process Memory",
+                              comment: "Row label for the max process memory field"),
+                sublabel: String(localized: "performance.memory.max_process.sub",
+                                 defaultValue: "Total resident memory ceiling for the server process.",
+                                 comment: "Sublabel for max process memory")
             ) {
                 TextInput(
                     text: $vm.maxProcessMemory,
-                    placeholder: "auto",
+                    placeholder: String(localized: "performance.memory.placeholder_auto",
+                                        defaultValue: "auto",
+                                        comment: "Memory field placeholder meaning automatic"),
                     mono: true,
                     width: 140
                 )
             }
             Row(
-                label: "Max Model Memory",
-                sublabel: "Engine pool ceiling. Models above this won't be auto-loaded."
+                label: String(localized: "performance.memory.max_model",
+                              defaultValue: "Max Model Memory",
+                              comment: "Row label for the max model memory field"),
+                sublabel: String(localized: "performance.memory.max_model.sub",
+                                 defaultValue: "Engine pool ceiling. Models above this won't be auto-loaded.",
+                                 comment: "Sublabel for max model memory")
             ) {
                 TextInput(
                     text: $vm.maxModelMemory,
-                    placeholder: "auto",
+                    placeholder: String(localized: "performance.memory.placeholder_auto",
+                                        defaultValue: "auto",
+                                        comment: "Memory field placeholder meaning automatic"),
                     mono: true,
                     width: 140
                 )
             }
             Row(
-                label: "Prefill Memory Guard",
-                sublabel: "Preflight prefill memory before kicking the engine. Drops requests that would OOM."
+                label: String(localized: "performance.memory.prefill_guard",
+                              defaultValue: "Prefill Memory Guard",
+                              comment: "Row label for prefill memory guard toggle"),
+                sublabel: String(localized: "performance.memory.prefill_guard.sub",
+                                 defaultValue: "Preflight prefill memory before kicking the engine. Drops requests that would OOM.",
+                                 comment: "Sublabel for prefill memory guard")
             ) {
                 Toggle("", isOn: $vm.prefillMemoryGuard)
                     .labelsHidden().toggleStyle(.switch)
             }
             Row(
-                label: "Idle Timeout",
-                sublabel: "Server-wide auto-unload after N seconds idle. Empty = disabled. Minimum 60."
+                label: String(localized: "performance.memory.idle_timeout",
+                              defaultValue: "Idle Timeout",
+                              comment: "Row label for idle timeout field"),
+                sublabel: String(localized: "performance.memory.idle_timeout.sub",
+                                 defaultValue: "Server-wide auto-unload after N seconds idle. Empty = disabled. Minimum 60.",
+                                 comment: "Sublabel for idle timeout")
             ) {
                 TextInput(
                     text: $vm.idleTimeoutText,
-                    placeholder: "off",
+                    placeholder: String(localized: "performance.memory.idle_timeout.placeholder",
+                                        defaultValue: "off",
+                                        comment: "Placeholder text for the idle timeout field when disabled"),
                     mono: true,
                     suffix: "s",
                     width: 110
                 )
             }
             Row(
-                label: "Model Fallback",
-                sublabel: "When the requested model isn't loaded, route to any loaded model instead of 404.",
+                label: String(localized: "performance.memory.model_fallback",
+                              defaultValue: "Model Fallback",
+                              comment: "Row label for model fallback toggle"),
+                sublabel: String(localized: "performance.memory.model_fallback.sub",
+                                 defaultValue: "When the requested model isn't loaded, route to any loaded model instead of 404.",
+                                 comment: "Sublabel for model fallback toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: $vm.modelFallback)
@@ -152,41 +196,63 @@ private struct CacheSection: View {
 
     var body: some View {
         SectionHeader(
-            "Cache",
-            subtitle: "KV cache spillover. The master switch gates everything below."
+            String(localized: "performance.section.cache",
+                   defaultValue: "Cache",
+                   comment: "Section header for KV cache settings"),
+            subtitle: String(localized: "performance.section.cache.sub",
+                             defaultValue: "KV cache spillover. The master switch gates everything below.",
+                             comment: "Subtitle for the Cache section")
         )
 
         ListGroup {
             Row(
-                label: "Cache Enabled",
-                sublabel: "Master switch for the engine's KV cache subsystem."
+                label: String(localized: "performance.cache.enabled",
+                              defaultValue: "Cache Enabled",
+                              comment: "Row label for the master cache enable toggle"),
+                sublabel: String(localized: "performance.cache.enabled.sub",
+                                 defaultValue: "Master switch for the engine's KV cache subsystem.",
+                                 comment: "Sublabel for the master cache enable toggle")
             ) {
                 Toggle("", isOn: $vm.cacheEnabled)
                     .labelsHidden().toggleStyle(.switch)
             }
             Row(
-                label: "Hot Cache Only",
-                sublabel: "Skip SSD spillover. Useful on fast machines with abundant RAM."
+                label: String(localized: "performance.cache.hot_only",
+                              defaultValue: "Hot Cache Only",
+                              comment: "Row label for the hot cache only toggle"),
+                sublabel: String(localized: "performance.cache.hot_only.sub",
+                                 defaultValue: "Skip SSD spillover. Useful on fast machines with abundant RAM.",
+                                 comment: "Sublabel for hot cache only toggle")
             ) {
                 Toggle("", isOn: $vm.hotCacheOnly)
                     .labelsHidden().toggleStyle(.switch)
                     .disabled(!vm.cacheEnabled)
             }
             Row(
-                label: "Hot Cache Size",
-                sublabel: "RAM ceiling for hot cache. \"0\" disables, \"8GB\" or \"auto\" accepted."
+                label: String(localized: "performance.cache.hot_size",
+                              defaultValue: "Hot Cache Size",
+                              comment: "Row label for the hot cache size field"),
+                sublabel: String(localized: "performance.cache.hot_size.sub",
+                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, \"8GB\" or \"auto\" accepted.",
+                                 comment: "Sublabel describing accepted hot cache size values")
             ) {
                 TextInput(
                     text: $vm.hotCacheMaxSize,
-                    placeholder: "auto",
+                    placeholder: String(localized: "performance.memory.placeholder_auto",
+                                        defaultValue: "auto",
+                                        comment: "Memory field placeholder meaning automatic"),
                     mono: true,
                     width: 140
                 )
                 .disabled(!vm.cacheEnabled)
             }
             Row(
-                label: "SSD Cache Directory",
-                sublabel: "Where cold-spillover blocks live. Empty = base_path/cache."
+                label: String(localized: "performance.cache.ssd_dir",
+                              defaultValue: "SSD Cache Directory",
+                              comment: "Row label for the SSD cache directory field"),
+                sublabel: String(localized: "performance.cache.ssd_dir.sub",
+                                 defaultValue: "Where cold-spillover blocks live. Empty = base_path/cache.",
+                                 comment: "Sublabel for the SSD cache directory")
             ) {
                 TextInput(
                     text: $vm.ssdCacheDir,
@@ -197,25 +263,37 @@ private struct CacheSection: View {
                 .disabled(!vm.cacheEnabled || vm.hotCacheOnly)
             }
             Row(
-                label: "SSD Cache Size",
-                sublabel: "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity."
+                label: String(localized: "performance.cache.ssd_size",
+                              defaultValue: "SSD Cache Size",
+                              comment: "Row label for the SSD cache size field"),
+                sublabel: String(localized: "performance.cache.ssd_size.sub",
+                                 defaultValue: "Cold-spillover ceiling. \"auto\" = 10% of SSD capacity.",
+                                 comment: "Sublabel describing accepted SSD cache size values")
             ) {
                 TextInput(
                     text: $vm.ssdCacheMaxSize,
-                    placeholder: "auto",
+                    placeholder: String(localized: "performance.memory.placeholder_auto",
+                                        defaultValue: "auto",
+                                        comment: "Memory field placeholder meaning automatic"),
                     mono: true,
                     width: 140
                 )
                 .disabled(!vm.cacheEnabled || vm.hotCacheOnly)
             }
             Row(
-                label: "Initial Cache Blocks",
-                sublabel: "Pre-allocated cache blocks at server start. Requires restart to apply.",
+                label: String(localized: "performance.cache.initial_blocks",
+                              defaultValue: "Initial Cache Blocks",
+                              comment: "Row label for the initial cache blocks field"),
+                sublabel: String(localized: "performance.cache.initial_blocks.sub",
+                                 defaultValue: "Pre-allocated cache blocks at server start. Requires restart to apply.",
+                                 comment: "Sublabel for the initial cache blocks field"),
                 isLast: true
             ) {
                 TextInput(
                     text: $vm.initialCacheBlocksText,
-                    placeholder: "auto",
+                    placeholder: String(localized: "performance.memory.placeholder_auto",
+                                        defaultValue: "auto",
+                                        comment: "Memory field placeholder meaning automatic"),
                     mono: true,
                     width: 110
                 )
@@ -331,7 +409,9 @@ final class PerformanceScreenVM: ObservableObject {
         // Validate first so a bad field's error surfaces without sending a
         // partial patch.
         guard let mc = parsedMaxConcurrent, mc > 0 else {
-            self.lastError = "Max Concurrent Requests must be a positive integer."
+            self.lastError = String(localized: "performance.error.max_concurrent_invalid",
+                                    defaultValue: "Max Concurrent Requests must be a positive integer.",
+                                    comment: "Performance screen error when max concurrent input is invalid")
             return
         }
         // Idle timeout: empty = leave alone (no patch field for null). Non-
@@ -340,7 +420,9 @@ final class PerformanceScreenVM: ObservableObject {
         var idleSeconds: Int? = nil
         if !idleTrimmed.isEmpty {
             guard let n = Int(idleTrimmed), n >= 60 else {
-                self.lastError = "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged)."
+                self.lastError = String(localized: "performance.error.idle_timeout_invalid",
+                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged).",
+                                        comment: "Performance screen error when idle timeout input is below 60 seconds")
                 return
             }
             idleSeconds = n
@@ -350,7 +432,9 @@ final class PerformanceScreenVM: ObservableObject {
         var initBlocks: Int? = nil
         if !initTrimmed.isEmpty {
             guard let n = Int(initTrimmed), n > 0 else {
-                self.lastError = "Initial Cache Blocks must be a positive integer (or empty)."
+                self.lastError = String(localized: "performance.error.initial_blocks_invalid",
+                                        defaultValue: "Initial Cache Blocks must be a positive integer (or empty).",
+                                        comment: "Performance screen error when initial cache blocks input is invalid")
                 return
             }
             initBlocks = n

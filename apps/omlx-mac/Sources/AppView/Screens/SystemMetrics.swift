@@ -99,10 +99,22 @@ final class SystemMetricsPoller: ObservableObject {
 
     nonisolated static func label(for severity: ThermalSeverity) -> String {
         switch severity {
-        case .nominal:  return "Nominal"
-        case .fair:     return "Fair"
-        case .serious:  return "Serious"
-        case .critical: return "Critical"
+        case .nominal:
+            return String(localized: "metrics.thermal.nominal",
+                          defaultValue: "Nominal",
+                          comment: "Thermal severity label shown in the Status screen's System block")
+        case .fair:
+            return String(localized: "metrics.thermal.fair",
+                          defaultValue: "Fair",
+                          comment: "Thermal severity label shown in the Status screen's System block")
+        case .serious:
+            return String(localized: "metrics.thermal.serious",
+                          defaultValue: "Serious",
+                          comment: "Thermal severity label shown in the Status screen's System block")
+        case .critical:
+            return String(localized: "metrics.thermal.critical",
+                          defaultValue: "Critical",
+                          comment: "Thermal severity label shown in the Status screen's System block")
         }
     }
 

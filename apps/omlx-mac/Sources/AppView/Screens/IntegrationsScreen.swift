@@ -45,22 +45,37 @@ private struct ClaudeCodeSection: View {
 
     var body: some View {
         SectionHeader(
-            "Claude Code",
-            subtitle: "Route Claude Code requests to local models or the cloud"
+            String(localized: "integrations.section.claude_code",
+                   defaultValue: "Claude Code",
+                   comment: "Section header for the Claude Code integration"),
+            subtitle: String(localized: "integrations.section.claude_code.sub",
+                             defaultValue: "Route Claude Code requests to local models or the cloud",
+                             comment: "Subtitle for the Claude Code section")
         )
 
         ListGroup {
-            Row(label: "Mode") {
+            Row(label: String(localized: "integrations.claude.mode",
+                              defaultValue: "Mode",
+                              comment: "Row label for the Claude Code mode segmented control")) {
                 Segmented(
                     selection: vm.bind($vm.claudeMode, save: {
                         Task { await vm.save(.claudeMode, client: client) }
                     }),
-                    options: [("cloud", "Cloud"), ("local", "Local")]
+                    options: [
+                        ("cloud", String(localized: "integrations.claude.mode.cloud",
+                                          defaultValue: "Cloud",
+                                          comment: "Claude Code mode option: route to cloud")),
+                        ("local", String(localized: "integrations.claude.mode.local",
+                                          defaultValue: "Local",
+                                          comment: "Claude Code mode option: route to local server")),
+                    ]
                 )
                 .frame(width: 160)
             }
             if vm.claudeMode == "local" {
-                Row(label: "Opus tier") {
+                Row(label: String(localized: "integrations.claude.opus",
+                                  defaultValue: "Opus tier",
+                                  comment: "Row label for the Opus model picker")) {
                     Popup(
                         selection: vm.bind($vm.opusModel, save: {
                             Task { await vm.save(.opusModel, client: client) }
@@ -69,7 +84,9 @@ private struct ClaudeCodeSection: View {
                         options: vm.modelOptions
                     )
                 }
-                Row(label: "Sonnet tier") {
+                Row(label: String(localized: "integrations.claude.sonnet",
+                                  defaultValue: "Sonnet tier",
+                                  comment: "Row label for the Sonnet model picker")) {
                     Popup(
                         selection: vm.bind($vm.sonnetModel, save: {
                             Task { await vm.save(.sonnetModel, client: client) }
@@ -79,8 +96,12 @@ private struct ClaudeCodeSection: View {
                     )
                 }
                 Row(
-                    label: "Haiku tier",
-                    sublabel: "Used for background tasks and tool calls"
+                    label: String(localized: "integrations.claude.haiku",
+                                  defaultValue: "Haiku tier",
+                                  comment: "Row label for the Haiku model picker"),
+                    sublabel: String(localized: "integrations.claude.haiku.sub",
+                                     defaultValue: "Used for background tasks and tool calls",
+                                     comment: "Sublabel for the Haiku tier picker")
                 ) {
                     Popup(
                         selection: vm.bind($vm.haikuModel, save: {
@@ -92,8 +113,12 @@ private struct ClaudeCodeSection: View {
                 }
             }
             Row(
-                label: "Context scaling",
-                sublabel: "Stretch context windows for long agentic sessions",
+                label: String(localized: "integrations.claude.context_scaling",
+                              defaultValue: "Context scaling",
+                              comment: "Row label for the Claude Code context scaling toggle"),
+                sublabel: String(localized: "integrations.claude.context_scaling.sub",
+                                 defaultValue: "Stretch context windows for long agentic sessions",
+                                 comment: "Sublabel for the context scaling toggle"),
                 isLast: !vm.contextScaling
             ) {
                 Toggle("", isOn: vm.bind($vm.contextScaling, save: {
@@ -103,8 +128,12 @@ private struct ClaudeCodeSection: View {
             }
             if vm.contextScaling {
                 Row(
-                    label: "Target context size",
-                    sublabel: "Per-request context window Claude Code will scale toward",
+                    label: String(localized: "integrations.claude.target_context",
+                                  defaultValue: "Target context size",
+                                  comment: "Row label for the Claude Code target context size field"),
+                    sublabel: String(localized: "integrations.claude.target_context.sub",
+                                     defaultValue: "Per-request context window Claude Code will scale toward",
+                                     comment: "Sublabel for the target context size field"),
                     isLast: true
                 ) {
                     TextInput(
@@ -131,7 +160,9 @@ private struct ClaudeSetupCommandSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("Setup Command")
+        SectionHeader(String(localized: "integrations.section.setup_command",
+                              defaultValue: "Setup Command",
+                              comment: "Section header for the Claude Code setup command block"))
 
         VStack(alignment: .leading, spacing: 10) {
             CommandBlock(command: vm.claudeLaunchCommand)
@@ -139,15 +170,21 @@ private struct ClaudeSetupCommandSection: View {
             DisclosureGroup(isExpanded: $showAdvanced) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(vm.claudeMode == "cloud"
-                         ? "Resets Anthropic env vars so the real `claude` binary talks to the cloud."
-                         : "Points the real `claude` binary at your local oMLX server.")
+                         ? String(localized: "integrations.setup.advanced.cloud",
+                                  defaultValue: "Resets Anthropic env vars so the real `claude` binary talks to the cloud.",
+                                  comment: "Explanation of the advanced env recipe in cloud mode")
+                         : String(localized: "integrations.setup.advanced.local",
+                                  defaultValue: "Points the real `claude` binary at your local oMLX server.",
+                                  comment: "Explanation of the advanced env recipe in local mode"))
                         .font(.omlxText(11.5))
                         .foregroundStyle(theme.textSecondary)
                     CommandBlock(command: vm.claudeEnvRecipe)
                 }
                 .padding(.top, 6)
             } label: {
-                Text("Advanced — run `claude` directly")
+                Text(String(localized: "integrations.setup.advanced.label",
+                            defaultValue: "Advanced — run `claude` directly",
+                            comment: "Disclosure label revealing the advanced env-var recipe for running claude directly"))
                     .font(.omlxText(12, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
             }
@@ -166,7 +203,9 @@ private struct CommandBlock: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("$ Terminal")
+                Text(String(localized: "integrations.command.terminal_caption",
+                            defaultValue: "$ Terminal",
+                            comment: "Caption above each shell command block"))
                     .font(.omlxText(10, weight: .semibold))
                     .foregroundStyle(theme.textTertiary)
                     .textCase(.uppercase)
@@ -226,13 +265,19 @@ private struct OtherIntegrationsSection: View {
 
     var body: some View {
         SectionHeader(
-            "Other Integrations",
-            subtitle: "Default model + launcher command for each named integration"
+            String(localized: "integrations.section.other",
+                   defaultValue: "Other Integrations",
+                   comment: "Section header for the additional integrations list"),
+            subtitle: String(localized: "integrations.section.other.sub",
+                             defaultValue: "Default model + launcher command for each named integration",
+                             comment: "Subtitle for the Other Integrations section")
         )
 
         ListGroup {
             IntegrationRow(
-                name: "Codex",
+                name: String(localized: "integrations.tool.codex",
+                             defaultValue: "Codex",
+                             comment: "Display name for the Codex integration"),
                 modelBinding: vm.bind($vm.codexModel, save: {
                     Task { await vm.save(.codexModel, client: client) }
                 }),
@@ -240,7 +285,9 @@ private struct OtherIntegrationsSection: View {
                 command: vm.codexCommand
             )
             IntegrationRow(
-                name: "OpenCode",
+                name: String(localized: "integrations.tool.opencode",
+                             defaultValue: "OpenCode",
+                             comment: "Display name for the OpenCode integration"),
                 modelBinding: vm.bind($vm.opencodeModel, save: {
                     Task { await vm.save(.opencodeModel, client: client) }
                 }),
@@ -248,7 +295,9 @@ private struct OtherIntegrationsSection: View {
                 command: vm.opencodeCommand
             )
             IntegrationRow(
-                name: "OpenClaw",
+                name: String(localized: "integrations.tool.openclaw",
+                             defaultValue: "OpenClaw",
+                             comment: "Display name for the OpenClaw integration"),
                 modelBinding: vm.bind($vm.openclawModel, save: {
                     Task { await vm.save(.openclawModel, client: client) }
                 }),
@@ -257,10 +306,14 @@ private struct OtherIntegrationsSection: View {
                 profileBinding: vm.bind($vm.openclawToolsProfile, save: {
                     Task { await vm.save(.openclawToolsProfile, client: client) }
                 }),
-                profileSublabel: "Built-in MCP tools the OpenClaw launcher exposes"
+                profileSublabel: String(localized: "integrations.openclaw.profile_sub",
+                                         defaultValue: "Built-in MCP tools the OpenClaw launcher exposes",
+                                         comment: "Sublabel for the OpenClaw tools-profile picker")
             )
             IntegrationRow(
-                name: "Hermes Agent",
+                name: String(localized: "integrations.tool.hermes",
+                             defaultValue: "Hermes Agent",
+                             comment: "Display name for the Hermes Agent integration"),
                 modelBinding: vm.bind($vm.hermesModel, save: {
                     Task { await vm.save(.hermesModel, client: client) }
                 }),
@@ -268,7 +321,9 @@ private struct OtherIntegrationsSection: View {
                 command: vm.hermesCommand
             )
             IntegrationRow(
-                name: "Pi",
+                name: String(localized: "integrations.tool.pi",
+                             defaultValue: "Pi",
+                             comment: "Display name for the Pi integration"),
                 modelBinding: vm.bind($vm.piModel, save: {
                     Task { await vm.save(.piModel, client: client) }
                 }),
@@ -276,7 +331,9 @@ private struct OtherIntegrationsSection: View {
                 command: vm.piCommand
             )
             IntegrationRow(
-                name: "Copilot CLI",
+                name: String(localized: "integrations.tool.copilot",
+                             defaultValue: "Copilot CLI",
+                             comment: "Display name for the Copilot CLI integration"),
                 modelBinding: vm.bind($vm.copilotModel, save: {
                     Task { await vm.save(.copilotModel, client: client) }
                 }),
@@ -319,7 +376,9 @@ private struct IntegrationRow: View {
                 if let profileBinding {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Tools profile")
+                            Text(String(localized: "integrations.openclaw.profile_label",
+                                        defaultValue: "Tools profile",
+                                        comment: "Row label for the OpenClaw tools-profile picker"))
                                 .font(.omlxText(12))
                                 .foregroundStyle(theme.textSecondary)
                             if let profileSublabel {
@@ -333,10 +392,18 @@ private struct IntegrationRow: View {
                             selection: profileBinding,
                             width: 160,
                             options: [
-                                ("minimal",   "Minimal"),
-                                ("coding",    "Coding"),
-                                ("messaging", "Messaging"),
-                                ("full",      "Full"),
+                                ("minimal",   String(localized: "integrations.openclaw.profile.minimal",
+                                                     defaultValue: "Minimal",
+                                                     comment: "OpenClaw tools profile option: minimal")),
+                                ("coding",    String(localized: "integrations.openclaw.profile.coding",
+                                                     defaultValue: "Coding",
+                                                     comment: "OpenClaw tools profile option: coding")),
+                                ("messaging", String(localized: "integrations.openclaw.profile.messaging",
+                                                     defaultValue: "Messaging",
+                                                     comment: "OpenClaw tools profile option: messaging")),
+                                ("full",      String(localized: "integrations.openclaw.profile.full",
+                                                     defaultValue: "Full",
+                                                     comment: "OpenClaw tools profile option: full")),
                             ]
                         )
                     }
@@ -359,14 +426,22 @@ private struct MCPSection: View {
 
     var body: some View {
         SectionHeader(
-            "MCP",
-            subtitle: "Path to an MCP server config file. Shared across all integration launchers."
+            String(localized: "integrations.section.mcp",
+                   defaultValue: "MCP",
+                   comment: "Section header for the MCP config path row"),
+            subtitle: String(localized: "integrations.section.mcp.sub",
+                             defaultValue: "Path to an MCP server config file. Shared across all integration launchers.",
+                             comment: "Subtitle for the MCP section")
         )
 
         ListGroup {
             Row(
-                label: "Config Path",
-                sublabel: "Absolute path to an MCP config JSON. Leave blank to disable.",
+                label: String(localized: "integrations.mcp.config_path",
+                              defaultValue: "Config Path",
+                              comment: "Row label for the MCP config path input"),
+                sublabel: String(localized: "integrations.mcp.config_path.sub",
+                                 defaultValue: "Absolute path to an MCP config JSON. Leave blank to disable.",
+                                 comment: "Sublabel describing the MCP config path field"),
                 isLast: true
             ) {
                 TextInput(
@@ -379,7 +454,9 @@ private struct MCPSection: View {
         }
         HStack {
             Spacer()
-            Button("Apply") {
+            Button(String(localized: "integrations.mcp.apply",
+                          defaultValue: "Apply",
+                          comment: "Apply button for the MCP config path")) {
                 Task { await vm.save(.mcpConfig, client: client) }
             }
             .buttonStyle(.omlx(.primary))
@@ -443,7 +520,11 @@ final class IntegrationsScreenVM: ObservableObject {
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
     var modelOptions: [(String, String)] {
-        var out: [(String, String)] = [("", "Select model…")]
+        var out: [(String, String)] = [
+            ("", String(localized: "integrations.model.select_placeholder",
+                        defaultValue: "Select model…",
+                        comment: "Placeholder option shown at the top of every per-integration model picker"))
+        ]
         for id in availableModels {
             out.append((id, id))
         }
@@ -579,7 +660,9 @@ final class IntegrationsScreenVM: ObservableObject {
         case .targetContextSize:
             let trimmed = targetContextSizeText.trimmingCharacters(in: .whitespaces)
             guard let n = Int(trimmed), n > 0 else {
-                self.lastError = "Target context size must be a positive integer."
+                self.lastError = String(localized: "integrations.error.target_context_invalid",
+                                        defaultValue: "Target context size must be a positive integer.",
+                                        comment: "Integrations screen error when the target context size input is invalid")
                 return
             }
             patch.claudeCodeTargetContextSize = n

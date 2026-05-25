@@ -47,9 +47,15 @@ struct QuantizationScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScreenHeader(
-                eyebrow: "oQ Quantization",
-                title: "Quantize on device",
-                subtitle: "Pick a full-precision model, choose an oQ level, and oMLX builds a mixed-precision plan tuned to that model's per-layer sensitivity. Output is standard mlx-lm safetensors — usable in any MLX runtime."
+                eyebrow: String(localized: "quant.header.eyebrow",
+                                defaultValue: "oQ Quantization",
+                                comment: "Eyebrow text above the Quantization screen header"),
+                title: String(localized: "quant.header.title",
+                              defaultValue: "Quantize on device",
+                              comment: "Main title for the Quantization screen header"),
+                subtitle: String(localized: "quant.header.subtitle",
+                                 defaultValue: "Pick a full-precision model, choose an oQ level, and oMLX builds a mixed-precision plan tuned to that model's per-layer sensitivity. Output is standard mlx-lm safetensors — usable in any MLX runtime.",
+                                 comment: "Subtitle paragraph describing what the Quantization screen does")
             )
 
             SourceModelSection(
@@ -135,14 +141,26 @@ private struct SourceModelSection: View {
 
     var body: some View {
         SectionHeader(
-            "Source Model",
-            subtitle: modelsLoaded ? "\(models.count) full-precision model\(models.count == 1 ? "" : "s") available" : "Loading…"
+            String(localized: "quant.source.title",
+                   defaultValue: "Source Model",
+                   comment: "Section heading for the source-model picker on the Quantization screen"),
+            subtitle: modelsLoaded
+                ? String(localized: "quant.source.subtitle.available",
+                         defaultValue: "\(models.count) full-precision model\(models.count == 1 ? "" : "s") available",
+                         comment: "Subtitle for Source Model section. Placeholders: model count, plural suffix")
+                : String(localized: "quant.source.subtitle.loading",
+                         defaultValue: "Loading…",
+                         comment: "Subtitle while the source model list is loading")
         )
 
         ListGroup {
             Row(
-                label: "Source",
-                sublabel: "Only full-precision models can be quantized"
+                label: String(localized: "quant.source.row.source.label",
+                              defaultValue: "Source",
+                              comment: "Row label for the source-model picker"),
+                sublabel: String(localized: "quant.source.row.source.sub",
+                                 defaultValue: "Only full-precision models can be quantized",
+                                 comment: "Row sublabel explaining the source-model picker constraint")
             ) {
                 Popup(
                     selection: $selectedModelPath,
@@ -153,8 +171,12 @@ private struct SourceModelSection: View {
 
             if !sensitivityCandidates.isEmpty && !selectedModelPath.isEmpty {
                 Row(
-                    label: "Sensitivity model",
-                    sublabel: "Use a quantized variant to analyze layer sensitivity with ~4× less memory"
+                    label: String(localized: "quant.source.row.sensitivity.label",
+                                  defaultValue: "Sensitivity model",
+                                  comment: "Row label for the optional sensitivity-model picker"),
+                    sublabel: String(localized: "quant.source.row.sensitivity.sub",
+                                     defaultValue: "Use a quantized variant to analyze layer sensitivity with ~4× less memory",
+                                     comment: "Row sublabel for the sensitivity-model picker")
                 ) {
                     Popup(
                         selection: $sensitivityModelPath,
@@ -164,7 +186,12 @@ private struct SourceModelSection: View {
                 }
             }
 
-            Row(label: "oQ level", sublabel: "Lower bits = smaller, faster, less accurate") {
+            Row(label: String(localized: "quant.source.row.level.label",
+                              defaultValue: "oQ level",
+                              comment: "Row label for the oQ level picker"),
+                sublabel: String(localized: "quant.source.row.level.sub",
+                                 defaultValue: "Lower bits = smaller, faster, less accurate",
+                                 comment: "Row sublabel explaining the oQ level tradeoff")) {
                 Popup(
                     selection: $oqLevel,
                     width: 120,
@@ -182,9 +209,14 @@ private struct SourceModelSection: View {
                             ProgressView()
                                 .controlSize(.small)
                                 .padding(.trailing, 2)
-                            Text("Starting…")
+                            Text(String(localized: "quant.button.starting",
+                                        defaultValue: "Starting…",
+                                        comment: "Button label shown while a quantization start request is in flight"))
                         } else {
-                            Label("Start Quantization", systemImage: "sparkles")
+                            Label(String(localized: "quant.button.start",
+                                         defaultValue: "Start Quantization",
+                                         comment: "Primary button label that submits a quantization job"),
+                                  systemImage: "sparkles")
                                 .labelStyle(.titleAndIcon)
                         }
                     }
@@ -196,7 +228,10 @@ private struct SourceModelSection: View {
     }
 
     private var modelOptions: [PopupOption<String>] {
-        var opts = [PopupOption(value: "", label: "Select a model…")]
+        var opts = [PopupOption(value: "",
+                                label: String(localized: "quant.source.option.select",
+                                              defaultValue: "Select a model…",
+                                              comment: "Placeholder option in the source-model dropdown"))]
         opts += models.map { m in
             PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
         }
@@ -204,7 +239,10 @@ private struct SourceModelSection: View {
     }
 
     private var sensitivityOptions: [PopupOption<String>] {
-        var opts = [PopupOption(value: "", label: "None (use source model)")]
+        var opts = [PopupOption(value: "",
+                                label: String(localized: "quant.source.option.no_sensitivity",
+                                              defaultValue: "None (use source model)",
+                                              comment: "Sentinel option meaning no sensitivity-model override"))]
         opts += sensitivityCandidates.map { m in
             PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
         }
@@ -234,11 +272,26 @@ private struct EstimateStrip: View {
 
     var body: some View {
         HStack(spacing: 18) {
-            pill(icon: "memorychip", text: "Est. memory: ~\(memoryText.isEmpty ? "—" : memoryText)")
+            pill(icon: "memorychip",
+                 text: String(localized: "quant.estimate.memory",
+                              defaultValue: "Est. memory: ~\(memoryText.isEmpty ? "—" : memoryText)",
+                              comment: "Estimate pill: peak memory required to quantize. Placeholder is the formatted byte string"))
             pill(icon: "gauge.with.dots.needle.50percent",
-                 text: bpwText.isEmpty ? "Calculating…" : "Effective \(bpwText) bpw")
+                 text: bpwText.isEmpty
+                    ? String(localized: "quant.estimate.calculating",
+                             defaultValue: "Calculating…",
+                             comment: "Estimate pill placeholder shown while values are being computed")
+                    : String(localized: "quant.estimate.bpw",
+                             defaultValue: "Effective \(bpwText) bpw",
+                             comment: "Estimate pill: effective bits-per-weight. Placeholder is the formatted bpw value"))
             pill(icon: "shippingbox",
-                 text: outputSizeText.isEmpty ? "Calculating…" : "Output size: ~\(outputSizeText)")
+                 text: outputSizeText.isEmpty
+                    ? String(localized: "quant.estimate.calculating",
+                             defaultValue: "Calculating…",
+                             comment: "Estimate pill placeholder shown while values are being computed")
+                    : String(localized: "quant.estimate.output_size",
+                             defaultValue: "Output size: ~\(outputSizeText)",
+                             comment: "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string"))
         }
         .padding(.horizontal, 18)
         .padding(.top, 4)
@@ -278,7 +331,9 @@ private struct AdvancedSection: View {
                     Image(systemName: isOpen ? "chevron.down" : "chevron.right")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
-                    Text("Advanced settings")
+                    Text(String(localized: "quant.advanced.title",
+                                defaultValue: "Advanced settings",
+                                comment: "Collapsible header for the Quantization advanced-settings block"))
                         .font(.omlxText(11, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
@@ -296,18 +351,28 @@ private struct AdvancedSection: View {
                 ListGroup {
                     if selectedIsVLM {
                         Row(
-                            label: "Text only",
-                            sublabel: "Exclude vision encoder weights (~2-3% smaller, text-only output)"
+                            label: String(localized: "quant.advanced.text_only.label",
+                                          defaultValue: "Text only",
+                                          comment: "Toggle row label: drop vision encoder weights when quantizing a VLM"),
+                            sublabel: String(localized: "quant.advanced.text_only.sub",
+                                             defaultValue: "Exclude vision encoder weights (~2-3% smaller, text-only output)",
+                                             comment: "Toggle row sublabel: text-only quantization effect")
                         ) {
                             Toggle("", isOn: $textOnly).labelsHidden().toggleStyle(.switch)
                         }
                     }
 
                     Row(
-                        label: "Preserve MTP",
+                        label: String(localized: "quant.advanced.preserve_mtp.label",
+                                      defaultValue: "Preserve MTP",
+                                      comment: "Toggle row label: keep multi-token prediction heads"),
                         sublabel: selectedHasMTP
-                            ? "Keep multi-token prediction heads in the quantized output"
-                            : "Unavailable — source model has no MTP heads"
+                            ? String(localized: "quant.advanced.preserve_mtp.sub.available",
+                                     defaultValue: "Keep multi-token prediction heads in the quantized output",
+                                     comment: "Toggle row sublabel when MTP is available")
+                            : String(localized: "quant.advanced.preserve_mtp.sub.unavailable",
+                                     defaultValue: "Unavailable — source model has no MTP heads",
+                                     comment: "Toggle row sublabel when MTP isn't supported by the chosen source")
                     ) {
                         Toggle("", isOn: $preserveMtp)
                             .labelsHidden()
@@ -316,8 +381,12 @@ private struct AdvancedSection: View {
                     }
 
                     Row(
-                        label: "Non-quant dtype",
-                        sublabel: "Precision for tensors that stay un-quantized (norms, scales)",
+                        label: String(localized: "quant.advanced.dtype.label",
+                                      defaultValue: "Non-quant dtype",
+                                      comment: "Segmented row label: precision for tensors not getting quantized"),
+                        sublabel: String(localized: "quant.advanced.dtype.sub",
+                                         defaultValue: "Precision for tensors that stay un-quantized (norms, scales)",
+                                         comment: "Segmented row sublabel explaining what dtype controls"),
                         isLast: true
                     ) {
                         Segmented(selection: $dtype, options: [
@@ -340,7 +409,9 @@ private struct EmptyModelsBanner: View {
             Image(systemName: "info.circle")
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textTertiary)
-            Text("No full-precision models found on disk. Download one from the Downloads tab first.")
+            Text(String(localized: "quant.empty_models",
+                        defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
+                        comment: "Banner shown when no full-precision models are available to quantize"))
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
@@ -367,7 +438,12 @@ private struct QueueSection: View {
         if tasks.isEmpty {
             EmptyView()
         } else {
-            SectionHeader("Queue", subtitle: "\(tasks.count) task\(tasks.count == 1 ? "" : "s")")
+            SectionHeader(String(localized: "quant.queue.title",
+                                  defaultValue: "Queue",
+                                  comment: "Section heading for the quantization task queue"),
+                          subtitle: String(localized: "quant.queue.subtitle",
+                                           defaultValue: "\(tasks.count) task\(tasks.count == 1 ? "" : "s")",
+                                           comment: "Subtitle for the Queue section. Placeholders: count, plural suffix"))
 
             ListGroup {
                 ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in
@@ -413,11 +489,16 @@ private struct QueueRow: View {
                     Button {
                         onUpload()
                     } label: {
-                        Label("Upload to HF", systemImage: "arrow.up.circle")
+                        Label(String(localized: "quant.queue.upload",
+                                     defaultValue: "Upload to HF",
+                                     comment: "Button label on a completed quant task that opens the HF upload sheet"),
+                              systemImage: "arrow.up.circle")
                             .labelStyle(.titleAndIcon)
                     }
                     .buttonStyle(.omlx(.normal, size: .small))
-                    .help("Upload to Hugging Face Hub")
+                    .help(String(localized: "quant.queue.upload.help",
+                                 defaultValue: "Upload to Hugging Face Hub",
+                                 comment: "Tooltip on the Upload to HF button"))
                 }
                 Button {
                     if task.isActive { onCancel() } else { onRemove() }
@@ -426,7 +507,13 @@ private struct QueueRow: View {
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
-                .help(task.isActive ? "Cancel" : "Remove")
+                .help(task.isActive
+                      ? String(localized: "quant.queue.cancel.help",
+                               defaultValue: "Cancel",
+                               comment: "Tooltip on the X button for an active quant task")
+                      : String(localized: "quant.queue.remove.help",
+                               defaultValue: "Remove",
+                               comment: "Tooltip on the X button for a terminal quant task"))
             }
             if task.isActive {
                 ProgressBar(progress: max(0, min(task.progress / 100, 1)))
@@ -475,13 +562,34 @@ private struct StatusChip: View {
     var body: some View {
         let cfg: (Color, String) = {
             switch status {
-            case .pending:    return (theme.textTertiary, "Pending")
-            case .loading:    return (theme.blueDot, "Loading")
-            case .quantizing: return (theme.blueDot, "Quantizing")
-            case .saving:     return (theme.blueDot, "Saving")
-            case .completed:  return (theme.greenDot, "Completed")
-            case .failed:     return (theme.redDot, "Failed")
-            case .cancelled:  return (theme.textTertiary, "Cancelled")
+            case .pending:    return (theme.textTertiary,
+                                       String(localized: "quant.status.pending",
+                                              defaultValue: "Pending",
+                                              comment: "Status chip label for a queued quantization task"))
+            case .loading:    return (theme.blueDot,
+                                       String(localized: "quant.status.loading",
+                                              defaultValue: "Loading",
+                                              comment: "Status chip label while the source model is being loaded"))
+            case .quantizing: return (theme.blueDot,
+                                       String(localized: "quant.status.quantizing",
+                                              defaultValue: "Quantizing",
+                                              comment: "Status chip label while quantization is running"))
+            case .saving:     return (theme.blueDot,
+                                       String(localized: "quant.status.saving",
+                                              defaultValue: "Saving",
+                                              comment: "Status chip label while the quantized output is being written"))
+            case .completed:  return (theme.greenDot,
+                                       String(localized: "quant.status.completed",
+                                              defaultValue: "Completed",
+                                              comment: "Status chip label for a finished quantization"))
+            case .failed:     return (theme.redDot,
+                                       String(localized: "quant.status.failed",
+                                              defaultValue: "Failed",
+                                              comment: "Status chip label for a failed quantization"))
+            case .cancelled:  return (theme.textTertiary,
+                                       String(localized: "quant.status.cancelled",
+                                              defaultValue: "Cancelled",
+                                              comment: "Status chip label for a quantization cancelled by the user"))
             case .none:       return (theme.textTertiary, "—")
             }
         }()
@@ -537,8 +645,12 @@ private struct UploadTasksSection: View {
             EmptyView()
         } else {
             SectionHeader(
-                "Uploads",
-                subtitle: "\(activeCount) active / \(completedCount) completed"
+                String(localized: "quant.uploads.title",
+                       defaultValue: "Uploads",
+                       comment: "Section heading for the HF upload task list"),
+                subtitle: String(localized: "quant.uploads.subtitle",
+                                 defaultValue: "\(activeCount) active / \(completedCount) completed",
+                                 comment: "Subtitle for Uploads section. Placeholders: active count, completed count")
             )
 
             ListGroup {
@@ -581,7 +693,10 @@ private struct UploadRow: View {
                     Button {
                         NSWorkspace.shared.open(url)
                     } label: {
-                        Label("Open", systemImage: "arrow.up.right.square")
+                        Label(String(localized: "quant.uploads.open",
+                                     defaultValue: "Open",
+                                     comment: "Button label that opens the published HF repo URL in a browser"),
+                              systemImage: "arrow.up.right.square")
                             .labelStyle(.titleAndIcon)
                     }
                     .buttonStyle(.omlx(.plain, size: .small))
@@ -594,7 +709,13 @@ private struct UploadRow: View {
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
-                .help(task.isActive ? "Cancel" : "Remove")
+                .help(task.isActive
+                      ? String(localized: "quant.uploads.cancel.help",
+                               defaultValue: "Cancel",
+                               comment: "Tooltip on the X button for an active upload task")
+                      : String(localized: "quant.uploads.remove.help",
+                               defaultValue: "Remove",
+                               comment: "Tooltip on the X button for a terminal upload task"))
             }
             if task.isActive {
                 ProgressBar(progress: max(0, min(task.progress / 100, 1)))
@@ -633,11 +754,26 @@ private struct UploadStatusChip: View {
     var body: some View {
         let cfg: (Color, String) = {
             switch status {
-            case .pending:   return (theme.textTertiary, "Pending")
-            case .uploading: return (theme.blueDot, "Uploading")
-            case .completed: return (theme.greenDot, "Completed")
-            case .failed:    return (theme.redDot, "Failed")
-            case .cancelled: return (theme.textTertiary, "Cancelled")
+            case .pending:   return (theme.textTertiary,
+                                      String(localized: "quant.upload_status.pending",
+                                             defaultValue: "Pending",
+                                             comment: "Status chip label for a queued upload"))
+            case .uploading: return (theme.blueDot,
+                                      String(localized: "quant.upload_status.uploading",
+                                             defaultValue: "Uploading",
+                                             comment: "Status chip label while an upload is in progress"))
+            case .completed: return (theme.greenDot,
+                                      String(localized: "quant.upload_status.completed",
+                                             defaultValue: "Completed",
+                                             comment: "Status chip label for a finished upload"))
+            case .failed:    return (theme.redDot,
+                                      String(localized: "quant.upload_status.failed",
+                                             defaultValue: "Failed",
+                                             comment: "Status chip label for a failed upload"))
+            case .cancelled: return (theme.textTertiary,
+                                      String(localized: "quant.upload_status.cancelled",
+                                             defaultValue: "Cancelled",
+                                             comment: "Status chip label for an upload cancelled by the user"))
             case .none:      return (theme.textTertiary, "—")
             }
         }()
@@ -681,7 +817,9 @@ private struct UploadModalView: View {
             // Sheet header — explicit since `SectionHeader` styles map to a
             // scrollable screen, not a modal.
             VStack(alignment: .leading, spacing: 4) {
-                Text("Upload to Hugging Face")
+                Text(String(localized: "quant.upload_modal.title",
+                            defaultValue: "Upload to Hugging Face",
+                            comment: "Title of the upload-to-HF sheet"))
                     .font(.omlxText(15, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(task.outputName)
@@ -735,15 +873,27 @@ private struct UploadModalView: View {
     private var credentialsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionHeader(
-                "Credentials",
-                subtitle: vm.uploadValidatedUsername.map { "Logged in as @\($0)" }
-                    ?? "Validate a token to enable upload"
+                String(localized: "quant.upload_modal.credentials.title",
+                       defaultValue: "Credentials",
+                       comment: "Section heading inside the upload sheet for the HF token row"),
+                subtitle: vm.uploadValidatedUsername.map {
+                    String(localized: "quant.upload_modal.credentials.subtitle.logged_in",
+                           defaultValue: "Logged in as @\($0)",
+                           comment: "Subtitle when a token has been validated. Placeholder is the HF username")
+                }
+                    ?? String(localized: "quant.upload_modal.credentials.subtitle.needs_validate",
+                              defaultValue: "Validate a token to enable upload",
+                              comment: "Subtitle when no token has been validated yet")
             )
 
             ListGroup {
                 Row(
-                    label: "HF token",
-                    sublabel: "Stored in macOS Keychain. Needs write access to your account."
+                    label: String(localized: "quant.upload_modal.token.label",
+                                  defaultValue: "HF token",
+                                  comment: "Row label for the HF token input"),
+                    sublabel: String(localized: "quant.upload_modal.token.sub",
+                                     defaultValue: "Stored in macOS Keychain. Needs write access to your account.",
+                                     comment: "Row sublabel explaining where the HF token is stored")
                 ) {
                     HStack(spacing: 6) {
                         TextInput(
@@ -758,9 +908,17 @@ private struct UploadModalView: View {
                         } label: {
                             if vm.isValidatingToken {
                                 ProgressView().controlSize(.small)
-                                Text("Validating…")
+                                Text(String(localized: "quant.upload_modal.token.validating",
+                                            defaultValue: "Validating…",
+                                            comment: "Button label while the HF token validation request is in flight"))
                             } else {
-                                Text(vm.uploadValidatedUsername == nil ? "Validate" : "Re-validate")
+                                Text(vm.uploadValidatedUsername == nil
+                                     ? String(localized: "quant.upload_modal.token.validate",
+                                              defaultValue: "Validate",
+                                              comment: "Button label that triggers HF token validation")
+                                     : String(localized: "quant.upload_modal.token.revalidate",
+                                              defaultValue: "Re-validate",
+                                              comment: "Button label that re-runs HF token validation after a successful one"))
                             }
                         }
                         .buttonStyle(.omlx(.normal, size: .small))
@@ -770,8 +928,12 @@ private struct UploadModalView: View {
 
                 if vm.uploadValidatedUsername != nil && !vm.uploadOrgs.isEmpty {
                     Row(
-                        label: "Target namespace",
-                        sublabel: "Publish under your account or one of your orgs",
+                        label: String(localized: "quant.upload_modal.namespace.label",
+                                      defaultValue: "Target namespace",
+                                      comment: "Row label for the HF namespace picker (user or org)"),
+                        sublabel: String(localized: "quant.upload_modal.namespace.sub.with_orgs",
+                                         defaultValue: "Publish under your account or one of your orgs",
+                                         comment: "Row sublabel when orgs are available to publish under"),
                         isLast: true
                     ) {
                         Popup(
@@ -784,10 +946,16 @@ private struct UploadModalView: View {
                     // Make the last visible row in the group flush with the
                     // bottom rounded edge by toggling `isLast` on it.
                     Row(
-                        label: "Target namespace",
+                        label: String(localized: "quant.upload_modal.namespace.label",
+                                      defaultValue: "Target namespace",
+                                      comment: "Row label for the HF namespace picker (user or org)"),
                         sublabel: vm.uploadValidatedUsername == nil
-                            ? "Available after validation"
-                            : "Your account is the only available namespace",
+                            ? String(localized: "quant.upload_modal.namespace.sub.unvalidated",
+                                     defaultValue: "Available after validation",
+                                     comment: "Row sublabel before any token has been validated")
+                            : String(localized: "quant.upload_modal.namespace.sub.user_only",
+                                     defaultValue: "Your account is the only available namespace",
+                                     comment: "Row sublabel when the validated user has no orgs"),
                         isLast: true
                     ) {
                         Text(vm.uploadNamespace.isEmpty ? "—" : "@\(vm.uploadNamespace)")
@@ -803,11 +971,17 @@ private struct UploadModalView: View {
 
     private var repositorySection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SectionHeader("Repository")
+            SectionHeader(String(localized: "quant.upload_modal.repo.title",
+                                  defaultValue: "Repository",
+                                  comment: "Section heading for the repo-config rows inside the upload sheet"))
             ListGroup {
                 Row(
-                    label: "Repo name",
-                    sublabel: "Full repo id will be \(vm.uploadNamespace.isEmpty ? "<namespace>" : vm.uploadNamespace)/<repo-name>"
+                    label: String(localized: "quant.upload_modal.repo_name.label",
+                                  defaultValue: "Repo name",
+                                  comment: "Row label for the editable HF repo name"),
+                    sublabel: String(localized: "quant.upload_modal.repo_name.sub",
+                                     defaultValue: "Full repo id will be \(vm.uploadNamespace.isEmpty ? "<namespace>" : vm.uploadNamespace)/<repo-name>",
+                                     comment: "Row sublabel previewing the full repo id. Placeholder is namespace or <namespace> sentinel")
                 ) {
                     HStack(spacing: 6) {
                         Text(vm.uploadNamespace.isEmpty ? "<namespace>/" : "\(vm.uploadNamespace)/")
@@ -823,8 +997,12 @@ private struct UploadModalView: View {
                 }
 
                 Row(
-                    label: "Private repo",
-                    sublabel: "Only you and your org will see this model",
+                    label: String(localized: "quant.upload_modal.private.label",
+                                  defaultValue: "Private repo",
+                                  comment: "Toggle row label: publish as private"),
+                    sublabel: String(localized: "quant.upload_modal.private.sub",
+                                     defaultValue: "Only you and your org will see this model",
+                                     comment: "Toggle row sublabel explaining the private flag"),
                     isLast: true
                 ) {
                     Toggle("", isOn: $isPrivate).labelsHidden().toggleStyle(.switch)
@@ -837,11 +1015,17 @@ private struct UploadModalView: View {
 
     private var readmeSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SectionHeader("README")
+            SectionHeader(String(localized: "quant.upload_modal.readme.title",
+                                  defaultValue: "README",
+                                  comment: "Section heading for the README configuration inside the upload sheet"))
             ListGroup {
                 Row(
-                    label: "Source",
-                    sublabel: "Generate a default card or copy from another local model"
+                    label: String(localized: "quant.upload_modal.readme_source.label",
+                                  defaultValue: "Source",
+                                  comment: "Row label for the README source picker"),
+                    sublabel: String(localized: "quant.upload_modal.readme_source.sub",
+                                     defaultValue: "Generate a default card or copy from another local model",
+                                     comment: "Row sublabel explaining the README source options")
                 ) {
                     Popup(
                         selection: $readmeSourcePath,
@@ -851,8 +1035,12 @@ private struct UploadModalView: View {
                 }
                 if readmeSourcePath.isEmpty {
                     Row(
-                        label: "Add re-download notice",
-                        sublabel: "Append a banner reminding downstream users to re-pull",
+                        label: String(localized: "quant.upload_modal.notice.label.add",
+                                      defaultValue: "Add re-download notice",
+                                      comment: "Toggle row label: append a re-download banner to the auto-generated README"),
+                        sublabel: String(localized: "quant.upload_modal.notice.sub.add",
+                                         defaultValue: "Append a banner reminding downstream users to re-pull",
+                                         comment: "Toggle row sublabel for the re-download notice"),
                         isLast: true
                     ) {
                         Toggle("", isOn: $addRedownloadNotice).labelsHidden().toggleStyle(.switch)
@@ -860,11 +1048,17 @@ private struct UploadModalView: View {
                 } else {
                     // Trailing row stays flush even when the toggle is hidden.
                     Row(
-                        label: "Re-download notice",
-                        sublabel: "Disabled when copying an existing README",
+                        label: String(localized: "quant.upload_modal.notice.label.copied",
+                                      defaultValue: "Re-download notice",
+                                      comment: "Row label when README is copied — notice toggle is disabled"),
+                        sublabel: String(localized: "quant.upload_modal.notice.sub.copied",
+                                         defaultValue: "Disabled when copying an existing README",
+                                         comment: "Row sublabel explaining why the notice toggle is off"),
                         isLast: true
                     ) {
-                        Text("Off")
+                        Text(String(localized: "quant.upload_modal.notice.off",
+                                    defaultValue: "Off",
+                                    comment: "Value text displayed when the re-download notice is unavailable"))
                             .font(.omlxText(13, weight: .medium))
                             .foregroundStyle(theme.textTertiary)
                     }
@@ -878,7 +1072,9 @@ private struct UploadModalView: View {
     private var footer: some View {
         HStack(spacing: 8) {
             Spacer()
-            Button("Cancel") { vm.uploadTarget = nil }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic cancel button")) { vm.uploadTarget = nil }
                 .buttonStyle(.omlx(.normal, size: .regular))
                 .keyboardShortcut(.cancelAction)
             Button {
@@ -886,9 +1082,14 @@ private struct UploadModalView: View {
             } label: {
                 if isStarting {
                     ProgressView().controlSize(.small)
-                    Text("Uploading…")
+                    Text(String(localized: "quant.upload_modal.uploading",
+                                defaultValue: "Uploading…",
+                                comment: "Footer button label shown while the upload start request is in flight"))
                 } else {
-                    Label("Upload", systemImage: "arrow.up.circle.fill")
+                    Label(String(localized: "quant.upload_modal.upload",
+                                 defaultValue: "Upload",
+                                 comment: "Primary footer button label that starts the HF upload"),
+                          systemImage: "arrow.up.circle.fill")
                         .labelStyle(.titleAndIcon)
                 }
             }
@@ -920,9 +1121,15 @@ private struct UploadModalView: View {
     }
 
     private var readmeOptions: [PopupOption<String>] {
-        var opts = [PopupOption(value: "", label: "Auto-generate")]
+        var opts = [PopupOption(value: "",
+                                label: String(localized: "quant.upload_modal.readme_source.auto",
+                                              defaultValue: "Auto-generate",
+                                              comment: "Default option in the README source picker meaning generate a default card"))]
         opts += vm.uploadCandidateModels.map { m in
-            PopupOption(value: m.path, label: "Copy from \(m.name)")
+            PopupOption(value: m.path,
+                        label: String(localized: "quant.upload_modal.readme_source.copy_from",
+                                      defaultValue: "Copy from \(m.name)",
+                                      comment: "README source option that copies an existing model's README. Placeholder is the source model name"))
         }
         return opts
     }
@@ -959,19 +1166,27 @@ private struct AboutSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("About oQ Quantization")
+        SectionHeader(String(localized: "quant.about.title",
+                              defaultValue: "About oQ Quantization",
+                              comment: "Section heading for the static About card on the Quantization screen"))
 
         ListGroup {
             FreeRow(isLast: true) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("oMLX Universal Dynamic Quantization")
+                    Text(String(localized: "quant.about.headline",
+                                defaultValue: "oMLX Universal Dynamic Quantization",
+                                comment: "Headline inside the About oQ card"))
                         .font(.omlxText(13, weight: .semibold))
                         .foregroundStyle(theme.text)
-                    Text("Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format. No custom loader required.")
+                    Text(String(localized: "quant.about.body1",
+                                defaultValue: "Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format. No custom loader required.",
+                                comment: "First body paragraph of the About oQ card"))
                         .font(.omlxText(11.5))
                         .foregroundStyle(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16) and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they matter most. Every model gets a unique bit allocation tuned to its architecture.")
+                    Text(String(localized: "quant.about.body2",
+                                defaultValue: "oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16) and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they matter most. Every model gets a unique bit allocation tuned to its architecture.",
+                                comment: "Second body paragraph of the About oQ card"))
                         .font(.omlxText(11.5))
                         .foregroundStyle(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1113,7 +1328,9 @@ final class QuantizationScreenVM: ObservableObject {
             self.modelsLoaded = true
         } catch {
             self.modelsLoaded = true
-            self.lastError = "Failed to load models: \(error)"
+            self.lastError = String(localized: "quant.error.load_models",
+                                    defaultValue: "Failed to load models: \(error)",
+                                    comment: "Banner error message when listing OQ models fails. Placeholder is the underlying error")
         }
     }
 
@@ -1253,16 +1470,22 @@ final class QuantizationScreenVM: ObservableObject {
                 await MainActor.run {
                     guard let self else { return }
                     if resp.success {
-                        self.lastSuccess = "Quantization started: \(displayName) → \(levelLabel)"
+                        self.lastSuccess = String(localized: "quant.success.started",
+                                                  defaultValue: "Quantization started: \(displayName) → \(levelLabel)",
+                                                  comment: "Success banner after a quant job starts. Placeholders: source model name, target oQ level")
                         self.scheduleSuccessClear()
                     } else {
-                        self.lastError = "Server refused the request"
+                        self.lastError = String(localized: "quant.error.server_refused",
+                                                defaultValue: "Server refused the request",
+                                                comment: "Banner error when the server returned success=false for a quant start")
                     }
                 }
                 await self?.loadTasks()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to start: \(error)"
+                    self?.lastError = String(localized: "quant.error.start_failed",
+                                             defaultValue: "Failed to start: \(error)",
+                                             comment: "Banner error when starting a quant job throws. Placeholder is the underlying error")
                 }
             }
         }
@@ -1274,7 +1497,11 @@ final class QuantizationScreenVM: ObservableObject {
                 _ = try await client.cancelOQTask(taskId: taskId)
                 await self?.loadTasks()
             } catch {
-                await MainActor.run { self?.lastError = "Cancel failed: \(error)" }
+                await MainActor.run {
+                    self?.lastError = String(localized: "quant.error.cancel_failed",
+                                             defaultValue: "Cancel failed: \(error)",
+                                             comment: "Banner error when cancelling a quant task throws. Placeholder is the underlying error")
+                }
             }
         }
     }
@@ -1285,7 +1512,11 @@ final class QuantizationScreenVM: ObservableObject {
                 _ = try await client.removeOQTask(taskId: taskId)
                 await self?.loadTasks()
             } catch {
-                await MainActor.run { self?.lastError = "Remove failed: \(error)" }
+                await MainActor.run {
+                    self?.lastError = String(localized: "quant.error.remove_failed",
+                                             defaultValue: "Remove failed: \(error)",
+                                             comment: "Banner error when removing a quant task throws. Placeholder is the underlying error")
+                }
             }
         }
     }
@@ -1308,7 +1539,9 @@ final class QuantizationScreenVM: ObservableObject {
     func validateUploadToken(client: OMLXClient) async {
         let token = uploadToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else {
-            lastUploadError = "Token is empty"
+            lastUploadError = String(localized: "quant.upload.error.empty_token",
+                                     defaultValue: "Token is empty",
+                                     comment: "Validation error when the HF token field is empty before validation")
             return
         }
         isValidatingToken = true
@@ -1324,7 +1557,9 @@ final class QuantizationScreenVM: ObservableObject {
             self.uploadValidatedUsername = nil
             self.uploadOrgs = []
             self.uploadNamespace = ""
-            self.lastUploadError = "Validate failed: \(error.omlxDescription)"
+            self.lastUploadError = String(localized: "quant.upload.error.validate_failed",
+                                          defaultValue: "Validate failed: \(error.omlxDescription)",
+                                          comment: "Error message when HF token validation throws. Placeholder is the underlying error description")
         }
     }
 
@@ -1337,14 +1572,18 @@ final class QuantizationScreenVM: ObservableObject {
         do {
             let resp = try await client.startHFUpload(body)
             if resp.success == false {
-                lastUploadError = "Server refused the request"
+                lastUploadError = String(localized: "quant.upload.error.server_refused",
+                                         defaultValue: "Server refused the request",
+                                         comment: "Error when the server returned success=false for an upload start")
             }
             await loadUploadTasks()
             // Make sure the polling loop picks up the new active task even
             // if nothing else was running before this submission.
             startPollingIfNeeded()
         } catch {
-            lastUploadError = "Upload failed: \(error.omlxDescription)"
+            lastUploadError = String(localized: "quant.upload.error.start_failed",
+                                     defaultValue: "Upload failed: \(error.omlxDescription)",
+                                     comment: "Error when an upload start request throws. Placeholder is the underlying error description")
         }
     }
 
@@ -1355,7 +1594,9 @@ final class QuantizationScreenVM: ObservableObject {
                 await self?.loadUploadTasks()
             } catch {
                 await MainActor.run {
-                    self?.lastUploadError = "Cancel failed: \(error)"
+                    self?.lastUploadError = String(localized: "quant.upload.error.cancel_failed",
+                                                   defaultValue: "Cancel failed: \(error)",
+                                                   comment: "Error when cancelling an upload task throws. Placeholder is the underlying error")
                 }
             }
         }
@@ -1368,7 +1609,9 @@ final class QuantizationScreenVM: ObservableObject {
                 await self?.loadUploadTasks()
             } catch {
                 await MainActor.run {
-                    self?.lastUploadError = "Remove failed: \(error)"
+                    self?.lastUploadError = String(localized: "quant.upload.error.remove_failed",
+                                                   defaultValue: "Remove failed: \(error)",
+                                                   comment: "Error when removing an upload task throws. Placeholder is the underlying error")
                 }
             }
         }

@@ -22,19 +22,58 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .server:           return "Server"
-        case .network:          return "Network"
-        case .performance:      return "Performance"
-        case .status:           return "Status"
-        case .logs:             return "Logs"
-        case .models:           return "Models"
-        case .downloads:        return "Downloads"
-        case .integrations:     return "Integrations"
-        case .quantization:     return "Quantization"
-        case .throughputBench:  return "Throughput"
-        case .accuracyBench:    return "Accuracy"
-        case .security:         return "Security"
-        case .about:            return "About oMLX"
+        case .server:
+            return String(localized: "sidebar.server",
+                          defaultValue: "Server",
+                          comment: "Sidebar row label / navigation title for the Server section")
+        case .network:
+            return String(localized: "sidebar.network",
+                          defaultValue: "Network",
+                          comment: "Sidebar row label / navigation title for the Network section")
+        case .performance:
+            return String(localized: "sidebar.performance",
+                          defaultValue: "Performance",
+                          comment: "Sidebar row label / navigation title for the Performance section")
+        case .status:
+            return String(localized: "sidebar.status",
+                          defaultValue: "Status",
+                          comment: "Sidebar row label / navigation title for the Status section")
+        case .logs:
+            return String(localized: "sidebar.logs",
+                          defaultValue: "Logs",
+                          comment: "Sidebar row label / navigation title for the Logs section")
+        case .models:
+            return String(localized: "sidebar.models",
+                          defaultValue: "Models",
+                          comment: "Sidebar row label / navigation title for the Models section")
+        case .downloads:
+            return String(localized: "sidebar.downloads",
+                          defaultValue: "Downloads",
+                          comment: "Sidebar row label / navigation title for the Downloads section")
+        case .integrations:
+            return String(localized: "sidebar.integrations",
+                          defaultValue: "Integrations",
+                          comment: "Sidebar row label / navigation title for the Integrations section")
+        case .quantization:
+            return String(localized: "sidebar.quantization",
+                          defaultValue: "Quantization",
+                          comment: "Sidebar row label / navigation title for the Quantization section")
+        case .throughputBench:
+            return String(localized: "sidebar.throughputBench",
+                          defaultValue: "Throughput",
+                          comment: "Sidebar row label / navigation title for the Throughput benchmark section")
+        case .accuracyBench:
+            return String(localized: "sidebar.accuracyBench",
+                          defaultValue: "Accuracy",
+                          comment: "Sidebar row label / navigation title for the Accuracy benchmark section")
+        case .security:
+            return String(localized: "sidebar.security",
+                          defaultValue: "Security",
+                          comment: "Sidebar row label / navigation title for the Security section")
+        case .about:
+            return String(localized: "sidebar.about",
+                          defaultValue: "About oMLX",
+                          comment: "Sidebar row label / navigation title for the About section")
         }
     }
 

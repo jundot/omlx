@@ -12,10 +12,22 @@ enum LandingPR: String, Sendable {
 
     var headline: String {
         switch self {
-        case .pr7:  return "Lands in PR 7"
-        case .pr8:  return "Lands in PR 8"
-        case .pr9:  return "Lands in PR 9"
-        case .pr11: return "Updater wires up in PR 11"
+        case .pr7:
+            return String(localized: "placeholder.headline.pr7",
+                          defaultValue: "Lands in PR 7",
+                          comment: "Placeholder section header for a screen whose real content ships in PR 7")
+        case .pr8:
+            return String(localized: "placeholder.headline.pr8",
+                          defaultValue: "Lands in PR 8",
+                          comment: "Placeholder section header for a screen whose real content ships in PR 8")
+        case .pr9:
+            return String(localized: "placeholder.headline.pr9",
+                          defaultValue: "Lands in PR 9",
+                          comment: "Placeholder section header for a screen whose real content ships in PR 9")
+        case .pr11:
+            return String(localized: "placeholder.headline.pr11",
+                          defaultValue: "Updater wires up in PR 11",
+                          comment: "Placeholder section header for the Updates surface that wires up in PR 11")
         }
     }
 }

@@ -21,9 +21,18 @@ enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var displayName: String {
         switch self {
-        case .stable:  return "Stable"
-        case .beta:    return "Beta"
-        case .nightly: return "Nightly"
+        case .stable:
+            return String(localized: "update.channel.stable",
+                          defaultValue: "Stable",
+                          comment: "Display name for the Stable update channel")
+        case .beta:
+            return String(localized: "update.channel.beta",
+                          defaultValue: "Beta",
+                          comment: "Display name for the Beta update channel")
+        case .nightly:
+            return String(localized: "update.channel.nightly",
+                          defaultValue: "Nightly",
+                          comment: "Display name for the Nightly update channel")
         }
     }
 }

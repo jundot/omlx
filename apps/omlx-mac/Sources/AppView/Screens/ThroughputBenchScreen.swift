@@ -44,9 +44,15 @@ struct ThroughputBenchScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScreenHeader(
-                eyebrow: "Throughput Benchmark",
-                title: "Measure inference speed",
-                subtitle: "Single-request TTFT/TPOT + continuous-batching TPS, swept across context lengths and batch sizes. Results stay in memory until the screen unloads."
+                eyebrow: String(localized: "bench.throughput.header.eyebrow",
+                                defaultValue: "Throughput Benchmark",
+                                comment: "Eyebrow label above the Throughput Bench screen header"),
+                title: String(localized: "bench.throughput.header.title",
+                              defaultValue: "Measure inference speed",
+                              comment: "Throughput Bench screen primary header"),
+                subtitle: String(localized: "bench.throughput.header.subtitle",
+                                 defaultValue: "Single-request TTFT/TPOT + continuous-batching TPS, swept across context lengths and batch sizes. Results stay in memory until the screen unloads.",
+                                 comment: "Throughput Bench screen subtitle describing the measurement sweep")
             )
 
             if let device = vm.device {
@@ -131,8 +137,16 @@ private struct DeviceChip: View {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         if !chip.isEmpty { parts.append(chip) }
-        if let mem = device.memoryGb, mem > 0 { parts.append("\(mem) GB") }
-        if let cores = device.gpuCores, cores > 0 { parts.append("\(cores) GPU cores") }
+        if let mem = device.memoryGb, mem > 0 {
+            parts.append(String(localized: "bench.throughput.device.memory",
+                                defaultValue: "\(mem) GB",
+                                comment: "Device chip memory fragment; placeholder is the GB count"))
+        }
+        if let cores = device.gpuCores, cores > 0 {
+            parts.append(String(localized: "bench.throughput.device.gpu_cores",
+                                defaultValue: "\(cores) GPU cores",
+                                comment: "Device chip GPU-cores fragment; placeholder is the core count"))
+        }
         return parts.isEmpty ? "—" : parts.joined(separator: " · ")
     }
 }
@@ -152,12 +166,25 @@ private struct ConfigurationSection: View {
 
     var body: some View {
         SectionHeader(
-            "Configuration",
-            subtitle: models.isEmpty ? "Loading models…" : "\(models.count) model\(models.count == 1 ? "" : "s") available"
+            String(localized: "bench.throughput.section.configuration",
+                   defaultValue: "Configuration",
+                   comment: "Section header for the Throughput Bench configuration block"),
+            subtitle: models.isEmpty
+                ? String(localized: "bench.throughput.subtitle.loading_models",
+                         defaultValue: "Loading models…",
+                         comment: "Throughput Bench section subtitle while models are loading")
+                : String(localized: "bench.throughput.subtitle.model_count",
+                         defaultValue: "\(models.count) model\(models.count == 1 ? "" : "s") available",
+                         comment: "Throughput Bench section subtitle showing how many models are available; placeholder is the count with pluralization")
         )
 
         ListGroup {
-            Row(label: "Model", sublabel: "Loaded or unloaded — server will load on demand") {
+            Row(label: String(localized: "bench.throughput.row.model.label",
+                              defaultValue: "Model",
+                              comment: "Row label for the Throughput Bench model picker"),
+                sublabel: String(localized: "bench.throughput.row.model.sub",
+                                 defaultValue: "Loaded or unloaded — server will load on demand",
+                                 comment: "Sublabel under the Throughput Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
                     width: 320,
@@ -167,15 +194,24 @@ private struct ConfigurationSection: View {
 
             FreeRow {
                 ChipRow(
-                    title: "Context lengths",
-                    sublabel: "Prompt tokens to feed for each single-request trial",
+                    title: String(localized: "bench.throughput.row.context_lengths.title",
+                                  defaultValue: "Context lengths",
+                                  comment: "Inline title above the prompt-length chip row"),
+                    sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
+                                     defaultValue: "Prompt tokens to feed for each single-request trial",
+                                     comment: "Sublabel under the prompt-length chip row"),
                     options: Self.promptLengthOptions,
                     selection: $promptLengths,
                     format: Self.formatPromptLength
                 )
             }
 
-            Row(label: "Generation length", sublabel: "Output tokens per single-request trial") {
+            Row(label: String(localized: "bench.throughput.row.gen_length.label",
+                              defaultValue: "Generation length",
+                              comment: "Row label for the Throughput Bench generation-length field"),
+                sublabel: String(localized: "bench.throughput.row.gen_length.sub",
+                                 defaultValue: "Output tokens per single-request trial",
+                                 comment: "Sublabel under the Throughput Bench generation-length field")) {
                 TextInput(
                     text: $genLength,
                     placeholder: "128",
@@ -186,8 +222,12 @@ private struct ConfigurationSection: View {
 
             FreeRow {
                 ChipRow(
-                    title: "Batch sizes",
-                    sublabel: "Concurrent requests per batch in the continuous-batching phase",
+                    title: String(localized: "bench.throughput.row.batch_sizes.title",
+                                  defaultValue: "Batch sizes",
+                                  comment: "Inline title above the batch-size chip row"),
+                    sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
+                                     defaultValue: "Concurrent requests per batch in the continuous-batching phase",
+                                     comment: "Sublabel under the batch-size chip row"),
                     options: Self.batchSizeOptions,
                     selection: $batchSizes,
                     format: { "\($0)" }
@@ -201,7 +241,10 @@ private struct ConfigurationSection: View {
                         Button {
                             onCancel()
                         } label: {
-                            Label("Cancel", systemImage: "stop.fill")
+                            Label(String(localized: "common.cancel",
+                                         defaultValue: "Cancel",
+                                         comment: "Generic Cancel button label"),
+                                  systemImage: "stop.fill")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.destructive))
@@ -209,7 +252,10 @@ private struct ConfigurationSection: View {
                         Button {
                             onRun()
                         } label: {
-                            Label("Run Benchmark", systemImage: "play.fill")
+                            Label(String(localized: "bench.throughput.button.run",
+                                         defaultValue: "Run Benchmark",
+                                         comment: "Throughput Bench primary button that starts a sweep"),
+                                  systemImage: "play.fill")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.primary))
@@ -221,7 +267,9 @@ private struct ConfigurationSection: View {
     }
 
     private var modelOptions: [PopupOption<String>] {
-        var opts = [PopupOption(value: "", label: "Select a model…")]
+        var opts = [PopupOption(value: "", label: String(localized: "bench.throughput.model.placeholder",
+                                                         defaultValue: "Select a model…",
+                                                         comment: "Placeholder option in the Throughput Bench model picker"))]
         opts += models.map { m in
             PopupOption(value: m.id, label: m.id)
         }
@@ -331,11 +379,15 @@ private struct LiveProgressCard: View {
                     ProgressView()
                         .controlSize(.small)
                     if resultCount == 0 {
-                        Text("Warming up…")
+                        Text(String(localized: "bench.throughput.progress.warming_up",
+                                    defaultValue: "Warming up…",
+                                    comment: "Throughput Bench progress label before the first result arrives"))
                             .font(.omlxText(12))
                             .foregroundStyle(theme.textSecondary)
                     } else {
-                        Text("Running… (\(resultCount) result\(resultCount == 1 ? "" : "s") so far)")
+                        Text(String(localized: "bench.throughput.progress.running",
+                                    defaultValue: "Running… (\(resultCount) result\(resultCount == 1 ? "" : "s") so far)",
+                                    comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count with pluralization"))
                             .font(.omlxText(12))
                             .foregroundStyle(theme.textSecondary)
                     }
@@ -356,14 +408,40 @@ private struct SingleResultsTable: View {
     @Environment(\.omlxTheme) private var theme
 
     private let columnHeaders: [String] = [
-        "Test", "TTFT (ms)", "TPOT (ms)", "pp TPS", "tg TPS",
-        "E2E (s)", "Throughput", "Peak Mem",
+        String(localized: "bench.throughput.single.col.test",
+               defaultValue: "Test",
+               comment: "Single-request results column header: test descriptor"),
+        String(localized: "bench.throughput.single.col.ttft",
+               defaultValue: "TTFT (ms)",
+               comment: "Single-request results column header: time-to-first-token in ms"),
+        String(localized: "bench.throughput.single.col.tpot",
+               defaultValue: "TPOT (ms)",
+               comment: "Single-request results column header: time-per-output-token in ms"),
+        String(localized: "bench.throughput.single.col.pp_tps",
+               defaultValue: "pp TPS",
+               comment: "Single-request results column header: prompt-processing tokens-per-second"),
+        String(localized: "bench.throughput.single.col.tg_tps",
+               defaultValue: "tg TPS",
+               comment: "Single-request results column header: token-generation tokens-per-second"),
+        String(localized: "bench.throughput.single.col.e2e",
+               defaultValue: "E2E (s)",
+               comment: "Single-request results column header: end-to-end latency in seconds"),
+        String(localized: "bench.throughput.single.col.throughput",
+               defaultValue: "Throughput",
+               comment: "Single-request results column header: total throughput"),
+        String(localized: "bench.throughput.single.col.peak_mem",
+               defaultValue: "Peak Mem",
+               comment: "Single-request results column header: peak memory usage"),
     ]
 
     var body: some View {
         SectionHeader(
-            "Single Request Results",
-            subtitle: "\(results.count) trial\(results.count == 1 ? "" : "s")"
+            String(localized: "bench.throughput.section.single_results",
+                   defaultValue: "Single Request Results",
+                   comment: "Section header for the Throughput Bench single-request results table"),
+            subtitle: String(localized: "bench.throughput.single.subtitle",
+                             defaultValue: "\(results.count) trial\(results.count == 1 ? "" : "s")",
+                             comment: "Subtitle for the single-request results table; placeholder is the count with pluralization")
         )
 
         ListGroup {
@@ -407,7 +485,9 @@ private struct SingleResultsTable: View {
     private func testLabel(_ r: BenchResultDTO) -> String {
         let pp = r.pp ?? 0
         let tg = r.tg ?? 0
-        return "pp \(pp) / tg \(tg)"
+        return String(localized: "bench.throughput.single.test_label",
+                      defaultValue: "pp \(pp) / tg \(tg)",
+                      comment: "Single-request row identifier showing prompt-processing and token-generation counts; placeholders are pp and tg integer counts")
     }
 }
 
@@ -420,13 +500,34 @@ private struct BatchResultsTable: View {
     @Environment(\.omlxTheme) private var theme
 
     private let columnHeaders: [String] = [
-        "Batch", "tg TPS", "pp TPS", "avg TTFT (ms)", "E2E (s)", "Speedup",
+        String(localized: "bench.throughput.batch.col.batch",
+               defaultValue: "Batch",
+               comment: "Batch results column header: batch size"),
+        String(localized: "bench.throughput.batch.col.tg_tps",
+               defaultValue: "tg TPS",
+               comment: "Batch results column header: token-generation tokens-per-second"),
+        String(localized: "bench.throughput.batch.col.pp_tps",
+               defaultValue: "pp TPS",
+               comment: "Batch results column header: prompt-processing tokens-per-second"),
+        String(localized: "bench.throughput.batch.col.avg_ttft",
+               defaultValue: "avg TTFT (ms)",
+               comment: "Batch results column header: average time-to-first-token in ms"),
+        String(localized: "bench.throughput.batch.col.e2e",
+               defaultValue: "E2E (s)",
+               comment: "Batch results column header: end-to-end latency in seconds"),
+        String(localized: "bench.throughput.batch.col.speedup",
+               defaultValue: "Speedup",
+               comment: "Batch results column header: speedup vs 1x baseline"),
     ]
 
     var body: some View {
         SectionHeader(
-            "Batch Results",
-            subtitle: "Continuous batching vs 1× baseline"
+            String(localized: "bench.throughput.section.batch_results",
+                   defaultValue: "Batch Results",
+                   comment: "Section header for the Throughput Bench continuous-batching results table"),
+            subtitle: String(localized: "bench.throughput.batch.subtitle",
+                             defaultValue: "Continuous batching vs 1× baseline",
+                             comment: "Subtitle under the Batch Results section header")
         )
 
         ListGroup {
@@ -445,7 +546,10 @@ private struct BatchResultsTable: View {
             if let baseline {
                 FreeRow {
                     HStack(spacing: 10) {
-                        cell("1× baseline", mono: true)
+                        cell(String(localized: "bench.throughput.batch.baseline_label",
+                                    defaultValue: "1× baseline",
+                                    comment: "Row label for the synthetic 1x baseline in the batch results table"),
+                             mono: true)
                         cell(format1(baseline.genTps))
                         cell(format1(baseline.processingTps))
                         cell(format1(baseline.ttftMs))
@@ -503,7 +607,9 @@ private struct TextExportSection: View {
                         Image(systemName: isOpen ? "chevron.down" : "chevron.right")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(theme.textSecondary)
-                        Text("Text export")
+                        Text(String(localized: "bench.throughput.text_export.title",
+                                    defaultValue: "Text export",
+                                    comment: "Disclosure header for the Throughput Bench text export block"))
                             .font(.omlxText(11, weight: .semibold))
                             .foregroundStyle(theme.textSecondary)
                             .textCase(.uppercase)
@@ -516,7 +622,9 @@ private struct TextExportSection: View {
                 Spacer(minLength: 0)
 
                 if isOpen {
-                    Button("Copy") { copyToPasteboard() }
+                    Button(String(localized: "common.copy",
+                                  defaultValue: "Copy",
+                                  comment: "Generic Copy button label")) { copyToPasteboard() }
                         .buttonStyle(.omlx(.normal, size: .small))
                 }
             }
@@ -562,7 +670,9 @@ private struct UploadSection: View {
 
     var body: some View {
         SectionHeader(
-            "Community Leaderboard",
+            String(localized: "bench.throughput.section.leaderboard",
+                   defaultValue: "Community Leaderboard",
+                   comment: "Section header for the Throughput Bench community-upload block"),
             subtitle: subtitle
         )
 
@@ -572,12 +682,16 @@ private struct UploadSection: View {
                 FreeRow(isLast: true) {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
-                        Text("Uploading to omlx.ai…")
+                        Text(String(localized: "bench.throughput.upload.uploading",
+                                    defaultValue: "Uploading to omlx.ai…",
+                                    comment: "Status label while bench results are being uploaded to the community leaderboard"))
                             .font(.omlxText(11.5))
                             .foregroundStyle(theme.textSecondary)
                         Spacer(minLength: 0)
                         if !state.results.isEmpty {
-                            Text("\(state.results.count) submitted")
+                            Text(String(localized: "bench.throughput.upload.count_submitted",
+                                        defaultValue: "\(state.results.count) submitted",
+                                        comment: "Inline counter shown during community upload; placeholder is the submitted count"))
                                 .font(.omlxMono(11))
                                 .foregroundStyle(theme.textTertiary)
                         }
@@ -608,11 +722,21 @@ private struct UploadSection: View {
 
     private var subtitle: String? {
         switch state.phase {
-        case "uploading": return "Submitting results…"
-        case "skipped":   return "Skipped"
+        case "uploading": return String(localized: "bench.throughput.upload.subtitle.uploading",
+                                        defaultValue: "Submitting results…",
+                                        comment: "Community-leaderboard subtitle while results are uploading")
+        case "skipped":   return String(localized: "bench.throughput.upload.subtitle.skipped",
+                                        defaultValue: "Skipped",
+                                        comment: "Community-leaderboard subtitle when the server skipped uploading")
         case "done":
-            if state.failedCount == 0 { return "\(state.successCount) of \(state.total) submitted" }
-            return "\(state.successCount) ok · \(state.failedCount) failed"
+            if state.failedCount == 0 {
+                return String(localized: "bench.throughput.upload.subtitle.done_all",
+                              defaultValue: "\(state.successCount) of \(state.total) submitted",
+                              comment: "Community-leaderboard subtitle on success; placeholders are success count and total")
+            }
+            return String(localized: "bench.throughput.upload.subtitle.done_partial",
+                          defaultValue: "\(state.successCount) ok · \(state.failedCount) failed",
+                          comment: "Community-leaderboard subtitle when some uploads failed; placeholders are success and failure counts")
         default: return nil
         }
     }
@@ -625,7 +749,9 @@ private struct UploadRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("pp \(result.contextLength)")
+            Text(String(localized: "bench.throughput.upload.row.context_length",
+                        defaultValue: "pp \(result.contextLength)",
+                        comment: "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length"))
                 .font(.omlxMono(12))
                 .foregroundStyle(theme.text)
                 .frame(width: 80, alignment: .leading)
@@ -646,14 +772,23 @@ private struct UploadRow: View {
                       : "checkmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(result.duplicate == true ? theme.textTertiary : theme.greenDot)
-                Text(result.duplicate == true ? "Already submitted" : "Submitted")
+                Text(result.duplicate == true
+                     ? String(localized: "bench.throughput.upload.row.already",
+                              defaultValue: "Already submitted",
+                              comment: "Upload row label when the leaderboard already has this result")
+                     : String(localized: "bench.throughput.upload.row.submitted",
+                              defaultValue: "Submitted",
+                              comment: "Upload row label after a successful submission"))
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 0)
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {
-                    Label("Open", systemImage: "arrow.up.right.square")
+                    Label(String(localized: "common.open",
+                                 defaultValue: "Open",
+                                 comment: "Generic Open button label"),
+                          systemImage: "arrow.up.right.square")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
@@ -661,7 +796,9 @@ private struct UploadRow: View {
                 Image(systemName: "questionmark.circle")
                     .font(.system(size: 11))
                     .foregroundStyle(theme.textTertiary)
-                Text("No URL returned")
+                Text(String(localized: "bench.throughput.upload.row.no_url",
+                            defaultValue: "No URL returned",
+                            comment: "Upload row label when the server returned no leaderboard URL"))
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
                 Spacer(minLength: 0)
@@ -682,7 +819,9 @@ private struct OwnerHashRow: View {
             Image(systemName: "person.crop.circle.badge.checkmark")
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textTertiary)
-            Text("Owner hash")
+            Text(String(localized: "bench.throughput.upload.owner_hash.label",
+                        defaultValue: "Owner hash",
+                        comment: "Label next to the leaderboard owner-hash identifier"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textTertiary)
             Text(ownerHash)
@@ -690,7 +829,9 @@ private struct OwnerHashRow: View {
                 .foregroundStyle(theme.textSecondary)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
-            Button("Copy") {
+            Button(String(localized: "common.copy",
+                          defaultValue: "Copy",
+                          comment: "Generic Copy button label")) {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(ownerHash, forType: .string)
             }
@@ -715,7 +856,9 @@ private struct SkippedBanner: View {
                 .font(.system(size: 11))
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Skipped community upload")
+                Text(String(localized: "bench.throughput.upload.skipped.title",
+                            defaultValue: "Skipped community upload",
+                            comment: "Banner heading shown when the server skipped uploading bench results"))
                     .font(.omlxText(12, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(body(reason: reason, features: features))
@@ -735,10 +878,18 @@ private struct SkippedBanner: View {
     private func body(reason: String?, features: [String]) -> String {
         switch reason {
         case "experimental_features":
-            let list = features.isEmpty ? "experimental features" : features.joined(separator: ", ")
-            return "Results were not submitted because \(list) were active during the run. These features skew throughput and would pollute the leaderboard."
+            let list = features.isEmpty
+                ? String(localized: "bench.throughput.upload.skipped.experimental_default",
+                         defaultValue: "experimental features",
+                         comment: "Fallback noun phrase listed in the skipped-upload reason when the server returned no feature names")
+                : features.joined(separator: ", ")
+            return String(localized: "bench.throughput.upload.skipped.experimental",
+                          defaultValue: "Results were not submitted because \(list) were active during the run. These features skew throughput and would pollute the leaderboard.",
+                          comment: "Skipped-upload reason when experimental features were active; placeholder is the comma-joined feature list")
         default:
-            return "The server skipped uploading these results."
+            return String(localized: "bench.throughput.upload.skipped.default",
+                          defaultValue: "The server skipped uploading these results.",
+                          comment: "Fallback skipped-upload reason when the server didn't provide one")
         }
     }
 }

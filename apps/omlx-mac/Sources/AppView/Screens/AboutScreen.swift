@@ -53,10 +53,14 @@ private struct HeroCard: View {
                 Text("oMLX")
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
-                Text("Native macOS app for the oMLX server")
+                Text(String(localized: "about.hero.tagline",
+                            defaultValue: "Native macOS app for the oMLX server",
+                            comment: "Tagline shown under the oMLX product name on the About screen hero card"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)
-                Text("Version \(version) · build \(build)")
+                Text(String(localized: "about.hero.version",
+                            defaultValue: "Version \(version) · build \(build)",
+                            comment: "Version + build line on the About screen hero card; placeholders are the bundle short version string and bundle version"))
                     .font(.omlxMono(11))
                     .foregroundStyle(theme.textTertiary)
             }
@@ -79,30 +83,48 @@ private struct HeroCard: View {
 
 private struct ProjectSection: View {
     var body: some View {
-        SectionHeader("Project")
+        SectionHeader(String(localized: "about.section.project",
+                             defaultValue: "Project",
+                             comment: "Section header above the project links list on the About screen"))
 
         ListGroup {
             LinkRow(
-                label: "GitHub Repository",
-                sublabel: "Source, issues, and roadmap",
+                label: String(localized: "about.project.github.label",
+                              defaultValue: "GitHub Repository",
+                              comment: "About screen link row label pointing to the oMLX GitHub repo"),
+                sublabel: String(localized: "about.project.github.sub",
+                                 defaultValue: "Source, issues, and roadmap",
+                                 comment: "Sublabel under the GitHub Repository link on the About screen"),
                 icon: "chevron.left.forwardslash.chevron.right",
                 url: URL(string: "https://github.com/jundot/omlx")!
             )
             LinkRow(
-                label: "Releases",
-                sublabel: "Download the latest CLI and macOS app",
+                label: String(localized: "about.project.releases.label",
+                              defaultValue: "Releases",
+                              comment: "About screen link row label pointing to GitHub releases"),
+                sublabel: String(localized: "about.project.releases.sub",
+                                 defaultValue: "Download the latest CLI and macOS app",
+                                 comment: "Sublabel under the Releases link on the About screen"),
                 icon: "shippingbox",
                 url: URL(string: "https://github.com/jundot/omlx/releases")!
             )
             LinkRow(
-                label: "Documentation",
-                sublabel: "Setup, model management, integrations",
+                label: String(localized: "about.project.docs.label",
+                              defaultValue: "Documentation",
+                              comment: "About screen link row label pointing to product documentation"),
+                sublabel: String(localized: "about.project.docs.sub",
+                                 defaultValue: "Setup, model management, integrations",
+                                 comment: "Sublabel under the Documentation link on the About screen"),
                 icon: "book.closed",
                 url: URL(string: "https://omlx.app/docs")!
             )
             LinkRow(
-                label: "Report an Issue",
-                sublabel: "Bugs and feature requests on GitHub",
+                label: String(localized: "about.project.issue.label",
+                              defaultValue: "Report an Issue",
+                              comment: "About screen link row label pointing to the GitHub new-issue form"),
+                sublabel: String(localized: "about.project.issue.sub",
+                                 defaultValue: "Bugs and feature requests on GitHub",
+                                 comment: "Sublabel under the Report an Issue link on the About screen"),
                 icon: "exclamationmark.bubble",
                 url: URL(string: "https://github.com/jundot/omlx/issues/new")!,
                 isLast: true
@@ -139,7 +161,10 @@ private struct LinkRow: View {
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {
-                    Label("Open", systemImage: "arrow.up.right.square")
+                    Label(String(localized: "common.open",
+                                 defaultValue: "Open",
+                                 comment: "Button label that opens the linked URL in the default browser"),
+                          systemImage: "arrow.up.right.square")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.normal, size: .small))
@@ -154,7 +179,9 @@ private struct LicenseSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("License")
+        SectionHeader(String(localized: "about.section.license",
+                             defaultValue: "License",
+                             comment: "Section header above the license block on the About screen"))
 
         ListGroup {
             FreeRow(isLast: true) {
@@ -163,11 +190,15 @@ private struct LicenseSection: View {
                         Image(systemName: "scale.3d")
                             .font(.system(size: 13))
                             .foregroundStyle(theme.textSecondary)
-                        Text("Apache License 2.0")
+                        Text(String(localized: "about.license.name",
+                                    defaultValue: "Apache License 2.0",
+                                    comment: "Name of the open-source license shown on the About screen"))
                             .font(.omlxText(13, weight: .medium))
                             .foregroundStyle(theme.text)
                     }
-                    Text("Copyright © oMLX contributors. Licensed under the Apache License, Version 2.0. See the LICENSE file in the repository for the full text.")
+                    Text(String(localized: "about.license.notice",
+                                defaultValue: "Copyright © oMLX contributors. Licensed under the Apache License, Version 2.0. See the LICENSE file in the repository for the full text.",
+                                comment: "Copyright + license notice paragraph on the About screen"))
                         .font(.omlxText(11.5))
                         .foregroundStyle(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -192,33 +223,45 @@ private struct CreditsSection: View {
     private let credits: [Credit] = [
         Credit(
             name: "MLX",
-            role: "Apple's array framework — the engine behind every model",
+            role: String(localized: "about.credits.mlx.role",
+                         defaultValue: "Apple's array framework — the engine behind every model",
+                         comment: "About screen Credits row: role/description for the MLX project"),
             url: URL(string: "https://github.com/ml-explore/mlx")!
         ),
         Credit(
             name: "mlx-lm",
-            role: "Language-model execution + fine-tuning on MLX",
+            role: String(localized: "about.credits.mlx_lm.role",
+                         defaultValue: "Language-model execution + fine-tuning on MLX",
+                         comment: "About screen Credits row: role/description for the mlx-lm project"),
             url: URL(string: "https://github.com/ml-explore/mlx-lm")!
         ),
         Credit(
             name: "mlx-vlm",
-            role: "Vision-language models on MLX",
+            role: String(localized: "about.credits.mlx_vlm.role",
+                         defaultValue: "Vision-language models on MLX",
+                         comment: "About screen Credits row: role/description for the mlx-vlm project"),
             url: URL(string: "https://github.com/Blaizzy/mlx-vlm")!
         ),
         Credit(
             name: "mlx-embeddings",
-            role: "Embedding + reranker models on MLX",
+            role: String(localized: "about.credits.mlx_embeddings.role",
+                         defaultValue: "Embedding + reranker models on MLX",
+                         comment: "About screen Credits row: role/description for the mlx-embeddings project"),
             url: URL(string: "https://github.com/Blaizzy/mlx-embeddings")!
         ),
         Credit(
             name: "mlx-audio",
-            role: "Audio (STT / TTS / STS) models on MLX",
+            role: String(localized: "about.credits.mlx_audio.role",
+                         defaultValue: "Audio (STT / TTS / STS) models on MLX",
+                         comment: "About screen Credits row: role/description for the mlx-audio project"),
             url: URL(string: "https://github.com/Blaizzy/mlx-audio")!
         ),
     ]
 
     var body: some View {
-        SectionHeader("Built On")
+        SectionHeader(String(localized: "about.section.built_on",
+                             defaultValue: "Built On",
+                             comment: "Section header above the credits list on the About screen"))
 
         ListGroup {
             ForEach(Array(credits.enumerated()), id: \.element.id) { idx, credit in

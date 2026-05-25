@@ -70,7 +70,9 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "Welcome to oMLX"
+        win.title = String(localized: "welcome.window.title",
+                           defaultValue: "Welcome to oMLX",
+                           comment: "Window title bar text for the Welcome wizard")
         win.contentViewController = hosting
         win.center()
         win.delegate = self
@@ -166,12 +168,16 @@ final class WelcomeViewModel: ObservableObject {
     func validateStorage() -> Bool {
         let trimmedBase = basePath.trimmingCharacters(in: .whitespaces)
         guard !trimmedBase.isEmpty else {
-            lastError = "Base directory is required."
+            lastError = String(localized: "welcome.error.base_dir_required",
+                               defaultValue: "Base directory is required.",
+                               comment: "Welcome wizard validation: empty base path")
             return false
         }
         guard let port = Int(portText.trimmingCharacters(in: .whitespaces)),
               (1...65535).contains(port) else {
-            lastError = "Port must be a number between 1 and 65535."
+            lastError = String(localized: "welcome.error.port_out_of_range",
+                               defaultValue: "Port must be a number between 1 and 65535.",
+                               comment: "Welcome wizard validation: port not in valid range")
             return false
         }
         _ = port
@@ -182,19 +188,27 @@ final class WelcomeViewModel: ObservableObject {
     func validateApiKey() -> Bool {
         let key = apiKey.trimmingCharacters(in: .whitespaces)
         guard key.count >= 4 else {
-            lastError = "API key must be at least 4 characters."
+            lastError = String(localized: "welcome.error.key_too_short",
+                               defaultValue: "API key must be at least 4 characters.",
+                               comment: "Welcome wizard validation: api key below min length")
             return false
         }
         guard !key.contains(where: { $0.isWhitespace }) else {
-            lastError = "API key must not contain whitespace."
+            lastError = String(localized: "welcome.error.key_whitespace",
+                               defaultValue: "API key must not contain whitespace.",
+                               comment: "Welcome wizard validation: api key contains spaces")
             return false
         }
         guard key.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value < 0x7F }) else {
-            lastError = "API key must contain only printable ASCII."
+            lastError = String(localized: "welcome.error.key_non_ascii",
+                               defaultValue: "API key must contain only printable ASCII.",
+                               comment: "Welcome wizard validation: api key has non-printable or non-ASCII chars")
             return false
         }
         guard apiKey == apiKeyConfirm else {
-            lastError = "API keys do not match."
+            lastError = String(localized: "welcome.error.key_mismatch",
+                               defaultValue: "API keys do not match.",
+                               comment: "Welcome wizard validation: confirm field differs")
             return false
         }
         lastError = nil
@@ -209,8 +223,12 @@ final class WelcomeViewModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Select"
-        panel.message = "Choose a parent folder. An .omlx directory will be created inside it."
+        panel.prompt = String(localized: "welcome.browse.prompt",
+                              defaultValue: "Select",
+                              comment: "NSOpenPanel button label for the Welcome wizard's folder pickers")
+        panel.message = String(localized: "welcome.browse.base_message",
+                               defaultValue: "Choose a parent folder. An .omlx directory will be created inside it.",
+                               comment: "NSOpenPanel message when picking the Base Directory in Welcome wizard")
         if panel.runModal() == .OK, let url = panel.url {
             basePath = url.appendingPathComponent(".omlx", isDirectory: true).path
         }
@@ -222,8 +240,12 @@ final class WelcomeViewModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Select"
-        panel.message = "Choose the directory containing your model files."
+        panel.prompt = String(localized: "welcome.browse.prompt",
+                              defaultValue: "Select",
+                              comment: "NSOpenPanel button label for the Welcome wizard's folder pickers")
+        panel.message = String(localized: "welcome.browse.model_message",
+                               defaultValue: "Choose the directory containing your model files.",
+                               comment: "NSOpenPanel message when picking the Model Directory in Welcome wizard")
         if panel.runModal() == .OK, let url = panel.url {
             modelDir = url.path
         }
@@ -238,7 +260,9 @@ final class WelcomeViewModel: ObservableObject {
 
         // 1. Persist AppConfig.
         guard let port = Int(portText.trimmingCharacters(in: .whitespaces)) else {
-            lastError = "Invalid port."
+            lastError = String(localized: "welcome.error.invalid_port",
+                               defaultValue: "Invalid port.",
+                               comment: "Welcome wizard: port field couldn't be parsed as an integer")
             return false
         }
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespaces)
@@ -269,7 +293,9 @@ final class WelcomeViewModel: ObservableObject {
                 withIntermediateDirectories: true
             )
         } catch {
-            lastError = "Cannot create base directory: \(error.localizedDescription)"
+            lastError = String(localized: "welcome.error.mkdir_failed",
+                               defaultValue: "Cannot create base directory: \(error.localizedDescription)",
+                               comment: "Welcome wizard: mkdir on the base path failed; placeholder is the system error message")
             return false
         }
 
@@ -280,7 +306,9 @@ final class WelcomeViewModel: ObservableObject {
         do {
             try config.save()
         } catch {
-            lastError = "Failed to save config: \(error.localizedDescription)"
+            lastError = String(localized: "welcome.error.save_config_failed",
+                               defaultValue: "Failed to save config: \(error.localizedDescription)",
+                               comment: "Welcome wizard: writing settings.json failed; placeholder is the system error message")
             return false
         }
         services.updateConfig(config)
@@ -300,7 +328,9 @@ final class WelcomeViewModel: ObservableObject {
                     basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
                 )
             } catch {
-                lastError = "Failed to locate Python runtime: \(error.localizedDescription)"
+                lastError = String(localized: "welcome.error.python_runtime_failed",
+                                   defaultValue: "Failed to locate Python runtime: \(error.localizedDescription)",
+                                   comment: "Welcome wizard: PythonRuntime.resolve() threw; placeholder is the system error message")
                 return false
             }
         }
@@ -313,12 +343,19 @@ final class WelcomeViewModel: ObservableObject {
             case .started, .alreadyRunning:
                 break
             case .portConflict(let conflict):
-                lastError = "Port \(config.port) is already in use" +
-                    (conflict.isOMLX ? " (oMLX server already running)." : ".")
+                lastError = conflict.isOMLX
+                    ? String(localized: "welcome.error.port_in_use_omlx",
+                             defaultValue: "Port \(config.port) is already in use (oMLX server already running).",
+                             comment: "Welcome wizard: bind() failed because another oMLX instance owns the port")
+                    : String(localized: "welcome.error.port_in_use",
+                             defaultValue: "Port \(config.port) is already in use.",
+                             comment: "Welcome wizard: bind() failed because some other process owns the port")
                 return false
             }
         } catch {
-            lastError = "Failed to start server: \(error.localizedDescription)"
+            lastError = String(localized: "welcome.error.start_server_failed",
+                               defaultValue: "Failed to start server: \(error.localizedDescription)",
+                               comment: "Welcome wizard: ServerProcess.start() threw; placeholder is the system error message")
             return false
         }
 
@@ -453,10 +490,14 @@ private struct WelcomeHeader: View {
                 .interpolation(.high)
                 .frame(width: 73, height: 73)
             VStack(spacing: 4) {
-                Text("Welcome to oMLX")
+                Text(String(localized: "welcome.header.title",
+                            defaultValue: "Welcome to oMLX",
+                            comment: "Main heading shown on the Welcome wizard"))
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
-                Text("LLM inference, optimized for your Mac")
+                Text(String(localized: "welcome.header.tagline",
+                            defaultValue: "LLM inference, optimized for your Mac",
+                            comment: "Sub-tagline under the Welcome wizard's main heading"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)
             }
@@ -475,18 +516,24 @@ private struct SetupBody: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Confirm where weights live and pick an API key. You can change either later in Settings.")
+            Text(String(localized: "welcome.intro",
+                        defaultValue: "Confirm where weights live and pick an API key. You can change either later in Settings.",
+                        comment: "Intro paragraph at the top of the Welcome wizard's setup body"))
                 .font(.omlxText(12))
                 .foregroundStyle(theme.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             // Storage
             VStack(alignment: .leading, spacing: 6) {
-                sectionLabel("Storage")
+                sectionLabel(String(localized: "welcome.storage.section",
+                                    defaultValue: "Storage",
+                                    comment: "Section heading above the Storage rows in Welcome wizard"))
                 ListGroup {
                     FreeRow {
                         VStack(alignment: .leading, spacing: 6) {
-                            labelRow("Base Directory")
+                            labelRow(String(localized: "welcome.storage.base_dir.label",
+                                            defaultValue: "Base Directory",
+                                            comment: "Row label for the Base Directory picker in Welcome wizard"))
                             HStack(spacing: 8) {
                                 Text(vm.basePath)
                                     .font(.omlxMono(11))
@@ -494,18 +541,28 @@ private struct SetupBody: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                Button("Browse…") { vm.browseBaseDirectory() }
+                                Button(String(localized: "welcome.button.browse",
+                                              defaultValue: "Browse…",
+                                              comment: "Folder picker trigger button in Welcome wizard")) {
+                                    vm.browseBaseDirectory()
+                                }
                                     .buttonStyle(.omlx(.normal, size: .small))
                             }
                         }
                     }
                     FreeRow {
                         VStack(alignment: .leading, spacing: 6) {
-                            labelRow("Model Directory",
-                                     sub: "Optional — defaults to <base>/models")
+                            labelRow(String(localized: "welcome.storage.model_dir.label",
+                                            defaultValue: "Model Directory",
+                                            comment: "Row label for the Model Directory picker in Welcome wizard"),
+                                     sub: String(localized: "welcome.storage.model_dir.sub",
+                                                 defaultValue: "Optional — defaults to <base>/models",
+                                                 comment: "Sublabel hinting that Model Directory is optional"))
                             HStack(spacing: 8) {
                                 Text(vm.modelDir.isEmpty
-                                     ? "<\((vm.basePath as NSString).lastPathComponent)>/models"
+                                     ? String(localized: "welcome.storage.model_dir.placeholder",
+                                              defaultValue: "<\((vm.basePath as NSString).lastPathComponent)>/models",
+                                              comment: "Placeholder string shown when Model Directory is unset; placeholder is the base path's leaf name")
                                      : vm.modelDir)
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
@@ -513,16 +570,28 @@ private struct SetupBody: View {
                                     .truncationMode(.middle)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 if !vm.modelDir.isEmpty {
-                                    Button("Reset") { vm.modelDir = "" }
+                                    Button(String(localized: "welcome.button.reset",
+                                                  defaultValue: "Reset",
+                                                  comment: "Clear the Model Directory override")) {
+                                        vm.modelDir = ""
+                                    }
                                         .buttonStyle(.omlx(.plain, size: .small))
                                 }
-                                Button("Browse…") { vm.browseModelDirectory() }
+                                Button(String(localized: "welcome.button.browse",
+                                              defaultValue: "Browse…",
+                                              comment: "Folder picker trigger button in Welcome wizard")) {
+                                    vm.browseModelDirectory()
+                                }
                                     .buttonStyle(.omlx(.normal, size: .small))
                             }
                         }
                     }
-                    Row(label: "Port",
-                        sublabel: "1024-65535 recommended; default 8080",
+                    Row(label: String(localized: "welcome.storage.port.label",
+                                      defaultValue: "Port",
+                                      comment: "Row label for the server port field in Welcome wizard"),
+                        sublabel: String(localized: "welcome.storage.port.sub",
+                                         defaultValue: "1024-65535 recommended; default 8080",
+                                         comment: "Sublabel for the port field with the recommended range"),
                         isLast: true) {
                         TextInput(text: $vm.portText, mono: true, width: 100)
                     }
@@ -531,12 +600,18 @@ private struct SetupBody: View {
 
             // API Key
             VStack(alignment: .leading, spacing: 6) {
-                sectionLabel("API Key")
+                sectionLabel(String(localized: "welcome.api_key.section",
+                                    defaultValue: "API Key",
+                                    comment: "Section heading above the API key rows in Welcome wizard"))
                 ListGroup {
                     FreeRow {
                         VStack(alignment: .leading, spacing: 6) {
-                            labelRow("API Key",
-                                     sub: "At least 4 printable characters, no whitespace")
+                            labelRow(String(localized: "welcome.api_key.label",
+                                            defaultValue: "API Key",
+                                            comment: "Row label for the primary API key field in Welcome wizard"),
+                                     sub: String(localized: "welcome.api_key.sub",
+                                                 defaultValue: "At least 4 printable characters, no whitespace",
+                                                 comment: "Sublabel describing API key format requirements"))
                             HStack(spacing: 6) {
                                 keyField($vm.apiKey)
                                 Button {
@@ -546,7 +621,13 @@ private struct SetupBody: View {
                                         .font(.system(size: 12))
                                 }
                                 .buttonStyle(.omlx(.plain, size: .small))
-                                .help(keyVisible ? "Hide key" : "Show key")
+                                .help(keyVisible
+                                      ? String(localized: "welcome.api_key.hide",
+                                               defaultValue: "Hide key",
+                                               comment: "Tooltip on the eye-slash button that masks the API key field")
+                                      : String(localized: "welcome.api_key.show",
+                                               defaultValue: "Show key",
+                                               comment: "Tooltip on the eye button that unmasks the API key field"))
                                 Button {
                                     vm.generateApiKey()
                                     keyVisible = true
@@ -554,17 +635,26 @@ private struct SetupBody: View {
                                     HStack(spacing: 4) {
                                         Image(systemName: "sparkles")
                                             .font(.system(size: 11))
-                                        Text("Generate")
+                                        Text(String(localized: "welcome.api_key.generate",
+                                                    defaultValue: "Generate",
+                                                    comment: "Button label that mints a random API key"))
                                     }
                                 }
                                 .buttonStyle(.omlx(.normal, size: .small))
-                                .help("Generate a random 40-char API key")
+                                .help(String(localized: "welcome.api_key.generate.help",
+                                             defaultValue: "Generate a random 40-char API key",
+                                             comment: "Tooltip on the Generate API key button"))
                             }
                         }
                     }
                     FreeRow(isLast: true) {
                         VStack(alignment: .leading, spacing: 6) {
-                            labelRow("Confirm", sub: "Re-enter the key to catch typos")
+                            labelRow(String(localized: "welcome.api_key.confirm.label",
+                                            defaultValue: "Confirm",
+                                            comment: "Row label for the API key confirmation field"),
+                                     sub: String(localized: "welcome.api_key.confirm.sub",
+                                                 defaultValue: "Re-enter the key to catch typos",
+                                                 comment: "Sublabel for the Confirm API key field"))
                             keyField($vm.apiKeyConfirm)
                         }
                     }
@@ -572,19 +662,28 @@ private struct SetupBody: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                HintLine(text: "Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.")
-                HintLine(text: "Your model library starts empty — visit Downloads to fetch your first model.")
-                HintLine(text: "You can re-open this wizard anytime from the menubar.")
+                HintLine(text: String(localized: "welcome.hint.settings_path",
+                                      defaultValue: "Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security.",
+                                      comment: "Hint line under the API key section pointing to settings.json"))
+                HintLine(text: String(localized: "welcome.hint.models_library",
+                                      defaultValue: "Your model library starts empty — visit Downloads to fetch your first model.",
+                                      comment: "Hint line pointing the user to Downloads after first-run"))
+                HintLine(text: String(localized: "welcome.hint.reopen",
+                                      defaultValue: "You can re-open this wizard anytime from the menubar.",
+                                      comment: "Hint line telling the user how to get back to the Welcome wizard"))
             }
         }
     }
 
     @ViewBuilder
     private func keyField(_ binding: Binding<String>) -> some View {
+        let placeholder = String(localized: "welcome.api_key.placeholder",
+                                 defaultValue: "sk-omlx-…",
+                                 comment: "Placeholder text inside the API key text fields")
         if keyVisible {
-            TextInput(text: binding, placeholder: "sk-omlx-…", mono: true, width: 260)
+            TextInput(text: binding, placeholder: placeholder, mono: true, width: 260)
         } else {
-            TextInput(text: binding, placeholder: "sk-omlx-…",
+            TextInput(text: binding, placeholder: placeholder,
                       isSecure: true, mono: true, width: 260)
         }
     }
@@ -635,7 +734,9 @@ private struct Footer: View {
             // the same start, then redirects the user to the local
             // /admin/dashboard. Sits to the left of the primary Start Server
             // button (macOS HIG: alternative on the left of primary).
-            Button("Open Admin Panel & Close") {
+            Button(String(localized: "welcome.button.open_admin",
+                          defaultValue: "Open Admin Panel & Close",
+                          comment: "Secondary footer button: start server and open the browser dashboard")) {
                 Task {
                     guard vm.validateSetup() else { return }
                     _ = await vm.startServerAndOpenAdmin()
@@ -653,10 +754,14 @@ private struct Footer: View {
                 if vm.isStarting {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("Starting…")
+                        Text(String(localized: "welcome.button.starting",
+                                    defaultValue: "Starting…",
+                                    comment: "Footer button label shown while the server is being spawned"))
                     }
                 } else {
-                    Text("Start Server")
+                    Text(String(localized: "welcome.button.start_server",
+                                defaultValue: "Start Server",
+                                comment: "Primary footer button that spawns the server and closes the wizard"))
                 }
             }
             .buttonStyle(.omlx(.primary))

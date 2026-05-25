@@ -47,8 +47,12 @@ private struct APIKeySection: View {
 
     var body: some View {
         SectionHeader(
-            "API Key",
-            subtitle: "Required to authenticate /v1 requests and admin sessions"
+            String(localized: "security.section.api_key",
+                   defaultValue: "API Key",
+                   comment: "Section header for the API key editor"),
+            subtitle: String(localized: "security.section.api_key.sub",
+                             defaultValue: "Required to authenticate /v1 requests and admin sessions",
+                             comment: "Subtitle for the API key section header")
         )
 
         ListGroup {
@@ -85,31 +89,54 @@ private struct APIKeyEditorRow: View {
 
     private var sublabel: String {
         vm.apiKeySet
-            ? "Used to authenticate /v1 and admin requests. ≥ 4 printable chars, no whitespace."
-            : "Set one before exposing the server. ≥ 4 printable chars, no whitespace."
+            ? String(localized: "security.api_key.sublabel.set",
+                     defaultValue: "Used to authenticate /v1 and admin requests. ≥ 4 printable chars, no whitespace.",
+                     comment: "Sublabel below the API key field when a key is already configured")
+            : String(localized: "security.api_key.sublabel.unset",
+                     defaultValue: "Set one before exposing the server. ≥ 4 printable chars, no whitespace.",
+                     comment: "Sublabel below the API key field when no key is configured")
     }
 
     var body: some View {
-        Row(label: "API Key", sublabel: sublabel, isLast: true) {
+        Row(label: String(localized: "security.api_key.row_label",
+                          defaultValue: "API Key",
+                          comment: "Row label for the API key editor"),
+            sublabel: sublabel, isLast: true) {
             HStack(spacing: 6) {
                 field
                 iconButton(systemName: showKey ? "eye.slash" : "eye",
-                           help: showKey ? "Hide key" : "Show key") {
+                           help: showKey
+                                ? String(localized: "security.api_key.hide",
+                                          defaultValue: "Hide key",
+                                          comment: "Tooltip on the eye button when the API key is visible")
+                                : String(localized: "security.api_key.show",
+                                          defaultValue: "Show key",
+                                          comment: "Tooltip on the eye button when the API key is masked")) {
                     showKey.toggle()
                 }
                 iconButton(systemName: "arrow.triangle.2.circlepath",
-                           help: "Generate a random key") {
+                           help: String(localized: "security.api_key.generate",
+                                        defaultValue: "Generate a random key",
+                                        comment: "Tooltip on the API key regenerate button")) {
                     draft = APIKeyGenerator.random()
                     showKey = true
                 }
                 iconButton(systemName: copied ? "checkmark" : "doc.on.doc",
-                           help: "Copy to clipboard",
+                           help: String(localized: "security.api_key.copy",
+                                        defaultValue: "Copy to clipboard",
+                                        comment: "Tooltip on the API key copy button"),
                            tint: copied ? theme.successText : theme.textSecondary,
                            disabled: draft.isEmpty) {
                     copyToClipboard()
                 }
                 if isDirty {
-                    Button(saving ? "Saving…" : "Save") {
+                    Button(saving
+                           ? String(localized: "security.api_key.saving",
+                                    defaultValue: "Saving…",
+                                    comment: "API key save button label while a save is in progress")
+                           : String(localized: "security.api_key.save",
+                                    defaultValue: "Save",
+                                    comment: "API key save button label when changes are pending")) {
                         Task { await save() }
                     }
                     .buttonStyle(.omlx(.primary, size: .small))
@@ -202,12 +229,18 @@ private struct AuthenticationSection: View {
     let client: OMLXClient
 
     var body: some View {
-        SectionHeader("Authentication")
+        SectionHeader(String(localized: "security.section.authentication",
+                              defaultValue: "Authentication",
+                              comment: "Section header for the authentication settings"))
 
         ListGroup {
             Row(
-                label: "Disable API Key Verification",
-                sublabel: "Allow unauthenticated /v1 and admin requests. Use for development only.",
+                label: String(localized: "security.auth.disable_verify",
+                              defaultValue: "Disable API Key Verification",
+                              comment: "Row label for the toggle that disables API key verification"),
+                sublabel: String(localized: "security.auth.disable_verify.sub",
+                                 defaultValue: "Allow unauthenticated /v1 and admin requests. Use for development only.",
+                                 comment: "Sublabel for the disable API key verification toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: vm.bind($vm.skipApiKeyVerification, save: {
@@ -233,13 +266,20 @@ private struct SubKeysSection: View {
 
     var body: some View {
         SectionHeader(
-            "Sub Keys",
-            subtitle: "Issue scoped keys for individual apps or users. Sub keys cannot grant admin access."
+            String(localized: "security.section.sub_keys",
+                   defaultValue: "Sub Keys",
+                   comment: "Section header for the sub-keys list"),
+            subtitle: String(localized: "security.section.sub_keys.sub",
+                             defaultValue: "Issue scoped keys for individual apps or users. Sub keys cannot grant admin access.",
+                             comment: "Subtitle for the Sub Keys section")
         ) {
             Button {
                 showCreate = true
             } label: {
-                Label("New", systemImage: "plus")
+                Label(String(localized: "security.sub_keys.new",
+                             defaultValue: "New",
+                             comment: "Button to open the sub-key create form"),
+                      systemImage: "plus")
                     .labelStyle(.titleAndIcon)
             }
             .buttonStyle(.omlx(.normal, size: .small))
@@ -247,22 +287,41 @@ private struct SubKeysSection: View {
 
         ListGroup {
             if showCreate {
-                Row(label: "Name", sublabel: "Optional human-readable label") {
-                    TextInput(text: $newName, placeholder: "Claude Code on laptop", width: 220)
+                Row(label: String(localized: "security.sub_keys.name_label",
+                                  defaultValue: "Name",
+                                  comment: "Row label for sub-key name input"),
+                    sublabel: String(localized: "security.sub_keys.name_sub",
+                                     defaultValue: "Optional human-readable label",
+                                     comment: "Sublabel for sub-key name input")) {
+                    TextInput(text: $newName,
+                              placeholder: String(localized: "security.sub_keys.name_placeholder",
+                                                  defaultValue: "Claude Code on laptop",
+                                                  comment: "Placeholder text for sub-key name input"),
+                              width: 220)
                 }
-                Row(label: "Key") {
-                    TextInput(text: $newKey, placeholder: "sk-omlx-sub-…", mono: true, width: 220)
+                Row(label: String(localized: "security.sub_keys.key_label",
+                                  defaultValue: "Key",
+                                  comment: "Row label for sub-key value input")) {
+                    TextInput(text: $newKey,
+                              placeholder: String(localized: "security.sub_keys.key_placeholder",
+                                                  defaultValue: "sk-omlx-sub-…",
+                                                  comment: "Placeholder text inside the sub-key value input"),
+                              mono: true, width: 220)
                 }
                 FreeRow {
                     HStack(spacing: 6) {
                         Spacer()
-                        Button("Cancel") {
+                        Button(String(localized: "common.cancel",
+                                      defaultValue: "Cancel",
+                                      comment: "Common cancel button label")) {
                             showCreate = false
                             newName = ""
                             newKey = ""
                         }
                         .buttonStyle(.omlx(.plain, size: .small))
-                        Button("Create") {
+                        Button(String(localized: "common.create",
+                                      defaultValue: "Create",
+                                      comment: "Common create button label")) {
                             Task {
                                 let ok = await vm.createSubKey(
                                     key: newKey, name: newName, client: client
@@ -282,7 +341,9 @@ private struct SubKeysSection: View {
 
             if vm.subKeys.isEmpty && !showCreate {
                 FreeRow(isLast: true) {
-                    Text("No sub keys yet.")
+                    Text(String(localized: "security.sub_keys.empty",
+                                defaultValue: "No sub keys yet.",
+                                comment: "Empty-state text shown when there are no sub-keys"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -294,7 +355,11 @@ private struct SubKeysSection: View {
                     FreeRow(isLast: isLast) {
                         HStack(spacing: 10) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(sub.name.isEmpty ? "(unnamed)" : sub.name)
+                                Text(sub.name.isEmpty
+                                     ? String(localized: "security.sub_keys.unnamed",
+                                              defaultValue: "(unnamed)",
+                                              comment: "Fallback display name for a sub-key with no name set")
+                                     : sub.name)
                                     .font(.omlxText(13, weight: .medium))
                                     .foregroundStyle(theme.text)
                                 Text(formatCreatedAt(sub.createdAt))
@@ -313,7 +378,9 @@ private struct SubKeysSection: View {
                                     .foregroundStyle(theme.redDot)
                             }
                             .buttonStyle(.omlx(.plain, size: .small))
-                            .help("Revoke")
+                            .help(String(localized: "security.sub_keys.revoke",
+                                         defaultValue: "Revoke",
+                                         comment: "Tooltip on the sub-key delete button"))
                         }
                     }
                 }
@@ -322,15 +389,25 @@ private struct SubKeysSection: View {
     }
 
     private func formatCreatedAt(_ iso: String) -> String {
-        guard !iso.isEmpty else { return "Created · unknown" }
+        guard !iso.isEmpty else {
+            return String(localized: "security.sub_keys.created_unknown",
+                          defaultValue: "Created · unknown",
+                          comment: "Sub-key created-at text when the timestamp is unavailable")
+        }
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let date = isoFormatter.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
-        guard let date else { return "Created · \(iso)" }
+        guard let date else {
+            return String(localized: "security.sub_keys.created_raw",
+                          defaultValue: "Created · \(iso)",
+                          comment: "Sub-key created-at text when the timestamp can't be parsed; placeholder is the raw ISO string")
+        }
         let f = DateFormatter()
         f.dateStyle = .medium
         f.timeStyle = .short
-        return "Created · \(f.string(from: date))"
+        return String(localized: "security.sub_keys.created_at",
+                      defaultValue: "Created · \(f.string(from: date))",
+                      comment: "Sub-key created-at text; placeholder is the formatted date and time")
     }
 }
 

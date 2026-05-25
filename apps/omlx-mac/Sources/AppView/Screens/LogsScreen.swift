@@ -11,17 +11,35 @@ struct LogsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SectionHeader("Server Logs", subtitle: vm.subtitle) {
+            SectionHeader(String(localized: "logs.section.title",
+                                  defaultValue: "Server Logs",
+                                  comment: "Section header above the log tail pane on the Logs screen"),
+                          subtitle: vm.subtitle) {
                 HStack(spacing: 6) {
                     Popup(
                         selection: $vm.lines,
                         width: 110,
                         options: [
-                            (100,   "Last 100"),
-                            (500,   "Last 500"),
-                            (1000,  "Last 1,000"),
-                            (5000,  "Last 5,000"),
-                            (20000, "Last 20,000"),
+                            (100,
+                             String(localized: "logs.lines.100",
+                                    defaultValue: "Last 100",
+                                    comment: "Popup option to show the most recent 100 log lines")),
+                            (500,
+                             String(localized: "logs.lines.500",
+                                    defaultValue: "Last 500",
+                                    comment: "Popup option to show the most recent 500 log lines")),
+                            (1000,
+                             String(localized: "logs.lines.1000",
+                                    defaultValue: "Last 1,000",
+                                    comment: "Popup option to show the most recent 1,000 log lines")),
+                            (5000,
+                             String(localized: "logs.lines.5000",
+                                    defaultValue: "Last 5,000",
+                                    comment: "Popup option to show the most recent 5,000 log lines")),
+                            (20000,
+                             String(localized: "logs.lines.20000",
+                                    defaultValue: "Last 20,000",
+                                    comment: "Popup option to show the most recent 20,000 log lines")),
                         ]
                     )
                     Button {
@@ -31,7 +49,11 @@ struct LogsScreen: View {
                     }
                     .buttonStyle(.omlx(.normal, size: .small))
                     .disabled(vm.isLoading)
-                    Button("Copy") { vm.copyToPasteboard() }
+                    Button(String(localized: "common.copy",
+                                  defaultValue: "Copy",
+                                  comment: "Button label to copy the visible log text to the pasteboard")) {
+                        vm.copyToPasteboard()
+                    }
                         .buttonStyle(.omlx(.normal, size: .small))
                         .disabled(vm.lines == 0 || vm.logText.isEmpty)
                 }
@@ -39,7 +61,10 @@ struct LogsScreen: View {
 
             if vm.availableFiles.count > 1 {
                 ListGroup {
-                    Row(label: "Log file", isLast: true) {
+                    Row(label: String(localized: "logs.row.file.label",
+                                      defaultValue: "Log file",
+                                      comment: "Row label for the log file selector popup on the Logs screen"),
+                        isLast: true) {
                         Popup(
                             selection: $vm.selectedFile,
                             width: 220,
@@ -94,7 +119,9 @@ private struct LogPane: View {
                 bgColor: NSColor(theme.codeBg)
             )
             if isEmpty && !isLoading {
-                Text("No log entries.")
+                Text(String(localized: "logs.empty",
+                            defaultValue: "No log entries.",
+                            comment: "Empty-state text shown inside the log pane when the server has no log entries"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -201,12 +228,19 @@ final class LogsScreenVM: ObservableObject {
 
     var subtitle: String {
         guard !logText.isEmpty else { return "" }
-        return "\(totalLines) lines"
+        return String(localized: "logs.subtitle.line_count",
+                      defaultValue: "\(totalLines) lines",
+                      comment: "Section header subtitle on the Logs screen; placeholder is the total number of log lines")
     }
 
     var fileOptions: [(String, String)] {
         availableFiles.map { name in
-            (name, name == "server.log" ? "server.log (current)" : name)
+            let label = name == "server.log"
+                ? String(localized: "logs.file.current",
+                         defaultValue: "server.log (current)",
+                         comment: "Popup label for the active server log file in the Logs screen file selector")
+                : name
+            return (name, label)
         }
     }
 

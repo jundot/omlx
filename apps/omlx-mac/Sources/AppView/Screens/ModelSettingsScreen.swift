@@ -94,7 +94,10 @@ private struct Header: View {
             Button {
                 onBack()
             } label: {
-                Label("Back to Models", systemImage: "chevron.left")
+                Label(String(localized: "settings.header.back_to_models",
+                             defaultValue: "Back to Models",
+                             comment: "Back button label at the top of the per-model settings screen"),
+                      systemImage: "chevron.left")
                     .labelStyle(.titleAndIcon)
             }
             .buttonStyle(.omlx(.plain, size: .small))
@@ -191,7 +194,9 @@ private struct ProfilesTab: View {
 
             ProfileGroup(
                 scope: .preset,
-                label: "Preset Profiles",
+                label: String(localized: "settings.profiles.preset.label",
+                              defaultValue: "Preset Profiles",
+                              comment: "Section label above the bundled preset profiles chip group"),
                 names: presetStore.entries.map(\.name),
                 activeName: vm.activeProfileState.activeName(in: .preset),
                 basedOnName: vm.activeProfileState.basedOnName(in: .preset),
@@ -207,7 +212,9 @@ private struct ProfilesTab: View {
 
             ProfileGroup(
                 scope: .global,
-                label: "Global Profiles",
+                label: String(localized: "settings.profiles.global.label",
+                              defaultValue: "Global Profiles",
+                              comment: "Section label above the user-defined global profile templates chip group"),
                 names: vm.templates.filter { $0.templateScope == .global }.map(\.name),
                 activeName: vm.activeProfileState.activeName(in: .global),
                 basedOnName: vm.activeProfileState.basedOnName(in: .global),
@@ -222,7 +229,9 @@ private struct ProfilesTab: View {
 
             ProfileGroup(
                 scope: .model,
-                label: "Model Profiles · \(vm.model?.id ?? vm.modelID)",
+                label: String(localized: "settings.profiles.model.label",
+                              defaultValue: "Model Profiles · \(vm.model?.id ?? vm.modelID)",
+                              comment: "Section label for the per-model profile chip group; placeholder is the model id"),
                 names: vm.profiles
                     .filter { $0.sourceTemplate == nil }
                     .map(\.name),
@@ -240,14 +249,24 @@ private struct ProfilesTab: View {
             detailCard
 
             SectionHeader(
-                "Server Defaults",
-                subtitle: "Used when no profile is set, or when a profile leaves a field empty"
+                String(localized: "settings.profiles.server_defaults.title",
+                       defaultValue: "Server Defaults",
+                       comment: "Section header above the read-only Server Defaults card"),
+                subtitle: String(localized: "settings.profiles.server_defaults.subtitle",
+                                 defaultValue: "Used when no profile is set, or when a profile leaves a field empty",
+                                 comment: "Subtitle explaining the role of the Server Defaults profile")
             ) {
-                Button("Edit on Server →") { onEditServer() }
+                Button(String(localized: "settings.profiles.edit_on_server",
+                              defaultValue: "Edit on Server →",
+                              comment: "Plain link button that deep-links to the Server screen's Default Profile section")) {
+                    onEditServer()
+                }
                     .buttonStyle(.omlx(.plain, size: .small))
             }
             ProfileDetailCard(
-                name: "Server Default Profile",
+                name: String(localized: "settings.profiles.server_default.name",
+                             defaultValue: "Server Default Profile",
+                             comment: "Display name of the synthesized 'Server Default' profile card"),
                 scope: nil,
                 settings: serverDefaultsAsDict(serverDefaults),
                 isActive: false,
@@ -310,7 +329,9 @@ private struct ProfilesTab: View {
             switch vm.activeProfileState {
             case .working(let basedOn):
                 ProfileDetailCard(
-                    name: "Working profile",
+                    name: String(localized: "settings.profiles.working.name",
+                                 defaultValue: "Working profile",
+                                 comment: "Display name for the in-progress (unsaved) working profile detail card"),
                     scope: basedOn?.scope,
                     settings: vm.currentSettingsDict(),
                     isActive: true,
@@ -335,7 +356,9 @@ private struct ProfilesTab: View {
                 )
             case .defaults:
                 ProfileDetailCard(
-                    name: "No profile",
+                    name: String(localized: "settings.profiles.no_profile.name",
+                                 defaultValue: "No profile",
+                                 comment: "Display name shown in the profile detail card when no profile is active"),
                     scope: nil,
                     settings: serverDefaultsAsDict(serverDefaults),
                     isActive: true,
@@ -436,59 +459,114 @@ private struct BasicTab: View {
 
     var body: some View {
         BasicEditBanner(vm: vm, client: client)
-        SectionHeader("Basic Settings")
+        SectionHeader(String(localized: "settings.basic.section",
+                             defaultValue: "Basic Settings",
+                             comment: "Section header above the Basic tab fields"))
 
         // Per-model fields (alias / modelType / TTL) auto-save on commit.
         // Profile-eligible fields (sampling, penalties) write to the
         // working profile instead — surfaced via the banner above.
         ListGroup {
-            Row(label: "Model Alias", sublabel: "Falls back to the model id") {
+            Row(label: String(localized: "settings.basic.alias.label",
+                              defaultValue: "Model Alias",
+                              comment: "Row label for the model alias field"),
+                sublabel: String(localized: "settings.basic.alias.sub",
+                                 defaultValue: "Falls back to the model id",
+                                 comment: "Sublabel for the model alias field")) {
                 TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: 220)
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
             }
-            Row(label: "Model Type") {
+            Row(label: String(localized: "settings.basic.model_type.label",
+                              defaultValue: "Model Type",
+                              comment: "Row label for the model type override popup")) {
                 Popup(
                     selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
                     width: 170,
                     options: ModelSettingsScreenVM.modelTypeOptions
                 )
             }
-            Row(label: "Context Window", sublabel: "Maximum tokens per request") {
+            Row(label: String(localized: "settings.basic.context_window.label",
+                              defaultValue: "Context Window",
+                              comment: "Row label for the context window field"),
+                sublabel: String(localized: "settings.basic.context_window.sub",
+                                 defaultValue: "Maximum tokens per request",
+                                 comment: "Sublabel for the context window field")) {
                 TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: 110)
             }
-            Row(label: "Max Tokens", sublabel: "Cap on generated tokens (empty = default)") {
-                TextInput(text: vm.bindProfile($vm.maxTokens), placeholder: "Default", mono: true, width: 110)
+            Row(label: String(localized: "settings.basic.max_tokens.label",
+                              defaultValue: "Max Tokens",
+                              comment: "Row label for the max generated tokens field"),
+                sublabel: String(localized: "settings.basic.max_tokens.sub",
+                                 defaultValue: "Cap on generated tokens (empty = default)",
+                                 comment: "Sublabel for the max generated tokens field")) {
+                TextInput(text: vm.bindProfile($vm.maxTokens),
+                          placeholder: String(localized: "settings.basic.max_tokens.placeholder",
+                                              defaultValue: "Default",
+                                              comment: "Placeholder shown when Max Tokens is empty (server default applies)"),
+                          mono: true, width: 110)
             }
-            Row(label: "Temperature",
-                sublabel: "Sampling randomness (≥ 0). 0 = deterministic.") {
+            Row(label: String(localized: "settings.basic.temperature.label",
+                              defaultValue: "Temperature",
+                              comment: "Row label for the sampling temperature field"),
+                sublabel: String(localized: "settings.basic.temperature.sub",
+                                 defaultValue: "Sampling randomness (≥ 0). 0 = deterministic.",
+                                 comment: "Sublabel describing the temperature field range")) {
                 TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: 90)
             }
-            Row(label: "Top P",
-                sublabel: "Nucleus sampling cutoff (0 < p ≤ 1).") {
+            Row(label: String(localized: "settings.basic.top_p.label",
+                              defaultValue: "Top P",
+                              comment: "Row label for the top-p nucleus sampling field"),
+                sublabel: String(localized: "settings.basic.top_p.sub",
+                                 defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
+                                 comment: "Sublabel describing the top-p valid range")) {
                 TextInput(text: vm.bindProfile($vm.topP), mono: true, width: 90)
             }
-            Row(label: "Top K",
-                sublabel: "Limit candidates to top K (positive integer).") {
+            Row(label: String(localized: "settings.basic.top_k.label",
+                              defaultValue: "Top K",
+                              comment: "Row label for the top-k sampling field"),
+                sublabel: String(localized: "settings.basic.top_k.sub",
+                                 defaultValue: "Limit candidates to top K (positive integer).",
+                                 comment: "Sublabel describing the top-k field")) {
                 TextInput(text: vm.bindProfile($vm.topK), mono: true, width: 90)
             }
-            Row(label: "Min P",
-                sublabel: "Minimum probability floor (0 ≤ p ≤ 1).") {
+            Row(label: String(localized: "settings.basic.min_p.label",
+                              defaultValue: "Min P",
+                              comment: "Row label for the min-p sampling field"),
+                sublabel: String(localized: "settings.basic.min_p.sub",
+                                 defaultValue: "Minimum probability floor (0 ≤ p ≤ 1).",
+                                 comment: "Sublabel describing the min-p field range")) {
                 TextInput(text: vm.bindProfile($vm.minP), mono: true, width: 90)
             }
-            Row(label: "Repetition Penalty",
-                sublabel: "Penalize repeated tokens (−2 to 2).") {
+            Row(label: String(localized: "settings.basic.repetition_penalty.label",
+                              defaultValue: "Repetition Penalty",
+                              comment: "Row label for the repetition-penalty field"),
+                sublabel: String(localized: "settings.basic.repetition_penalty.sub",
+                                 defaultValue: "Penalize repeated tokens (−2 to 2).",
+                                 comment: "Sublabel describing repetition-penalty range")) {
                 TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: 90)
             }
-            Row(label: "Presence Penalty",
-                sublabel: "Penalize tokens already present (−2 to 2).") {
+            Row(label: String(localized: "settings.basic.presence_penalty.label",
+                              defaultValue: "Presence Penalty",
+                              comment: "Row label for the presence-penalty field"),
+                sublabel: String(localized: "settings.basic.presence_penalty.sub",
+                                 defaultValue: "Penalize tokens already present (−2 to 2).",
+                                 comment: "Sublabel describing presence-penalty range")) {
                 TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: 90)
             }
             Row(
-                label: "TTL",
-                sublabel: "Seconds before idle unload (empty = no TTL)",
+                label: String(localized: "settings.basic.ttl.label",
+                              defaultValue: "TTL",
+                              comment: "Row label for the idle-unload TTL field"),
+                sublabel: String(localized: "settings.basic.ttl.sub",
+                                 defaultValue: "Seconds before idle unload (empty = no TTL)",
+                                 comment: "Sublabel for the idle-unload TTL field"),
                 isLast: true
             ) {
-                TextInput(text: $vm.ttlSeconds, placeholder: "No TTL", mono: true, suffix: "s", width: 110)
+                TextInput(text: $vm.ttlSeconds,
+                          placeholder: String(localized: "settings.basic.ttl.placeholder",
+                                              defaultValue: "No TTL",
+                                              comment: "Placeholder shown when no TTL is configured"),
+                          mono: true, suffix: "s", width: 110)
                     .onSubmit { Task { await vm.save(.ttl, client: client) } }
             }
         }
@@ -564,19 +642,29 @@ private struct AdvancedTab: View {
 
     var body: some View {
         BasicEditBanner(vm: vm, client: client)
-        SectionHeader("Advanced Settings")
+        SectionHeader(String(localized: "settings.advanced.section",
+                             defaultValue: "Advanced Settings",
+                             comment: "Section header above the Advanced tab fields"))
 
         // Profile-eligible toggles use `bindProfile` — flipping them flips
         // the working-dirty flag. `isPinned` and `trustRemoteCode` stay
         // per-model (server excludes them from profiles) and auto-save.
         ListGroup {
-            Row(label: "Enable Thinking",
-                sublabel: "Enable reasoning/thinking mode for this model") {
+            Row(label: String(localized: "settings.advanced.enable_thinking.label",
+                              defaultValue: "Enable Thinking",
+                              comment: "Row label for the enable-thinking toggle"),
+                sublabel: String(localized: "settings.advanced.enable_thinking.sub",
+                                 defaultValue: "Enable reasoning/thinking mode for this model",
+                                 comment: "Sublabel for the enable-thinking toggle")) {
                 Toggle("", isOn: vm.bindProfile($vm.enableThinking))
                     .labelsHidden().toggleStyle(.switch)
             }
-            Row(label: "Thinking Budget",
-                sublabel: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.") {
+            Row(label: String(localized: "settings.advanced.thinking_budget.label",
+                              defaultValue: "Thinking Budget",
+                              comment: "Row label for the thinking budget field"),
+                sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                                 defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
+                                 comment: "Sublabel for the thinking budget field")) {
                 HStack(spacing: 8) {
                     if vm.thinkingBudgetEnabled {
                         TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
@@ -586,8 +674,12 @@ private struct AdvancedTab: View {
                         .labelsHidden().toggleStyle(.switch)
                 }
             }
-            Row(label: "Limit Tool Result Tokens",
-                sublabel: "Truncate large tool results (e.g. file reads) to a token limit") {
+            Row(label: String(localized: "settings.advanced.tool_result_limit.label",
+                              defaultValue: "Limit Tool Result Tokens",
+                              comment: "Row label for the tool-result token limit field"),
+                sublabel: String(localized: "settings.advanced.tool_result_limit.sub",
+                                 defaultValue: "Truncate large tool results (e.g. file reads) to a token limit",
+                                 comment: "Sublabel for the tool-result token limit field")) {
                 HStack(spacing: 8) {
                     if vm.limitToolResults {
                         TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
@@ -598,18 +690,30 @@ private struct AdvancedTab: View {
                         .labelsHidden().toggleStyle(.switch)
                 }
             }
-            Row(label: "Force Sampling",
-                sublabel: "Override request sampling parameters with configured values") {
+            Row(label: String(localized: "settings.advanced.force_sampling.label",
+                              defaultValue: "Force Sampling",
+                              comment: "Row label for the force-sampling toggle"),
+                sublabel: String(localized: "settings.advanced.force_sampling.sub",
+                                 defaultValue: "Override request sampling parameters with configured values",
+                                 comment: "Sublabel for the force-sampling toggle")) {
                 Toggle("", isOn: vm.bindProfile($vm.forceSampling))
                     .labelsHidden().toggleStyle(.switch)
             }
-            Row(label: "Reasoning Parser",
-                sublabel: "Override the chain-of-thought parser. Leave empty to use the model's default.") {
+            Row(label: String(localized: "settings.advanced.reasoning_parser.label",
+                              defaultValue: "Reasoning Parser",
+                              comment: "Row label for the reasoning-parser override field"),
+                sublabel: String(localized: "settings.advanced.reasoning_parser.sub",
+                                 defaultValue: "Override the chain-of-thought parser. Leave empty to use the model's default.",
+                                 comment: "Sublabel for the reasoning-parser override field")) {
                 TextInput(text: vm.bindProfile($vm.reasoningParser),
                           placeholder: "auto", mono: true, width: 150)
             }
-            Row(label: "Pin in memory",
-                sublabel: "Keep this model resident between requests") {
+            Row(label: String(localized: "settings.advanced.pin_memory.label",
+                              defaultValue: "Pin in memory",
+                              comment: "Row label for the pin-in-memory toggle"),
+                sublabel: String(localized: "settings.advanced.pin_memory.sub",
+                                 defaultValue: "Keep this model resident between requests",
+                                 comment: "Sublabel for the pin-in-memory toggle")) {
                 Toggle("", isOn: vm.bind($vm.isPinned, save: {
                     Task { await vm.save(.isPinned, client: client) }
                 }))
@@ -619,8 +723,12 @@ private struct AdvancedTab: View {
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in
             // the server process; never propagated via profiles.
-            Row(label: "Trust Remote Code",
-                sublabel: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
+            Row(label: String(localized: "settings.advanced.trust_remote_code.label",
+                              defaultValue: "Trust Remote Code",
+                              comment: "Row label for the security-sensitive trust-remote-code toggle"),
+                sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
+                                 defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
+                                 comment: "Sublabel describing the security implications of trust-remote-code"),
                 isLast: true) {
                 Toggle("", isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
@@ -631,14 +739,22 @@ private struct AdvancedTab: View {
         }
 
         SectionHeader(
-            "Chat Template Kwargs",
-            subtitle: "Forwarded to the model's chat template. Toggle Force to override per-request values."
+            String(localized: "settings.advanced.chat_template.section",
+                   defaultValue: "Chat Template Kwargs",
+                   comment: "Section header above the chat-template kwargs editor"),
+            subtitle: String(localized: "settings.advanced.chat_template.subtitle",
+                             defaultValue: "Forwarded to the model's chat template. Toggle Force to override per-request values.",
+                             comment: "Subtitle for the chat-template kwargs section")
         )
         ChatTemplateKwargsEditor(vm: vm, client: client)
 
         SectionHeader(
-            "Experimental",
-            subtitle: "Speculative decoding, KV-cache quantization, and other research features."
+            String(localized: "settings.advanced.experimental.section",
+                   defaultValue: "Experimental",
+                   comment: "Section header above the Experimental settings group"),
+            subtitle: String(localized: "settings.advanced.experimental.subtitle",
+                             defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
+                             comment: "Subtitle for the Experimental settings section")
         )
         ExperimentalSection(vm: vm, client: client)
     }
@@ -657,8 +773,12 @@ private struct ChatTemplateKwargsEditor: View {
             FreeRow {
                 HStack {
                     Text(vm.chatTemplateEntries.isEmpty
-                         ? "No chat-template kwargs."
-                         : "\(vm.chatTemplateEntries.count) kwarg\(vm.chatTemplateEntries.count == 1 ? "" : "s")")
+                         ? String(localized: "settings.advanced.chat_template.empty",
+                                  defaultValue: "No chat-template kwargs.",
+                                  comment: "Placeholder text shown when no chat-template kwargs are configured")
+                         : String(localized: "settings.advanced.chat_template.count",
+                                  defaultValue: "\(vm.chatTemplateEntries.count) kwarg\(vm.chatTemplateEntries.count == 1 ? "" : "s")",
+                                  comment: "Count summary in the chat-template editor; placeholders are the entry count and an optional plural 's'"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
@@ -695,11 +815,16 @@ private struct ChatTemplateKwargsEditor: View {
                     vm.addKwarg(.reasoningEffort)
                 }
             }
-            Button("custom…") {
+            Button(String(localized: "settings.advanced.chat_template.add_custom",
+                          defaultValue: "custom…",
+                          comment: "Menu item for adding a custom (free-form key/value) chat-template kwarg")) {
                 vm.addKwarg(.custom)
             }
         } label: {
-            Label("Add kwarg", systemImage: "plus")
+            Label(String(localized: "settings.advanced.chat_template.add_kwarg",
+                         defaultValue: "Add kwarg",
+                         comment: "Plus-button label for adding a chat-template kwarg row"),
+                  systemImage: "plus")
                 .labelStyle(.titleAndIcon)
         }
         .menuStyle(.borderlessButton)
@@ -739,17 +864,31 @@ private struct EntryEditor: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Remove kwarg")
+                .help(String(localized: "settings.advanced.chat_template.remove",
+                             defaultValue: "Remove kwarg",
+                             comment: "Tooltip on the trash/xmark button that deletes a chat-template kwarg row"))
             }
             valueRow
         }
     }
 
     private var typeLabel: String {
+        // These are eyebrow labels rendered uppercase above each editor.
+        // Keeping the localization keys aligned with display text rather
+        // than the server kwarg key.
         switch entry.kind {
-        case .enableThinking:  return "ENABLE_THINKING"
-        case .reasoningEffort: return "REASONING_EFFORT"
-        case .custom:          return "CUSTOM"
+        case .enableThinking:
+            return String(localized: "settings.advanced.chat_template.type.enable_thinking",
+                          defaultValue: "ENABLE_THINKING",
+                          comment: "Eyebrow label above the enable_thinking kwarg editor")
+        case .reasoningEffort:
+            return String(localized: "settings.advanced.chat_template.type.reasoning_effort",
+                          defaultValue: "REASONING_EFFORT",
+                          comment: "Eyebrow label above the reasoning_effort kwarg editor")
+        case .custom:
+            return String(localized: "settings.advanced.chat_template.type.custom",
+                          defaultValue: "CUSTOM",
+                          comment: "Eyebrow label above a custom (free-form) chat-template kwarg editor")
         }
     }
 
@@ -777,10 +916,16 @@ private struct EntryEditor: View {
         case .custom:
             VStack(alignment: .leading, spacing: 6) {
                 TextInput(text: vm.bindProfile(binding.customKey),
-                          placeholder: "key", mono: true)
+                          placeholder: String(localized: "settings.advanced.chat_template.key_placeholder",
+                                              defaultValue: "key",
+                                              comment: "Placeholder for the custom kwarg key field"),
+                          mono: true)
                 HStack(spacing: 8) {
                     TextInput(text: vm.bindProfile(binding.value),
-                              placeholder: "value", mono: true)
+                              placeholder: String(localized: "settings.advanced.chat_template.value_placeholder",
+                                                  defaultValue: "value",
+                                                  comment: "Placeholder for the custom kwarg value field"),
+                              mono: true)
                     forceCheckbox
                 }
             }
@@ -789,12 +934,16 @@ private struct EntryEditor: View {
 
     private var forceCheckbox: some View {
         Toggle(isOn: vm.bindProfile(binding.force)) {
-            Text("Force")
+            Text(String(localized: "settings.advanced.chat_template.force",
+                        defaultValue: "Force",
+                        comment: "Checkbox label for forcing a chat-template kwarg via forced_ct_kwargs"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
-        .help("Add this key to forced_ct_kwargs so the request body can't override it.")
+        .help(String(localized: "settings.advanced.chat_template.force.help",
+                     defaultValue: "Add this key to forced_ct_kwargs so the request body can't override it.",
+                     comment: "Tooltip explaining the Force checkbox"))
     }
 }
 
@@ -812,8 +961,12 @@ private struct ExperimentalSection: View {
         // bindProfile and surface in the Active banner above.
         ListGroup {
             // TurboQuant KV
-            Row(label: "TurboQuant KV Cache",
-                sublabel: "Quantize the KV cache during prefill. Saves memory at a small quality cost.") {
+            Row(label: String(localized: "settings.experimental.turboquant.label",
+                              defaultValue: "TurboQuant KV Cache",
+                              comment: "Row label for the TurboQuant KV cache toggle"),
+                sublabel: String(localized: "settings.experimental.turboquant.sub",
+                                 defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
+                                 comment: "Sublabel describing TurboQuant KV cache")) {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
@@ -830,8 +983,12 @@ private struct ExperimentalSection: View {
             // IndexCache (DSA-only — surface to the user that the row
             // only applies to models whose config matches the DSA set).
             if vm.isDSAConfigModel {
-                Row(label: "IndexCache",
-                    sublabel: "Sparse attention index cache for DSA models. THUDM/IndexCache.") {
+                Row(label: String(localized: "settings.experimental.indexcache.label",
+                                  defaultValue: "IndexCache",
+                                  comment: "Row label for the DSA IndexCache toggle"),
+                    sublabel: String(localized: "settings.experimental.indexcache.sub",
+                                     defaultValue: "Sparse attention index cache for DSA models. THUDM/IndexCache.",
+                                     comment: "Sublabel describing the DSA IndexCache feature")) {
                     HStack(spacing: 8) {
                         if vm.indexCacheEnabled {
                             TextInput(text: vm.bindProfile($vm.indexCacheFreq),
@@ -844,36 +1001,52 @@ private struct ExperimentalSection: View {
             }
 
             // SpecPrefill
-            Row(label: "SpecPrefill",
-                sublabel: "Attention-based sparse prefill for MoE/hybrid models.") {
+            Row(label: String(localized: "settings.experimental.specprefill.label",
+                              defaultValue: "SpecPrefill",
+                              comment: "Row label for the SpecPrefill toggle"),
+                sublabel: String(localized: "settings.experimental.specprefill.sub",
+                                 defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
+                                 comment: "Sublabel describing SpecPrefill")) {
                 Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
                     .labelsHidden().toggleStyle(.switch)
             }
             if vm.specprefillEnabled {
-                Row(label: "Draft Model",
-                    sublabel: "Small model sharing tokenizer with target.") {
+                Row(label: String(localized: "settings.experimental.specprefill.draft.label",
+                                  defaultValue: "Draft Model",
+                                  comment: "Row label for the SpecPrefill draft-model picker"),
+                    sublabel: String(localized: "settings.experimental.specprefill.draft.sub",
+                                     defaultValue: "Small model sharing tokenizer with target.",
+                                     comment: "Sublabel for the SpecPrefill draft-model picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.specprefillDraftModel),
                         width: 260,
                         options: vm.draftModelOptions()
                     )
                 }
-                Row(label: "Keep Rate") {
+                Row(label: String(localized: "settings.experimental.specprefill.keep_rate.label",
+                                  defaultValue: "Keep Rate",
+                                  comment: "Row label for the SpecPrefill keep-rate dropdown")) {
                     Popup(
                         selection: vm.bindProfile($vm.specprefillKeepPct),
                         width: 320,
                         options: ModelSettingsScreenVM.specprefillKeepPctOptions
                     )
                 }
-                Row(label: "Threshold",
-                    sublabel: "Min prompt tokens to trigger (shorter prompts use full prefill).") {
+                Row(label: String(localized: "settings.experimental.specprefill.threshold.label",
+                                  defaultValue: "Threshold",
+                                  comment: "Row label for the SpecPrefill threshold field"),
+                    sublabel: String(localized: "settings.experimental.specprefill.threshold.sub",
+                                     defaultValue: "Min prompt tokens to trigger (shorter prompts use full prefill).",
+                                     comment: "Sublabel for the SpecPrefill threshold field")) {
                     TextInput(text: vm.bindProfile($vm.specprefillThreshold),
                               placeholder: "8192", mono: true, suffix: "tk", width: 110)
                 }
             }
 
             // DFlash
-            Row(label: "DFlash",
+            Row(label: String(localized: "settings.experimental.dflash.label",
+                              defaultValue: "DFlash",
+                              comment: "Row label for the DFlash toggle"),
                 sublabel: dflashSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
                     .labelsHidden().toggleStyle(.switch)
@@ -881,27 +1054,42 @@ private struct ExperimentalSection: View {
                     .help(vm.model?.dflashCompatibilityReason ?? "")
             }
             if vm.dflashEnabled {
-                Row(label: "DFlash Draft Model") {
+                Row(label: String(localized: "settings.experimental.dflash.draft.label",
+                                  defaultValue: "DFlash Draft Model",
+                                  comment: "Row label for the DFlash draft-model picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashDraftModel),
                         width: 260,
                         options: vm.draftModelOptions()
                     )
                 }
-                Row(label: "Draft Quantization") {
+                Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
+                                  defaultValue: "Draft Quantization",
+                                  comment: "Row label for the DFlash draft-quantization picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashDraftQuantBits),
                         width: 160,
                         options: ModelSettingsScreenVM.dflashDraftQuantOptions
                     )
                 }
-                Row(label: "Max Context (fallback)",
-                    sublabel: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.") {
+                Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
+                                  defaultValue: "Max Context (fallback)",
+                                  comment: "Row label for the DFlash max-context fallback field"),
+                    sublabel: String(localized: "settings.experimental.dflash.max_ctx.sub",
+                                     defaultValue: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.",
+                                     comment: "Sublabel describing the DFlash max-context fallback")) {
                     TextInput(text: vm.bindProfile($vm.dflashMaxCtx),
-                              placeholder: "unlimited", mono: true, suffix: "tk", width: 130)
+                              placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
+                                                  defaultValue: "unlimited",
+                                                  comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
+                              mono: true, suffix: "tk", width: 130)
                 }
-                Row(label: "DFlash in-memory cache",
-                    sublabel: "DFlash L1 prefix snapshot cache in RAM.") {
+                Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
+                                  defaultValue: "DFlash in-memory cache",
+                                  comment: "Row label for the DFlash L1 in-memory cache toggle"),
+                    sublabel: String(localized: "settings.experimental.dflash.mem_cache.sub",
+                                     defaultValue: "DFlash L1 prefix snapshot cache in RAM.",
+                                     comment: "Sublabel for the DFlash L1 in-memory cache toggle")) {
                     HStack(spacing: 8) {
                         if vm.dflashInMemoryCache {
                             TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
@@ -911,7 +1099,9 @@ private struct ExperimentalSection: View {
                             .labelsHidden().toggleStyle(.switch)
                     }
                 }
-                Row(label: "DFlash SSD cache",
+                Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
+                                  defaultValue: "DFlash SSD cache",
+                                  comment: "Row label for the DFlash L2 SSD cache toggle"),
                     sublabel: dflashSsdSublabel) {
                     Toggle("", isOn: vm.bindProfile($vm.dflashSsdCache))
                         .labelsHidden().toggleStyle(.switch)
@@ -920,7 +1110,9 @@ private struct ExperimentalSection: View {
             }
 
             // Native MTP — last row of the experimental group.
-            Row(label: "Native MTP",
+            Row(label: String(localized: "settings.experimental.mtp.label",
+                              defaultValue: "Native MTP",
+                              comment: "Row label for the Native MTP toggle"),
                 sublabel: mtpSublabel,
                 isLast: true) {
                 Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
@@ -936,17 +1128,25 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
-        return "Block-diffusion speculative decoding. Single-stream only (requests run one at a time)."
+        return String(localized: "settings.experimental.dflash.sub",
+                      defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
+                      comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
     }
 
     private var dflashSsdSublabel: String {
         if !(vm.model?.dflashSsdCacheAvailable ?? false) {
-            return "Enable the global paged SSD cache directory first."
+            return String(localized: "settings.experimental.dflash.ssd_cache.sub.unavailable",
+                          defaultValue: "Enable the global paged SSD cache directory first.",
+                          comment: "Sublabel for the DFlash SSD cache row when the global SSD cache directory isn't configured")
         }
         if !vm.dflashInMemoryCache {
-            return "Requires the in-memory cache to be enabled."
+            return String(localized: "settings.experimental.dflash.ssd_cache.sub.needs_l1",
+                          defaultValue: "Requires the in-memory cache to be enabled.",
+                          comment: "Sublabel for the DFlash SSD cache row when the L1 in-memory cache is off")
         }
-        return "L2 spill of evicted L1 entries to disk."
+        return String(localized: "settings.experimental.dflash.ssd_cache.sub",
+                      defaultValue: "L2 spill of evicted L1 entries to disk.",
+                      comment: "Default sublabel for the DFlash SSD cache toggle")
     }
 
     private var mtpToggleDisabled: Bool {
@@ -962,7 +1162,9 @@ private struct ExperimentalSection: View {
            !(vm.model?.mtpCompatible ?? true) {
             return reason
         }
-        return "Multi-token prediction. Speeds generation when the model supports it."
+        return String(localized: "settings.experimental.mtp.sub",
+                      defaultValue: "Multi-token prediction. Speeds generation when the model supports it.",
+                      comment: "Default sublabel for the Native MTP toggle")
     }
 }
 
@@ -975,9 +1177,18 @@ final class ModelSettingsScreenVM: ObservableObject {
 
         var label: String {
             switch self {
-            case .profiles: return "Profiles"
-            case .basic:    return "Basic"
-            case .advanced: return "Advanced"
+            case .profiles:
+                return String(localized: "settings.section.profiles",
+                              defaultValue: "Profiles",
+                              comment: "Segmented control label for the Profiles tab")
+            case .basic:
+                return String(localized: "settings.section.basic",
+                              defaultValue: "Basic",
+                              comment: "Segmented control label for the Basic tab")
+            case .advanced:
+                return String(localized: "settings.section.advanced",
+                              defaultValue: "Advanced",
+                              comment: "Segmented control label for the Advanced tab")
             }
         }
     }
@@ -1000,43 +1211,99 @@ final class ModelSettingsScreenVM: ObservableObject {
         case mtpEnabled
     }
 
-    static let modelTypeOptions: [(String, String)] = [
-        ("",          "Auto-detect"),
-        ("llm",       "LLM"),
-        ("vlm",       "VLM"),
-        ("embed",     "Embedding"),
-        ("rerank",    "Reranker"),
-        ("audio-stt", "Audio STT"),
-        ("audio-tts", "Audio TTS"),
-        ("audio-sts", "Audio STS"),
-    ]
+    static var modelTypeOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.model_type.auto_detect",
+                        defaultValue: "Auto-detect",
+                        comment: "Model type option meaning the server should auto-detect")),
+            ("llm", String(localized: "settings.model_type.llm",
+                           defaultValue: "LLM",
+                           comment: "Model type option label for text language models")),
+            ("vlm", String(localized: "settings.model_type.vlm",
+                           defaultValue: "VLM",
+                           comment: "Model type option label for vision-language models")),
+            ("embed", String(localized: "settings.model_type.embed",
+                             defaultValue: "Embedding",
+                             comment: "Model type option label for embedding models")),
+            ("rerank", String(localized: "settings.model_type.rerank",
+                              defaultValue: "Reranker",
+                              comment: "Model type option label for reranker models")),
+            ("audio-stt", String(localized: "settings.model_type.audio_stt",
+                                 defaultValue: "Audio STT",
+                                 comment: "Model type option label for speech-to-text models")),
+            ("audio-tts", String(localized: "settings.model_type.audio_tts",
+                                 defaultValue: "Audio TTS",
+                                 comment: "Model type option label for text-to-speech models")),
+            ("audio-sts", String(localized: "settings.model_type.audio_sts",
+                                 defaultValue: "Audio STS",
+                                 comment: "Model type option label for speech-to-speech models")),
+        ]
+    }
 
-    static let turboquantKvBitsOptions: [(String, String)] = [
-        ("2",   "2-bit"),
-        ("2.5", "2.5-bit"),
-        ("3",   "3-bit"),
-        ("3.5", "3.5-bit"),
-        ("4",   "4-bit"),
-        ("6",   "6-bit"),
-        ("8",   "8-bit"),
-    ]
+    static var turboquantKvBitsOptions: [(String, String)] {
+        [
+            ("2", String(localized: "settings.turboquant.bits.2",
+                         defaultValue: "2-bit",
+                         comment: "TurboQuant KV bit-width option")),
+            ("2.5", String(localized: "settings.turboquant.bits.2_5",
+                           defaultValue: "2.5-bit",
+                           comment: "TurboQuant KV bit-width option")),
+            ("3", String(localized: "settings.turboquant.bits.3",
+                         defaultValue: "3-bit",
+                         comment: "TurboQuant KV bit-width option")),
+            ("3.5", String(localized: "settings.turboquant.bits.3_5",
+                           defaultValue: "3.5-bit",
+                           comment: "TurboQuant KV bit-width option")),
+            ("4", String(localized: "settings.turboquant.bits.4",
+                         defaultValue: "4-bit",
+                         comment: "TurboQuant KV bit-width option")),
+            ("6", String(localized: "settings.turboquant.bits.6",
+                         defaultValue: "6-bit",
+                         comment: "TurboQuant KV bit-width option")),
+            ("8", String(localized: "settings.turboquant.bits.8",
+                         defaultValue: "8-bit",
+                         comment: "TurboQuant KV bit-width option")),
+        ]
+    }
 
     /// Keep-pct labels mirror the HTML editor's tradeoff annotations
     /// so the user picks an approximate speedup, not a raw fraction.
-    static let specprefillKeepPctOptions: [(String, String)] = [
-        ("0.1",  "10% — Aggressive (~5-7x, some quality loss)"),
-        ("0.2",  "20% — Balanced (~3x, recommended)"),
-        ("0.25", "25% — Conservative+ (~2.5x)"),
-        ("0.3",  "30% — Conservative (~2.2x)"),
-        ("0.4",  "40% — Mild (~1.8x)"),
-        ("0.5",  "50% — Minimal (~1.5x)"),
-    ]
+    static var specprefillKeepPctOptions: [(String, String)] {
+        [
+            ("0.1", String(localized: "settings.specprefill.keep.10",
+                           defaultValue: "10% — Aggressive (~5-7x, some quality loss)",
+                           comment: "SpecPrefill keep-rate dropdown option")),
+            ("0.2", String(localized: "settings.specprefill.keep.20",
+                           defaultValue: "20% — Balanced (~3x, recommended)",
+                           comment: "SpecPrefill keep-rate dropdown option")),
+            ("0.25", String(localized: "settings.specprefill.keep.25",
+                            defaultValue: "25% — Conservative+ (~2.5x)",
+                            comment: "SpecPrefill keep-rate dropdown option")),
+            ("0.3", String(localized: "settings.specprefill.keep.30",
+                           defaultValue: "30% — Conservative (~2.2x)",
+                           comment: "SpecPrefill keep-rate dropdown option")),
+            ("0.4", String(localized: "settings.specprefill.keep.40",
+                           defaultValue: "40% — Mild (~1.8x)",
+                           comment: "SpecPrefill keep-rate dropdown option")),
+            ("0.5", String(localized: "settings.specprefill.keep.50",
+                           defaultValue: "50% — Minimal (~1.5x)",
+                           comment: "SpecPrefill keep-rate dropdown option")),
+        ]
+    }
 
-    static let dflashDraftQuantOptions: [(String, String)] = [
-        ("",  "bf16 (default)"),
-        ("4", "4-bit"),
-        ("8", "8-bit"),
-    ]
+    static var dflashDraftQuantOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.quant.bf16",
+                        defaultValue: "bf16 (default)",
+                        comment: "DFlash draft quantization option for bf16 (no quantization)")),
+            ("4", String(localized: "settings.dflash.quant.4bit",
+                         defaultValue: "4-bit",
+                         comment: "DFlash draft quantization option")),
+            ("8", String(localized: "settings.dflash.quant.8bit",
+                         defaultValue: "8-bit",
+                         comment: "DFlash draft quantization option")),
+        ]
+    }
 
     /// `config_model_type` values that surface IndexCache in the HTML
     /// admin. Mirrored from `dashboard.js:5-7` (`DSA_MODEL_TYPES`).
@@ -1288,12 +1555,18 @@ final class ModelSettingsScreenVM: ObservableObject {
             case .failure(let e): self.lastError = e.message; return
             }
         case .repetitionPenalty:
-            switch SamplingValidator.penalty(repetitionPenalty, name: "Repetition Penalty") {
+            switch SamplingValidator.penalty(repetitionPenalty,
+                                             name: String(localized: "settings.validator.repetition_penalty.name",
+                                                          defaultValue: "Repetition Penalty",
+                                                          comment: "Field name embedded in validation errors for repetition penalty")) {
             case .success(let v): patch.repetitionPenalty = v
             case .failure(let e): self.lastError = e.message; return
             }
         case .presencePenalty:
-            switch SamplingValidator.penalty(presencePenalty, name: "Presence Penalty") {
+            switch SamplingValidator.penalty(presencePenalty,
+                                             name: String(localized: "settings.validator.presence_penalty.name",
+                                                          defaultValue: "Presence Penalty",
+                                                          comment: "Field name embedded in validation errors for presence penalty")) {
             case .success(let v): patch.presencePenalty = v
             case .failure(let e): self.lastError = e.message; return
             }
@@ -1383,7 +1656,11 @@ final class ModelSettingsScreenVM: ObservableObject {
     /// Options for SpecPrefill / DFlash draft-model dropdowns. Filters
     /// out the current model so it can't pick itself as its own draft.
     func draftModelOptions() -> [(String, String)] {
-        var out: [(String, String)] = [("", "Select draft model…")]
+        var out: [(String, String)] = [
+            ("", String(localized: "settings.draft_model.placeholder",
+                        defaultValue: "Select draft model…",
+                        comment: "Initial placeholder option in the SpecPrefill/DFlash draft-model picker")),
+        ]
         for m in allModels where m.id != modelID {
             out.append((m.modelPath ?? m.id, m.id))
         }
@@ -1398,8 +1675,16 @@ final class ModelSettingsScreenVM: ObservableObject {
     /// MTP can't co-exist with DFlash or TurboQuant KV. The toggle uses
     /// this to disable itself and surface the conflict reason.
     var mtpConflictReason: String? {
-        if dflashEnabled    { return "Disable DFlash before enabling MTP." }
-        if turboquantKvEnabled { return "Disable TurboQuant KV before enabling MTP." }
+        if dflashEnabled {
+            return String(localized: "settings.mtp.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling MTP.",
+                          comment: "Tooltip / sublabel shown when MTP can't be enabled because DFlash is on")
+        }
+        if turboquantKvEnabled {
+            return String(localized: "settings.mtp.conflict.turboquant",
+                          defaultValue: "Disable TurboQuant KV before enabling MTP.",
+                          comment: "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on")
+        }
         return nil
     }
 
@@ -1805,20 +2090,35 @@ struct SamplingValidationError: Error, Equatable {
 
 enum SamplingValidator {
     static func temperature(_ raw: String) -> Result<Double?, SamplingValidationError> {
-        parseDouble(raw, label: "Temperature") { v in
-            v >= 0 ? nil : "Temperature must be ≥ 0."
+        let label = String(localized: "settings.validator.temperature.name",
+                           defaultValue: "Temperature",
+                           comment: "Field name embedded in validation errors for temperature")
+        return parseDouble(raw, label: label) { v in
+            v >= 0 ? nil : String(localized: "settings.validator.temperature.range",
+                                  defaultValue: "Temperature must be ≥ 0.",
+                                  comment: "Validation error when temperature is below the allowed range")
         }
     }
 
     static func topP(_ raw: String) -> Result<Double?, SamplingValidationError> {
-        parseDouble(raw, label: "Top P") { v in
-            (v > 0 && v <= 1) ? nil : "Top P must be in (0, 1]."
+        let label = String(localized: "settings.validator.top_p.name",
+                           defaultValue: "Top P",
+                           comment: "Field name embedded in validation errors for top-p")
+        return parseDouble(raw, label: label) { v in
+            (v > 0 && v <= 1) ? nil : String(localized: "settings.validator.top_p.range",
+                                             defaultValue: "Top P must be in (0, 1].",
+                                             comment: "Validation error when top-p falls outside the allowed range")
         }
     }
 
     static func minP(_ raw: String) -> Result<Double?, SamplingValidationError> {
-        parseDouble(raw, label: "Min P") { v in
-            (v >= 0 && v <= 1) ? nil : "Min P must be in [0, 1]."
+        let label = String(localized: "settings.validator.min_p.name",
+                           defaultValue: "Min P",
+                           comment: "Field name embedded in validation errors for min-p")
+        return parseDouble(raw, label: label) { v in
+            (v >= 0 && v <= 1) ? nil : String(localized: "settings.validator.min_p.range",
+                                              defaultValue: "Min P must be in [0, 1].",
+                                              comment: "Validation error when min-p falls outside the allowed range")
         }
     }
 
@@ -1826,17 +2126,23 @@ enum SamplingValidator {
         let t = raw.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return .success(nil) }
         guard let v = Int(t) else {
-            return .failure(.init(message: "Top K must be an integer."))
+            return .failure(.init(message: String(localized: "settings.validator.top_k.integer",
+                                                  defaultValue: "Top K must be an integer.",
+                                                  comment: "Validation error when top-k isn't an integer")))
         }
         guard v >= 1 else {
-            return .failure(.init(message: "Top K must be a positive integer."))
+            return .failure(.init(message: String(localized: "settings.validator.top_k.positive",
+                                                  defaultValue: "Top K must be a positive integer.",
+                                                  comment: "Validation error when top-k isn't positive")))
         }
         return .success(v)
     }
 
     static func penalty(_ raw: String, name: String) -> Result<Double?, SamplingValidationError> {
         parseDouble(raw, label: name) { v in
-            (v >= -2 && v <= 2) ? nil : "\(name) must be in [-2, 2]."
+            (v >= -2 && v <= 2) ? nil : String(localized: "settings.validator.penalty.range",
+                                               defaultValue: "\(name) must be in [-2, 2].",
+                                               comment: "Validation error when a penalty field is outside [-2,2]; placeholder is the field name")
         }
     }
 
@@ -1848,7 +2154,9 @@ enum SamplingValidator {
         let t = raw.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return .success(nil) }
         guard let v = Double(t) else {
-            return .failure(.init(message: "\(label) must be a number."))
+            return .failure(.init(message: String(localized: "settings.validator.must_be_number",
+                                                  defaultValue: "\(label) must be a number.",
+                                                  comment: "Validation error when a sampling field isn't a number; placeholder is the field name")))
         }
         if let msg = check(v) { return .failure(.init(message: msg)) }
         return .success(v)

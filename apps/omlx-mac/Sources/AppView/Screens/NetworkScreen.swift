@@ -27,7 +27,9 @@ struct NetworkScreen: View {
 
             HStack {
                 Spacer()
-                Button("Apply") {
+                Button(String(localized: "network.button.apply",
+                              defaultValue: "Apply",
+                              comment: "Footer button on the Network screen that commits the edited proxy/TLS values to the server")) {
                     Task { await vm.save(client: services.client) }
                 }
                 .buttonStyle(.omlx(.primary))
@@ -49,12 +51,18 @@ private struct ProxiesSection: View {
 
     var body: some View {
         SectionHeader(
-            "Proxies",
-            subtitle: "Outbound HTTP routing. Empty = no proxy. Applied via HTTP_PROXY / HTTPS_PROXY / NO_PROXY env vars."
+            String(localized: "network.section.proxies.title",
+                   defaultValue: "Proxies",
+                   comment: "Section header above the outbound proxy fields on the Network screen"),
+            subtitle: String(localized: "network.section.proxies.subtitle",
+                             defaultValue: "Outbound HTTP routing. Empty = no proxy. Applied via HTTP_PROXY / HTTPS_PROXY / NO_PROXY env vars.",
+                             comment: "Subtitle under the Proxies section header explaining how the values are applied")
         )
 
         ListGroup {
-            Row(label: "HTTP proxy") {
+            Row(label: String(localized: "network.row.http_proxy.label",
+                              defaultValue: "HTTP proxy",
+                              comment: "Row label for the HTTP_PROXY field on the Network screen")) {
                 TextInput(
                     text: $vm.httpProxy,
                     placeholder: "http://proxy.local:8080",
@@ -62,7 +70,9 @@ private struct ProxiesSection: View {
                     width: 320
                 )
             }
-            Row(label: "HTTPS proxy") {
+            Row(label: String(localized: "network.row.https_proxy.label",
+                              defaultValue: "HTTPS proxy",
+                              comment: "Row label for the HTTPS_PROXY field on the Network screen")) {
                 TextInput(
                     text: $vm.httpsProxy,
                     placeholder: "http://proxy.local:8080",
@@ -71,8 +81,12 @@ private struct ProxiesSection: View {
                 )
             }
             Row(
-                label: "No proxy",
-                sublabel: "Comma-separated host/CIDR list to bypass the proxy.",
+                label: String(localized: "network.row.no_proxy.label",
+                              defaultValue: "No proxy",
+                              comment: "Row label for the NO_PROXY field on the Network screen"),
+                sublabel: String(localized: "network.row.no_proxy.sub",
+                                 defaultValue: "Comma-separated host/CIDR list to bypass the proxy.",
+                                 comment: "Sublabel explaining the No proxy field format on the Network screen"),
                 isLast: true
             ) {
                 TextInput(
@@ -93,14 +107,22 @@ private struct TLSSection: View {
 
     var body: some View {
         SectionHeader(
-            "TLS",
-            subtitle: "Custom root CA for environments with TLS-inspecting proxies."
+            String(localized: "network.section.tls.title",
+                   defaultValue: "TLS",
+                   comment: "Section header above the TLS / custom CA fields on the Network screen"),
+            subtitle: String(localized: "network.section.tls.subtitle",
+                             defaultValue: "Custom root CA for environments with TLS-inspecting proxies.",
+                             comment: "Subtitle under the TLS section header on the Network screen")
         )
 
         ListGroup {
             Row(
-                label: "CA bundle",
-                sublabel: "Absolute path to a PEM-encoded CA bundle. Empty = system trust store.",
+                label: String(localized: "network.row.ca_bundle.label",
+                              defaultValue: "CA bundle",
+                              comment: "Row label for the custom CA bundle path field on the Network screen"),
+                sublabel: String(localized: "network.row.ca_bundle.sub",
+                                 defaultValue: "Absolute path to a PEM-encoded CA bundle. Empty = system trust store.",
+                                 comment: "Sublabel explaining the CA bundle field on the Network screen"),
                 isLast: true
             ) {
                 TextInput(

@@ -25,11 +25,17 @@ struct StatusScreen: View {
             // endpoint.
             ServerHeroCard()
 
-            SectionHeader("Serving Stats") {
+            SectionHeader(String(localized: "status.session_stats",
+                                  defaultValue: "Serving Stats",
+                                  comment: "Section header for the serving stats tiles")) {
                 HStack(spacing: 10) {
                     Segmented(selection: $vm.scope, options: [
-                        ("session", "Session"),
-                        ("alltime", "All Time"),
+                        ("session", String(localized: "status.scope.session",
+                                            defaultValue: "Session",
+                                            comment: "Segmented control option: session-scope stats")),
+                        ("alltime", String(localized: "status.scope.alltime",
+                                            defaultValue: "All Time",
+                                            comment: "Segmented control option: all-time stats")),
                     ])
                     .frame(width: 160)
                     Button {
@@ -39,35 +45,59 @@ struct StatusScreen: View {
                             .font(.system(size: 11, weight: .semibold))
                     }
                     .buttonStyle(.omlx(.plain, size: .small))
-                    .help(vm.scope == "alltime" ? "Clear all-time stats" : "Clear session stats")
+                    .help(vm.scope == "alltime"
+                          ? String(localized: "status.clear.alltime.help",
+                                   defaultValue: "Clear all-time stats",
+                                   comment: "Tooltip on the clear button when all-time scope is selected")
+                          : String(localized: "status.clear.session.help",
+                                   defaultValue: "Clear session stats",
+                                   comment: "Tooltip on the clear button when session scope is selected"))
                     .disabled(vm.stats == nil)
                 }
             }
             StatTilesRow(stats: vm.stats)
 
-            SectionHeader("System", subtitle: vm.systemSubtitle)
+            SectionHeader(String(localized: "status.section.system",
+                                  defaultValue: "System",
+                                  comment: "Section header for system status rows"),
+                          subtitle: vm.systemSubtitle)
             ListGroup {
-                Row(label: "GPU Wired Memory") {
+                Row(label: String(localized: "status.row.gpu_memory",
+                                  defaultValue: "GPU Wired Memory",
+                                  comment: "Row label for GPU wired memory")) {
                     GpuMemoryTrailing(stats: vm.stats)
                 }
-                Row(label: "System RAM") {
+                Row(label: String(localized: "status.row.system_ram",
+                                  defaultValue: "System RAM",
+                                  comment: "Row label for system RAM")) {
                     SystemRamTrailing(metrics: vm.metrics)
                 }
                 Row(
-                    label: "GPU Utilization",
-                    sublabel: "Approximate · active request load"
+                    label: String(localized: "status.row.gpu_utilization",
+                                  defaultValue: "GPU Utilization",
+                                  comment: "Row label for GPU utilization"),
+                    sublabel: String(localized: "status.row.gpu_utilization.sub",
+                                     defaultValue: "Approximate · active request load",
+                                     comment: "Sublabel for GPU utilization row")
                 ) {
                     Text(vm.gpuUtilizationText)
                         .font(.omlxMono(12))
                 }
-                Row(label: "Thermal State") {
+                Row(label: String(localized: "status.row.thermal_state",
+                                  defaultValue: "Thermal State",
+                                  comment: "Row label for thermal state")) {
                     ThermalTrailing(state: vm.metrics.thermalState)
                 }
-                Row(label: "Server Uptime") {
+                Row(label: String(localized: "status.row.server_uptime",
+                                  defaultValue: "Server Uptime",
+                                  comment: "Row label for server uptime")) {
                     Text(vm.uptimeText)
                         .font(.omlxMono(12))
                 }
-                Row(label: "oMLX Version", isLast: true) {
+                Row(label: String(localized: "status.row.version",
+                                  defaultValue: "oMLX Version",
+                                  comment: "Row label for the running oMLX version"),
+                    isLast: true) {
                     Text(vm.versionText)
                         .font(.omlxMono(12))
                         .foregroundStyle(.secondary)
@@ -79,10 +109,14 @@ struct StatusScreen: View {
                 onClearTap: { showingClearSsdCacheConfirm = true }
             )
 
-            SectionHeader("Updates")
+            SectionHeader(String(localized: "status.updates.title",
+                                  defaultValue: "Updates",
+                                  comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            SectionHeader("Active Now")
+            SectionHeader(String(localized: "status.section.active_now",
+                                  defaultValue: "Active Now",
+                                  comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
 
             if let error = vm.lastError {
@@ -98,25 +132,43 @@ struct StatusScreen: View {
         .onDisappear { vm.stop() }
         .confirmationDialog(
             vm.scope == "alltime"
-                ? "Clear all-time stats? This cannot be undone."
-                : "Clear session stats?",
+                ? String(localized: "status.confirm.clear_alltime",
+                         defaultValue: "Clear all-time stats? This cannot be undone.",
+                         comment: "Confirmation dialog title for clearing all-time stats")
+                : String(localized: "status.confirm.clear_session",
+                         defaultValue: "Clear session stats?",
+                         comment: "Confirmation dialog title for clearing session stats"),
             isPresented: $showingClearStatsConfirm,
             titleVisibility: .visible
         ) {
-            Button("Clear", role: .destructive) {
+            Button(String(localized: "status.confirm.clear_button",
+                          defaultValue: "Clear",
+                          comment: "Destructive clear button inside stats clear confirmation dialogs"),
+                   role: .destructive) {
                 Task { await vm.clearStats() }
             }
-            Button("Cancel", role: .cancel) {}
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Common cancel button label"),
+                   role: .cancel) {}
         }
         .confirmationDialog(
-            "Clear all SSD cache files? Loaded models will rebuild their KV cache on next prefill.",
+            String(localized: "status.confirm.clear_ssd",
+                   defaultValue: "Clear all SSD cache files? Loaded models will rebuild their KV cache on next prefill.",
+                   comment: "Confirmation dialog title for clearing the SSD KV cache"),
             isPresented: $showingClearSsdCacheConfirm,
             titleVisibility: .visible
         ) {
-            Button("Clear", role: .destructive) {
+            Button(String(localized: "status.confirm.clear_button",
+                          defaultValue: "Clear",
+                          comment: "Destructive clear button inside stats clear confirmation dialogs"),
+                   role: .destructive) {
                 Task { await vm.clearSsdCache() }
             }
-            Button("Cancel", role: .cancel) {}
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Common cancel button label"),
+                   role: .cancel) {}
         }
     }
 }
@@ -133,18 +185,27 @@ private struct RuntimeCacheSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("Runtime Cache", subtitle: subtitleText)
+        SectionHeader(String(localized: "status.section.runtime_cache",
+                              defaultValue: "Runtime Cache",
+                              comment: "Section header for the runtime cache observability panel"),
+                      subtitle: subtitleText)
         ListGroup {
-            Row(label: "Cache Files") {
+            Row(label: String(localized: "status.runtime_cache.files",
+                              defaultValue: "Cache Files",
+                              comment: "Row label for cache file count")) {
                 Text(fileCountText)
                     .font(.omlxMono(12))
             }
-            Row(label: "Total Size") {
+            Row(label: String(localized: "status.runtime_cache.size",
+                              defaultValue: "Total Size",
+                              comment: "Row label for total cache size on disk")) {
                 Text(sizeText)
                     .font(.omlxMono(12))
             }
             if let dir = cache?.ssdCacheDir, !dir.isEmpty {
-                Row(label: "Location") {
+                Row(label: String(localized: "status.runtime_cache.location",
+                                  defaultValue: "Location",
+                                  comment: "Row label for the SSD cache directory path")) {
                     Text(dir)
                         .font(.omlxMono(11))
                         .foregroundStyle(theme.textSecondary)
@@ -157,7 +218,10 @@ private struct RuntimeCacheSection: View {
             FreeRow(isLast: true) {
                 HStack {
                     Spacer()
-                    Button("Clear SSD Cache", action: onClearTap)
+                    Button(String(localized: "status.runtime_cache.clear_ssd",
+                                  defaultValue: "Clear SSD Cache",
+                                  comment: "Destructive button to clear all SSD cache files"),
+                           action: onClearTap)
                         .buttonStyle(.omlx(.destructive, size: .small))
                         .disabled((cache?.totalNumFiles ?? 0) == 0)
                 }
@@ -167,7 +231,14 @@ private struct RuntimeCacheSection: View {
 
     private var fileCountText: String {
         guard let n = cache?.totalNumFiles else { return "—" }
-        return n == 1 ? "1 file" : "\(n) files"
+        if n == 1 {
+            return String(localized: "status.runtime_cache.file_count.one",
+                          defaultValue: "1 file",
+                          comment: "Singular cache file count")
+        }
+        return String(localized: "status.runtime_cache.file_count.other",
+                      defaultValue: "\(n) files",
+                      comment: "Plural cache file count; placeholder is the number of files")
     }
 
     private var sizeText: String {
@@ -180,7 +251,9 @@ private struct RuntimeCacheSection: View {
         let blocks = cache.effectiveBlockSizes ?? []
         guard !blocks.isEmpty else { return nil }
         let list = blocks.map(String.init).joined(separator: " · ")
-        return "Block size · \(list)"
+        return String(localized: "status.runtime_cache.block_size",
+                      defaultValue: "Block size · \(list)",
+                      comment: "Subtitle showing the effective KV cache block sizes; placeholder is a separator-joined list of numbers")
     }
 }
 
@@ -205,25 +278,45 @@ private struct StatTilesRow: View {
         // subtitle to two lines at narrower widths.
         HStack(alignment: .top, spacing: 10) {
             StatTile(
-                label: "Total Tokens",
+                label: String(localized: "status.tile.total",
+                              defaultValue: "Total Tokens",
+                              comment: "Stat tile label for total tokens served"),
                 value: stats.map { fmtNum($0.totalTokensServed) } ?? "—",
-                sub: "prompt + completion"
+                sub: String(localized: "status.tile.total.sub",
+                            defaultValue: "prompt + completion",
+                            comment: "Sub-label for the total tokens stat tile")
             )
             StatTile(
-                label: "Cached",
+                label: String(localized: "status.tile.cached",
+                              defaultValue: "Cached",
+                              comment: "Stat tile label for cached tokens"),
                 value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—",
-                sub: stats.map { String(format: "%.1f%% efficiency", $0.cacheEfficiency) },
+                sub: stats.map {
+                    String(localized: "status.tile.cached.sub",
+                           defaultValue: "\(String(format: "%.1f", $0.cacheEfficiency))% efficiency",
+                           comment: "Sub-label showing cache efficiency percentage on the cached tile; placeholder is a formatted percentage")
+                },
                 accentRole: .success
             )
             StatTile(
-                label: "Generation",
+                label: String(localized: "status.tile.generation",
+                              defaultValue: "Generation",
+                              comment: "Stat tile label for average generation rate"),
                 value: stats.map { String(format: "%.1f tok/s", $0.avgGenerationTps) } ?? "—",
-                sub: "across active models"
+                sub: String(localized: "status.tile.generation.sub",
+                            defaultValue: "across active models",
+                            comment: "Sub-label for the generation rate tile")
             )
             StatTile(
-                label: "Requests",
+                label: String(localized: "status.tile.requests",
+                              defaultValue: "Requests",
+                              comment: "Stat tile label for the total requests count"),
                 value: stats.map { fmtNum($0.totalRequests) } ?? "—",
-                sub: stats.map { "\(($0.activeModels.totalActiveRequests ?? 0)) in flight" }
+                sub: stats.map {
+                    String(localized: "status.tile.requests.sub",
+                           defaultValue: "\(($0.activeModels.totalActiveRequests ?? 0)) in flight",
+                           comment: "Sub-label showing in-flight request count; placeholder is the number of active requests")
+                }
             )
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -403,7 +496,9 @@ private struct ActiveNowList: View {
         ListGroup {
             if models.isEmpty {
                 FreeRow(isLast: true) {
-                    Text("Server idle — no models loaded")
+                    Text(String(localized: "status.active_now.empty",
+                                defaultValue: "Server idle — no models loaded",
+                                comment: "Empty-state text shown when the Active Now list has no entries"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -430,11 +525,23 @@ private struct ActiveNowList: View {
         if model.isLoading == true {
             StatusPill(status: .starting)
         } else if (model.activeRequests ?? 0) > 0 {
-            StatusPill(status: .custom(color: theme.greenDot, label: "Generating", fillBg: true))
+            StatusPill(status: .custom(color: theme.greenDot,
+                                        label: String(localized: "status.active_now.badge.generating",
+                                                      defaultValue: "Generating",
+                                                      comment: "Active Now badge: model currently generating tokens"),
+                                        fillBg: true))
         } else if (model.waitingRequests ?? 0) > 0 {
-            StatusPill(status: .custom(color: theme.amberDot, label: "Waiting", fillBg: true))
+            StatusPill(status: .custom(color: theme.amberDot,
+                                        label: String(localized: "status.active_now.badge.waiting",
+                                                      defaultValue: "Waiting",
+                                                      comment: "Active Now badge: model has queued requests"),
+                                        fillBg: true))
         } else {
-            StatusPill(status: .custom(color: theme.textTertiary, label: "Loaded", fillBg: true))
+            StatusPill(status: .custom(color: theme.textTertiary,
+                                        label: String(localized: "status.active_now.badge.loaded",
+                                                      defaultValue: "Loaded",
+                                                      comment: "Active Now badge: model is loaded but idle"),
+                                        fillBg: true))
         }
     }
 }
@@ -463,8 +570,12 @@ private struct UpdatesSection: View {
                 }
             }
             Row(
-                label: "Update Channel",
-                sublabel: "Stable receives tested releases. Beta gets new features sooner."
+                label: String(localized: "status.updates.channel",
+                              defaultValue: "Update Channel",
+                              comment: "Row label for the update channel picker"),
+                sublabel: String(localized: "status.updates.channel.sub",
+                                 defaultValue: "Stable receives tested releases. Beta gets new features sooner.",
+                                 comment: "Sublabel for the update channel picker")
             ) {
                 Popup(
                     selection: Binding(
@@ -476,8 +587,12 @@ private struct UpdatesSection: View {
                 )
             }
             Row(
-                label: "Automatically Check",
-                sublabel: "Look for updates daily in the background"
+                label: String(localized: "status.updates.auto_check",
+                              defaultValue: "Automatically Check",
+                              comment: "Row label for the auto-check updates toggle"),
+                sublabel: String(localized: "status.updates.auto_check.sub",
+                                 defaultValue: "Look for updates daily in the background",
+                                 comment: "Sublabel for the auto-check toggle")
             ) {
                 Toggle("", isOn: Binding(
                     get: { updates.autoCheck },
@@ -487,8 +602,12 @@ private struct UpdatesSection: View {
                 .toggleStyle(.switch)
             }
             Row(
-                label: "Auto-download Updates",
-                sublabel: "Download in the background, install on next launch",
+                label: String(localized: "status.updates.auto_download",
+                              defaultValue: "Auto-download Updates",
+                              comment: "Row label for the auto-download updates toggle"),
+                sublabel: String(localized: "status.updates.auto_download.sub",
+                                 defaultValue: "Download in the background, install on next launch",
+                                 comment: "Sublabel for the auto-download toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: Binding(
@@ -505,15 +624,21 @@ private struct UpdatesSection: View {
     private var primaryLine: some View {
         switch updates.state {
         case .checking:
-            Text("Checking for updates…")
+            Text(String(localized: "status.updates.checking_primary",
+                        defaultValue: "Checking for updates…",
+                        comment: "Primary update status line while a check is in progress"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         case .available(let upd):
-            Text("oMLX \(upd.version) is available")
+            Text(String(localized: "status.updates.available_primary",
+                        defaultValue: "oMLX \(upd.version) is available",
+                        comment: "Primary update status line when a new version is available; placeholder is the version string"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         case .idle:
-            Text("oMLX is up to date")
+            Text(String(localized: "status.updates.up_to_date_primary",
+                        defaultValue: "oMLX is up to date",
+                        comment: "Primary update status line when no update is available"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         }
@@ -523,11 +648,15 @@ private struct UpdatesSection: View {
     private var secondaryLine: some View {
         switch updates.state {
         case .checking:
-            Text("Checking GitHub releases…")
+            Text(String(localized: "status.updates.checking_secondary",
+                        defaultValue: "Checking GitHub releases…",
+                        comment: "Secondary update status line while a check is in progress"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
-            Text("You have the current version · \(upd.sizeText ?? "—")")
+            Text(String(localized: "status.updates.available_secondary",
+                        defaultValue: "You have the current version · \(upd.sizeText ?? "—")",
+                        comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         case .idle(let lastChecked):
@@ -541,29 +670,47 @@ private struct UpdatesSection: View {
     private var actionButton: some View {
         switch updates.state {
         case .available:
-            Button("Install & Restart") { updates.installAndRestart() }
+            Button(String(localized: "status.updates.install",
+                          defaultValue: "Install & Restart",
+                          comment: "Updates action button to install a downloaded update and restart")) {
+                updates.installAndRestart()
+            }
                 .buttonStyle(.omlx(.primary, size: .small))
         case .checking:
-            Button("Checking…") { }
+            Button(String(localized: "status.updates.checking_button",
+                          defaultValue: "Checking…",
+                          comment: "Updates action button label while a check is in progress")) { }
                 .buttonStyle(.omlx(.normal, size: .small))
                 .disabled(true)
         case .idle:
-            Button("Check Now") { updates.checkForUpdates() }
+            Button(String(localized: "status.updates.check",
+                          defaultValue: "Check Now",
+                          comment: "Updates action button label to trigger a manual update check")) {
+                updates.checkForUpdates()
+            }
                 .buttonStyle(.omlx(.normal, size: .small))
         }
     }
 
     private func lastCheckedText(_ date: Date?) -> String {
-        guard let date else { return "Never checked" }
+        guard let date else {
+            return String(localized: "status.updates.never_checked",
+                          defaultValue: "Never checked",
+                          comment: "Secondary update line when there is no prior check timestamp")
+        }
         let formatter = DateFormatter()
         formatter.dateStyle = .none
         formatter.timeStyle = .short
         let calendar = Calendar.current
         if calendar.isDateInToday(date) {
-            return "Last checked today at \(formatter.string(from: date))"
+            return String(localized: "status.updates.last_checked_today",
+                          defaultValue: "Last checked today at \(formatter.string(from: date))",
+                          comment: "Last-checked text when the last check was today; placeholder is the local time")
         }
         formatter.dateStyle = .medium
-        return "Last checked \(formatter.string(from: date))"
+        return String(localized: "status.updates.last_checked_date",
+                      defaultValue: "Last checked \(formatter.string(from: date))",
+                      comment: "Last-checked text when the last check was before today; placeholder is the formatted date and time")
     }
 }
 
@@ -584,18 +731,26 @@ final class StatusScreenVM: ObservableObject {
     private var pollTask: Task<Void, Never>?
 
     var systemSubtitle: String {
-        var arch = "Apple Silicon"
+        var arch = String(localized: "status.arch.apple_silicon",
+                          defaultValue: "Apple Silicon",
+                          comment: "Architecture label shown in the System section subtitle for Apple Silicon Macs")
         #if arch(x86_64)
-        arch = "Intel"
+        arch = String(localized: "status.arch.intel",
+                      defaultValue: "Intel",
+                      comment: "Architecture label shown in the System section subtitle for Intel Macs")
         #endif
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        return "\(arch) · macOS \(os.majorVersion).\(os.minorVersion)"
+        return String(localized: "status.system.subtitle",
+                      defaultValue: "\(arch) · macOS \(os.majorVersion).\(os.minorVersion)",
+                      comment: "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers")
     }
 
     var versionText: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
-        return "\(v) · build \(b)"
+        return String(localized: "status.version.text",
+                      defaultValue: "\(v) · build \(b)",
+                      comment: "Version row value combining marketing version and build number; placeholders are the version string and build string")
     }
 
     var uptimeText: String {

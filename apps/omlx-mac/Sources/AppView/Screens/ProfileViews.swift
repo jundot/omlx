@@ -25,9 +25,15 @@ enum ProfileScopeMeta {
 
     static func label(_ scope: ProfileScope) -> String {
         switch scope {
-        case .preset: return "Preset"
-        case .global: return "Global"
-        case .model:  return "Model"
+        case .preset: return String(localized: "profile.scope.preset",
+                                    defaultValue: "Preset",
+                                    comment: "Scope label for shipped preset profiles in Profiles tab")
+        case .global: return String(localized: "profile.scope.global",
+                                    defaultValue: "Global",
+                                    comment: "Scope label for user-defined global profiles")
+        case .model:  return String(localized: "profile.scope.model",
+                                    defaultValue: "Model",
+                                    comment: "Scope label for per-model profiles")
         }
     }
 }
@@ -104,14 +110,19 @@ struct ProfileGroup: View {
                         .symbolEffect(.rotate, isActive: isRefreshing)
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
-                .help("Refresh presets from omlx.ai")
+                .help(String(localized: "profile.group.refresh.help",
+                             defaultValue: "Refresh presets from omlx.ai",
+                             comment: "Tooltip on the refresh button in the preset chip group header"))
                 .disabled(isRefreshing)
             }
             if canSaveCurrent {
                 Button {
                     onSaveCurrent()
                 } label: {
-                    Label("Save current as new", systemImage: "plus")
+                    Label(String(localized: "profile.group.save_current_as_new",
+                                 defaultValue: "Save current as new",
+                                 comment: "Button in profile chip-group header that saves the working profile as a new named profile"),
+                          systemImage: "plus")
                         .labelStyle(.titleAndIcon)
                         .font(.omlxText(11, weight: .medium))
                 }
@@ -132,7 +143,9 @@ struct ProfileGroup: View {
         let metaColor = ProfileScopeMeta.color(scope, theme: theme)
         Group {
             if names.isEmpty {
-                Text("No \(ProfileScopeMeta.label(scope).lowercased()) profiles yet.")
+                Text(String(localized: "profile.group.empty",
+                            defaultValue: "No \(ProfileScopeMeta.label(scope).lowercased()) profiles yet.",
+                            comment: "Placeholder text in an empty profile chip group; placeholder is the lowercased scope name"))
                     .font(.omlxText(11.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.vertical, 10)
@@ -334,9 +347,13 @@ struct ActiveProfileBanner: View {
 
     private var titleText: String {
         switch state {
-        case .working:                   return "Working profile"
+        case .working:                   return String(localized: "profile.banner.working.title",
+                                                       defaultValue: "Working profile",
+                                                       comment: "Profile banner title when the user has unsaved edits")
         case .named(_, let name):        return name
-        case .defaults:                  return "No profile"
+        case .defaults:                  return String(localized: "profile.banner.defaults.title",
+                                                       defaultValue: "No profile",
+                                                       comment: "Profile banner title when the model uses server defaults")
         }
     }
 
@@ -345,20 +362,28 @@ struct ActiveProfileBanner: View {
         switch state {
         case .working(let basedOn):
             if let basedOn {
-                Text("Unsaved · based on \(basedOn.name) (\(ProfileScopeMeta.label(basedOn.scope)))")
+                Text(String(localized: "profile.banner.working.subtitle.based_on",
+                            defaultValue: "Unsaved · based on \(basedOn.name) (\(ProfileScopeMeta.label(basedOn.scope)))",
+                            comment: "Profile banner subtitle for working state with a base profile; placeholders are profile name and scope label"))
                     .font(.omlxText(11.5))
                     .foregroundStyle(theme.textSecondary)
             } else {
-                Text("Unsaved · based on server defaults")
+                Text(String(localized: "profile.banner.working.subtitle.defaults",
+                            defaultValue: "Unsaved · based on server defaults",
+                            comment: "Profile banner subtitle when working profile has no named base"))
                     .font(.omlxText(11.5))
                     .foregroundStyle(theme.textSecondary)
             }
         case .named(let scope, _):
-            Text("\(ProfileScopeMeta.label(scope)) profile · active on this model")
+            Text(String(localized: "profile.banner.named.subtitle",
+                        defaultValue: "\(ProfileScopeMeta.label(scope)) profile · active on this model",
+                        comment: "Profile banner subtitle when a named profile is active; placeholder is scope label"))
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
         case .defaults:
-            Text("Using server defaults · edit any field to start a working profile")
+            Text(String(localized: "profile.banner.defaults.subtitle",
+                        defaultValue: "Using server defaults · edit any field to start a working profile",
+                        comment: "Profile banner subtitle when no profile is assigned"))
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
         }
@@ -370,15 +395,25 @@ struct ActiveProfileBanner: View {
             switch state {
             case .working(let basedOn):
                 if let basedOn, basedOn.scope != .preset, let onUpdateBasedOn {
-                    Button("Update \(basedOn.name)") { onUpdateBasedOn() }
+                    Button(String(localized: "profile.banner.action.update_based_on",
+                                  defaultValue: "Update \(basedOn.name)",
+                                  comment: "Profile banner action to overwrite the base profile with working edits; placeholder is the base profile's name")) { onUpdateBasedOn() }
                         .buttonStyle(.omlx(.normal, size: .small))
                 }
                 if let onSaveAsNew {
-                    Button("Save as new") { onSaveAsNew() }
+                    Button(String(localized: "profile.banner.action.save_as_new",
+                                  defaultValue: "Save as new",
+                                  comment: "Profile banner action that saves working edits as a new profile")) { onSaveAsNew() }
                         .buttonStyle(.omlx(.primary, size: .small))
                 }
                 if let onRevert {
-                    Button(basedOn == nil ? "Discard" : "Revert") { onRevert() }
+                    Button(basedOn == nil
+                           ? String(localized: "profile.banner.action.discard",
+                                    defaultValue: "Discard",
+                                    comment: "Profile banner action that discards working edits when there's no base profile")
+                           : String(localized: "profile.banner.action.revert",
+                                    defaultValue: "Revert",
+                                    comment: "Profile banner action that reverts working edits back to the base profile")) { onRevert() }
                         .buttonStyle(.omlx(.plain, size: .small))
                 }
             case .named, .defaults:
@@ -419,21 +454,38 @@ struct SaveAsPopover: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("Save current profile as")
+            Text(String(localized: "profile.save_as.title",
+                        defaultValue: "Save current profile as",
+                        comment: "Lead label inside the Save-as popover for naming a new profile"))
                 .font(.omlxText(12, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Segmented(
                 selection: $scope,
-                options: [(.global, "Global"), (.model, "Model")]
+                options: [
+                    (.global, String(localized: "profile.scope.global",
+                                     defaultValue: "Global",
+                                     comment: "Scope label for user-defined global profiles")),
+                    (.model,  String(localized: "profile.scope.model",
+                                     defaultValue: "Model",
+                                     comment: "Scope label for per-model profiles")),
+                ]
             )
             .frame(width: 140)
-            TextInput(text: $name, placeholder: "profile-name", mono: true)
+            TextInput(text: $name,
+                      placeholder: String(localized: "profile.save_as.name.placeholder",
+                                          defaultValue: "profile-name",
+                                          comment: "Placeholder text inside the new-profile name field"),
+                      mono: true)
                 .frame(maxWidth: .infinity)
                 .focused($nameFocused)
                 .onSubmit { onCommit() }
-            Button("Cancel") { onCancel() }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Generic Cancel button label")) { onCancel() }
                 .buttonStyle(.omlx(.normal, size: .small))
-            Button("Save") { onCommit() }
+            Button(String(localized: "common.save",
+                          defaultValue: "Save",
+                          comment: "Generic Save button label")) { onCommit() }
                 .buttonStyle(.omlx(.primary, size: .small))
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
         }
@@ -516,13 +568,21 @@ struct ProfileDetailCard: View {
                         .font(.omlxText(16, weight: .semibold))
                         .foregroundStyle(theme.text)
                     if isActive && !isWorking {
-                        badge(text: "ACTIVE", fg: .white, bg: theme.greenDot)
+                        badge(text: String(localized: "profile.detail.badge.active",
+                                           defaultValue: "ACTIVE",
+                                           comment: "Badge shown on the profile detail card when this profile is active on the model"),
+                              fg: .white, bg: theme.greenDot)
                     }
                     if isWorking {
-                        badge(text: "UNSAVED", fg: Color(rgb24: 0x1A1407), bg: theme.amberDot)
+                        badge(text: String(localized: "profile.detail.badge.unsaved",
+                                           defaultValue: "UNSAVED",
+                                           comment: "Badge on the profile detail card indicating unsaved working-state edits"),
+                              fg: Color(rgb24: 0x1A1407), bg: theme.amberDot)
                     }
                     if isWorkingBase && !isWorking {
-                        badge(text: "BASE OF WORKING",
+                        badge(text: String(localized: "profile.detail.badge.base_of_working",
+                                           defaultValue: "BASE OF WORKING",
+                                           comment: "Badge on the profile detail card marking the profile the working profile forked from"),
                               fg: theme.textSecondary, bg: .clear,
                               border: theme.inputBorder)
                     }
@@ -539,15 +599,21 @@ struct ProfileDetailCard: View {
             Spacer(minLength: 8)
             HStack(spacing: 6) {
                 if let onClosePreview {
-                    Button("Done") { onClosePreview() }
+                    Button(String(localized: "profile.detail.action.done",
+                                  defaultValue: "Done",
+                                  comment: "Profile detail card button that closes the preview overlay")) { onClosePreview() }
                         .buttonStyle(.omlx(.plain, size: .small))
                 }
                 if showUpdate, let onUpdateFromWorking {
-                    Button("Update with working") { onUpdateFromWorking() }
+                    Button(String(localized: "profile.detail.action.update_with_working",
+                                  defaultValue: "Update with working",
+                                  comment: "Profile detail card button that writes the current working edits into this named profile")) { onUpdateFromWorking() }
                         .buttonStyle(.omlx(.normal, size: .small))
                 }
                 if showApply, let onApply {
-                    Button("Apply") { onApply() }
+                    Button(String(localized: "profile.detail.action.apply",
+                                  defaultValue: "Apply",
+                                  comment: "Profile detail card button that activates this profile on the model")) { onApply() }
                         .buttonStyle(.omlx(.primary, size: .small))
                 }
                 if showDelete, let onDelete {
@@ -589,17 +655,27 @@ struct ProfileDetailCard: View {
 
     private var subtitleText: String {
         if isWorking, let basedOn {
-            return "Working profile · based on \(basedOn.name) (\(ProfileScopeMeta.label(basedOn.scope)))"
+            return String(localized: "profile.detail.subtitle.working_based_on",
+                          defaultValue: "Working profile · based on \(basedOn.name) (\(ProfileScopeMeta.label(basedOn.scope)))",
+                          comment: "Profile detail card subtitle in working state with a base profile; placeholders are name and scope label")
         }
         if isWorking {
-            return "Working profile · based on server defaults"
+            return String(localized: "profile.detail.subtitle.working_defaults",
+                          defaultValue: "Working profile · based on server defaults",
+                          comment: "Profile detail card subtitle in working state without a base profile")
         }
         if scope == nil {
-            return "Falls back here when no profile is set, or when a profile leaves a field empty"
+            return String(localized: "profile.detail.subtitle.defaults",
+                          defaultValue: "Falls back here when no profile is set, or when a profile leaves a field empty",
+                          comment: "Profile detail card subtitle for the Server Defaults card")
         }
         let count = settings.keys.filter { !isEmptyValue(settings[$0]) }.count
-        let scopeLabel = scope.map { ProfileScopeMeta.label($0) } ?? "Profile"
-        return "\(scopeLabel) profile · \(count) setting\(count == 1 ? "" : "s")"
+        let scopeLabel = scope.map { ProfileScopeMeta.label($0) } ?? String(localized: "profile.detail.subtitle.scope.profile",
+                                                                            defaultValue: "Profile",
+                                                                            comment: "Fallback scope label in the profile detail subtitle when scope is unknown")
+        return String(localized: "profile.detail.subtitle.named",
+                      defaultValue: "\(scopeLabel) profile · \(count) setting\(count == 1 ? "" : "s")",
+                      comment: "Profile detail card subtitle for a named profile; placeholders are scope label and a setting count with pluralization")
     }
 
     @ViewBuilder
@@ -638,7 +714,9 @@ struct ProfileDetailCard: View {
             if hasTemplates { templatesSection(s) }
             if !hasSampling && !hasCapacity && !hasPenalty && !hasBehavior
                 && !hasAcceleration && !hasTemplates {
-                Text("This profile doesn't override any settings.")
+                Text(String(localized: "profile.detail.empty",
+                            defaultValue: "This profile doesn't override any settings.",
+                            comment: "Placeholder text in the profile detail card when no settings are set"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -649,12 +727,26 @@ struct ProfileDetailCard: View {
 
     @ViewBuilder
     private func samplingSection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Sampling")
+        sectionTitle(String(localized: "profile.detail.section.sampling",
+                            defaultValue: "Sampling",
+                            comment: "Profile detail card section header for sampler-related fields"))
         let entries: [(String, Double?, Double, Double, String)] = [
-            ("Temperature", doubleOf(s["temperature"]), 0, 2, "%.2f"),
-            ("Top P",       doubleOf(s["top_p"]),       0, 1, "%.2f"),
-            ("Top K",       doubleOf(s["top_k"]),       0, 100, "%.0f"),
-            ("Min P",       doubleOf(s["min_p"]),       0, 1, "%.2f"),
+            (String(localized: "profile.detail.sampling.temperature",
+                    defaultValue: "Temperature",
+                    comment: "Sampling meter label: temperature"),
+             doubleOf(s["temperature"]), 0, 2, "%.2f"),
+            (String(localized: "profile.detail.sampling.top_p",
+                    defaultValue: "Top P",
+                    comment: "Sampling meter label: top-p"),
+             doubleOf(s["top_p"]),       0, 1, "%.2f"),
+            (String(localized: "profile.detail.sampling.top_k",
+                    defaultValue: "Top K",
+                    comment: "Sampling meter label: top-k"),
+             doubleOf(s["top_k"]),       0, 100, "%.0f"),
+            (String(localized: "profile.detail.sampling.min_p",
+                    defaultValue: "Min P",
+                    comment: "Sampling meter label: min-p"),
+             doubleOf(s["min_p"]),       0, 1, "%.2f"),
         ].filter { $0.1 != nil }
         HStack(alignment: .top, spacing: 18) {
             ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
@@ -665,16 +757,40 @@ struct ProfileDetailCard: View {
 
     @ViewBuilder
     private func capacitySection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Capacity")
+        sectionTitle(String(localized: "profile.detail.section.capacity",
+                            defaultValue: "Capacity",
+                            comment: "Profile detail card section header for capacity-related fields"))
         let entries: [(String, String)] = [
-            ("Type", s["model_type_override"].flatMap { ($0.value as? String) }
+            (String(localized: "profile.detail.capacity.type",
+                    defaultValue: "Type",
+                    comment: "Capacity stat label: model type override"),
+             s["model_type_override"].flatMap { ($0.value as? String) }
                 .flatMap { capacityType(value: $0) }),
-            ("Context", s["max_context_window"].flatMap { intOf($0) }
-                .map { "\(fmtCtx(Double($0))) tk" }),
-            ("Max Tokens", s["max_tokens"].flatMap { intOf($0) }
-                .map { "\($0) tk" }),
-            ("TTL", s["ttl_seconds"].flatMap { intOf($0) }
-                .map { $0 == 0 ? "Persistent" : "\($0)s" }),
+            (String(localized: "profile.detail.capacity.context",
+                    defaultValue: "Context",
+                    comment: "Capacity stat label: max context window"),
+             s["max_context_window"].flatMap { intOf($0) }
+                .map { String(localized: "profile.detail.capacity.tokens",
+                              defaultValue: "\(fmtCtx(Double($0))) tk",
+                              comment: "Token count rendered next to a Capacity stat; placeholder is the formatted count") }),
+            (String(localized: "profile.detail.capacity.max_tokens",
+                    defaultValue: "Max Tokens",
+                    comment: "Capacity stat label: max output tokens"),
+             s["max_tokens"].flatMap { intOf($0) }
+                .map { String(localized: "profile.detail.capacity.tokens.raw",
+                              defaultValue: "\($0) tk",
+                              comment: "Raw token count for max tokens; placeholder is the integer count") }),
+            (String(localized: "profile.detail.capacity.ttl",
+                    defaultValue: "TTL",
+                    comment: "Capacity stat label: time-to-live for the model in memory"),
+             s["ttl_seconds"].flatMap { intOf($0) }
+                .map { $0 == 0
+                       ? String(localized: "profile.detail.capacity.ttl.persistent",
+                                defaultValue: "Persistent",
+                                comment: "TTL value rendered when the model is pinned indefinitely")
+                       : String(localized: "profile.detail.capacity.ttl.seconds",
+                                defaultValue: "\($0)s",
+                                comment: "TTL value in seconds; placeholder is the integer seconds") }),
         ].compactMap { (label, value) in value.map { (label, $0) } }
         HStack(alignment: .top, spacing: 18) {
             ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
@@ -685,10 +801,18 @@ struct ProfileDetailCard: View {
 
     @ViewBuilder
     private func penaltySection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Penalties")
+        sectionTitle(String(localized: "profile.detail.section.penalties",
+                            defaultValue: "Penalties",
+                            comment: "Profile detail card section header for repetition/presence penalty fields"))
         let entries: [(String, Double?, Double, Double)] = [
-            ("Repetition", doubleOf(s["repetition_penalty"]), 0, 2),
-            ("Presence", doubleOf(s["presence_penalty"]), -2, 2),
+            (String(localized: "profile.detail.penalty.repetition",
+                    defaultValue: "Repetition",
+                    comment: "Penalty meter label: repetition"),
+             doubleOf(s["repetition_penalty"]), 0, 2),
+            (String(localized: "profile.detail.penalty.presence",
+                    defaultValue: "Presence",
+                    comment: "Penalty meter label: presence"),
+             doubleOf(s["presence_penalty"]), -2, 2),
         ].filter { $0.1 != nil }
         HStack(alignment: .top, spacing: 18) {
             ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
@@ -699,23 +823,44 @@ struct ProfileDetailCard: View {
 
     @ViewBuilder
     private func behaviorSection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Behavior")
+        sectionTitle(String(localized: "profile.detail.section.behavior",
+                            defaultValue: "Behavior",
+                            comment: "Profile detail card section header for behavior-flag chips"))
         FlowLayout(spacing: 6) {
             if let v = s["enable_thinking"].flatMap({ boolOf($0) }) {
-                flagChip(label: "Thinking", on: v)
+                flagChip(label: String(localized: "profile.detail.behavior.thinking",
+                                       defaultValue: "Thinking",
+                                       comment: "Behavior chip: extended-thinking flag"),
+                         on: v)
             }
             if let v = s["thinking_budget_enabled"].flatMap({ boolOf($0) }) {
                 let n = intOf(s["thinking_budget_tokens"]) ?? 8192
-                flagChip(label: v ? "Budget · \(fmtCtx(Double(n))) tk" : "Thinking budget", on: v)
+                flagChip(label: v
+                         ? String(localized: "profile.detail.behavior.thinking_budget.on",
+                                  defaultValue: "Budget · \(fmtCtx(Double(n))) tk",
+                                  comment: "Behavior chip when thinking budget is enabled; placeholder is the formatted token count")
+                         : String(localized: "profile.detail.behavior.thinking_budget.off",
+                                  defaultValue: "Thinking budget",
+                                  comment: "Behavior chip label when thinking budget is disabled"),
+                         on: v)
             }
             if let v = s["max_tool_result_tokens"].flatMap({ intOf($0) }) {
-                flagChip(label: "Limit tool output", on: v > 0)
+                flagChip(label: String(localized: "profile.detail.behavior.limit_tool_output",
+                                       defaultValue: "Limit tool output",
+                                       comment: "Behavior chip: cap on tool result tokens"),
+                         on: v > 0)
             }
             if let v = s["force_sampling"].flatMap({ boolOf($0) }) {
-                flagChip(label: "Force sampling", on: v)
+                flagChip(label: String(localized: "profile.detail.behavior.force_sampling",
+                                       defaultValue: "Force sampling",
+                                       comment: "Behavior chip: force sampling flag"),
+                         on: v)
             }
             if let v = s["is_pinned"].flatMap({ boolOf($0) }) {
-                flagChip(label: "Pinned in memory", on: v)
+                flagChip(label: String(localized: "profile.detail.behavior.pinned",
+                                       defaultValue: "Pinned in memory",
+                                       comment: "Behavior chip: pin-in-memory flag"),
+                         on: v)
             }
         }
     }
@@ -727,7 +872,9 @@ struct ProfileDetailCard: View {
     /// settings — without forcing the user back into the Advanced tab.
     @ViewBuilder
     private func accelerationSection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Acceleration")
+        sectionTitle(String(localized: "profile.detail.section.acceleration",
+                            defaultValue: "Acceleration",
+                            comment: "Profile detail card section header for experimental acceleration knobs"))
         FlowLayout(spacing: 6) {
             if let on = s["turboquant_kv_enabled"].flatMap({ boolOf($0) }) {
                 flagChip(label: turboquantLabel(s, on: on), on: on)
@@ -739,13 +886,19 @@ struct ProfileDetailCard: View {
                 }
             }
             if let on = s["mtp_enabled"].flatMap({ boolOf($0) }) {
-                flagChip(label: "Native MTP", on: on)
+                flagChip(label: String(localized: "profile.detail.acceleration.mtp",
+                                       defaultValue: "Native MTP",
+                                       comment: "Acceleration chip: native multi-token prediction"),
+                         on: on)
             }
             if let on = s["specprefill_enabled"].flatMap({ boolOf($0) }) {
                 flagChip(label: specprefillLabel(s, on: on), on: on)
             }
             if let freq = intOf(s["index_cache_freq"]), freq > 0 {
-                flagChip(label: "IndexCache · every \(freq)", on: true)
+                flagChip(label: String(localized: "profile.detail.acceleration.index_cache",
+                                       defaultValue: "IndexCache · every \(freq)",
+                                       comment: "Acceleration chip describing IndexCache frequency; placeholder is the integer frequency"),
+                         on: true)
             }
         }
     }
@@ -756,21 +909,30 @@ struct ProfileDetailCard: View {
     /// distance from the sampler knobs above.
     @ViewBuilder
     private func templatesSection(_ s: [String: AnyCodable]) -> some View {
-        sectionTitle("Templates")
+        sectionTitle(String(localized: "profile.detail.section.templates",
+                            defaultValue: "Templates",
+                            comment: "Profile detail card section header for tokenizer/chat-template fields"))
         FlowLayout(spacing: 6) {
             if let parser = (s["reasoning_parser"]?.value as? String)?
                 .trimmingCharacters(in: .whitespaces), !parser.isEmpty {
-                flagChip(label: "Reasoning · \(parser)", on: true)
+                flagChip(label: String(localized: "profile.detail.templates.reasoning_parser",
+                                       defaultValue: "Reasoning · \(parser)",
+                                       comment: "Templates chip naming the active reasoning parser; placeholder is the parser identifier"),
+                         on: true)
             }
             if let count = nonEmptyKwargCount(s["chat_template_kwargs"]) {
                 flagChip(
-                    label: "Chat template · \(count) override\(count == 1 ? "" : "s")",
+                    label: String(localized: "profile.detail.templates.chat_template",
+                                  defaultValue: "Chat template · \(count) override\(count == 1 ? "" : "s")",
+                                  comment: "Templates chip describing chat-template kwarg override count; placeholder is the count with pluralization"),
                     on: true
                 )
             }
             if let count = nonEmptyKwargCount(s["forced_ct_kwargs"]) {
                 flagChip(
-                    label: "Forced CT · \(count) key\(count == 1 ? "" : "s")",
+                    label: String(localized: "profile.detail.templates.forced_ct",
+                                  defaultValue: "Forced CT · \(count) key\(count == 1 ? "" : "s")",
+                                  comment: "Templates chip describing forced chat-template key count; placeholder is the count with pluralization"),
                     on: true
                 )
             }
@@ -778,46 +940,78 @@ struct ProfileDetailCard: View {
     }
 
     private func turboquantLabel(_ s: [String: AnyCodable], on: Bool) -> String {
-        guard on else { return "TurboQuant KV" }
+        let baseName = String(localized: "profile.detail.acceleration.turboquant",
+                              defaultValue: "TurboQuant KV",
+                              comment: "Acceleration chip base name for TurboQuant KV-cache compression")
+        guard on else { return baseName }
         let bits = doubleOf(s["turboquant_kv_bits"])
         let skip = intOf(s["turboquant_skip_last"]) ?? 0
         let bitsText = bits.map { v in
             v.truncatingRemainder(dividingBy: 1) == 0
-                ? "\(Int(v))bit"
-                : String(format: "%.1fbit", v)
+                ? String(localized: "profile.detail.acceleration.turboquant.bits_int",
+                         defaultValue: "\(Int(v))bit",
+                         comment: "TurboQuant bit-width suffix when the value is an integer; placeholder is the int")
+                : String(format: String(localized: "profile.detail.acceleration.turboquant.bits_decimal",
+                                        defaultValue: "%.1fbit",
+                                        comment: "TurboQuant bit-width suffix when fractional; %.1f gets the decimal width"), v)
         }
-        let parts = [bitsText, skip > 0 ? "skip \(skip)" : nil].compactMap { $0 }
-        return parts.isEmpty ? "TurboQuant KV" : "TurboQuant KV · \(parts.joined(separator: " / "))"
+        let skipText = skip > 0
+            ? String(localized: "profile.detail.acceleration.turboquant.skip",
+                     defaultValue: "skip \(skip)",
+                     comment: "TurboQuant skip-last-N suffix; placeholder is the layer count")
+            : nil
+        let parts = [bitsText, skipText].compactMap { $0 }
+        return parts.isEmpty
+            ? baseName
+            : String(localized: "profile.detail.acceleration.turboquant.with_parts",
+                     defaultValue: "TurboQuant KV · \(parts.joined(separator: " / "))",
+                     comment: "TurboQuant chip with detail suffix; placeholder is the joined detail parts")
     }
 
     private func dflashLabel(_ s: [String: AnyCodable], on: Bool) -> String {
-        guard on else { return "DFlash" }
+        let baseName = String(localized: "profile.detail.acceleration.dflash",
+                              defaultValue: "DFlash",
+                              comment: "Acceleration chip base name for DFlash drafter")
+        guard on else { return baseName }
         let drafter = (s["dflash_draft_model"]?.value as? String)?
             .trimmingCharacters(in: .whitespaces)
         if let d = drafter, !d.isEmpty {
-            return "DFlash · \(d)"
+            return String(localized: "profile.detail.acceleration.dflash.with_drafter",
+                          defaultValue: "DFlash · \(d)",
+                          comment: "DFlash chip with drafter model id; placeholder is the model identifier")
         }
-        return "DFlash"
+        return baseName
     }
 
     private func dflashQuantLabel(_ s: [String: AnyCodable]) -> String {
         let w = intOf(s["dflash_draft_quant_weight_bits"]) ?? 4
         let a = intOf(s["dflash_draft_quant_activation_bits"]) ?? 8
         let g = intOf(s["dflash_draft_quant_group_size"]) ?? 64
-        return "Drafter quant · W\(w)/A\(a) G\(g)"
+        return String(localized: "profile.detail.acceleration.dflash_quant",
+                      defaultValue: "Drafter quant · W\(w)/A\(a) G\(g)",
+                      comment: "DFlash drafter quantization chip; placeholders are weight bits, activation bits, group size")
     }
 
     private func specprefillLabel(_ s: [String: AnyCodable], on: Bool) -> String {
-        guard on else { return "SpecPrefill" }
+        let baseName = String(localized: "profile.detail.acceleration.specprefill",
+                              defaultValue: "SpecPrefill",
+                              comment: "Acceleration chip base name for SpecPrefill")
+        guard on else { return baseName }
         // `specprefill_keep_pct` is a fraction (0.1–0.5 per
         // `omlx/model_settings.py:62`); render as a percent so the chip
         // reads naturally.
         let keep = doubleOf(s["specprefill_keep_pct"])
             .map { String(format: "%.0f%%", $0 * 100) }
         let thresh = intOf(s["specprefill_threshold"])
-            .map { "≥\(fmtCtx(Double($0))) tk" }
+            .map { String(localized: "profile.detail.acceleration.specprefill.threshold",
+                          defaultValue: "≥\(fmtCtx(Double($0))) tk",
+                          comment: "SpecPrefill threshold suffix; placeholder is the formatted token count") }
         let parts = [keep, thresh].compactMap { $0 }
-        return parts.isEmpty ? "SpecPrefill" : "SpecPrefill · \(parts.joined(separator: " / "))"
+        return parts.isEmpty
+            ? baseName
+            : String(localized: "profile.detail.acceleration.specprefill.with_parts",
+                     defaultValue: "SpecPrefill · \(parts.joined(separator: " / "))",
+                     comment: "SpecPrefill chip with detail suffix; placeholder is the joined detail parts")
     }
 
     /// Count of non-empty key-value pairs in a `[String: AnyCodable]`

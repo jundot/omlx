@@ -44,9 +44,15 @@ struct AccuracyBenchScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScreenHeader(
-                eyebrow: "Accuracy Benchmark",
-                title: "Measure model accuracy",
-                subtitle: "Queue benchmarks across models. Results accumulate until you reset them. Resume across app launches via the server-side queue."
+                eyebrow: String(localized: "bench.accuracy.header.eyebrow",
+                                defaultValue: "Accuracy Benchmark",
+                                comment: "Eyebrow label above the Accuracy Bench screen header"),
+                title: String(localized: "bench.accuracy.header.title",
+                              defaultValue: "Measure model accuracy",
+                              comment: "Accuracy Bench screen primary header"),
+                subtitle: String(localized: "bench.accuracy.header.subtitle",
+                                 defaultValue: "Queue benchmarks across models. Results accumulate until you reset them. Resume across app launches via the server-side queue.",
+                                 comment: "Accuracy Bench screen subtitle explaining queueing behavior")
             )
 
             ConfigurationSection(
@@ -95,27 +101,60 @@ struct BenchmarkCatalogEntry: Hashable, Identifiable {
     var id: String { key }
 }
 
-private let benchmarkCatalog: [BenchmarkCatalogEntry] = [
-    .init(key: "mmlu",          displayName: "MMLU",          category: "Knowledge"),
-    .init(key: "mmlu_pro",      displayName: "MMLU-Pro",      category: "Knowledge"),
-    .init(key: "kmmlu",         displayName: "KMMLU (Korean)", category: "Knowledge"),
-    .init(key: "cmmlu",         displayName: "CMMLU (Chinese)", category: "Knowledge"),
-    .init(key: "jmmlu",         displayName: "JMMLU (Japanese)", category: "Knowledge"),
-    .init(key: "hellaswag",     displayName: "HellaSwag",     category: "Reasoning"),
-    .init(key: "truthfulqa",    displayName: "TruthfulQA",    category: "Reasoning"),
-    .init(key: "arc_challenge", displayName: "ARC-Challenge", category: "Reasoning"),
-    .init(key: "winogrande",    displayName: "WinoGrande",    category: "Reasoning"),
-    .init(key: "gsm8k",         displayName: "GSM8K",         category: "Math"),
-    .init(key: "mathqa",        displayName: "MathQA",        category: "Math"),
-    .init(key: "humaneval",     displayName: "HumanEval",     category: "Code"),
-    .init(key: "mbpp",          displayName: "MBPP",          category: "Code"),
-    .init(key: "livecodebench", displayName: "LiveCodeBench", category: "Code"),
-    .init(key: "bbq",           displayName: "BBQ",           category: "Safety"),
-    .init(key: "safetybench",   displayName: "SafetyBench",   category: "Safety"),
-]
+private let benchmarkCatalog: [BenchmarkCatalogEntry] = {
+    let knowledge = String(localized: "bench.accuracy.category.knowledge",
+                           defaultValue: "Knowledge",
+                           comment: "Accuracy bench catalog category: knowledge benchmarks")
+    let reasoning = String(localized: "bench.accuracy.category.reasoning",
+                           defaultValue: "Reasoning",
+                           comment: "Accuracy bench catalog category: reasoning benchmarks")
+    let math = String(localized: "bench.accuracy.category.math",
+                      defaultValue: "Math",
+                      comment: "Accuracy bench catalog category: math benchmarks")
+    let code = String(localized: "bench.accuracy.category.code",
+                      defaultValue: "Code",
+                      comment: "Accuracy bench catalog category: code benchmarks")
+    let safety = String(localized: "bench.accuracy.category.safety",
+                        defaultValue: "Safety",
+                        comment: "Accuracy bench catalog category: safety benchmarks")
+    // Benchmark display names are proper nouns (dataset names) shared with
+    // the HTML admin; only the language-tag suffixes are translated.
+    return [
+        .init(key: "mmlu",          displayName: "MMLU",          category: knowledge),
+        .init(key: "mmlu_pro",      displayName: "MMLU-Pro",      category: knowledge),
+        .init(key: "kmmlu",
+              displayName: String(localized: "bench.accuracy.dataset.kmmlu",
+                                  defaultValue: "KMMLU (Korean)",
+                                  comment: "Accuracy bench display name with language tag"),
+              category: knowledge),
+        .init(key: "cmmlu",
+              displayName: String(localized: "bench.accuracy.dataset.cmmlu",
+                                  defaultValue: "CMMLU (Chinese)",
+                                  comment: "Accuracy bench display name with language tag"),
+              category: knowledge),
+        .init(key: "jmmlu",
+              displayName: String(localized: "bench.accuracy.dataset.jmmlu",
+                                  defaultValue: "JMMLU (Japanese)",
+                                  comment: "Accuracy bench display name with language tag"),
+              category: knowledge),
+        .init(key: "hellaswag",     displayName: "HellaSwag",     category: reasoning),
+        .init(key: "truthfulqa",    displayName: "TruthfulQA",    category: reasoning),
+        .init(key: "arc_challenge", displayName: "ARC-Challenge", category: reasoning),
+        .init(key: "winogrande",    displayName: "WinoGrande",    category: reasoning),
+        .init(key: "gsm8k",         displayName: "GSM8K",         category: math),
+        .init(key: "mathqa",        displayName: "MathQA",        category: math),
+        .init(key: "humaneval",     displayName: "HumanEval",     category: code),
+        .init(key: "mbpp",          displayName: "MBPP",          category: code),
+        .init(key: "livecodebench", displayName: "LiveCodeBench", category: code),
+        .init(key: "bbq",           displayName: "BBQ",           category: safety),
+        .init(key: "safetybench",   displayName: "SafetyBench",   category: safety),
+    ]
+}()
 
 private let sampleSizeOptions: [(Int, String)] = [
-    (0,    "Full"),
+    (0,    String(localized: "bench.accuracy.sample_size.full",
+                  defaultValue: "Full",
+                  comment: "Sample-size dropdown option: full dataset")),
     (50,   "50"),
     (100,  "100"),
     (200,  "200"),
@@ -144,12 +183,19 @@ private struct ConfigurationSection: View {
 
     var body: some View {
         SectionHeader(
-            "Configuration",
+            String(localized: "bench.accuracy.section.configuration",
+                   defaultValue: "Configuration",
+                   comment: "Section header for the Accuracy Bench configuration block"),
             subtitle: subtitleText
         )
 
         ListGroup {
-            Row(label: "Model", sublabel: "Loaded models are listed first") {
+            Row(label: String(localized: "bench.accuracy.row.model.label",
+                              defaultValue: "Model",
+                              comment: "Row label for the Accuracy Bench model picker"),
+                sublabel: String(localized: "bench.accuracy.row.model.sub",
+                                 defaultValue: "Loaded models are listed first",
+                                 comment: "Sublabel under the Accuracy Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
                     width: 320,
@@ -158,16 +204,24 @@ private struct ConfigurationSection: View {
             }
 
             Row(
-                label: "Batch size",
-                sublabel: "Higher batches finish faster but use more memory"
+                label: String(localized: "bench.accuracy.row.batch_size.label",
+                              defaultValue: "Batch size",
+                              comment: "Row label for the Accuracy Bench batch-size selector"),
+                sublabel: String(localized: "bench.accuracy.row.batch_size.sub",
+                                 defaultValue: "Higher batches finish faster but use more memory",
+                                 comment: "Sublabel under the Accuracy Bench batch-size selector")
             ) {
                 Segmented(selection: $batchSize, options: batchSizeOptions)
                     .frame(width: 260)
             }
 
             Row(
-                label: "Extended thinking",
-                sublabel: "Enable per-question reasoning traces (slower)"
+                label: String(localized: "bench.accuracy.row.thinking.label",
+                              defaultValue: "Extended thinking",
+                              comment: "Row label for the Accuracy Bench extended-thinking toggle"),
+                sublabel: String(localized: "bench.accuracy.row.thinking.sub",
+                                 defaultValue: "Enable per-question reasoning traces (slower)",
+                                 comment: "Sublabel under the Accuracy Bench extended-thinking toggle")
             ) {
                 Toggle("", isOn: $enableThinking).labelsHidden().toggleStyle(.switch)
             }
@@ -175,7 +229,9 @@ private struct ConfigurationSection: View {
             FreeRow {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
-                        Text("Benchmarks")
+                        Text(String(localized: "bench.accuracy.benchmarks.title",
+                                    defaultValue: "Benchmarks",
+                                    comment: "Inline label above the Accuracy Bench benchmark grid"))
                             .font(.omlxText(13, weight: .medium))
                             .foregroundStyle(theme.text)
                         Text(benchmarksSubtitle)
@@ -200,9 +256,14 @@ private struct ConfigurationSection: View {
                             ProgressView()
                                 .controlSize(.small)
                                 .padding(.trailing, 2)
-                            Text("Adding…")
+                            Text(String(localized: "bench.accuracy.button.adding",
+                                        defaultValue: "Adding…",
+                                        comment: "Accuracy Bench add-to-queue button label while the request is in flight"))
                         } else {
-                            Label("Add to Queue & Run", systemImage: "play.fill")
+                            Label(String(localized: "bench.accuracy.button.add",
+                                         defaultValue: "Add to Queue & Run",
+                                         comment: "Accuracy Bench primary button that adds the configured run to the queue"),
+                                  systemImage: "play.fill")
                                 .labelStyle(.titleAndIcon)
                         }
                     }
@@ -214,28 +275,42 @@ private struct ConfigurationSection: View {
     }
 
     private var modelOptions: [PopupOption<String>] {
-        var opts = [PopupOption(value: "", label: "Select a model…")]
+        var opts = [PopupOption(value: "", label: String(localized: "bench.accuracy.model.placeholder",
+                                                         defaultValue: "Select a model…",
+                                                         comment: "Placeholder option in the Accuracy Bench model picker"))]
         let sorted = models.sorted { (a, b) -> Bool in
             if a.loaded != b.loaded { return a.loaded && !b.loaded }
             return a.id.localizedCaseInsensitiveCompare(b.id) == .orderedAscending
         }
         opts += sorted.map { m in
-            let badge = m.loaded ? " • loaded" : ""
+            let badge = m.loaded
+                ? String(localized: "bench.accuracy.model.loaded_badge",
+                         defaultValue: " • loaded",
+                         comment: "Suffix appended to a loaded model's name in the Accuracy Bench picker")
+                : ""
             return PopupOption(value: m.id, label: "\(m.id)\(badge)")
         }
         return opts
     }
 
     private var subtitleText: String? {
-        if models.isEmpty { return "Loading models…" }
+        if models.isEmpty { return String(localized: "bench.accuracy.subtitle.loading_models",
+                                          defaultValue: "Loading models…",
+                                          comment: "Accuracy Bench section subtitle while models are loading") }
         let count = selectedBenchmarks.count
-        return "\(count) benchmark\(count == 1 ? "" : "s") selected"
+        return String(localized: "bench.accuracy.subtitle.selected_count",
+                      defaultValue: "\(count) benchmark\(count == 1 ? "" : "s") selected",
+                      comment: "Accuracy Bench section subtitle showing how many benchmarks the user has picked; placeholder is the count with pluralization")
     }
 
     private var benchmarksSubtitle: String {
         let count = selectedBenchmarks.count
-        if count == 0 { return "Tap to select. 0 = full dataset." }
-        return "\(count) selected"
+        if count == 0 { return String(localized: "bench.accuracy.benchmarks.subtitle.empty",
+                                      defaultValue: "Tap to select. 0 = full dataset.",
+                                      comment: "Subtitle next to the Benchmarks grid when nothing is selected") }
+        return String(localized: "bench.accuracy.benchmarks.subtitle.count",
+                      defaultValue: "\(count) selected",
+                      comment: "Subtitle next to the Benchmarks grid showing the selected count")
     }
 }
 
@@ -324,7 +399,9 @@ private struct BenchmarkCard: View {
 
             if isSelected {
                 HStack(spacing: 6) {
-                    Text("Samples:")
+                    Text(String(localized: "bench.accuracy.card.samples_label",
+                                defaultValue: "Samples:",
+                                comment: "Inline label next to the per-benchmark sample-size dropdown"))
                         .font(.omlxText(10.5))
                         .foregroundStyle(theme.textTertiary)
                     Popup(
@@ -371,7 +448,10 @@ private struct QueueSection: View {
         let showSection = activelyRunning || !queue.isEmpty
 
         if showSection {
-            SectionHeader("Queue", subtitle: subtitle(running: activelyRunning, queue: queue))
+            SectionHeader(String(localized: "bench.accuracy.section.queue",
+                                 defaultValue: "Queue",
+                                 comment: "Section header for the Accuracy Bench queue/in-progress block"),
+                          subtitle: subtitle(running: activelyRunning, queue: queue))
 
             ListGroup {
                 if activelyRunning {
@@ -400,9 +480,19 @@ private struct QueueSection: View {
 
     private func subtitle(running: Bool, queue: [AccuracyQueueItem]) -> String {
         let queuedCount = queue.count
-        let queuedPart = "\(queuedCount) queued"
-        if running { return "\(queuedPart) · 1 running" }
-        if queuedCount == 0 { return "no active runs" }
+        let queuedPart = String(localized: "bench.accuracy.queue.subtitle.queued",
+                                defaultValue: "\(queuedCount) queued",
+                                comment: "Accuracy Bench queue subtitle fragment showing queued count")
+        if running {
+            return String(localized: "bench.accuracy.queue.subtitle.with_running",
+                          defaultValue: "\(queuedPart) · 1 running",
+                          comment: "Accuracy Bench queue subtitle when one bench is running; placeholder is the queued-count fragment")
+        }
+        if queuedCount == 0 {
+            return String(localized: "bench.accuracy.queue.subtitle.empty",
+                          defaultValue: "no active runs",
+                          comment: "Accuracy Bench queue subtitle when nothing is running or queued")
+        }
         return queuedPart
     }
 }
@@ -419,19 +509,28 @@ private struct RunningRow: View {
             HStack(spacing: 8) {
                 ProgressView()
                     .controlSize(.small)
-                Text(modelId.isEmpty ? "Running…" : modelId)
+                Text(modelId.isEmpty
+                     ? String(localized: "bench.accuracy.queue.running.placeholder",
+                              defaultValue: "Running…",
+                              comment: "Accuracy Bench running-row title when the server hasn't reported the model id yet")
+                     : modelId)
                     .font(.omlxMono(12))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 StatusPill(status: .custom(
                     color: theme.blueDot,
-                    label: "Running",
+                    label: String(localized: "bench.accuracy.status.running",
+                                  defaultValue: "Running",
+                                  comment: "Status pill label on the Accuracy Bench running row"),
                     fillBg: true
                 ))
                 Spacer(minLength: 6)
                 Button(action: onCancel) {
-                    Label("Cancel", systemImage: "stop.fill")
+                    Label(String(localized: "common.cancel",
+                                 defaultValue: "Cancel",
+                                 comment: "Generic Cancel button label"),
+                          systemImage: "stop.fill")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.destructive, size: .small))
@@ -493,7 +592,9 @@ private struct QueuedRow: View {
                     .font(.system(size: 11))
             }
             .buttonStyle(.omlx(.plain, size: .small))
-            .help("Remove from queue")
+            .help(String(localized: "bench.accuracy.queue.remove.help",
+                         defaultValue: "Remove from queue",
+                         comment: "Tooltip on the X button next to a queued Accuracy Bench entry"))
         }
     }
 
@@ -514,10 +615,16 @@ private struct ResultsSection: View {
     var body: some View {
         if !results.isEmpty {
             SectionHeader(
-                "Results",
-                subtitle: "\(results.count) result\(results.count == 1 ? "" : "s")"
+                String(localized: "bench.accuracy.section.results",
+                       defaultValue: "Results",
+                       comment: "Section header for the Accuracy Bench results list"),
+                subtitle: String(localized: "bench.accuracy.results.subtitle",
+                                 defaultValue: "\(results.count) result\(results.count == 1 ? "" : "s")",
+                                 comment: "Subtitle showing the number of accumulated Accuracy Bench results")
             ) {
-                Button("Clear all") { onClear() }
+                Button(String(localized: "bench.accuracy.results.clear_all",
+                              defaultValue: "Clear all",
+                              comment: "Button in the Accuracy Bench results header that resets the result list")) { onClear() }
                     .buttonStyle(.omlx(.plain, size: .small))
                     .foregroundStyle(theme.redDot)
             }
@@ -553,7 +660,10 @@ private struct ResultCard: View {
                             .foregroundStyle(theme.text)
                         Pill(label: result.modelId, color: theme.blueDot)
                         if result.thinkingUsed {
-                            Pill(label: "Extended thinking", color: Color(rgb24: 0x5E5CE6))
+                            Pill(label: String(localized: "bench.accuracy.result.thinking_pill",
+                                               defaultValue: "Extended thinking",
+                                               comment: "Pill on an Accuracy Bench result card when extended thinking was used"),
+                                 color: Color(rgb24: 0x5E5CE6))
                         }
                     }
                     Text(subtitleText)
@@ -570,7 +680,9 @@ private struct ResultCard: View {
                     HStack(spacing: 5) {
                         Image(systemName: categoriesOpen ? "chevron.down" : "chevron.right")
                             .font(.system(size: 9, weight: .semibold))
-                        Text("Categories")
+                        Text(String(localized: "bench.accuracy.result.categories",
+                                    defaultValue: "Categories",
+                                    comment: "Disclosure label on an Accuracy Bench result card revealing per-category breakdowns"))
                             .font(.omlxText(11, weight: .medium))
                     }
                     .foregroundStyle(theme.textSecondary)
@@ -675,7 +787,9 @@ private struct TextExportSection: View {
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader("Text Export")
+        SectionHeader(String(localized: "bench.accuracy.section.text_export",
+                             defaultValue: "Text Export",
+                             comment: "Section header for the Accuracy Bench text-export block"))
 
         ListGroup {
             FreeRow(isLast: true) {
@@ -687,7 +801,13 @@ private struct TextExportSection: View {
                             HStack(spacing: 5) {
                                 Image(systemName: isOpen ? "chevron.down" : "chevron.right")
                                     .font(.system(size: 9, weight: .semibold))
-                                Text(isOpen ? "Hide text dump" : "Show text dump")
+                                Text(isOpen
+                                     ? String(localized: "bench.accuracy.text_export.hide",
+                                              defaultValue: "Hide text dump",
+                                              comment: "Disclosure label that hides the Accuracy Bench text export")
+                                     : String(localized: "bench.accuracy.text_export.show",
+                                              defaultValue: "Show text dump",
+                                              comment: "Disclosure label that reveals the Accuracy Bench text export"))
                                     .font(.omlxText(11, weight: .medium))
                             }
                             .foregroundStyle(theme.textSecondary)
@@ -698,7 +818,13 @@ private struct TextExportSection: View {
                         Button {
                             copyToClipboard()
                         } label: {
-                            Label(copied ? "Copied" : "Copy",
+                            Label(copied
+                                  ? String(localized: "bench.accuracy.text_export.copied",
+                                           defaultValue: "Copied",
+                                           comment: "Transient confirmation label after copying the Accuracy Bench text dump")
+                                  : String(localized: "common.copy",
+                                           defaultValue: "Copy",
+                                           comment: "Generic Copy button label"),
                                   systemImage: copied ? "checkmark" : "doc.on.doc")
                                 .labelStyle(.titleAndIcon)
                         }
@@ -792,7 +918,9 @@ final class AccuracyBenchScreenVM: ObservableObject {
             let resp = try await client.listModels()
             self.models = resp.models
         } catch {
-            self.lastError = "Failed to load models: \(error.omlxDescription)"
+            self.lastError = String(localized: "bench.accuracy.error.load_models",
+                                    defaultValue: "Failed to load models: \(error.omlxDescription)",
+                                    comment: "Accuracy Bench error when listing models fails; placeholder is the underlying error description")
         }
     }
 
@@ -871,7 +999,9 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to add to queue: \(error.omlxDescription)"
+                    self?.lastError = String(localized: "bench.accuracy.error.add_queue",
+                                             defaultValue: "Failed to add to queue: \(error.omlxDescription)",
+                                             comment: "Accuracy Bench error when adding to queue fails; placeholder is the underlying error")
                 }
             }
         }
@@ -884,7 +1014,9 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await MainActor.run { self?.status = s }
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to remove: \(error.omlxDescription)"
+                    self?.lastError = String(localized: "bench.accuracy.error.remove",
+                                             defaultValue: "Failed to remove: \(error.omlxDescription)",
+                                             comment: "Accuracy Bench error when removing a queue entry fails; placeholder is the underlying error")
                 }
             }
         }
@@ -897,7 +1029,9 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to cancel: \(error.omlxDescription)"
+                    self?.lastError = String(localized: "bench.accuracy.error.cancel",
+                                             defaultValue: "Failed to cancel: \(error.omlxDescription)",
+                                             comment: "Accuracy Bench error when cancelling the running bench fails; placeholder is the underlying error")
                 }
             }
         }
@@ -911,7 +1045,9 @@ final class AccuracyBenchScreenVM: ObservableObject {
                 await self?.pollOnce()
             } catch {
                 await MainActor.run {
-                    self?.lastError = "Failed to clear results: \(error.omlxDescription)"
+                    self?.lastError = String(localized: "bench.accuracy.error.clear_results",
+                                             defaultValue: "Failed to clear results: \(error.omlxDescription)",
+                                             comment: "Accuracy Bench error when clearing accumulated results fails; placeholder is the underlying error")
                 }
             }
         }

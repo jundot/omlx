@@ -18,22 +18,36 @@ struct ServerScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ServerHeroCard(vm: vm)
 
-            SectionHeader("Network")
+            SectionHeader(String(localized: "server.section.network",
+                                  defaultValue: "Network",
+                                  comment: "Section heading for the Network rows in Server screen"))
             ListGroup {
-                Row(label: "Listen Address") {
+                Row(label: String(localized: "server.row.listen_address",
+                                  defaultValue: "Listen Address",
+                                  comment: "Row label for the listen-address picker in Server screen")) {
                     Popup(
                         selection: vm.bind($vm.host, save: { vm.saveHost(services: services) }),
                         width: 220,
                         options: [
-                            ("127.0.0.1", "127.0.0.1 (Local only)"),
-                            ("0.0.0.0", "0.0.0.0 (All networks)"),
-                            ("localhost", "localhost"),
+                            ("127.0.0.1", String(localized: "server.host.local_only",
+                                                  defaultValue: "127.0.0.1 (Local only)",
+                                                  comment: "Listen-address popup option for loopback only")),
+                            ("0.0.0.0", String(localized: "server.host.all_networks",
+                                                defaultValue: "0.0.0.0 (All networks)",
+                                                comment: "Listen-address popup option for binding to all interfaces")),
+                            ("localhost", String(localized: "server.host.localhost",
+                                                  defaultValue: "localhost",
+                                                  comment: "Listen-address popup option for localhost")),
                         ]
                     )
                 }
                 Row(
-                    label: "Port",
-                    sublabel: "Default 8080. Server restarts on save.",
+                    label: String(localized: "server.row.port",
+                                  defaultValue: "Port",
+                                  comment: "Row label for the server port field"),
+                    sublabel: String(localized: "server.row.port.sub",
+                                     defaultValue: "Default 8080. Server restarts on save.",
+                                     comment: "Sublabel under the Port field"),
                     isLast: true
                 ) {
                     TextInput(text: $vm.portText, mono: true, width: 90)
@@ -41,51 +55,82 @@ struct ServerScreen: View {
                 }
             }
 
-            SectionHeader("API Endpoints")
+            SectionHeader(String(localized: "server.section.endpoints",
+                                  defaultValue: "API Endpoints",
+                                  comment: "Section heading for the API endpoints list"))
             APIEndpointsList(host: vm.effectiveHost, port: vm.effectivePort)
 
             SectionHeader(
-                "Default Profile",
-                subtitle: "Fallback values used when a model has no profile, or when a profile leaves a field empty"
+                String(localized: "server.section.default_profile",
+                       defaultValue: "Default Profile",
+                       comment: "Section heading for the default sampling profile editor"),
+                subtitle: String(localized: "server.section.default_profile.sub",
+                                 defaultValue: "Fallback values used when a model has no profile, or when a profile leaves a field empty",
+                                 comment: "Subtitle for the Default Profile section")
             )
             // Deep-link target for the per-model Profiles tab's "Edit on
             // Server →" link (see AppServices.ServerAnchor.defaultProfile).
             .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
 
-            SectionHeader("Logging")
+            SectionHeader(String(localized: "server.section.logging",
+                                  defaultValue: "Logging",
+                                  comment: "Section heading for the Logging rows"))
             ListGroup {
-                Row(label: "Log Level", isLast: true) {
+                Row(label: String(localized: "server.row.log_level",
+                                  defaultValue: "Log Level",
+                                  comment: "Row label for the log level picker"),
+                    isLast: true) {
                     Popup(
                         selection: vm.bind($vm.logLevel, save: vm.saveLogLevel),
                         width: 130,
                         options: [
-                            ("error",   "Error"),
-                            ("warning", "Warning"),
-                            ("info",    "Info"),
-                            ("debug",   "Debug"),
-                            ("trace",   "Trace"),
+                            ("error",   String(localized: "server.log_level.error",
+                                                defaultValue: "Error",
+                                                comment: "Log level popup option")),
+                            ("warning", String(localized: "server.log_level.warning",
+                                                defaultValue: "Warning",
+                                                comment: "Log level popup option")),
+                            ("info",    String(localized: "server.log_level.info",
+                                                defaultValue: "Info",
+                                                comment: "Log level popup option")),
+                            ("debug",   String(localized: "server.log_level.debug",
+                                                defaultValue: "Debug",
+                                                comment: "Log level popup option")),
+                            ("trace",   String(localized: "server.log_level.trace",
+                                                defaultValue: "Trace",
+                                                comment: "Log level popup option")),
                         ]
                     )
                 }
             }
 
             SectionHeader(
-                "Storage",
-                subtitle: "Where models, settings, logs, and the SSD cache live."
+                String(localized: "server.section.storage",
+                       defaultValue: "Storage",
+                       comment: "Section heading for storage rows in Server screen"),
+                subtitle: String(localized: "server.section.storage.sub",
+                                 defaultValue: "Where models, settings, logs, and the SSD cache live.",
+                                 comment: "Subtitle for the Storage section in Server screen")
             )
             ListGroup {
                 Row(
-                    label: "Base Path",
-                    sublabel: "OMLX_BASE_PATH. Files move and the server "
-                        + "restarts when this changes."
+                    label: String(localized: "server.row.base_path",
+                                  defaultValue: "Base Path",
+                                  comment: "Row label for the Base Path text input"),
+                    sublabel: String(localized: "server.row.base_path.sub",
+                                     defaultValue: "OMLX_BASE_PATH. Files move and the server restarts when this changes.",
+                                     comment: "Sublabel under the Base Path field")
                 ) {
                     TextInput(text: $vm.basePathText, mono: true, width: 280)
                 }
                 Row(
-                    label: "Models Directory",
-                    sublabel: "Where the server reads and writes model "
-                        + "weights. Downloaded models land here.",
+                    label: String(localized: "server.row.models_directory",
+                                  defaultValue: "Models Directory",
+                                  comment: "Row label for the Models Directory text input"),
+                    sublabel: String(localized: "server.row.models_directory.sub",
+                                     defaultValue: "Where the server reads and writes model weights. Downloaded models land here.",
+                                     comment: "Sublabel under the Models Directory field"),
                     isLast: true
                 ) {
                     TextInput(text: $vm.modelDirText, mono: true, width: 280)
@@ -93,7 +138,11 @@ struct ServerScreen: View {
             }
             HStack {
                 Spacer()
-                Button("Apply") { vm.applyStorage(services: services) }
+                Button(String(localized: "server.button.apply",
+                              defaultValue: "Apply",
+                              comment: "Button to apply pending storage changes")) {
+                    vm.applyStorage(services: services)
+                }
                     .buttonStyle(.omlx(.primary))
                     .disabled(!vm.hasPendingStorageChanges(services: services)
                               || vm.isMovingBasePath)
@@ -149,7 +198,9 @@ struct ServerHeroCard: View {
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text("oMLX Server")
+                    Text(String(localized: "server.hero.title",
+                                defaultValue: "oMLX Server",
+                                comment: "Hero card title on Server and Status screens"))
                         .font(.omlxText(18, weight: .semibold))
                         .foregroundStyle(theme.text)
                     StatusPill(status: pillStatus)
@@ -189,7 +240,10 @@ struct ServerHeroCard: View {
                         Task { try? await services.restartServer() }
                     }
                 } label: {
-                    Label("Restart", systemImage: "arrow.clockwise")
+                    Label(String(localized: "server.hero.restart",
+                                 defaultValue: "Restart",
+                                 comment: "Hero card button to restart the server"),
+                          systemImage: "arrow.clockwise")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.normal))
@@ -197,14 +251,19 @@ struct ServerHeroCard: View {
                 Button {
                     Task { await services.stopServer() }
                 } label: {
-                    Label("Stop", systemImage: "stop.fill")
+                    Label(String(localized: "server.hero.stop",
+                                 defaultValue: "Stop",
+                                 comment: "Hero card button to stop the server"),
+                          systemImage: "stop.fill")
                         .labelStyle(.titleAndIcon)
                 }
                 .buttonStyle(.omlx(.destructive))
             }
 
         case .starting, .stopping:
-            Button("Working…") { }
+            Button(String(localized: "server.hero.working",
+                          defaultValue: "Working…",
+                          comment: "Hero card button label shown while the server is transitioning between states")) { }
                 .buttonStyle(.omlx(.normal))
                 .disabled(true)
 
@@ -212,7 +271,10 @@ struct ServerHeroCard: View {
             Button {
                 _ = try? services.startServer()
             } label: {
-                Label("Start Server", systemImage: "play.fill")
+                Label(String(localized: "server.hero.start",
+                             defaultValue: "Start Server",
+                             comment: "Hero card button to start the server"),
+                      systemImage: "play.fill")
                     .labelStyle(.titleAndIcon)
             }
             .buttonStyle(.omlx(.primary))
@@ -226,7 +288,11 @@ struct ServerHeroCard: View {
         case .starting:     return .starting
         case .stopping:     return .stopping
         case .stopped:      return .stopped
-        case .unresponsive: return .custom(color: theme.amberDot, label: "Unresponsive", fillBg: true)
+        case .unresponsive: return .custom(color: theme.amberDot,
+                                            label: String(localized: "server.hero.pill.unresponsive",
+                                                          defaultValue: "Unresponsive",
+                                                          comment: "Status pill label when the server process is alive but not answering health checks"),
+                                            fillBg: true)
         case .failed:       return .error
         }
     }
@@ -236,13 +302,21 @@ struct ServerHeroCard: View {
         let port = services.config.port
         switch services.serverState {
         case .running, .unresponsive:
-            return "Listening on \(host):\(port)"
+            return String(localized: "server.hero.subtitle.listening",
+                          defaultValue: "Listening on \(host):\(port)",
+                          comment: "Hero subtitle while server is running; placeholders are host and port")
         case .starting:
-            return "Starting on \(host):\(port)…"
+            return String(localized: "server.hero.subtitle.starting",
+                          defaultValue: "Starting on \(host):\(port)…",
+                          comment: "Hero subtitle while server is starting up; placeholders are host and port")
         case .stopping:
-            return "Stopping…"
+            return String(localized: "server.hero.subtitle.stopping",
+                          defaultValue: "Stopping…",
+                          comment: "Hero subtitle while server is shutting down")
         case .stopped:
-            return "Not running"
+            return String(localized: "server.hero.subtitle.not_running",
+                          defaultValue: "Not running",
+                          comment: "Hero subtitle when server is stopped")
         case .failed(let m):
             return m
         }
@@ -289,33 +363,57 @@ private struct ServerDefaultProfileEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ListGroup {
-                Row(label: "Context Window",
-                    sublabel: "Maximum prompt + completion tokens.") {
+                Row(label: String(localized: "server.profile.context_window",
+                                  defaultValue: "Context Window",
+                                  comment: "Row label for the context window field in Default Profile"),
+                    sublabel: String(localized: "server.profile.context_window.sub",
+                                     defaultValue: "Maximum prompt + completion tokens.",
+                                     comment: "Sublabel for the context window field")) {
                     TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: 110)
                         .onSubmit { vm.saveSamplingContext() }
                 }
-                Row(label: "Max Tokens",
-                    sublabel: "Server-wide cap on generated tokens.") {
+                Row(label: String(localized: "server.profile.max_tokens",
+                                  defaultValue: "Max Tokens",
+                                  comment: "Row label for the max tokens field"),
+                    sublabel: String(localized: "server.profile.max_tokens.sub",
+                                     defaultValue: "Server-wide cap on generated tokens.",
+                                     comment: "Sublabel for the max tokens field")) {
                     TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: 110)
                         .onSubmit { vm.saveSamplingMaxTokens() }
                 }
-                Row(label: "Temperature",
-                    sublabel: "Sampling randomness (0–2).") {
+                Row(label: String(localized: "server.profile.temperature",
+                                  defaultValue: "Temperature",
+                                  comment: "Row label for the temperature field"),
+                    sublabel: String(localized: "server.profile.temperature.sub",
+                                     defaultValue: "Sampling randomness (0–2).",
+                                     comment: "Sublabel for the temperature field")) {
                     TextInput(text: $vm.samplingTemperatureText, placeholder: "0.7", mono: true, width: 90)
                         .onSubmit { vm.saveSamplingTemperature() }
                 }
-                Row(label: "Top P",
-                    sublabel: "Nucleus sampling cutoff (0–1).") {
+                Row(label: String(localized: "server.profile.top_p",
+                                  defaultValue: "Top P",
+                                  comment: "Row label for the Top P field"),
+                    sublabel: String(localized: "server.profile.top_p.sub",
+                                     defaultValue: "Nucleus sampling cutoff (0–1).",
+                                     comment: "Sublabel for the Top P field")) {
                     TextInput(text: $vm.samplingTopPText, mono: true, width: 90)
                         .onSubmit { vm.saveSamplingTopP() }
                 }
-                Row(label: "Top K",
-                    sublabel: "Limit candidates to top K. 0 = disabled.") {
+                Row(label: String(localized: "server.profile.top_k",
+                                  defaultValue: "Top K",
+                                  comment: "Row label for the Top K field"),
+                    sublabel: String(localized: "server.profile.top_k.sub",
+                                     defaultValue: "Limit candidates to top K. 0 = disabled.",
+                                     comment: "Sublabel for the Top K field")) {
                     TextInput(text: $vm.samplingTopKText, mono: true, width: 90)
                         .onSubmit { vm.saveSamplingTopK() }
                 }
-                Row(label: "Repetition Penalty",
-                    sublabel: "Penalize repeated tokens.",
+                Row(label: String(localized: "server.profile.repetition_penalty",
+                                  defaultValue: "Repetition Penalty",
+                                  comment: "Row label for the repetition penalty field"),
+                    sublabel: String(localized: "server.profile.repetition_penalty.sub",
+                                     defaultValue: "Penalize repeated tokens.",
+                                     comment: "Sublabel for the repetition penalty field"),
                     isLast: !expanded
                 ) {
                     TextInput(text: $vm.samplingRepetitionPenaltyText, mono: true, width: 90)
@@ -325,14 +423,55 @@ private struct ServerDefaultProfileEditor: View {
                     // The remaining design rows aren't server-backed yet —
                     // surfaced disabled with a "Per-model only" pill so the
                     // user knows to set them in the per-model Advanced tab.
-                    perModelOnlyRow(label: "Min P", note: "Server defaults don't include min_p; set on a model profile.")
-                    perModelOnlyRow(label: "Presence Penalty", note: "Per-model only.")
-                    perModelOnlyRow(label: "TTL", note: "Per-model only — see Models → [model] → Basic.")
-                    perModelOnlyRow(label: "Enable Thinking", note: "Per-model only — set on a profile.")
-                    perModelOnlyRow(label: "Limit Tool Output", note: "Per-model only.")
-                    perModelOnlyRow(label: "Force Sampling", note: "Per-model only.")
-                    perModelOnlyRow(label: "Pin in memory", note: "Per-model only.")
-                    perModelOnlyRow(label: "Speculative decoding", note: "Per-model only — see Models → [model] → Advanced.", isLast: true)
+                    perModelOnlyRow(label: String(localized: "server.profile.min_p",
+                                                  defaultValue: "Min P",
+                                                  comment: "Disabled row label for Min P"),
+                                    note: String(localized: "server.profile.min_p.note",
+                                                 defaultValue: "Server defaults don't include min_p; set on a model profile.",
+                                                 comment: "Note explaining Min P is per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.presence_penalty",
+                                                  defaultValue: "Presence Penalty",
+                                                  comment: "Disabled row label for Presence Penalty"),
+                                    note: String(localized: "server.profile.presence_penalty.note",
+                                                 defaultValue: "Per-model only.",
+                                                 comment: "Note marking Presence Penalty as per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.ttl",
+                                                  defaultValue: "TTL",
+                                                  comment: "Disabled row label for TTL"),
+                                    note: String(localized: "server.profile.ttl.note",
+                                                 defaultValue: "Per-model only — see Models → [model] → Basic.",
+                                                 comment: "Note explaining TTL is per-model only and where to find it"))
+                    perModelOnlyRow(label: String(localized: "server.profile.enable_thinking",
+                                                  defaultValue: "Enable Thinking",
+                                                  comment: "Disabled row label for Enable Thinking"),
+                                    note: String(localized: "server.profile.enable_thinking.note",
+                                                 defaultValue: "Per-model only — set on a profile.",
+                                                 comment: "Note marking Enable Thinking as per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.limit_tool_output",
+                                                  defaultValue: "Limit Tool Output",
+                                                  comment: "Disabled row label for Limit Tool Output"),
+                                    note: String(localized: "server.profile.limit_tool_output.note",
+                                                 defaultValue: "Per-model only.",
+                                                 comment: "Note marking Limit Tool Output as per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.force_sampling",
+                                                  defaultValue: "Force Sampling",
+                                                  comment: "Disabled row label for Force Sampling"),
+                                    note: String(localized: "server.profile.force_sampling.note",
+                                                 defaultValue: "Per-model only.",
+                                                 comment: "Note marking Force Sampling as per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.pin_in_memory",
+                                                  defaultValue: "Pin in memory",
+                                                  comment: "Disabled row label for Pin in memory"),
+                                    note: String(localized: "server.profile.pin_in_memory.note",
+                                                 defaultValue: "Per-model only.",
+                                                 comment: "Note marking Pin in memory as per-model only"))
+                    perModelOnlyRow(label: String(localized: "server.profile.speculative_decoding",
+                                                  defaultValue: "Speculative decoding",
+                                                  comment: "Disabled row label for Speculative decoding"),
+                                    note: String(localized: "server.profile.speculative_decoding.note",
+                                                 defaultValue: "Per-model only — see Models → [model] → Advanced.",
+                                                 comment: "Note explaining Speculative decoding is per-model only and where to find it"),
+                                    isLast: true)
                 }
             }
             HStack {
@@ -340,7 +479,13 @@ private struct ServerDefaultProfileEditor: View {
                 Button {
                     expanded.toggle()
                 } label: {
-                    Text(expanded ? "Show fewer" : "Show all fields…")
+                    Text(expanded
+                         ? String(localized: "server.profile.show_fewer",
+                                  defaultValue: "Show fewer",
+                                  comment: "Toggle label to collapse the advanced sampling fields list")
+                         : String(localized: "server.profile.show_all",
+                                  defaultValue: "Show all fields…",
+                                  comment: "Toggle label to expand the advanced sampling fields list"))
                         .font(.omlxText(11.5, weight: .medium))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
@@ -354,7 +499,9 @@ private struct ServerDefaultProfileEditor: View {
     @ViewBuilder
     private func perModelOnlyRow(label: String, note: String, isLast: Bool = false) -> some View {
         Row(label: label, sublabel: note, isLast: isLast) {
-            Text("Per-model only")
+            Text(String(localized: "server.profile.per_model_only",
+                        defaultValue: "Per-model only",
+                        comment: "Pill text marking a sampling field as configurable only on individual model profiles"))
                 .font(.omlxText(10.5, weight: .heavy))
                 .kerning(0.6)
                 .textCase(.uppercase)
@@ -379,16 +526,25 @@ private struct APIEndpointsList: View {
 
     var body: some View {
         ListGroup {
-            Row(label: "OpenAI-compatible") {
+            Row(label: String(localized: "server.endpoint.openai",
+                              defaultValue: "OpenAI-compatible",
+                              comment: "API endpoint row label for the OpenAI-compatible base URL")) {
                 CodeChip(value: "http://\(host):\(port)/v1")
             }
-            Row(label: "Anthropic / Claude Code") {
+            Row(label: String(localized: "server.endpoint.anthropic",
+                              defaultValue: "Anthropic / Claude Code",
+                              comment: "API endpoint row label for the Anthropic/Claude Code base URL")) {
                 CodeChip(value: "http://\(host):\(port)")
             }
-            Row(label: "Health probe") {
+            Row(label: String(localized: "server.endpoint.health",
+                              defaultValue: "Health probe",
+                              comment: "API endpoint row label for the health probe URL")) {
                 CodeChip(value: "http://\(host):\(port)/health")
             }
-            Row(label: "Metrics (Prometheus)", isLast: true) {
+            Row(label: String(localized: "server.endpoint.metrics",
+                              defaultValue: "Metrics (Prometheus)",
+                              comment: "API endpoint row label for the Prometheus metrics URL"),
+                isLast: true) {
                 CodeChip(value: "http://\(host):\(port)/metrics")
             }
         }
@@ -423,7 +579,9 @@ private struct ServerAdvancedSection: View {
                         .foregroundStyle(theme.textSecondary)
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                         .animation(.easeOut(duration: 0.12), value: expanded)
-                    Text("Advanced")
+                    Text(String(localized: "server.section.advanced",
+                                defaultValue: "Advanced",
+                                comment: "Disclosure header for the advanced server settings"))
                         .font(.omlxText(11, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
@@ -440,22 +598,36 @@ private struct ServerAdvancedSection: View {
             if expanded {
                 ListGroup {
                     Row(
-                        label: "SSE Keep-Alive Mode",
-                        sublabel: "How the server keeps long-lived SSE streams open. \"chunk\" emits an empty data line, \"comment\" emits `: ping`, \"off\" disables."
+                        label: String(localized: "server.advanced.sse_keepalive",
+                                      defaultValue: "SSE Keep-Alive Mode",
+                                      comment: "Advanced row label for the SSE keep-alive mode picker"),
+                        sublabel: String(localized: "server.advanced.sse_keepalive.sub",
+                                         defaultValue: "How the server keeps long-lived SSE streams open. \"chunk\" emits an empty data line, \"comment\" emits `: ping`, \"off\" disables.",
+                                         comment: "Sublabel describing the SSE keep-alive mode options")
                     ) {
                         Popup(
                             selection: vm.bind($vm.sseKeepaliveMode, save: vm.saveSseKeepaliveMode),
                             width: 130,
                             options: [
-                                ("chunk",   "Chunk"),
-                                ("comment", "Comment"),
-                                ("off",     "Off"),
+                                ("chunk",   String(localized: "server.advanced.sse_keepalive.chunk",
+                                                    defaultValue: "Chunk",
+                                                    comment: "SSE keep-alive mode option: empty data chunk")),
+                                ("comment", String(localized: "server.advanced.sse_keepalive.comment",
+                                                    defaultValue: "Comment",
+                                                    comment: "SSE keep-alive mode option: comment ping")),
+                                ("off",     String(localized: "server.advanced.sse_keepalive.off",
+                                                    defaultValue: "Off",
+                                                    comment: "SSE keep-alive mode option: disabled")),
                             ]
                         )
                     }
                     Row(
-                        label: "Server Aliases",
-                        sublabel: "Extra host names the server identifies as. Comma-separated. Used for cookie / Host header matching.",
+                        label: String(localized: "server.advanced.aliases",
+                                      defaultValue: "Server Aliases",
+                                      comment: "Advanced row label for the server aliases input"),
+                        sublabel: String(localized: "server.advanced.aliases.sub",
+                                         defaultValue: "Extra host names the server identifies as. Comma-separated. Used for cookie / Host header matching.",
+                                         comment: "Sublabel describing the server aliases input format"),
                         isLast: true
                     ) {
                         TextInput(
@@ -480,7 +652,9 @@ private struct HintFooter: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HintLine(text: "Endpoints update live as you change Listen Address and Port. Some changes (host, port) take effect after a server restart.")
+            HintLine(text: String(localized: "server.footer.hint",
+                                  defaultValue: "Endpoints update live as you change Listen Address and Port. Some changes (host, port) take effect after a server restart.",
+                                  comment: "Hint footer text under the Server screen explaining endpoint behavior"))
             if let error {
                 Text(error)
                     .font(.omlxText(11))
@@ -558,7 +732,9 @@ final class ServerScreenVM: ObservableObject {
 
     func saveSamplingContext() {
         guard let n = Int(samplingContextText.trimmingCharacters(in: .whitespaces)), n > 0 else {
-            self.lastError = "Context Window must be a positive integer."
+            self.lastError = String(localized: "server.error.context_window_invalid",
+                                    defaultValue: "Context Window must be a positive integer.",
+                                    comment: "Server screen error when Context Window input is invalid")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingMaxContextWindow: n)) }
@@ -566,7 +742,9 @@ final class ServerScreenVM: ObservableObject {
 
     func saveSamplingMaxTokens() {
         guard let n = Int(samplingMaxTokensText.trimmingCharacters(in: .whitespaces)), n > 0 else {
-            self.lastError = "Max Tokens must be a positive integer."
+            self.lastError = String(localized: "server.error.max_tokens_invalid",
+                                    defaultValue: "Max Tokens must be a positive integer.",
+                                    comment: "Server screen error when Max Tokens input is invalid")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingMaxTokens: n)) }
@@ -575,7 +753,9 @@ final class ServerScreenVM: ObservableObject {
     func saveSamplingTemperature() {
         guard let v = Double(samplingTemperatureText.trimmingCharacters(in: .whitespaces)),
               v >= 0, v <= 2 else {
-            self.lastError = "Temperature must be a number in [0, 2]."
+            self.lastError = String(localized: "server.error.temperature_invalid",
+                                    defaultValue: "Temperature must be a number in [0, 2].",
+                                    comment: "Server screen error when Temperature input is out of range")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingTemperature: v)) }
@@ -584,7 +764,9 @@ final class ServerScreenVM: ObservableObject {
     func saveSamplingTopP() {
         guard let v = Double(samplingTopPText.trimmingCharacters(in: .whitespaces)),
               v >= 0, v <= 1 else {
-            self.lastError = "Top P must be a number in [0, 1]."
+            self.lastError = String(localized: "server.error.top_p_invalid",
+                                    defaultValue: "Top P must be a number in [0, 1].",
+                                    comment: "Server screen error when Top P input is out of range")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingTopP: v)) }
@@ -592,7 +774,9 @@ final class ServerScreenVM: ObservableObject {
 
     func saveSamplingTopK() {
         guard let n = Int(samplingTopKText.trimmingCharacters(in: .whitespaces)), n >= 0 else {
-            self.lastError = "Top K must be ≥ 0."
+            self.lastError = String(localized: "server.error.top_k_invalid",
+                                    defaultValue: "Top K must be ≥ 0.",
+                                    comment: "Server screen error when Top K input is negative or not a number")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingTopK: n)) }
@@ -601,7 +785,9 @@ final class ServerScreenVM: ObservableObject {
     func saveSamplingRepetitionPenalty() {
         guard let v = Double(samplingRepetitionPenaltyText.trimmingCharacters(in: .whitespaces)),
               v >= 0 else {
-            self.lastError = "Repetition Penalty must be a non-negative number."
+            self.lastError = String(localized: "server.error.repetition_penalty_invalid",
+                                    defaultValue: "Repetition Penalty must be a non-negative number.",
+                                    comment: "Server screen error when Repetition Penalty is invalid")
             return
         }
         Task { await commit(GlobalSettingsPatch(samplingRepetitionPenalty: v)) }
@@ -647,7 +833,9 @@ final class ServerScreenVM: ObservableObject {
     func savePort(services: AppServices) {
         guard let port = Int(portText.trimmingCharacters(in: .whitespaces)),
               (1...65535).contains(port) else {
-            self.lastError = "Port must be a number between 1 and 65535."
+            self.lastError = String(localized: "server.error.port_invalid",
+                                    defaultValue: "Port must be a number between 1 and 65535.",
+                                    comment: "Server screen error when port value is out of valid range")
             return
         }
         // Patch settings.json on the running server first so its persisted
@@ -679,15 +867,21 @@ final class ServerScreenVM: ObservableObject {
         let diff = storageDiff(services: services)
 
         if !diff.baseChanged && !diff.dirChanged {
-            self.lastError = "Nothing to apply — both fields match the current config."
+            self.lastError = String(localized: "server.error.nothing_to_apply",
+                                    defaultValue: "Nothing to apply — both fields match the current config.",
+                                    comment: "Server screen error when Apply is tapped with no pending changes")
             return
         }
         if diff.baseChanged && diff.normalizedBase.isEmpty {
-            self.lastError = "Base path cannot be empty."
+            self.lastError = String(localized: "server.error.base_path_empty",
+                                    defaultValue: "Base path cannot be empty.",
+                                    comment: "Server screen error when Base Path is empty on Apply")
             return
         }
         if diff.dirChanged && diff.normalizedModelDir.isEmpty {
-            self.lastError = "Models Directory cannot be empty."
+            self.lastError = String(localized: "server.error.models_dir_empty",
+                                    defaultValue: "Models Directory cannot be empty.",
+                                    comment: "Server screen error when Models Directory is empty on Apply")
             return
         }
 
@@ -753,11 +947,15 @@ final class ServerScreenVM: ObservableObject {
         let hostChanged = host != effectiveHost
 
         if portChanged, let p = parsedPort, !(1...65535).contains(p) {
-            self.lastError = "Port must be a number between 1 and 65535."
+            self.lastError = String(localized: "server.error.port_invalid",
+                                    defaultValue: "Port must be a number between 1 and 65535.",
+                                    comment: "Server screen error when port value is out of valid range")
             return
         }
         if portChanged && parsedPort == nil {
-            self.lastError = "Port must be a number between 1 and 65535."
+            self.lastError = String(localized: "server.error.port_invalid",
+                                    defaultValue: "Port must be a number between 1 and 65535.",
+                                    comment: "Server screen error when port value is out of valid range")
             return
         }
 
