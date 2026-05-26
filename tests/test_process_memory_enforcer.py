@@ -70,6 +70,18 @@ def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
     return entry
 
 
+def _close_coro(coro):
+    """side_effect for patched asyncio.create_task that closes the coroutine.
+
+    Tests that mock create_task to skip the background loop still pass the
+    real `_enforcement_loop()` coroutine in. Closing it prevents the
+    "coroutine was never awaited" RuntimeWarning at gc time.
+    """
+    if hasattr(coro, "close"):
+        coro.close()
+    return MagicMock()
+
+
 @pytest.fixture
 def mock_engine_pool():
     """Create a mock EnginePool with required methods."""
@@ -487,7 +499,7 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
-            asyncio, "create_task", return_value=MagicMock()
+            asyncio, "create_task", side_effect=_close_coro
         ):
             mock_mx.set_wired_limit.return_value = 36 * 1024**3
             enforcer.start()
@@ -513,7 +525,7 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
-            asyncio, "create_task", return_value=MagicMock()
+            asyncio, "create_task", side_effect=_close_coro
         ):
             mock_mx.set_wired_limit.return_value = 48 * 1024**3
             enforcer.start()
@@ -540,7 +552,7 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
-            asyncio, "create_task", return_value=MagicMock()
+            asyncio, "create_task", side_effect=_close_coro
         ):
             mock_mx.set_wired_limit.return_value = 0
             enforcer.start()
@@ -561,7 +573,7 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
-            asyncio, "create_task", return_value=MagicMock()
+            asyncio, "create_task", side_effect=_close_coro
         ):
             mock_mx.set_wired_limit.side_effect = RuntimeError("unsupported")
             enforcer.start()  # must not raise
@@ -579,7 +591,7 @@ class TestMetalWiredLimit:
         with patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
-            asyncio, "create_task", return_value=MagicMock()
+            asyncio, "create_task", side_effect=_close_coro
         ):
             enforcer.start()
         mock_mx.set_wired_limit.assert_not_called()
