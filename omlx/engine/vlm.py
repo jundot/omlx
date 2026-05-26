@@ -1426,6 +1426,15 @@ class VLMBatchedEngine(BaseEngine):
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
 
+                cached_whole = None
+                if not all(f is not None for f in cached_per_image):
+                    # Fallback: whole-request entry (stored when per-image split
+                    # is unsupported, e.g. Gemma 4 multi-image with per-image
+                    # resize). Mirrors the store-side branch below.
+                    cached_whole = self._vision_cache.get(
+                        image_hash, self._model_name
+                    )
+
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
@@ -1433,6 +1442,12 @@ class VLMBatchedEngine(BaseEngine):
                     logger.debug(
                         "Vision feature cache hit (per-image): all %d images cached",
                         num_images,
+                    )
+                elif cached_whole is not None:
+                    call_kwargs["cached_image_features"] = cached_whole
+                    logger.debug(
+                        "Vision feature cache hit (whole-request): %s",
+                        image_hash[:16],
                     )
                 else:
                     # Some or all uncached — compute all, then cache per-image
