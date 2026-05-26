@@ -14,6 +14,12 @@ _VLM_TEXT_PREFIX = "language_model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
+_MTP_WEIGHT_PREFIXES = (
+    "mtp.",
+    "language_model.mtp.",
+    "model.language_model.mtp.",
+)
+
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add ``language_model.``-prefixed variants of per-layer quantization keys.
@@ -68,6 +74,56 @@ def _patch_mlx_lm_load_config() -> None:
     _MLX_LM_LOAD_CONFIG_PATCHED = True
 
 
+def _is_mtp_weight_key(key: str) -> bool:
+    return key.startswith(_MTP_WEIGHT_PREFIXES)
+
+
+def _checkpoint_has_mtp_weights(model_name: str) -> bool | None:
+    """Return whether a local checkpoint visibly contains MTP tensors.
+
+    ``None`` means the checkpoint layout could not be inspected cheaply, so
+    callers should preserve legacy behavior. Sharded MLX/HF exports normally
+    have a ``*.safetensors.index.json`` file, which lets us answer this
+    without opening the tensor files themselves.
+    """
+    model_path = Path(model_name)
+    index_paths = sorted(model_path.glob("*.safetensors.index.json"))
+    if index_paths:
+        for index_path in index_paths:
+            try:
+                index = json.loads(index_path.read_text())
+            except Exception as e:
+                logger.debug("Could not read %s for MTP key scan: %s", index_path, e)
+                return None
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict):
+                return None
+            if any(_is_mtp_weight_key(key) for key in weight_map):
+                return True
+        return False
+
+    tensor_paths = sorted(model_path.glob("*.safetensors"))
+    if not tensor_paths:
+        return None
+
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        logger.debug("safetensors unavailable for MTP key scan: %s", e)
+        return None
+
+    try:
+        for tensor_path in tensor_paths:
+            with safe_open(tensor_path, framework="numpy") as handle:
+                if any(_is_mtp_weight_key(key) for key in handle.keys()):
+                    return True
+    except Exception as e:
+        logger.debug("Could not scan safetensors for MTP keys: %s", e)
+        return None
+
+    return False
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -104,9 +160,13 @@ def maybe_apply_pre_load_patches(
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
-    from ..patches.mlx_lm_mtp import set_mtp_active
+    from ..patches.mlx_lm_mtp import (
+        set_mtp_active,
+        set_mtp_weight_binding_active,
+    )
 
     set_mtp_active(False)
+    set_mtp_weight_binding_active(False)
 
     _patch_mlx_lm_load_config()
 
@@ -144,10 +204,21 @@ def maybe_apply_pre_load_patches(
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
     if _is_mtp_compatible(config, model_type):
-        mtp_enabled = bool(
+        checkpoint_has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        has_missing_mtp_weights = checkpoint_has_mtp_weights is False
+        requested_mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
+        mtp_enabled = requested_mtp_enabled and not has_missing_mtp_weights
         from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+
+        if has_missing_mtp_weights:
+            log = logger.warning if requested_mtp_enabled else logger.debug
+            log(
+                "%s declares MTP heads but no mtp.* weights were found; "
+                "loading without MTP",
+                model_name,
+            )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
@@ -209,7 +280,18 @@ def maybe_apply_pre_load_patches(
                             "weights to bind)",
                             model_name,
                         )
-                if apply_mlx_vlm_mtp_runtime_patch():
+                if has_missing_mtp_weights:
+                    logger.debug(
+                        "Skipping mlx-vlm runtime MTP patch for %s "
+                        "(config declares MTP but checkpoint has no mtp.* weights)",
+                        model_name,
+                    )
+                else:
+                    set_mtp_weight_binding_active(True)
+                if (
+                    not has_missing_mtp_weights
+                    and apply_mlx_vlm_mtp_runtime_patch()
+                ):
                     if mtp_enabled:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s",

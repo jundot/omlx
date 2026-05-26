@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # right before ``mlx_lm.load()`` runs based on ``model_settings.mtp_enabled``.
 # Default False keeps newly-loaded models MTP-free unless explicitly opted in.
 _MTP_ACTIVE = False
+_MTP_WEIGHT_BINDING_ACTIVE = False
 
 
 def set_mtp_active(active: bool) -> None:
@@ -53,6 +54,24 @@ def set_mtp_active(active: bool) -> None:
 
 def is_mtp_active() -> bool:
     return _MTP_ACTIVE
+
+
+def set_mtp_weight_binding_active(active: bool) -> None:
+    """Toggle whether VLM loads should attach an MTP module for weights.
+
+    VLM checkpoints can need ``self.mtp`` present even when speculative
+    decoding is disabled, because persisted ``mtp.*`` tensors still need a
+    destination during strict weight loading. This flag is separate from
+    ``is_mtp_active()`` so mtp_enabled=False can still bind real MTP weights,
+    while checkpoints that only declare MTP in config but have no MTP tensors
+    load as normal VLMs.
+    """
+    global _MTP_WEIGHT_BINDING_ACTIVE
+    _MTP_WEIGHT_BINDING_ACTIVE = bool(active)
+
+
+def is_mtp_weight_binding_active() -> bool:
+    return _MTP_WEIGHT_BINDING_ACTIVE
 
 
 def apply_mlx_lm_mtp_patch() -> bool:

@@ -192,18 +192,14 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         original_init(self, args, config)
-        # Always attach MTPModule when the config declares MTP heads, so
-        # mlx-vlm's load_weights (which skips Model.sanitize for is_mlx_format
-        # checkpoints) can place the persisted mtp.* tensors. Whether MTP
-        # speculative decode is actually invoked at inference time is gated
-        # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
-        # which checks the process-wide ``is_mtp_active`` flag.
-        # Without this unconditional attach, mtp_enabled=False would fail
-        # VLM load with "Received N parameters not in model" and the engine
-        # pool would permanently downgrade the entry to BatchedEngine —
-        # losing vision support.
+        # Attach MTPModule only when this load has real MTP tensors to bind.
+        # This preserves the mtp_enabled=False binding fix for true MTP
+        # checkpoints without forcing no-MTP exports to expect missing
+        # language_model.mtp.* parameters.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0:
+        from ..mlx_lm_mtp import is_mtp_weight_binding_active
+
+        if n_mtp > 0 and is_mtp_weight_binding_active():
             self.mtp = q35_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):

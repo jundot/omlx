@@ -168,13 +168,16 @@ class TestVlmMtpPreLoadDispatch:
         calls: list[str] = []
         sanitize_mock = MagicMock(side_effect=lambda: calls.append("sanitize") or True)
         runtime_mock = MagicMock(side_effect=lambda: calls.append("runtime") or True)
+        set_mtp_active_mock = MagicMock()
+        set_mtp_weight_binding_active_mock = MagicMock()
         # Side-step the real mlx-lm load_config monkey-patch.
         monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
         monkeypatch.setitem(
             sys.modules,
             "omlx.patches.mlx_lm_mtp",
             MagicMock(
-                set_mtp_active=MagicMock(),
+                set_mtp_active=set_mtp_active_mock,
+                set_mtp_weight_binding_active=set_mtp_weight_binding_active_mock,
                 apply_mlx_lm_mtp_patch=MagicMock(return_value=True),
             ),
         )
@@ -186,12 +189,18 @@ class TestVlmMtpPreLoadDispatch:
                 apply_mlx_vlm_mtp_runtime_patch=runtime_mock,
             ),
         )
-        return calls, sanitize_mock, runtime_mock
+        return (
+            calls,
+            sanitize_mock,
+            runtime_mock,
+            set_mtp_active_mock,
+            set_mtp_weight_binding_active_mock,
+        )
 
     def test_sanitize_patch_runs_before_runtime_for_vlm_mtp(
         self, tmp_path, monkeypatch
     ):
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, _, _ = self._stub_patches(monkeypatch)
         # qwen3_5 (dense VLM) declaring an MTP head under text_config.
         path = _write_config(
             tmp_path,
@@ -214,7 +223,7 @@ class TestVlmMtpPreLoadDispatch:
         # even with mtp_enabled=False. Otherwise mlx-vlm's strict load_weights
         # fails with "parameters not in model" and the engine falls back to
         # LLM, silently dropping vision.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, _, _ = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
@@ -233,7 +242,7 @@ class TestVlmMtpPreLoadDispatch:
         # mlx-vlm classes even when the model declares MTP heads. for_vlm
         # defaults to False so they pass through without invoking mlx-vlm
         # patches.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, _, _ = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
@@ -251,7 +260,7 @@ class TestVlmMtpPreLoadDispatch:
         # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
         # sanitize replacement so pre-converted switch_mlp weights load.
         # Runtime MTP patch must NOT run — there is no mtp.* tree to bind.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, _, _ = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5_moe", "vision_config": {}, '
@@ -268,7 +277,7 @@ class TestVlmMtpPreLoadDispatch:
     def test_qwen36_moe_vlm_sanitize_skipped_without_for_vlm(
         self, tmp_path, monkeypatch
     ):
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, _, _ = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5_moe", "vision_config": {}, '
@@ -281,3 +290,69 @@ class TestVlmMtpPreLoadDispatch:
         sanitize_mock.assert_not_called()
         runtime_mock.assert_not_called()
         assert calls == []
+
+    def test_vlm_mtp_runtime_skipped_when_config_declares_missing_mtp_weights(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression for quantized VLM checkpoints that retain
+        # text_config.mtp_num_hidden_layers=1 but were exported without
+        # preserve_mtp. The sanitize patch is still useful, but attaching a
+        # runtime MTPModule would make strict load expect missing
+        # language_model.mtp.* parameters and trigger LLM fallback.
+        (
+            calls,
+            sanitize_mock,
+            runtime_mock,
+            set_mtp_active_mock,
+            set_mtp_weight_binding_active_mock,
+        ) = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            '{"weight_map": {'
+            '"vision_tower.blocks.0.norm1.weight": "model-00001.safetensors", '
+            '"language_model.model.embed_tokens.weight": "model-00001.safetensors"'
+            "}}"
+        )
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_not_called()
+        assert calls == ["sanitize"]
+        assert set_mtp_active_mock.call_args_list[-1].args == (False,)
+        assert set_mtp_weight_binding_active_mock.call_args_list[-1].args == (False,)
+
+    def test_vlm_mtp_runtime_kept_when_checkpoint_has_mtp_weights(
+        self, tmp_path, monkeypatch
+    ):
+        (
+            calls,
+            sanitize_mock,
+            runtime_mock,
+            set_mtp_active_mock,
+            set_mtp_weight_binding_active_mock,
+        ) = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            '{"weight_map": {'
+            '"mtp.layers.0.input_layernorm.weight": "model-00001.safetensors"'
+            "}}"
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        assert calls == ["sanitize", "runtime"]
+        assert set_mtp_active_mock.call_args_list[-1].args == (False,)
+        assert set_mtp_weight_binding_active_mock.call_args_list[-1].args == (True,)
