@@ -52,6 +52,9 @@ class ProcessMemoryEnforcer:
         global_settings: GlobalSettings | None = None,
         soft_threshold: float = 0.85,
         hard_threshold: float = 0.95,
+        user_explicit_max: bool = False,
+        prefill_safe_zone_ratio: float = 0.80,
+        prefill_min_chunk_tokens: int = 32,
     ):
         """
         Initialize the process memory enforcer.
@@ -69,6 +72,15 @@ class ProcessMemoryEnforcer:
                 (LRU non-pinned eviction + admission pause; in-flight allowed).
             hard_threshold: Fraction of max_bytes that triggers hard action
                 (also abort in-flight when all loaded models are pinned).
+            user_explicit_max: True when max_bytes came from a user-set value
+                (CLI / env / settings.json), False when it was derived from
+                the "auto" default. Controls whether the scheduler hard
+                ceiling honors max_bytes (explicit) or system_ram - 4GB
+                (auto, with system protection priority).
+            prefill_safe_zone_ratio: Fraction of hard cap below which prefill
+                runs at full chunk size; above triggers adaptive shrink.
+            prefill_min_chunk_tokens: Floor for adaptive shrink. If even this
+                size would exceed the cap, prefill is aborted.
         """
         self._engine_pool = engine_pool
         self._max_bytes = max_bytes
@@ -78,6 +90,9 @@ class ProcessMemoryEnforcer:
         self._global_settings = global_settings
         self._soft_threshold = soft_threshold
         self._hard_threshold = hard_threshold
+        self._user_explicit_max = user_explicit_max
+        self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
+        self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
         self._task: asyncio.Task | None = None
         self._running = False
         # Most recently observed pressure level, consumed by scheduler /
@@ -121,17 +136,23 @@ class ProcessMemoryEnforcer:
         )
 
     def _get_hard_limit_bytes(self) -> int:
-        """Hard limit for inline prefill check: system_ram - 4GB.
+        """Hard limit for inline prefill check.
+
+        - User-explicit max (CLI/env/settings.json): the user value IS the
+          ceiling. They asked for this number to be respected.
+        - Auto mode: system_ram - 4GB so the kernel keeps headroom for
+          itself and prefill gets room above the enforcer's soft/hard
+          watermarks.
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
-        Always >= max_bytes so prefill gets headroom above the soft limit.
 
-        Note: this is the absolute system ceiling for the scheduler's prefill
-        check, distinct from the enforcer's own soft/hard watermarks
-        (`_soft_bytes` / `_hard_bytes`) which trigger LRU eviction.
+        Note: distinct from `_soft_bytes` / `_hard_bytes` which are
+        max_bytes * threshold and drive LRU eviction / admission pause.
         """
         if self._max_bytes <= 0:
             return 0
+        if self._user_explicit_max:
+            return self._max_bytes
         from .settings import get_system_memory
 
         return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
@@ -233,6 +254,8 @@ class ProcessMemoryEnforcer:
                 scheduler._memory_hard_limit_bytes = hard_limit
                 scheduler._prefill_memory_guard = self._prefill_memory_guard
                 scheduler._admission_paused = admission_paused
+                scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
+                scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
                 bg = getattr(scheduler, "batch_generator", None)
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                     bg._memory_limit_bytes = self._max_bytes

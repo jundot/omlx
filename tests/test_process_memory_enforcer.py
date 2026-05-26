@@ -371,6 +371,35 @@ class TestHardLimitCalculation:
         )
         assert enforcer._get_hard_limit_bytes() == 0
 
+    def test_hard_limit_honors_user_explicit_max(self, mock_engine_pool):
+        """When user_explicit_max=True the user value IS the ceiling, even
+        on big systems where system_ram - 4GB would otherwise win. Regression
+        for the case where a 600GB system silently ignored
+        OMLX_MAX_PROCESS_MEMORY=28GB and let prefill grow to ~596GB."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            max_bytes=28 * 1024**3,
+            user_explicit_max=True,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 600 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 28 * 1024**3
+
+    def test_hard_limit_auto_mode_still_uses_system_minus_4gb(
+        self, mock_engine_pool
+    ):
+        """user_explicit_max=False (auto) keeps the legacy behavior."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            max_bytes=28 * 1024**3,
+            user_explicit_max=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 96 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 92 * 1024**3
+
 
 class TestSingleModelMemoryPressure:
     """Tests for single-model memory pressure handling (Issue #62).

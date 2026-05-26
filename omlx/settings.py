@@ -315,11 +315,22 @@ class MemorySettings:
     """Process-level memory enforcement settings."""
 
     max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
+    # True when the user set max_process_memory via CLI / env / settings.json
+    # (not the "auto" default). Read by ProcessMemoryEnforcer._get_hard_limit_bytes
+    # to decide whether the scheduler hard ceiling honors the user value or
+    # falls back to system_ram - 4GB.
+    max_process_memory_is_explicit: bool = False
     prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
     # Two-stage watermark on max_process_memory. soft triggers admission pause + LRU eviction,
     # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
+    # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio
+    # the next chunk is sized so its predicted transient stays under the cap.
+    # If even prefill_min_chunk_tokens would exceed the cap, the request is
+    # aborted via the same cleanup path the hard-limit RuntimeError uses.
+    prefill_safe_zone_ratio: float = 0.80
+    prefill_min_chunk_tokens: int = 32
 
     def get_max_process_memory_bytes(self) -> int | None:
         """
@@ -356,9 +367,12 @@ class MemorySettings:
         """Convert to dictionary."""
         return {
             "max_process_memory": self.max_process_memory,
+            "max_process_memory_is_explicit": self.max_process_memory_is_explicit,
             "prefill_memory_guard": self.prefill_memory_guard,
             "soft_threshold": self.soft_threshold,
             "hard_threshold": self.hard_threshold,
+            "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
+            "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
         }
 
     @classmethod
@@ -366,9 +380,18 @@ class MemorySettings:
         """Create from dictionary."""
         return cls(
             max_process_memory=data.get("max_process_memory", "auto"),
+            max_process_memory_is_explicit=bool(
+                data.get("max_process_memory_is_explicit", False)
+            ),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
+            prefill_safe_zone_ratio=float(
+                data.get("prefill_safe_zone_ratio", 0.80)
+            ),
+            prefill_min_chunk_tokens=int(
+                data.get("prefill_min_chunk_tokens", 32)
+            ),
         )
 
 
@@ -841,6 +864,7 @@ class GlobalSettings:
         # Memory enforcement settings
         if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
             self.memory.max_process_memory = max_process_memory
+            self.memory.max_process_memory_is_explicit = True
 
         # Scheduler settings
         max_concurrent = os.getenv("OMLX_MAX_CONCURRENT_REQUESTS") or os.getenv(
@@ -937,6 +961,7 @@ class GlobalSettings:
             and args.max_process_memory is not None
         ):
             self.memory.max_process_memory = args.max_process_memory
+            self.memory.max_process_memory_is_explicit = True
 
         # Scheduler settings
         if (
@@ -1110,6 +1135,17 @@ class GlobalSettings:
                         errors.append("max_process_memory must be positive")
                 except ValueError as e:
                     errors.append(f"Invalid max_process_memory: {e}")
+
+        if not 0.5 <= self.memory.prefill_safe_zone_ratio <= 0.99:
+            errors.append(
+                f"prefill_safe_zone_ratio must be in [0.5, 0.99], "
+                f"got {self.memory.prefill_safe_zone_ratio}"
+            )
+        if not 1 <= self.memory.prefill_min_chunk_tokens <= 1024:
+            errors.append(
+                f"prefill_min_chunk_tokens must be in [1, 1024], "
+                f"got {self.memory.prefill_min_chunk_tokens}"
+            )
 
         # Scheduler validation
         if self.scheduler.max_concurrent_requests <= 0:
