@@ -508,74 +508,99 @@ class TestScheduleWaitingChunkedFork:
         finally:
             tracker.clear()
 
-    def test_adaptive_throttle_safe_zone_passes_through(self):
-        """When current memory < safe_zone, _adaptive_chunk_size returns the
-        requested size unchanged (no throughput cost in normal operation)."""
+    def _setup_throttle(self, max_bytes_gb=10, hard_cap_gb=12):
+        """Build a scheduler with watermark fields set for throttle tests."""
         sched = _make_scheduler()
-        sched._memory_hard_limit_bytes = 10 * 1024**3
+        sched._memory_limit_bytes = max_bytes_gb * 1024**3
+        sched._memory_hard_limit_bytes = hard_cap_gb * 1024**3
         sched._prefill_safe_zone_ratio = 0.80
         sched._prefill_min_chunk_tokens = 32
+        return sched
 
-        with patch("omlx.scheduler.mx.get_active_memory", return_value=1 * 1024**3):
-            with patch(
-                "omlx.scheduler.get_phys_footprint", return_value=1 * 1024**3
-            ):
-                result = sched._adaptive_chunk_size(
-                    2048, request_id="r1", loop_label="external"
-                )
+    def _mock_current(self, sched, current_gb):
+        """Context manager-ish — patch both memory probes to current_gb."""
+        target = int(current_gb * 1024**3)
+        return patch(
+            "omlx.scheduler.mx.get_active_memory", return_value=target
+        ), patch("omlx.scheduler.get_phys_footprint", return_value=target)
+
+    def test_adaptive_throttle_below_soft_watermark_passthrough(self):
+        """current < soft watermark → no throttle, full chunk."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # soft_watermark = 10 * 0.80 = 8 GB; current 5 GB is below
+        a, b = self._mock_current(sched, 5)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
         assert result == 2048
 
-    def test_adaptive_throttle_caution_zone_shrinks_chunk(self):
-        """In caution zone, chunk size is reduced so predicted transient
-        fits within remaining headroom to the cap."""
-        sched = _make_scheduler()
-        sched._memory_hard_limit_bytes = 10 * 1024**3
-        sched._prefill_safe_zone_ratio = 0.80
-        sched._prefill_min_chunk_tokens = 32
-        # Seed tracker so predict() returns a non-zero value
-        sched._prefill_transient_tracker.update(
-            n_tokens=1000, transient_bytes=2 * 1024**3
-        )  # 2 MB/token
+    def test_adaptive_throttle_tier_1024(self):
+        """First quarter of the soft-to-hard band → 1024."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # soft_wm = 8 GB, band = 12 - 8 = 4 GB. 10% into band = 8.4 GB.
+        a, b = self._mock_current(sched, 8.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 1024
 
-        # current = 9 GB, ceiling_target = 9.5 GB, headroom = 0.5 GB
-        with patch("omlx.scheduler.mx.get_active_memory", return_value=9 * 1024**3):
-            with patch(
-                "omlx.scheduler.get_phys_footprint", return_value=9 * 1024**3
-            ):
-                result = sched._adaptive_chunk_size(
-                    2048, request_id="r1", loop_label="external"
-                )
-        # 0.5 GB / 2 MB-per-token ≈ 256 (with EWMA prediction)
-        assert result < 2048
-        assert result >= sched._prefill_min_chunk_tokens
+    def test_adaptive_throttle_tier_512(self):
+        """25-50% of band → 512."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 35% of band: 8 + 4*0.35 = 9.4 GB
+        a, b = self._mock_current(sched, 9.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 512
 
-    def test_adaptive_throttle_min_chunk_aborts(self):
-        """If even prefill_min_chunk_tokens would exceed the cap, raise
-        RuntimeError so the #1405 cleanup path can emit a clean error."""
-        sched = _make_scheduler()
-        sched._memory_hard_limit_bytes = 10 * 1024**3
-        sched._prefill_safe_zone_ratio = 0.80
-        sched._prefill_min_chunk_tokens = 32
-        # Pretend each token costs 100 MB — even 32 tokens would need 3.2 GB
-        # but headroom is only 0.01 GB
-        sched._prefill_transient_tracker.update(
-            n_tokens=10, transient_bytes=1024 * 1024 * 1024
-        )
+    def test_adaptive_throttle_tier_256(self):
+        """50-75% of band → 256."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 60% of band: 8 + 4*0.60 = 10.4 GB
+        a, b = self._mock_current(sched, 10.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 256
 
-        target = int(10 * 1024**3 * 0.95) - 10 * 1024**2  # very little headroom
-        with patch("omlx.scheduler.mx.get_active_memory", return_value=target):
-            with patch("omlx.scheduler.get_phys_footprint", return_value=target):
-                import pytest
+    def test_adaptive_throttle_tier_128(self):
+        """75%+ of band → 128 (or min_chunk if larger)."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 80% of band: 8 + 4*0.80 = 11.2 GB
+        a, b = self._mock_current(sched, 11.2)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 128
 
-                with pytest.raises(RuntimeError, match="Adaptive throttle"):
-                    sched._adaptive_chunk_size(
-                        2048, request_id="r1", loop_label="external"
-                    )
+    def test_adaptive_throttle_requested_smaller_than_tier(self):
+        """Requested chunk already smaller than the tier target → pass through."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 80% of band → tier 128. But requested=64 < 128.
+        a, b = self._mock_current(sched, 11.2)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                64, request_id="r1", loop_label="external"
+            )
+        assert result == 64
 
     def test_adaptive_throttle_no_cap_passthrough(self):
-        """When hard limit is unset (=0), no throttle, no measurement."""
-        sched = _make_scheduler()
+        """When hard limit or soft base is unset (=0), no throttle."""
+        sched = self._setup_throttle()
         sched._memory_hard_limit_bytes = 0
+        result = sched._adaptive_chunk_size(
+            2048, request_id="r1", loop_label="external"
+        )
+        assert result == 2048
+
+        sched._memory_hard_limit_bytes = 10 * 1024**3
+        sched._memory_limit_bytes = 0
         result = sched._adaptive_chunk_size(
             2048, request_id="r1", loop_label="external"
         )
