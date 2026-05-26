@@ -323,102 +323,33 @@
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <!-- Memory Guard -->
+                                <!-- Memory Guard + Tier -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-1"
+                                           x-show="globalSettings.memory.prefill_memory_guard"
+                                           x-text="memoryGuardTierDescription"></p>
+                                        <p class="text-xs text-neutral-400 mt-0.5"
+                                           x-show="globalSettings.memory.prefill_memory_guard"
+                                           x-html="DOMPurify.sanitize(memoryGuardBreakdownHTML)"></p>
                                     </div>
-                                    <button type="button"
-                                            @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
-                                            :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                    </button>
-                                </div>
-                                <!-- Memory Limit (Total) -->
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_total') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">
-                                            {{ t('settings.resource.memory_limit_total_description') }}
-                                            <br>
-                                            {{ t('settings.resource.memory_limit_total_eviction') }}
-                                            <strong>{{ t('settings.resource.memory_limit_total_auto') }}</strong>{{ t('settings.resource.memory_limit_total_auto_desc') }}
-                                            {{ t('settings.resource.memory_limit_total_disabled') }}
-                                        </p>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
-                                            <input type="checkbox" x-model="processMemoryAuto"
-                                                   @change="if(processMemoryAuto) { globalSettings.memory.max_process_memory = 'auto'; } else { updateProcessMemoryFromSlider(); }"
-                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
-                                        </label>
-                                        <input type="range" min="0" max="99" step="1"
-                                               x-model.number="processMemoryPercent"
-                                               :disabled="processMemoryAuto"
-                                               @input="updateProcessMemoryFromSlider()"
-                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
-                                               :class="processMemoryAuto
-                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
-                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
-                                        <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
-                                              :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="processMemoryAuto ? window.t('settings.resource.auto') : (processMemoryPercent === 0 ? window.t('settings.resource.off') : processMemoryPercent + '%')"></span>
-                                            <template x-if="processMemoryAuto || processMemoryPercent !== 0"><span><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingProcessMemory" @click="if(!processMemoryAuto) { editingProcessMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="processMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="processMemorySizeGB"></span><input x-show="editingProcessMemory"
-                                                   type="number"
-                                                   :value="processMemorySizeGB"
-                                                   @change="updateProcessMemoryFromInput($event.target.value); editingProcessMemory = false"
-                                                   @blur="editingProcessMemory = false"
-                                                   @keydown.enter="updateProcessMemoryFromInput($event.target.value); editingProcessMemory = false"
-                                                   @keydown.escape="editingProcessMemory = false"
-                                                   x-init="if (editingProcessMemory) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
-                                                   step="1"><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
-                                        </span>
-                                    </div>
-                                </div>
-                                <!-- Memory Limit (Models Only) -->
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_models') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">
-                                            {{ t('settings.resource.memory_limit_models_description') }}
-                                        </p>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
-                                            <input type="checkbox" x-model="modelMemoryAuto"
-                                                   @change="if(modelMemoryAuto) { memoryPercent = 90; updateMemoryFromSlider(); }"
-                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
-                                        </label>
-                                        <input type="range" min="0" max="100" step="1"
-                                               x-model.number="memoryPercent"
-                                               :disabled="modelMemoryAuto"
-                                               @input="updateMemoryFromSlider()"
-                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
-                                               :class="modelMemoryAuto
-                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
-                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
-                                        <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
-                                              :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : (memoryPercent === 0 ? window.t('settings.resource.off') : memoryPercent + '%')"></span>
-                                            <template x-if="modelMemoryAuto || memoryPercent !== 0"><span><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
-                                                   type="number"
-                                                   :value="modelMemorySizeGB"
-                                                   @change="updateModelMemoryFromInput($event.target.value); editingModelMemory = false"
-                                                   @blur="editingModelMemory = false"
-                                                   @keydown.enter="updateModelMemoryFromInput($event.target.value); editingModelMemory = false"
-                                                   @keydown.escape="editingModelMemory = false"
-                                                   x-init="if (editingModelMemory) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
-                                                   step="1"><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
-                                        </span>
+                                    <div class="flex items-center gap-3">
+                                        <select x-model="globalSettings.memory.memory_guard_tier"
+                                                x-show="globalSettings.memory.prefill_memory_guard"
+                                                class="px-2.5 py-1.5 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                            <option value="safe">{{ t('settings.resource.guard_tier.safe') }}</option>
+                                            <option value="balanced">{{ t('settings.resource.guard_tier.balanced') }}</option>
+                                            <option value="aggressive">{{ t('settings.resource.guard_tier.aggressive') }}</option>
+                                        </select>
+                                        <button type="button"
+                                                @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
+                                                :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
                                     </div>
                                 </div>
                                 <!-- Memory Limit (In-Memory Hot Cache) -->

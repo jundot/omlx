@@ -8,10 +8,10 @@ Commands:
 
 Usage:
     # Multi-model serving
-    omlx serve --model-dir /path/to/models --max-model-memory 32GB
+    omlx serve --model-dir /path/to/models
 
     # With pinned models
-    omlx serve --model-dir /path/to/models --max-model-memory 48GB --pin llama-3b,qwen-7b
+    omlx serve --model-dir /path/to/models --pin llama-3b,qwen-7b
 """
 
 import argparse
@@ -28,10 +28,6 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "model_dir") and args.model_dir is not None:
         return True
     if hasattr(args, "port") and args.port is not None:
-        return True
-    if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
-        return True
-    if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
     if hasattr(args, "host") and args.host is not None:
         return True
@@ -171,8 +167,7 @@ def serve_command(args):
     model_dirs = settings.model.get_model_dirs(settings.base_path)
     print(f"Base path: {settings.base_path}")
     print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
-    print(f"Max model memory: {settings.model.max_model_memory}")
-    print(f"Max process memory: {settings.memory.max_process_memory}")
+    print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
 
     # Store MCP config path for FastAPI startup
     # Priority: CLI arg > settings.json
@@ -252,7 +247,6 @@ def serve_command(args):
     # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
     init_server(
         model_dirs=[str(d) for d in model_dirs],
-        max_model_memory=settings.model.get_max_model_memory_bytes(),
         scheduler_config=scheduler_config,
         api_key=settings.auth.api_key,
         global_settings=settings,
@@ -531,22 +525,6 @@ Example directory structure:
         default=None,
         help="Directory containing model subdirectories (default: ~/.omlx/models)",
     )
-    serve_parser.add_argument(
-        "--max-model-memory",
-        type=str,
-        default=None,
-        help="Maximum memory for loaded models (e.g., 32GB, 'disabled'). Default: 80%% of system memory.",
-    )
-    serve_parser.add_argument(
-        "--max-process-memory",
-        type=str,
-        default=None,
-        help=(
-            "Max total process memory as percentage of system RAM (10-99%%), "
-            "'auto' (RAM - 8GB), or 'disabled'. Default: auto."
-        ),
-    )
-
     # Server options
     serve_parser.add_argument("--host", type=str, default=None, help="Host to bind (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=None, help="Port to bind (default: 8000)")

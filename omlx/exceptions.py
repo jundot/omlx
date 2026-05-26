@@ -393,18 +393,19 @@ class ModelNotFoundError(EnginePoolError):
 
 
 class ModelTooLargeError(EnginePoolError):
-    """Raised when a model exceeds the memory limit."""
+    """Raised when a model cannot fit under the current memory ceiling."""
 
-    def __init__(self, model_id: str, model_size: int, max_memory: int):
+    def __init__(self, model_id: str, model_size: int, ceiling: int):
         self.model_id = model_id
         self.model_size = model_size
-        self.max_memory = max_memory
+        self.ceiling = ceiling
         # Import here to avoid circular dependency
         from .model_discovery import format_size
 
         message = (
             f"Model '{model_id}' ({format_size(model_size)}) "
-            f"exceeds max-model-memory ({format_size(max_memory)})"
+            f"does not fit under the memory ceiling ({format_size(ceiling)}). "
+            f"Free system memory or lower memory_guard_tier."
         )
         super().__init__(message)
 

@@ -27,7 +27,7 @@ import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .config import parse_size
 
@@ -70,14 +70,6 @@ def get_system_memory() -> int:
     # Default to 16GB if detection fails
     logger.warning("Could not detect system memory, defaulting to 16GB")
     return 16 * 1024**3
-
-
-def _adaptive_system_reserve(total: int) -> int:
-    """Adaptive system reservation: 20% of total, clamped to [2GB, 8GB]."""
-    reserve = int(total * 0.20)
-    min_reserve = 2 * 1024**3
-    max_reserve = 8 * 1024**3
-    return max(min_reserve, min(reserve, max_reserve))
 
 
 def get_ssd_capacity(path: str | Path) -> int:
@@ -140,7 +132,6 @@ class ModelSettings:
 
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
-    max_model_memory: str = "auto"  # "auto" means 80% of RAM
     model_fallback: bool = False  # Use default model when requested model not found
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
@@ -171,29 +162,11 @@ class ModelSettings:
         """
         return self.get_model_dirs(base_path)[0]
 
-    def get_max_model_memory_bytes(self) -> int | None:
-        """
-        Get max model memory in bytes, or None if disabled.
-
-        Returns:
-            Max model memory in bytes (90% of usable RAM if "auto"),
-            or None if disabled (no limit).
-        """
-        value = self.max_model_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return max(1 * 1024**3, int((total - reserve) * 0.9))
-        return parse_size(self.max_model_memory)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
-            "max_model_memory": self.max_model_memory,
             "model_fallback": self.model_fallback,
         }
 
@@ -207,7 +180,6 @@ class ModelSettings:
         return cls(
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
-            max_model_memory=data.get("max_model_memory", "auto"),
             model_fallback=data.get("model_fallback", False),
         )
 
@@ -310,18 +282,20 @@ class CacheSettings:
         )
 
 
+MemoryGuardTier = Literal["safe", "balanced", "aggressive"]
+VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive"}
+
+
 @dataclass
 class MemorySettings:
     """Process-level memory enforcement settings."""
 
-    max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
-    # True when the user set max_process_memory via CLI / env / settings.json
-    # (not the "auto" default). Read by ProcessMemoryEnforcer._get_hard_limit_bytes
-    # to decide whether the scheduler hard ceiling honors the user value or
-    # falls back to system_ram - 4GB.
-    max_process_memory_is_explicit: bool = False
     prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
-    # Two-stage watermark on max_process_memory. soft triggers admission pause + LRU eviction,
+    # Tier selects how much system RAM to reserve for OS / other apps.
+    # The ProcessMemoryEnforcer turns this into a hard ceiling via
+    # min(static_ceiling, dynamic_ceiling) — see process_memory_enforcer.py.
+    memory_guard_tier: MemoryGuardTier = "balanced"
+    # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
     # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
@@ -332,43 +306,11 @@ class MemorySettings:
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
 
-    def get_max_process_memory_bytes(self) -> int | None:
-        """
-        Get max process memory in bytes, or None if disabled.
-
-        - "auto": system RAM minus 8GB
-        - "disabled": None (no enforcement)
-        - "XX%": percentage of system RAM (10-99%)
-
-        Returns:
-            Max process memory in bytes, or None if disabled.
-        """
-        value = self.max_process_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return total - reserve
-        # Parse percentage like "80%"
-        percent_str = value.rstrip("%")
-        try:
-            percent = int(percent_str)
-        except ValueError:
-            # Try parsing as absolute size (e.g., "32GB")
-            return parse_size(self.max_process_memory)
-        if not 10 <= percent <= 99:
-            raise ValueError(
-                f"max_process_memory must be 10-99%, got {percent}%"
-            )
-        return int(get_system_memory() * percent / 100)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "max_process_memory": self.max_process_memory,
-            "max_process_memory_is_explicit": self.max_process_memory_is_explicit,
             "prefill_memory_guard": self.prefill_memory_guard,
+            "memory_guard_tier": self.memory_guard_tier,
             "soft_threshold": self.soft_threshold,
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
@@ -378,12 +320,12 @@ class MemorySettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
+        tier = str(data.get("memory_guard_tier", "balanced")).lower()
+        if tier not in VALID_MEMORY_GUARD_TIERS:
+            tier = "balanced"
         return cls(
-            max_process_memory=data.get("max_process_memory", "auto"),
-            max_process_memory_is_explicit=bool(
-                data.get("max_process_memory_is_explicit", False)
-            ),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+            memory_guard_tier=tier,  # type: ignore[arg-type]
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
             prefill_safe_zone_ratio=float(
@@ -858,14 +800,6 @@ class GlobalSettings:
             dirs = [d.strip() for d in model_dir.split(",") if d.strip()]
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
-        if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
-            self.model.max_model_memory = max_model_memory
-
-        # Memory enforcement settings
-        if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
-            self.memory.max_process_memory = max_process_memory
-            self.memory.max_process_memory_is_explicit = True
-
         # Scheduler settings
         max_concurrent = os.getenv("OMLX_MAX_CONCURRENT_REQUESTS") or os.getenv(
             "OMLX_MAX_NUM_SEQS"
@@ -952,17 +886,6 @@ class GlobalSettings:
             dirs = [d.strip() for d in args.model_dir.split(",") if d.strip()]
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
-        if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
-            self.model.max_model_memory = args.max_model_memory
-
-        # Memory enforcement settings
-        if (
-            hasattr(args, "max_process_memory")
-            and args.max_process_memory is not None
-        ):
-            self.memory.max_process_memory = args.max_process_memory
-            self.memory.max_process_memory_is_explicit = True
-
         # Scheduler settings
         if (
             hasattr(args, "max_concurrent_requests")
@@ -1108,33 +1031,12 @@ class GlobalSettings:
                 f"(must be one of {valid_keepalive_modes})"
             )
 
-        # Model validation
-        if self.model.max_model_memory.lower() not in ("auto", "disabled"):
-            try:
-                size = parse_size(self.model.max_model_memory)
-                if size <= 0:
-                    errors.append("max_model_memory must be positive")
-            except ValueError as e:
-                errors.append(f"Invalid max_model_memory: {e}")
-
-        # Memory enforcement validation
-        mem_val = self.memory.max_process_memory.strip().lower()
-        if mem_val not in ("auto", "disabled"):
-            percent_str = mem_val.rstrip("%")
-            try:
-                percent = int(percent_str)
-                if not 10 <= percent <= 99:
-                    errors.append(
-                        f"max_process_memory must be 10-99%, got {percent}%"
-                    )
-            except ValueError:
-                # Could be absolute size, try parsing
-                try:
-                    size = parse_size(self.memory.max_process_memory)
-                    if size <= 0:
-                        errors.append("max_process_memory must be positive")
-                except ValueError as e:
-                    errors.append(f"Invalid max_process_memory: {e}")
+        # Memory guard tier validation
+        if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
+            errors.append(
+                f"Invalid memory_guard_tier: {self.memory.memory_guard_tier} "
+                f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
+            )
 
         if not 0.5 <= self.memory.prefill_safe_zone_ratio <= 0.99:
             errors.append(

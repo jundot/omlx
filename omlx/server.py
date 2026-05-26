@@ -333,25 +333,25 @@ async def lifespan(app: FastAPI):
         _server_state.global_settings is not None
         and _server_state.engine_pool is not None
     ):
-        max_bytes = _server_state.global_settings.memory.get_max_process_memory_bytes()
-        if max_bytes is not None:
-            from .process_memory_enforcer import ProcessMemoryEnforcer
+        from .process_memory_enforcer import ProcessMemoryEnforcer
 
-            enforcer = ProcessMemoryEnforcer(
-                engine_pool=_server_state.engine_pool,
-                max_bytes=max_bytes,
-                settings_manager=_server_state.settings_manager,
-                prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
-                global_settings=_server_state.global_settings,
-                soft_threshold=_server_state.global_settings.memory.soft_threshold,
-                hard_threshold=_server_state.global_settings.memory.hard_threshold,
-                user_explicit_max=_server_state.global_settings.memory.max_process_memory_is_explicit,
-                prefill_safe_zone_ratio=_server_state.global_settings.memory.prefill_safe_zone_ratio,
-                prefill_min_chunk_tokens=_server_state.global_settings.memory.prefill_min_chunk_tokens,
-            )
-            _server_state.process_memory_enforcer = enforcer
-            _server_state.engine_pool._process_memory_enforcer = enforcer
-            enforcer.start()
+        memory_settings = _server_state.global_settings.memory
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=_server_state.engine_pool,
+            memory_guard_tier=memory_settings.memory_guard_tier,
+            settings_manager=_server_state.settings_manager,
+            prefill_memory_guard=memory_settings.prefill_memory_guard,
+            global_settings=_server_state.global_settings,
+            soft_threshold=memory_settings.soft_threshold,
+            hard_threshold=memory_settings.hard_threshold,
+            prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
+            prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+        )
+        _server_state.process_memory_enforcer = enforcer
+        _server_state.engine_pool._process_memory_enforcer = enforcer
+        # Engine pool consults the enforcer for the pre-load ceiling.
+        _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        enforcer.start()
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -1103,7 +1103,6 @@ def validate_context_window(
 
 def init_server(
     model_dirs: str | list[str],
-    max_model_memory: int | None,
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
@@ -1113,7 +1112,6 @@ def init_server(
 
     Args:
         model_dirs: Path or list of paths to directories containing model subdirectories
-        max_model_memory: Maximum memory for loaded models in bytes, or None for no limit
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
         global_settings: GlobalSettings instance (optional)
@@ -1205,9 +1203,10 @@ def init_server(
             model_path.mkdir(parents=True, exist_ok=True)
             logger.warning(f"Model directory created (empty): {md}")
 
-    # Create engine pool
+    # Create engine pool. The pool consults enforcer.get_final_ceiling()
+    # for pre-load admission — wired up later in startup once the enforcer
+    # is constructed.
     _server_state.engine_pool = EnginePool(
-        max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
     )
 
@@ -1246,10 +1245,11 @@ def init_server(
         logger.info(f"Default model: {_server_state.default_model}")
     else:
         logger.info("No default model (no models available)")
-    if max_model_memory is None:
-        logger.info("Max model memory: disabled (no limit)")
-    else:
-        logger.info(f"Max model memory: {format_size(max_model_memory)}")
+    if global_settings and getattr(global_settings, "memory", None):
+        logger.info(
+            f"Memory guard tier: {global_settings.memory.memory_guard_tier} "
+            f"(guard {'on' if global_settings.memory.prefill_memory_guard else 'off'})"
+        )
     logger.info(f"Default max tokens: {_server_state.sampling.max_tokens}")
     if api_key:
         logger.info("API key authentication: enabled")
@@ -1553,10 +1553,12 @@ async def health():
 
     pool_status = None
     if _server_state.engine_pool is not None:
+        enforcer = _server_state.process_memory_enforcer
+        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
-            "max_model_memory": _server_state.engine_pool.max_model_memory,
+            "final_ceiling": ceiling,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
@@ -1591,7 +1593,10 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
-        model_memory_max = pool.max_model_memory
+        enforcer = _server_state.process_memory_enforcer
+        model_memory_max = (
+            enforcer.get_final_ceiling() if enforcer is not None else None
+        )
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -4743,21 +4748,19 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server (use omlx CLI instead)."""
-    from .config import parse_size
-
     parser = argparse.ArgumentParser(
         description="oMLX multi-model serving for Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Multi-model serving
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB
+    python -m omlx.server --model-dir /path/to/models
 
     # With pinned models
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 48GB --pin llama-3b,qwen-7b
+    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
 
     # With MCP tools
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB --mcp-config mcp.json
+    python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
 Note: Use the omlx CLI for full feature support.
         """,
@@ -4767,12 +4770,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--max-model-memory",
-        type=str,
-        default="32GB",
-        help="Maximum memory for loaded models (e.g., 32GB). KV cache uses additional memory.",
     )
     parser.add_argument(
         "--pin",
@@ -4823,7 +4820,6 @@ Note: Use the omlx CLI for full feature support.
     # Initialize server
     init_server(
         model_dir=args.model_dir,
-        max_model_memory=parse_size(args.max_model_memory),
         pinned_models=pinned_models,
         default_model=args.default_model,
         max_tokens=args.max_tokens,

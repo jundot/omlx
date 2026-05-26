@@ -4550,11 +4550,14 @@ class Scheduler:
         if current + peak > self._memory_hard_limit_bytes:
             from .utils.hardware import format_bytes
 
+            usage_gb = current / (1024**3)
+            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
-                f"Reduce context length or increase --max-process-memory."
+                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                f"Reduce context length or lower memory_guard_tier."
             )
         return None
 

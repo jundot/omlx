@@ -408,15 +408,32 @@ class EngineCore:
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate).
         """
+        from .utils.proc_memory import get_phys_footprint
+
         request_ids = list(self._output_collectors.keys())
+        ceiling = 0
+        sched = self.scheduler
+        if sched is not None:
+            ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+        usage = get_phys_footprint()
+        usage_gb = usage / (1024**3)
+        ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                error_msg = (
-                    "Request aborted: process memory limit exceeded. "
-                    "Increase --max-process-memory or reduce context size."
-                )
+                if ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                        "Reduce context size or lower memory_guard_tier."
+                    )
+                else:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB). "
+                        "Reduce context size or lower memory_guard_tier."
+                    )
                 collector.put(
                     RequestOutput(
                         request_id=rid,

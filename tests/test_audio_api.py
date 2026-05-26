@@ -51,7 +51,7 @@ def _make_pool(entries: list) -> MagicMock:
         (e for e in entries if e.model_id == mid), None
     )
     pool.get_status.return_value = {
-        "max_model_memory": 32 * 1024**3,
+        "final_ceiling": 32 * 1024**3,
         "current_model_memory": 0,
         "model_count": len(entries),
         "loaded_count": sum(1 for e in entries if e.engine is not None),

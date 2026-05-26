@@ -9,6 +9,36 @@ import pytest
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
+def _make_enforcer(
+    engine_pool,
+    ceiling: int = 10 * 1024**3,
+    tier: str = "balanced",
+    poll_interval: float = 0.1,
+    soft_threshold: float = 1.0,
+    hard_threshold: float = 1.0,
+    **kwargs,
+) -> ProcessMemoryEnforcer:
+    """Build an enforcer with a deterministic hard ceiling.
+
+    The new enforcer derives its ceiling from system_memory + tier +
+    psutil.virtual_memory().available, which is impractical to mock per
+    test. We replace `_get_hard_limit_bytes` with a constant so tests can
+    exercise the watermark logic without juggling system mocks.
+
+    Passing `ceiling=0` disables the limit.
+    """
+    enforcer = ProcessMemoryEnforcer(
+        engine_pool=engine_pool,
+        memory_guard_tier=tier,
+        poll_interval=poll_interval,
+        soft_threshold=soft_threshold,
+        hard_threshold=hard_threshold,
+        **kwargs,
+    )
+    enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    return enforcer
+
+
 def _cycling(values):
     """side_effect helper: yield each value, then repeat the last forever.
 
@@ -53,19 +83,13 @@ def mock_engine_pool():
 
 @pytest.fixture
 def enforcer(mock_engine_pool):
-    """Create an enforcer with 10GB limit.
+    """Create an enforcer with a fixed 10GB ceiling.
 
-    Soft/hard thresholds set to 1.0 so legacy single-threshold tests keep
-    treating max_bytes as the single trip point. Dedicated 2-watermark
-    tests construct their own enforcer with default thresholds.
+    Soft/hard thresholds default to 1.0 so legacy single-threshold tests
+    keep treating the ceiling as the single trip point. Dedicated
+    2-watermark tests construct their own enforcer with default thresholds.
     """
-    return ProcessMemoryEnforcer(
-        engine_pool=mock_engine_pool,
-        max_bytes=10 * 1024**3,
-        poll_interval=0.1,
-        soft_threshold=1.0,
-        hard_threshold=1.0,
-    )
+    return _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
 
 
 class TestCheckAndEnforce:
@@ -247,15 +271,13 @@ class TestCheckAndEnforce:
         # Should not raise, just log warning
 
 
-class TestDisabledWhenMaxBytesZero:
-    """Tests for enforcement disabled when max_bytes <= 0."""
+class TestDisabledWhenCeilingZero:
+    """Tests for enforcement disabled when the ceiling is 0 (guard off)."""
 
     @pytest.mark.asyncio
-    async def test_no_enforce_when_max_bytes_zero(self, mock_engine_pool):
-        """No enforcement when max_bytes is 0 (disabled)."""
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=0
-        )
+    async def test_no_enforce_when_ceiling_zero(self, mock_engine_pool):
+        """No enforcement when ceiling is 0 (guard disabled)."""
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
         engine = MagicMock()
         engine.abort_all_requests = AsyncMock(return_value=0)
         entry = _make_entry("model-a", engine=engine)
@@ -269,11 +291,9 @@ class TestDisabledWhenMaxBytesZero:
         mock_engine_pool._unload_engine.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_enforce_when_max_bytes_negative(self, mock_engine_pool):
-        """No enforcement when max_bytes is negative."""
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=-1
-        )
+    async def test_no_enforce_when_guard_off(self, mock_engine_pool):
+        """No enforcement when memory guard toggle is off."""
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             await enforcer._check_and_enforce()
@@ -284,10 +304,8 @@ class TestDisabledWhenMaxBytesZero:
     async def test_propagate_zero_disables_inline_prefill_check(
         self, mock_engine_pool
     ):
-        """Propagating max_bytes=0 sets scheduler limit to 0 (disabled)."""
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=0
-        )
+        """Propagating ceiling=0 sets scheduler limit to 0 (disabled)."""
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 999
         bg._memory_hard_limit_bytes = 999
@@ -343,75 +361,110 @@ class TestPrefillMemoryGuardToggle:
             mock_mx.set_cache_limit.assert_not_called()
 
 
-class TestHardLimitCalculation:
-    """Tests for _get_hard_limit_bytes calculation."""
+class TestStaticCeiling:
+    """Tier-driven static ceiling (`total_ram - tier.static_reserve`).
 
-    def test_hard_limit_large_system_reserves_6gb(self, enforcer):
-        """>= 16 GB systems reserve 6 GB in auto mode."""
+    >= 16 GB systems use a tier-scaled reserve. < 16 GB systems always
+    use 4 GB regardless of tier.
+    """
+
+    @pytest.mark.parametrize(
+        "tier,expected_reserve_gb",
+        [("safe", 12), ("balanced", 8), ("aggressive", 6)],
+    )
+    def test_large_system_tier_reserve(
+        self, mock_engine_pool, tier, expected_reserve_gb
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
+        )
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 96 * 1024**3
-            result = enforcer._get_hard_limit_bytes()
-        assert result == 90 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == (96 - expected_reserve_gb) * 1024**3
 
-    def test_hard_limit_small_system_reserves_4gb(self, mock_engine_pool):
-        """< 16 GB systems reserve only 4 GB so small Macs can still load
-        a model + leave a usable prefill budget."""
+    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
+    def test_small_system_uses_4gb_reserve_regardless_of_tier(
+        self, mock_engine_pool, tier
+    ):
         enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=4 * 1024**3
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 8 * 1024**3
-            result = enforcer._get_hard_limit_bytes()
-        assert result == 4 * 1024**3  # max(8-4, 4) = 4
+            mock_mem.return_value = 12 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 8 * 1024**3
 
-    def test_hard_limit_at_least_max_bytes(self, mock_engine_pool):
-        """Hard limit is at least max_bytes when system reserve would push
-        the ceiling below the user's requested limit."""
-        # 16GB system at the cut-off uses 6GB reserve -> 10GB.
-        # max_bytes=14GB is larger, so ceiling stays at 14GB.
+
+class TestDynamicCeiling:
+    """Dynamic ceiling tracks system_available + omlx_phys_footprint."""
+
+    @pytest.mark.parametrize(
+        "tier,buffer_bytes",
+        [
+            ("safe", 2 * 1024**3),
+            ("balanced", 1 * 1024**3),
+            ("aggressive", 512 * 1024**2),
+        ],
+    )
+    def test_dynamic_ceiling_subtracts_other_app_buffer(
+        self, mock_engine_pool, tier, buffer_bytes
+    ):
         enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=14 * 1024**3
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 16 * 1024**3
-            result = enforcer._get_hard_limit_bytes()
-        assert result == 14 * 1024**3
+        with patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=10 * 1024**3,
+        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
+            mock_psutil.virtual_memory.return_value.available = 5 * 1024**3
+            result = enforcer._get_dynamic_ceiling()
+        assert result == 10 * 1024**3 + 5 * 1024**3 - buffer_bytes
 
-    def test_hard_limit_zero_when_disabled(self, mock_engine_pool):
-        """Hard limit is 0 when max_bytes <= 0 (disabled)."""
+
+class TestHardLimitCalculation:
+    """`_get_hard_limit_bytes` returns min(static, dynamic), or 0 when guard off."""
+
+    def test_picks_static_when_smaller(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, max_bytes=0
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=30 * 1024**3,
+        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
+            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_psutil.virtual_memory.return_value.available = 40 * 1024**3
+            # dynamic = 30 + 40 - 2 = 68 GB; static (40) wins
+            assert enforcer._get_hard_limit_bytes() == 40 * 1024**3
+
+    def test_picks_dynamic_when_smaller(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=10 * 1024**3,
+        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
+            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_psutil.virtual_memory.return_value.available = 5 * 1024**3
+            # dynamic = 10 + 5 - 1 (balanced buffer) = 14 GB; dynamic wins
+            assert enforcer._get_hard_limit_bytes() == 14 * 1024**3
+
+    def test_zero_when_guard_disabled(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
         )
         assert enforcer._get_hard_limit_bytes() == 0
+        assert enforcer.get_final_ceiling() == 0
 
-    def test_hard_limit_honors_user_explicit_max(self, mock_engine_pool):
-        """When user_explicit_max=True the user value IS the ceiling, even
-        on big systems where system_ram minus reserve would otherwise win.
-        Regression for the case where a 600GB system silently ignored
-        OMLX_MAX_PROCESS_MEMORY=28GB and let prefill grow to ~596GB."""
+    def test_unknown_tier_falls_back_to_balanced(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool,
-            max_bytes=28 * 1024**3,
-            user_explicit_max=True,
+            engine_pool=mock_engine_pool, memory_guard_tier="extreme"
         )
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 600 * 1024**3
-            result = enforcer._get_hard_limit_bytes()
-        assert result == 28 * 1024**3
-
-    def test_hard_limit_auto_mode_uses_size_aware_reserve(
-        self, mock_engine_pool
-    ):
-        """user_explicit_max=False (auto) uses size-aware reserve."""
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool,
-            max_bytes=28 * 1024**3,
-            user_explicit_max=False,
-        )
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3  # large, reserve=6GB
-            result = enforcer._get_hard_limit_bytes()
-        assert result == 90 * 1024**3
+        assert enforcer.memory_guard_tier == "balanced"
 
 
 class TestSingleModelMemoryPressure:
@@ -564,18 +617,17 @@ class TestMemoryLimitPropagation:
         entry = _make_entry("model-a", engine=engine)
         enforcer._engine_pool._entries = {"model-a": entry}
 
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3
-            enforcer._propagate_memory_limit()
+        enforcer._propagate_memory_limit()
 
+        # Fixture stubs the ceiling at 10 GB with soft_threshold = 1.0,
+        # so the scheduler soft limit equals the ceiling.
         assert scheduler._memory_limit_bytes == 10 * 1024**3
         assert bg._memory_limit_bytes == 10 * 1024**3
-        # hard limit = 96GB - 6GB = 90GB (>=16GB system reserves 6GB)
-        assert scheduler._memory_hard_limit_bytes == 90 * 1024**3
-        assert bg._memory_hard_limit_bytes == 90 * 1024**3
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+        assert bg._memory_hard_limit_bytes == 10 * 1024**3
 
-    def test_propagates_on_max_bytes_change(self, enforcer):
-        """Propagates updated limits when max_bytes is changed at runtime."""
+    def test_propagates_on_tier_change(self, enforcer):
+        """Changing the tier at runtime triggers re-propagation."""
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 0
         bg._memory_hard_limit_bytes = 0
@@ -589,9 +641,9 @@ class TestMemoryLimitPropagation:
         enforcer._engine_pool._entries = {"model-a": entry}
 
         enforcer._running = True
-        with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3
-            enforcer.max_bytes = 20 * 1024**3
+        # Simulate the ceiling shrinking after the tier flip.
+        enforcer._get_hard_limit_bytes = lambda: 20 * 1024**3
+        enforcer.memory_guard_tier = "safe"
 
         assert scheduler._memory_limit_bytes == 20 * 1024**3
         assert bg._memory_limit_bytes == 20 * 1024**3
@@ -699,14 +751,22 @@ class TestStoreCacheCapWalk:
 class TestProperties:
     """Tests for enforcer properties."""
 
-    def test_max_bytes_getter(self, enforcer):
-        """Test max_bytes property."""
-        assert enforcer.max_bytes == 10 * 1024**3
+    def test_memory_guard_tier_default(self, enforcer):
+        """Default tier from `_make_enforcer` is balanced."""
+        assert enforcer.memory_guard_tier == "balanced"
 
-    def test_max_bytes_setter(self, enforcer):
-        """Test updating max_bytes at runtime."""
-        enforcer.max_bytes = 20 * 1024**3
-        assert enforcer.max_bytes == 20 * 1024**3
+    def test_memory_guard_tier_setter(self, enforcer):
+        """Setting a new tier updates the internal state."""
+        enforcer.memory_guard_tier = "safe"
+        assert enforcer.memory_guard_tier == "safe"
+
+    def test_memory_guard_tier_setter_ignores_unknown_value(self, enforcer):
+        """Unknown tier values normalize to balanced."""
+        enforcer.memory_guard_tier = "extreme"
+        assert enforcer.memory_guard_tier == "balanced"
+
+    def test_get_final_ceiling_matches_hard_limit(self, enforcer):
+        assert enforcer.get_final_ceiling() == enforcer._get_hard_limit_bytes()
 
     def test_is_running_initially_false(self, enforcer):
         """Test is_running is False before start."""
@@ -716,8 +776,9 @@ class TestProperties:
         """Test get_status when enforcer is not running."""
         status = enforcer.get_status()
         assert status["enabled"] is False
-        assert status["max_bytes"] == 10 * 1024**3
+        assert status["ceiling_bytes"] == 0
         assert status["current_bytes"] == 0
+        assert status["memory_guard_tier"] == "balanced"
 
 
 class TestLifecycle:
@@ -777,17 +838,16 @@ class TestTwoWatermarkPressureLevels:
 
     @pytest.fixture
     def enforcer_2wm(self, pool):
-        return ProcessMemoryEnforcer(
-            engine_pool=pool,
-            max_bytes=100 * 1024**3,
-            poll_interval=0.1,
+        return _make_enforcer(
+            pool,
+            ceiling=100 * 1024**3,
             soft_threshold=0.85,
             hard_threshold=0.95,
         )
 
     def test_soft_hard_bytes_computed(self, enforcer_2wm):
-        assert enforcer_2wm._soft_bytes == int(100 * 1024**3 * 0.85)
-        assert enforcer_2wm._hard_bytes == int(100 * 1024**3 * 0.95)
+        assert enforcer_2wm._soft_bytes() == int(100 * 1024**3 * 0.85)
+        assert enforcer_2wm._hard_bytes() == int(100 * 1024**3 * 0.95)
 
     def test_get_pressure_level_when_not_running(self, enforcer_2wm):
         # _running=False → always ok regardless of cached level

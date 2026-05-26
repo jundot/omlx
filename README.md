@@ -272,11 +272,8 @@ Models are auto-detected by type. You can also download models directly from the
 ## CLI Configuration
 
 ```bash
-# Memory limit for loaded models
-omlx serve --model-dir ~/models --max-model-memory 32GB
-
-# Process-level memory limit (default: auto = RAM - 8GB)
-omlx serve --model-dir ~/models --max-process-memory 80%
+# Start with default settings (memory guard tier = balanced, manage via admin UI)
+omlx serve --model-dir ~/models
 
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

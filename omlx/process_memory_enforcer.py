@@ -2,22 +2,29 @@
 """
 Process-level memory enforcer for oMLX.
 
-Monitors total Metal memory usage via mx.get_active_memory() and enforces
-the max_process_memory limit by unloading LRU models from EnginePool.
+The enforcer derives a hard ceiling from the configured memory_guard_tier
+(safe / balanced / aggressive) and the current system state, then drives
+soft / hard watermarks from that ceiling. When usage crosses a watermark
+it unloads LRU models from EnginePool and pauses admission for new
+prefills.
 
-The enforcer runs as a background asyncio task that polls memory usage at
-a configurable interval (default: 1 second). When usage exceeds the limit,
-it immediately unloads the least-recently-used non-pinned model. If the
-model is mid-inference, the inference is aborted as part of engine shutdown.
+Ceiling = min(static_ceiling, dynamic_ceiling):
+  static_ceiling  = total_ram - tier.static_reserve
+  dynamic_ceiling = omlx_phys_footprint + system_available - tier.other_app_reserve
+
+static_ceiling caps the absolute Metal pressure. dynamic_ceiling moves
+in real time with system_available so that when other apps grab memory
+the ceiling drops immediately and LRU eviction or scheduler abort fires.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
+import psutil
 
 from .utils.proc_memory import get_phys_footprint
 
@@ -29,6 +36,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Reserve below 16 GB systems regardless of tier — small Macs cannot
+# afford a tier-scaled cut and still load any useful model.
+_SMALL_SYSTEM_RESERVE = 4 * 1024**3
+_SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
+
+# Tier maps: static reserve (>= 16 GB systems) + real-time spike buffer.
+_STATIC_RESERVE_LARGE: dict[str, int] = {
+    "safe": 12 * 1024**3,  # aligned with Apple iogpu.wired_limit 75%
+    "balanced": 8 * 1024**3,
+    "aggressive": 6 * 1024**3,
+}
+_OTHER_APP_RESERVE: dict[str, int] = {
+    "safe": 2 * 1024**3,
+    "balanced": 1 * 1024**3,
+    "aggressive": 512 * 1024**2,
+}
+
+
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
     return f"{b / 1024**3:.1f}GB"
@@ -38,21 +63,21 @@ class ProcessMemoryEnforcer:
     """
     Background task that enforces process-level memory limits.
 
-    Polls mx.get_active_memory() every poll_interval seconds and unloads
-    LRU models from EnginePool when the limit is exceeded.
+    Polls usage every poll_interval seconds. On every tick it recomputes
+    the dynamic ceiling from system_available, so other-app pressure is
+    reflected immediately without restarting the enforcer.
     """
 
     def __init__(
         self,
         engine_pool: EnginePool,
-        max_bytes: int,
+        memory_guard_tier: str = "balanced",
         poll_interval: float = 1.0,
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
         soft_threshold: float = 0.85,
         hard_threshold: float = 0.95,
-        user_explicit_max: bool = False,
         prefill_safe_zone_ratio: float = 0.80,
         prefill_min_chunk_tokens: int = 32,
     ):
@@ -61,36 +86,31 @@ class ProcessMemoryEnforcer:
 
         Args:
             engine_pool: The engine pool to evict models from.
-            max_bytes: Maximum allowed process memory in bytes (compared
-                against max(mx.get_active_memory(), phys_footprint)).
+            memory_guard_tier: One of "safe", "balanced", "aggressive".
+                Selects static_reserve (>= 16 GB systems) and
+                other_app_reserve buffers. Below 16 GB systems always
+                use a 4 GB static reserve regardless of tier.
             poll_interval: Seconds between memory checks.
             settings_manager: Optional settings manager for TTL checks.
-            prefill_memory_guard: Whether to enable pre-flight memory
-                estimation to reject requests that would exceed limits.
+            prefill_memory_guard: When False, returns a ceiling of 0 so
+                callers treat the limit as disabled.
             global_settings: Optional global settings for idle timeout.
-            soft_threshold: Fraction of max_bytes that triggers soft action
+            soft_threshold: Fraction of ceiling that triggers soft action
                 (LRU non-pinned eviction + admission pause; in-flight allowed).
-            hard_threshold: Fraction of max_bytes that triggers hard action
+            hard_threshold: Fraction of ceiling that triggers hard action
                 (also abort in-flight when all loaded models are pinned).
-            user_explicit_max: True when max_bytes came from a user-set value
-                (CLI / env / settings.json), False when it was derived from
-                the "auto" default. Controls whether the scheduler hard
-                ceiling honors max_bytes (explicit) or system_ram - 4GB
-                (auto, with system protection priority).
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
-            prefill_min_chunk_tokens: Floor for adaptive shrink. If even this
-                size would exceed the cap, prefill is aborted.
+            prefill_min_chunk_tokens: Floor for adaptive shrink.
         """
         self._engine_pool = engine_pool
-        self._max_bytes = max_bytes
+        self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
         self._poll_interval = poll_interval
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
         self._global_settings = global_settings
         self._soft_threshold = soft_threshold
         self._hard_threshold = hard_threshold
-        self._user_explicit_max = user_explicit_max
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
         self._task: asyncio.Task | None = None
@@ -99,22 +119,27 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
 
-    @property
-    def max_bytes(self) -> int:
-        """Maximum allowed Metal memory in bytes."""
-        return self._max_bytes
+    @staticmethod
+    def _normalize_tier(tier: str) -> str:
+        t = (tier or "").strip().lower()
+        if t not in _STATIC_RESERVE_LARGE:
+            return "balanced"
+        return t
 
-    @max_bytes.setter
-    def max_bytes(self, value: int) -> None:
-        old = self._max_bytes
-        self._max_bytes = value
+    @property
+    def memory_guard_tier(self) -> str:
+        return self._memory_guard_tier
+
+    @memory_guard_tier.setter
+    def memory_guard_tier(self, value: str) -> None:
+        new_tier = self._normalize_tier(value)
+        if new_tier == self._memory_guard_tier:
+            return
+        old = self._memory_guard_tier
+        self._memory_guard_tier = new_tier
         if self._running:
             self._propagate_memory_limit()
-            self._set_metal_memory_limit()
-        logger.info(
-            f"Process memory limit changed: "
-            f"{_format_gb(old)} -> {_format_gb(value)}"
-        )
+        logger.info(f"Memory guard tier changed: {old} -> {new_tier}")
 
     @property
     def is_running(self) -> bool:
@@ -127,54 +152,66 @@ class ProcessMemoryEnforcer:
             return
         self._running = True
         self._propagate_memory_limit()
-        self._set_metal_memory_limit()
+        ceiling = self._get_hard_limit_bytes()
         self._task = asyncio.create_task(self._enforcement_loop())
         logger.info(
             f"Process memory enforcer started "
-            f"(limit: {_format_gb(self._max_bytes)}, "
-            f"interval: {self._poll_interval}s)"
+            f"(tier={self._memory_guard_tier}, "
+            f"ceiling={_format_gb(ceiling)}, "
+            f"interval={self._poll_interval}s)"
         )
 
-    def _get_hard_limit_bytes(self) -> int:
-        """Hard limit for inline prefill check.
-
-        - User-explicit max (CLI/env/settings.json): the user value IS the
-          ceiling. They asked for this number to be respected.
-        - Auto mode: leave headroom for the kernel and other tenants.
-          Reserve scales with the machine size since larger systems also
-          have larger chunk transients (head_dim>128 SDPA fallback peaks
-          grow with context length, not just chunk size).
-            * < 16 GB systems (8/12 GB MacBooks): reserve 4 GB
-            * >= 16 GB systems:                   reserve 6 GB
-
-        Returns 0 if enforcement is disabled (max_bytes <= 0).
-
-        Note: distinct from `_soft_bytes` / `_hard_bytes` which are
-        max_bytes * threshold and drive LRU eviction / admission pause.
-        """
-        if self._max_bytes <= 0:
-            return 0
-        if self._user_explicit_max:
-            return self._max_bytes
+    def _get_static_ceiling(self) -> int:
+        """Total RAM minus tier-scaled static reserve."""
         from .settings import get_system_memory
 
         system_bytes = get_system_memory()
-        reserve = 4 * 1024**3 if system_bytes < 16 * 1024**3 else 6 * 1024**3
-        return max(system_bytes - reserve, self._max_bytes)
+        if system_bytes < _SMALL_SYSTEM_THRESHOLD:
+            reserve = _SMALL_SYSTEM_RESERVE
+        else:
+            reserve = _STATIC_RESERVE_LARGE[self._memory_guard_tier]
+        return max(0, system_bytes - reserve)
 
-    @property
+    def _get_dynamic_ceiling(self) -> int:
+        """Real-time ceiling based on `psutil.virtual_memory().available`.
+
+        Recomputed on every call — never cached — so other-app spikes
+        (Chrome / Xcode / video editor) shrink the ceiling within one
+        poll. other_app_reserve absorbs sub-1s spikes that fall between
+        polling ticks.
+        """
+        omlx_usage = get_phys_footprint()
+        system_available = psutil.virtual_memory().available
+        buffer = _OTHER_APP_RESERVE[self._memory_guard_tier]
+        return max(0, omlx_usage + system_available - buffer)
+
+    def _get_hard_limit_bytes(self) -> int:
+        """Final hard ceiling = min(static, dynamic).
+
+        Returns 0 if the memory guard is disabled (callers treat 0 as
+        "no limit").
+        """
+        if not self._prefill_memory_guard:
+            return 0
+        return min(self._get_static_ceiling(), self._get_dynamic_ceiling())
+
+    def get_final_ceiling(self) -> int:
+        """Public accessor used by engine_pool pre-load admission."""
+        return self._get_hard_limit_bytes()
+
     def _soft_bytes(self) -> int:
-        """Soft watermark: max_bytes * soft_threshold."""
-        if self._max_bytes <= 0:
+        """Soft watermark: ceiling * soft_threshold."""
+        ceiling = self._get_hard_limit_bytes()
+        if ceiling <= 0:
             return 0
-        return int(self._max_bytes * self._soft_threshold)
+        return int(ceiling * self._soft_threshold)
 
-    @property
     def _hard_bytes(self) -> int:
-        """Hard watermark: max_bytes * hard_threshold."""
-        if self._max_bytes <= 0:
+        """Hard watermark: ceiling * hard_threshold."""
+        ceiling = self._get_hard_limit_bytes()
+        if ceiling <= 0:
             return 0
-        return int(self._max_bytes * self._hard_threshold)
+        return int(ceiling * self._hard_threshold)
 
     def _current_usage_bytes(self) -> int:
         """Process memory usage as seen by macOS jetsam.
@@ -194,20 +231,6 @@ class ProcessMemoryEnforcer:
         """
         return self._pressure_level if self._running else "ok"
 
-    def _set_metal_memory_limit(self) -> None:
-        """No-op. Metal-level limits removed to prevent model load swap.
-
-        mx.set_memory_limit() causes MLX to aggressively reclaim cached
-        buffers during model loading, creating alloc/free churn that
-        pushes the system into swap. All memory enforcement is handled
-        by mx.get_active_memory() polling instead. (#429)
-        """
-        pass
-
-    def _clear_metal_memory_limit(self) -> None:
-        """No-op. See _set_metal_memory_limit."""
-        pass
-
     @property
     def prefill_memory_guard(self) -> bool:
         """Whether prefill memory guard is enabled."""
@@ -218,10 +241,6 @@ class ProcessMemoryEnforcer:
         self._prefill_memory_guard = value
         if self._running:
             self._propagate_memory_limit()
-            if value:
-                self._set_metal_memory_limit()
-            else:
-                self._clear_metal_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
     @staticmethod
@@ -249,22 +268,27 @@ class ProcessMemoryEnforcer:
         return getattr(inner_engine, "scheduler", None)
 
     def _propagate_memory_limit(self) -> None:
-        """Propagate soft/hard memory limits to schedulers for inline prefill checking."""
-        hard_limit = self._get_hard_limit_bytes()
+        """Propagate ceiling-derived watermarks to all schedulers.
+
+        Called on every enforcer tick so the dynamic ceiling reaches the
+        schedulers as fast as the poll interval allows.
+        """
+        ceiling = self._get_hard_limit_bytes()
+        soft_limit = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
             scheduler = self._resolve_scheduler(entry)
             if scheduler is not None:
-                scheduler._memory_limit_bytes = self._max_bytes
-                scheduler._memory_hard_limit_bytes = hard_limit
+                scheduler._memory_limit_bytes = soft_limit
+                scheduler._memory_hard_limit_bytes = ceiling
                 scheduler._prefill_memory_guard = self._prefill_memory_guard
                 scheduler._admission_paused = admission_paused
                 scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
                 scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
                 bg = getattr(scheduler, "batch_generator", None)
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
-                    bg._memory_limit_bytes = self._max_bytes
-                    bg._memory_hard_limit_bytes = hard_limit
+                    bg._memory_limit_bytes = soft_limit
+                    bg._memory_hard_limit_bytes = ceiling
 
     def _walk_store_cache_caps(self) -> None:
         """Walk each scheduler's store-cache gate one step per poll (#1383).
@@ -322,24 +346,29 @@ class ProcessMemoryEnforcer:
     async def _check_and_enforce(self) -> None:
         """Check current memory and enforce 2-watermark policy.
 
+        The ceiling is recomputed on every tick (dynamic ceiling moves
+        with system_available), so watermarks shift as other apps take
+        or release memory.
+
         Pressure levels:
         - ok (current < soft): no action, ensure admission unpaused.
         - soft (soft <= current < hard): LRU non-pinned eviction + signal
           schedulers to pause new admissions (in-flight requests proceed).
         - hard (current >= hard): full enforcement — LRU evict, abort
           in-flight when only pinned remain, abort in-progress model loads.
-
-        Pressure target on recovery is the soft threshold (always evict
-        back below soft to avoid oscillation when single eviction lands
-        just under hard).
         """
-        if self._max_bytes <= 0:
+        # Always propagate so the scheduler sees the latest ceiling /
+        # admission_paused, even when usage stays below the soft mark.
+        self._propagate_memory_limit()
+
+        ceiling = self._get_hard_limit_bytes()
+        if ceiling <= 0:
             self._pressure_level = "ok"
             return
 
         current = self._current_usage_bytes()
-        soft = self._soft_bytes
-        hard = self._hard_bytes
+        soft = int(ceiling * self._soft_threshold)
+        hard = int(ceiling * self._hard_threshold)
         prev_level = self._pressure_level
 
         if current < soft:
@@ -349,15 +378,14 @@ class ProcessMemoryEnforcer:
         else:
             new_level = "hard"
 
-        # Update cached level and propagate admission_paused immediately so
-        # the scheduler stops admitting new prefills before we start evicting.
         if new_level != prev_level:
             self._pressure_level = new_level
             self._propagate_memory_limit()
             logger.info(
                 f"Memory pressure level: {prev_level} -> {new_level} "
                 f"(current={_format_gb(current)}, "
-                f"soft={_format_gb(soft)}, hard={_format_gb(hard)})"
+                f"soft={_format_gb(soft)}, hard={_format_gb(hard)}, "
+                f"ceiling={_format_gb(ceiling)})"
             )
 
         if new_level == "ok":
@@ -449,9 +477,14 @@ class ProcessMemoryEnforcer:
         # Re-evaluate level after eviction completes so admission state
         # reflects post-eviction reality on the next propagate.
         post_current = self._current_usage_bytes()
-        if post_current < soft:
+        # Recompute ceiling again — eviction may free phys, shifting the
+        # dynamic ceiling.
+        post_ceiling = self._get_hard_limit_bytes()
+        post_soft = int(post_ceiling * self._soft_threshold) if post_ceiling > 0 else 0
+        post_hard = int(post_ceiling * self._hard_threshold) if post_ceiling > 0 else 0
+        if post_ceiling <= 0 or post_current < post_soft:
             post_level = "ok"
-        elif post_current < hard:
+        elif post_current < post_hard:
             post_level = "soft"
         else:
             post_level = "hard"
@@ -474,21 +507,29 @@ class ProcessMemoryEnforcer:
         uses internally so admin UI / /health utilization matches the
         watermark the enforcer is actually comparing against.
         """
+        ceiling = self._get_hard_limit_bytes() if self._running else 0
+        static_ceiling = self._get_static_ceiling() if self._running else 0
+        dynamic_ceiling = self._get_dynamic_ceiling() if self._running else 0
         current = self._current_usage_bytes() if self._running else 0
+        soft = int(ceiling * self._soft_threshold) if ceiling > 0 else 0
+        hard = int(ceiling * self._hard_threshold) if ceiling > 0 else 0
         return {
             "enabled": self._running,
-            "max_bytes": self._max_bytes,
-            "max_formatted": _format_gb(self._max_bytes),
+            "memory_guard_tier": self._memory_guard_tier,
+            "ceiling_bytes": ceiling,
+            "ceiling_formatted": _format_gb(ceiling),
+            "static_ceiling_bytes": static_ceiling,
+            "static_ceiling_formatted": _format_gb(static_ceiling),
+            "dynamic_ceiling_bytes": dynamic_ceiling,
+            "dynamic_ceiling_formatted": _format_gb(dynamic_ceiling),
             "soft_threshold": self._soft_threshold,
             "hard_threshold": self._hard_threshold,
-            "soft_bytes": self._soft_bytes,
-            "soft_formatted": _format_gb(self._soft_bytes),
-            "hard_bytes": self._hard_bytes,
-            "hard_formatted": _format_gb(self._hard_bytes),
+            "soft_bytes": soft,
+            "soft_formatted": _format_gb(soft),
+            "hard_bytes": hard,
+            "hard_formatted": _format_gb(hard),
             "current_bytes": current,
             "current_formatted": _format_gb(current),
             "pressure_level": self._pressure_level if self._running else "ok",
-            "utilization": (
-                current / self._max_bytes if self._max_bytes > 0 else 0.0
-            ),
+            "utilization": (current / ceiling if ceiling > 0 else 0.0),
         }
