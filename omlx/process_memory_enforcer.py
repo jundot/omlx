@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -57,6 +58,106 @@ _OTHER_APP_RESERVE: dict[str, int] = {
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
     return f"{b / 1024**3:.1f}GB"
+
+
+def get_iogpu_wired_limit_bytes() -> int:
+    """Read the kernel's `iogpu.wired_limit_mb` sysctl in bytes.
+
+    Returns 0 when the value is unset (`0` in sysctl means "use the system
+    default", typically ~75% of RAM) or when the read fails. Callers
+    should treat 0 as "limit unknown / not enforced" and fall back to a
+    different source (e.g. mx.device_info()'s working set size).
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "iogpu.wired_limit_mb"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value_mb = int(out.stdout.strip())
+        if value_mb <= 0:
+            return 0
+        return value_mb * 1024**2
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0
+
+
+def _get_max_metal_working_set_bytes() -> int:
+    """Apple's default Metal cap as reported by MLX (~75% of RAM).
+
+    `mx.set_wired_limit` refuses any value above this when the kernel
+    iogpu.wired_limit_mb is unset (= 0).
+    """
+    try:
+        info = mx.device_info()
+        size = int(info.get("max_recommended_working_set_size", 0) or 0)
+        return max(0, size)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def get_effective_metal_cap_bytes() -> int:
+    """Effective per-process Metal allocation cap.
+
+    Uses the kernel iogpu.wired_limit_mb when explicitly set (> 0).
+    Otherwise falls back to Apple's max_recommended_working_set_size.
+    This is the value above which `mx.set_wired_limit` will reject the
+    request, so callers should clamp against it before calling MLX.
+    """
+    sysctl_cap = get_iogpu_wired_limit_bytes()
+    if sysctl_cap > 0:
+        return sysctl_cap
+    return _get_max_metal_working_set_bytes()
+
+
+def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
+    """Try to raise Metal wired limit for this process to `desired_bytes`.
+
+    Returns (applied_bytes, previous_bytes). `applied_bytes` is what we
+    actually told MLX (clamped to the kernel iogpu.wired_limit_mb if it
+    is lower); `previous_bytes` is what MLX reports the prior limit was,
+    or None on failure / older macOS where the call is unavailable.
+
+    Emits a WARNING when the kernel sysctl caps us below `desired_bytes`
+    so the user sees the hint in logs in addition to the admin UI red
+    banner.
+
+    `mx.set_wired_limit` raises when asked for more than the kernel
+    sysctl allows, so we clamp before calling.
+    """
+    if desired_bytes <= 0:
+        return 0, None
+    effective_cap = get_effective_metal_cap_bytes()
+    capped = effective_cap > 0 and effective_cap < desired_bytes
+    applied = effective_cap if capped else desired_bytes
+    try:
+        previous = mx.set_wired_limit(applied)
+        if capped:
+            source = (
+                "kernel iogpu.wired_limit_mb"
+                if get_iogpu_wired_limit_bytes() > 0
+                else "Apple max_recommended_working_set_size"
+            )
+            logger.warning(
+                "Metal cap (%s, %s) is below the oMLX static ceiling (%s); "
+                "Metal will clamp allocations to the cap and panic if a "
+                "request exceeds it. Raise it with: sudo sysctl "
+                "iogpu.wired_limit_mb=%d",
+                _format_gb(effective_cap),
+                source,
+                _format_gb(desired_bytes),
+                desired_bytes // (1024**2),
+            )
+        return applied, int(previous)
+    except Exception as exc:  # noqa: BLE001
+        # Older macOS (<15) or the API just isn't available. Log + skip.
+        logger.warning(
+            "mx.set_wired_limit(%s) failed; Metal will use its default cap (%s)",
+            _format_gb(applied),
+            exc,
+        )
+        return 0, None
 
 
 class ProcessMemoryEnforcer:
@@ -118,6 +219,10 @@ class ProcessMemoryEnforcer:
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
+        # Last value passed to mx.set_wired_limit (0 if not yet applied
+        # or the call failed). Used by the admin dashboard to surface a
+        # warning when the kernel iogpu.wired_limit_mb is below this.
+        self._metal_wired_limit_request: int = 0
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -147,12 +252,38 @@ class ProcessMemoryEnforcer:
         return self._running
 
     def start(self) -> None:
-        """Start the background enforcement loop."""
+        """Start the background enforcement loop.
+
+        Also raises this process's Metal wired-memory limit to the static
+        ceiling so allocations within ceiling don't bounce off Apple's
+        default ~75% cap. Static ceiling is used (not dynamic) because
+        dynamic shrinks with other-app pressure and would oscillate the
+        Metal limit if used here.
+        """
         if self._running:
             return
         self._running = True
         self._propagate_memory_limit()
         ceiling = self._get_hard_limit_bytes()
+
+        if self._prefill_memory_guard:
+            static_ceiling = self._get_static_ceiling()
+            applied, previous = _apply_metal_wired_limit(static_ceiling)
+            # Store the *desired* limit (= static ceiling) rather than the
+            # post-clamp applied value. The admin UI compares this against
+            # the live iogpu.wired_limit_mb so a kernel cap below the
+            # desired limit triggers the red sysctl-command banner.
+            self._metal_wired_limit_request = static_ceiling
+            if applied > 0:
+                logger.info(
+                    "Metal wired limit raised: %s -> %s "
+                    "(target=%s, iogpu sysctl cap=%s)",
+                    _format_gb(previous or 0),
+                    _format_gb(applied),
+                    _format_gb(static_ceiling),
+                    _format_gb(get_iogpu_wired_limit_bytes()),
+                )
+
         self._task = asyncio.create_task(self._enforcement_loop())
         logger.info(
             f"Process memory enforcer started "
@@ -186,14 +317,28 @@ class ProcessMemoryEnforcer:
         return max(0, omlx_usage + system_available - buffer)
 
     def _get_hard_limit_bytes(self) -> int:
-        """Final hard ceiling = min(static, dynamic).
+        """Final hard ceiling = min(static, dynamic, metal_cap).
+
+        `metal_cap` is the effective Metal allocation cap (kernel
+        iogpu.wired_limit_mb when set, otherwise Apple's
+        max_recommended_working_set_size). Including it here means oMLX
+        never plans allocations above what Metal will actually accept,
+        so users who have not raised iogpu.wired_limit_mb still get a
+        safe (smaller) ceiling rather than a panic.
 
         Returns 0 if the memory guard is disabled (callers treat 0 as
         "no limit").
         """
         if not self._prefill_memory_guard:
             return 0
-        return min(self._get_static_ceiling(), self._get_dynamic_ceiling())
+        candidates = [
+            self._get_static_ceiling(),
+            self._get_dynamic_ceiling(),
+        ]
+        metal_cap = get_effective_metal_cap_bytes()
+        if metal_cap > 0:
+            candidates.append(metal_cap)
+        return min(candidates)
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
