@@ -466,7 +466,6 @@ class TestHardLimitCalculation:
         )
         assert enforcer.memory_guard_tier == "balanced"
 
-
 class TestSingleModelMemoryPressure:
     """Tests for single-model memory pressure handling (Issue #62).
 
