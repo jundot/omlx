@@ -3,12 +3,17 @@
 Base engine interface for oMLX inference.
 """
 
+import asyncio
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
+
+import mlx.core as mx
+
+from omlx.engine_core import get_mlx_executor
 
 
 @dataclass
@@ -324,8 +329,8 @@ class BaseNonStreamingEngine(ABC):
             activity.update(self._sanitize_activity_metadata(updates))
             activity["last_activity_at"] = time.monotonic()
 
-    def _end_activity(self, activity_id: str) -> bool:
-        """End an activity and return True if cache should be cleared."""
+    def _end_activity(self, activity_id: str) -> None:
+        """End an activity."""
         with self._active_lock:
             removed = self._activities.pop(activity_id, None)
             if removed is None:
@@ -335,7 +340,22 @@ class BaseNonStreamingEngine(ABC):
             self._active_count -= 1
             if self._active_count < 0:
                 raise RuntimeError("Active request count became negative")
-            return self._active_count == 0
+
+    async def _finish_activity(self, activity_id: str) -> None:
+        """End an activity and clear the Metal buffer pool.
+
+        Always clears per request. Gating the clear on `_active_count == 0`
+        caused unbounded Metal pool growth under concurrent workloads (#684),
+        because indexing clients keep the active count above zero indefinitely.
+        `mx.synchronize()` is required before `mx.clear_cache()` to avoid
+        Metal buffer races on M3/M4 (#300, #888, #1106).
+        """
+        self._end_activity(activity_id)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            lambda: (mx.synchronize(), mx.clear_cache()),
+        )
 
     def get_activity_snapshot(self) -> Dict[str, Any]:
         """Return active non-streaming operations for admin display."""
