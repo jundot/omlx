@@ -6236,6 +6236,27 @@ class Scheduler:
                 logger.debug("Could not extract model config for memory estimation")
                 return
 
+            # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+            # language-model dimensions under a sub-config. Prefer
+            # ``text_config`` / ``language_config`` / ``llm_config`` when ANY
+            # of them exposes the LM layer count, even if the top-level config
+            # also has one — on some VLM packs (older Gemma-3, certain Llava /
+            # HF auto-wrappers) the top-level field refers to the *vision
+            # encoder*, not the LM, and accepting it silently miscalibrates
+            # the SDPA-peak estimate by a constant factor (a 40-layer LM
+            # wrapped in a 33-layer vision tower under-estimates by ~20 %).
+            # Probe both ``num_hidden_layers`` and the legacy ``n_layer`` alias
+            # so a GPT-style nested config is also picked up. Falls back to the
+            # top-level config only when no sub-config has either field.
+            for sub_attr in ("text_config", "language_config", "llm_config"):
+                sub = getattr(config, sub_attr, None)
+                if sub is not None and (
+                    getattr(sub, "num_hidden_layers", None)
+                    or getattr(sub, "n_layer", None)
+                ):
+                    config = sub
+                    break
+
             # Extract KV cache dimensions
             num_layers = getattr(config, "num_hidden_layers", None) or getattr(
                 config, "n_layer", None
