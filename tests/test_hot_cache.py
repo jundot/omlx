@@ -1045,3 +1045,200 @@ class TestPendingWriteBuffer:
             assert len(loaded_ssd) == 2
         finally:
             mgr.close()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestSSDWriteDrops:
+    """ssd_write_drops counter increments at queue-saturation drop sites."""
+
+    # Mirrors TestPendingWriteBuffer._make_cache_data — small dimensions
+    # so the per-entry footprint is small and predictable for queue tests.
+    def _make_cache_data(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
+        return [
+            (
+                mx.zeros((1, heads, seq_len, head_dim)),
+                mx.zeros((1, heads, seq_len, head_dim)),
+            )
+            for _ in range(num_layers)
+        ]
+
+    # Mirrors TestPendingWriteBuffer._save_block — uses 2 layers, token_count=16
+    # so the entry_size formula `2 * 2 * 1 * 2 * 16 * 16 * 4` calibrates Test A.
+    def _save_block(self, manager, block_hash, model="test-model"):
+        cache_data = self._make_cache_data()
+        return manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name=model,
+            layer_cache_types=["KVCache"] * 2,
+        )
+
+    def test_paged_ssd_cache_stats_default_and_reset(self):
+        """Dataclass: ssd_write_drops defaults to 0 and is zeroed by reset()."""
+        from omlx.cache.stats import PagedSSDCacheStats
+
+        # Default is zero.
+        stats = PagedSSDCacheStats()
+        assert stats.ssd_write_drops == 0
+
+        # reset() returns it to zero from a non-zero state.
+        stats = PagedSSDCacheStats(ssd_write_drops=5, saves=2, loads=3)
+        stats.reset()
+        assert stats.ssd_write_drops == 0
+        # Verify reset() didn't break the existing fields it already handled.
+        assert stats.saves == 0
+        assert stats.loads == 0
+
+    def test_ssd_write_drops_field_round_trips_through_get_stats(self, tmp_path):
+        """The _stats dict value flows through get_stats() AND get_stats_for_model().
+
+        Force a non-zero value into _stats so a missing pass-through in either
+        accessor would leave the dataclass at the default 0 and fail this test.
+        The default-0 case is covered by the dataclass-level test in Task 1;
+        this test exercises the wiring specifically.
+        """
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "wiring_test",
+            max_size_bytes=100 * 1024**2,
+        )
+        try:
+            # Directly poke a non-zero value to test the accessor pass-through
+            # specifically. The real increment sites have their own tests
+            # further down in this class; this test would catch a regression
+            # where a future refactor drops the field from get_stats() or
+            # get_stats_for_model() but leaves the _stats dict key alone.
+            mgr._stats["ssd_write_drops"] = 7
+
+            # Global stats accessor.
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 7, (
+                "get_stats() must pass _stats['ssd_write_drops'] through "
+                "to the dataclass field"
+            )
+
+            # Per-model stats accessor — same wiring, separate code path.
+            # Use any model name; the field is global on the manager.
+            model_stats = mgr.get_stats_for_model("any-model-name")
+            assert model_stats.ssd_write_drops == 7, (
+                "get_stats_for_model() must pass _stats['ssd_write_drops'] "
+                "through to the dataclass field"
+            )
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_hot_eviction_queue_full(self, tmp_path):
+        """Site 1: hot-cache eviction → put_nowait raises queue.Full → drop += 1.
+
+        Patches the real queue's put_nowait to always raise queue.Full,
+        guaranteeing the drop path fires on the first eviction without any
+        dependency on the writer thread's drain rate.
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
+        # entry_size matches the small-dimension helpers above (num_layers=2,
+        # K+V=2 tensors, batch=1, heads=2, seq=16, head_dim=16, float32=4).
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100  # holds exactly 2 entries
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_hot_eviction_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            with patch.object(
+                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+            ):
+                self._save_block(mgr, b"qf_drop_block_00")
+                self._save_block(mgr, b"qf_drop_block_01")
+                # save_02 evicts block 00 → _enqueue_ssd_write → put_nowait
+                # raises queue.Full → drop fires, cleanup runs.
+                self._save_block(mgr, b"qf_drop_block_02")
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            assert stats.errors == 0  # drops are distinct from errors
+
+            # Block 00 was the one being enqueued when put_nowait raised.
+            # Cleanup must have removed it from both pending structures.
+            with mgr._pending_write_hashes_lock:
+                assert b"qf_drop_block_00" not in mgr._pending_write_buffers
+                assert b"qf_drop_block_00" not in mgr._pending_write_hashes
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_cold_store_preflight(self, tmp_path):
+        """Site 2: save_block preflight _write_queue.full() guard.
+
+        Hot cache disabled. Patches the queue's `full()` method to return
+        True so the preflight short-circuits on the first save. No real
+        queue manipulation, no writer-thread race, no risk of crashing the
+        writer with a malformed sentinel.
+        """
+        from unittest.mock import patch
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_cold_preflight_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,  # hot cache disabled → cold-store path
+        )
+        try:
+            with patch.object(mgr._write_queue, "full", return_value=True):
+                cache_data = self._make_cache_data()
+                ok = mgr.save_block(
+                    block_hash=b"cold_preflight_drop_00",
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+                assert ok is False
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            assert stats.errors == 0
+            # Site 2 is a preflight rejection — no index/buffer state was
+            # created, so nothing to assert on cleanup.
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_cold_store_late_exception(self, tmp_path):
+        """Site 3: save_block put_nowait raises queue.Full after preflight passes.
+
+        Hot cache disabled. put_nowait is patched to raise queue.Full even
+        though _write_queue.full() reports False — forces the late-exception
+        path inside save_block. Cleanup must remove index + pending hashes.
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_cold_late_exception_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+        try:
+            cache_data = self._make_cache_data()
+            block_hash = b"cold_late_drop_00"
+            with patch.object(
+                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+            ):
+                ok = mgr.save_block(
+                    block_hash=block_hash,
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+                assert ok is False
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            # Site 3 cleanup: removed from index and pending hashes.
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+        finally:
+            mgr.close()

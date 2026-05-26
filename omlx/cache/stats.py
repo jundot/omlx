@@ -187,9 +187,13 @@ class PagedSSDCacheStats(BaseCacheStats):
     Extends base stats with storage-specific and hot cache metrics.
     """
 
+    # Operation counters
     saves: int = 0
     loads: int = 0
     errors: int = 0
+    ssd_write_drops: int = 0
+
+    # Storage capacity
     total_size_bytes: int = 0
     max_size_bytes: int = 0
     configured_max_size_bytes: int = 0
@@ -230,6 +234,7 @@ class PagedSSDCacheStats(BaseCacheStats):
         self.saves = 0
         self.loads = 0
         self.errors = 0
+        self.ssd_write_drops = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert stats to dictionary."""
