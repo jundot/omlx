@@ -2340,3 +2340,187 @@ class TestPreloadBlocks:
             assert ssd_manager2._hot_cache_get(bh) is not None
 
         ssd_manager2.close()
+
+
+class TestInlineLRUUnlinks:
+    """LRU eviction must unlink inline on the calling thread, not enqueue
+    ``("unlink", path)`` tasks onto ``_write_queue``.
+
+    The original async-queued design routed eviction unlinks through the
+    same bounded queue that carries pending writes. Under sustained save
+    pressure, the queue saturated, ``save_block``'s pre-eviction
+    ``_write_queue.full()`` short-circuit fired before eviction could
+    run, and the cache stayed permanently full once the queue saturated.
+    Inlining removes the bounded-queue contention.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def _entry_size(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
+        # 2 tensors (K+V) per layer, batch=1, float32=4
+        return num_layers * 2 * 1 * heads * seq_len * head_dim * 4
+
+    def _save_block(self, mgr, mx, block_hash, num_layers=2):
+        cache_data = [
+            (mx.zeros((1, 2, 16, 16)), mx.zeros((1, 2, 16, 16)))
+            for _ in range(num_layers)
+        ]
+        return mgr.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name="test-model",
+            layer_cache_types=["KVCache"] * num_layers,
+        )
+
+    def test_eviction_does_not_enqueue_unlink_tasks(self, tmp_path, mx):
+        """Force eviction; assert no ``("unlink", ...)`` items ever enter
+        ``_write_queue``. Regression for the original async-queued
+        design."""
+        entry_size = self._entry_size()
+        # Room for ~2 entries; the third save forces eviction of the first.
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_eviction",
+            max_size_bytes=max_bytes,
+        )
+
+        # Sentinel: intercept put_nowait and reject any unlink-shaped tuple.
+        original_put_nowait = mgr._write_queue.put_nowait
+        unlink_attempts: list = []
+
+        def guard_put_nowait(item):
+            if isinstance(item, tuple) and item and item[0] == "unlink":
+                unlink_attempts.append(item)
+            return original_put_nowait(item)
+
+        mgr._write_queue.put_nowait = guard_put_nowait  # type: ignore[assignment]
+
+        try:
+            for i in range(5):
+                self._save_block(mgr, mx, f"inline_evict_{i:04d}".encode())
+
+            assert unlink_attempts == [], (
+                "Eviction must unlink inline, not enqueue. Found queued "
+                f"unlink attempts: {unlink_attempts!r}"
+            )
+        finally:
+            mgr.close()
+
+    def test_eviction_frees_capacity_under_pressure(self, tmp_path, mx):
+        """Even when the writer thread is paused (mimicking the
+        saturation scenario), eviction must keep the index size within
+        the configured cap."""
+        entry_size = self._entry_size()
+        max_bytes = entry_size * 2 + 100  # holds exactly 2 entries
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_pressure",
+            max_size_bytes=max_bytes,
+        )
+        try:
+            # Save more entries than the cap allows; eviction must keep
+            # the index within ``max_bytes``.
+            for i in range(8):
+                self._save_block(mgr, mx, f"pressure_{i:04d}".encode())
+
+            # Wait briefly for in-flight writes to settle so the index
+            # accounting reflects post-eviction state.
+            time.sleep(0.05)
+
+            assert mgr._index.total_size <= max_bytes + entry_size, (
+                f"Eviction failed to keep total_size ({mgr._index.total_size}) "
+                f"near cap ({max_bytes})"
+            )
+        finally:
+            mgr.close()
+
+    def test_inline_eviction_burst_is_capped(self, tmp_path, mx):
+        """A large forced eviction is bounded by
+        ``_MAX_INLINE_UNLINKS_PER_SAVE``; deferred entries reinsert into
+        the index so subsequent saves drain the remainder."""
+        from omlx.cache.paged_ssd_cache import _MAX_INLINE_UNLINKS_PER_SAVE
+
+        # Use a large cap initially, then shrink to force a mass-eviction.
+        entry_size = self._entry_size()
+        n_entries = _MAX_INLINE_UNLINKS_PER_SAVE + 16
+        initial_max = entry_size * (n_entries + 2)
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "inline_burst",
+            max_size_bytes=initial_max,
+        )
+        try:
+            for i in range(n_entries):
+                self._save_block(mgr, mx, f"burst_{i:04d}".encode())
+
+            # Wait for writes to flush so file_size in the index matches
+            # what's on disk.
+            time.sleep(0.05)
+            count_before = mgr._index.count
+
+            # Shrink the effective cap dramatically. Next eviction must
+            # cap its inline burst at _MAX_INLINE_UNLINKS_PER_SAVE.
+            mgr._max_size = entry_size  # cap at 1 entry
+
+            # Trigger eviction via a fresh save.
+            self._save_block(mgr, mx, b"burst_trigger___")
+
+            # After one save, the index should have shed at most
+            # _MAX_INLINE_UNLINKS_PER_SAVE entries. The rest must have
+            # been reinserted so subsequent saves can drain them.
+            time.sleep(0.05)
+            count_after = mgr._index.count
+            removed = count_before + 1 - count_after  # +1 for the new save
+            assert removed <= _MAX_INLINE_UNLINKS_PER_SAVE, (
+                f"Inline burst removed {removed} entries (cap "
+                f"{_MAX_INLINE_UNLINKS_PER_SAVE}); ENOSPC-storm protection "
+                f"is not in effect"
+            )
+            assert removed > 0, (
+                "No entries were evicted despite the new save crossing "
+                "the (shrunken) cap"
+            )
+        finally:
+            mgr.close()
+
+    def test_unlink_failure_increments_counter(self, tmp_path, mx):
+        """When ``Path.unlink`` raises ``OSError``, the eviction loop
+        records the failure in ``evict_unlink_failures`` instead of
+        silently dropping the signal."""
+        entry_size = self._entry_size()
+        max_bytes = entry_size + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "unlink_fail",
+            max_size_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, mx, b"unlink_fail_0001")
+            time.sleep(0.05)
+
+            # Patch unlink to raise OSError on the next eviction attempt.
+            from pathlib import Path as _Path
+
+            original_unlink = _Path.unlink
+
+            def boom_unlink(self, *args, **kwargs):
+                raise OSError("simulated unlink failure")
+
+            with patch.object(_Path, "unlink", boom_unlink):
+                # Save a second block; eviction of the first triggers the
+                # patched unlink.
+                self._save_block(mgr, mx, b"unlink_fail_0002")
+                time.sleep(0.05)
+
+            assert mgr._stats["evict_unlink_failures"] >= 1
+        finally:
+            mgr.close()

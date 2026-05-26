@@ -71,6 +71,17 @@ def _compute_max_pending_writes() -> int:
 
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
 
+# Cap on the number of LRU blocks ``_enforce_size_limit_for_new_block`` is
+# allowed to unlink in one inline burst. Eviction normally returns ~1
+# entry; the cap exists for the ENOSPC-recovery path where the disk-usage
+# cache invalidates and the next ``_get_effective_max_size`` call can
+# shrink sharply — ``evict_until_size`` would then return hundreds of
+# entries at once and stall the inference thread on a syscall storm.
+# Deferred-but-not-unlinked entries are reinserted into the index so
+# subsequent saves drain the remainder; bounds per-call latency at the
+# cost of taking multiple saves to fully reconverge.
+_MAX_INLINE_UNLINKS_PER_SAVE = 32
+
 
 # Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
 # semantics change in a way that older blocks become unsafe to load.
@@ -749,6 +760,7 @@ class PagedSSDCacheManager(CacheManager):
             "hits": 0,
             "misses": 0,
             "evictions": 0,
+            "evict_unlink_failures": 0,
             "errors": 0,
             "hot_cache_hits": 0,
             "hot_cache_evictions": 0,
@@ -1206,23 +1218,6 @@ class PagedSSDCacheManager(CacheManager):
 
             if item is None:  # Sentinel for shutdown
                 break
-
-            # Unlink task: tuple ('unlink', file_path). Used to defer LRU file
-            # deletion off the inference thread (see _enforce_size_limit_for_new_block).
-            # Sequential queue processing prevents race with subsequent writes
-            # to the same block_hash (write tasks always queued after unlink).
-            if isinstance(item[0], str) and item[0] == "unlink":
-                _, unlink_path = item
-                try:
-                    if unlink_path.exists():
-                        unlink_path.unlink()
-                        self._stats["evictions"] += 1
-                        logger.debug(f"Evicted SSD cache file (async): {unlink_path}")
-                except FileNotFoundError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"Failed to delete evicted file {unlink_path}: {e}")
-                continue
 
             block_hash, tensors_raw, metadata, file_path = item
             temp_path = None
@@ -2366,24 +2361,61 @@ class PagedSSDCacheManager(CacheManager):
 
         if self._index.total_size > target_size:
             evicted = self._index.evict_until_size(target_size)
-            # Defer file unlink to the writer thread to avoid blocking the
-            # inference thread with N file delete syscalls. Sequential queue
-            # processing keeps unlink ordered before any later write of the
-            # same block_hash. Hot cache is NOT touched here — see
-            # original comment about delete_block() being the only path that
-            # clears both tiers.
-            for metadata in evicted:
+            # Inline unlinks on the calling thread. Eviction typically returns
+            # a single entry per save (the ``evict_until_size`` loop stops as
+            # soon as ``total_size <= target``), so this is one syscall per
+            # save in steady state. The previous design enqueued evicted
+            # paths as ``("unlink", path)`` items onto ``_write_queue`` — the
+            # same bounded queue that carries pending writes — so eviction
+            # could never free queue capacity, only add more work to it.
+            # Combined with the pre-eviction ``_write_queue.full()`` short-
+            # circuit at the top of ``save_block``, that interaction kept the
+            # cache permanently full once the queue saturated. Inline removes
+            # the bounded-queue contention entirely. Hot cache is NOT touched
+            # here — ``delete_block()`` is the only path that clears both
+            # tiers.
+            #
+            # Bounded inline burst. The ENOSPC-recovery path invalidates the
+            # 30 s disk-usage cache, which can shrink the next
+            # ``_get_effective_max_size`` call sharply — ``evict_until_size``
+            # may then return hundreds of entries at once and the inline
+            # loop would stall the inference thread on a syscall storm. Cap
+            # the burst at ``_MAX_INLINE_UNLINKS_PER_SAVE`` and reinsert the
+            # deferred metadata into the index so subsequent saves drain
+            # the remainder. Bounds per-call latency at the cost of taking
+            # multiple saves to fully reconverge.
+            unlinked_count = 0
+            for metadata in evicted[:_MAX_INLINE_UNLINKS_PER_SAVE]:
                 try:
-                    self._write_queue.put_nowait(("unlink", metadata.file_path))
-                except queue.Full:
-                    # Queue saturated — fall back to inline unlink so size
-                    # accounting stays consistent. Rare path.
-                    try:
-                        if metadata.file_path.exists():
-                            metadata.file_path.unlink()
-                            self._stats["evictions"] += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to delete evicted file: {e}")
+                    if metadata.file_path.exists():
+                        metadata.file_path.unlink()
+                    self._stats["evictions"] += 1
+                    unlinked_count += 1
+                except FileNotFoundError:
+                    # Concurrent writer/cleanup beat us to it. Still counts
+                    # as an eviction from the index's perspective.
+                    self._stats["evictions"] += 1
+                    unlinked_count += 1
+                except OSError as e:
+                    # The block has already been removed from the index by
+                    # ``evict_until_size``; surfacing the unlink failure as
+                    # a counter keeps the size accounting honest (an on-disk
+                    # file outside the index can still occupy bytes the
+                    # next ``_get_effective_max_size`` call doesn't see).
+                    self._stats["evict_unlink_failures"] += 1
+                    logger.warning(
+                        f"Failed to delete evicted file {metadata.file_path}: {e}"
+                    )
+            # Reinsert anything we deferred so size accounting reflects the
+            # on-disk reality. Next save will retry.
+            for metadata in evicted[_MAX_INLINE_UNLINKS_PER_SAVE:]:
+                self._index.add(metadata)
+            if unlinked_count < len(evicted):
+                logger.debug(
+                    f"Inline eviction capped at {_MAX_INLINE_UNLINKS_PER_SAVE} "
+                    f"of {len(evicted)} entries; {len(evicted) - unlinked_count} "
+                    f"reinserted for subsequent saves to drain"
+                )
 
     def enforce_size_limit(self) -> int:
         """
