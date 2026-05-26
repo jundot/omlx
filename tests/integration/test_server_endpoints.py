@@ -373,7 +373,7 @@ class TestHealthEndpoint:
         pool_info = data["engine_pool"]
         assert "model_count" in pool_info
         assert "loaded_count" in pool_info
-        assert "max_model_memory" in pool_info
+        assert "final_ceiling" in pool_info
         assert "current_model_memory" in pool_info
 
 
