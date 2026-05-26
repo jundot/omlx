@@ -1911,23 +1911,24 @@ class Scheduler:
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
                 current = max(mx.get_active_memory(), get_phys_footprint())
-                # TEMP DEBUG (#1040 follow-up): per-chunk memory snapshot
-                # for diagnosing whether transient bursts ever exceed the
-                # cap. Remove once the adaptive throttle is validated.
                 _hard = self._memory_hard_limit_bytes
                 _soft = self._memory_limit_bytes
-                logger.info(
-                    "[memcheck:external] rid=%s n=%d processed=%d "
-                    "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
-                    request.request_id,
-                    n_to_process,
-                    processed_tokens,
-                    current / 1024**3,
-                    _soft / 1024**3,
-                    _hard / 1024**3,
-                    "OVER_HARD" if _hard > 0 and current > _hard
-                    else ("OVER_SOFT" if current > _soft else "OK"),
-                )
+                # Only log when crossing the soft watermark — that's the
+                # caution zone where adaptive throttle decisions matter.
+                # Skipped on healthy traffic to keep the log quiet.
+                if current > _soft:
+                    logger.debug(
+                        "[memcheck:external] rid=%s n=%d processed=%d "
+                        "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
+                        request.request_id,
+                        n_to_process,
+                        processed_tokens,
+                        current / 1024**3,
+                        _soft / 1024**3,
+                        _hard / 1024**3,
+                        "OVER_HARD" if _hard > 0 and current > _hard
+                        else "OVER_SOFT",
+                    )
                 if (
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
@@ -2302,24 +2303,23 @@ class Scheduler:
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
             current = max(mx.get_active_memory(), get_phys_footprint())
-            # TEMP DEBUG (#1040 follow-up): per-chunk memory snapshot
-            # for diagnosing whether transient bursts ever exceed the
-            # cap. Remove once the adaptive throttle is validated.
             _hard = self._memory_hard_limit_bytes
             _soft = self._memory_limit_bytes
-            logger.info(
-                "[memcheck:chunked_step] rid=%s n=%d processed=%d/%d "
-                "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
-                state.request.request_id,
-                n,
-                state.tokens_processed,
-                state.total_length - 1,
-                current / 1024**3,
-                _soft / 1024**3,
-                _hard / 1024**3,
-                "OVER_HARD" if _hard > 0 and current > _hard
-                else ("OVER_SOFT" if current > _soft else "OK"),
-            )
+            # Caution-zone-only memcheck log (see external loop counterpart).
+            if current > _soft:
+                logger.debug(
+                    "[memcheck:chunked_step] rid=%s n=%d processed=%d/%d "
+                    "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
+                    state.request.request_id,
+                    n,
+                    state.tokens_processed,
+                    state.total_length - 1,
+                    current / 1024**3,
+                    _soft / 1024**3,
+                    _hard / 1024**3,
+                    "OVER_HARD" if _hard > 0 and current > _hard
+                    else "OVER_SOFT",
+                )
             if (
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
