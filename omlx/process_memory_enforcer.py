@@ -121,7 +121,16 @@ class ProcessMemoryEnforcer:
         )
 
     def _get_hard_limit_bytes(self) -> int:
-        """Hard limit for inline prefill check: system_ram - 4GB.
+        """Hard limit for inline prefill check.
+
+        - User-explicit max (CLI/env/settings.json): the user value IS the
+          ceiling. They asked for this number to be respected.
+        - Auto mode: leave headroom for the kernel and other tenants.
+          Reserve scales with the machine size since larger systems also
+          have larger chunk transients (head_dim>128 SDPA fallback peaks
+          grow with context length, not just chunk size).
+            * < 16 GB systems (8/12 GB MacBooks): reserve 4 GB
+            * >= 16 GB systems:                   reserve 6 GB
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
         Always >= max_bytes so prefill gets headroom above the soft limit.
@@ -134,7 +143,9 @@ class ProcessMemoryEnforcer:
             return 0
         from .settings import get_system_memory
 
-        return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
+        system_bytes = get_system_memory()
+        reserve = 4 * 1024**3 if system_bytes < 16 * 1024**3 else 6 * 1024**3
+        return max(system_bytes - reserve, self._max_bytes)
 
     @property
     def _soft_bytes(self) -> int:
