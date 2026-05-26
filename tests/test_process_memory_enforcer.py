@@ -346,16 +346,29 @@ class TestPrefillMemoryGuardToggle:
 class TestHardLimitCalculation:
     """Tests for _get_hard_limit_bytes calculation."""
 
-    def test_hard_limit_is_system_ram_minus_4gb(self, enforcer):
-        """Hard limit = system_ram - 4GB."""
+    def test_hard_limit_large_system_reserves_6gb(self, enforcer):
+        """>= 16 GB systems reserve 6 GB in auto mode."""
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 96 * 1024**3
             result = enforcer._get_hard_limit_bytes()
-        assert result == 92 * 1024**3
+        assert result == 90 * 1024**3
+
+    def test_hard_limit_small_system_reserves_4gb(self, mock_engine_pool):
+        """< 16 GB systems reserve only 4 GB so small Macs can still load
+        a model + leave a usable prefill budget."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=4 * 1024**3
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 8 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 4 * 1024**3  # max(8-4, 4) = 4
 
     def test_hard_limit_at_least_max_bytes(self, mock_engine_pool):
-        """Hard limit is at least max_bytes (for small systems)."""
-        # 16GB system, 14GB soft limit -> system-4GB = 12GB < 14GB
+        """Hard limit is at least max_bytes when system reserve would push
+        the ceiling below the user's requested limit."""
+        # 16GB system at the cut-off uses 6GB reserve -> 10GB.
+        # max_bytes=14GB is larger, so ceiling stays at 14GB.
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, max_bytes=14 * 1024**3
         )
@@ -373,8 +386,8 @@ class TestHardLimitCalculation:
 
     def test_hard_limit_honors_user_explicit_max(self, mock_engine_pool):
         """When user_explicit_max=True the user value IS the ceiling, even
-        on big systems where system_ram - 4GB would otherwise win. Regression
-        for the case where a 600GB system silently ignored
+        on big systems where system_ram minus reserve would otherwise win.
+        Regression for the case where a 600GB system silently ignored
         OMLX_MAX_PROCESS_MEMORY=28GB and let prefill grow to ~596GB."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
@@ -386,19 +399,19 @@ class TestHardLimitCalculation:
             result = enforcer._get_hard_limit_bytes()
         assert result == 28 * 1024**3
 
-    def test_hard_limit_auto_mode_still_uses_system_minus_4gb(
+    def test_hard_limit_auto_mode_uses_size_aware_reserve(
         self, mock_engine_pool
     ):
-        """user_explicit_max=False (auto) keeps the legacy behavior."""
+        """user_explicit_max=False (auto) uses size-aware reserve."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
             max_bytes=28 * 1024**3,
             user_explicit_max=False,
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3
+            mock_mem.return_value = 96 * 1024**3  # large, reserve=6GB
             result = enforcer._get_hard_limit_bytes()
-        assert result == 92 * 1024**3
+        assert result == 90 * 1024**3
 
 
 class TestSingleModelMemoryPressure:
@@ -557,9 +570,9 @@ class TestMemoryLimitPropagation:
 
         assert scheduler._memory_limit_bytes == 10 * 1024**3
         assert bg._memory_limit_bytes == 10 * 1024**3
-        # hard limit = 96GB - 4GB = 92GB
-        assert scheduler._memory_hard_limit_bytes == 92 * 1024**3
-        assert bg._memory_hard_limit_bytes == 92 * 1024**3
+        # hard limit = 96GB - 6GB = 90GB (>=16GB system reserves 6GB)
+        assert scheduler._memory_hard_limit_bytes == 90 * 1024**3
+        assert bg._memory_hard_limit_bytes == 90 * 1024**3
 
     def test_propagates_on_max_bytes_change(self, enforcer):
         """Propagates updated limits when max_bytes is changed at runtime."""

@@ -140,9 +140,12 @@ class ProcessMemoryEnforcer:
 
         - User-explicit max (CLI/env/settings.json): the user value IS the
           ceiling. They asked for this number to be respected.
-        - Auto mode: system_ram - 4GB so the kernel keeps headroom for
-          itself and prefill gets room above the enforcer's soft/hard
-          watermarks.
+        - Auto mode: leave headroom for the kernel and other tenants.
+          Reserve scales with the machine size since larger systems also
+          have larger chunk transients (head_dim>128 SDPA fallback peaks
+          grow with context length, not just chunk size).
+            * < 16 GB systems (8/12 GB MacBooks): reserve 4 GB
+            * >= 16 GB systems:                   reserve 6 GB
 
         Returns 0 if enforcement is disabled (max_bytes <= 0).
 
@@ -155,7 +158,9 @@ class ProcessMemoryEnforcer:
             return self._max_bytes
         from .settings import get_system_memory
 
-        return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
+        system_bytes = get_system_memory()
+        reserve = 4 * 1024**3 if system_bytes < 16 * 1024**3 else 6 * 1024**3
+        return max(system_bytes - reserve, self._max_bytes)
 
     @property
     def _soft_bytes(self) -> int:

@@ -2406,6 +2406,10 @@ class Scheduler:
                 self._prefill_states.pop(rid, None)
                 self.requests.pop(rid, None)
                 get_prefill_tracker().remove(rid)
+                # Drop Metal cache pool buffers held by the aborted chunk's
+                # forward / mx.eval transients. Without this, enforcer keeps
+                # seeing the burst footprint until the next mx.clear_cache().
+                _sync_and_clear_cache()
                 # Surface the failure to the engine. Without this, the
                 # request is silently dropped and the client hangs.
                 rejected.append(
@@ -4998,6 +5002,9 @@ class Scheduler:
                         )
                         self.requests.pop(request.request_id, None)
                         get_prefill_tracker().remove(request.request_id)
+                        # Drop Metal cache pool buffers held by the aborted
+                        # first chunk's forward / mx.eval transients.
+                        _sync_and_clear_cache()
                         rejected_outputs.append(
                             RequestOutput(
                                 request_id=request.request_id,
@@ -5046,6 +5053,9 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self.requests.pop(request.request_id, None)
                     get_prefill_tracker().remove(request.request_id)
+                    # Drop Metal cache pool buffers held by the aborted
+                    # chunk's forward / mx.eval transients.
+                    _sync_and_clear_cache()
                     rejected_outputs.append(
                         RequestOutput(
                             request_id=request.request_id,
