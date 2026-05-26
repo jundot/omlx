@@ -1055,6 +1055,28 @@ def get_system_memory_info() -> dict:
     except Exception:
         omlx_phys_footprint_bytes = 0
 
+    # Effective Metal cap = sysctl iogpu.wired_limit_mb when set, else
+    # Apple's max_recommended_working_set_size (~75% of RAM). The admin UI
+    # compares this against the value oMLX wanted at start (static
+    # ceiling) and warns when the cap is below the request.
+    try:
+        from ..process_memory_enforcer import get_effective_metal_cap_bytes
+
+        iogpu_wired_limit_bytes = int(get_effective_metal_cap_bytes())
+    except Exception:
+        iogpu_wired_limit_bytes = 0
+    omlx_wired_limit_request_bytes = 0
+    try:
+        from ..server import _server_state
+
+        enforcer = getattr(_server_state, "process_memory_enforcer", None)
+        if enforcer is not None:
+            omlx_wired_limit_request_bytes = int(
+                getattr(enforcer, "_metal_wired_limit_request", 0) or 0
+            )
+    except Exception:
+        pass
+
     return {
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
@@ -1062,6 +1084,8 @@ def get_system_memory_info() -> dict:
         "auto_limit_formatted": format_size(auto_limit_bytes),
         "available_bytes": available_bytes,
         "omlx_phys_footprint_bytes": omlx_phys_footprint_bytes,
+        "iogpu_wired_limit_bytes": iogpu_wired_limit_bytes,
+        "omlx_wired_limit_request_bytes": omlx_wired_limit_request_bytes,
     }
 
 
@@ -2708,6 +2732,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "auto_model_memory": memory_info["auto_limit_formatted"],
             "available_memory_bytes": memory_info["available_bytes"],
             "omlx_phys_footprint_bytes": memory_info["omlx_phys_footprint_bytes"],
+            "iogpu_wired_limit_bytes": memory_info["iogpu_wired_limit_bytes"],
+            "omlx_wired_limit_request_bytes": memory_info[
+                "omlx_wired_limit_request_bytes"
+            ],
             "ssd_total_bytes": disk_info["total_bytes"],
             "ssd_total": disk_info["total_formatted"],
         },

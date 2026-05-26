@@ -321,6 +321,7 @@
   "settings.resource.guard_tier.aggressive": "Aggressive",
   "settings.resource.guard_tier.description_template": "Selecting {tier} lets oMLX use up to {ceiling_gb} GB of memory, including model weights and KV cache.",
   "settings.resource.guard_tier.breakdown_dynamic": "* System memory {total}, currently available {available}, safety buffer {buffer} ({tier})",
+  "settings.resource.guard_tier.wired_limit_warning": "Kernel iogpu.wired_limit_mb is only {kernel} GB but oMLX wants {requested} GB. Allocations above the kernel cap may panic. Run this in Terminal to raise it:",
   "settings.resource.guard_tier.breakdown_static": "* System memory {total}, safety reserve {reserve} ({tier}), max oMLX memory {ceiling}",
   "settings.resource.hot_cache_limit": "熱快取限制（記憶體快取）",
   "settings.resource.hot_cache_description": "頻繁存取的 KV 快取區塊的記憶體快取。",

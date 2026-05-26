@@ -326,12 +326,31 @@
                                 <!-- Memory Guard + Tier -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                        </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
                                         <p class="text-xs text-neutral-500 mt-1"
                                            x-show="globalSettings.memory.prefill_memory_guard"
                                            x-text="memoryGuardTierDescription"></p>
-                                        <p class="text-xs text-neutral-400 mt-0.5"
+                                        <template x-if="globalSettings.memory.prefill_memory_guard && memoryGuardShowWiredLimitWarning">
+                                            <div class="mt-1">
+                                                <p class="text-xs font-bold text-red-600"
+                                                   x-html="DOMPurify.sanitize(memoryGuardWiredLimitWarningHTML)"></p>
+                                                <div class="flex items-center justify-between gap-2 mt-1 px-3 py-2 bg-code rounded-md">
+                                                    <code class="text-xs font-mono text-fg break-all" x-text="memoryGuardWiredLimitCommand"></code>
+                                                    <button type="button"
+                                                            @click="copyWiredLimitCommand()"
+                                                            :class="wiredLimitCopied ? 'text-green-500' : 'text-fg-tertiary hover:text-fg'"
+                                                            class="transition-colors flex-shrink-0"
+                                                            :title="wiredLimitCopied ? 'Copied' : 'Copy'">
+                                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </template>
+                                        <p class="text-xs text-neutral-400 mt-1"
                                            x-show="globalSettings.memory.prefill_memory_guard"
                                            x-html="DOMPurify.sanitize(memoryGuardBreakdownHTML)"></p>
                                     </div>

@@ -467,6 +467,124 @@ class TestHardLimitCalculation:
         assert enforcer.memory_guard_tier == "balanced"
 
 
+class TestMetalWiredLimit:
+    """enforcer.start() raises the per-process Metal wired memory limit
+    via mx.set_wired_limit so allocations within the ceiling don't bounce
+    off Apple's default cap.
+    """
+
+    def test_start_calls_set_wired_limit_with_static_ceiling(
+        self, mock_engine_pool
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=48 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=64 * 1024**3,  # cap above static ceiling
+        ), patch(
+            "omlx.process_memory_enforcer.mx"
+        ) as mock_mx, patch.object(
+            asyncio, "create_task", return_value=MagicMock()
+        ):
+            mock_mx.set_wired_limit.return_value = 36 * 1024**3
+            enforcer.start()
+        # balanced @ 48 GB => static_ceiling = 40 GB
+        mock_mx.set_wired_limit.assert_called_once_with(40 * 1024**3)
+        # Stored value is the desired ceiling (not the post-clamp value)
+        # so the admin UI can detect a kernel cap that's below the
+        # request and surface the sysctl-raise hint.
+        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+
+    def test_start_clamps_to_effective_cap_when_lower(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="aggressive"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=42 * 1024**3,  # cap < static ceiling
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=42 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.mx"
+        ) as mock_mx, patch.object(
+            asyncio, "create_task", return_value=MagicMock()
+        ):
+            mock_mx.set_wired_limit.return_value = 48 * 1024**3
+            enforcer.start()
+        # aggressive @ 64 GB static = 58 GB, clamped to cap 42 GB
+        mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
+        # Desired (58 GB) is stored, not the post-clamp 42 GB.
+        assert enforcer._metal_wired_limit_request == 58 * 1024**3
+
+    def test_start_clamps_to_apple_default_when_sysctl_unset(
+        self, mock_engine_pool
+    ):
+        """sysctl=0 path: fall back to mx.device_info()'s working set size."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=512 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=128 * 1024**3,  # Apple default below static ceiling
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=0,  # sysctl unset; cap comes from working set
+        ), patch(
+            "omlx.process_memory_enforcer.mx"
+        ) as mock_mx, patch.object(
+            asyncio, "create_task", return_value=MagicMock()
+        ):
+            mock_mx.set_wired_limit.return_value = 0
+            enforcer.start()
+        # balanced @ 512 GB static = 504 GB, clamped to working set 128 GB
+        mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
+        assert enforcer._metal_wired_limit_request == 504 * 1024**3
+
+    def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
+        """Older macOS (<15) raises on the call; enforcer keeps going."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=48 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=0,
+        ), patch(
+            "omlx.process_memory_enforcer.mx"
+        ) as mock_mx, patch.object(
+            asyncio, "create_task", return_value=MagicMock()
+        ):
+            mock_mx.set_wired_limit.side_effect = RuntimeError("unsupported")
+            enforcer.start()  # must not raise
+        # We store the desired static_ceiling even when the call fails,
+        # so the admin UI can still surface a warning.
+        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+
+    def test_start_skips_when_guard_disabled(self, mock_engine_pool):
+        """Guard off means we should not touch Metal limits either."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch(
+            "omlx.process_memory_enforcer.mx"
+        ) as mock_mx, patch.object(
+            asyncio, "create_task", return_value=MagicMock()
+        ):
+            enforcer.start()
+        mock_mx.set_wired_limit.assert_not_called()
+
+
 class TestSingleModelMemoryPressure:
     """Tests for single-model memory pressure handling (Issue #62).
 
