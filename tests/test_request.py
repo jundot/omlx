@@ -391,6 +391,8 @@ class TestRequestOutput:
         assert output.output_text == ""
         assert output.finished is False
         assert output.finish_reason is None
+        assert output.prefill_duration == 0.0
+        assert output.generation_duration == 0.0
 
     def test_with_tokens(self):
         """Test RequestOutput with tokens."""

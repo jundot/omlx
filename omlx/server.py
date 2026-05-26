@@ -233,6 +233,24 @@ class ServerState:
 _server_state: ServerState = ServerState()
 
 
+def _output_timing(output: object, field: str) -> float:
+    """Return a non-negative timing value from an engine output."""
+    value = getattr(output, field, 0.0) or 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _generation_duration_for_metrics(output: object, elapsed: float) -> float:
+    """Prefer engine timing, falling back to elapsed minus TTFT."""
+    generation_duration = _output_timing(output, "generation_duration")
+    if generation_duration > 0:
+        return generation_duration
+    prefill_duration = _output_timing(output, "prefill_duration")
+    return max(0.0, elapsed - prefill_duration)
+
+
 def get_server_state() -> ServerState:
     """Get the global server state."""
     return _server_state
@@ -1992,6 +2010,8 @@ async def create_completion(
         total_completion_tokens = 0
         total_prompt_tokens = 0
         total_cached_tokens = 0
+        total_prefill_duration = 0.0
+        total_generation_duration = 0.0
 
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
             request.temperature, request.top_p, request.model,
@@ -2028,8 +2048,12 @@ async def create_completion(
             total_completion_tokens += output.completion_tokens
             total_prompt_tokens += output.prompt_tokens
             total_cached_tokens += output.cached_tokens
+            total_prefill_duration += _output_timing(output, "prefill_duration")
+            total_generation_duration += _output_timing(output, "generation_duration")
 
         elapsed = time.perf_counter() - start_time
+        if total_generation_duration <= 0:
+            total_generation_duration = max(0.0, elapsed - total_prefill_duration)
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
         logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}")
 
@@ -2037,7 +2061,8 @@ async def create_completion(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=total_cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=total_prefill_duration,
+            generation_duration=total_generation_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
 
@@ -2337,7 +2362,8 @@ async def create_chat_completion(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=_output_timing(output, "prefill_duration"),
+            generation_duration=_generation_duration_for_metrics(output, elapsed),
             model_id=resolved_model,
         )
 
@@ -3644,7 +3670,8 @@ async def create_anthropic_message(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=_output_timing(output, "prefill_duration"),
+            generation_duration=_generation_duration_for_metrics(output, elapsed),
             model_id=resolved_model,
         )
 
@@ -4054,7 +4081,8 @@ async def create_response(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=_output_timing(output, "prefill_duration"),
+            generation_duration=_generation_duration_for_metrics(output, elapsed),
             model_id=resolved_model,
         )
 

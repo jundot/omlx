@@ -54,6 +54,8 @@ class MockGenerationOutput:
     finished: bool = True
     tool_calls: Optional[List[Dict[str, Any]]] = None
     cached_tokens: int = 0
+    prefill_duration: float = 0.0
+    generation_duration: float = 0.0
 
 
 class MockEmbeddingEngineImpl(EmbeddingEngine):
@@ -559,6 +561,38 @@ class TestResponsesEndpoint:
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
 
+    def test_responses_records_prefill_metrics(self, client, mock_llm_engine):
+        """Non-streaming Responses API requests should record engine TTFT."""
+        from omlx.server_metrics import get_server_metrics, reset_server_metrics
+
+        reset_server_metrics()
+        try:
+            mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+                text="Responses API response.",
+                prompt_tokens=100,
+                completion_tokens=20,
+                cached_tokens=25,
+                prefill_duration=0.5,
+                generation_duration=1.0,
+                finish_reason="stop",
+                finished=True,
+            ))
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "input": "Metric prompt",
+                },
+            )
+
+            assert response.status_code == 200
+            snapshot = get_server_metrics().get_snapshot(model_id="test-model")
+            assert snapshot["avg_prefill_tps"] == pytest.approx(150.0)
+            assert snapshot["avg_generation_tps"] == pytest.approx(20.0)
+        finally:
+            reset_server_metrics()
+
 
 class TestModelsStatusEndpoint:
     """Tests for the /v1/models/status endpoint."""
@@ -644,6 +678,36 @@ class TestCompletionEndpoint:
         data = response.json()
         assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
 
+    def test_completion_records_prefill_metrics(self, client, mock_llm_engine):
+        """Non-streaming completions should contribute engine TTFT to server metrics."""
+        from omlx.server_metrics import get_server_metrics, reset_server_metrics
+
+        reset_server_metrics()
+        try:
+            mock_llm_engine.generate = AsyncMock(return_value=MockGenerationOutput(
+                text="Generated response.",
+                prompt_tokens=80,
+                completion_tokens=10,
+                cached_tokens=20,
+                prefill_duration=0.5,
+                generation_duration=1.0,
+            ))
+
+            response = client.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "Metric prompt",
+                },
+            )
+
+            assert response.status_code == 200
+            snapshot = get_server_metrics().get_snapshot(model_id="test-model")
+            assert snapshot["avg_prefill_tps"] == pytest.approx(120.0)
+            assert snapshot["avg_generation_tps"] == pytest.approx(10.0)
+        finally:
+            reset_server_metrics()
+
 
 class TestChatCompletionEndpoint:
     """Tests for the /v1/chat/completions endpoint."""
@@ -721,6 +785,38 @@ class TestChatCompletionEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
+
+    def test_chat_completion_records_prefill_metrics(self, client, mock_llm_engine):
+        """Non-streaming chat should contribute engine TTFT to server metrics."""
+        from omlx.server_metrics import get_server_metrics, reset_server_metrics
+
+        reset_server_metrics()
+        try:
+            mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+                text="Chat response.",
+                prompt_tokens=100,
+                completion_tokens=20,
+                cached_tokens=25,
+                prefill_duration=0.5,
+                generation_duration=1.0,
+                finish_reason="stop",
+                finished=True,
+            ))
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Metric prompt"}],
+                },
+            )
+
+            assert response.status_code == 200
+            snapshot = get_server_metrics().get_snapshot(model_id="test-model")
+            assert snapshot["avg_prefill_tps"] == pytest.approx(150.0)
+            assert snapshot["avg_generation_tps"] == pytest.approx(20.0)
+        finally:
+            reset_server_metrics()
 
     def test_chat_completion_sanitizes_reasoning_tool_call_markup(self, client, mock_llm_engine):
         """Thinking-only tool calls should become structured tool_calls without leaked markup."""
@@ -819,6 +915,39 @@ class TestAnthropicMessagesEndpoint:
         )
 
         assert response.status_code == 200
+
+    def test_anthropic_messages_records_prefill_metrics(self, client, mock_llm_engine):
+        """Non-streaming Anthropic messages should record engine TTFT."""
+        from omlx.server_metrics import get_server_metrics, reset_server_metrics
+
+        reset_server_metrics()
+        try:
+            mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
+                text="Anthropic response.",
+                prompt_tokens=90,
+                completion_tokens=15,
+                cached_tokens=30,
+                prefill_duration=0.5,
+                generation_duration=1.0,
+                finish_reason="stop",
+                finished=True,
+            ))
+
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "test-model",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Metric prompt"}],
+                },
+            )
+
+            assert response.status_code == 200
+            snapshot = get_server_metrics().get_snapshot(model_id="test-model")
+            assert snapshot["avg_prefill_tps"] == pytest.approx(120.0)
+            assert snapshot["avg_generation_tps"] == pytest.approx(15.0)
+        finally:
+            reset_server_metrics()
 
     def test_anthropic_messages_sanitize_thinking_tool_call_markup(self, client, mock_llm_engine):
         """Anthropic thinking blocks should not expose raw tool-call markup."""

@@ -35,6 +35,9 @@ class GenerationOutput:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Timing
+    prefill_duration: float = 0.0
+    generation_duration: float = 0.0
 
 
 class BaseEngine(ABC):

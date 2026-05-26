@@ -368,6 +368,28 @@ class TestRequestOutputCollectorMergeOutputs:
         assert result.output_token_ids == [100, 101, 102]  # Uses latest
         assert result.completion_tokens == 3  # Uses latest
 
+    def test_merge_preserves_timing(self):
+        """Test _merge_outputs carries first TTFT and latest generation time."""
+        collector = RequestOutputCollector()
+
+        existing = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[100],
+            prefill_duration=0.25,
+            generation_duration=0.1,
+        )
+        new = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[101],
+            prefill_duration=0.25,
+            generation_duration=0.4,
+        )
+
+        result = collector._merge_outputs(existing, new)
+
+        assert result.prefill_duration == 0.25
+        assert result.generation_duration == 0.4
+
     def test_merge_preserves_finished_status(self):
         """Test _merge_outputs preserves finished status."""
         collector = RequestOutputCollector()

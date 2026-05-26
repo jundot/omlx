@@ -697,6 +697,46 @@ class TestSchedulerStatistics:
         assert stats["num_running"] == 0
 
 
+class TestSchedulerResponseTiming:
+    """Tests for timing metadata on generated outputs."""
+
+    def test_process_batch_response_adds_timing(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """RequestOutput should expose TTFT and decode duration."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        monkeypatch.setattr("omlx.scheduler.time.monotonic", lambda: 12.5)
+        monkeypatch.setattr(scheduler, "_get_detokenizer", lambda _request_id: None)
+
+        request = Request(
+            request_id="req-timing",
+            prompt="Prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+            prefill_started_at=8.0,
+            generation_started_at=10.0,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        response = type(
+            "Resp",
+            (),
+            {"uid": 99, "token": 42, "finish_reason": None},
+        )()
+
+        outputs, finished_ids = scheduler._process_batch_responses([response])
+
+        assert finished_ids == set()
+        assert outputs[0].prefill_duration == pytest.approx(4.5)
+        assert outputs[0].generation_duration == pytest.approx(2.5)
+
+
 class TestSchedulerReset:
     """Tests for Scheduler reset methods."""
 

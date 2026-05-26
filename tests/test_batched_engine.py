@@ -42,6 +42,8 @@ class FakeStreamingCore:
             finish_reason=None,
             tool_calls=None,
             cached_tokens=0,
+            prefill_duration=0.25,
+            generation_duration=0.5,
         )
 
     async def abort_request(self, request_id):
@@ -63,6 +65,8 @@ class TestGenerationOutput:
         assert output.new_text == ""
         assert output.finished is True
         assert output.tool_calls is None
+        assert output.prefill_duration == 0.0
+        assert output.generation_duration == 0.0
 
     def test_custom_values(self):
         """Test GenerationOutput with custom values."""
@@ -75,6 +79,8 @@ class TestGenerationOutput:
             new_text="partial",
             finished=False,
             tool_calls=[{"name": "test_tool", "arguments": "{}"}],
+            prefill_duration=0.25,
+            generation_duration=0.5,
         )
 
         assert output.text == "Generated text"
@@ -85,6 +91,8 @@ class TestGenerationOutput:
         assert output.new_text == "partial"
         assert output.finished is False
         assert output.tool_calls == [{"name": "test_tool", "arguments": "{}"}]
+        assert output.prefill_duration == 0.25
+        assert output.generation_duration == 0.5
 
     def test_streaming_output(self):
         """Test GenerationOutput for streaming use case."""

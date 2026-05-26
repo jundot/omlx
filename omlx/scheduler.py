@@ -4705,6 +4705,9 @@ class Scheduler:
                 )
                 break
 
+            if request.prefill_started_at is None:
+                request.prefill_started_at = time.monotonic()
+
             # Mark as Harmony model if applicable (before think detection)
             if self._is_harmony_model:
                 request.is_harmony_model = True
@@ -5213,6 +5216,13 @@ class Scheduler:
                 continue
 
             request.last_activity_at = step_now
+            if request.first_token_at is None:
+                request.first_token_at = step_now
+
+            prefill_started_at = request.prefill_started_at or request.arrival_time
+            prefill_duration = max(0.0, request.first_token_at - prefill_started_at)
+            generation_started_at = request.generation_started_at or request.first_token_at
+            generation_duration = max(0.0, step_now - generation_started_at)
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -5312,6 +5322,8 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                prefill_duration=prefill_duration,
+                generation_duration=generation_duration,
                 cached_tokens=request.cached_tokens,
             )
 
@@ -5778,6 +5790,9 @@ class Scheduler:
             # Reset scheduling state
             request.status = RequestStatus.WAITING
             request.batch_uid = None
+            request.prefill_started_at = None
+            request.generation_started_at = None
+            request.first_token_at = None
 
             # Reset cache state
             request.prompt_cache = None

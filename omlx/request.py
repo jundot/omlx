@@ -123,6 +123,8 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     generation_started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
+    first_token_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration
@@ -262,6 +264,8 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    prefill_duration: float = 0.0
+    generation_duration: float = 0.0
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None

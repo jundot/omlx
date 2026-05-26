@@ -513,6 +513,8 @@ class BatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            prefill_duration=output.prefill_duration,
+            generation_duration=output.generation_duration,
         )
 
     async def stream_generate(
@@ -613,6 +615,8 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    prefill_duration=output.prefill_duration,
+                    generation_duration=output.generation_duration,
                 )
         except GeneratorExit:
             # Client disconnected
