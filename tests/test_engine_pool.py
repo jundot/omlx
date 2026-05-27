@@ -705,7 +705,10 @@ class TestEnginePoolAsync:
 
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
-        scheduler_config = SchedulerConfig(completion_batch_size=6)
+        scheduler_config = SchedulerConfig(
+            completion_batch_size=6,
+            embedding_batch_size=4,
+        )
         pool = _make_pool(
             ceiling=10 * 1024**3,
             scheduler_config=scheduler_config,
@@ -763,6 +766,31 @@ class TestEnginePoolAsync:
             trust_remote_code=False,
             scheduler_config=pool._scheduler_config,
         )
+
+    @pytest.mark.asyncio
+    async def test_apply_embedding_batch_size_updates_loaded_embedding_engines(self):
+        """Runtime setting changes should update pool config and loaded embedding engines."""
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.scheduler import SchedulerConfig
+
+        engine = EmbeddingEngine("embed-model", batch_size=8)
+        pool = _make_pool(
+            ceiling=10 * 1024**3,
+            scheduler_config=SchedulerConfig(embedding_batch_size=8),
+        )
+        pool._entries["embed-model"] = EngineEntry(
+            model_id="embed-model",
+            model_path="/tmp/embed-model",
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+            engine=engine,
+        )
+
+        await pool.apply_embedding_batch_size(5)
+
+        assert pool._scheduler_config.embedding_batch_size == 5
+        assert engine.get_stats()["batch_size"] == 5
 
     @pytest.mark.asyncio
     async def test_get_engine_returns_cached(self, pool_with_mock_engines):

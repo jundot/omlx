@@ -49,14 +49,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 with the model repo. Off by default for security (issue #926).
             batch_size: Explicit per-forward input chunk size override.
             scheduler_config: Shared scheduler configuration. Embedding uses
-                completion_batch_size as its per-forward input chunk size.
+                embedding_batch_size as its per-forward input chunk size.
         """
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         if batch_size is None:
             batch_size = (
-                getattr(scheduler_config, "completion_batch_size", 8)
+                getattr(scheduler_config, "embedding_batch_size", 8)
                 if scheduler_config is not None
                 else 8
             )
@@ -138,11 +138,12 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         if not input_items:
             return EmbeddingOutput(embeddings=[], total_tokens=0, dimensions=0)
 
+        batch_size = self._batch_size
         activity_id = self._begin_activity(
             "embedding",
             detail="Embedding",
             total_items=len(input_items),
-            metadata={"input_count": len(input_items), "batch_size": self._batch_size},
+            metadata={"input_count": len(input_items), "batch_size": batch_size},
         )
         try:
             loop = asyncio.get_running_loop()
@@ -150,8 +151,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             total_tokens = 0
             dimensions = 0
 
-            for start in range(0, len(input_items), self._batch_size):
-                batch = input_items[start:start + self._batch_size]
+            for start in range(0, len(input_items), batch_size):
+                batch = input_items[start:start + batch_size]
 
                 def _embed_sync():
                     try:

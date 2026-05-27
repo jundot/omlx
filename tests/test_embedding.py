@@ -757,8 +757,23 @@ class TestEmbeddingEngine:
         assert stats["model_name"] == "test-model"
         assert stats["loaded"] is False
 
-    def test_engine_uses_scheduler_completion_batch_size(self):
+    def test_engine_uses_scheduler_embedding_batch_size(self):
         """Embedding chunk size should follow shared scheduler config."""
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.scheduler import SchedulerConfig
+
+        engine = EmbeddingEngine(
+            "test-model",
+            scheduler_config=SchedulerConfig(
+                completion_batch_size=6,
+                embedding_batch_size=4,
+            ),
+        )
+
+        assert engine.get_stats()["batch_size"] == 4
+
+    def test_engine_ignores_scheduler_completion_batch_size(self):
+        """Completion batching should not affect embedding forward chunks."""
         from omlx.engine.embedding import EmbeddingEngine
         from omlx.scheduler import SchedulerConfig
 
@@ -767,7 +782,7 @@ class TestEmbeddingEngine:
             scheduler_config=SchedulerConfig(completion_batch_size=6),
         )
 
-        assert engine.get_stats()["batch_size"] == 6
+        assert engine.get_stats()["batch_size"] == 8
 
     def test_engine_preserves_positional_batch_size_argument(self):
         """Keep EmbeddingEngine(model, trust_remote_code, batch_size) working."""
@@ -905,6 +920,39 @@ class TestEmbeddingEngine:
             ]
             assert mock_mx.synchronize.call_count == 3
             assert mock_mx.clear_cache.call_count == 3
+
+    def test_engine_snapshots_batch_size_per_request(self):
+        """Live batch-size updates must not skip or duplicate active request inputs."""
+        engine = EmbeddingEngine("test-model", batch_size=2)
+        observed_batches = []
+
+        def embed_side_effect(inputs, **kwargs):
+            observed_batches.append(list(inputs))
+            if len(observed_batches) == 1:
+                engine._batch_size = 1
+            return EmbeddingOutput(
+                embeddings=[[float(text.rsplit("-", 1)[-1])] for text in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            asyncio.run(engine.start())
+            result = asyncio.run(
+                engine.embed([f"text-{i}" for i in range(5)])
+            )
+
+            assert result.embeddings == [[0.0], [1.0], [2.0], [3.0], [4.0]]
+            assert observed_batches == [
+                ["text-0", "text-1"],
+                ["text-2", "text-3"],
+                ["text-4"],
+            ]
 
     def test_concurrent_large_embedding_requests_interleave_between_chunks(self):
         """One large embedding request should not monopolize the MLX executor."""

@@ -36,6 +36,7 @@ class TestSchedulerConfig:
         assert config.max_num_batched_tokens == 8192
         assert config.policy == SchedulingPolicy.FCFS
         assert config.completion_batch_size == 32
+        assert config.embedding_batch_size == 8
         assert config.prefill_step_size == 2048
         assert config.paged_cache_block_size == 256
         assert config.max_cache_blocks is None
@@ -53,6 +54,7 @@ class TestSchedulerConfig:
             max_num_batched_tokens=4096,
             policy=SchedulingPolicy.PRIORITY,
             completion_batch_size=16,
+            embedding_batch_size=12,
             prefill_step_size=1024,
             paged_cache_block_size=128,
             max_cache_blocks=500,
@@ -68,6 +70,7 @@ class TestSchedulerConfig:
         assert config.max_num_batched_tokens == 4096
         assert config.policy == SchedulingPolicy.PRIORITY
         assert config.completion_batch_size == 16
+        assert config.embedding_batch_size == 12
         assert config.prefill_step_size == 1024
         assert config.paged_cache_block_size == 128
         assert config.max_cache_blocks == 500

@@ -134,6 +134,19 @@ class EnginePool:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
 
+    async def apply_embedding_batch_size(self, batch_size: int) -> None:
+        """Apply embedding batch size to future and currently loaded embedding engines."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("embedding batch size must be > 0")
+
+        async with self._lock:
+            self._scheduler_config.embedding_batch_size = batch_size
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                if isinstance(engine, EmbeddingEngine):
+                    engine._batch_size = batch_size
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:

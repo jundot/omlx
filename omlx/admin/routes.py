@@ -215,6 +215,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Scheduler settings
     max_concurrent_requests: int | None = None
+    embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
 
     # Cache settings
@@ -2700,6 +2701,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
+            "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
         },
         "cache": {
@@ -2815,6 +2817,8 @@ async def update_global_settings(
 
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
+    pending_embedding_batch_size: int | None = None
+    previous_embedding_batch_size: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -2935,6 +2939,15 @@ async def update_global_settings(
         global_settings.scheduler.max_concurrent_requests = (
             request.max_concurrent_requests
         )
+
+    # Apply embedding batch size setting (Live for loaded embedding engines)
+    if request.embedding_batch_size is not None:
+        if request.embedding_batch_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid embedding_batch_size: must be > 0",
+            )
+        pending_embedding_batch_size = request.embedding_batch_size
 
     # Apply chunked prefill setting (Live)
     if request.chunked_prefill is not None:
@@ -3217,16 +3230,33 @@ async def update_global_settings(
         global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
 
+    if pending_embedding_batch_size is not None:
+        previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
+        global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
+
     # Validate settings
     errors = global_settings.validate()
     if errors:
+        if previous_embedding_batch_size is not None:
+            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
     try:
         global_settings.save()
     except Exception as e:
+        if previous_embedding_batch_size is not None:
+            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_embedding_batch_size is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_embedding_batch_size(pending_embedding_batch_size)
+        runtime_applied.append("embedding_batch_size")
+        logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
 
     # Build response message
     message = "Settings saved successfully."

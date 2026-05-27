@@ -596,6 +596,8 @@ class SchedulerConfig:
     policy: SchedulingPolicy = SchedulingPolicy.FCFS
     # BatchGenerator settings (passed directly to mlx-lm)
     completion_batch_size: int = 32
+    # Per-forward embedding input chunk size
+    embedding_batch_size: int = 8
     prefill_step_size: int = 2048
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
