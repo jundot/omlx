@@ -5175,6 +5175,7 @@ async def get_benchmark_results(
         "status": run.status,
         "results": run.results,
         "error": run.error_message if run.error_message else None,
+        "upload_state": run.upload_state,
     }
 
 

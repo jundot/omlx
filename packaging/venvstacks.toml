@@ -1,5 +1,14 @@
-# oMLX venvstacks configuration
-# Build portable macOS app with MLX bundled
+# oMLX venvstacks layer template
+#
+# Layer structure + runtime pin + uv resolver settings live here. The
+# actual `requirements = [...]` for the mlx-framework layer is generated
+# at build time by packaging/build.py:_generate_venvstacks_toml() from
+# pyproject.toml's [project] dependencies + [bundle] optional extra, so
+# this file does not list package versions. Single source of truth for
+# Python deps is pyproject.toml.
+#
+# No [[applications]] block: the Swift app is the application surface,
+# so the venvstacks export only ships a runtime + framework layer.
 
 [[runtimes]]
 name = "cpython-3.11"
@@ -12,6 +21,12 @@ platforms = [
 [[frameworks]]
 name = "mlx-framework"
 runtime = "cpython-3.11"
+# Hand-curated for flyto fork (NOT generated). Upstream switched to
+# build.py-generated requirements via _generate_venvstacks_toml(); flyto
+# diverges here because we git-pin dflash-mlx, mlx-vlm, mlx-lm and ship
+# the audio extras inline. Migrating to the generation script is a
+# separate Swift-app-build task -- this file is harmless until anyone
+# tries to actually build the .app bundle from this repo.
 requirements = [
     # Core MLX
     "mlx==0.31.2",
@@ -95,19 +110,6 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
-]
-
-[[applications]]
-name = "omlx-app"
-launch_module = "omlx_app"
-frameworks = ["mlx-framework"]
-requirements = [
-    # PyObjC for native macOS menubar app
-    "pyobjc-core>=10.0",
-    "pyobjc-framework-Cocoa>=10.0",
-]
-platforms = [
-    "macosx_arm64",
 ]
 
 [tool.uv]
