@@ -650,9 +650,15 @@ def build_venvstacks():
     # Step 3: Lock environments (always re-lock to match current wheels)
     # If lock fails due to sdist-only packages (no pre-built wheel on PyPI),
     # _lock_with_sdist_retry() builds them locally and retries automatically.
+    # NOTE: the driver-resolution call below replaces upstream's hardcoded
+    # ``["pipx", "run", "venvstacks"]`` so a host with uvx but no pipx
+    # (flyto dev setup) can build the app bundle. _venvstacks_driver()
+    # already implements the resolver; the upstream commit just forgot to
+    # wire it into the lock / build / export calls.
+    driver = _venvstacks_driver()
     print("\n  Locking environments...")
-    lock_cmd = [
-        "pipx", "run", "venvstacks", "lock",
+    lock_cmd = driver + [
+        "lock",
         str(resolved_toml),
     ] + local_wheels_args
     if version_map:
@@ -664,8 +670,8 @@ def build_venvstacks():
 
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
-    run_cmd([
-        "pipx", "run", "venvstacks", "build",
+    run_cmd(driver + [
+        "build",
         str(resolved_toml),
         "--no-lock",
     ] + local_wheels_args)
@@ -675,8 +681,8 @@ def build_venvstacks():
     if EXPORT_DIR.exists():
         shutil.rmtree(EXPORT_DIR)
 
-    run_cmd([
-        "pipx", "run", "venvstacks", "local-export",
+    run_cmd(driver + [
+        "local-export",
         str(resolved_toml),
         "--output-dir", str(EXPORT_DIR),
     ])
