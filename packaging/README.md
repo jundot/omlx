@@ -56,8 +56,16 @@ No application layer — the Swift app is the application surface.
 
 ## Installation
 
-1. Open the DMG produced by the Swift build.
-2. Drag `oMLX.app` to Applications.
-3. Launch the app (appears in the menubar).
-4. Walk through the first-run wizard (Storage + API key), then Start
+The Swift build (`build.sh release`) produces `build/Stage/oMLX.app`
+directly — no DMG step. To install:
+
+1. Drag `build/Stage/oMLX.app` to `/Applications`, or `open` it
+   in-place to launch from `build/Stage/`.
+2. Launch the app (appears in the menubar).
+3. Walk through the first-run wizard (Storage + API key), then Start
    Server.
+
+> The DMGs on the [Releases](https://github.com/jundot/omlx/releases)
+> page are produced by an off-tree maintainer pipeline, not by anything
+> in this repo. End users follow the Releases install path; this
+> section is for developers building from source.
