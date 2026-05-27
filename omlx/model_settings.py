@@ -650,6 +650,11 @@ class ModelSettingsManager:
     # ==================== Templates ====================
 
     def _load_templates(self) -> None:
+        # Built-in defaults ship inside the package (omlx/default_global_templates.json)
+        # and are merged in at read time — they are NEVER copied to disk and never
+        # appear in `self._templates`. The user file under <base_path> holds
+        # ONLY user-created templates; a missing/empty file is the legitimate
+        # initial state.
         if not self.templates_file.exists():
             self._templates = {}
             return
@@ -684,12 +689,18 @@ class ModelSettingsManager:
             raise
 
     def list_templates(self) -> list[dict]:
+        # Shipped JSON seeds were retired in favor of the client-side preset
+        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # surface is user-created. Callers that distinguish presets from
+        # user templates do so via the preset bundle, not an `is_builtin`
+        # flag on this response.
         with self._lock:
             return [dict(t) for t in self._templates.values()]
 
     def get_template(self, name: str) -> Optional[dict]:
         with self._lock:
-            return dict(self._templates.get(name, {})) or None
+            u = self._templates.get(name)
+            return dict(u) if u is not None else None
 
     def save_template(
         self,
