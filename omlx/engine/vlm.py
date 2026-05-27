@@ -703,6 +703,13 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
+        # loader thread so per-engine inference threads can read them (#1304).
+        from ..utils.model_loading import materialize_lazy_state
+        await loop.run_in_executor(
+            get_mlx_executor(), materialize_lazy_state, self._vlm_model
+        )
+
         _fix_processor_none_pixels(self._processor)
 
         # Initialize vision feature cache

@@ -858,8 +858,8 @@ class TestStoreCacheWorkerSync:
             sched_mod._safe_sync_stream()
 
         assert len(calls) == 1
-        assert calls[0] and calls[0][0] is sched_mod.generation_stream, (
-            f"Worker sync must target generation_stream, got: {calls}"
+        assert calls[0] and calls[0][0] is sched_mod._default_generation_stream, (
+            f"Worker sync must target _default_generation_stream, got: {calls}"
         )
 
     def test_safe_sync_swallows_no_stream_runtime_error(self):

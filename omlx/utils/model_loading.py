@@ -8,6 +8,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
+from mlx.utils import tree_flatten
+
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
@@ -400,6 +403,23 @@ def load_text_model(
     from mlx_lm import load
 
     return load(model_name, tokenizer_config=tokenizer_config)
+
+
+def materialize_lazy_state(model: Any) -> None:
+    """Force-evaluate every mx.array in the model tree on the loader thread.
+
+    mlx-vlm's load() runs `mx.eval(model.language_model.parameters())`, which
+    leaves frozen buffers (RoPE freqs and similar) plus sibling sub-trees
+    (vision_tower, audio_tower) as lazy arrays bound to the loader thread's
+    default stream. When a different thread (e.g. an EngineCore per-engine
+    executor introduced in #1304) later runs forward, mx.eval hits "no
+    Stream(gpu, X) in current thread" because those lazy ops target a stream
+    that only exists on the loader thread. Materializing the whole tree here
+    makes every leaf array safe to read from any thread afterwards.
+    """
+    arrays = [v for _, v in tree_flatten(model) if isinstance(v, mx.array)]
+    if arrays:
+        mx.eval(arrays)
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
