@@ -286,3 +286,30 @@ class TestGrammarCompilerForward:
         vlm.grammar_compiler = None
         engine = _make_dflash(embedded_vlm=vlm)
         assert engine.grammar_compiler is None
+
+
+class TestPrefixCacheEnabledForward:
+    """DFlashEngine must forward prefix_cache_enabled to its embedded target.
+
+    Regression: server.py threads engine.prefix_cache_enabled into the
+    Anthropic-style usage accounting (api/anthropic_utils.py splits
+    prompt tokens into cache_creation / cache_read on it). Before the
+    forward, DFlash-wrapped models silently reported zero cache hits
+    even when the embedded engine was hitting its prefix cache.
+    """
+
+    def test_false_when_no_embedded_engine(self):
+        engine = _make_dflash(embedded_vlm=None)
+        assert engine.prefix_cache_enabled is False
+
+    def test_true_when_embedded_engine_reports_true(self):
+        vlm = MagicMock()
+        vlm.prefix_cache_enabled = True
+        engine = _make_dflash(embedded_vlm=vlm)
+        assert engine.prefix_cache_enabled is True
+
+    def test_false_when_embedded_engine_reports_false(self):
+        vlm = MagicMock()
+        vlm.prefix_cache_enabled = False
+        engine = _make_dflash(embedded_vlm=vlm)
+        assert engine.prefix_cache_enabled is False
