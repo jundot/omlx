@@ -71,7 +71,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         win.title = String(localized: "welcome.window.title",
-                           defaultValue: "Welcome to oMLX",
+                           defaultValue: "Welcome to Flyto MLX",
                            comment: "Window title bar text for the Welcome wizard")
         win.contentViewController = hosting
         win.center()
@@ -345,8 +345,8 @@ final class WelcomeViewModel: ObservableObject {
             case .portConflict(let conflict):
                 lastError = conflict.isOMLX
                     ? String(localized: "welcome.error.port_in_use_omlx",
-                             defaultValue: "Port \(String(config.port)) is already in use (oMLX server already running).",
-                             comment: "Welcome wizard: bind() failed because another oMLX instance owns the port")
+                             defaultValue: "Port \(String(config.port)) is already in use (Flyto MLX server already running).",
+                             comment: "Welcome wizard: bind() failed because another Flyto MLX instance owns the port")
                     : String(localized: "welcome.error.port_in_use",
                              defaultValue: "Port \(String(config.port)) is already in use.",
                              comment: "Welcome wizard: bind() failed because some other process owns the port")
@@ -491,7 +491,7 @@ private struct WelcomeHeader: View {
                 .frame(width: 73, height: 73)
             VStack(spacing: 4) {
                 Text(String(localized: "welcome.header.title",
-                            defaultValue: "Welcome to oMLX",
+                            defaultValue: "Welcome to Flyto MLX",
                             comment: "Main heading shown on the Welcome wizard"))
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
