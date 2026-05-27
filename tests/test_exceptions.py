@@ -267,11 +267,11 @@ class TestEnginePoolExceptions:
         error = ModelTooLargeError(
             model_id="huge-model",
             model_size=100 * 1024**3,
-            max_memory=32 * 1024**3,
+            ceiling=32 * 1024**3,
         )
         assert error.model_id == "huge-model"
         assert error.model_size == 100 * 1024**3
-        assert error.max_memory == 32 * 1024**3
+        assert error.ceiling == 32 * 1024**3
         assert isinstance(error, EnginePoolError)
 
     def test_insufficient_memory_error(self):

@@ -157,8 +157,7 @@ class MockEnginePool:
     def loaded_model_count(self) -> int:
         return 1
 
-    @property
-    def max_model_memory(self) -> int:
+    def _current_ceiling(self) -> int:
         return 32 * 1024 * 1024 * 1024
 
     @property

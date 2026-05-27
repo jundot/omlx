@@ -17,6 +17,22 @@ from omlx.exceptions import (
 )
 
 
+def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
+    """Construct an EnginePool with a stubbed pre-load ceiling callback.
+
+    Pre-load admission ceiling now comes from ProcessMemoryEnforcer via
+    a callback, so tests inject a fake callback that returns the desired
+    ceiling. ``ceiling=None`` (or 0) disables the limit (callback returns
+    0, which engine_pool treats as "no limit").
+    """
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=ceiling: c
+    return pool
+
+
 @pytest.fixture
 def mock_model_dir(tmp_path):
     """Create a mock model directory with multiple models."""
@@ -64,21 +80,21 @@ class TestEnginePoolInit:
 
     def test_init_default_config(self):
         """Test initialization with default config."""
-        pool = EnginePool(max_model_memory=32 * 1024**3)
-        assert pool.max_model_memory == 32 * 1024**3
+        pool = _make_pool(ceiling=32 * 1024**3)
+        assert pool._current_ceiling() == 32 * 1024**3
         assert pool.current_model_memory == 0
         assert pool.model_count == 0
         assert pool.loaded_model_count == 0
 
     def test_init_disabled_memory(self):
         """Test initialization with disabled (None) memory limit."""
-        pool = EnginePool(max_model_memory=None)
-        assert pool.max_model_memory is None
+        pool = _make_pool(ceiling=None)
+        assert pool._current_ceiling() == 0
         assert pool.current_model_memory == 0
 
     def test_model_too_large_skipped_when_disabled(self, small_mock_model_dir):
         """Test that ModelTooLargeError is NOT raised when memory is disabled."""
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool.discover_models(str(small_mock_model_dir))
         # With None (disabled), the size check should be skipped entirely
         # Model loading will fail for other reasons (mock), but ModelTooLargeError
@@ -90,7 +106,7 @@ class TestEnginePoolInit:
 
     def test_discover_models(self, small_mock_model_dir):
         """Test model discovery."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         assert pool.model_count == 2
@@ -99,7 +115,7 @@ class TestEnginePoolInit:
 
     def test_discover_models_with_pinned(self, small_mock_model_dir):
         """Test model discovery with pinned models."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir), pinned_models=["model-a"])
 
         entry = pool.get_entry("model-a")
@@ -116,7 +132,7 @@ class TestDiscoverModelsMerge:
 
     def test_rediscover_preserves_loaded_engine(self, small_mock_model_dir):
         """Test that re-discovery preserves loaded engine state."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Simulate loaded model-a
@@ -142,7 +158,7 @@ class TestDiscoverModelsMerge:
 
     def test_rediscover_removes_stale_unloaded(self, small_mock_model_dir):
         """Test that unloaded models missing from disk are removed."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
         assert "model-a" in pool.get_model_ids()
         assert "model-b" in pool.get_model_ids()
@@ -163,7 +179,7 @@ class TestDiscoverModelsMerge:
         self, small_mock_model_dir
     ):
         """Test that loaded models are kept even if missing from disk."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Simulate loaded model-b
@@ -186,7 +202,7 @@ class TestDiscoverModelsMerge:
 
     def test_rediscover_updates_pinned_flag_on_loaded(self, small_mock_model_dir):
         """Test that pinned flag is updated on loaded models during re-discovery."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Simulate loaded model-a (not pinned)
@@ -212,7 +228,7 @@ class TestEnginePoolErrors:
 
     def test_model_not_found_error(self, small_mock_model_dir):
         """Test ModelNotFoundError when model doesn't exist."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         with pytest.raises(ModelNotFoundError) as exc_info:
@@ -224,14 +240,14 @@ class TestEnginePoolErrors:
     def test_model_too_large_error(self, small_mock_model_dir):
         """Test ModelTooLargeError when model exceeds memory limit."""
         # Set very small memory limit
-        pool = EnginePool(max_model_memory=100)  # 100 bytes
+        pool = _make_pool(ceiling=100)  # 100 bytes
         pool.discover_models(str(small_mock_model_dir))
 
         with pytest.raises(ModelTooLargeError) as exc_info:
             asyncio.run(pool.get_engine("model-a"))
 
         assert exc_info.value.model_id == "model-a"
-        assert exc_info.value.max_memory == 100
+        assert exc_info.value.ceiling == 100
 
 
 class TestEnginePoolStatus:
@@ -239,12 +255,12 @@ class TestEnginePoolStatus:
 
     def test_get_status(self, small_mock_model_dir):
         """Test get_status returns correct information."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir), pinned_models=["model-a"])
 
         status = pool.get_status()
 
-        assert status["max_model_memory"] == 10 * 1024**3
+        assert status["final_ceiling"] == 10 * 1024**3
         assert status["current_model_memory"] == 0
         assert status["model_count"] == 2
         assert status["loaded_count"] == 0
@@ -261,7 +277,7 @@ class TestEnginePoolStatus:
 
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         ids = pool.get_model_ids()
@@ -269,7 +285,7 @@ class TestEnginePoolStatus:
 
     def test_get_loaded_model_ids_empty(self, small_mock_model_dir):
         """Test get_loaded_model_ids when no models loaded."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         assert pool.get_loaded_model_ids() == []
@@ -314,7 +330,7 @@ class TestApplySettingsOverrides:
 
     def test_override_changes_model_type(self, small_mock_model_dir):
         """Test that model_type_override changes entry model_type and engine_type."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Verify auto-detected types
@@ -343,7 +359,7 @@ class TestApplySettingsOverrides:
 
     def test_no_override_leaves_entry_unchanged(self, small_mock_model_dir):
         """Test that None override doesn't change entry types."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         from omlx.model_settings import ModelSettings
@@ -363,7 +379,7 @@ class TestVLMFallback:
     @pytest.mark.asyncio
     async def test_vlm_fallback_to_llm_on_start_failure(self, small_mock_model_dir):
         """Test that VLM loading failure falls back to LLM BatchedEngine."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Force model-a to be VLM type
@@ -402,7 +418,7 @@ class TestVLMFallback:
     @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry = pool.get_entry("model-a")
@@ -421,7 +437,7 @@ class TestVLMFallback:
         self, small_mock_model_dir
     ):
         """Test that force_lm failure for VLM model falls back to VLMBatchedEngine."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Force model-a to be VLM type
@@ -462,7 +478,7 @@ class TestVLMFallback:
     @pytest.mark.asyncio
     async def test_force_lm_no_fallback_for_non_vlm(self, small_mock_model_dir):
         """Test that force_lm failure for non-VLM model still raises."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry = pool.get_entry("model-a")
@@ -483,7 +499,7 @@ class TestEnginePoolLRU:
     @pytest.fixture
     def pool_with_entries(self, small_mock_model_dir):
         """Create pool with mock entries for LRU testing."""
-        pool = EnginePool(max_model_memory=5000)  # 5KB limit
+        pool = _make_pool(ceiling=5000)  # 5KB limit
         pool.discover_models(str(small_mock_model_dir))
         return pool
 
@@ -585,7 +601,7 @@ class TestEnginePoolAsync:
     @pytest.fixture
     def pool_with_mock_engines(self, small_mock_model_dir):
         """Create pool with mocked engine loading."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
         return pool
 
@@ -678,13 +694,25 @@ class TestEnginePoolEviction:
     """Tests for memory-based eviction."""
 
     @pytest.fixture
-    def tight_memory_pool(self, small_mock_model_dir):
-        """Create pool with tight memory limit."""
-        # Model-a is ~1KB (1024 bytes + overhead ~1.1KB)
-        # Model-b is ~2KB (2048 bytes + overhead ~2.1KB)
-        # Set limit to allow each model individually but not both together
-        pool = EnginePool(max_model_memory=2500)  # Allows each but not both
+    def tight_memory_pool(self, small_mock_model_dir, monkeypatch):
+        """Create pool with tight memory limit.
+
+        Pre-load admission compares ``phys_footprint + model_size`` against
+        the ceiling. For byte-sized synthetic ceilings the test must proxy
+        phys_footprint to the pool's tracked weight sum, otherwise the
+        real process phys footprint (~100MB) blows past the 2.5KB ceiling
+        before the first load.
+        """
+        # Model-a is ~1KB, model-b is ~2KB. Ceiling allows each but not both.
+        pool = _make_pool(ceiling=2500)
         pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool.mx.get_active_memory", lambda: 0
+        )
         return pool
 
     @pytest.mark.asyncio
@@ -747,7 +775,7 @@ class TestEnginePoolStatus:
 
     def test_get_status_includes_is_loading(self, small_mock_model_dir):
         """Test get_status includes is_loading field."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         status = pool.get_status()
@@ -762,7 +790,7 @@ class TestEnginePoolTTL:
     @pytest.fixture
     def pool_with_loaded_model(self, small_mock_model_dir):
         """Create pool with a mock-loaded model."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Mock-load model-a
@@ -1028,7 +1056,7 @@ class TestResolveModelId:
 
     def test_direct_match(self, small_mock_model_dir):
         """Test direct model_id match returns immediately."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         result = pool.resolve_model_id("model-a", settings_manager=None)
@@ -1036,7 +1064,7 @@ class TestResolveModelId:
 
     def test_alias_match(self, small_mock_model_dir):
         """Test alias resolution returns real model_id."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
@@ -1051,7 +1079,7 @@ class TestResolveModelId:
 
     def test_no_match_returns_original(self, small_mock_model_dir):
         """Test unresolved name returns original string."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
@@ -1065,7 +1093,7 @@ class TestResolveModelId:
 
     def test_alias_match_no_settings_manager(self, small_mock_model_dir):
         """Test with None settings_manager falls back to direct match only."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         result = pool.resolve_model_id("some-alias", settings_manager=None)
@@ -1073,7 +1101,7 @@ class TestResolveModelId:
 
     def test_provider_prefix_alias_match(self, small_mock_model_dir):
         """Test alias resolution with provider prefix (e.g. omlx/alias)."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
@@ -1088,7 +1116,7 @@ class TestResolveModelId:
 
     def test_provider_prefix_direct_match(self, small_mock_model_dir):
         """Test direct match with provider prefix (e.g. provider/model-a)."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         result = pool.resolve_model_id("provider/model-a", settings_manager=None)
@@ -1096,7 +1124,7 @@ class TestResolveModelId:
 
     def test_provider_prefix_no_match(self, small_mock_model_dir):
         """Test prefix strip still returns original when no match found."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
@@ -1110,7 +1138,7 @@ class TestResolveModelId:
 
     def test_case_insensitive_match(self, small_mock_model_dir):
         """Test case-insensitive fallback when exact match fails."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         result = pool.resolve_model_id("MODEL-A", settings_manager=None)
@@ -1118,7 +1146,7 @@ class TestResolveModelId:
 
     def test_case_insensitive_with_provider_prefix(self, small_mock_model_dir):
         """Test case-insensitive match after stripping provider prefix."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
@@ -1126,7 +1154,7 @@ class TestResolveModelId:
 
     def test_exact_match_preferred_over_case_insensitive(self, small_mock_model_dir):
         """Test exact match takes priority over case-insensitive."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         # Exact match should be returned directly
@@ -1145,7 +1173,7 @@ class TestMemorySettleBarrier:
         (max(2GB, 5% of 5GB) = max(2GB, 0.25GB) = 2GB), the barrier
         requires at least 3GB freed.
         """
-        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool = _make_pool(ceiling=100 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry = pool._entries["model-a"]
@@ -1327,7 +1355,7 @@ class TestMemorySettleBarrier:
         For a 60GB model, 5% = 3GB > 2GB floor, so tolerance = 3GB.
         min_expected_freed = 60GB - 3GB = 57GB.
         """
-        pool = EnginePool(max_model_memory=200 * 1024**3)
+        pool = _make_pool(ceiling=200 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry = pool._entries["model-a"]
@@ -1374,7 +1402,7 @@ class TestMemorySettleBarrier:
         For a 1GB model, 5% = 0.05GB << 2GB, so tolerance = 2GB floor.
         min_expected_freed = max(0, 1GB - 2GB) = 0, settle is trivially true.
         """
-        pool = EnginePool(max_model_memory=100 * 1024**3)
+        pool = _make_pool(ceiling=100 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry = pool._entries["model-a"]
