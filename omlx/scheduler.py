@@ -6066,6 +6066,11 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        # Async store_cache bookkeeping. shutdown() drains these before us,
+        # but clear here too so reset() is safe to call standalone (e.g. tests
+        # or recovery paths) without leaking Request refs through stale futures.
+        self._pending_async_removes.clear()
+        self._inflight_store_futures.clear()
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
@@ -6153,6 +6158,13 @@ class Scheduler:
                     concurrent.futures.wait(inflight, timeout=30.0)
                 self._drain_pending_async_removes()
                 self._store_cache_executor.shutdown(wait=True)
+                # Final drain after executor join. All workers are now done,
+                # so any entries still in _pending_async_removes (skipped by
+                # the first drain because their future hadn't completed yet)
+                # are guaranteed drainable here. Without this, slow worker
+                # finishes between the 30s wait timeout and shutdown(wait=True)
+                # would leave KV cache references pinned on Request objects.
+                self._drain_pending_async_removes()
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")
             self._store_cache_executor = None

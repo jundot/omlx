@@ -720,6 +720,74 @@ class TestSchedulerReset:
         assert len(scheduler.requests) == 0
         assert scheduler.batch_generator is None
 
+    def test_reset_clears_async_store_cache_bookkeeping(
+        self, mock_model, mock_tokenizer
+    ):
+        """reset() must drop _pending_async_removes and _inflight_store_futures.
+
+        Regression for #1459: when a slow async store_cache worker finishes
+        between scheduler.shutdown()'s 30s wait timeout and the subsequent
+        executor.shutdown(wait=True), the deferred _drain_pending_async_removes
+        step that nulls req._extracted_cache never runs again. If reset()
+        leaves these two containers populated, the futures keep Request
+        references alive and the KV cache stays pinned for the rest of the
+        process lifetime. Clearing them in reset() is the second line of
+        defense after shutdown()'s final drain.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_future = MagicMock()
+        scheduler._pending_async_removes.append(
+            (999, "req-leaked", fake_future)
+        )
+        scheduler._inflight_store_futures["req-leaked"] = fake_future
+
+        scheduler.reset()
+
+        assert len(scheduler._pending_async_removes) == 0
+        assert len(scheduler._inflight_store_futures) == 0
+
+    def test_shutdown_drains_after_executor_join(self, mock_model, mock_tokenizer):
+        """shutdown() must drain pending removes again after executor join.
+
+        Regression for #1459. When the 30s `wait()` times out, the first
+        drain skips not-yet-done futures (deque break on `not future.done()`).
+        `executor.shutdown(wait=True)` then joins all workers — by the time
+        it returns, every future is done — but without a second drain those
+        skipped entries stay pinned, keeping the request's KV cache alive
+        for the rest of the process lifetime.
+
+        Asserts: drain runs both before and after executor.shutdown.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+
+        # Seed an inflight future so shutdown() enters the wait branch.
+        scheduler._inflight_store_futures["req-slow"] = MagicMock()
+
+        call_order = []
+        original_drain = scheduler._drain_pending_async_removes
+
+        def record_drain():
+            call_order.append("drain")
+            original_drain()
+
+        def record_executor_shutdown(wait=True):
+            call_order.append("executor_shutdown")
+
+        fake_executor.shutdown.side_effect = record_executor_shutdown
+        scheduler._drain_pending_async_removes = record_drain
+
+        with patch("concurrent.futures.wait"):
+            scheduler.shutdown()
+
+        assert call_order == ["drain", "executor_shutdown", "drain"], (
+            f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        )
+
 
 class TestSchedulerStopTokens:
     """Tests for stop token handling."""
