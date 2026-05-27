@@ -596,54 +596,35 @@ def _venvstacks_driver() -> list[str]:
     """Pick an available venvstacks driver as a command prefix.
 
     Resolution order (first that works wins):
-      1. `venvstacks` directly on PATH — installed via the dev extra in
-         pyproject.toml, fastest path with no extra startup overhead.
-      2. `uvx venvstacks` — uv's pipx-equivalent. Already available to
-         anyone using uv for development setup.
-      3. `pipx run venvstacks` — historical default; works if pipx is
-         installed on the host.
+      1. `<sys.executable> -m venvstacks` when venvstacks is importable
+         from the Python running build.py.
+      2. `uvx venvstacks` — uv's pipx-equivalent.
+      3. `pipx run venvstacks` — historical default.
+      4. `venvstacks` on PATH as a last resort.
 
-    Aborts with a clear remediation message if none are available, so a
-    contributor with neither uv nor pipx nor a dev-installed venvstacks
-    gets actionable guidance instead of a cryptic "command not found".
+    Why -m first: the PATH-installed `venvstacks` script's shebang may
+    point at a dotted interpreter like `.../python3.11`. venvstacks 0.7
+    computes `Path(sys.executable).suffix` to derive the runtime binary
+    extension; on `python3.11` that returns ".11", producing a bogus
+    `bin/python.11` path and breaking `pip --python`. Running via the
+    current interpreter (typically `.../python3`, suffix "") sidesteps
+    the bug. See https://github.com/lmstudio-ai/venvstacks/issues/ for
+    the upstream report.
     """
-    if shutil.which("venvstacks") is not None:
-        return ["venvstacks"]
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import venvstacks"],
+            check=True, capture_output=True,
+        )
+        return [sys.executable, "-m", "venvstacks"]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
     if shutil.which("uvx") is not None:
         return ["uvx", "venvstacks"]
     if shutil.which("pipx") is not None:
         return ["pipx", "run", "venvstacks"]
-    print(
-        "  ✗ No venvstacks driver found. Install with one of:\n"
-        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
-        "      uv sync --dev                (uv-managed venv)\n"
-        "      pipx install venvstacks       (host-global tool)",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def _venvstacks_driver() -> list[str]:
-    """Pick an available venvstacks driver as a command prefix.
-
-    Resolution order (first that works wins):
-      1. `venvstacks` directly on PATH — installed via the dev extra in
-         pyproject.toml, fastest path with no extra startup overhead.
-      2. `uvx venvstacks` — uv's pipx-equivalent. Already available to
-         anyone using uv for development setup.
-      3. `pipx run venvstacks` — historical default; works if pipx is
-         installed on the host.
-
-    Aborts with a clear remediation message if none are available, so a
-    contributor with neither uv nor pipx nor a dev-installed venvstacks
-    gets actionable guidance instead of a cryptic "command not found".
-    """
     if shutil.which("venvstacks") is not None:
         return ["venvstacks"]
-    if shutil.which("uvx") is not None:
-        return ["uvx", "venvstacks"]
-    if shutil.which("pipx") is not None:
-        return ["pipx", "run", "venvstacks"]
     print(
         "  ✗ No venvstacks driver found. Install with one of:\n"
         "      pip install -e \".[dev]\"     (pip-managed venv)\n"
