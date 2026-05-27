@@ -111,6 +111,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "venvstacks>=0.7.0",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -123,6 +124,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "venvstacks>=0.7.0",
 ]
 
 [project.urls]

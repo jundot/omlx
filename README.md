@@ -335,7 +335,7 @@ pytest -m "not slow"
 
 ### macOS App
 
-Requires Python 3.11+ and [venvstacks](https://venvstacks.lmstudio.ai) (`pip install venvstacks`).
+Requires Python 3.11+ and [venvstacks](https://venvstacks.lmstudio.ai). venvstacks is declared as a dev dependency, so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version into your environment. `build.py` also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
 cd packaging
