@@ -17,6 +17,7 @@ import re
 import secrets
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -582,13 +583,19 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     pool._current_model_memory = 0
 
     # Update downloader model directories
-    global _hf_downloader, _ms_downloader
+    global _hf_downloader, _ms_downloader, _oq_manager, _hf_uploader
     if model_dirs:
         primary_dir = model_dirs[0]
         if _hf_downloader is not None:
             _hf_downloader.update_model_dir(primary_dir)
         if _ms_downloader is not None:
             _ms_downloader.update_model_dir(primary_dir)
+
+    # Update components that scan all model directories
+    if _oq_manager is not None:
+        _oq_manager.update_model_dirs(model_dirs)
+    if _hf_uploader is not None:
+        _hf_uploader.update_model_dirs(model_dirs)
 
     # Re-discover models from new directories
     try:
@@ -1106,11 +1113,11 @@ def get_system_memory_info() -> dict:
         and auto_limit_formatted (80% of total).
     """
     try:
-        # macOS: use sysctl to get physical memory
-        import subprocess
-
+        # macOS: use sysctl to get physical memory. Invoke by absolute path —
+        # sysctl lives in /usr/sbin, which isn't on PATH in some headless
+        # launchd contexts (brew services). See issue #1322.
         result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -5170,65 +5177,18 @@ _UPDATE_CACHE_TTL = 3600  # 1 hour
 async def check_update(
     is_admin: bool = Depends(require_admin),
 ):
-    """Check GitHub Releases for newer oMLX version (cached 24h)."""
-    global _update_cache, _update_cache_time
+    """Disabled in flyto-mlx.
 
-    now = time.time()
-    if _update_cache is not None and now - _update_cache_time < _UPDATE_CACHE_TTL:
-        return _update_cache
-
-    no_update = {
+    flyto is a soft-fork on a separate version line (0.4.x) and pulls upstream
+    changes via curated cherry-picks (see docs/upstream-sync.md), not via the
+    in-app update notification. Always reports no update so the dashboard
+    banner never lights up against upstream jundot/omlx tags.
+    """
+    return {
         "update_available": False,
         "latest_version": None,
         "release_url": None,
     }
-
-    try:
-        # Use the releases list (not /releases/latest) and pick the highest
-        # stable PEP 440 tag. Dev/rc tags here have historically been
-        # published with the GitHub prerelease flag unset, which makes
-        # /releases/latest return them as if they were stable.
-        resp = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases",
-            params={"per_page": 20},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            _update_cache = no_update
-            _update_cache_time = now
-            return _update_cache
-
-        data = select_latest_stable_release(resp.json())
-        if data is None:
-            _update_cache = no_update
-            _update_cache_time = now
-            return _update_cache
-
-        latest = data["tag_name"].lstrip("v")
-
-        try:
-            from packaging.version import Version
-
-            update_available = Version(latest) > Version(_omlx_version)
-        except Exception:
-            update_available = False
-
-        if update_available:
-            _update_cache = {
-                "update_available": True,
-                "latest_version": latest,
-                "release_url": data.get("html_url"),
-            }
-        else:
-            _update_cache = no_update
-
-        _update_cache_time = now
-    except Exception:
-        _update_cache = no_update
-        _update_cache_time = now
-
-    return _update_cache
 
 
 # =============================================================================

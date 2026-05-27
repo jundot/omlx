@@ -38,7 +38,7 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
             if not key.startswith(_VLM_TEXT_PREFIX) and prefixed not in quant:
                 extras[prefixed] = val
             elif key.startswith(_VLM_TEXT_PREFIX):
-                short = key[len(_VLM_TEXT_PREFIX):]
+                short = key[len(_VLM_TEXT_PREFIX) :]
                 if short not in quant:
                     extras[short] = val
         if extras:
@@ -71,6 +71,7 @@ def _patch_mlx_lm_load_config() -> None:
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
+    for_vlm: bool = False,
 ) -> None:
     """Apply patches that need to run *before* mlx_lm.load() runs.
 
@@ -78,8 +79,22 @@ def maybe_apply_pre_load_patches(
 
     - DeepSeek V4 patch (PR 1192) when ``config.json`` declares
       ``model_type == "deepseek_v4"``.
-    - Native MTP patch (PR 990 + PR 15) when ``model_settings.mtp_enabled``
-      is True AND the config declares MTP heads on a supported model_type.
+    - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
+      on a supported model_type. Always applied for sanitize correctness;
+      head attachment is gated by ``model_settings.mtp_enabled``.
+    - mlx-vlm side MTP runtime + nested-visual patches when ``for_vlm`` is
+      True. Required so persisted ``mtp.*`` weights can bind to the
+      LanguageModel tree even when ``mtp_enabled`` is False (otherwise
+      strict load fails on a Qwen3.6 *-mtp VLM and the engine falls back
+      to LLM, losing vision). VLMBatchedEngine passes ``for_vlm=True``;
+      BatchedEngine / DFlashEngine / LLM loaders keep the default.
+    - mlx-vlm MoE VLM sanitize patch when ``for_vlm`` is True and the
+      checkpoint is a Qwen3.6 MoE VLM without declared MTP heads.
+      Pre-converted mlx-lm exports ship ``switch_mlp`` weights; stock
+      mlx-vlm ``sanitize`` unconditionally pops ``experts.gate_up_proj``
+      and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
+      is installed first. ``for_vlm=True`` is only passed by
+      ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
 
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
@@ -130,8 +145,7 @@ def maybe_apply_pre_load_patches(
     # never had MTP heads.
     if _is_mtp_compatible(config, model_type):
         mtp_enabled = bool(
-            model_settings is not None
-            and getattr(model_settings, "mtp_enabled", False)
+            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
         from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
 
@@ -150,28 +164,65 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
-        # mlx-vlm side: when the model loads via VLMBatchedEngine
-        # (e.g. ``qwen3_5_moe`` with vision_config), the mlx-lm patch
-        # alone can't attach an MTP head to the mlx-vlm classes.
-        # Apply the parallel runtime patch on mlx-vlm so the MTPModule is
-        # instantiated on ``LanguageModel.__init__``.
-        if mtp_enabled:
+        # mlx-vlm side: only relevant when entering through VLMBatchedEngine
+        # (e.g. ``qwen3_5_moe`` with vision_config). The mlx-lm patch alone
+        # can't attach an MTP head to the mlx-vlm classes — apply the
+        # parallel runtime patch so MTPModule is instantiated on
+        # ``LanguageModel.__init__``.
+        #
+        # Applied regardless of ``mtp_enabled``: with MTP off, persisted
+        # ``mtp.*`` weights still need a binding site on the language model
+        # tree or mlx-vlm's strict load_weights fails with "parameters not
+        # in model" (issue #1404). MTP decode invocation stays gated by
+        # ``is_mtp_active()`` downstream, so MTP off + module attached
+        # behaves identically to a stock no-MTP model at inference time
+        # (with a small constant memory cost for the unused MTPModule).
+        #
+        # ``for_vlm=False`` skips this branch on BatchedEngine / DFlashEngine
+        # paths so mlx-vlm classes are not touched when the load goes
+        # through mlx-lm only.
+        if for_vlm:
             try:
                 from ..patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_patch,
                     apply_mlx_vlm_mtp_runtime_patch,
                 )
             except Exception:
                 pass
             else:
+                # Sanitize-preservation patch MUST run too: the stock
+                # mlx-vlm Model.sanitize strips every ``mtp.*`` key, so
+                # without this the MTPModule loads at random init (0%
+                # accept). Previously only wired into the oQ path; needed
+                # on the inference load path as well for VLM checkpoints
+                # that ship MTP heads (e.g. PARO + injected guru87 head).
+                if apply_mlx_vlm_mtp_patch():
+                    if mtp_enabled:
+                        logger.info(
+                            "mlx-vlm MTP sanitize patch applied for %s",
+                            model_name,
+                        )
+                    else:
+                        logger.debug(
+                            "mlx-vlm MTP sanitize patch applied for %s "
+                            "(mtp_enabled=False; allows persisted mtp.* "
+                            "weights to bind)",
+                            model_name,
+                        )
                 if apply_mlx_vlm_mtp_runtime_patch():
-                    logger.info(
-                        "mlx-vlm runtime MTP patch applied for %s",
-                        model_name,
-                    )
-    elif (
-        model_settings is not None
-        and getattr(model_settings, "mtp_enabled", False)
-    ):
+                    if mtp_enabled:
+                        logger.info(
+                            "mlx-vlm runtime MTP patch applied for %s",
+                            model_name,
+                        )
+                    else:
+                        logger.debug(
+                            "mlx-vlm runtime MTP patch applied for %s "
+                            "(mtp_enabled=False; head attached for weight "
+                            "load only)",
+                            model_name,
+                        )
+    elif model_settings is not None and getattr(model_settings, "mtp_enabled", False):
         logger.warning(
             "mtp_enabled=True for %s but model is incompatible "
             "(model_type=%r, mtp_heads=%s); MTP path will be inactive",
@@ -180,13 +231,41 @@ def maybe_apply_pre_load_patches(
             _has_mtp_heads(config),
         )
 
+    # Pre-converted mlx-lm Qwen3.6 MoE VLMs (e.g. mlx-community mxfp4) ship
+    # switch_mlp weights under language_model.model.* and often declare
+    # mtp_num_hidden_layers=0. The mlx_vlm_mtp sanitize replacement skips
+    # unfuse when switch_mlp is already present; stock mlx-vlm sanitize
+    # unconditionally pops experts.gate_up_proj and VLM load fails with
+    # KeyError → LLM fallback (vision silently dropped, issue #1261). That
+    # sanitize patch was previously only wired through _is_mtp_compatible
+    # above; apply it here for non-MTP MoE VLMs. Runtime MTP patch stays in
+    # the branch above.
+    if (
+        for_vlm
+        and model_type
+        and model_type.startswith("qwen3_5_moe")
+        and not _is_mtp_compatible(config, model_type)
+    ):
+        try:
+            from ..patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+        except Exception as e:
+            logger.debug("qwen3_6 MoE VLM sanitize patch import failed: %s", e)
+        else:
+            if apply_mlx_vlm_mtp_patch():
+                logger.debug(
+                    "mlx-vlm qwen3_6 MoE VLM sanitize patch applied for %s "
+                    "(no MTP heads; switch_mlp load correctness)",
+                    model_name,
+                )
+
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*
     # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
     # Model.sanitize is current (stock mlx-vlm or mlx_vlm_mtp runtime), so
     # the call has to land after apply_mlx_vlm_mtp_runtime_patch above.
-    # No-op when the wrap's already installed or mlx-vlm isn't importable.
-    if model_type and model_type.startswith("qwen3_5_moe"):
+    # VLM-only: dflash / mlx-lm paths never instantiate mlx-vlm classes,
+    # so touching them there is just dead weight.
+    if for_vlm and model_type and model_type.startswith("qwen3_5_moe"):
         try:
             from ..patches.qwen3_6_nested_visual import (
                 apply_qwen3_6_nested_visual_patch,

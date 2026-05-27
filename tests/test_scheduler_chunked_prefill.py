@@ -471,3 +471,83 @@ class TestScheduleWaitingChunkedFork:
 
         mock_ep.assert_called_once()
         mock_bp.assert_not_called()
+
+    def test_non_chunked_path_runtime_error_cleans_up_and_rejects(self):
+        """RuntimeError from _do_external_prefill in the non-chunked path
+        must pop self.requests, drop the temp uid mappings, remove the
+        PrefillProgressTracker entry, and emit a finish_reason=\"error\"
+        RequestOutput so the client sees the failure (#1405)."""
+        from omlx.prefill_progress import get_prefill_tracker
+
+        sched, req = self._setup(n_tokens=3, step_size=4)
+        rid = req.request_id
+        tracker = get_prefill_tracker()
+        tracker.clear()
+        tracker.update(rid, processed=1, total=3, model_id="test")
+        assert tracker.get_model_progress("test"), "tracker entry not set up"
+
+        try:
+            with patch.object(
+                sched,
+                "_do_external_prefill",
+                side_effect=RuntimeError("Memory limit exceeded during prefill"),
+            ):
+                scheduled, rejected = sched._schedule_waiting()
+
+            assert rid not in sched.requests
+            assert rid not in sched.request_id_to_uid
+            assert not any(v == rid for v in sched.uid_to_request_id.values())
+            assert tracker.get_model_progress("test") == []
+            assert scheduled == []
+            assert len(rejected) == 1
+            out = rejected[0]
+            assert out.request_id == rid
+            assert out.finished is True
+            assert out.finish_reason == "error"
+            assert "Memory limit" in out.error
+        finally:
+            tracker.clear()
+
+    def test_chunked_first_chunk_runtime_error_cleans_up_and_rejects(self):
+        """RuntimeError on the chunked first chunk must pop self.requests,
+        remove the PrefillProgressTracker entry, and emit an error
+        RequestOutput. _step_prefill_chunk updates the tracker before the
+        hard-limit check, so without this catch the entry would leak
+        (#1405)."""
+        from omlx.prefill_progress import get_prefill_tracker
+
+        sched, req = self._setup(n_tokens=10, step_size=4)
+        rid = req.request_id
+        tracker = get_prefill_tracker()
+        tracker.clear()
+        tracker.update(rid, processed=2, total=10, model_id="test")
+        assert tracker.get_model_progress("test"), "tracker entry not set up"
+
+        try:
+            with patch.object(
+                sched,
+                "_begin_prefill",
+                return_value=_make_prefill_state(sched, req),
+            ):
+                with patch.object(
+                    sched,
+                    "_step_prefill_chunk",
+                    side_effect=RuntimeError(
+                        "Memory limit exceeded during chunked prefill"
+                    ),
+                ):
+                    scheduled, rejected = sched._schedule_waiting()
+
+            assert rid not in sched.requests
+            assert rid not in sched._prefill_states
+            assert req not in sched.prefilling
+            assert tracker.get_model_progress("test") == []
+            assert scheduled == []
+            assert len(rejected) == 1
+            out = rejected[0]
+            assert out.request_id == rid
+            assert out.finished is True
+            assert out.finish_reason == "error"
+            assert "Memory limit" in out.error
+        finally:
+            tracker.clear()

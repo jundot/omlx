@@ -346,16 +346,29 @@ class TestPrefillMemoryGuardToggle:
 class TestHardLimitCalculation:
     """Tests for _get_hard_limit_bytes calculation."""
 
-    def test_hard_limit_is_system_ram_minus_4gb(self, enforcer):
-        """Hard limit = system_ram - 4GB."""
+    def test_hard_limit_large_system_reserves_6gb(self, enforcer):
+        """>= 16 GB systems reserve 6 GB in auto mode."""
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 96 * 1024**3
             result = enforcer._get_hard_limit_bytes()
-        assert result == 92 * 1024**3
+        assert result == 90 * 1024**3
+
+    def test_hard_limit_small_system_reserves_4gb(self, mock_engine_pool):
+        """< 16 GB systems reserve only 4 GB so small Macs can still load
+        a model + leave a usable prefill budget."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, max_bytes=4 * 1024**3
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 8 * 1024**3
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 4 * 1024**3  # max(8-4, 4) = 4
 
     def test_hard_limit_at_least_max_bytes(self, mock_engine_pool):
-        """Hard limit is at least max_bytes (for small systems)."""
-        # 16GB system, 14GB soft limit -> system-4GB = 12GB < 14GB
+        """Hard limit is at least max_bytes when system reserve would push
+        the ceiling below the user's requested limit."""
+        # 16GB system at the cut-off uses 6GB reserve -> 10GB.
+        # max_bytes=14GB is larger, so ceiling stays at 14GB.
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, max_bytes=14 * 1024**3
         )
@@ -371,6 +384,26 @@ class TestHardLimitCalculation:
         )
         assert enforcer._get_hard_limit_bytes() == 0
 
+    @pytest.mark.skip(
+        reason="user_explicit_max is part of upstream acd0533 / c645c9f "
+        "memory_guard_tier refactor; flyto has not adopted it yet."
+    )
+    def test_hard_limit_honors_user_explicit_max(self, mock_engine_pool):
+        """Placeholder for upstream user_explicit_max behavior. Re-enable
+        once flyto picks up the memory_guard_tier work."""
+
+    def test_hard_limit_auto_mode_uses_size_aware_reserve(
+        self, mock_engine_pool
+    ):
+        """Auto mode uses size-aware reserve: >=16GB system -> reserve 6GB."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            max_bytes=28 * 1024**3,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 96 * 1024**3  # large, reserve=6GB
+            result = enforcer._get_hard_limit_bytes()
+        assert result == 90 * 1024**3
 
 class TestSingleModelMemoryPressure:
     """Tests for single-model memory pressure handling (Issue #62).
@@ -528,9 +561,9 @@ class TestMemoryLimitPropagation:
 
         assert scheduler._memory_limit_bytes == 10 * 1024**3
         assert bg._memory_limit_bytes == 10 * 1024**3
-        # hard limit = 96GB - 4GB = 92GB
-        assert scheduler._memory_hard_limit_bytes == 92 * 1024**3
-        assert bg._memory_hard_limit_bytes == 92 * 1024**3
+        # hard limit = 96GB - 6GB = 90GB (>=16GB system reserves 6GB)
+        assert scheduler._memory_hard_limit_bytes == 90 * 1024**3
+        assert bg._memory_hard_limit_bytes == 90 * 1024**3
 
     def test_propagates_on_max_bytes_change(self, enforcer):
         """Propagates updated limits when max_bytes is changed at runtime."""
@@ -585,6 +618,73 @@ class TestMemoryLimitPropagation:
 
         for scheduler in schedulers:
             assert scheduler._memory_limit_bytes == 10 * 1024**3
+
+
+class TestStoreCacheCapWalk:
+    """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""
+
+    def _scheduler_with_adjust(self):
+        scheduler = MagicMock(spec=[])
+        scheduler.adjust_store_cache_cap = MagicMock()
+        return scheduler
+
+    def test_calls_adjust_with_current_pressure(self, enforcer):
+        scheduler = self._scheduler_with_adjust()
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+        enforcer._pressure_level = "soft"
+
+        enforcer._walk_store_cache_caps()
+
+        scheduler.adjust_store_cache_cap.assert_called_once_with("soft")
+
+    def test_no_op_when_engine_missing(self, enforcer):
+        entry = _make_entry("m", engine=None)
+        enforcer._engine_pool._entries = {"m": entry}
+        # Should not raise.
+        enforcer._walk_store_cache_caps()
+
+    def test_no_op_when_scheduler_lacks_method(self, enforcer):
+        engine = MagicMock(spec=[])  # no scheduler attr
+        entry = _make_entry("m", engine=engine)
+        enforcer._engine_pool._entries = {"m": entry}
+        # Should not raise.
+        enforcer._walk_store_cache_caps()
+
+    @pytest.mark.asyncio
+    async def test_check_and_enforce_walks_caps_on_ok(self, enforcer):
+        scheduler = self._scheduler_with_adjust()
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        ):
+            mock_mx.get_active_memory.return_value = 1 * 1024**3  # ok
+            await enforcer._check_and_enforce()
+
+        scheduler.adjust_store_cache_cap.assert_called_with("ok")
+
+    @pytest.mark.asyncio
+    async def test_check_and_enforce_walks_caps_on_soft(self, enforcer):
+        # Force a 0.85/0.95 split so 9GB lands in the soft band.
+        enforcer._soft_threshold = 0.85
+        enforcer._hard_threshold = 0.95
+        scheduler = self._scheduler_with_adjust()
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+        enforcer._engine_pool._find_lru_victim = MagicMock(return_value=None)
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        ):
+            mock_mx.get_active_memory.return_value = 9 * 1024**3  # soft
+            await enforcer._check_and_enforce()
+
+        scheduler.adjust_store_cache_cap.assert_called_with("soft")
 
 
 class TestProperties:

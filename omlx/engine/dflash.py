@@ -364,6 +364,14 @@ class DFlashEngine(BaseEngine):
         from ..speculative.dflash_factory import attach_dflash_to_loaded_target
         from ..engine_core import get_mlx_executor
 
+        # Wrap dflash's hook installers so we can revert the class-level
+        # __call__ patches when this engine stops. Without this, a later
+        # Native MTP load on the same process sees leftover dflash hooks
+        # and crashes with TypeError on n_confirmed (upstream #1388).
+        # Idempotent: only wraps once per process.
+        from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
+        install_dflash_lifecycle_wrap()
+
         if embedded_model is None:
             embedded_model = getattr(self._embedded_vlm, "_vlm_model", None) \
                 or getattr(self._embedded_vlm, "_model", None)
@@ -478,6 +486,14 @@ class DFlashEngine(BaseEngine):
         self._draft_model = None
         self._target_ops = None
         self._draft_backend = None
+        # Revert dflash's class-level __call__ patches so a subsequent
+        # Native MTP load on the same process sees clean linear_attn /
+        # self_attn classes (upstream #1388).
+        try:
+            from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            restore_dflash_class_patches()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_class_patches (stop): {exc}")
         # Wrapper; underlying weights belong to embedded_vlm and get torn
         # down when the embedded engine stops below.
         self._target_model = None
@@ -504,6 +520,14 @@ class DFlashEngine(BaseEngine):
         self._runtime_context = None
         self._tokenizer_obj = None
         self._loaded = False
+        # Revert class-level __call__ patches dflash installed during start().
+        # Required so a subsequent Native MTP load on the same process sees
+        # clean classes instead of leftover dflash hooks (issue #1388).
+        try:
+            from ..patches.dflash_lifecycle import restore_dflash_class_patches
+            restore_dflash_class_patches()
+        except Exception as exc:
+            logger.debug(f"restore_dflash_class_patches: {exc}")
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(

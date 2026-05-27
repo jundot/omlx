@@ -171,6 +171,11 @@ def run_vlm_mtp_decode(
             stop_check=stop_check,
             eos_token_ids=eos_set,
         ):
+            # mlx-vlm only calls mx.clear_cache() every 256 tokens (see
+            # _mtp_rounds_batch in mlx_vlm/speculative/utils.py). On large
+            # targets like Gemma 4 31B the buffer pool balloons between
+            # those flushes (issue #1416). Clearing per round bounds it.
+            mx.clear_cache()
             yield tokens
         return
 
@@ -193,4 +198,5 @@ def run_vlm_mtp_decode(
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
     ):
+        mx.clear_cache()
         yield tok
