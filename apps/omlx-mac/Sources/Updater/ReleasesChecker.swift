@@ -68,7 +68,16 @@ enum ReleasesError: Error, CustomStringConvertible {
 }
 
 enum ReleasesChecker {
-    static let releasesURL = URL(string: "https://api.github.com/repos/jundot/omlx/releases?per_page=20")!
+    // Flyto MLX fork: auto-update is disabled. The upstream jundot/omlx
+    // releases would replace this fork's binary with the upstream one on
+    // install, which is wrong for a fork that deliberately diverges (the
+    // GUI bundle hack on m2max/m5max launches fork-local Python code; an
+    // upstream-replaced .app would break that). When flyto sets up its
+    // own panwudi/flyto-mlx Releases pipeline (with .dmg assets) this URL
+    // can be flipped to point there; until then `check()` short-circuits
+    // to "already up to date".
+    static let releasesURL = URL(string: "https://api.github.com/repos/panwudi/flyto-mlx/releases?per_page=20")!
+    static let autoUpdateEnabled = false
 
     /// Fetches recent releases and picks the newest one that beats `currentVersion`
     /// under the given channel. Returns `nil` if we're already up to date.
@@ -77,6 +86,10 @@ enum ReleasesChecker {
         channel: UpdateChannel,
         session: URLSession = .shared
     ) async throws -> AvailableRelease? {
+        // Disabled for the flyto-mlx fork. See `autoUpdateEnabled` above.
+        if !autoUpdateEnabled {
+            return nil
+        }
         var request = URLRequest(url: releasesURL, timeoutInterval: 10)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
 

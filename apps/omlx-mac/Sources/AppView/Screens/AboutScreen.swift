@@ -50,12 +50,12 @@ private struct HeroCard: View {
                 .interpolation(.high)
                 .frame(width: 69, height: 69)
             VStack(alignment: .leading, spacing: 4) {
-                Text("oMLX")
+                Text("Flyto MLX")
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "about.hero.tagline",
-                            defaultValue: "Native macOS app for the oMLX server",
-                            comment: "Tagline shown under the oMLX product name on the About screen hero card"))
+                            defaultValue: "Native macOS app for the Flyto MLX server",
+                            comment: "Tagline shown under the Flyto MLX product name on the About screen hero card"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "about.hero.version",
@@ -96,7 +96,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Source, issues, and roadmap",
                                  comment: "Sublabel under the GitHub Repository link on the About screen"),
                 icon: "chevron.left.forwardslash.chevron.right",
-                url: URL(string: "https://github.com/jundot/omlx")!
+                url: URL(string: "https://github.com/panwudi/flyto-mlx")!
             )
             LinkRow(
                 label: String(localized: "about.project.releases.label",
@@ -106,7 +106,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Download the latest CLI and macOS app",
                                  comment: "Sublabel under the Releases link on the About screen"),
                 icon: "shippingbox",
-                url: URL(string: "https://github.com/jundot/omlx/releases")!
+                url: URL(string: "https://github.com/panwudi/flyto-mlx/releases")!
             )
             LinkRow(
                 label: String(localized: "about.project.docs.label",
@@ -116,7 +116,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Setup, model management, integrations",
                                  comment: "Sublabel under the Documentation link on the About screen"),
                 icon: "book.closed",
-                url: URL(string: "https://omlx.app/docs")!
+                url: URL(string: "https://github.com/panwudi/flyto-mlx#readme")!
             )
             LinkRow(
                 label: String(localized: "about.project.issue.label",
@@ -126,7 +126,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Bugs and feature requests on GitHub",
                                  comment: "Sublabel under the Report an Issue link on the About screen"),
                 icon: "exclamationmark.bubble",
-                url: URL(string: "https://github.com/jundot/omlx/issues/new")!,
+                url: URL(string: "https://github.com/panwudi/flyto-mlx/issues/new")!,
                 isLast: true
             )
         }
@@ -197,7 +197,7 @@ private struct LicenseSection: View {
                             .foregroundStyle(theme.text)
                     }
                     Text(String(localized: "about.license.notice",
-                                defaultValue: "Copyright © oMLX contributors. Licensed under the Apache License, Version 2.0. See the LICENSE file in the repository for the full text.",
+                                defaultValue: "Copyright © Flyto MLX contributors and the upstream oMLX project. Licensed under the Apache License, Version 2.0. See the LICENSE and NOTICE files in the repository for the full text and attribution.",
                                 comment: "Copyright + license notice paragraph on the About screen"))
                         .font(.omlxText(11.5))
                         .foregroundStyle(theme.textSecondary)

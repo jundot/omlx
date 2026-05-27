@@ -91,7 +91,7 @@ final class MenubarController: NSObject {
         if statusItem.button?.image == nil {
             let fallback = NSImage(
                 systemSymbolName: "cube.transparent",
-                accessibilityDescription: "oMLX"
+                accessibilityDescription: "Flyto MLX"
             )
             fallback?.isTemplate = true
             statusItem.button?.image = fallback
