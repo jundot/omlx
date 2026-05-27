@@ -114,5 +114,8 @@ omlx/admin/tailwindcss-*
 # Git worktrees
 .worktrees/
 
+# Swift rewrite architecture notes — kept locally for reference, not tracked.
+docs/native_app_architecture.md
+
 # UV lockfile
 uv.lock

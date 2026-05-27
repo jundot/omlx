@@ -1,0 +1,73 @@
+{
+    "total_tokens_served": 0,
+    "total_cached_tokens": 0,
+    "cache_efficiency": 0.0,
+    "total_prompt_tokens": 0,
+    "total_completion_tokens": 0,
+    "total_requests": 0,
+    "avg_prefill_tps": 0.0,
+    "avg_generation_tps": 0.0,
+    "uptime_seconds": 1917.3,
+    "host": "127.0.0.1",
+    "port": 8964,
+    "api_key": "sk-omlx-EXAMPLE-KEY-REDACTED",
+    "cli_prefix": "/Applications/oMLX.app/Contents/MacOS/omlx-cli",
+    "claude_code_context_scaling_enabled": false,
+    "claude_code_target_context_size": 200000,
+    "engines": {
+        "mlx-lm": {
+            "name": "mlx-lm",
+            "version": "0.31.3",
+            "commit": null,
+            "url": null
+        },
+        "mlx-vlm": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "commit": null,
+            "url": null
+        },
+        "mlx-embeddings": {
+            "name": "mlx-embeddings",
+            "version": "0.1.0",
+            "commit": null,
+            "url": null
+        },
+        "mlx-audio": {
+            "name": "mlx-audio",
+            "version": "0.4.3",
+            "commit": null,
+            "url": null
+        }
+    },
+    "active_models": {
+        "models": [],
+        "model_memory_used": 0,
+        "model_memory_max": 54116587929,
+        "memory_pressure": {
+            "enabled": true,
+            "current_bytes": 112280224,
+            "soft_bytes": 51110110822,
+            "hard_bytes": 57123065036,
+            "current_formatted": "0.1GB",
+            "soft_formatted": "47.6GB",
+            "hard_formatted": "53.2GB",
+            "pressure_level": "ok"
+        },
+        "total_active_requests": 0,
+        "total_waiting_requests": 0
+    },
+    "runtime_cache": {
+        "base_path": "/Users/test/.omlx",
+        "ssd_cache_dir": "/Users/test/.omlx/cache",
+        "response_state_dir": "/Users/test/.omlx/cache/response-state",
+        "models": [],
+        "total_num_files": 0,
+        "total_size_bytes": 0,
+        "effective_block_sizes": [],
+        "disk_max_bytes": 21474836480,
+        "hot_cache_max_bytes": 0,
+        "hot_cache_size_bytes": 0,
+        "hot_cache_entries": 0
+    }
+}

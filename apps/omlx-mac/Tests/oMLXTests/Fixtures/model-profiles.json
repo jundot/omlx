@@ -1,0 +1,33 @@
+{
+    "profiles": [
+        {
+            "name": "qwen36-thinking-coding",
+            "display_name": "Qwen3.6 Thinking \u00b7 Precise Coding",
+            "description": "Qwen3.6 thinking-mode defaults tuned for WebDev and other tasks that need lower variance.",
+            "created_at": "2026-05-13T15:20:18.389513+00:00",
+            "updated_at": "2026-05-19T11:45:09.918114+00:00",
+            "settings": {
+                "presence_penalty": 0,
+                "max_context_window": 131072,
+                "force_sampling": false,
+                "turboquant_kv_enabled": false,
+                "dflash_enabled": false,
+                "max_tokens": 262144,
+                "thinking_budget_tokens": 8192,
+                "max_tool_result_tokens": 0,
+                "thinking_budget_enabled": false,
+                "top_k": 20,
+                "min_p": 0,
+                "mtp_enabled": false,
+                "top_p": 0.95,
+                "specprefill_enabled": false,
+                "temperature": 0.6,
+                "repetition_penalty": 1,
+                "enable_thinking": true,
+                "turboquant_kv_bits": 4.0,
+                "turboquant_skip_last": true
+            },
+            "source_template": null
+        }
+    ]
+}

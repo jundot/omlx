@@ -210,7 +210,7 @@ brew services info omlx     # 查看状态
 
 ### macOS 菜单栏应用
 
-原生 PyObjC 菜单栏应用（非 Electron）。无需打开终端即可启动、停止和监控服务器。包含持久化服务统计（重启后保留）、崩溃自动重启和应用内自动更新。
+原生 Swift / SwiftUI 菜单栏应用（非 Electron）。无需打开终端即可启动、停止和监控服务器。包含持久化服务统计（重启后保留）、崩溃自动重启和基于 Sparkle 的自动更新。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX 菜单栏统计" width="400">

@@ -1,0 +1,103 @@
+{
+    "base_path": "/Users/test/.omlx",
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8964,
+        "log_level": "info",
+        "server_aliases": [
+            "localhost",
+            "127.0.0.1",
+            "mac.local",
+            "mac.local",
+            "mac.localdomain",
+            "192.0.2.10",
+            "192.0.2.11",
+            "192.0.2.12",
+            "192.0.2.13"
+        ],
+        "sse_keepalive_mode": "chunk"
+    },
+    "model": {
+        "model_dirs": [
+            "/Users/test/.omlx/models"
+        ],
+        "model_dir": "/Users/test/.omlx/models",
+        "max_model_memory": "auto",
+        "model_fallback": false
+    },
+    "memory": {
+        "max_process_memory": "auto",
+        "prefill_memory_guard": true
+    },
+    "scheduler": {
+        "max_concurrent_requests": 8,
+        "chunked_prefill": true
+    },
+    "cache": {
+        "enabled": true,
+        "ssd_cache_dir": "/Users/test/.omlx/cache",
+        "ssd_cache_max_size": "20GB",
+        "hot_cache_only": false,
+        "hot_cache_max_size": "0",
+        "initial_cache_blocks": 256
+    },
+    "mcp": {
+        "config_path": null
+    },
+    "huggingface": {
+        "endpoint": "https://hf-mirror.com"
+    },
+    "modelscope": {
+        "endpoint": ""
+    },
+    "network": {
+        "http_proxy": "",
+        "https_proxy": "",
+        "no_proxy": "",
+        "ca_bundle": ""
+    },
+    "sampling": {
+        "max_context_window": 32768,
+        "max_tokens": 32768,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 0,
+        "repetition_penalty": 1
+    },
+    "auth": {
+        "api_key_set": true,
+        "api_key": "sk-omlx-EXAMPLE-KEY-REDACTED",
+        "skip_api_key_verification": false,
+        "sub_keys": []
+    },
+    "claude_code": {
+        "context_scaling_enabled": false,
+        "target_context_size": 200000,
+        "mode": "cloud",
+        "opus_model": null,
+        "sonnet_model": null,
+        "haiku_model": null
+    },
+    "integrations": {
+        "codex_model": null,
+        "opencode_model": "",
+        "openclaw_model": null,
+        "hermes_model": null,
+        "pi_model": null,
+        "copilot_model": null,
+        "openclaw_tools_profile": "coding"
+    },
+    "system": {
+        "total_memory_bytes": 68719476736,
+        "total_memory": "64.00 GB",
+        "auto_model_memory": "51.20 GB",
+        "ssd_total_bytes": 994662584320,
+        "ssd_total": "926.35 GB"
+    },
+    "ui": {
+        "language": "en"
+    },
+    "idle_timeout": {
+        "idle_timeout_seconds": null
+    }
+}

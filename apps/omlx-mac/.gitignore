@@ -1,0 +1,12 @@
+# Local Xcode build output
+build/
+DerivedData/
+
+# Xcode user-specific state (should not be committed)
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager artifacts
+.swiftpm/
+.build/
+Package.resolved

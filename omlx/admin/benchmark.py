@@ -90,6 +90,21 @@ class BenchmarkRun:
     # the run's results are not uploaded to omlx.ai community benchmarks
     # because experimental features skew the numbers.
     experimental_features: list[str] = field(default_factory=list)
+    # Mirror of the upload SSE events so REST consumers (e.g. native Swift
+    # app polling /results) can render leaderboard status without opening
+    # the stream. Phases: "idle" → "uploading" → "done" | "skipped". The
+    # browser HTML still consumes the SSE stream directly; this is purely
+    # additive state that lives alongside it.
+    upload_state: dict = field(default_factory=lambda: {
+        "phase": "idle",
+        "results": [],          # per-context-length: {context_length, id?, url?, duplicate?, error?}
+        "total": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "owner_hash": None,     # display hash, populated on upload_done
+        "skipped_reason": None, # e.g. "experimental_features"
+        "skipped_features": [],
+    })
 
 
 # Event types that close the SSE stream for a bench run. `done` is NOT
@@ -484,6 +499,9 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     # These features (DFlash, SpecPrefill, TurboQuant KV) skew throughput
     # and would pollute the community leaderboard if mixed in unmarked.
     if run.experimental_features:
+        run.upload_state["phase"] = "skipped"
+        run.upload_state["skipped_reason"] = "experimental_features"
+        run.upload_state["skipped_features"] = list(run.experimental_features)
         await _send_event(run, {
             "type": "upload_skipped",
             "reason": "experimental_features",
@@ -495,6 +513,7 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         )
         return
 
+    run.upload_state["phase"] = "uploading"
     await _send_event(run, {
         "type": "progress",
         "phase": "upload",
@@ -597,35 +616,41 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             if resp.status_code == 201:
                 data = resp.json()
                 success_count += 1
+                result_dict = {
+                    "context_length": context_length,
+                    "id": data.get("id"),
+                    "url": data.get("url"),
+                }
+                run.upload_state["results"].append(result_dict)
                 await _send_event(run, {
                     "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "id": data.get("id"),
-                        "url": data.get("url"),
-                    },
+                    "data": result_dict,
                 })
             elif resp.status_code == 409:
                 data = resp.json()
                 success_count += 1  # Duplicate is still ok
+                result_dict = {
+                    "context_length": context_length,
+                    "id": data.get("existing_id"),
+                    "url": data.get("existing_url"),
+                    "duplicate": True,
+                }
+                run.upload_state["results"].append(result_dict)
                 await _send_event(run, {
                     "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "id": data.get("existing_id"),
-                        "url": data.get("existing_url"),
-                        "duplicate": True,
-                    },
+                    "data": result_dict,
                 })
             else:
                 failed_count += 1
                 error_msg = _sanitize_upload_error(resp)
+                result_dict = {
+                    "context_length": context_length,
+                    "error": error_msg,
+                }
+                run.upload_state["results"].append(result_dict)
                 await _send_event(run, {
                     "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "error": error_msg,
-                    },
+                    "data": result_dict,
                 })
                 # Surface the sanitized message to ops; the full body
                 # (truncated) goes to debug so it can still be retrieved
@@ -642,15 +667,22 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
 
         except Exception as e:
             failed_count += 1
+            result_dict = {
+                "context_length": context_length,
+                "error": str(e),
+            }
+            run.upload_state["results"].append(result_dict)
             await _send_event(run, {
                 "type": "upload",
-                "data": {
-                    "context_length": context_length,
-                    "error": str(e),
-                },
+                "data": result_dict,
             })
             logger.warning(f"Benchmark upload error for pp{context_length}: {e}")
 
+    run.upload_state["phase"] = "done"
+    run.upload_state["total"] = len(single_results)
+    run.upload_state["success_count"] = success_count
+    run.upload_state["failed_count"] = failed_count
+    run.upload_state["owner_hash"] = owner_hash_display
     await _send_event(run, {
         "type": "upload_done",
         "data": {

@@ -1,7 +1,7 @@
-"""GitHub release selection helpers used by the menubar app's update check.
+"""GitHub release selection helpers used by the admin panel's release picker.
 
-Kept separate from app.py so the logic is unit-testable without pulling in
-the PyObjC stack.
+Kept as a leaf module so the PEP 440 / channel-filter logic stays
+unit-testable without pulling in the admin route surface.
 """
 
 from typing import Any
