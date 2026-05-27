@@ -676,6 +676,7 @@ class DFlashEngine(BaseEngine):
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
             )
+            prefix_hit_tokens = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
@@ -753,6 +754,7 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "cached_tokens": prefix_hit_tokens,
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -851,6 +853,7 @@ class DFlashEngine(BaseEngine):
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
                 )
+                prefix_hit_tokens = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
@@ -873,7 +876,7 @@ class DFlashEngine(BaseEngine):
                     final = parser_session.finalize()
                     if final.visible_text:
                         parsed_visible_parts.append(final.visible_text)
-                return summary, tokens, parser_session, parsed_visible_parts
+                return summary, tokens, parser_session, parsed_visible_parts, prefix_hit_tokens
             finally:
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
@@ -887,7 +890,7 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated, parser_session, parsed_visible_parts = (
+            summary, generated, parser_session, parsed_visible_parts, prefix_hit_tokens = (
                 await asyncio.shield(asyncio.wrap_future(future))
             )
         except asyncio.CancelledError:
@@ -935,6 +938,7 @@ class DFlashEngine(BaseEngine):
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             finish_reason="stop",
+            cached_tokens=prefix_hit_tokens,
         )
 
     async def stream_generate(
@@ -1038,6 +1042,7 @@ class DFlashEngine(BaseEngine):
                         finish_reason = "error"
                     finished_normally = True
 
+                cached_tokens = int(metrics.get("cached_tokens", 0)) if metrics else 0
                 yield GenerationOutput(
                     text=total_text,
                     new_text=new_text,
@@ -1046,6 +1051,7 @@ class DFlashEngine(BaseEngine):
                     completion_tokens=total_completion,
                     finished=finished,
                     finish_reason=finish_reason,
+                    cached_tokens=cached_tokens,
                 )
 
                 if finished:
