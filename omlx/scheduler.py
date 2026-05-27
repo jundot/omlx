@@ -1117,11 +1117,16 @@ class Scheduler:
           without blocking the inference thread. async_eval completes
           Metal command enqueueing before returning, so all commands
           are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize() (global barrier — waits
-          all streams) to ensure materialization is complete before
-          extracting tensor bytes. Stream-scoped sync is not possible
-          here because generation_stream is thread-local to the
-          inference thread.
+        - This worker calls mx.synchronize(generation_stream) via the
+          _safe_sync_generation_stream helper to wait on the same
+          stream where mx.async_eval dispatched the arrays. A bare
+          mx.synchronize() with no args only blocks on the default
+          stream (gpu:0) and would leave the dispatched gpu:2 work
+          unsynchronized, racing the buffer-protocol access below
+          (#1437). Stream objects are not thread-local in MLX
+          (Metal device is a global singleton), so
+          mx.synchronize(stream) is safe cross-thread; it just calls
+          waitUntilCompleted on the command buffer.
         - bfloat16 view+eval inside _extract_tensor_bytes runs on this
           worker's default mx stream, isolated from generation_stream;
           the underlying buffer is read-only at this point.
@@ -1140,7 +1145,7 @@ class Scheduler:
             # buffer pool mid-read (#1106).
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
-                    mx.synchronize()
+                    _safe_sync_generation_stream()
                 block_table = self.block_aware_cache.store_cache(
                     request_id,
                     token_sequence_to_store,

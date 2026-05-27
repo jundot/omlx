@@ -1306,14 +1306,19 @@ class PagedSSDCacheManager(CacheManager):
             metadata.update(cache_list_meta)
 
             # Caller (scheduler._cleanup_finished, async store-cache path)
-            # already mx.eval's all real KV arrays on the inference thread
-            # before submitting to the omlx-store-cache executor. The tiny
+            # dispatches real KV arrays via mx.async_eval on the inference
+            # thread's generation_stream before submitting to the
+            # omlx-store-cache executor. The worker then waits on that same
+            # stream via mx.synchronize(generation_stream) (see
+            # _async_store_cache_worker) before reaching this code path,
+            # so the arrays are fully materialized by the time
+            # _extract_tensor_bytes hits the buffer protocol. The tiny
             # mx.zeros((1,)) placeholders allocated above are lazy nodes
             # whose buffer materialization happens implicitly via the buffer
-            # protocol. Skipping the explicit mx.eval here keeps save_block
+            # protocol. Skipping any explicit mx.eval here keeps save_block
             # off the Metal command-submission path when invoked from a
             # non-inference thread, which is the source of the cross-thread
-            # race tracked in #978/#1040.
+            # race tracked in #978/#1040/#1106/#1437.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)

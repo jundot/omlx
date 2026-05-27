@@ -824,6 +824,73 @@ class TestSyncAndClearCache:
             clear_cache.assert_not_called()
 
 
+class TestStoreCacheWorkerSync:
+    """Tests for store-cache worker stream-scoped sync (#1437).
+
+    Worker must wait on generation_stream specifically, not on the
+    default stream. mx.synchronize() with no args only blocks on the
+    default stream (gpu:0) and leaves the gpu:2 dispatched work
+    unwaited, racing the buffer-protocol access in
+    _extract_tensor_bytes -> SIGABRT in get_command_encoder(gpu:2).
+    """
+
+    def test_safe_sync_passes_generation_stream(self):
+        """_safe_sync_generation_stream must invoke mx.synchronize with
+        the generation_stream object, not call the no-args variant.
+
+        Regression: PR #1146 wired the worker to bare mx.synchronize()
+        under the (incorrect) assumption that it was a global barrier
+        and that stream-scoped sync was unsafe cross-thread. Both
+        assumptions are wrong: synchronize() defaults to a single
+        stream, and Stream objects are not thread-local. The worker
+        path now routes through this helper so the regression has a
+        single chokepoint to assert against.
+        """
+        from omlx import scheduler as sched_mod
+
+        calls = []
+
+        def fake_sync(*args, **kwargs):
+            calls.append(args)
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_generation_stream()
+
+        assert len(calls) == 1
+        assert calls[0] and calls[0][0] is sched_mod.generation_stream, (
+            f"Worker sync must target generation_stream, got: {calls}"
+        )
+
+    def test_safe_sync_swallows_no_stream_runtime_error(self):
+        """A 'no Stream' RuntimeError from cross-thread sync must be
+        swallowed so the worker can still proceed to extract bytes.
+
+        On some MLX builds mx.synchronize(stream) raises 'There is no
+        Stream(gpu, X) in current thread' from a thread that has not
+        submitted work to that stream. In the store-cache worker that
+        condition means there is no in-flight gpu:2 work to drain, so
+        it is safe to continue.
+        """
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("There is no Stream(gpu, 2) in current thread.")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_generation_stream()
+
+    def test_safe_sync_propagates_other_runtime_errors(self):
+        """Real GPU errors must not be silently swallowed."""
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("Metal command buffer execution failed")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            with pytest.raises(RuntimeError, match="command buffer execution failed"):
+                sched_mod._safe_sync_generation_stream()
+
+
 class TestSchedulerFormatBytes:
     """Tests for Scheduler._format_bytes()."""
 
