@@ -48,6 +48,10 @@ from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 
+# Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
+# stream when no per-engine stream is provided.
+_default_generation_stream = generation_stream
+
 
 @dataclass
 class _VLMMTPDecodeState:
@@ -98,7 +102,7 @@ class _VLMMTPResponse:
 _mx_buffer_access_lock = threading.RLock()
 
 
-def _sync_and_clear_cache():
+def _sync_and_clear_cache(stream=None):
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
     Without synchronization, mx.clear_cache() can release Metal buffers that
@@ -114,28 +118,30 @@ def _sync_and_clear_cache():
     See: https://github.com/jundot/omlx/issues/300, #888, #1106
     """
     with _mx_buffer_access_lock:
-        # Generation_stream may not have in-flight work on the current thread
+        # The engine stream may not have in-flight work on the current thread
         # (e.g. external prefill submits to the default stream). On some MLX
         # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
         # thread" in that case; swallow it since there is nothing to drain.
+        target = stream if stream is not None else _default_generation_stream
         try:
-            mx.synchronize(generation_stream)
+            mx.synchronize(target)
         except RuntimeError:
             pass
         mx.synchronize()  # default stream
         mx.clear_cache()
 
 
-def _safe_sync_generation_stream():
-    """mx.synchronize(generation_stream) that tolerates cross-thread calls.
+def _safe_sync_stream(stream=None):
+    """mx.synchronize(stream) that tolerates cross-thread calls.
 
-    Generation_stream is owned by the _mlx_executor thread. Teardown paths
-    that run on the main thread (via EngineCore.close) hit "no Stream in
+    The per-engine stream is owned by the engine's executor thread. Teardown
+    paths that run on the main thread (via EngineCore.close) hit "no Stream in
     current thread" RuntimeError. Swallow that specific case so cleanup can
     proceed; re-raise anything else so real GPU errors stay visible.
     """
+    target = stream if stream is not None else _default_generation_stream
     try:
-        mx.synchronize(generation_stream)
+        mx.synchronize(target)
     except RuntimeError as e:
         if "no Stream" not in str(e):
             raise
@@ -717,6 +723,7 @@ class Scheduler:
         model: Any,
         tokenizer: Any,
         config: SchedulerConfig | None = None,
+        stream: Any | None = None,
     ):
         """
         Initialize the scheduler.
@@ -725,6 +732,8 @@ class Scheduler:
             model: The MLX model
             tokenizer: The tokenizer
             config: Scheduler configuration
+            stream: Optional mx.Stream for this engine. Falls back to the
+                module-level _default_generation_stream when not provided.
         """
         self.model = model
         # Deep-copy the tokenizer so the scheduler owns an independent Rust
@@ -735,6 +744,7 @@ class Scheduler:
         # Rust RefCell.  See: https://github.com/huggingface/tokenizers/issues/537
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
+        self._stream = stream if stream is not None else _default_generation_stream
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1117,18 +1127,18 @@ class Scheduler:
           without blocking the inference thread. async_eval completes
           Metal command enqueueing before returning, so all commands
           are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize(generation_stream) via the
-          _safe_sync_generation_stream helper to wait on the same
-          stream where mx.async_eval dispatched the arrays. A bare
-          mx.synchronize() with no args only blocks on the default
-          stream (gpu:0) and would leave the dispatched gpu:2 work
+        - This worker calls mx.synchronize(self._stream) via the
+          _safe_sync_stream helper to wait on the same stream where
+          mx.async_eval dispatched the arrays. A bare mx.synchronize()
+          with no args only blocks on the default stream (gpu:0) and
+          would leave the dispatched per-engine stream's work
           unsynchronized, racing the buffer-protocol access below
-          (#1437). Stream objects are not thread-local in MLX
-          (Metal device is a global singleton), so
-          mx.synchronize(stream) is safe cross-thread; it just calls
-          waitUntilCompleted on the command buffer.
+          (#1437). Stream objects are not thread-local in MLX (Metal
+          device is a global singleton), so mx.synchronize(stream) is
+          safe cross-thread; it just calls waitUntilCompleted on the
+          command buffer.
         - bfloat16 view+eval inside _extract_tensor_bytes runs on this
-          worker's default mx stream, isolated from generation_stream;
+          worker's default mx stream, isolated from self._stream;
           the underlying buffer is read-only at this point.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
@@ -1145,7 +1155,7 @@ class Scheduler:
             # buffer pool mid-read (#1106).
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
-                    _safe_sync_generation_stream()
+                    _safe_sync_stream(self._stream)
                 block_table = self.block_aware_cache.store_cache(
                     request_id,
                     token_sequence_to_store,
@@ -1192,7 +1202,7 @@ class Scheduler:
                     )
             # Run batch_generator.remove on the inference thread.
             try:
-                _safe_sync_generation_stream()
+                _safe_sync_stream(self._stream)
                 self._remove_uid_from_active_batch(uid)
                 if hasattr(self.model, "unregister_rope_delta"):
                     self.model.unregister_rope_delta(uid)
@@ -1607,6 +1617,7 @@ class Scheduler:
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            stream=self._stream,
         )
 
         return bg
@@ -1968,7 +1979,7 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            _sync_and_clear_cache()
+            _sync_and_clear_cache(self._stream)
 
         # Emit final boundary snapshot if prompt lands exactly on boundary.
         if boundary_enabled:
@@ -1982,7 +1993,7 @@ class Scheduler:
                     request, prompt_cache, total_tokens
                 )
 
-        _sync_and_clear_cache()
+        _sync_and_clear_cache(self._stream)
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
         if vlm_embeds is not None and _saved_rope_deltas is not None:
@@ -2296,7 +2307,7 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        _sync_and_clear_cache()
+        _sync_and_clear_cache(self._stream)
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
@@ -2434,7 +2445,7 @@ class Scheduler:
             # Prefill complete — emit final boundary snapshot and insert.
             self._prefill_states.pop(rid, None)
             self._emit_final_boundary_if_needed(state)
-            _sync_and_clear_cache()
+            _sync_and_clear_cache(self._stream)
 
             # Ensure a BatchGenerator exists (may not if all requests were
             # previously in chunked prefill with no running decode).
@@ -2942,12 +2953,12 @@ class Scheduler:
             return None
 
         try:
-            # Synchronize pending generation_stream operations before
+            # Synchronize pending engine stream operations before
             # accessing batch cache tensors.
             with self._phase_timer("boundary_capture_sync"):
-                _safe_sync_generation_stream()
+                _safe_sync_stream(self._stream)
             with self._phase_timer("boundary_capture_extract"):
-                with mx.stream(generation_stream):
+                with mx.stream(self._stream):
                     result = self.batch_generator.extract_cache([uid])
                     if uid not in result:
                         return None
@@ -3818,7 +3829,7 @@ class Scheduler:
 
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
         try:
-            with mx.stream(generation_stream):
+            with mx.stream(self._stream):
                 out = lm(
                     last_arr,
                     cache=prefilled_cache,
@@ -3958,7 +3969,7 @@ class Scheduler:
         responses: list[_VLMMTPResponse] = []
         for uid, state in list(self._vlm_mtp_active.items()):
             try:
-                with mx.stream(generation_stream):
+                with mx.stream(self._stream):
                     token_val = next(state.generator)
             except StopIteration:
                 # Round loop exited naturally — terminate with prompt cache
@@ -4195,11 +4206,11 @@ class Scheduler:
                     logger.debug(f"SpecPrefill: draft cache store failed: {e}")
 
             # Free draft cache from memory.  Use _sync_and_clear_cache() so
-            # the generation_stream is drained before Metal buffers are
+            # the engine stream is drained before Metal buffers are
             # returned to the pool — a bare mx.clear_cache() here can race
             # with in-flight async evals and trigger a kernel panic (#557).
             del used_cache
-            _sync_and_clear_cache()
+            _sync_and_clear_cache(self._stream)
 
             # Mark scoring complete (auto-removes tracker entry).
             tracker.update(request.request_id, n_to_score, n_to_score, model_id)
@@ -4346,7 +4357,7 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
-            _safe_sync_generation_stream()
+            _safe_sync_stream(self._stream)
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
@@ -4502,7 +4513,7 @@ class Scheduler:
         # state — mx.synchronize() or mx.clear_cache() can throw a C++
         # exception that causes SIGABRT if uncaught (#435).
         try:
-            _sync_and_clear_cache()
+            _sync_and_clear_cache(self._stream)
         except Exception as e:
             logger.warning(f"Metal cache clear failed during error recovery: {e}")
         return failed_ids
@@ -4841,13 +4852,13 @@ class Scheduler:
                             )
                             sys_arr = sys_arr[step:]
                             # Use _sync_and_clear_cache() instead of bare
-                            # mx.clear_cache() to flush the generation_stream
+                            # mx.clear_cache() to flush the engine stream
                             # before releasing Metal buffers.  A bare call here
                             # can race with in-flight command buffers submitted
                             # by the preceding mx.eval(), triggering the same
                             # 'completeMemory() prepare count underflow' kernel
                             # panic that #435 fixed elsewhere (#557).
-                            _sync_and_clear_cache()
+                            _sync_and_clear_cache(self._stream)
                         if sys_arr.size > 0:
                             _check_specprefill_abort(sys_processed)
                             final_sys = int(sys_arr.size)
@@ -5025,7 +5036,7 @@ class Scheduler:
 
                     if done:
                         self._emit_final_boundary_if_needed(state)
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         get_prefill_tracker().remove(request.request_id)
                         self._insert_prefilled_request(request, state, scheduled)
                     else:
@@ -5424,12 +5435,12 @@ class Scheduler:
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
-        # Synchronize pending generation_stream operations before cache storage.
+        # Synchronize pending engine stream operations before cache storage.
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
             with self._phase_timer("cleanup_finished_sync"):
-                _safe_sync_generation_stream()
+                _safe_sync_stream(self._stream)
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -5482,7 +5493,7 @@ class Scheduler:
                             # without blocking; the worker calls
                             # mx.synchronize() to wait before extracting
                             # bytes.
-                            with mx.stream(generation_stream):
+                            with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
                                     boundary_override = self._get_boundary_store_override(
                                         request_id,
@@ -5623,7 +5634,7 @@ class Scheduler:
                     # used by in-flight Metal command buffers from the previous
                     # batch_generator.next() call.  Without this barrier the Metal
                     # driver can hit 'completeMemory() prepare count underflow'.
-                    _safe_sync_generation_stream()
+                    _safe_sync_stream(self._stream)
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
@@ -5906,7 +5917,7 @@ class Scheduler:
                         + len(responses)
                     )
                     if self._tokens_since_clear_cache >= 1024:
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
 
         except _PrefillAbortedError:
@@ -5977,7 +5988,7 @@ class Scheduler:
             should_clear = True
             self._deferred_clear_at = None
         if should_clear:
-            _sync_and_clear_cache()
+            _sync_and_clear_cache(self._stream)
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0

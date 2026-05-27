@@ -835,8 +835,9 @@ class TestStoreCacheWorkerSync:
     """
 
     def test_safe_sync_passes_generation_stream(self):
-        """_safe_sync_generation_stream must invoke mx.synchronize with
-        the generation_stream object, not call the no-args variant.
+        """_safe_sync_stream() with no args must invoke mx.synchronize with
+        the module-level _default_generation_stream object, not call the
+        no-args variant.
 
         Regression: PR #1146 wired the worker to bare mx.synchronize()
         under the (incorrect) assumption that it was a global barrier
@@ -854,7 +855,7 @@ class TestStoreCacheWorkerSync:
             calls.append(args)
 
         with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
-            sched_mod._safe_sync_generation_stream()
+            sched_mod._safe_sync_stream()
 
         assert len(calls) == 1
         assert calls[0] and calls[0][0] is sched_mod.generation_stream, (
@@ -877,7 +878,7 @@ class TestStoreCacheWorkerSync:
             raise RuntimeError("There is no Stream(gpu, 2) in current thread.")
 
         with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
-            sched_mod._safe_sync_generation_stream()
+            sched_mod._safe_sync_stream()
 
     def test_safe_sync_propagates_other_runtime_errors(self):
         """Real GPU errors must not be silently swallowed."""
@@ -888,7 +889,7 @@ class TestStoreCacheWorkerSync:
 
         with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
             with pytest.raises(RuntimeError, match="command buffer execution failed"):
-                sched_mod._safe_sync_generation_stream()
+                sched_mod._safe_sync_stream()
 
 
 class TestSchedulerFormatBytes:

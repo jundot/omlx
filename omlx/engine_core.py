@@ -78,6 +78,22 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _global_mlx_executor
 
 
+_wired_limit_set = False
+
+
+def _ensure_wired_limit() -> None:
+    """Set Metal wired memory limit once at first engine creation.
+
+    BatchGenerator normally calls mx.set_wired_limit() per-instance, which
+    races when multiple engines init concurrently (process-global setting).
+    We call it once here instead.
+    """
+    global _wired_limit_set
+    if not _wired_limit_set and mx.metal.is_available():
+        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+        _wired_limit_set = True
+
+
 @dataclass
 class EngineConfig:
     """Configuration for the engine."""
@@ -133,12 +149,23 @@ class EngineCore:
         )
         self._owns_model = True
 
-        # Create scheduler
+        # Per-engine executor with dedicated mx.Stream (#1248).
+        # Each EngineCore gets its own thread + GPU stream so different
+        # models can run scheduler.step() concurrently.
+        _ensure_wired_limit()
+        self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
+        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+        )
+
+        # Create scheduler with per-engine stream
         scheduler_config = self.config.scheduler_config or SchedulerConfig()
         self.scheduler = Scheduler(
             model=model,
             tokenizer=tokenizer,
             config=scheduler_config,
+            stream=self._mlx_stream,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -151,11 +178,6 @@ class EngineCore:
         self._task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
-
-        # Global single-thread executor shared across ALL engines.
-        # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
-        # from different engine threads cause segfaults. See issue #85.
-        self._mlx_executor = get_mlx_executor()
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -698,9 +720,9 @@ class EngineCore:
 
         self._closed = True
 
-        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
-        # stream is bound to the MLX executor thread, so dispatch both
+        # stream is bound to the engine's executor thread, so dispatch both
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
@@ -711,6 +733,10 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+
+        if self._mlx_executor is not None:
+            self._mlx_executor.shutdown(wait=True)
+            self._mlx_executor = None
 
         # Clear output collectors
         for collector in self._output_collectors.values():
