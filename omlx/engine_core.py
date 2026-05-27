@@ -78,22 +78,6 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _global_mlx_executor
 
 
-_wired_limit_set = False
-
-
-def _ensure_wired_limit() -> None:
-    """Set Metal wired memory limit once at first engine creation.
-
-    BatchGenerator normally calls mx.set_wired_limit() per-instance, which
-    races when multiple engines init concurrently (process-global setting).
-    We call it once here instead.
-    """
-    global _wired_limit_set
-    if not _wired_limit_set and mx.metal.is_available():
-        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
-        _wired_limit_set = True
-
-
 @dataclass
 class EngineConfig:
     """Configuration for the engine."""
@@ -152,7 +136,6 @@ class EngineCore:
         # Per-engine executor with dedicated mx.Stream (#1248).
         # Each EngineCore gets its own thread + GPU stream so different
         # models can run scheduler.step() concurrently.
-        _ensure_wired_limit()
         self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
         self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
