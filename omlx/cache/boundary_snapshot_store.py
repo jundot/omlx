@@ -56,6 +56,17 @@ class BoundarySnapshotSSDStore:
         Snapshots are stored under ``base_dir/_boundary_snapshots/``.
     """
 
+    # Timeouts applied when acquiring _writer_busy from each cleanup
+    # path. cleanup_request is called from the scheduler's abort hot
+    # path (~3 sites) and must yield faster than cleanup_all, which
+    # also runs at startup / reset where blocking longer is tolerable
+    # in exchange for a stronger orphan-avoidance guarantee. The
+    # worst-case impact on the timeout fallback is identical in both
+    # paths — an orphan file in the recreated dir until the next
+    # constructor cleanup — so the only knob is per-call latency.
+    _CLEANUP_ALL_TIMEOUT_S = 5.0
+    _CLEANUP_REQUEST_TIMEOUT_S = 2.0
+
     def __init__(self, base_dir: Path) -> None:
         self._snapshot_dir = base_dir / "_boundary_snapshots"
         # Clean up orphaned files from previous crashes.
@@ -75,14 +86,24 @@ class BoundarySnapshotSSDStore:
         self._pending_writes: dict[tuple[str, int], dict] = {}
         self._pending_lock = threading.Lock()
 
-        # Cancelled requests with remaining queue item counts.  Writer
+        # Cancelled requests with remaining queue item counts. Writer
         # thread decrements on each skip; entry is deleted when count
-        # reaches zero, preventing unbounded growth.
+        # reaches zero, preventing unbounded growth. All access is
+        # guarded by ``_cancelled_lock`` — the dict was previously
+        # mutated unlocked from cleanup_request, cleanup_all, and the
+        # writer thread, creating lost-cancellation and counter-
+        # underflow races.
         self._cancelled_requests: dict[str, int] = {}
+        self._cancelled_lock = threading.Lock()
 
         # Background writer thread.
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
         self._shutdown = threading.Event()
+        # Held by the writer for the duration of each item's processing.
+        # cleanup_all() acquires it after draining the queue so the writer
+        # can't be mid-item (creating files inside the just-cleaned dir)
+        # when rmtree runs.
+        self._writer_busy = threading.Lock()
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             name="boundary-snapshot-writer",
@@ -154,13 +175,30 @@ class BoundarySnapshotSSDStore:
             try:
                 self._write_queue.put_nowait((pw_key, tensors_raw, metadata, file_path))
             except queue.Full:
+                # Roll back the pending + registry entries: with no
+                # queue item the writer can never decrement
+                # _cancelled_requests for this entry, so if a later
+                # cleanup_request counts it the rid stays pinned in
+                # _cancelled_requests forever and every subsequent
+                # save under that rid is silently discarded by the
+                # _is_cancelled gates. The previous "stays in memory
+                # only" promise was already broken because cleanup
+                # discards the in-memory copy anyway.
                 logger.warning(
-                    "Boundary snapshot write queue full, snapshot %s/%d "
-                    "stays in memory only",
+                    "Boundary snapshot write queue full, dropping "
+                    "snapshot %s/%d",
                     request_id,
                     token_count,
                 )
-                # Still returns True — data is in pending_writes for read-back.
+                with self._pending_lock:
+                    self._pending_writes.pop(pw_key, None)
+                with self._registry_lock:
+                    req_files = self._file_registry.get(request_id)
+                    if req_files is not None:
+                        req_files.pop(token_count, None)
+                        if not req_files:
+                            self._file_registry.pop(request_id, None)
+                return False
 
             return True
 
@@ -241,57 +279,256 @@ class BoundarySnapshotSSDStore:
         the worker's :meth:`load` calls and silently strip block storage.
         :class:`omlx.scheduler.Scheduler` defers this call until the
         ``store_future`` for ``request_id`` is done.
+
+        Acquires ``_writer_busy`` after marking the request cancelled so
+        the writer thread can finish any item it is mid-processing first.
+        Without this barrier the writer can pull an item, ``mkdir`` the
+        request directory, write its temp file, then ``os.rename`` it
+        into the final path *after* we have rmtree'd — leaving an
+        orphaned file behind. The ``_cancelled_requests`` counter (held
+        under ``_cancelled_lock``) catches the late-rename case if
+        ``_writer_busy.acquire`` times out.
+
+        Bounded with a timeout so a stuck I/O on the writer thread
+        cannot deadlock request abort paths (called from scheduler's
+        hot path at ~3 sites).
+
+        The cancelled-counter is bumped additively and only when at
+        least one pending item exists for the rid — see the inline
+        comment at the bump site for the two distinct bugs that
+        rules out (stale ``rid: 0`` after a timeout for an empty
+        cleanup, and overwrites racing with re-entrant cleanup_request
+        calls for the same rid).
         """
-        # Count remaining queue items and mark as cancelled.  The writer
-        # thread decrements the count on each skip and removes the entry
-        # when it reaches zero.
+        if self._shutdown.is_set():
+            # After shutdown the writer no longer reacquires
+            # _writer_busy per-item, so cleanup_request cannot
+            # synchronise with it. Best-effort: just drop in-memory
+            # state. Files (if any leaked through shutdown) are removed
+            # by the next constructor cleanup_all.
+            with self._pending_lock:
+                for k in [k for k in self._pending_writes if k[0] == request_id]:
+                    del self._pending_writes[k]
+            with self._registry_lock:
+                self._file_registry.pop(request_id, None)
+            logger.warning(
+                "cleanup_request(%s) called after shutdown — running "
+                "in-memory-only", request_id,
+            )
+            return
+
+        # Atomically: count pending items for this rid, drop them, mark
+        # the rid cancelled. Holding both locks during the snapshot is
+        # required to keep the counter consistent with what the writer
+        # will see — a save() call from another thread cannot interleave
+        # an enqueue between our count and our cancellation mark.
+        #
+        # The bump is additive (``get + count``) and skipped entirely
+        # when ``count == 0``. Both rules close real bugs:
+        #   * Skip-on-zero: cleanup_request("X") for an rid with no
+        #     pending items previously wrote ``cancelled[X] = 0`` then
+        #     popped it on the acquired path. On the timeout fallback
+        #     the pop never runs and the ``X: 0`` entry lingers for
+        #     the process lifetime — every subsequent save() under
+        #     that rid (or any later reuse of the same string) is
+        #     discarded by the writer's ``_is_cancelled`` gates,
+        #     which check key membership not value > 0. The counter
+        #     must only exist when there is at least one in-flight
+        #     item to drain it.
+        #   * Additive: a re-entrant cleanup_request("X") for an rid
+        #     that already has an in-flight cancellation must NOT
+        #     overwrite the previous count. The writer's
+        #     ``cleared_by_cleanup`` branch + ``_writer_busy`` lock
+        #     together close the file-write race today, but the
+        #     per-item dec_cancelled bookkeeping still has to balance.
+        #     Overwriting drops the remaining decs on the floor; on
+        #     the next ``save()`` under the same rid the writer would
+        #     see a non-zero counter from the earlier batch and
+        #     silently discard the new item.
         with self._pending_lock:
-            count = sum(1 for k in self._pending_writes if k[0] == request_id)
             keys_to_remove = [k for k in self._pending_writes if k[0] == request_id]
+            count = len(keys_to_remove)
             for key in keys_to_remove:
                 del self._pending_writes[key]
-        self._cancelled_requests[request_id] = count
+            if count > 0:
+                with self._cancelled_lock:
+                    self._cancelled_requests[request_id] = (
+                        self._cancelled_requests.get(request_id, 0) + count
+                    )
 
         # Remove from registry.
         with self._registry_lock:
             self._file_registry.pop(request_id, None)
 
-        # Remove files.
-        req_dir = self._snapshot_dir / request_id
-        if req_dir.exists():
-            try:
-                shutil.rmtree(req_dir)
-            except Exception as e:
-                logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
+        # Wait briefly for the writer to finish any item it had already
+        # pulled. If it's genuinely stuck (slow disk, dead thread) fall
+        # back to the cancelled-counter rescue rather than blocking the
+        # caller.
+        acquired = self._writer_busy.acquire(
+            timeout=self._CLEANUP_REQUEST_TIMEOUT_S
+        )
+        try:
+            # Remove files.
+            req_dir = self._snapshot_dir / request_id
+            if req_dir.exists():
+                try:
+                    shutil.rmtree(req_dir)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to clean up snapshots for %s: %s", request_id, e
+                    )
+        finally:
+            if acquired:
+                self._writer_busy.release()
+                # Counter entry has done its job — we own the lock so all
+                # _is_cancelled-gated work has either run or skipped. Drop
+                # the counter so a future racing save() can't leave it
+                # elevated forever. CRITICAL: only pop on the acquired
+                # path. On timeout the writer is still mid-item and may
+                # not yet have consulted ``_is_cancelled``; popping here
+                # would defeat the late-rename rescue that the docstring
+                # advertises as the timeout-fallback safety net.
+                with self._cancelled_lock:
+                    self._cancelled_requests.pop(request_id, None)
+            else:
+                logger.warning(
+                    "cleanup_request(%s): writer thread did not yield "
+                    "within %.1fs; relying on cancelled-counter rescue "
+                    "for late-rename safety",
+                    request_id,
+                    self._CLEANUP_REQUEST_TIMEOUT_S,
+                )
 
     def cleanup_all(self) -> None:
-        """Delete all snapshot files (for reset/startup)."""
+        """Delete all snapshot files (for reset/startup).
+
+        Synchronizes with the background writer: we drain the queue to
+        prevent it from starting a new item, then acquire ``_writer_busy``
+        to wait until any item it had already pulled finishes. Without
+        this barrier the writer can create ``req-X/temp.safetensors``
+        and ``os.rename`` it to its final path *after* we've already
+        rmtree'd and recreated the snapshot directory, leaving an
+        orphaned file behind.
+
+        Threading: concurrent ``save()`` is safe because the writer
+        consults ``_pending_writes`` and ``_is_cancelled`` while
+        holding ``_writer_busy``, and ``cleanup_all`` clears both
+        under the same lock before rmtree. The earlier "must run on
+        the save() thread" constraint is therefore no longer required.
+
+        Invariant enforcement: ``cleanup_all`` must run BEFORE
+        ``shutdown()`` to actually synchronise with the writer. Once
+        ``_shutdown`` is set the writer drops the per-item
+        ``_writer_busy`` acquire, so a post-shutdown ``cleanup_all``
+        cannot block on the writer and degrades to an in-memory
+        clear. Callers that need both should pass ``shutdown(
+        cleanup=True)`` instead of sequencing the calls themselves.
+        """
+        if self._shutdown.is_set():
+            # See cleanup_request: best-effort in-memory clear only.
+            with self._pending_lock:
+                self._pending_writes.clear()
+            with self._registry_lock:
+                self._file_registry.clear()
+            with self._cancelled_lock:
+                self._cancelled_requests.clear()
+            logger.warning(
+                "cleanup_all called after shutdown — running in-memory-only; "
+                "callers wanting on-disk cleanup should use "
+                "shutdown(cleanup=True) instead"
+            )
+            return
+
         # Drain write queue so the writer thread doesn't process stale
-        # items after the directory is deleted.
+        # items after the directory is deleted. Put_nowait the sentinel
+        # back so shutdown still sees it; on Full just drop and let
+        # shutdown re-issue.
         while True:
             try:
                 item = self._write_queue.get_nowait()
                 if item is None:  # Sentinel — put it back for shutdown.
-                    self._write_queue.put(item)
+                    try:
+                        self._write_queue.put_nowait(item)
+                    except queue.Full:
+                        # Drop the sentinel; shutdown will re-enqueue.
+                        # If cleanup_all is the LAST call before process
+                        # exit without an explicit shutdown(), the writer
+                        # thread will only be reaped on daemon teardown.
+                        logger.debug(
+                            "cleanup_all: dropped writer-sentinel on Full"
+                        )
                     break
             except queue.Empty:
                 break
 
-        with self._pending_lock:
-            self._pending_writes.clear()
-        with self._registry_lock:
-            self._file_registry.clear()
-        self._cancelled_requests.clear()
+        # Wait for the writer to finish any item it had already pulled.
+        # When we own _writer_busy the writer is between items, and we
+        # just drained the queue so no new item can start. Bounded so a
+        # stuck writer (slow disk, dead thread) cannot deadlock callers
+        # — scheduler calls cleanup_all() from its abort / reset hot
+        # path. After the timeout we proceed anyway: the worst case is
+        # an orphaned file in the recreated directory, which next
+        # startup's cleanup_all() will clear.
+        acquired = self._writer_busy.acquire(
+            timeout=self._CLEANUP_ALL_TIMEOUT_S
+        )
+        try:
+            if not acquired:
+                logger.warning(
+                    "cleanup_all: writer thread did not yield within "
+                    "%.1fs; proceeding with rmtree — late-rename may "
+                    "orphan a file under the recreated snapshot dir "
+                    "until next startup.",
+                    self._CLEANUP_ALL_TIMEOUT_S,
+                )
+            with self._pending_lock:
+                self._pending_writes.clear()
+            with self._registry_lock:
+                self._file_registry.clear()
+            with self._cancelled_lock:
+                # Only safe to clear when we own _writer_busy — otherwise
+                # a writer mid-_dec_cancelled would race. On timeout we
+                # leave the counter intact so the rescue path stays
+                # effective for in-flight items.
+                if acquired:
+                    self._cancelled_requests.clear()
 
-        if self._snapshot_dir.exists():
-            try:
-                shutil.rmtree(self._snapshot_dir)
-            except Exception as e:
-                logger.debug("Failed to clean up all boundary snapshots: %s", e)
-        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+            if self._snapshot_dir.exists():
+                try:
+                    shutil.rmtree(self._snapshot_dir)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to clean up all boundary snapshots: %s", e
+                    )
+            self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+        finally:
+            if acquired:
+                self._writer_busy.release()
 
-    def shutdown(self) -> None:
-        """Stop background writer thread."""
+    def shutdown(self, *, cleanup: bool = False) -> None:
+        """Stop background writer thread.
+
+        Parameters
+        ----------
+        cleanup : bool
+            When True, run ``cleanup_all()`` first, then signal shutdown.
+            This enforces the cleanup-before-shutdown ordering invariant
+            in one call. Callers that pass ``cleanup=False`` (the
+            default) and *also* want cleanup MUST call ``cleanup_all()``
+            themselves before ``shutdown()``.
+
+        Invariant: if a caller wants to combine ``cleanup_all()`` with
+        shutdown, the cleanup MUST run BEFORE ``_shutdown.set()`` /
+        sentinel-enqueue. Once the sentinel is in the queue and the
+        writer has consumed it, the writer no longer reacquires
+        ``_writer_busy`` after each item, so a subsequent
+        ``cleanup_all`` would wait its full 5s timeout if the writer is
+        already mid-final-item, then proceed unsynchronised. The
+        ``cleanup=True`` path handles this ordering; the warning at
+        the top of ``cleanup_all`` catches misordered callers.
+        """
+        if cleanup:
+            self.cleanup_all()
         self._shutdown.set()
         try:
             self._write_queue.put_nowait(None)  # Sentinel
@@ -303,13 +540,21 @@ class BoundarySnapshotSSDStore:
     # Internal
     # ------------------------------------------------------------------
 
+    def _is_cancelled(self, request_id: str) -> bool:
+        """Thread-safe check for cancellation."""
+        with self._cancelled_lock:
+            return request_id in self._cancelled_requests
+
     def _dec_cancelled(self, request_id: str) -> None:
-        """Decrement cancelled counter; remove entry when exhausted."""
-        remaining = self._cancelled_requests.get(request_id, 0) - 1
-        if remaining <= 0:
-            self._cancelled_requests.pop(request_id, None)
-        else:
-            self._cancelled_requests[request_id] = remaining
+        """Decrement cancelled counter under lock; remove entry when
+        exhausted. Atomic read-modify-write closes the underflow race
+        between two writer-thread iterations / cleanup_all clears."""
+        with self._cancelled_lock:
+            remaining = self._cancelled_requests.get(request_id, 0) - 1
+            if remaining <= 0:
+                self._cancelled_requests.pop(request_id, None)
+            else:
+                self._cancelled_requests[request_id] = remaining
 
     def _file_path(self, request_id: str, token_count: int) -> Path:
         return self._snapshot_dir / request_id / f"{token_count}.safetensors"
@@ -325,74 +570,117 @@ class BoundarySnapshotSSDStore:
             if item is None:  # Sentinel
                 break
 
-            pw_key, tensors_raw, metadata, file_path = item
+            # Hold _writer_busy for the entire item's lifetime so
+            # cleanup_all() can serialize with us — otherwise it can
+            # rmtree the snapshot directory while we're mid-write and
+            # we'd recreate ``req-X/`` underneath it, leaving an
+            # orphaned file after the cleanup returns.
+            with self._writer_busy:
+                self._process_write_item(item)
 
-            # Skip writes for cancelled/cleaned-up requests.
-            if pw_key[0] in self._cancelled_requests:
+    def _process_write_item(self, item) -> None:
+        """Process one (pw_key, tensors_raw, metadata, file_path) queue item.
+
+        Extracted from ``_writer_loop`` so the busy-lock can wrap it
+        cleanly. Called only on the writer thread.
+        """
+        pw_key, tensors_raw, metadata, file_path = item
+
+        # If cleanup_all or cleanup_request cleared this key from
+        # _pending_writes while the item was in the writer's local hand
+        # (i.e. between ``get()`` and entering ``with _writer_busy``),
+        # treat the write as cancelled. This closes the late-rename
+        # window where cleanup runs entirely between the writer's pull
+        # and its busy-lock acquisition.
+        with self._pending_lock:
+            cleared_by_cleanup = pw_key not in self._pending_writes
+        if cleared_by_cleanup:
+            # If a timed-out cleanup_request bumped ``_cancelled_requests``
+            # before clearing pending_writes, this item is one of the N
+            # the counter is waiting on. Without this decrement the
+            # counter would never reach zero, leaving the rid pinned in
+            # ``_cancelled_requests`` for the process lifetime and
+            # causing every subsequent write under that rid (or any
+            # later reuse of the same string) to be silently discarded.
+            if self._is_cancelled(pw_key[0]):
+                self._dec_cancelled(pw_key[0])
+            return
+
+        # Skip writes for cancelled/cleaned-up requests.
+        if self._is_cancelled(pw_key[0]):
+            with self._pending_lock:
+                self._pending_writes.pop(pw_key, None)
+            try:
+                req_dir = file_path.parent
+                if req_dir.exists():
+                    shutil.rmtree(req_dir)
+            except Exception:
+                pass
+            self._dec_cancelled(pw_key[0])
+            return
+
+        temp_path = None
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+
+            # Request may have been cleaned up while serializing.
+            if self._is_cancelled(pw_key[0]):
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except Exception:
+                    pass
                 with self._pending_lock:
                     self._pending_writes.pop(pw_key, None)
+                self._dec_cancelled(pw_key[0])
+                return
+
+            os.rename(str(temp_path), str(file_path))
+
+            # Cleanup may race with a queued write; remove any late file.
+            if self._is_cancelled(pw_key[0]):
                 try:
-                    req_dir = file_path.parent
+                    if file_path.exists():
+                        file_path.unlink()
+                except Exception:
+                    pass
+                req_dir = file_path.parent
+                try:
                     if req_dir.exists():
                         shutil.rmtree(req_dir)
                 except Exception:
                     pass
                 self._dec_cancelled(pw_key[0])
-                continue
-
-            temp_path = None
-            try:
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
-                _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
-
-                # Request may have been cleaned up while serializing.
-                if pw_key[0] in self._cancelled_requests:
-                    try:
-                        if temp_path.exists():
-                            temp_path.unlink()
-                    except Exception:
-                        pass
-                    with self._pending_lock:
-                        self._pending_writes.pop(pw_key, None)
-                    self._dec_cancelled(pw_key[0])
-                    continue
-
-                os.rename(str(temp_path), str(file_path))
-
-                # Cleanup may race with a queued write; remove any late file.
-                if pw_key[0] in self._cancelled_requests:
-                    try:
-                        if file_path.exists():
-                            file_path.unlink()
-                    except Exception:
-                        pass
-                    req_dir = file_path.parent
-                    try:
-                        if req_dir.exists():
-                            shutil.rmtree(req_dir)
-                    except Exception:
-                        pass
-                    self._dec_cancelled(pw_key[0])
-            except Exception as e:
-                logger.debug("Background snapshot write failed: %s", e)
-                for p in (temp_path, file_path):
-                    try:
-                        if p is not None and p.exists():
-                            p.unlink()
-                    except Exception:
-                        pass
-            finally:
-                # Remove extracted cache objects from pending writes to free
-                # memory, but keep tensors_raw for read-back until file is on
-                # disk.
-                with self._pending_lock:
-                    pending = self._pending_writes.get(pw_key)
-                    if pending is not None:
-                        pending.pop("extracted", None)
-                    # If file was written successfully, remove entirely.
-                    if file_path.exists():
-                        self._pending_writes.pop(pw_key, None)
+        except Exception as e:
+            logger.debug("Background snapshot write failed: %s", e)
+            for p in (temp_path, file_path):
+                try:
+                    if p is not None and p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+            # Same bookkeeping invariant as the early-return path: if
+            # cleanup_request bumped the counter and the failure was a
+            # side-effect of that cleanup (e.g. its rmtree pulled the
+            # parent dir out from under our temp write), we still owe
+            # one decrement. The _is_cancelled rescue blocks above all
+            # return before this except clause runs, so we cannot
+            # double-decrement.
+            if self._is_cancelled(pw_key[0]):
+                self._dec_cancelled(pw_key[0])
+        finally:
+            # Remove extracted cache objects from pending writes to free
+            # memory, but keep tensors_raw for read-back until file is on
+            # disk.
+            with self._pending_lock:
+                pending = self._pending_writes.get(pw_key)
+                if pending is not None:
+                    pending.pop("extracted", None)
+                # If file was written successfully, remove entirely.
+                if file_path.exists():
+                    self._pending_writes.pop(pw_key, None)
 
     def _serialize_extracted(
         self,
