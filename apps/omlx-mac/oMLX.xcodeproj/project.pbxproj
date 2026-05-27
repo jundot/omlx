@@ -1,0 +1,882 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */; };
+		1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */; };
+		1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */; };
+		2BB000000000000000000001 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000001 /* Theme.swift */; };
+		2BB000000000000000000002 /* Squircle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000002 /* Squircle.swift */; };
+		2BB000000000000000000003 /* Glass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000003 /* Glass.swift */; };
+		2BB000000000000000000004 /* Button.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000004 /* Button.swift */; };
+		2BB000000000000000000005 /* Popup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000005 /* Popup.swift */; };
+		2BB000000000000000000006 /* TextInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000006 /* TextInput.swift */; };
+		2BB000000000000000000007 /* Segmented.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000007 /* Segmented.swift */; };
+		2BB000000000000000000008 /* ListGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000008 /* ListGroup.swift */; };
+		2BB000000000000000000009 /* Row.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000009 /* Row.swift */; };
+		2BB00000000000000000000A /* SectionHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000A /* SectionHeader.swift */; };
+		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
+		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
+		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
+		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
+		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
+		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
+		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
+		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
+		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
+		4BB000000000000000000002 /* SignalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000002 /* SignalHandlers.swift */; };
+		6BB000000000000000000001 /* AppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000001 /* AppView.swift */; };
+		6BB000000000000000000002 /* AppSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000002 /* AppSection.swift */; };
+		6BB000000000000000000004 /* ServerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000004 /* ServerScreen.swift */; };
+		6BB000000000000000000005 /* StatusScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000005 /* StatusScreen.swift */; };
+		6BB000000000000000000006 /* LogsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000006 /* LogsScreen.swift */; };
+		6BB000000000000000000007 /* ModelsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000007 /* ModelsScreen.swift */; };
+		6BB000000000000000000008 /* DownloadsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000008 /* DownloadsScreen.swift */; };
+		6BB000000000000000000009 /* IntegrationsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000009 /* IntegrationsScreen.swift */; };
+		6BB00000000000000000000A /* SecurityScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000A /* SecurityScreen.swift */; };
+		6BB00000000000000000000B /* AboutScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000B /* AboutScreen.swift */; };
+		6BB00000000000000000000C /* QuantizationScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000C /* QuantizationScreen.swift */; };
+		6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000D /* ThroughputBenchScreen.swift */; };
+		6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000E /* AccuracyBenchScreen.swift */; };
+		6BB00000000000000000000F /* NetworkScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC00000000000000000000F /* NetworkScreen.swift */; };
+		6BB000000000000000000010 /* PerformanceScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000010 /* PerformanceScreen.swift */; };
+		7BB000000000000000000001 /* AppServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000001 /* AppServices.swift */; };
+		7BB000000000000000000002 /* OMLXClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000002 /* OMLXClient.swift */; };
+		7BB000000000000000000003 /* Endpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000003 /* Endpoints.swift */; };
+		7BB000000000000000000004 /* GlobalSettingsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000004 /* GlobalSettingsDTO.swift */; };
+		7BB000000000000000000005 /* ServerInfoDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000005 /* ServerInfoDTO.swift */; };
+		7BB000000000000000000006 /* StatsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000006 /* StatsDTO.swift */; };
+		7BB000000000000000000007 /* LogsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000007 /* LogsDTO.swift */; };
+		7BB000000000000000000008 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CC000000000000000000008 /* UpdateController.swift */; };
+		8BB000000000000000000001 /* ModelsDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000001 /* ModelsDTO.swift */; };
+		8BB000000000000000000002 /* ProfileDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000002 /* ProfileDTO.swift */; };
+		8BB000000000000000000003 /* HFTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000003 /* HFTaskDTO.swift */; };
+		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
+		8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000005 /* ChatTemplateKwargs.swift */; };
+		8BB000000000000000000006 /* DflashByteSize.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000006 /* DflashByteSize.swift */; };
+		8BB000000000000000000007 /* SystemMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetrics.swift */; };
+		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
+		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
+		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
+		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
+		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
+		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
+		9BB000000000000000000002 /* OQDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000002 /* OQDTO.swift */; };
+		9BB000000000000000000003 /* HFUploadDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000003 /* HFUploadDTO.swift */; };
+		9BB000000000000000000004 /* BenchDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000004 /* BenchDTO.swift */; };
+		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
+		BBB000000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000002 /* Localizable.xcstrings */; };
+		BBB000000000000000000004 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000003 /* AppUpdater.swift */; };
+		BBB000000000000000000005 /* ReleasesChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000004 /* ReleasesChecker.swift */; };
+		DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000001 /* AppServicesPathTests.swift */; };
+		DBB000000000000000000002 /* AppConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* AppConfigTests.swift */; };
+		DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */; };
+		DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000004 /* ProfileDTODecodeTests.swift */; };
+		DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000005 /* SamplingValidatorTests.swift */; };
+		DBB000000000000000000006 /* APIKeyGeneratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000006 /* APIKeyGeneratorTests.swift */; };
+		DBB000000000000000000007 /* ChatTemplateKwargsCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */; };
+		DBB000000000000000000008 /* DflashByteSizeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000008 /* DflashByteSizeTests.swift */; };
+		DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */; };
+		DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000A /* ProfileScopeTests.swift */; };
+		DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000B /* SystemMetricsTests.swift */; };
+		DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000C /* WelcomeViewModelTests.swift */; };
+		DBB00000000000000000000D /* DTOFixtureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000D /* DTOFixtureTests.swift */; };
+		DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */; };
+		DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000F /* LocalizationSmokeTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		DAA000000000000000000008 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1AAAAAAAAAAAAAAAAAAAAAA2;
+			remoteInfo = "oMLX";
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = oMLXApp.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX.entitlements"; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
+		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		2CC000000000000000000002 /* Squircle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Squircle.swift; sourceTree = "<group>"; };
+		2CC000000000000000000003 /* Glass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Glass.swift; sourceTree = "<group>"; };
+		2CC000000000000000000004 /* Button.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Button.swift; sourceTree = "<group>"; };
+		2CC000000000000000000005 /* Popup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Popup.swift; sourceTree = "<group>"; };
+		2CC000000000000000000006 /* TextInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextInput.swift; sourceTree = "<group>"; };
+		2CC000000000000000000007 /* Segmented.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Segmented.swift; sourceTree = "<group>"; };
+		2CC000000000000000000008 /* ListGroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListGroup.swift; sourceTree = "<group>"; };
+		2CC000000000000000000009 /* Row.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Row.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000A /* SectionHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionHeader.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000D /* ScreenScaffold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenScaffold.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
+		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
+		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
+		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
+		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
+		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
+		4CC000000000000000000002 /* SignalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalHandlers.swift; sourceTree = "<group>"; };
+		6CC000000000000000000001 /* AppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppView.swift; sourceTree = "<group>"; };
+		6CC000000000000000000002 /* AppSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSection.swift; sourceTree = "<group>"; };
+		6CC000000000000000000004 /* ServerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000005 /* StatusScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000006 /* LogsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000007 /* ModelsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000008 /* DownloadsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000009 /* IntegrationsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationsScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000A /* SecurityScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurityScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000B /* AboutScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AboutScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000C /* QuantizationScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000D /* ThroughputBenchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThroughputBenchScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000E /* AccuracyBenchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccuracyBenchScreen.swift; sourceTree = "<group>"; };
+		6CC00000000000000000000F /* NetworkScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkScreen.swift; sourceTree = "<group>"; };
+		6CC000000000000000000010 /* PerformanceScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreen.swift; sourceTree = "<group>"; };
+		7CC000000000000000000001 /* AppServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServices.swift; sourceTree = "<group>"; };
+		7CC000000000000000000002 /* OMLXClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OMLXClient.swift; sourceTree = "<group>"; };
+		7CC000000000000000000003 /* Endpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Endpoints.swift; sourceTree = "<group>"; };
+		7CC000000000000000000004 /* GlobalSettingsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalSettingsDTO.swift; sourceTree = "<group>"; };
+		7CC000000000000000000005 /* ServerInfoDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerInfoDTO.swift; sourceTree = "<group>"; };
+		7CC000000000000000000006 /* StatsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatsDTO.swift; sourceTree = "<group>"; };
+		7CC000000000000000000007 /* LogsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsDTO.swift; sourceTree = "<group>"; };
+		7CC000000000000000000008 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
+		8CC000000000000000000001 /* ModelsDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000002 /* ProfileDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000003 /* HFTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTaskDTO.swift; sourceTree = "<group>"; };
+		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
+		8CC000000000000000000005 /* ChatTemplateKwargs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargs.swift; sourceTree = "<group>"; };
+		8CC000000000000000000006 /* DflashByteSize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSize.swift; sourceTree = "<group>"; };
+		8CC000000000000000000007 /* SystemMetrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetrics.swift; sourceTree = "<group>"; };
+		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
+		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
+		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
+		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000002 /* OQDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OQDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000003 /* HFUploadDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFUploadDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000004 /* BenchDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTO.swift; sourceTree = "<group>"; };
+		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
+		BCC000000000000000000002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		BCC000000000000000000003 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
+		BCC000000000000000000004 /* ReleasesChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesChecker.swift; sourceTree = "<group>"; };
+		DCC000000000000000000001 /* AppServicesPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServicesPathTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000002 /* AppConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfigTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVMStorageDiffTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000004 /* ProfileDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTODecodeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000005 /* SamplingValidatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SamplingValidatorTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000006 /* APIKeyGeneratorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGeneratorTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargsCodecTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000008 /* DflashByteSizeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSizeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalSettingsSamplingTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000A /* ProfileScopeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileScopeTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000B /* SystemMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000C /* WelcomeViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeViewModelTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000D /* DTOFixtureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DTOFixtureTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcessIntegrationTests.swift; sourceTree = "<group>"; };
+		DCC00000000000000000000F /* LocalizationSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationSmokeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1EEEEEEEEEEEEEEEEEEEEEE2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DAA000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1BBBBBBBBBBBBBBBBBBBBBB1 /* oMLX */ = {
+			isa = PBXGroup;
+			children = (
+				1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */,
+				DEE000000000000000000001 /* Tests */,
+				1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */,
+				1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				DEE000000000000000000002 /* oMLXTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000002 /* oMLXTests */ = {
+			isa = PBXGroup;
+			children = (
+				DCC000000000000000000001 /* AppServicesPathTests.swift */,
+				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
+				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
+				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
+				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
+				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
+				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
+				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
+				DCC00000000000000000000A /* ProfileScopeTests.swift */,
+				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
+				DCC00000000000000000000D /* DTOFixtureTests.swift */,
+				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
+				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
+			);
+			path = oMLXTests;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				1BBBBBBBBBBBBBBBBBBBBBB3 /* App */,
+				1BBBBBBBBBBBBBBBBBBBBBB4 /* Menubar */,
+				1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */,
+				3EE000000000000000000001 /* Config */,
+				2EE000000000000000000001 /* Theme */,
+				7EE000000000000000000001 /* Net */,
+				7EE000000000000000000003 /* Updater */,
+				6EE000000000000000000001 /* AppView */,
+				AEE000000000000000000001 /* Welcome */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		AEE000000000000000000001 /* Welcome */ = {
+			isa = PBXGroup;
+			children = (
+				ACC000000000000000000001 /* WelcomeWindow.swift */,
+			);
+			path = Welcome;
+			sourceTree = "<group>";
+		};
+		6EE000000000000000000001 /* AppView */ = {
+			isa = PBXGroup;
+			children = (
+				6CC000000000000000000001 /* AppView.swift */,
+				6CC000000000000000000002 /* AppSection.swift */,
+				7CC000000000000000000001 /* AppServices.swift */,
+				9CC000000000000000000006 /* PresetBundleStore.swift */,
+				6EE000000000000000000002 /* Screens */,
+			);
+			path = AppView;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000001 /* Net */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000002 /* OMLXClient.swift */,
+				7CC000000000000000000003 /* Endpoints.swift */,
+				7EE000000000000000000002 /* DTO */,
+			);
+			path = Net;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000002 /* DTO */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000004 /* GlobalSettingsDTO.swift */,
+				7CC000000000000000000005 /* ServerInfoDTO.swift */,
+				7CC000000000000000000006 /* StatsDTO.swift */,
+				7CC000000000000000000007 /* LogsDTO.swift */,
+				8CC000000000000000000001 /* ModelsDTO.swift */,
+				8CC000000000000000000002 /* ProfileDTO.swift */,
+				8CC000000000000000000003 /* HFTaskDTO.swift */,
+				8CC00000000000000000000A /* MSTaskDTO.swift */,
+				9CC000000000000000000001 /* SubKeyDTO.swift */,
+				9CC000000000000000000002 /* OQDTO.swift */,
+				9CC000000000000000000003 /* HFUploadDTO.swift */,
+				9CC000000000000000000004 /* BenchDTO.swift */,
+				9CC000000000000000000005 /* PresetBundleDTO.swift */,
+			);
+			path = DTO;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000003 /* Updater */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000008 /* UpdateController.swift */,
+				BCC000000000000000000003 /* AppUpdater.swift */,
+				BCC000000000000000000004 /* ReleasesChecker.swift */,
+			);
+			path = Updater;
+			sourceTree = "<group>";
+		};
+		6EE000000000000000000002 /* Screens */ = {
+			isa = PBXGroup;
+			children = (
+				6CC000000000000000000004 /* ServerScreen.swift */,
+				6CC000000000000000000005 /* StatusScreen.swift */,
+				6CC000000000000000000006 /* LogsScreen.swift */,
+				6CC000000000000000000007 /* ModelsScreen.swift */,
+				6CC000000000000000000008 /* DownloadsScreen.swift */,
+				8CC000000000000000000004 /* ModelSettingsScreen.swift */,
+				8CC000000000000000000005 /* ChatTemplateKwargs.swift */,
+				8CC000000000000000000006 /* DflashByteSize.swift */,
+				8CC000000000000000000007 /* SystemMetrics.swift */,
+				8CC000000000000000000008 /* ProfileViews.swift */,
+				8CC000000000000000000009 /* ProfileWorkingState.swift */,
+				6CC000000000000000000009 /* IntegrationsScreen.swift */,
+				6CC00000000000000000000A /* SecurityScreen.swift */,
+				6CC00000000000000000000B /* AboutScreen.swift */,
+				6CC00000000000000000000C /* QuantizationScreen.swift */,
+				6CC00000000000000000000D /* ThroughputBenchScreen.swift */,
+				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
+				6CC00000000000000000000F /* NetworkScreen.swift */,
+				6CC000000000000000000010 /* PerformanceScreen.swift */,
+			);
+			path = Screens;
+			sourceTree = "<group>";
+		};
+		3EE000000000000000000001 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				3CC000000000000000000001 /* AppConfig.swift */,
+				3CC000000000000000000004 /* ShellEnvWriter.swift */,
+				3CC000000000000000000005 /* APIKeyGenerator.swift */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000001 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000001 /* Theme.swift */,
+				2CC000000000000000000002 /* Squircle.swift */,
+				2CC000000000000000000003 /* Glass.swift */,
+				2EE000000000000000000002 /* Components */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000002 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000004 /* Button.swift */,
+				2CC000000000000000000005 /* Popup.swift */,
+				2CC000000000000000000006 /* TextInput.swift */,
+				2CC000000000000000000007 /* Segmented.swift */,
+				2CC000000000000000000008 /* ListGroup.swift */,
+				2CC000000000000000000009 /* Row.swift */,
+				2CC00000000000000000000A /* SectionHeader.swift */,
+				2CC00000000000000000000B /* StatusPill.swift */,
+				2CC00000000000000000000C /* CodeChip.swift */,
+				2CC00000000000000000000D /* ScreenScaffold.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
+				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
+				4CC000000000000000000001 /* PortConflictResolver.swift */,
+				4CC000000000000000000002 /* SignalHandlers.swift */,
+			);
+			path = Server;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB3 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */,
+				1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB4 /* Menubar */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */,
+				3CC000000000000000000002 /* MenubarStatsPoller.swift */,
+				3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */,
+			);
+			path = Menubar;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */,
+				1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */,
+				1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */,
+				BCC000000000000000000002 /* Localizable.xcstrings */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */,
+				DCC000000000000000000010 /* oMLXTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX" */;
+			buildPhases = (
+				1EEEEEEEEEEEEEEEEEEEEEE1 /* Sources */,
+				1EEEEEEEEEEEEEEEEEEEEEE2 /* Frameworks */,
+				1EEEEEEEEEEEEEEEEEEEEEE3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "oMLX";
+			packageProductDependencies = (
+			);
+			productName = "oMLX";
+			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */;
+			productType = "com.apple.product-type.application";
+		};
+		DAA000000000000000000001 /* oMLXTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXTests" */;
+			buildPhases = (
+				DAA000000000000000000005 /* Sources */,
+				DAA000000000000000000006 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				DAA000000000000000000007 /* PBXTargetDependency */,
+			);
+			name = oMLXTests;
+			productName = oMLXTests;
+			productReference = DCC000000000000000000010 /* oMLXTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastSwiftUpdateCheck = 1640;
+				LastUpgradeCheck = 1640;
+				TargetAttributes = {
+					1AAAAAAAAAAAAAAAAAAAAAA2 = {
+						CreatedOnToolsVersion = 16.4;
+					};
+					DAA000000000000000000001 = {
+						CreatedOnToolsVersion = 16.4;
+						TestTargetID = 1AAAAAAAAAAAAAAAAAAAAAA2;
+					};
+				};
+			};
+			buildConfigurationList = 1AAAAAAAAAAAAAAAAAAAAAA3 /* Build configuration list for PBXProject "oMLX" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 1BBBBBBBBBBBBBBBBBBBBBB1;
+			packageReferences = (
+			);
+			productRefGroup = 1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */,
+				DAA000000000000000000001 /* oMLXTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1EEEEEEEEEEEEEEEEEEEEEE3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1DDDDDDDDDDDDDDDDDDDDDD4 /* Assets.xcassets in Resources */,
+				BBB000000000000000000002 /* Localizable.xcstrings in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1EEEEEEEEEEEEEEEEEEEEEE1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
+				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
+				2BB000000000000000000001 /* Theme.swift in Sources */,
+				2BB000000000000000000002 /* Squircle.swift in Sources */,
+				2BB000000000000000000003 /* Glass.swift in Sources */,
+				2BB000000000000000000004 /* Button.swift in Sources */,
+				2BB000000000000000000005 /* Popup.swift in Sources */,
+				2BB000000000000000000006 /* TextInput.swift in Sources */,
+				2BB000000000000000000007 /* Segmented.swift in Sources */,
+				2BB000000000000000000008 /* ListGroup.swift in Sources */,
+				2BB000000000000000000009 /* Row.swift in Sources */,
+				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
+				2BB00000000000000000000D /* ScreenScaffold.swift in Sources */,
+				2BB00000000000000000000B /* StatusPill.swift in Sources */,
+				2BB00000000000000000000C /* CodeChip.swift in Sources */,
+				3BB000000000000000000001 /* AppConfig.swift in Sources */,
+				3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */,
+				3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */,
+				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
+				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
+				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
+				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
+				6BB000000000000000000001 /* AppView.swift in Sources */,
+				6BB000000000000000000002 /* AppSection.swift in Sources */,
+				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
+				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
+				6BB000000000000000000006 /* LogsScreen.swift in Sources */,
+				6BB000000000000000000007 /* ModelsScreen.swift in Sources */,
+				6BB000000000000000000008 /* DownloadsScreen.swift in Sources */,
+				6BB000000000000000000009 /* IntegrationsScreen.swift in Sources */,
+				6BB00000000000000000000A /* SecurityScreen.swift in Sources */,
+				6BB00000000000000000000B /* AboutScreen.swift in Sources */,
+				6BB00000000000000000000C /* QuantizationScreen.swift in Sources */,
+				6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */,
+				6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */,
+				6BB00000000000000000000F /* NetworkScreen.swift in Sources */,
+				6BB000000000000000000010 /* PerformanceScreen.swift in Sources */,
+				7BB000000000000000000001 /* AppServices.swift in Sources */,
+				7BB000000000000000000002 /* OMLXClient.swift in Sources */,
+				7BB000000000000000000003 /* Endpoints.swift in Sources */,
+				7BB000000000000000000004 /* GlobalSettingsDTO.swift in Sources */,
+				7BB000000000000000000005 /* ServerInfoDTO.swift in Sources */,
+				7BB000000000000000000006 /* StatsDTO.swift in Sources */,
+				7BB000000000000000000007 /* LogsDTO.swift in Sources */,
+				7BB000000000000000000008 /* UpdateController.swift in Sources */,
+				8BB000000000000000000001 /* ModelsDTO.swift in Sources */,
+				8BB000000000000000000002 /* ProfileDTO.swift in Sources */,
+				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
+				8BB00000000000000000000A /* MSTaskDTO.swift in Sources */,
+				9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */,
+				9BB000000000000000000006 /* PresetBundleStore.swift in Sources */,
+				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
+				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
+				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,
+				8BB000000000000000000007 /* SystemMetrics.swift in Sources */,
+				8BB000000000000000000008 /* ProfileViews.swift in Sources */,
+				8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */,
+				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
+				9BB000000000000000000002 /* OQDTO.swift in Sources */,
+				9BB000000000000000000003 /* HFUploadDTO.swift in Sources */,
+				9BB000000000000000000004 /* BenchDTO.swift in Sources */,
+				ABB000000000000000000001 /* WelcomeWindow.swift in Sources */,
+				BBB000000000000000000004 /* AppUpdater.swift in Sources */,
+				BBB000000000000000000005 /* ReleasesChecker.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DAA000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */,
+				DBB000000000000000000002 /* AppConfigTests.swift in Sources */,
+				DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */,
+				DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */,
+				DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */,
+				DBB000000000000000000006 /* APIKeyGeneratorTests.swift in Sources */,
+				DBB000000000000000000007 /* ChatTemplateKwargsCodecTests.swift in Sources */,
+				DBB000000000000000000008 /* DflashByteSizeTests.swift in Sources */,
+				DBB000000000000000000009 /* GlobalSettingsSamplingTests.swift in Sources */,
+				DBB00000000000000000000A /* ProfileScopeTests.swift in Sources */,
+				DBB00000000000000000000B /* SystemMetricsTests.swift in Sources */,
+				DBB00000000000000000000C /* WelcomeViewModelTests.swift in Sources */,
+				DBB00000000000000000000D /* DTOFixtureTests.swift in Sources */,
+				DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */,
+				DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		DAA000000000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1AAAAAAAAAAAAAAAAAAAAAA2 /* oMLX */;
+			targetProxy = DAA000000000000000000008 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1AAAAAAAAAAAAAAAAAAAAAA5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_NS_ASSERTIONS = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		1AAAAAAAAAAAAAAAAAAAAAA6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		1AAAAAAAAAAAAAAAAAAAAAA7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Resources/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		1AAAAAAAAAAAAAAAAAAAAAA8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Resources/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		DAA000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX.app/Contents/MacOS/oMLX";
+			};
+			name = Debug;
+		};
+		DAA000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/oMLX.app/Contents/MacOS/oMLX";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1AAAAAAAAAAAAAAAAAAAAAA3 /* Build configuration list for PBXProject "oMLX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1AAAAAAAAAAAAAAAAAAAAAA5 /* Debug */,
+				1AAAAAAAAAAAAAAAAAAAAAA6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1AAAAAAAAAAAAAAAAAAAAAA4 /* Build configuration list for PBXNativeTarget "oMLX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1AAAAAAAAAAAAAAAAAAAAAA7 /* Debug */,
+				1AAAAAAAAAAAAAAAAAAAAAA8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DAA000000000000000000002 /* Build configuration list for PBXNativeTarget "oMLXTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DAA000000000000000000003 /* Debug */,
+				DAA000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
+}

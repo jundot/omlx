@@ -210,7 +210,7 @@ Benchmarking en un clic depuis le panneau d'admin. Mesure le prefill (PP) et la 
 
 ### Application barre de menus macOS
 
-Application native PyObjC dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique intégrée.
+Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique via Sparkle.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -338,22 +338,20 @@ pytest -m "not slow"
 
 ### Application macOS
 
-Nécessite Python 3.11+ et [venvstacks](https://venvstacks.lmstudio.ai) (`pip install venvstacks`).
+L'application SwiftUI native vit dans `apps/omlx-mac/`. Nécessite Xcode 26.5+ et Python 3.11+. venvstacks est déclaré comme dépendance dev, donc `pip install -e ".[dev]"` (ou `uv sync --dev`) installe la version épinglée. Le script de build retombe sur `uvx venvstacks` ou `pipx run venvstacks` si vous préférez un runner d'outils global.
 
 ```bash
-cd packaging
+# Préparer un oMLX.app exécutable (xcodebuild + couches Python venvstacks + signature ad-hoc)
+apps/omlx-mac/Scripts/build.sh release
 
-# Build complet (venvstacks + bundle app + DMG)
-python build.py
+# Le résultat atterrit dans apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# Ignorer venvstacks (modifications de code uniquement)
-python build.py --skip-venv
-
-# DMG uniquement
-python build.py --dmg-only
+# Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-Voir [packaging/README.md](packaging/README.md) pour les détails sur la structure du bundle app et la configuration des couches.
+Le premier build à froid prend 10–20 minutes (assemblage des couches Python venvstacks). Les builds suivants réutilisent `packaging/_export/` et finissent en environ 4 minutes. Voir [packaging/README.md](packaging/README.md) pour la configuration des couches et [apps/omlx-mac/](apps/omlx-mac/) pour les sources Swift.
 
 ## Contribuer
 
