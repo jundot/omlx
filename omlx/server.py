@@ -2591,6 +2591,8 @@ def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
     protocol structure (thinking tags, channel markers, etc.) and patches
     the user's grammar into the output slot.
     """
+    from omlx._torch_stub import install as _install_torch_stub
+    _install_torch_stub()
     import xgrammar as xgr
 
     reasoning = not (

@@ -1531,6 +1531,17 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
     binding on macOS arm64), or has neither API available.
     """
+    # Install the torch stub BEFORE any xgrammar import. If this lives
+    # inside the first try-block, a failure on the 0.1.34+ path can leave
+    # the fallback try-block importing xgrammar without the stub, which
+    # is guaranteed ImportError on stub-only (DMG) deployments.
+    try:
+        from omlx._torch_stub import install as _install_torch_stub
+
+        _install_torch_stub()
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("torch stub install failed: %s", e)
+
     # Prefer the 0.1.34+ registry so newer parsers (qwen3_6, gemma4,
     # deepseek_v4, ...) are exposed.
     try:
