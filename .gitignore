@@ -90,8 +90,10 @@ logs/
 
 # Temporary files
 tmp/
+tmp_*/
 temp/
 *.tmp
+*.bak
 
 # MLX cache
 .mlx_cache/
