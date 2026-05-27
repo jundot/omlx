@@ -8,6 +8,8 @@ import math
 import numpy as np
 import struct
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -803,7 +805,7 @@ class TestEmbeddingEngine:
         engine = EmbeddingEngine("test-model")
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.base.mx") as mock_mx:
+             patch("omlx.engine.embedding.mx") as mock_mx:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -829,7 +831,7 @@ class TestEmbeddingEngine:
         concurrency = 4
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.base.mx") as mock_mx:
+             patch("omlx.engine.embedding.mx") as mock_mx:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -848,6 +850,81 @@ class TestEmbeddingEngine:
 
             assert mock_mx.synchronize.call_count == concurrency
             assert mock_mx.clear_cache.call_count == concurrency
+
+    def test_engine_chunks_large_embedding_requests_and_clears_each_chunk(self):
+        """Large embedding requests should not hold the whole batch in MLX memory."""
+        engine = EmbeddingEngine("test-model", batch_size=2)
+
+        def embed_side_effect(inputs, **kwargs):
+            return EmbeddingOutput(
+                embeddings=[[float(text.rsplit("-", 1)[-1])] for text in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx") as mock_mx:
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            asyncio.run(engine.start())
+            result = asyncio.run(
+                engine.embed([f"text-{i}" for i in range(5)])
+            )
+
+            assert result.embeddings == [[0.0], [1.0], [2.0], [3.0], [4.0]]
+            assert result.total_tokens == 5
+            assert result.dimensions == 1
+            assert [
+                call.kwargs["inputs"] for call in mock_model.embed.call_args_list
+            ] == [
+                ["text-0", "text-1"],
+                ["text-2", "text-3"],
+                ["text-4"],
+            ]
+            assert mock_mx.synchronize.call_count == 3
+            assert mock_mx.clear_cache.call_count == 3
+
+    def test_concurrent_large_embedding_requests_interleave_between_chunks(self):
+        """One large embedding request should not monopolize the MLX executor."""
+        engine = EmbeddingEngine("test-model", batch_size=2)
+        observed_chunks = []
+        observed_lock = threading.Lock()
+
+        def embed_side_effect(inputs, **kwargs):
+            time.sleep(0.01)
+            with observed_lock:
+                observed_chunks.append(tuple(inputs))
+            return EmbeddingOutput(
+                embeddings=[[float(text.rsplit("-", 1)[-1])] for text in inputs],
+                total_tokens=len(inputs),
+                dimensions=1,
+            )
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
+            mock_model = MagicMock()
+            mock_model.embed.side_effect = embed_side_effect
+            MockModel.return_value = mock_model
+
+            async def run_concurrent():
+                await engine.start()
+                return await asyncio.gather(
+                    engine.embed([f"a-{i}" for i in range(4)]),
+                    engine.embed([f"b-{i}" for i in range(4)]),
+                )
+
+            first, second = asyncio.run(run_concurrent())
+
+            assert [row[0] for row in first.embeddings] == [0.0, 1.0, 2.0, 3.0]
+            assert [row[0] for row in second.embeddings] == [0.0, 1.0, 2.0, 3.0]
+            assert observed_chunks == [
+                ("a-0", "a-1"),
+                ("b-0", "b-1"),
+                ("a-2", "a-3"),
+                ("b-2", "b-3"),
+            ]
 
 
 class TestEmbeddingModelsPydantic:
