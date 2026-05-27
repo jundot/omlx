@@ -300,23 +300,6 @@ class BoundarySnapshotSSDStore:
         cleanup, and overwrites racing with re-entrant cleanup_request
         calls for the same rid).
         """
-        if self._shutdown.is_set():
-            # After shutdown the writer no longer reacquires
-            # _writer_busy per-item, so cleanup_request cannot
-            # synchronise with it. Best-effort: just drop in-memory
-            # state. Files (if any leaked through shutdown) are removed
-            # by the next constructor cleanup_all.
-            with self._pending_lock:
-                for k in [k for k in self._pending_writes if k[0] == request_id]:
-                    del self._pending_writes[k]
-            with self._registry_lock:
-                self._file_registry.pop(request_id, None)
-            logger.warning(
-                "cleanup_request(%s) called after shutdown — running "
-                "in-memory-only", request_id,
-            )
-            return
-
         # Atomically: count pending items for this rid, drop them, mark
         # the rid cancelled. Holding both locks during the snapshot is
         # required to keep the counter consistent with what the writer
@@ -415,30 +398,7 @@ class BoundarySnapshotSSDStore:
         holding ``_writer_busy``, and ``cleanup_all`` clears both
         under the same lock before rmtree. The earlier "must run on
         the save() thread" constraint is therefore no longer required.
-
-        Invariant enforcement: ``cleanup_all`` must run BEFORE
-        ``shutdown()`` to actually synchronise with the writer. Once
-        ``_shutdown`` is set the writer drops the per-item
-        ``_writer_busy`` acquire, so a post-shutdown ``cleanup_all``
-        cannot block on the writer and degrades to an in-memory
-        clear. Callers that need both should pass ``shutdown(
-        cleanup=True)`` instead of sequencing the calls themselves.
         """
-        if self._shutdown.is_set():
-            # See cleanup_request: best-effort in-memory clear only.
-            with self._pending_lock:
-                self._pending_writes.clear()
-            with self._registry_lock:
-                self._file_registry.clear()
-            with self._cancelled_lock:
-                self._cancelled_requests.clear()
-            logger.warning(
-                "cleanup_all called after shutdown — running in-memory-only; "
-                "callers wanting on-disk cleanup should use "
-                "shutdown(cleanup=True) instead"
-            )
-            return
-
         # Drain write queue so the writer thread doesn't process stale
         # items after the directory is deleted. Put_nowait the sentinel
         # back so shutdown still sees it; on Full just drop and let
@@ -505,30 +465,8 @@ class BoundarySnapshotSSDStore:
             if acquired:
                 self._writer_busy.release()
 
-    def shutdown(self, *, cleanup: bool = False) -> None:
-        """Stop background writer thread.
-
-        Parameters
-        ----------
-        cleanup : bool
-            When True, run ``cleanup_all()`` first, then signal shutdown.
-            This enforces the cleanup-before-shutdown ordering invariant
-            in one call. Callers that pass ``cleanup=False`` (the
-            default) and *also* want cleanup MUST call ``cleanup_all()``
-            themselves before ``shutdown()``.
-
-        Invariant: if a caller wants to combine ``cleanup_all()`` with
-        shutdown, the cleanup MUST run BEFORE ``_shutdown.set()`` /
-        sentinel-enqueue. Once the sentinel is in the queue and the
-        writer has consumed it, the writer no longer reacquires
-        ``_writer_busy`` after each item, so a subsequent
-        ``cleanup_all`` would wait its full 5s timeout if the writer is
-        already mid-final-item, then proceed unsynchronised. The
-        ``cleanup=True`` path handles this ordering; the warning at
-        the top of ``cleanup_all`` catches misordered callers.
-        """
-        if cleanup:
-            self.cleanup_all()
+    def shutdown(self) -> None:
+        """Stop background writer thread."""
         self._shutdown.set()
         try:
             self._write_queue.put_nowait(None)  # Sentinel
