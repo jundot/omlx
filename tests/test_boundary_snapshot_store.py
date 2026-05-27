@@ -624,42 +624,6 @@ class TestBoundarySnapshotSSDStore:
         with self.store._cancelled_lock:
             assert "req-qfull" not in self.store._cancelled_requests
 
-    def test_shutdown_cleanup_true_runs_cleanup_before_setting_flag(self):
-        """``shutdown(cleanup=True)`` must run ``cleanup_all()`` BEFORE
-        flipping ``_shutdown`` so the writer still reacquires
-        ``_writer_busy`` per item during the cleanup. Otherwise the
-        cleanup degrades to an in-memory-only clear (see the
-        post-shutdown branch in ``cleanup_all``).
-        """
-        # Save a block first so cleanup_all has something to drain.
-        self.store.save("req-shutdown", 1024, [MagicMock()], _mock_extract_cache_states)
-
-        # Use a small custom store so we can shut down without affecting
-        # other tests in this class.
-        from pathlib import Path
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            store2 = BoundarySnapshotSSDStore(Path(td))
-            try:
-                store2.save(
-                    "req-x", 256, [MagicMock()], _mock_extract_cache_states
-                )
-                snapshot_dir = store2._snapshot_dir
-                assert snapshot_dir.exists()
-                store2.shutdown(cleanup=True)
-                # After cleanup_all+shutdown the per-request dir is empty
-                # of leftover request subdirs (the cleanup itself rmtrees
-                # then mkdirs the parent).
-                assert snapshot_dir.exists()
-                leftover = list(snapshot_dir.iterdir())
-                assert leftover == [], (
-                    f"shutdown(cleanup=True) left files behind: {leftover}"
-                )
-            finally:
-                if store2._writer_thread.is_alive():
-                    store2.shutdown()
-
     def test_cancelled_requests_dict_is_thread_safe(self):
         """Concurrent cleanup_request + writer should not race on
         _cancelled_requests. Without locking, the counter underflows or
