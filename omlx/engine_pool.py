@@ -97,7 +97,6 @@ class EnginePool:
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._current_model_memory = 0
-        self._scheduler_config_provided = scheduler_config is not None
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -625,13 +624,11 @@ class EnginePool:
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
                 if effective_type == "embedding":
-                    embedding_kwargs = {
-                        "model_name": entry.model_path,
-                        "trust_remote_code": trc,
-                    }
-                    if self._scheduler_config_provided:
-                        embedding_kwargs["scheduler_config"] = self._scheduler_config
-                    engine = EmbeddingEngine(**embedding_kwargs)
+                    engine = EmbeddingEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
+                    )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
                         model_name=entry.model_path,

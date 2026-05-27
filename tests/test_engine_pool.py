@@ -735,8 +735,8 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
-    async def test_embedding_engine_keeps_default_without_scheduler_config(self, tmp_path):
-        """A bare EnginePool should not inflate EmbeddingEngine's default chunk size."""
+    async def test_embedding_engine_receives_fallback_scheduler_config(self, tmp_path):
+        """A bare EnginePool should pass its fallback scheduler config consistently."""
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -761,6 +761,7 @@ class TestEnginePoolAsync:
         MockEmbeddingEngine.assert_called_once_with(
             model_name=str(model_path),
             trust_remote_code=False,
+            scheduler_config=pool._scheduler_config,
         )
 
     @pytest.mark.asyncio
