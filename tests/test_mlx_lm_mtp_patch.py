@@ -573,7 +573,10 @@ class TestBatchGeneratorDispatch:
 
         monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", fake_rebuild)
         monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
-        monkeypatch.setattr(batch_generator, "_get_generation_stream", lambda: mx.cpu)
+        # ``_get_generation_stream`` was removed in #1304 when the patch
+        # moved stream selection to the enclosing BatchGenerator context.
+        # The fake_backbone / fake_rebuild monkeypatches above bypass the
+        # actual MLX dispatch, so no stream override is needed.
 
         def greedy(lp_2d):
             return mx.argmax(lp_2d, axis=-1).astype(mx.uint32)
