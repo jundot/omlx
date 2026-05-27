@@ -849,10 +849,12 @@
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
                     <template x-if="renamingChatId === chat.id">
                         <div class="flex items-center gap-1 flex-1 min-w-0">
-                            <input x-model="renameDraft" @click.stop @keydown.enter.prevent="saveRenamedChat(chat.id)"
+                            <input x-model="renameDraft" x-ref="renameInput" @click.stop
+                                @keydown.enter.prevent="saveRenamedChat(chat.id)"
                                 @keydown.escape.prevent="cancelRenamingChat()"
                                 class="flex-1 min-w-0 text-sm px-2 py-1 rounded-md border border-line focus:outline-none focus:border-line-strong"
-                                style="background: var(--bg-primary); color: var(--text-primary);">
+                                style="background: var(--bg-primary); color: var(--text-primary);"
+                                x-init="$nextTick(() => { $el.focus(); $el.select(); })">
                             <button @click.stop="saveRenamedChat(chat.id)"
                                 class="p-1 hover:bg-surface-alt rounded transition-colors"
                                 :title="window.t('chat.rename_save_tooltip')">
@@ -906,19 +908,6 @@
                         <option value="light">{{ t('navbar.theme.light_mode') }}</option>
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
                     </select>
-                </div>
-            </div>
-            <!-- Auto-name chat -->
-            <div class="relative w-full" x-show="true">
-                <div class="flex items-center gap-1.5 px-2 py-1 text-xs text-fg-tertiary hover:bg-surface-muted rounded">
-                    <i data-lucide="type" class="w-3.5 h-3.5 flex-shrink-0"></i>
-                    <span class="flex-1 truncate">Auto-name</span>
-                    <button @click="autoName = !autoName; localStorage.setItem('omlx_auto_name', autoName)" type="button"
-                        class="w-8 h-4 rounded-full transition-colors flex-shrink-0 relative"
-                        :class="autoName ? 'bg-accent' : 'bg-surface-muted'">
-                        <div class="absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform"
-                            :class="autoName ? 'translate-x-4' : 'translate-x-0'"></div>
-                    </button>
                 </div>
             </div>
             <button @click="clearAllHistory()" x-show="chatHistory.length > 0"
@@ -1918,8 +1907,6 @@
             releaseUrl: null,
             versionHover: false,
             _updateCheckTimer: null,
-
-            autoName: localStorage.getItem('omlx_auto_name') !== 'false',
 
             // Timeline navigation rail
             timelineDots: [],              // [{ index, topPx }]
@@ -2996,6 +2983,13 @@
     startRenamingChat(chat) {
         this.renamingChatId = chat.id;
         this.renameDraft = chat.title || window.t('chat.new_chat_title');
+        this.$nextTick(() => {
+            const ref = this.$refs.renameInput;
+            const input = Array.isArray(ref) ? ref[0] : ref;
+            if (!input) return;
+            input.focus();
+            input.select();
+        });
     },
 
     cancelRenamingChat() {
@@ -3448,10 +3442,6 @@
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
-                // Auto-generate chat title after first assistant response
-                if (this.autoName && chatSession.messages.filter(m => m.role === 'user').length === 1) {
-                    this.regenerateChatTitle();
-                }
             }
             this.resetStreamSession(stream, { preserveFinalContent: true });
             this.thinkingAutoScroll = true;
