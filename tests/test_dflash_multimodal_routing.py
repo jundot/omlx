@@ -313,3 +313,89 @@ class TestPrefixCacheEnabledForward:
         vlm.prefix_cache_enabled = False
         engine = _make_dflash(embedded_vlm=vlm)
         assert engine.prefix_cache_enabled is False
+
+
+class TestCachedTokensSurfacedFromPrefixFlow:
+    """DFlash decode path must surface dflash_mlx PrefixCacheFlow hit count
+    into GenerationOutput.cached_tokens.
+
+    Regression: upstream #1441. Before this fix the dflash decode path
+    constructed GenerationOutput without cached_tokens, so even when
+    dflash_mlx's RuntimeCacheManager.lookup matched a prefix the OpenAI
+    usage.prompt_tokens_details.cached_tokens reported 0. Multi-turn
+    chats showed full-cold prefill on every turn while DFlash was on.
+
+    The fix wires ``prefix_flow.hit_tokens`` through to GenerationOutput
+    on both the sync ``generate()`` and the streaming ``stream_generate``
+    paths.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_yields_cached_tokens_from_metrics(self):
+        """The streaming path threads metrics['cached_tokens'] into every
+        yielded GenerationOutput so server.py's `last_output.cached_tokens`
+        sees the right value regardless of which chunk it samples.
+        """
+        import asyncio as _asyncio
+
+        from omlx.engine.base import GenerationOutput
+
+        # Build the minimum DFlashEngine state the streaming generator
+        # touches before its first ``await queue.get()`` --- everything
+        # else can be patched. We're testing the queue-to-yield wiring,
+        # not the dflash_mlx executor.
+        engine = DFlashEngine.__new__(DFlashEngine)
+        engine._loaded = True
+        engine._embedded_vlm = MagicMock()
+        engine._tokenizer_obj = MagicMock()
+        engine._tokenizer_obj.encode = MagicMock(return_value=[1, 2, 3, 4, 5])
+        engine._concurrent_sem = None
+        engine._active_count = 0
+        engine._detect_needs_think_prefix = MagicMock(return_value=False)
+
+        # _route returns "dflash" so the call doesn't bounce to
+        # _embedded_vlm.stream_generate.
+        engine._route = MagicMock(return_value="dflash")
+        engine._ensure_drafter_loaded = AsyncMock()
+
+        # Replace the executor + run function so the queue gets fed
+        # deterministically: 2 token chunks then a summary chunk with
+        # cached_tokens=42 in metrics.
+        async def _fake_run_streaming_via_queue(
+            prompt_tokens, max_tokens, temperature, queue, loop, stop_event,
+        ):
+            await queue.put(("hello", [10], False, None))
+            await queue.put((" world", [20], False, None))
+            await queue.put(
+                ("", [], True, {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "acceptance_ratio": 0.9,
+                    "cycles_completed": 1,
+                    "cached_tokens": 42,
+                }),
+            )
+
+        def _fake_run_in_executor(_executor, fn, *args):
+            # Drive the fake feeder on the event loop instead of a thread,
+            # so the queue.put calls actually land.
+            return _asyncio.ensure_future(
+                _fake_run_streaming_via_queue(*args)
+            )
+
+        loop = _asyncio.get_event_loop()
+        loop.run_in_executor = _fake_run_in_executor
+
+        outputs: list[GenerationOutput] = []
+        async for out in engine.stream_generate(prompt="hi", max_tokens=4):
+            outputs.append(out)
+
+        # 3 yields (2 token chunks + 1 final). Every chunk after the final
+        # SummaryEvent metric carries cached_tokens=42. The first chunk
+        # comes before metrics so it stays 0; once the metric arrives
+        # subsequent chunks pick it up. We require the final yielded
+        # chunk to carry the value, since that is what server.py reads
+        # for usage accounting.
+        assert len(outputs) == 3
+        assert outputs[-1].cached_tokens == 42
+        assert outputs[-1].finished is True

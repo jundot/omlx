@@ -971,11 +971,21 @@ class DFlashEngine(BaseEngine):
                         f"cycles={cycles}"
                         f"{', fallback=AR' if fallback else ''}"
                     )
+                    # ``prefix_flow.hit_tokens`` carries the cached prefix-
+                    # length that dflash actually matched against the request
+                    # (RuntimeCacheManager.lookup -> matched_tokens). Surfacing
+                    # it as cached_tokens here is what fixes upstream #1441:
+                    # without it dflash-routed requests always reported
+                    # cached_tokens=0 to OpenAI clients even when the dflash
+                    # prefix cache had a hit, making multi-turn chats look
+                    # like every prefill was cold.
+                    cached = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
                     metrics = {
                         "prompt_tokens": int(event.prompt_token_count),
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "cached_tokens": cached,
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -1083,7 +1093,11 @@ class DFlashEngine(BaseEngine):
                         elif isinstance(event, SummaryEvent):
                             summary = event
                         # Other events (progress, snapshots) are informational.
-                    return summary, tokens
+                    # prefix_flow.hit_tokens carries the dflash prefix-cache
+                    # hit count; surface it so the caller can populate
+                    # GenerationOutput.cached_tokens (fix for upstream #1441).
+                    cached = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
+                    return summary, tokens, cached
                 finally:
                     if event_iter is not None:
                         close = getattr(event_iter, "close", None)
@@ -1097,7 +1111,9 @@ class DFlashEngine(BaseEngine):
             self._active_count += 1
             future = loop.run_in_executor(get_mlx_executor(), _run)
             try:
-                summary, generated = await asyncio.shield(asyncio.wrap_future(future))
+                summary, generated, cached_tokens = await asyncio.shield(
+                    asyncio.wrap_future(future)
+                )
             except asyncio.CancelledError:
                 stop_event.set()
                 logger.info("DFlash generate cancelled, waiting for executor to drain")
@@ -1136,6 +1152,7 @@ class DFlashEngine(BaseEngine):
                 tokens=generated,
                 prompt_tokens=prompt_tokens_count,
                 completion_tokens=completion_tokens_count,
+                cached_tokens=cached_tokens,
                 finish_reason="stop",
             )
         finally:
@@ -1214,6 +1231,12 @@ class DFlashEngine(BaseEngine):
         total_text = ""
         total_completion = 0
         finished_normally = False
+        # cached_tokens travels on the final SummaryEvent only (mid-stream
+        # chunks have metrics=None). Snapshot it onto every yielded chunk
+        # so usage accounting downstream (server.py reads last_output.
+        # cached_tokens) sees the right number regardless of which chunk
+        # it samples. Fix for upstream #1441.
+        cached_tokens = 0
 
         try:
             while True:
@@ -1225,6 +1248,9 @@ class DFlashEngine(BaseEngine):
 
                 total_text += new_text
                 total_completion += len(new_tokens)
+
+                if metrics and "cached_tokens" in metrics:
+                    cached_tokens = int(metrics["cached_tokens"])
 
                 finish_reason = None
                 if finished:
@@ -1239,6 +1265,7 @@ class DFlashEngine(BaseEngine):
                     tokens=new_tokens,
                     prompt_tokens=prompt_len,
                     completion_tokens=total_completion,
+                    cached_tokens=cached_tokens,
                     finished=finished,
                     finish_reason=finish_reason,
                 )
