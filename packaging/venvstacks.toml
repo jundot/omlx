@@ -20,7 +20,7 @@ platforms = [
 
 [[frameworks]]
 name = "mlx-framework"
-runtime = "cpython-3.11"
+runtime = "cpython-3.14"
 # Populated by build.py:_generate_venvstacks_toml() from
 # pyproject.toml's [project] dependencies + [project.optional-dependencies] bundle
 # (see _LAYER_REQUIREMENTS_SOURCES["mlx-framework"] = ["project", "bundle"]).
