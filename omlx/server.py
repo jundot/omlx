@@ -1359,6 +1359,26 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     return None
 
 
+def _chat_keepalive_chunk(response_id: str) -> str:
+    """Keepalive frame that shares the stream's completion id.
+
+    The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
+    (``chatcmpl-keepalive``) that differs from the real completion chunks.
+    Strict OpenAI stream accumulators (e.g. the official ``openai-go`` SDK)
+    assume every chunk in one streamed completion shares a single ``id``: they
+    latch the first chunk's id and silently drop later chunks whose id differs,
+    discarding the real ``tool_calls``/``finish_reason``/``usage``. Emitting the
+    keepalive with the stream's own ``response_id`` makes it a true no-op for
+    those clients while remaining a parseable data event for clients that can't
+    handle SSE comment lines.
+    """
+    return (
+        'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
+        '"created":0,"model":"keepalive",'
+        '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    )
+
+
 async def _safe_anext(ait):
     """Wrapper for __anext__ that converts StopAsyncIteration to a sentinel.
 
@@ -2314,11 +2334,17 @@ async def create_chat_completion(
         chat_kwargs["stop"] = request.stop
 
     if request.stream:
+        # Pre-mint the completion id so the keepalive frame (emitted before the
+        # generator starts) can share it. See _chat_keepalive_chunk.
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        keepalive = _resolve_keepalive("openai_chat")
+        if keepalive == _KEEPALIVE_CHAT_CHUNK:
+            keepalive = _chat_keepalive_chunk(response_id)
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
                 http_request=http_request,
-                keepalive_chunk=_resolve_keepalive("openai_chat"),
+                keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2770,6 +2796,7 @@ async def stream_chat_completion(
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
+    response_id: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2785,7 +2812,9 @@ async def stream_chat_completion(
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    # Reuse the id pre-minted by the caller (so the keepalive frame can share
+    # it); otherwise mint one for direct/non-streaming callers.
+    response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(

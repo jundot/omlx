@@ -153,6 +153,37 @@ class TestKeepaliveChunkFormats:
         assert items == ["data: real\n\n"]
 
 
+class TestChatKeepaliveSharesStreamId:
+    """The chunk-form chat keepalive must reuse the stream's completion id.
+
+    Strict OpenAI stream accumulators key on a single per-stream ``id`` and
+    drop chunks whose id differs from the first. A keepalive carrying the
+    sentinel ``chatcmpl-keepalive`` id therefore causes them to discard the
+    real tool_calls/usage chunks. _chat_keepalive_chunk reuses the stream id so
+    the frame is a true no-op for those clients.
+    """
+
+    def test_frame_uses_given_response_id(self):
+        from omlx.server import _chat_keepalive_chunk
+
+        frame = _chat_keepalive_chunk("chatcmpl-abc123")
+        assert frame.startswith("data: ")
+        assert frame.endswith("\n\n")
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload["id"] == "chatcmpl-abc123"
+        assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["content"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+
+    def test_frame_does_not_use_sentinel_id(self):
+        from omlx.server import _chat_keepalive_chunk
+
+        payload = json.loads(
+            _chat_keepalive_chunk("chatcmpl-real").removeprefix("data: ").strip()
+        )
+        assert payload["id"] != "chatcmpl-keepalive"
+
+
 class TestResolveKeepalive:
     """Tests for _resolve_keepalive helper that maps settings to wire format."""
 
