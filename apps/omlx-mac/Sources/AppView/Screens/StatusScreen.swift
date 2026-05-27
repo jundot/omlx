@@ -16,6 +16,7 @@ struct StatusScreen: View {
 
     @State private var showingClearStatsConfirm = false
     @State private var showingClearSsdCacheConfirm = false
+    @State private var showingClearHotCacheConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -106,7 +107,8 @@ struct StatusScreen: View {
 
             RuntimeCacheSection(
                 cache: vm.stats?.runtimeCache,
-                onClearTap: { showingClearSsdCacheConfirm = true }
+                onClearSsdTap: { showingClearSsdCacheConfirm = true },
+                onClearHotTap: { showingClearHotCacheConfirm = true }
             )
 
             SectionHeader(String(localized: "status.updates.title",
@@ -170,19 +172,43 @@ struct StatusScreen: View {
                           comment: "Common cancel button label"),
                    role: .cancel) {}
         }
+        .confirmationDialog(
+            String(localized: "status.confirm.clear_hot",
+                   defaultValue: "Clear the in-memory KV cache for all loaded models? Subsequent requests will re-fault from SSD or recompute.",
+                   comment: "Confirmation dialog title for clearing the hot (memory) KV cache"),
+            isPresented: $showingClearHotCacheConfirm,
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "status.confirm.clear_button",
+                          defaultValue: "Clear",
+                          comment: "Destructive clear button inside stats clear confirmation dialogs"),
+                   role: .destructive) {
+                Task { await vm.clearHotCache() }
+            }
+            Button(String(localized: "common.cancel",
+                          defaultValue: "Cancel",
+                          comment: "Common cancel button label"),
+                   role: .cancel) {}
+        }
     }
 }
 
 // MARK: - Runtime Cache section
 
-/// File count + total size of the on-disk SSD KV cache, plus a `Clear`
-/// button. Mirrors HTML _status.html's "Runtime Cache Observability"
-/// panel — `total_num_files == 0` disables the clear button.
+/// Two-tier KV cache observability — memory (hot) tier + on-disk (SSD)
+/// tier. Mirrors HTML _status.html's "Runtime Cache Observability"
+/// panel. The memory tier rows hide when `hot_cache_max_bytes == 0`,
+/// which signals the memory tier is disabled for the current run.
 private struct RuntimeCacheSection: View {
     let cache: StatsDTO.RuntimeCacheDTO?
-    let onClearTap: () -> Void
+    let onClearSsdTap: () -> Void
+    let onClearHotTap: () -> Void
 
     @Environment(\.omlxTheme) private var theme
+
+    private var hotTierEnabled: Bool {
+        (cache?.hotCacheMaxBytes ?? 0) > 0
+    }
 
     var body: some View {
         SectionHeader(String(localized: "status.section.runtime_cache",
@@ -190,6 +216,20 @@ private struct RuntimeCacheSection: View {
                               comment: "Section header for the runtime cache observability panel"),
                       subtitle: subtitleText)
         ListGroup {
+            if hotTierEnabled {
+                Row(label: String(localized: "status.runtime_cache.memory",
+                                  defaultValue: "Memory Cache",
+                                  comment: "Row label for the in-memory (hot) KV cache size gauge")) {
+                    Text(memoryGaugeText)
+                        .font(.omlxMono(12))
+                }
+                Row(label: String(localized: "status.runtime_cache.memory_entries",
+                                  defaultValue: "Memory Entries",
+                                  comment: "Row label for the number of in-memory KV cache entries")) {
+                    Text(memoryEntriesText)
+                        .font(.omlxMono(12))
+                }
+            }
             Row(label: String(localized: "status.runtime_cache.files",
                               defaultValue: "Cache Files",
                               comment: "Row label for cache file count")) {
@@ -216,17 +256,43 @@ private struct RuntimeCacheSection: View {
                 }
             }
             FreeRow(isLast: true) {
-                HStack {
+                HStack(spacing: 8) {
                     Spacer()
+                    if hotTierEnabled {
+                        Button(String(localized: "status.runtime_cache.clear_hot",
+                                      defaultValue: "Clear Memory Cache",
+                                      comment: "Destructive button to clear the in-memory KV cache"),
+                               action: onClearHotTap)
+                            .buttonStyle(.omlx(.destructive, size: .small))
+                            .disabled((cache?.hotCacheEntries ?? 0) == 0)
+                    }
                     Button(String(localized: "status.runtime_cache.clear_ssd",
                                   defaultValue: "Clear SSD Cache",
                                   comment: "Destructive button to clear all SSD cache files"),
-                           action: onClearTap)
+                           action: onClearSsdTap)
                         .buttonStyle(.omlx(.destructive, size: .small))
                         .disabled((cache?.totalNumFiles ?? 0) == 0)
                 }
             }
         }
+    }
+
+    private var memoryGaugeText: String {
+        let used = cache?.hotCacheSizeBytes ?? 0
+        let cap = cache?.hotCacheMaxBytes ?? 0
+        return "\(formatByteCount(used)) / \(formatByteCount(cap))"
+    }
+
+    private var memoryEntriesText: String {
+        let n = cache?.hotCacheEntries ?? 0
+        if n == 1 {
+            return String(localized: "status.runtime_cache.memory_entries.one",
+                          defaultValue: "1 entry",
+                          comment: "Singular memory cache entry count")
+        }
+        return String(localized: "status.runtime_cache.memory_entries.other",
+                      defaultValue: "\(n) entries",
+                      comment: "Plural memory cache entry count; placeholder is the number of entries")
     }
 
     private var fileCountText: String {
@@ -859,6 +925,18 @@ final class StatusScreenVM: ObservableObject {
         guard let client else { return }
         do {
             _ = try await client.clearSsdCache()
+            await tick()
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    /// Drop the in-memory (hot) KV cache for all loaded models. Subsequent
+    /// requests re-fault from SSD or recompute.
+    func clearHotCache() async {
+        guard let client else { return }
+        do {
+            _ = try await client.clearHotCache()
             await tick()
         } catch {
             self.lastError = error.omlxDescription

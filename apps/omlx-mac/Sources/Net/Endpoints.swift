@@ -18,6 +18,7 @@ enum AdminAPI {
     static let statsClear      = "\(prefix)/stats/clear"
     static let statsClearAlltime = "\(prefix)/stats/clear-alltime"
     static let ssdCacheClear   = "\(prefix)/ssd-cache/clear"
+    static let hotCacheClear   = "\(prefix)/hot-cache/clear"
     static let logs            = "\(prefix)/logs"
 
     static let models          = "\(prefix)/models"
