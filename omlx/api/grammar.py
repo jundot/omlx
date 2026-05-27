@@ -37,16 +37,40 @@ def create_grammar_compiler(tokenizer, model):
     """Create an xgrammar GrammarCompiler for the given tokenizer and model.
 
     Returns None if vocab_size cannot be determined.
+
+    Passes the full stop-token set (tokenizer eos + generation_config eos)
+    to ``TokenizerInfo.from_huggingface(stop_token_ids=...)`` so the
+    grammar matcher allows every real EOS / end-of-turn token to terminate
+    a structured output. Without this, multi-EOS models like Gemma 4
+    (canonical ``<eos>`` plus ``<end_of_turn>`` token 106, declared only
+    in generation_config.json) loop on repeating characters inside a
+    ``<string>`` state because the bitmask masks out the very tokens the
+    model would use to escape -- observed in production 2026-05-28 on
+    gemma4-moe-26b-a4b-q6 (21k tokens / 6 min on one request before
+    max_tokens stopped it).
     """
     import xgrammar as xgr
 
-    from ..utils.tokenizer import resolve_vocab_size, unwrap_tokenizer
+    from ..utils.tokenizer import (
+        collect_stop_token_ids,
+        resolve_vocab_size,
+        unwrap_tokenizer,
+    )
 
     hf_tokenizer = unwrap_tokenizer(tokenizer)
     vocab_size = resolve_vocab_size(model)
     kwargs = {}
     if vocab_size is not None:
         kwargs["vocab_size"] = vocab_size
+
+    stop_token_ids = collect_stop_token_ids(hf_tokenizer)
+    if stop_token_ids:
+        kwargs["stop_token_ids"] = sorted(stop_token_ids)
+        logger.info(
+            "Wiring %d stop token(s) into xgrammar: %s",
+            len(stop_token_ids),
+            sorted(stop_token_ids),
+        )
 
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
     return xgr.GrammarCompiler(tokenizer_info)

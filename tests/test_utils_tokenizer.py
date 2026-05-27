@@ -345,3 +345,84 @@ class TestResolveVocabSize:
 
         model = SimpleNamespace()
         assert resolve_vocab_size(model) is None
+
+
+class TestCollectStopTokenIds:
+    """Tests for collect_stop_token_ids -- the helper that feeds
+    xgrammar.TokenizerInfo.from_huggingface so structured-output bitmasks
+    don't mask out model-specific EOS / end-of-turn tokens.
+
+    Regression: 2026-05-28 prod incident on gemma4-moe-26b-a4b-q6 ---
+    json_schema requests looped inside a <string> state because xgrammar
+    only saw the canonical <eos> token; Gemma 4's <end_of_turn> (106) and
+    second EOS (50) were only declared in generation_config.json.
+    """
+
+    def test_includes_canonical_eos_int(self):
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        tok = SimpleNamespace(eos_token_id=2, name_or_path=None)
+        assert collect_stop_token_ids(tok) == {2}
+
+    def test_includes_canonical_eos_list(self):
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        tok = SimpleNamespace(eos_token_id=[2, 50256], name_or_path=None)
+        assert collect_stop_token_ids(tok) == {2, 50256}
+
+    def test_includes_plural_eos_token_ids(self):
+        """Some MLX tokenizers expose the plural attribute too."""
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        tok = SimpleNamespace(eos_token_id=2, eos_token_ids=[2, 106], name_or_path=None)
+        assert collect_stop_token_ids(tok) == {2, 106}
+
+    def test_reads_generation_config_eos(self, tmp_path):
+        """Generation_config.json eos_token_id is unioned in --- this is
+        the actual Gemma 4 path that broke production."""
+        import json
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"eos_token_id": [1, 106, 50]})
+        )
+        tok = SimpleNamespace(eos_token_id=1, name_or_path=str(tmp_path))
+        assert collect_stop_token_ids(tok) == {1, 106, 50}
+
+    def test_returns_empty_set_when_nothing_available(self):
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        tok = SimpleNamespace(eos_token_id=None, name_or_path=None)
+        assert collect_stop_token_ids(tok) == set()
+
+    def test_handles_missing_generation_config_gracefully(self, tmp_path):
+        """name_or_path points at a directory with no generation_config.json:
+        returns just the tokenizer eos, doesn't raise."""
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        # tmp_path is real but has no generation_config.json
+        tok = SimpleNamespace(eos_token_id=2, name_or_path=str(tmp_path))
+        assert collect_stop_token_ids(tok) == {2}
+
+    def test_handles_malformed_generation_config(self, tmp_path):
+        """generation_config.json exists but is malformed: returns just
+        the tokenizer eos, doesn't raise."""
+        from types import SimpleNamespace
+
+        from omlx.utils.tokenizer import collect_stop_token_ids
+
+        (tmp_path / "generation_config.json").write_text("not json at all {")
+        tok = SimpleNamespace(eos_token_id=2, name_or_path=str(tmp_path))
+        assert collect_stop_token_ids(tok) == {2}
