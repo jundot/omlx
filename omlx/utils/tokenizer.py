@@ -38,6 +38,82 @@ def unwrap_tokenizer(tokenizer):
     return tokenizer
 
 
+def collect_stop_token_ids(tokenizer: Any) -> set[int]:
+    """Collect every EOS / end-of-turn token id the model treats as terminal.
+
+    Mirrors the scheduler's ``_get_stop_tokens`` logic minus protocol-specific
+    additions (Harmony stops are scheduler-layer concerns). Used by
+    ``api.grammar.create_grammar_compiler`` to wire xgrammar's
+    ``TokenizerInfo.stop_token_ids`` so the GrammarMatcher's bitmask treats
+    every real EOS as terminal.
+
+    Why this matters: Gemma 4 declares ``<end_of_turn>`` (token 106) plus a
+    second EOS variant (50) only in ``generation_config.json`` ---
+    ``tokenizer.eos_token_id`` is the canonical ``<eos>`` alone. Without
+    surfacing the generation_config set to xgrammar, the matcher masks
+    those tokens out of the bitmask once a structured-output state expects
+    string content; the model loops on repeating characters inside the
+    ``<string>`` state until it hits ``max_tokens`` (observed 2026-05-28:
+    21k tokens / 6 min on a single chat completion).
+
+    Resolution order (union):
+    1. ``tokenizer.eos_token_id`` (int or list).
+    2. ``tokenizer.eos_token_ids`` (some MLX tokenizers expose the plural).
+    3. ``{tokenizer.name_or_path}/generation_config.json`` ``eos_token_id``
+       (int or list), if the path resolves locally.
+
+    Returns an empty set if no stop token can be derived. xgrammar treats
+    that as "use tokenizer's eos only", which is the pre-fix behavior.
+    """
+    stops: set[int] = set()
+
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        if isinstance(eos, int):
+            stops.add(eos)
+        else:
+            try:
+                stops.update(int(t) for t in eos)
+            except TypeError:
+                pass
+
+    eos_plural = getattr(tokenizer, "eos_token_ids", None)
+    if eos_plural is not None:
+        if isinstance(eos_plural, int):
+            stops.add(eos_plural)
+        else:
+            try:
+                stops.update(int(t) for t in eos_plural)
+            except TypeError:
+                pass
+
+    model_path = getattr(tokenizer, "name_or_path", None)
+    if model_path:
+        try:
+            import json
+            import os
+
+            gc_path = os.path.join(model_path, "generation_config.json")
+            if os.path.exists(gc_path):
+                with open(gc_path) as f:
+                    gc = json.load(f)
+                gc_eos = gc.get("eos_token_id")
+                if gc_eos is not None:
+                    if isinstance(gc_eos, int):
+                        stops.add(gc_eos)
+                    else:
+                        try:
+                            stops.update(int(t) for t in gc_eos)
+                        except TypeError:
+                            pass
+        except Exception as e:
+            logger.debug(
+                "collect_stop_token_ids: failed reading generation_config: %s", e
+            )
+
+    return stops
+
+
 def resolve_vocab_size(model: Any) -> int | None:
     """Extract vocab_size from a model, preferring the authoritative source.
 
