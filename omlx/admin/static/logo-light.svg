@@ -1,24 +1,26 @@
-<svg version="1.0" xmlns="http://www.w3.org/2000/svg"
- width="1024" height="1024" viewBox="123 114 763 763"
- preserveAspectRatio="xMidYMid meet">
-<g transform="translate(0.000000,1024.000000) scale(0.100000,-0.100000)"
-fill="#000000" stroke="none">
-<path d="M5170 8523 c-90 -10 -286 -56 -381 -88 -226 -79 -414 -194 -592 -365
--203 -194 -330 -412 -411 -705 -43 -158 -62 -292 -91 -665 -58 -734 -206
--1362 -460 -1950 -177 -409 -322 -671 -538 -973 -54 -76 -97 -140 -95 -142 14
--12 161 -25 289 -25 410 0 911 148 1232 364 332 223 569 559 660 936 47 194
-59 305 55 540 -3 193 -1 219 15 243 62 95 184 78 240 -33 84 -168 47 -642 -78
--999 -36 -104 -124 -288 -173 -365 -141 -219 -359 -434 -570 -563 -170 -104
--481 -228 -734 -293 l-86 -23 -32 -91 c-44 -124 -157 -353 -226 -456 -156
--233 -352 -416 -600 -561 -116 -68 -153 -102 -160 -150 -6 -42 22 -91 65 -113
-80 -42 361 -99 684 -141 448 -57 1172 -64 1597 -14 128 15 378 57 533 90 l138
-29 112 -34 c244 -74 462 -105 793 -113 473 -11 721 38 782 157 75 146 -85 322
--368 403 -47 14 -108 28 -135 32 -103 13 -103 13 -59 42 144 97 331 277 447
-432 241 319 386 684 437 1096 13 101 16 408 5 500 -54 464 -183 850 -512 1525
--156 320 -174 375 -181 520 -7 178 29 287 138 423 104 130 247 237 522 391
-187 105 219 146 159 206 -33 33 -70 44 -308 94 -202 43 -299 73 -408 130 -65
-33 -107 67 -226 183 -81 77 -182 168 -226 200 -220 164 -497 279 -760 317
--103 15 -393 20 -493 9z m951 -841 c75 -39 119 -111 119 -194 0 -137 -93 -232
--225 -232 -168 0 -283 172 -215 322 55 120 200 167 321 104z"/>
-</g>
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="6" flood-color="#000" flood-opacity="0.15"/>
+    </filter>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#f0f0f0"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#9a9da4"/>
+      <stop offset="35%"  stop-color="#6e7178"/>
+      <stop offset="75%"  stop-color="#3d3f44"/>
+      <stop offset="100%" stop-color="#1c1d22"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded card to match Mac app icon style -->
+  <rect x="10" y="10" width="140" height="140" rx="32" fill="url(#bg)" filter="url(#shadow)"/>
+  <!-- Flyto "ô" glyph: donut + caret roof, source viewBox 240×240, centred in 140×140 inner card.
+       Scale 140/240 = 0.5833, offset by (10,10) to land inside the card. -->
+  <g transform="translate(10, 10) scale(0.5833)">
+    <path fill="url(#silver)" fill-rule="evenodd"
+          d="M120,60 a78,78 0 1 0 0.01,0 Z M120,108 a30,30 0 1 1 -0.01,0 Z"/>
+    <polygon fill="url(#silver)" points="120,18 216,98 198,114 120,48 42,114 24,98"/>
+  </g>
 </svg>
