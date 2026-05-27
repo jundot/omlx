@@ -36,7 +36,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         self,
         model_name: str,
         trust_remote_code: bool = False,
-        batch_size: int = 8,
+        batch_size: int | None = None,
+        *,
+        scheduler_config: Any | None = None,
     ):
         """
         Initialize the embedding engine.
@@ -45,10 +47,19 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             trust_remote_code: Allow loaders to execute custom Python shipped
                 with the model repo. Off by default for security (issue #926).
+            batch_size: Explicit per-forward input chunk size override.
+            scheduler_config: Shared scheduler configuration. Embedding uses
+                completion_batch_size as its per-forward input chunk size.
         """
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
+        if batch_size is None:
+            batch_size = (
+                getattr(scheduler_config, "completion_batch_size", 8)
+                if scheduler_config is not None
+                else 8
+            )
         self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None
 

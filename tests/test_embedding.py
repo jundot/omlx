@@ -757,6 +757,26 @@ class TestEmbeddingEngine:
         assert stats["model_name"] == "test-model"
         assert stats["loaded"] is False
 
+    def test_engine_uses_scheduler_completion_batch_size(self):
+        """Embedding chunk size should follow shared scheduler config."""
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.scheduler import SchedulerConfig
+
+        engine = EmbeddingEngine(
+            "test-model",
+            scheduler_config=SchedulerConfig(completion_batch_size=6),
+        )
+
+        assert engine.get_stats()["batch_size"] == 6
+
+    def test_engine_preserves_positional_batch_size_argument(self):
+        """Keep EmbeddingEngine(model, trust_remote_code, batch_size) working."""
+        from omlx.engine.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", False, 3)
+
+        assert engine.get_stats()["batch_size"] == 3
+
     def test_engine_get_model_info_not_loaded(self):
         """Test get_model_info when model is not loaded."""
         from omlx.engine.embedding import EmbeddingEngine
