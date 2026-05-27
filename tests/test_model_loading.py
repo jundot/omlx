@@ -19,6 +19,19 @@ def _write_config(tmp_path, body: str) -> str:
     return str(tmp_path)
 
 
+def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
+    """Drop a stub ``model.safetensors.index.json`` next to config.json so
+    ``_checkpoint_has_mtp_weights`` resolves deterministically in tests."""
+    keys = {"language_model.model.embed_tokens.weight": "model.safetensors"}
+    if has_mtp:
+        keys["language_model.mtp.fc.weight"] = "model.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"metadata": {}, "weight_map": '
+        + str(keys).replace("'", '"')
+        + "}"
+    )
+
+
 class TestNoDispatch:
     """Cases where the dispatcher should return None and let the caller
     fall back to the standard mlx-lm/mlx-vlm load path."""
@@ -164,10 +177,14 @@ class TestVlmMtpPreLoadDispatch:
     def _stub_patches(self, monkeypatch):
         """Replace the patch modules with mocks that record call order.
 
-        Returns the recorded-order list plus the sanitize/runtime mocks."""
+        Returns the recorded-order list plus the sanitize/runtime/attach
+        mocks."""
         calls: list[str] = []
         sanitize_mock = MagicMock(side_effect=lambda: calls.append("sanitize") or True)
         runtime_mock = MagicMock(side_effect=lambda: calls.append("runtime") or True)
+        attach_mock = MagicMock(
+            side_effect=lambda enabled: calls.append(f"attach={enabled}")
+        )
         # Side-step the real mlx-lm load_config monkey-patch.
         monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
         monkeypatch.setitem(
@@ -184,29 +201,34 @@ class TestVlmMtpPreLoadDispatch:
             MagicMock(
                 apply_mlx_vlm_mtp_patch=sanitize_mock,
                 apply_mlx_vlm_mtp_runtime_patch=runtime_mock,
+                set_mtp_attach_enabled=attach_mock,
             ),
         )
-        return calls, sanitize_mock, runtime_mock
+        return calls, sanitize_mock, runtime_mock, attach_mock
 
     def test_sanitize_patch_runs_before_runtime_for_vlm_mtp(
         self, tmp_path, monkeypatch
     ):
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
         # qwen3_5 (dense VLM) declaring an MTP head under text_config.
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
             '"text_config": {"mtp_num_hidden_layers": 1}}',
         )
+        _write_mtp_index(tmp_path, has_mtp=True)
         settings = types.SimpleNamespace(mtp_enabled=True)
 
         maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
         # Ordering matters: the dense runtime patch assumes sanitize was
         # already installed by apply_mlx_vlm_mtp_patch.
-        assert calls == ["sanitize", "runtime"]
+        assert calls == ["attach=True", "sanitize", "runtime"]
 
     def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
         # Issue #1404: persisted ``mtp.*`` weights must still get a binding
@@ -214,26 +236,63 @@ class TestVlmMtpPreLoadDispatch:
         # even with mtp_enabled=False. Otherwise mlx-vlm's strict load_weights
         # fails with "parameters not in model" and the engine falls back to
         # LLM, silently dropping vision.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
             '"text_config": {"mtp_num_hidden_layers": 1}}',
         )
+        _write_mtp_index(tmp_path, has_mtp=True)
         settings = types.SimpleNamespace(mtp_enabled=False)
 
         maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_called_once()
-        assert calls == ["sanitize", "runtime"]
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_vlm_attach_disabled_when_config_declares_mtp_but_weights_missing(
+        self, tmp_path, monkeypatch
+    ):
+        # Issue #1426: unsloth Qwen3.6 UD MLX builds declare
+        # mtp_num_hidden_layers=1 in config.json but ship no mtp.* weights.
+        # Attaching MTPModule there causes mlx-vlm strict load_weights to
+        # fail with "Missing N parameters: language_model.mtp.*", the
+        # engine falls back to LLM, and vision is silently dropped. The
+        # dispatcher must flip set_mtp_attach_enabled(False) so the runtime
+        # patch's __init__ wrap skips attachment for this load.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=False)
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        # Runtime patch itself still applies (process-wide class wrap is
+        # idempotent and harmless when there are no mtp.* weights to bind);
+        # the gate is what prevents MTPModule attachment.
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(False)
+        assert calls == ["attach=False", "sanitize", "runtime"]
 
     def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
         # BatchedEngine / DFlashEngine / LLM loader paths must NOT touch
         # mlx-vlm classes even when the model declares MTP heads. for_vlm
         # defaults to False so they pass through without invoking mlx-vlm
         # patches.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
@@ -251,7 +310,9 @@ class TestVlmMtpPreLoadDispatch:
         # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
         # sanitize replacement so pre-converted switch_mlp weights load.
         # Runtime MTP patch must NOT run — there is no mtp.* tree to bind.
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5_moe", "vision_config": {}, '
@@ -268,7 +329,9 @@ class TestVlmMtpPreLoadDispatch:
     def test_qwen36_moe_vlm_sanitize_skipped_without_for_vlm(
         self, tmp_path, monkeypatch
     ):
-        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5_moe", "vision_config": {}, '
@@ -281,3 +344,78 @@ class TestVlmMtpPreLoadDispatch:
         sanitize_mock.assert_not_called()
         runtime_mock.assert_not_called()
         assert calls == []
+
+
+class TestCheckpointHasMtpWeights:
+    """``_checkpoint_has_mtp_weights`` decides whether the mlx-vlm runtime
+    patch attaches ``MTPModule`` at load time. The scan must:
+
+    - return True when ``model.safetensors.index.json`` declares any key
+      under the ``(language_model.|model.)?mtp.`` prefix family;
+    - return False when no MTP-prefixed key is found;
+    - return False on missing / unreadable inputs (callers treat that as
+      "no MTP weights" — the conservative choice).
+    """
+
+    def _write_index(self, tmp_path, weight_map: dict) -> None:
+        import json as _json
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            _json.dumps({"metadata": {}, "weight_map": weight_map})
+        )
+
+    def test_returns_true_when_index_has_language_model_mtp(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            {
+                "language_model.model.embed_tokens.weight": "model.safetensors",
+                "language_model.mtp.fc.weight": "model.safetensors",
+            },
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+    def test_returns_true_when_index_has_bare_mtp(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            {"mtp.layers.0.self_attn.q_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+    def test_returns_true_when_index_has_model_language_model_mtp(self, tmp_path):
+        # mlx-vlm HF-source layout before sanitize-time remap (oQ writes this).
+        self._write_index(
+            tmp_path,
+            {"model.language_model.mtp.norm.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+    def test_returns_false_when_index_lacks_mtp(self, tmp_path):
+        # Unsloth Qwen3.6 UD MLX layout: vision_tower + language_model.model.*
+        # but no language_model.mtp.* keys despite mtp_num_hidden_layers > 0
+        # in config.json (issue #1426).
+        self._write_index(
+            tmp_path,
+            {
+                "language_model.model.embed_tokens.weight": "model.safetensors",
+                "vision_tower.blocks.0.attn.proj.weight": "model.safetensors",
+            },
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_false_for_empty_dir(self, tmp_path):
+        # No index, no shards — caller treats as "no MTP weights".
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_false_for_nonexistent_path(self, tmp_path):
+        assert (
+            model_loading._checkpoint_has_mtp_weights(
+                str(tmp_path / "does-not-exist")
+            )
+            is False
+        )
+
+    def test_returns_false_on_malformed_index(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text("{not valid")
+        # Falls through to safetensors-header scan; no shards exist, so
+        # the helper conservatively returns False.
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
