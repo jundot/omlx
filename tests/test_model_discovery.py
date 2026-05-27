@@ -248,9 +248,17 @@ class TestDetectModelType:
         assert detect_model_type(tmp_path) == "llm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
-        """Test detection of Qwen3.5 MoE as VLM."""
+        """Genuine VLM qwen3_5_moe (vision_config + VLM architecture) is VLM.
+
+        Updated post-upstream #812: qwen3_5_moe is now in
+        AMBIGUOUS_VLM_MODEL_TYPES, so vision_config alone no longer triggers
+        VLM classification — a VLM architecture in ``architectures`` is also
+        required. Bare vision_config without VLM architecture is covered by
+        ``test_detect_text_only_qwen3_5_moe_as_llm`` below.
+        """
         config = {
             "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen2_5_VLForConditionalGeneration"],
             "vision_config": {"depth": 32, "hidden_size": 1280},
             "text_config": {"hidden_size": 4096},
         }
