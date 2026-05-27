@@ -217,12 +217,11 @@ class GlobalSettingsRequest(BaseModel):
     # Model settings
     model_dirs: list[str] | None = None
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
-    max_model_memory: str | None = None
     model_fallback: bool | None = None
 
     # Memory enforcement
-    max_process_memory: str | None = None  # "auto", "disabled", or "XX%"
     memory_prefill_memory_guard: bool | None = None
+    memory_guard_tier: str | None = None  # "safe" / "balanced" / "aggressive"
 
     # Scheduler settings
     max_concurrent_requests: int | None = None
@@ -655,117 +654,35 @@ async def _reload_models() -> tuple[bool, str]:
     return True, msg
 
 
-async def _apply_max_model_memory_runtime(
-    max_memory_bytes: int | None,
+async def _apply_memory_guard_tier_runtime(
+    tier: str,
 ) -> tuple[bool, str]:
     """
-    Apply max model memory change at runtime.
+    Apply memory_guard_tier change at runtime.
 
-    If current usage exceeds new limit, unloads LRU models until within limit.
-    If None, disables model memory limiting.
-
-    Returns:
-        Tuple of (success, message)
-    """
-    from ..model_discovery import format_size
-    from ..server import _server_state
-
-    if _server_state.engine_pool is None:
-        return False, "Engine pool not initialized"
-
-    pool = _server_state.engine_pool
-    old_limit = pool._max_model_memory
-    pool._max_model_memory = max_memory_bytes
-
-    old_display = format_size(old_limit) if old_limit is not None else "disabled"
-
-    if max_memory_bytes is None:
-        msg = f"Max model memory changed: {old_display} -> disabled (no limit)"
-        return True, msg
-
-    # If current usage exceeds new limit, unload LRU models
-    unloaded = []
-    while pool._current_model_memory > max_memory_bytes:
-        victim = pool._find_lru_victim()
-        if not victim:
-            # All models are pinned, can't free more memory
-            break
-        await pool._unload_engine(victim)
-        unloaded.append(victim)
-
-    msg = f"Max model memory changed: {old_display} -> {format_size(max_memory_bytes)}"
-    if unloaded:
-        msg += f", unloaded: {', '.join(unloaded)}"
-
-    return True, msg
-
-
-async def _apply_max_process_memory_runtime(
-    max_process_memory: str,
-) -> tuple[bool, str]:
-    """
-    Apply max process memory change at runtime.
-
-    Starts, stops, or updates the ProcessMemoryEnforcer based on the new value.
+    Pushes the new tier into the running ProcessMemoryEnforcer, which
+    recomputes static + dynamic ceilings on its next propagation tick.
 
     Returns:
         Tuple of (success, message)
     """
     from ..server import _server_state
-    from ..settings import get_system_memory
+    from ..settings import VALID_MEMORY_GUARD_TIERS
 
-    if max_process_memory.lower() == "disabled":
-        # Stop enforcer if running
-        if _server_state.process_memory_enforcer is not None:
-            await _server_state.process_memory_enforcer.stop()
-            _server_state.process_memory_enforcer = None
-            if _server_state.engine_pool is not None:
-                _server_state.engine_pool._process_memory_enforcer = None
-        return True, "Process memory enforcement disabled"
-
-    # Calculate max bytes
-    value = max_process_memory.strip().lower()
-    if value == "auto":
-        from ..settings import _adaptive_system_reserve
-
-        total = get_system_memory()
-        reserve = _adaptive_system_reserve(total)
-        max_bytes = total - reserve
-    else:
-        percent_str = value.rstrip("%")
-        try:
-            percent = int(percent_str)
-            max_bytes = int(get_system_memory() * percent / 100)
-        except ValueError:
-            from ..config import parse_size
-            max_bytes = parse_size(max_process_memory)
-
-    if _server_state.process_memory_enforcer is not None:
-        # Update existing enforcer's limit
-        _server_state.process_memory_enforcer.max_bytes = max_bytes
-        # Trigger immediate check
-        await _server_state.process_memory_enforcer._check_and_enforce()
-        return True, (
-            f"Process memory limit updated to "
-            f"{max_bytes / 1024**3:.1f}GB"
+    tier_lower = tier.strip().lower()
+    if tier_lower not in VALID_MEMORY_GUARD_TIERS:
+        return False, (
+            f"Invalid memory_guard_tier {tier!r}; expected one of "
+            f"{sorted(VALID_MEMORY_GUARD_TIERS)}"
         )
-    else:
-        # Create and start new enforcer
-        if _server_state.engine_pool is None:
-            return False, "Engine pool not initialized"
-        from ..process_memory_enforcer import ProcessMemoryEnforcer
 
-        enforcer = ProcessMemoryEnforcer(
-            engine_pool=_server_state.engine_pool,
-            max_bytes=max_bytes,
-        )
-        _server_state.process_memory_enforcer = enforcer
-        _server_state.engine_pool._process_memory_enforcer = enforcer
-        enforcer.start()
-        return True, (
-            f"Process memory enforcement enabled at "
-            f"{max_bytes / 1024**3:.1f}GB"
-        )
+    enforcer = _server_state.process_memory_enforcer
+    if enforcer is None:
+        return False, "ProcessMemoryEnforcer not running"
+
+    old = enforcer.memory_guard_tier
+    enforcer.memory_guard_tier = tier_lower
+    return True, f"memory_guard_tier changed: {old} -> {tier_lower}"
 
 
 async def _apply_cache_settings_runtime(
@@ -2769,12 +2686,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 str(d) for d in global_settings.model.get_model_dirs(global_settings.base_path)
             ],
             "model_dir": str(global_settings.model.get_model_dir(global_settings.base_path)),
-            "max_model_memory": global_settings.model.max_model_memory,
             "model_fallback": global_settings.model.model_fallback,
         },
         "memory": {
-            "max_process_memory": global_settings.memory.max_process_memory,
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
+            "memory_guard_tier": global_settings.memory.memory_guard_tier,
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
@@ -2861,7 +2777,7 @@ async def update_global_settings(
     Update global server settings.
 
     Updates are persisted to the global settings file. Some settings
-    (log_level, model_dir, max_model_memory, cache) are applied immediately,
+    (log_level, model_dir, memory_guard_tier, cache) are applied immediately,
     while others (host, port, scheduler, mcp) require server restart.
 
     Args:
@@ -2951,43 +2867,26 @@ async def update_global_settings(
                     detail=f"Failed to change model directories: {msg}"
                 )
 
-    if request.max_model_memory is not None and request.max_model_memory != "":
-        global_settings.model.max_model_memory = request.max_model_memory
-        # Apply at runtime
-        try:
-            if request.max_model_memory.lower() == "disabled":
-                max_bytes = None
-            elif request.max_model_memory.lower() == "auto":
-                max_bytes = global_settings.model.get_max_model_memory_bytes()
-            else:
-                max_bytes = parse_size(request.max_model_memory)
-            success, msg = await _apply_max_model_memory_runtime(max_bytes)
-            if success:
-                runtime_applied.append("max_model_memory")
-                logger.info(msg)
-            else:
-                logger.warning(f"Failed to apply max_model_memory runtime: {msg}")
-        except ValueError as e:
-            logger.warning(f"Invalid max_model_memory format: {e}")
-
     if request.model_fallback is not None:
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
 
-    # Apply process memory enforcement settings (Live)
-    if request.max_process_memory is not None:
-        global_settings.memory.max_process_memory = request.max_process_memory
+    # Apply memory guard tier (Live)
+    if request.memory_guard_tier is not None:
+        global_settings.memory.memory_guard_tier = (
+            request.memory_guard_tier  # type: ignore[assignment]
+        )
         try:
-            success, msg = await _apply_max_process_memory_runtime(
-                request.max_process_memory
+            success, msg = await _apply_memory_guard_tier_runtime(
+                request.memory_guard_tier
             )
             if success:
-                runtime_applied.append("max_process_memory")
+                runtime_applied.append("memory_guard_tier")
                 logger.info(msg)
             else:
-                logger.warning(f"Failed to apply max_process_memory: {msg}")
+                logger.warning(f"Failed to apply memory_guard_tier: {msg}")
         except Exception as e:
-            logger.warning(f"Error applying max_process_memory: {e}")
+            logger.warning(f"Error applying memory_guard_tier: {e}")
 
     # Apply prefill memory guard setting (Live)
     if request.memory_prefill_memory_guard is not None:
@@ -3987,7 +3886,7 @@ def _build_active_models_data() -> dict:
     return {
         "models": models,
         "model_memory_used": status.get("current_model_memory", 0),
-        "model_memory_max": status.get("max_model_memory", 0),
+        "model_memory_max": status.get("final_ceiling", 0),
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }
