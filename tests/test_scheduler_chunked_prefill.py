@@ -508,6 +508,104 @@ class TestScheduleWaitingChunkedFork:
         finally:
             tracker.clear()
 
+    def _setup_throttle(self, max_bytes_gb=10, hard_cap_gb=12):
+        """Build a scheduler with watermark fields set for throttle tests."""
+        sched = _make_scheduler()
+        sched._memory_limit_bytes = max_bytes_gb * 1024**3
+        sched._memory_hard_limit_bytes = hard_cap_gb * 1024**3
+        sched._prefill_safe_zone_ratio = 0.80
+        sched._prefill_min_chunk_tokens = 32
+        return sched
+
+    def _mock_current(self, sched, current_gb):
+        """Context manager-ish — patch both memory probes to current_gb."""
+        target = int(current_gb * 1024**3)
+        return patch(
+            "omlx.scheduler.mx.get_active_memory", return_value=target
+        ), patch("omlx.scheduler.get_phys_footprint", return_value=target)
+
+    def test_adaptive_throttle_below_soft_watermark_passthrough(self):
+        """current < soft watermark → no throttle, full chunk."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # soft_watermark = 10 * 0.80 = 8 GB; current 5 GB is below
+        a, b = self._mock_current(sched, 5)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 2048
+
+    def test_adaptive_throttle_tier_1024(self):
+        """First quarter of the soft-to-hard band → 1024."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # soft_wm = 8 GB, band = 12 - 8 = 4 GB. 10% into band = 8.4 GB.
+        a, b = self._mock_current(sched, 8.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 1024
+
+    def test_adaptive_throttle_tier_512(self):
+        """25-50% of band → 512."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 35% of band: 8 + 4*0.35 = 9.4 GB
+        a, b = self._mock_current(sched, 9.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 512
+
+    def test_adaptive_throttle_tier_256(self):
+        """50-75% of band → 256."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 60% of band: 8 + 4*0.60 = 10.4 GB
+        a, b = self._mock_current(sched, 10.4)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 256
+
+    def test_adaptive_throttle_tier_128(self):
+        """75%+ of band → 128 (or min_chunk if larger)."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 80% of band: 8 + 4*0.80 = 11.2 GB
+        a, b = self._mock_current(sched, 11.2)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                2048, request_id="r1", loop_label="external"
+            )
+        assert result == 128
+
+    def test_adaptive_throttle_requested_smaller_than_tier(self):
+        """Requested chunk already smaller than the tier target → pass through."""
+        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
+        # 80% of band → tier 128. But requested=64 < 128.
+        a, b = self._mock_current(sched, 11.2)
+        with a, b:
+            result = sched._adaptive_chunk_size(
+                64, request_id="r1", loop_label="external"
+            )
+        assert result == 64
+
+    def test_adaptive_throttle_no_cap_passthrough(self):
+        """When hard limit or soft base is unset (=0), no throttle."""
+        sched = self._setup_throttle()
+        sched._memory_hard_limit_bytes = 0
+        result = sched._adaptive_chunk_size(
+            2048, request_id="r1", loop_label="external"
+        )
+        assert result == 2048
+
+        sched._memory_hard_limit_bytes = 10 * 1024**3
+        sched._memory_limit_bytes = 0
+        result = sched._adaptive_chunk_size(
+            2048, request_id="r1", loop_label="external"
+        )
+        assert result == 2048
+
     def test_chunked_first_chunk_runtime_error_cleans_up_and_rejects(self):
         """RuntimeError on the chunked first chunk must pop self.requests,
         remove the PrefillProgressTracker entry, and emit an error
