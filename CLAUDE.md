@@ -54,6 +54,34 @@ tests/         pytest suite
   rebase onto `main`, then merge. No long-lived half-finished branches.
 - Commit / push only when asked.
 
+## Standing authorizations (AI workflow)
+
+These are durable, repo-scoped grants. They override the default "ask before
+destructive / shared-state operation" rule for this repo only.
+
+- **AI may self-merge own PRs from `sync/*` branches into `main`** when ALL of:
+  1. Branch name matches `sync/*` (AI-opened upstream-sync or AI-driven fix
+     workflow, not human-authored feature branches).
+  2. Full test suite was run on the branch; only failures are the known
+     pre-existing set (see `docs/upstream-sync.md` baseline). Zero regression.
+  3. PR body has a Test plan section with the targeted-test list AND the
+     full-suite numbers (pass / fail / skip) AND an explicit "zero regression"
+     statement tied to the baseline.
+  4. Use `merge_method: "merge"` (preserve atomic cherry-pick history) — NOT
+     squash, NOT rebase. flyto's `git log --grep="cherry picked from"` workflow
+     depends on atomic commits surviving into main.
+  5. Merge commit subject + body follow the bilingual convention.
+
+- **AI may force-push to its own `sync/*` branches** when rebasing AI-authored
+  commits before the PR is merged. Once a PR is merged the branch is read-only
+  history.
+
+- **AI may NOT self-merge feature branches** (`feat/*`, `fix/*`, anything not
+  matching `sync/*`) or any branch opened by a human.
+
+- **AI may NOT push directly to `main`.** Always via PR, even with the
+  self-merge grant above.
+
 ## Machines
 
 - oMLX servers run on **m2max** and **m5max** at `~/Code/omlx`, launched by
