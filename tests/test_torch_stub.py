@@ -300,6 +300,48 @@ def test_missing_top_level_attribute_raises_attributeerror_and_logs(
     assert not hasattr(torch, "another_missing_attr")
 
 
+def test_known_probe_names_log_at_debug_not_warning(stub_module, caplog):
+    """xgrammar / tvm_ffi probe a fixed set of dtype names via
+    ``getattr(torch, name)`` for feature detection. They catch the
+    AttributeError and fall back, so a per-probe WARNING is pure noise.
+    Known-probed names log at DEBUG instead.
+
+    Regression for #1453 review feedback (fry69): 9 WARNING entries per
+    model load flagged as actionable when they aren't.
+    """
+    for k in _TOUCHED:
+        sys.modules.pop(k, None)
+    with mock.patch("importlib.util.find_spec", side_effect=lambda name: None):
+        stub_module.install()
+    torch = sys.modules["torch"]
+
+    # Probe one known dtype + one genuinely-missing attribute. Capture at
+    # DEBUG so both log calls land in caplog.records and we can compare
+    # their levels.
+    with caplog.at_level("DEBUG", logger="omlx._torch_stub"):
+        with pytest.raises(AttributeError):
+            torch.float8_e4m3fn  # noqa: B018
+        with pytest.raises(AttributeError):
+            torch.totally_unknown_attr  # noqa: B018
+
+    dtype_records = [
+        rec for rec in caplog.records
+        if "torch.float8_e4m3fn" in rec.message
+    ]
+    unknown_records = [
+        rec for rec in caplog.records
+        if "torch.totally_unknown_attr" in rec.message
+    ]
+    assert dtype_records, "known-probe name should still log at DEBUG"
+    assert unknown_records, "unknown name should still log"
+    assert all(rec.levelname == "DEBUG" for rec in dtype_records), (
+        f"known probe must log at DEBUG, got {[r.levelname for r in dtype_records]}"
+    )
+    assert all(rec.levelname == "WARNING" for rec in unknown_records), (
+        f"unknown attr must log at WARNING, got {[r.levelname for r in unknown_records]}"
+    )
+
+
 def test_stub_modules_have_real_spec_and_loader(stub_module):
     """Every stub module in sys.modules must have a real ``__spec__``
     (a ``ModuleSpec`` instance, not ``None``) so ``importlib.util.

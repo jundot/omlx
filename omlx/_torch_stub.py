@@ -147,6 +147,23 @@ _TENSOR_ALIASES = (
 )
 
 
+# Names that xgrammar / tvm_ffi probe via getattr(torch, name) for
+# feature-detection — they catch AttributeError and fall back gracefully.
+# Logging WARNING for these floods the log on every model load (one per
+# name per process) with diagnostics that aren't actually actionable.
+# Demote known-probed names to DEBUG; everything else stays WARNING so
+# genuinely-missing attributes surface in operator logs.
+_KNOWN_PROBE_NAMES: frozenset[str] = frozenset({
+    # Integer dtypes added post-torch-2.0 that tvm_ffi.dtypes enumerates
+    "uint16", "uint32", "uint64",
+    # FP8 / FP4 dtypes (probed by tvm_ffi.dtypes' dtype-mapping table)
+    "float8_e4m3fn", "float8_e4m3fnuz",
+    "float8_e5m2", "float8_e5m2fnuz",
+    "float8_e8m0fnu",
+    "float4_e2m1fn_x2",
+})
+
+
 def _make_top_level_torch_getattr() -> "callable":
     """Return a ``__getattr__`` for the stub's top-level torch module.
 
@@ -160,7 +177,7 @@ def _make_top_level_torch_getattr() -> "callable":
     before hitting this.
     """
 
-    _missing_attr_warned: set[str] = set()
+    _missing_attr_logged: set[str] = set()
 
     def __getattr__(name: str):  # noqa: N807
         # Surface the miss at WARNING level so a future xgrammar release
@@ -168,10 +185,14 @@ def _make_top_level_torch_getattr() -> "callable":
         # before the AttributeError surfaces in a request handler. Rate-
         # limit per name so repeated probes (e.g. hasattr() under a
         # loop) don't flood the journal — once per name per process is
-        # enough to identify the gap.
-        if name not in _missing_attr_warned:
-            _missing_attr_warned.add(name)
-            logger.warning(
+        # enough to identify the gap. Known-probed dtype names log at
+        # DEBUG because xgrammar / tvm_ffi catch the AttributeError and
+        # the WARNING is pure noise on every model load.
+        if name not in _missing_attr_logged:
+            _missing_attr_logged.add(name)
+            level = logging.DEBUG if name in _KNOWN_PROBE_NAMES else logging.WARNING
+            logger.log(
+                level,
                 "oMLX torch stub missing attribute: torch.%s "
                 "(install real torch if this is load-bearing)",
                 name,
