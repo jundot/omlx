@@ -232,6 +232,22 @@ class DFlashEngine(BaseEngine):
             return None
         return getattr(self._embedded_vlm, "grammar_compiler", None)
 
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        """Forward to the embedded target engine's prefix_cache_enabled.
+
+        The BlockAwarePrefixCache lives on the embedded engine's
+        scheduler. Without this forward, BaseEngine's False default
+        leaks into Anthropic-style usage accounting (the prompt-token
+        split between cache_creation_input_tokens / cache_read_input_tokens
+        is gated on this flag in api/anthropic_utils.py), so a DFlash-
+        wrapped model silently reports zero cache hits even when the
+        embedded engine is serving them.
+        """
+        if self._embedded_vlm is None:
+            return False
+        return bool(getattr(self._embedded_vlm, "prefix_cache_enabled", False))
+
     @staticmethod
     def _has_multimodal_content(messages: list[dict[str, Any]]) -> bool:
         """Detect whether any message carries image / audio content parts.
