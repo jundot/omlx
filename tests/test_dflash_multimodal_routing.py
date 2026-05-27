@@ -257,3 +257,32 @@ class TestStreamChatRoutesMultimodalToEmbeddedVLM:
         assert received == chunks
         engine.stream_generate.assert_called_once()
         vlm.stream_chat.assert_not_called()
+
+
+class TestGrammarCompilerForward:
+    """DFlashEngine must forward grammar_compiler to its embedded target.
+
+    Regression: server.py reads ``getattr(engine, 'grammar_compiler', None)``
+    when handling structured-output requests. Before this forward, a
+    DFlashEngine-loaded model would always fall through to BaseEngine's
+    None default and the request would be rejected with a misleading
+    'xgrammar required' message even when xgrammar was installed and
+    a plain BatchedEngine load of the same model would have worked.
+    """
+
+    def test_none_when_no_embedded_engine(self):
+        engine = _make_dflash(embedded_vlm=None)
+        assert engine.grammar_compiler is None
+
+    def test_forwards_to_embedded_engine_when_set(self):
+        sentinel = object()
+        vlm = MagicMock()
+        vlm.grammar_compiler = sentinel
+        engine = _make_dflash(embedded_vlm=vlm)
+        assert engine.grammar_compiler is sentinel
+
+    def test_forwards_none_from_embedded_engine(self):
+        vlm = MagicMock()
+        vlm.grammar_compiler = None
+        engine = _make_dflash(embedded_vlm=vlm)
+        assert engine.grammar_compiler is None

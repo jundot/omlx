@@ -214,6 +214,24 @@ class DFlashEngine(BaseEngine):
         from .vlm import VLMBatchedEngine
         return isinstance(self._embedded_vlm, VLMBatchedEngine)
 
+    @property
+    def grammar_compiler(self):
+        """Forward to the embedded target engine's lazy grammar_compiler.
+
+        DFlashEngine is a speculative-decoding wrapper around a real
+        BatchedEngine / VLMBatchedEngine target. xgrammar lives on the
+        target engine (it needs the actual model + tokenizer to build
+        the compiler), so we delegate. Without this forward, server.py's
+        ``getattr(engine, 'grammar_compiler', None)`` falls through to
+        BaseEngine's None default and the request is rejected with a
+        misleading "xgrammar required" message even when xgrammar is
+        installed and would work on a plain BatchedEngine load of the
+        same model.
+        """
+        if self._embedded_vlm is None:
+            return None
+        return getattr(self._embedded_vlm, "grammar_compiler", None)
+
     @staticmethod
     def _has_multimodal_content(messages: list[dict[str, Any]]) -> bool:
         """Detect whether any message carries image / audio content parts.
