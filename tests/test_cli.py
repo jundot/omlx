@@ -13,6 +13,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from omlx._version import __version__
+
 
 class TestCLIModule:
     """Tests for CLI module existence and basic functionality."""
@@ -44,6 +46,18 @@ class TestCLIHelp:
         assert result.returncode == 0
         # Should show available commands
         assert "serve" in result.stdout.lower()
+
+    def test_main_version(self):
+        """Test main CLI version output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == __version__
+        assert result.stderr == ""
 
     def test_serve_help(self):
         """Test serve command help output."""

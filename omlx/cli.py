@@ -18,6 +18,8 @@ import argparse
 import faulthandler
 import sys
 
+from ._version import __version__
+
 
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
@@ -495,6 +497,12 @@ Examples:
   omlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
   omlx launch codex --model qwen3.5
         """,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__version__,
+        help="Print the oMLX version and exit",
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
