@@ -2,14 +2,14 @@
 //
 // One tab for every "how the engine runs" knob. Three sections:
 //   • Scheduler — max_concurrent_requests (moved from ServerScreen for
-//     scheduler coherence) + chunked_prefill.
+//     scheduler coherence), embedding_batch_size, and chunked_prefill.
 //   • Memory & Lifecycle — process / model memory limits, prefill memory
 //     guard, server-wide idle timeout, model fallback routing.
 //   • Cache — master enable toggle gates a hot-cache toggle + size, a
 //     cold-cache directory + size, and an advanced initial-blocks tuning
 //     knob (requires restart).
 //
-// All twelve fields are server-side already (`omlx/admin/routes.py:191-272`)
+// All thirteen fields are server-side already (`omlx/admin/routes.py:191-272`)
 // — Phase 3 is pure UI. Single Apply button at the bottom, Storage /
 // Network pattern: disabled until at least one trimmed draft diverges
 // from its loaded value, and only changed fields are sent in the PATCH
@@ -77,6 +77,16 @@ private struct SchedulerSection: View {
                                  comment: "Sublabel for max concurrent requests")
             ) {
                 TextInput(text: $vm.maxConcurrentText, mono: true, width: 90)
+            }
+            Row(
+                label: String(localized: "performance.scheduler.embedding_batch_size",
+                              defaultValue: "Embedding Batch Size",
+                              comment: "Row label for embedding batch size"),
+                sublabel: String(localized: "performance.scheduler.embedding_batch_size.sub",
+                                 defaultValue: "Max input texts per embedding forward pass.",
+                                 comment: "Sublabel for embedding batch size")
+            ) {
+                TextInput(text: $vm.embeddingBatchSizeText, mono: true, width: 90)
             }
             Row(
                 label: String(localized: "performance.scheduler.chunked_prefill",
@@ -309,6 +319,7 @@ private struct CacheSection: View {
 final class PerformanceScreenVM: ObservableObject {
     // Scheduler
     @Published var maxConcurrentText: String = "8"
+    @Published var embeddingBatchSizeText: String = "8"
     @Published var chunkedPrefill: Bool = false
 
     // Memory & Lifecycle
@@ -328,6 +339,7 @@ final class PerformanceScreenVM: ObservableObject {
 
     // Loaded baselines (everything that drives Apply's enabled state)
     @Published private(set) var loadedMaxConcurrent: Int = 8
+    @Published private(set) var loadedEmbeddingBatchSize: Int = 8
     @Published private(set) var loadedChunkedPrefill: Bool = false
     @Published private(set) var loadedMaxProcessMemory: String = ""
     @Published private(set) var loadedMaxModelMemory: String = ""
@@ -346,6 +358,7 @@ final class PerformanceScreenVM: ObservableObject {
 
     var hasPendingChanges: Bool {
         parsedMaxConcurrent != loadedMaxConcurrent
+            || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
             || chunkedPrefill != loadedChunkedPrefill
             || trim(maxProcessMemory) != loadedMaxProcessMemory
             || trim(maxModelMemory) != loadedMaxModelMemory
@@ -366,6 +379,9 @@ final class PerformanceScreenVM: ObservableObject {
             if let sched = s.scheduler {
                 self.maxConcurrentText = String(sched.maxConcurrentRequests)
                 self.loadedMaxConcurrent = sched.maxConcurrentRequests
+                let embeddingBatchSize = sched.embeddingBatchSize ?? 8
+                self.embeddingBatchSizeText = String(embeddingBatchSize)
+                self.loadedEmbeddingBatchSize = embeddingBatchSize
                 self.chunkedPrefill = sched.chunkedPrefill ?? false
                 self.loadedChunkedPrefill = sched.chunkedPrefill ?? false
             }
@@ -414,6 +430,12 @@ final class PerformanceScreenVM: ObservableObject {
                                     comment: "Performance screen error when max concurrent input is invalid")
             return
         }
+        guard let embeddingBatchSize = parsedEmbeddingBatchSize, embeddingBatchSize > 0 else {
+            self.lastError = String(localized: "performance.error.embedding_batch_size_invalid",
+                                    defaultValue: "Embedding Batch Size must be a positive integer.",
+                                    comment: "Performance screen error when embedding batch size input is invalid")
+            return
+        }
         // Idle timeout: empty = leave alone (no patch field for null). Non-
         // empty must be a positive integer; server enforces >= 60 itself.
         let idleTrimmed = idleTimeoutText.trimmingCharacters(in: .whitespaces)
@@ -443,6 +465,9 @@ final class PerformanceScreenVM: ObservableObject {
         var patch = GlobalSettingsPatch()
         // Scheduler
         if mc != loadedMaxConcurrent { patch.maxConcurrentRequests = mc }
+        if embeddingBatchSize != loadedEmbeddingBatchSize {
+            patch.embeddingBatchSize = embeddingBatchSize
+        }
         if chunkedPrefill != loadedChunkedPrefill { patch.chunkedPrefill = chunkedPrefill }
         // Memory & lifecycle
         let mpm = trim(maxProcessMemory)
@@ -475,6 +500,7 @@ final class PerformanceScreenVM: ObservableObject {
             _ = try await client.updateGlobalSettings(patch)
             // Converge baselines on success.
             self.loadedMaxConcurrent = mc
+            self.loadedEmbeddingBatchSize = embeddingBatchSize
             self.loadedChunkedPrefill = chunkedPrefill
             self.loadedMaxProcessMemory = mpm
             self.loadedMaxModelMemory = mmm
@@ -497,6 +523,10 @@ final class PerformanceScreenVM: ObservableObject {
 
     private var parsedMaxConcurrent: Int? {
         Int(maxConcurrentText.trimmingCharacters(in: .whitespaces))
+    }
+
+    private var parsedEmbeddingBatchSize: Int? {
+        Int(embeddingBatchSizeText.trimmingCharacters(in: .whitespaces))
     }
 
     private var parsedIdleTimeout: Int? {

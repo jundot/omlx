@@ -48,6 +48,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct SchedulerSettings: Codable, Equatable, Sendable {
         let maxConcurrentRequests: Int
+        let embeddingBatchSize: Int?
         let chunkedPrefill: Bool?
     }
 
@@ -160,6 +161,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var port: Int? = nil
     var logLevel: String? = nil
     var maxConcurrentRequests: Int? = nil
+    var embeddingBatchSize: Int? = nil
 
     // Server — Advanced (Phase 4).
     /// Extra host names the server identifies as for cookie/host-header

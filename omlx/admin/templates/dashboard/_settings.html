@@ -463,6 +463,16 @@
                                            min="1"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
+                                <!-- Embedding Batch Size -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.embedding_batch_size') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.embedding_batch_size_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.embedding_batch_size"
+                                           min="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                                 <!-- Chunked Prefill -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>

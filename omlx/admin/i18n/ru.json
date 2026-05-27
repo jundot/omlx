@@ -342,6 +342,8 @@
   "settings.resource.prefill_memory_guard_description": "Оценивайте расход памяти перед prefill и откладывайте выполнение при дефиците памяти, чтобы избежать ошибок выделения Metal.",
   "settings.resource.max_concurrent_requests": "Максимум одновременных запросов",
   "settings.resource.max_concurrent_requests_hint": "Максимальное число запросов, обрабатываемых одновременно. Более высокие значения увеличивают пропускную способность, но используют больше памяти.",
+  "settings.resource.embedding_batch_size": "Размер пакета эмбеддингов",
+  "settings.resource.embedding_batch_size_hint": "Максимальное число входных текстов для эмбеддингов за один прямой проход. Более высокие значения увеличивают пропускную способность, но используют больше памяти.",
   "settings.resource.chunked_prefill": "Chunked Prefill",
   "settings.resource.chunked_prefill_description": "Interleave prefill chunks with decode steps. Reduces time-to-first-token for concurrent requests by processing one prefill chunk per step instead of blocking decode.",
   "settings.resource.restart_badge": "Требует перезапуска",

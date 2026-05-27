@@ -342,6 +342,8 @@
   "settings.resource.prefill_memory_guard_description": "Estimez la mémoire avant le pré-remplissage et reportez la planification sous pression mémoire pour éviter les défaillances d'allocation Metal.",
   "settings.resource.max_concurrent_requests": "Nombre max de requêtes simultanées",
   "settings.resource.max_concurrent_requests_hint": "Nombre maximal de requêtes traitées simultanément. Les valeurs plus élevées augmentent le débit mais utilisent plus de mémoire.",
+  "settings.resource.embedding_batch_size": "Taille de lot des embeddings",
+  "settings.resource.embedding_batch_size_hint": "Nombre maximal de textes incorporés en une passe avant. Les valeurs plus élevées augmentent le débit mais utilisent plus de mémoire.",
   "settings.resource.chunked_prefill": "Chunked Prefill",
   "settings.resource.chunked_prefill_description": "Interleave prefill chunks with decode steps. Reduces time-to-first-token for concurrent requests by processing one prefill chunk per step instead of blocking decode.",
   "settings.resource.restart_badge": "Redémarrage nécessaire",

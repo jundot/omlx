@@ -342,6 +342,8 @@
   "settings.resource.prefill_memory_guard_description": "在預填充前估算記憶體，記憶體壓力時延遲調度以防止Metal分配失敗。",
   "settings.resource.max_concurrent_requests": "最大並發請求",
   "settings.resource.max_concurrent_requests_hint": "同時處理的最大請求數。數值越大吞吐量越高，但記憶體使用也越多。",
+  "settings.resource.embedding_batch_size": "Embedding 批次大小",
+  "settings.resource.embedding_batch_size_hint": "單次前向計算處理的最大 embedding 輸入文字數。數值越大吞吐量越高，但記憶體使用也越多。",
   "settings.resource.chunked_prefill": "Chunked Prefill",
   "settings.resource.chunked_prefill_description": "Interleave prefill chunks with decode steps. Reduces time-to-first-token for concurrent requests by processing one prefill chunk per step instead of blocking decode.",
   "settings.resource.restart_badge": "需要重新啟動",

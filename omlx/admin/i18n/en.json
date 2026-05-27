@@ -342,6 +342,8 @@
   "settings.resource.prefill_memory_guard_description": "Pause prefill scheduling and evict LRU models when memory pressure approaches the ceiling derived from the reserve level on the right.",
   "settings.resource.max_concurrent_requests": "Max Concurrent Requests",
   "settings.resource.max_concurrent_requests_hint": "Maximum number of requests processed simultaneously. Higher values increase throughput but use more memory.",
+  "settings.resource.embedding_batch_size": "Embedding Batch Size",
+  "settings.resource.embedding_batch_size_hint": "Maximum number of input texts embedded in one forward pass. Higher values increase throughput but use more memory.",
   "settings.resource.chunked_prefill": "Chunked Prefill",
   "settings.resource.chunked_prefill_description": "Interleave prefill chunks with decode steps. Reduces time-to-first-token for concurrent requests by processing one prefill chunk per step instead of blocking decode.",
   "settings.resource.restart_badge": "Restart needed",

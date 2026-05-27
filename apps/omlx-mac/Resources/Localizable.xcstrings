@@ -3582,6 +3582,18 @@
         }
       }
     },
+    "performance.error.embedding_batch_size_invalid" : {
+      "comment" : "Performance screen error when embedding batch size input is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Embedding Batch Size must be a positive integer."
+          }
+        }
+      }
+    },
     "performance.error.idle_timeout_invalid" : {
       "comment" : "Performance screen error when idle timeout input is below 60 seconds",
       "extractionState" : "manual",
@@ -3782,6 +3794,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Split long prompts across scheduler ticks so other requests can interleave."
+          }
+        }
+      }
+    },
+    "performance.scheduler.embedding_batch_size" : {
+      "comment" : "Row label for embedding batch size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Embedding Batch Size"
+          }
+        }
+      }
+    },
+    "performance.scheduler.embedding_batch_size.sub" : {
+      "comment" : "Sublabel for embedding batch size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max input texts per embedding forward pass."
           }
         }
       }
