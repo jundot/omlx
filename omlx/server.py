@@ -5000,18 +5000,13 @@ Note: Use the omlx CLI for full feature support.
     # Parse pinned models
     pinned_models = args.pin.split(",") if args.pin else []
 
-    # Initialize server
-    init_server(
-        model_dir=args.model_dir,
-        max_model_memory=parse_size(args.max_model_memory),
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+    # NOTE: this __main__ block has been dead since the multi-model
+    # refactor (init_server takes model_dirs= plural, not model_dir=).
+    # Real entry is omlx.cli:serve_command. Left as a stub to make the
+    # break obvious if anyone tries `python -m omlx.server` directly.
+    raise SystemExit(
+        "omlx.server is no longer runnable directly; use `omlx serve`."
     )
-
-    # Start server
-    import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
