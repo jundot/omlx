@@ -11,6 +11,8 @@ import logging
 import random
 from pathlib import Path
 
+from .constants import BenchmarkKey
+
 logger = logging.getLogger(__name__)
 
 # Fixed seed for all sampling — ensures identical question sets across models

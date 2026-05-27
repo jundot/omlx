@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from .constants import BenchmarkKey
+
 logger = logging.getLogger(__name__)
 
 # Token budget for thinking/reasoning models (industry reference: OpenCompass 8K~32K)

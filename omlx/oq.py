@@ -27,38 +27,27 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.model_discovery import _has_vision_subconfig
+from .oq_constants import (
+    OQ_LEVELS,
+    OQ_DTYPES,
+    _OQ_DEFAULT_GROUP_SIZE,
+    _MAX_MODEL_RAM_FRACTION,
+    _PROXY_QUANT_BITS,
+    _PROXY_QUANT_GROUP_SIZE,
+    _LEVEL_BITS,
+    _LEVEL_PROTECTION,
+    _OQ_BPW_TARGETS,
+    _extract_layer_index,
+    _mode_for_bits,
+    _gs_for_mode,
+    _bits_fn_factory,
+)
 
 logger = logging.getLogger(__name__)
-
-OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
-
-OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
-
-_OQ_DEFAULT_GROUP_SIZE = 64
-
-_MAX_MODEL_RAM_FRACTION = 0.8
 
 # Auto-built proxy for sensitivity measurement when the source model
 # exceeds available RAM. Uniform 4-bit affine quant — same shape as a
 # user-supplied --sensitivity-model, but built on demand.
-_PROXY_QUANT_BITS = 4
-_PROXY_QUANT_GROUP_SIZE = 64
-
-_LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
-
-_LEVEL_PROTECTION: dict[float, str] = {
-    2: "full", 3: "full", 3.5: "full",
-    4: "full", 5: "full", 6: "full", 8: "full",
-}
-
-_OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
-    2: (2.8, 3.0),
-    3: (3.5, 3.7),
-    3.5: (3.8, 4.0),
-    4: (4.6, 4.7),
-    5: (5.5, 5.7),
-    6: (6.5, 6.7),
-}
 
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
@@ -320,12 +309,6 @@ def _is_moe_router(path: str) -> bool:
     if ".gate." in path and "gate_proj" not in path:
         return True
     return False
-
-
-def _extract_layer_index(path: str) -> int:
-    """Extract transformer layer index from module path. Returns -1 if absent."""
-    m = re.search(r"layers\.(\d+)\.", path)
-    return int(m.group(1)) if m else -1
 
 
 def _default_bits(config: dict) -> int:
@@ -1794,17 +1777,6 @@ def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
         mode = result.get("mode", _mode_for_bits(bits))
         return bits, gs, mode
     return base_bits, _gs_for_mode(base_bits, group_size), _mode_for_bits(base_bits)
-
-
-def _mode_for_bits(bits: int) -> str:
-    """Select quantization mode. Always affine to minimize kernel combos."""
-    return "affine"
-
-
-def _gs_for_mode(bits: int, default_gs: int) -> int:
-    """Get group_size. Always default to minimize kernel combos."""
-    return default_gs
-
 
 
 # --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
