@@ -45,6 +45,42 @@ commit)。
   - **仍未并回 main**,等人工 review 后 `git merge --ff-only`。
   - #1241(structured output strict enforcement)同批修复 —— 见下。
 
+- **2026-05-26** — 上游 8 天发了 4 个 release(`v0.3.9` → `v0.3.12`,
+  共 38 个 commit,排除 bump/图片上传)。在分支 `sync/upstream-2026-05-26`
+  (基于 `main` @ `6cbc7b7`,即 "禁用 Mac app 内的上游 update check")cherry-pick:
+  - **A 组(DFlash / MTP / tool_calling / oQ)12 个**:`941fcbe` `b413356`
+    `42fc129` `6f927ec` `ea2eaa1` `a53bf11`(#1356) `90d7e40`(#1392/#1393)
+    `64f7d93` `915190d`(#1388) + 顺带 `878c892`(#1336,#1388 的前置依赖,
+    新测试用了它的 `_is_greedy.temp` 语义) `b33cb6a` `56ae7f0`(#1404)
+    `ecb610e`(#1412)。`d0f60ec`(#1344 dflash 多模态 VLM fallback)
+    跳过 —— 上游用 lazy `_fallback_engine` swap,flyto Path A 是永久
+    `_embedded_vlm` 双引擎,routing 基于 prompt token len 而不是 content;
+    要做等同效果需要重写 message 路由层,**留独立 spike**。
+  - **B 组(scheduler / memory 正确性)6 个**:`ef49351`(#1383)
+    `f0f3138`(#1389) `3b15958`(#1405) `7d30401` `ea7efd4`(=0169f15)
+    `3af848b`(#684)。`0169f15` 解冲突时:test `test_hard_limit_honors_user_explicit_max`
+    跳过(`user_explicit_max` 字段属于 C 组 `acd0533` 引入,flyto 没有),
+    `test_hard_limit_auto_mode_uses_size_aware_reserve` 去 `user_explicit_max` kwarg
+    后保留。
+  - **D 组(中低优,trial cherry-pick)5/12 干净进入**:`f6fdaf2`(=f1d1fc3 #1339)
+    `5749613`(=5d8145b) `31d31be`(=db07311) `ef1e842`(=7d640c1 #1417)
+    `5e394cf`(=1010fd3)。冲突跳过 7 个:`cf4023c` `c4ebb7f` `f8174a9`
+    `2f2f508` `8c70903` `1b666af` `6a77fd5` —— 都是低优,与 flyto 自身
+    改动相撞,沿用上游版本价值不大。
+  - **C 组 `c645c9f` 内存配置重写**(memory_guard_tier 替 max_*_memory):
+    涉及 29 个文件,flyto 113 处引用 `max_process_memory`/`max_model_memory`,
+    需独立 spike 评估配置迁移路径(settings.json 字段名变更 + admin UI 改造)。
+    `3ef7b94` `4cfbc8b` `acd0533` `64bd2a2`(#1431) `b129a19`(#1425)
+    均依赖它,一并延后。
+  - 顺带修了一个 main 残留:`tests/test_admin_auth.py::TestCheckUpdate`
+    与 `test_admin_update_check.py` 同名重复,任务 1 漏改 —— sync 分支上
+    一并删除(`efc40cd`)。
+  - **完整套件 m5max:4493 pass / 3 fail / 37 skip**。3 个 fail 在 `main` 上
+    同样 fail,均为 `test_settings.py` 里 mock 文件 `auth.api_key` 被
+    `OMLX_SERVER_API_KEY` 环境变量覆盖的测试设计缺陷,**与本批 cherry-pick
+    零回归**。
+  - 仍未并回 main,等人工 review 后 `git merge --ff-only`。
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |
@@ -68,6 +104,34 @@ cherry-pick 一律带 `-x`,commit message 里保留 "cherry picked from commit �
 | #1269 | `8b0cb178` | `314a36d` | server: 非流式 usage 响应补 `total_time` | 干净 |
 | #1183 | `0de60746` `b49963b7` | `edf0c7d` `137d91d` | cache: per-model cache 命中率可观测性 | 干净(注:这两个 commit 也是 #1149 的子集) |
 | #1245 | `7d038950` `d8d99a8d` | `331b0f4` `6ea2fcb` | responses: Responses API 原生 reasoning 支持 | `admin/routes.py` —— #1245 顺手把 settings dict 重构成 `dataclass_fields` 推导式,flyto 是**刻意维护的显式白名单**(见 #1268 / `0d28e26`),保留 flyto 版本,并回退随之多余的 `dataclass_fields` import;PR 第一个 commit `dbde075d8`(test 修复)cherry-pick 报 empty,确认 flyto 已有 |
+
+### 2026-05-26 第三批(v0.3.9..v0.3.12,在分支 `sync/upstream-2026-05-26`)
+
+| 上游 commit | flyto commit | 内容 | 冲突处理 |
+|---|---|---|---|
+| `941fcbe` | `c036019` | mtp: reset state across batch reshapes | 干净 |
+| `b413356`(#1320) | `1d70b9e` | load: wire MTP sanitize-preservation patch into VLM 加载 | 干净 |
+| `42fc129` | `21f3342` | test: cover VLM MTP sanitize patch wiring | 干净 |
+| `6f927ec` | `7b61c1f` | mtp: reconcile cache to standard state on batch reshape | 干净 |
+| `ea2eaa1`(#1386) | `4eb5c7c` | oq: 拷 `processor_config.json` 保留 VLM 能力 | 干净 |
+| `a53bf11`(#1356) | `76b4b7c` | Anthropic `tool_use` stream block indices | 干净 |
+| `90d7e40`(#1392/#1393) | `afb6c88` | tool_calling: thinking tool call 用 name-matching 替 Guard 1 启发 | 干净 |
+| `64f7d93` | `4eb0e8c` | tool_calling: 区分 `tools=[]` 与 `tools=None` | 干净 |
+| `915190d`(#1388) | `c544c25` | mtp: 自愈 patches + dflash hook lifecycle wrap | `omlx/engine/dflash.py` —— 上游引入 `_evict_dflash_and_start_fallback` 跟 flyto 的 `_embedded_vlm` 双引擎不兼容,保留 flyto 路径;`install_dflash_lifecycle_wrap()` 移到 `_load_drafter_bundle`,`restore_dflash_class_patches()` 加到 `stop()`。`tests/test_mlx_lm_mtp_patch.py` `SimpleNamespace` import 漏合,手动补 |
+| `878c892`(#1336) | `b33cb6a` | mtp: `_is_greedy` 检查真实 sampler.temp(#1388 测试的前置依赖) | 干净 |
+| `56ae7f0`(#1404) | `56ae7f0` | mtp: `mtp_enabled=False` 时也 attach VLM MTPModule | `omlx/engine/vlm.py` —— 3 处冲突:① specprefill `_load_draft` 接受 upstream 版本(`set_mtp_active(False)` + finally restore);② / ③ chat template + token counting 保留 flyto 的 audio divergence |
+| `ecb610e`(#1412) | `ecb610e` | load: mlx-vlm MoE sanitize 给 Qwen3.6 无 MTP head 的 VLM | 干净 |
+| `ef49351`(#1383) | `25cdb67` | scheduler: 内存压力下 cap async store-cache pipeline | 干净 |
+| `f0f3138`(#1389) | `f0f3138` | engine: guard late aborts after engine close | 干净 |
+| `3b15958`(#1405) | `3b15958` | scheduler: hard-limit RuntimeError 后清 prefill 状态 | 干净 |
+| `7d30401` | `7d30401` | vlm_mtp: 每轮清 mlx cache 限内存峰 | 干净 |
+| `ea7efd4`(=0169f15) | `ea7efd4` | memory: aborted prefill 清 MLX cache + size-aware hard cap reserve | `omlx/process_memory_enforcer.py` docstring 单冲突取上游;`test_process_memory_enforcer.py` `user_explicit_max` 测试跳过(字段来自 C 组未引入的 `acd0533`)|
+| `3af848b`(#684) | `3af848b` | engine: 每请求清 MLX cache(不仅 idle 时) | 干净 |
+| `f6fdaf2`(=f1d1fc3 #1339) | `f6fdaf2` | hf: 跨域永久重定向 follow | 干净 |
+| `5749613`(=5d8145b) | `5749613` | hardware: 用绝对路径调 macOS 系统工具 | 干净 |
+| `31d31be`(=db07311) | `31d31be` | admin: 用绝对路径调 sysctl | 干净 |
+| `ef1e842`(=7d640c1 #1417) | `ef1e842` | vlm: per-image lookup + whole-request fallback | 干净 |
+| `5e394cf`(=1010fd3) | `5e394cf` | admin: 运行时 propagate `model_dirs` 到 OQManager + HFUploader | 干净 |
 
 ## 确认已在 flyto(评估时已存在,勿重复引入)
 
@@ -95,6 +159,18 @@ cherry-pick 一律带 `-x`,commit message 里保留 "cherry picked from commit �
   #988 MseeP 徽章、#987 俄语 README、#1026 Nix flake、#855 图像生成 API、
   #1025 docs/CLAUDE.md、#952 Crush / #1282 Pi 集成、
   UI QoL 类(#1278 / #1213 / #1187 / #830 / #1052 / #350)
+- **2026-05-26 D 组冲突 commits**(低优,与 flyto 自身改动相撞,沿用上游
+  版本价值不大):`cf4023c`(admin chat preserve_thinking history #1329)、
+  `c4ebb7f`(hf_downloader cancel callback)、`f8174a9`(hf_downloader disable
+  xet)、`2f2f508`(integrations env scrub #1350)、`8c70903`(responses
+  tag-free as content #1348 —— flyto Responses 与上游 diverge 大)、
+  `1b666af`(cache ssd_write_drops counter #1406)、`6a77fd5`(scheduler
+  memcheck log gate —— 与已引入的 #1383 路径冲突)。
+- **`d0f60ec`(#1344)dflash 多模态 VLM fallback** —— 上游用 lazy
+  `_fallback_engine` swap + `supports_multimodal_fallback` content detect,
+  flyto Path A 是永久 `_embedded_vlm` 双引擎,routing 基于 prompt token len
+  而非 content。`message_extractor` hook 也只覆盖 gemma4/harmony,不通用。
+  要做等同效果需要在 server.py 层重写 message 路由,**留独立 spike**。
 
 ## 待引入(评估为有价值,下一批,尚未 cherry-pick)
 
@@ -111,6 +187,8 @@ Qwen-Gemma / oQ)的相关度。
 | #1225 | specprefill: 无 draft model 的自打分(单请求 TTFT) | 中 | specprefill |
 | #1268 | profiles: 分类 9 个新 ModelSettings 字段 | 中 | 与 flyto `0d28e26` 同类,修 #1259 测试失败之一 |
 | #1149 | cache: 多槽 LRU MRU partial block cache | 暂缓 | 19-commit **draft**,且包含 #1183 两个 commit;等它在上游定稿再说 |
+| `c645c9f` + `3ef7b94` + `4cfbc8b` + `acd0533` + `64bd2a2`(#1431) + `b129a19`(#1425) | memory: drop `max_*_memory`,add `memory_guard_tier` with dynamic ceiling(+ size-aware reserve、user-explicit hard cap、tier-aware active-memory reclaim) | 高(需 spike) | **breaking config**:删 `max_process_memory` / `max_model_memory`,换 `memory_guard_tier {safe,balanced,aggressive}`,涉及 29 个上游文件,flyto 113 处引用旧字段。spike 要覆盖:① 是否值得换 API;② settings.json 迁移路径;③ admin UI 改造;④ CLI args 改动;⑤ 用户已有配置兼容性。本次因 0169f15 已经引入,`user_explicit_max` test 临时 skip,等迁移落地一并打开。|
+| #1344 (`d0f60ec`) | dflash: 多模态请求 → VLM fallback,在 template flatten 之前检测 | 高(需 spike) | 与 flyto Path A 双引擎架构冲突,需在 server.py 层重写 message 路由让 dflash + `_embedded_vlm` 也走 `extract_multimodal_content`。可能与 #1056 / #818 一并设计。|
 
 ## 上游 issue 处理记录
 
