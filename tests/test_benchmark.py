@@ -258,7 +258,9 @@ class TestSSEEventFormat:
             "total": 3,
         })
 
-        event = run.queue.get_nowait()
+        # SSE delivery: events are appended to `run.events` (replay log).
+        assert len(run.events) == 1
+        event = run.events[0]
         assert event["type"] == "progress"
         assert event["phase"] == "single"
         assert event["current"] == 1
@@ -285,7 +287,8 @@ class TestSSEEventFormat:
         }
         await _send_event(run, {"type": "result", "data": result_data})
 
-        event = run.queue.get_nowait()
+        assert len(run.events) == 1
+        event = run.events[0]
         assert event["type"] == "result"
         assert event["data"]["test_type"] == "single"
         assert event["data"]["pp"] == 1024
@@ -430,10 +433,8 @@ class TestUploadToOmlxAi:
         with patch("asyncio.to_thread", mock_to_thread):
             await _upload_to_omlx_ai(run, mock_pool)
 
-        # Collect all events
-        events = []
-        while not run.queue.empty():
-            events.append(run.queue.get_nowait())
+        # Collect all events from the replay log.
+        events = list(run.events)
 
         # Should have: progress, upload, upload_done
         event_types = [e["type"] for e in events]
@@ -492,9 +493,7 @@ class TestUploadToOmlxAi:
         with patch("asyncio.to_thread", mock_to_thread):
             await _upload_to_omlx_ai(run, mock_pool)
 
-        events = []
-        while not run.queue.empty():
-            events.append(run.queue.get_nowait())
+        events = list(run.events)
 
         upload_event = next(e for e in events if e["type"] == "upload")
         assert upload_event["data"]["duplicate"] is True
@@ -535,9 +534,7 @@ class TestUploadToOmlxAi:
         with patch("asyncio.to_thread", mock_to_thread):
             await _upload_to_omlx_ai(run, mock_pool)
 
-        events = []
-        while not run.queue.empty():
-            events.append(run.queue.get_nowait())
+        events = list(run.events)
 
         # Only an upload_skipped event is emitted, no progress / upload / upload_done
         event_types = [e["type"] for e in events]
