@@ -40,6 +40,9 @@ class _FakeTokenizer:
     def decode(self, tokens, skip_special_tokens=True):
         return "decoded"
 
+    def apply_chat_template(self, messages, **kwargs):
+        return "templated prompt"
+
 
 class _FakePrefixFlow:
     hit_tokens = 3
@@ -129,7 +132,7 @@ def _make_engine(dflash_module):
     engine._detect_needs_think_prefix = lambda prompt_tokens: False
     engine._think_prefix_text = lambda: "<think>\n"
 
-    def fake_stream(prompt_tokens, max_tokens):
+    def fake_stream(prompt_tokens, max_tokens, **kwargs):
         events = iter(
             [
                 TokenEvent(
@@ -167,3 +170,68 @@ def test_dflash_stream_generate_surfaces_prefix_flow_hit_tokens(dflash_module):
 
     assert outputs[-1].finished is True
     assert outputs[-1].cached_tokens == 3
+
+
+def test_dflash_generate_forwards_prefix_cache_metadata_to_flow(dflash_module):
+    engine = _make_engine(dflash_module)
+    captured = {}
+    request = types.SimpleNamespace(request_type="chat", messages=[])
+    chat_template_kwargs = {"enable_thinking": False}
+
+    def fake_stream(prompt_tokens, max_tokens, **kwargs):
+        captured.update(kwargs)
+        events = iter(
+            [
+                TokenEvent(
+                    token_id=10,
+                    generated_tokens=1,
+                    acceptance_ratio=1.0,
+                    cycles_completed=1,
+                ),
+                _summary_event(),
+            ]
+        )
+        return events, _FakePrefixFlow(), {0}
+
+    engine._stream_dflash_events = fake_stream
+
+    asyncio.run(
+        engine.generate(
+            "prompt",
+            max_tokens=1,
+            prefix_cache_request=request,
+            prefix_cache_chat_template_kwargs=chat_template_kwargs,
+        )
+    )
+
+    assert captured["prefix_cache_request"] is request
+    assert captured["prefix_cache_chat_template_kwargs"] == chat_template_kwargs
+
+
+def test_dflash_chat_forwards_prefix_cache_policy_metadata(dflash_module):
+    engine = _make_engine(dflash_module)
+    captured = {}
+
+    async def fake_generate(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return _GenerationOutput(text="ok")
+
+    engine.generate = fake_generate
+    messages = [{"role": "user", "content": "hello"}]
+    chat_template_kwargs = {"enable_thinking": False}
+
+    asyncio.run(
+        engine.chat(
+            messages=messages,
+            max_tokens=1,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=False,
+        )
+    )
+
+    assert captured["prompt"] == "templated prompt"
+    request = captured["kwargs"]["prefix_cache_request"]
+    assert request.request_type == "chat"
+    assert request.messages == messages
+    assert captured["kwargs"]["prefix_cache_chat_template_kwargs"] == chat_template_kwargs
