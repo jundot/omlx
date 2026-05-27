@@ -112,15 +112,19 @@ class TestServeCommandOptions:
         )
         assert "--model-dir" in result.stdout
 
-    def test_serve_has_max_model_memory_option(self):
-        """Test that serve command has --max-model-memory option."""
+    def test_serve_has_memory_guard_tier_option(self):
+        """serve command exposes --memory-guard-tier as the new primary flag,
+        and keeps --max-model-memory / --max-process-memory as deprecated."""
         result = subprocess.run(
             [sys.executable, "-m", "omlx.cli", "serve", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
         )
+        assert "--memory-guard-tier" in result.stdout
+        # Deprecated aliases remain so existing scripts do not break.
         assert "--max-model-memory" in result.stdout
+        assert "--max-process-memory" in result.stdout
 
     def test_serve_no_model_specific_options(self):
         """Test that serve command does not have model-specific options (managed via admin page)."""
@@ -319,6 +323,7 @@ class TestHasCliOverrides:
         defaults = {
             "model_dir": None,
             "port": None,
+            "memory_guard_tier": None,
             "max_model_memory": None,
             "max_process_memory": None,
             "host": None,
@@ -346,12 +351,19 @@ class TestHasCliOverrides:
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(model_dir="/tmp/models")) is True
 
-    def test_max_model_memory_explicit(self):
+    def test_memory_guard_tier_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(memory_guard_tier="safe")) is True
+        assert _has_cli_overrides(self._make_args(memory_guard_tier="balanced")) is True
+
+    def test_max_model_memory_explicit_deprecated(self):
+        """Deprecated --max-model-memory still triggers override detection."""
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(max_model_memory="auto")) is True
         assert _has_cli_overrides(self._make_args(max_model_memory="32GB")) is True
 
-    def test_max_process_memory_explicit(self):
+    def test_max_process_memory_explicit_deprecated(self):
+        """Deprecated --max-process-memory still triggers override detection."""
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(max_process_memory="64GB")) is True
 

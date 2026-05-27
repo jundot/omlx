@@ -336,27 +336,33 @@ async def lifespan(app: FastAPI):
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.preload_pinned_models()
 
-    # Start process memory enforcer if configured
+    # Start process memory enforcer. The enforcer always runs so the
+    # engine pool can consult its real-time ceiling on every load; the
+    # guard is effectively disabled when prefill_memory_guard=False, in
+    # which case get_final_ceiling() returns 0 and the pool admits
+    # unconditionally.
     if (
         _server_state.global_settings is not None
         and _server_state.engine_pool is not None
     ):
-        max_bytes = _server_state.global_settings.memory.get_max_process_memory_bytes()
-        if max_bytes is not None:
-            from .process_memory_enforcer import ProcessMemoryEnforcer
+        from .process_memory_enforcer import ProcessMemoryEnforcer
 
-            enforcer = ProcessMemoryEnforcer(
-                engine_pool=_server_state.engine_pool,
-                max_bytes=max_bytes,
-                settings_manager=_server_state.settings_manager,
-                prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
-                global_settings=_server_state.global_settings,
-                soft_threshold=_server_state.global_settings.memory.soft_threshold,
-                hard_threshold=_server_state.global_settings.memory.hard_threshold,
-            )
-            _server_state.process_memory_enforcer = enforcer
-            _server_state.engine_pool._process_memory_enforcer = enforcer
-            enforcer.start()
+        mem_cfg = _server_state.global_settings.memory
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=_server_state.engine_pool,
+            memory_guard_tier=mem_cfg.memory_guard_tier,
+            settings_manager=_server_state.settings_manager,
+            prefill_memory_guard=mem_cfg.prefill_memory_guard,
+            global_settings=_server_state.global_settings,
+            soft_threshold=mem_cfg.soft_threshold,
+            hard_threshold=mem_cfg.hard_threshold,
+            prefill_safe_zone_ratio=mem_cfg.prefill_safe_zone_ratio,
+            prefill_min_chunk_tokens=mem_cfg.prefill_min_chunk_tokens,
+        )
+        _server_state.process_memory_enforcer = enforcer
+        _server_state.engine_pool._process_memory_enforcer = enforcer
+        _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        enforcer.start()
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -1143,7 +1149,6 @@ def validate_context_window(
 
 def init_server(
     model_dirs: str | list[str],
-    max_model_memory: int | None,
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
@@ -1153,7 +1158,6 @@ def init_server(
 
     Args:
         model_dirs: Path or list of paths to directories containing model subdirectories
-        max_model_memory: Maximum memory for loaded models in bytes, or None for no limit
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
         global_settings: GlobalSettings instance (optional)
@@ -1245,9 +1249,9 @@ def init_server(
             model_path.mkdir(parents=True, exist_ok=True)
             logger.warning(f"Model directory created (empty): {md}")
 
-    # Create engine pool
+    # Create engine pool. Ceiling-based admission is wired up later in
+    # lifespan() once the ProcessMemoryEnforcer is created.
     _server_state.engine_pool = EnginePool(
-        max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
     )
 
@@ -1286,10 +1290,12 @@ def init_server(
         logger.info(f"Default model: {_server_state.default_model}")
     else:
         logger.info("No default model (no models available)")
-    if max_model_memory is None:
-        logger.info("Max model memory: disabled (no limit)")
-    else:
-        logger.info(f"Max model memory: {format_size(max_model_memory)}")
+    if global_settings is not None:
+        logger.info(
+            f"Memory guard tier: {global_settings.memory.memory_guard_tier} "
+            f"(prefill_memory_guard="
+            f"{global_settings.memory.prefill_memory_guard})"
+        )
     logger.info(f"Default max tokens: {_server_state.sampling.max_tokens}")
     if api_key:
         logger.info("API key authentication: enabled")
@@ -1596,7 +1602,7 @@ async def health():
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
-            "max_model_memory": _server_state.engine_pool.max_model_memory,
+            "final_ceiling": _server_state.engine_pool._current_ceiling(),
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
@@ -1631,7 +1637,9 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
-        model_memory_max = pool.max_model_memory
+        # Real-time ceiling (min(static, dynamic)) from the enforcer.
+        # 0 means the guard is disabled or not yet wired up.
+        model_memory_max = pool._current_ceiling() or None
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -4992,18 +5000,13 @@ Note: Use the omlx CLI for full feature support.
     # Parse pinned models
     pinned_models = args.pin.split(",") if args.pin else []
 
-    # Initialize server
-    init_server(
-        model_dir=args.model_dir,
-        max_model_memory=parse_size(args.max_model_memory),
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+    # NOTE: this __main__ block has been dead since the multi-model
+    # refactor (init_server takes model_dirs= plural, not model_dir=).
+    # Real entry is omlx.cli:serve_command. Left as a stub to make the
+    # break obvious if anyone tries `python -m omlx.server` directly.
+    raise SystemExit(
+        "omlx.server is no longer runnable directly; use `omlx serve`."
     )
-
-    # Start server
-    import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ class FakePool:
     def get_status(self):
         return {
             "current_model_memory": 1024,
-            "max_model_memory": 2048,
+            "final_ceiling": 2048,
             "models": [
                 {
                     "id": "model-a",
@@ -139,7 +139,7 @@ class FakeNonStreamingPool:
     def get_status(self):
         return {
             "current_model_memory": 1024,
-            "max_model_memory": 2048,
+            "final_ceiling": 2048,
             "models": [
                 {
                     "id": "embed-model",

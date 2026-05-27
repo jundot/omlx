@@ -7,11 +7,11 @@ Commands:
     omlx serve --model-dir /path/to/models    Start multi-model server
 
 Usage:
-    # Multi-model serving
-    omlx serve --model-dir /path/to/models --max-model-memory 32GB
+    # Multi-model serving (default memory_guard_tier=balanced)
+    omlx serve --model-dir /path/to/models
 
-    # With pinned models
-    omlx serve --model-dir /path/to/models --max-model-memory 48GB --pin llama-3b,qwen-7b
+    # Tighter system reserve, with pinned models
+    omlx serve --model-dir /path/to/models --memory-guard-tier safe --pin llama-3b,qwen-7b
 """
 
 import argparse
@@ -28,6 +28,8 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "model_dir") and args.model_dir is not None:
         return True
     if hasattr(args, "port") and args.port is not None:
+        return True
+    if hasattr(args, "memory_guard_tier") and args.memory_guard_tier is not None:
         return True
     if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
         return True
@@ -171,8 +173,8 @@ def serve_command(args):
     model_dirs = settings.model.get_model_dirs(settings.base_path)
     print(f"Base path: {settings.base_path}")
     print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
-    print(f"Max model memory: {settings.model.max_model_memory}")
-    print(f"Max process memory: {settings.memory.max_process_memory}")
+    print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
+    print(f"Prefill memory guard: {settings.memory.prefill_memory_guard}")
 
     # Store MCP config path for FastAPI startup
     # Priority: CLI arg > settings.json
@@ -252,7 +254,6 @@ def serve_command(args):
     # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
     init_server(
         model_dirs=[str(d) for d in model_dirs],
-        max_model_memory=settings.model.get_max_model_memory_bytes(),
         scheduler_config=scheduler_config,
         api_key=settings.auth.api_key,
         global_settings=settings,
@@ -522,18 +523,32 @@ Example directory structure:
         help="Directory containing model subdirectories (default: ~/.omlx/models)",
     )
     serve_parser.add_argument(
+        "--memory-guard-tier",
+        type=str,
+        choices=["safe", "balanced", "aggressive"],
+        default=None,
+        help=(
+            "Tier-based memory ceiling: safe (12GB static reserve), "
+            "balanced (8GB, default), aggressive (6GB). The ceiling is "
+            "min(static, dynamic) where dynamic shrinks with system load."
+        ),
+    )
+    serve_parser.add_argument(
         "--max-model-memory",
         type=str,
         default=None,
-        help="Maximum memory for loaded models (e.g., 32GB, 'disabled'). Default: 80%% of system memory.",
+        help=(
+            "DEPRECATED. Ignored. Use --memory-guard-tier instead. The "
+            "engine pool now sizes its budget from the real-time ceiling."
+        ),
     )
     serve_parser.add_argument(
         "--max-process-memory",
         type=str,
         default=None,
         help=(
-            "Max total process memory as percentage of system RAM (10-99%%), "
-            "'auto' (RAM - 8GB), or 'disabled'. Default: auto."
+            "DEPRECATED. Inferred to the nearest --memory-guard-tier with "
+            "a warning. Use --memory-guard-tier directly."
         ),
     )
 

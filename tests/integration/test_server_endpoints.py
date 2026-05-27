@@ -258,12 +258,11 @@ class MockEnginePool:
         return sum(1 for m in self._models if m["loaded"])
 
     @property
-    def max_model_memory(self) -> int:
-        return 32 * 1024 * 1024 * 1024  # 32GB
-
-    @property
     def current_model_memory(self) -> int:
         return 1000000
+
+    def _current_ceiling(self) -> int:
+        return 32 * 1024 * 1024 * 1024  # 32GB
 
     def get_entry(self, model_id: str):
         return None
@@ -278,7 +277,7 @@ class MockEnginePool:
         return {
             "models": self._models,
             "loaded_count": self.loaded_model_count,
-            "max_model_memory": self.max_model_memory,
+            "final_ceiling": self._current_ceiling(),
         }
 
     async def get_engine(self, model_id: str):
@@ -372,7 +371,7 @@ class TestHealthEndpoint:
         pool_info = data["engine_pool"]
         assert "model_count" in pool_info
         assert "loaded_count" in pool_info
-        assert "max_model_memory" in pool_info
+        assert "final_ceiling" in pool_info
         assert "current_model_memory" in pool_info
 
 

@@ -44,13 +44,13 @@ class TestStatusEndpoint:
         """When engine pool exists, return model and memory stats."""
         pool = MagicMock(spec=[
             "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "max_model_memory", "_entries",
+            "current_model_memory", "_current_ceiling", "_entries",
         ])
         pool.model_count = 5
         pool.loaded_model_count = 2
         pool.get_loaded_model_ids.return_value = ["model-a", "model-b"]
         pool.current_model_memory = 16 * 1024**3
-        pool.max_model_memory = 32 * 1024**3
+        pool._current_ceiling.return_value = 32 * 1024**3
 
         entry_a = MagicMock(spec=["is_loading", "engine"])
         entry_a.is_loading = False
@@ -96,13 +96,13 @@ class TestStatusEndpoint:
 
         pool = MagicMock(spec=[
             "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "max_model_memory", "_entries",
+            "current_model_memory", "_current_ceiling", "_entries",
         ])
         pool.model_count = 1
         pool.loaded_model_count = 1
         pool.get_loaded_model_ids.return_value = ["model-a"]
         pool.current_model_memory = 0
-        pool.max_model_memory = None
+        pool._current_ceiling.return_value = 0
         pool._entries = {"model-a": entry}
 
         self._state.engine_pool = pool
@@ -138,16 +138,16 @@ class TestStatusEndpoint:
             assert key in data, f"Missing key: {key}"
 
     def test_unlimited_memory_max(self, client):
-        """When max_model_memory is None, formatted shows 'unlimited'."""
+        """When the ceiling is 0 (guard off), formatted shows 'unlimited'."""
         pool = MagicMock(spec=[
             "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "max_model_memory", "_entries",
+            "current_model_memory", "_current_ceiling", "_entries",
         ])
         pool.model_count = 0
         pool.loaded_model_count = 0
         pool.get_loaded_model_ids.return_value = []
         pool.current_model_memory = 0
-        pool.max_model_memory = None
+        pool._current_ceiling.return_value = 0
         pool._entries = {}
 
         self._state.engine_pool = pool
