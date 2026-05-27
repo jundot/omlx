@@ -81,6 +81,26 @@ commit)。
     零回归**。
   - 仍未并回 main,等人工 review 后 `git merge --ff-only`。
 
+- **2026-05-27 dflash 多模态路由** — 分支 `sync/dflash-multimodal-routing`
+  (基于 `main` @ `e8e0967`)。不 cherry-pick 上游 `d0f60ec`(#1344),而是
+  按 flyto Path A(永久 `_embedded_vlm` 双引擎)做等价设计:
+  - `DFlashEngine.supports_multimodal_fallback` property:`_embedded_vlm` 是
+    `VLMBatchedEngine` 时返 True,否则 False(text-only fallback 不算).
+  - `DFlashEngine._has_multimodal_content(messages)` helper:检测 OpenAI
+    `image_url` / Anthropic `image` / `input_audio` 等结构化 content part.
+  - `DFlashEngine.chat / stream_chat`:多模态请求直接 forward 到
+    `self._embedded_vlm.chat / stream_chat`,绕过 `_apply_chat_template`
+    的 text-only 路径(否则图像在 template flatten 时被丢).
+  - `server.py` 两处(OpenAI chat completions + Anthropic messages):
+    `is_vlm` 判断扩展为 `isinstance(engine, VLMBatchedEngine) or
+    supports_multimodal_fallback`,使得 dflash+VLM 走
+    `extract_multimodal_content` / `preserve_images=True`,把图像保留到
+    `engine.chat()` 入口.
+  - 新增 `tests/test_dflash_multimodal_routing.py`(15 test,全绿).
+  - 完整套件:4509 pass / 4 fail / 37 skip. 4 fail 中 3 个是已知 pre-existing
+    settings env var 问题,1 个 `test_boundary_snapshot_store` 是 full-suite
+    ordering flake(isolated 通过, 与本批改动无关).
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |
@@ -170,7 +190,8 @@ cherry-pick 一律带 `-x`,commit message 里保留 "cherry picked from commit �
   `_fallback_engine` swap + `supports_multimodal_fallback` content detect,
   flyto Path A 是永久 `_embedded_vlm` 双引擎,routing 基于 prompt token len
   而非 content。`message_extractor` hook 也只覆盖 gemma4/harmony,不通用。
-  要做等同效果需要在 server.py 层重写 message 路由,**留独立 spike**。
+  **2026-05-27 用 flyto 自己的设计落地了**,等价效果,不再 cherry-pick
+  上游 commit(见下「2026-05-27 dflash 多模态路由」段)。
 
 ## 待引入(评估为有价值,下一批,尚未 cherry-pick)
 
@@ -188,7 +209,8 @@ Qwen-Gemma / oQ)的相关度。
 | #1268 | profiles: 分类 9 个新 ModelSettings 字段 | 中 | 与 flyto `0d28e26` 同类,修 #1259 测试失败之一 |
 | #1149 | cache: 多槽 LRU MRU partial block cache | 暂缓 | 19-commit **draft**,且包含 #1183 两个 commit;等它在上游定稿再说 |
 | `c645c9f` + `3ef7b94` + `4cfbc8b` + `acd0533` + `64bd2a2`(#1431) + `b129a19`(#1425) | memory: drop `max_*_memory`,add `memory_guard_tier` with dynamic ceiling(+ size-aware reserve、user-explicit hard cap、tier-aware active-memory reclaim) | 高(需 spike) | **breaking config**:删 `max_process_memory` / `max_model_memory`,换 `memory_guard_tier {safe,balanced,aggressive}`,涉及 29 个上游文件,flyto 113 处引用旧字段。spike 要覆盖:① 是否值得换 API;② settings.json 迁移路径;③ admin UI 改造;④ CLI args 改动;⑤ 用户已有配置兼容性。本次因 0169f15 已经引入,`user_explicit_max` test 临时 skip,等迁移落地一并打开。|
-| #1344 (`d0f60ec`) | dflash: 多模态请求 → VLM fallback,在 template flatten 之前检测 | 高(需 spike) | 与 flyto Path A 双引擎架构冲突,需在 server.py 层重写 message 路由让 dflash + `_embedded_vlm` 也走 `extract_multimodal_content`。可能与 #1056 / #818 一并设计。|
+| ~~#1344~~ | ~~dflash 多模态请求 → VLM fallback~~ | ~~高(需 spike)~~ | **2026-05-27 用 flyto 自己的设计落地**(见下「2026-05-27 dflash 多模态路由」段),不走 cherry-pick 路径。|
+| #1056 / #818 | dflash: 把带图请求路由到 VLM fallback engine | 待评估 | flyto 已用自己的 `supports_multimodal_fallback` + dflash.chat 路由覆盖 image,可能仍可参考 #818 的 audio / tts 部分。|
 
 ## 上游 issue 处理记录
 
