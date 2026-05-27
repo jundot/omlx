@@ -210,7 +210,7 @@ One-click benchmarking from the admin panel. Measures prefill (PP) and text gene
 
 ### macOS Menubar App
 
-Native PyObjC menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and in-app auto-update.
+Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and Sparkle-driven auto-update.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -272,11 +272,8 @@ Models are auto-detected by type. You can also download models directly from the
 ## CLI Configuration
 
 ```bash
-# Memory limit for loaded models
-omlx serve --model-dir ~/models --max-model-memory 32GB
-
-# Process-level memory limit (default: auto = RAM - 8GB)
-omlx serve --model-dir ~/models --max-process-memory 80%
+# Start with default settings (memory guard tier = balanced, manage via admin UI)
+omlx serve --model-dir ~/models
 
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
@@ -338,22 +335,20 @@ pytest -m "not slow"
 
 ### macOS App
 
-Requires Python 3.11+ and [venvstacks](https://venvstacks.lmstudio.ai) (`pip install venvstacks`).
+The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
-cd packaging
+# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
+apps/omlx-mac/Scripts/build.sh release
 
-# Full build (venvstacks + app bundle + DMG)
-python build.py
+# Result lands at apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# Skip venvstacks (code changes only)
-python build.py --skip-venv
-
-# DMG only
-python build.py --dmg-only
+# Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-See [packaging/README.md](packaging/README.md) for details on the app bundle structure and layer configuration.
+First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
 
 ## Contributing
 

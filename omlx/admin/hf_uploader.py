@@ -175,6 +175,10 @@ class HFUploader:
         self._cancelled: set[str] = set()
         self._upload_sem = asyncio.Semaphore(1)
 
+    def update_model_dirs(self, model_dirs: list[str]) -> None:
+        """Update model directory paths."""
+        self._model_dirs = [Path(d) for d in model_dirs]
+
     @staticmethod
     async def validate_token(token: str) -> dict:
         """Validate a HuggingFace token and return user info.

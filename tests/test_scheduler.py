@@ -754,6 +754,74 @@ class TestSchedulerReset:
         assert len(scheduler.requests) == 0
         assert scheduler.batch_generator is None
 
+    def test_reset_clears_async_store_cache_bookkeeping(
+        self, mock_model, mock_tokenizer
+    ):
+        """reset() must drop _pending_async_removes and _inflight_store_futures.
+
+        Regression for #1459: when a slow async store_cache worker finishes
+        between scheduler.shutdown()'s 30s wait timeout and the subsequent
+        executor.shutdown(wait=True), the deferred _drain_pending_async_removes
+        step that nulls req._extracted_cache never runs again. If reset()
+        leaves these two containers populated, the futures keep Request
+        references alive and the KV cache stays pinned for the rest of the
+        process lifetime. Clearing them in reset() is the second line of
+        defense after shutdown()'s final drain.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_future = MagicMock()
+        scheduler._pending_async_removes.append(
+            (999, "req-leaked", fake_future)
+        )
+        scheduler._inflight_store_futures["req-leaked"] = fake_future
+
+        scheduler.reset()
+
+        assert len(scheduler._pending_async_removes) == 0
+        assert len(scheduler._inflight_store_futures) == 0
+
+    def test_shutdown_drains_after_executor_join(self, mock_model, mock_tokenizer):
+        """shutdown() must drain pending removes again after executor join.
+
+        Regression for #1459. When the 30s `wait()` times out, the first
+        drain skips not-yet-done futures (deque break on `not future.done()`).
+        `executor.shutdown(wait=True)` then joins all workers — by the time
+        it returns, every future is done — but without a second drain those
+        skipped entries stay pinned, keeping the request's KV cache alive
+        for the rest of the process lifetime.
+
+        Asserts: drain runs both before and after executor.shutdown.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+
+        # Seed an inflight future so shutdown() enters the wait branch.
+        scheduler._inflight_store_futures["req-slow"] = MagicMock()
+
+        call_order = []
+        original_drain = scheduler._drain_pending_async_removes
+
+        def record_drain():
+            call_order.append("drain")
+            original_drain()
+
+        def record_executor_shutdown(wait=True):
+            call_order.append("executor_shutdown")
+
+        fake_executor.shutdown.side_effect = record_executor_shutdown
+        scheduler._drain_pending_async_removes = record_drain
+
+        with patch("concurrent.futures.wait"):
+            scheduler.shutdown()
+
+        assert call_order == ["drain", "executor_shutdown", "drain"], (
+            f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        )
+
 
 class TestSchedulerStopTokens:
     """Tests for stop token handling."""
@@ -856,6 +924,74 @@ class TestSyncAndClearCache:
             with pytest.raises(RuntimeError, match="default stream failure"):
                 sched_mod._sync_and_clear_cache()
             clear_cache.assert_not_called()
+
+
+class TestStoreCacheWorkerSync:
+    """Tests for store-cache worker stream-scoped sync (#1437).
+
+    Worker must wait on generation_stream specifically, not on the
+    default stream. mx.synchronize() with no args only blocks on the
+    default stream (gpu:0) and leaves the gpu:2 dispatched work
+    unwaited, racing the buffer-protocol access in
+    _extract_tensor_bytes -> SIGABRT in get_command_encoder(gpu:2).
+    """
+
+    def test_safe_sync_passes_generation_stream(self):
+        """_safe_sync_stream() with no args must invoke mx.synchronize with
+        the module-level _default_generation_stream object, not call the
+        no-args variant.
+
+        Regression: PR #1146 wired the worker to bare mx.synchronize()
+        under the (incorrect) assumption that it was a global barrier
+        and that stream-scoped sync was unsafe cross-thread. Both
+        assumptions are wrong: synchronize() defaults to a single
+        stream, and Stream objects are not thread-local. The worker
+        path now routes through this helper so the regression has a
+        single chokepoint to assert against.
+        """
+        from omlx import scheduler as sched_mod
+
+        calls = []
+
+        def fake_sync(*args, **kwargs):
+            calls.append(args)
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_stream()
+
+        assert len(calls) == 1
+        assert calls[0] and calls[0][0] is sched_mod._default_generation_stream, (
+            f"Worker sync must target _default_generation_stream, got: {calls}"
+        )
+
+    def test_safe_sync_swallows_no_stream_runtime_error(self):
+        """A 'no Stream' RuntimeError from cross-thread sync must be
+        swallowed so the worker can still proceed to extract bytes.
+
+        On some MLX builds mx.synchronize(stream) raises 'There is no
+        Stream(gpu, X) in current thread' from a thread that has not
+        submitted work to that stream. In the store-cache worker that
+        condition means there is no in-flight gpu:2 work to drain, so
+        it is safe to continue.
+        """
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("There is no Stream(gpu, 2) in current thread.")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_stream()
+
+    def test_safe_sync_propagates_other_runtime_errors(self):
+        """Real GPU errors must not be silently swallowed."""
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("Metal command buffer execution failed")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            with pytest.raises(RuntimeError, match="command buffer execution failed"):
+                sched_mod._safe_sync_stream()
 
 
 class TestSchedulerFormatBytes:

@@ -23,6 +23,16 @@ import pytest
 from omlx.engine_pool import EngineEntry, EnginePool
 
 
+def _engine_pool_with_ceiling(ceiling=None):
+    """Helper: EnginePool with a stubbed pre-load ceiling callback."""
+    pool = EnginePool()
+    if ceiling and ceiling > 0:
+        pool._get_final_ceiling = lambda c=ceiling: c
+    else:
+        pool._get_final_ceiling = lambda: 0
+    return pool
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -55,7 +65,7 @@ def audio_model_dir(tmp_path):
 @pytest.fixture
 def pool_with_audio(audio_model_dir):
     """EnginePool with audio + LLM models, generous memory limit."""
-    pool = EnginePool(max_model_memory=10 * 1024**3)
+    pool = _engine_pool_with_ceiling(10 * 1024**3)
     pool.discover_models(str(audio_model_dir))
     return pool
 
@@ -247,7 +257,7 @@ class TestAudioPinning:
 
     def test_discover_with_pinned_audio(self, audio_model_dir):
         """discover_models() with pinned_models pins the audio entry."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _engine_pool_with_ceiling(10 * 1024**3)
         pool.discover_models(str(audio_model_dir), pinned_models=["whisper-tiny"])
 
         assert pool._entries["whisper-tiny"].is_pinned is True
@@ -255,7 +265,7 @@ class TestAudioPinning:
 
     def test_pinned_audio_not_selected_as_lru_victim(self, audio_model_dir):
         """Pinned audio model is excluded from LRU eviction candidates."""
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _engine_pool_with_ceiling(10 * 1024**3)
         pool.discover_models(str(audio_model_dir), pinned_models=["whisper-tiny"])
 
         pool._entries["whisper-tiny"].engine = MagicMock()
@@ -293,14 +303,24 @@ class TestAudioPreLoadEviction:
         (stt_dir / "model.safetensors").write_bytes(b"0" * 2048)
 
         # Limit: allow one model but not both simultaneously
-        pool = EnginePool(max_model_memory=2500)
+        pool = _engine_pool_with_ceiling(2500)
         pool.discover_models(str(tmp_path))
         return pool
 
     @pytest.mark.asyncio
-    async def test_loading_stt_evicts_llm(self, tight_audio_pool):
+    async def test_loading_stt_evicts_llm(self, tight_audio_pool, monkeypatch):
         """When memory is tight, loading STT evicts the loaded LLM."""
         pool = tight_audio_pool
+        # Proxy phys_footprint to the pool's tracked weight sum so admission
+        # against the byte-sized synthetic ceiling matches the test's intent
+        # (real phys_footprint is ~100 MB and would dominate).
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool.mx.get_active_memory", lambda: 0
+        )
 
         mock_llm = MagicMock()
         mock_llm.start = AsyncMock()

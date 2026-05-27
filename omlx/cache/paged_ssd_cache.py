@@ -652,6 +652,7 @@ class PagedSSDCacheManager(CacheManager):
             "preload_calls": 0,
             "preload_blocks_loaded": 0,
             "preload_time_ms": 0.0,
+            "ssd_write_drops": 0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -804,6 +805,7 @@ class PagedSSDCacheManager(CacheManager):
             )
             return True
         except queue.Full:
+            self._stats["ssd_write_drops"] += 1
             logger.warning(
                 f"SSD write queue full, dropping evicted block "
                 f"{block_hash.hex()[:16]}"
@@ -1140,6 +1142,7 @@ class PagedSSDCacheManager(CacheManager):
         # Check queue capacity before doing expensive GPU/disk work
         # (not needed for hot cache write-back mode)
         if not self._hot_cache_enabled and self._write_queue.full():
+            self._stats["ssd_write_drops"] += 1
             logger.warning(
                 f"SSD cache write queue full, skipping save for "
                 f"{block_hash.hex()[:16]}"
@@ -1303,14 +1306,19 @@ class PagedSSDCacheManager(CacheManager):
             metadata.update(cache_list_meta)
 
             # Caller (scheduler._cleanup_finished, async store-cache path)
-            # already mx.eval's all real KV arrays on the inference thread
-            # before submitting to the omlx-store-cache executor. The tiny
+            # dispatches real KV arrays via mx.async_eval on the inference
+            # thread's generation_stream before submitting to the
+            # omlx-store-cache executor. The worker then waits on that same
+            # stream via mx.synchronize(generation_stream) (see
+            # _async_store_cache_worker) before reaching this code path,
+            # so the arrays are fully materialized by the time
+            # _extract_tensor_bytes hits the buffer protocol. The tiny
             # mx.zeros((1,)) placeholders allocated above are lazy nodes
             # whose buffer materialization happens implicitly via the buffer
-            # protocol. Skipping the explicit mx.eval here keeps save_block
+            # protocol. Skipping any explicit mx.eval here keeps save_block
             # off the Metal command-submission path when invoked from a
             # non-inference thread, which is the source of the cross-thread
-            # race tracked in #978/#1040.
+            # race tracked in #978/#1040/#1106/#1437.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
@@ -1377,6 +1385,7 @@ class PagedSSDCacheManager(CacheManager):
                     (block_hash, tensors_raw, metadata, file_path)
                 )
             except queue.Full:
+                self._stats["ssd_write_drops"] += 1
                 logger.warning(
                     f"SSD cache write queue full, dropping write for "
                     f"{block_hash.hex()[:16]}"
@@ -2287,6 +2296,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                ssd_write_drops=self._stats["ssd_write_drops"],
             )
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
@@ -2345,6 +2355,7 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
+                ssd_write_drops=self._stats["ssd_write_drops"],
             )
 
     def get_stats_dict(self) -> dict[str, Any]:

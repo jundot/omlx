@@ -2,6 +2,8 @@
 """Tests for profile/template CRUD on ModelSettingsManager."""
 
 
+import json
+
 import pytest
 
 from omlx.model_profiles import InvalidProfileNameError
@@ -145,7 +147,10 @@ class TestProfileFieldFiltering:
 
 
 class TestTemplatesCRUD:
-    def test_list_templates_empty(self, mgr):
+    def test_list_templates_empty_by_default(self, mgr):
+        # Shipped builtins were retired in favor of the client-side preset
+        # bundle (`omlx/admin/static/omlx_preset.json`); the server's
+        # /api/profile-templates surface now exposes user templates only.
         assert mgr.list_templates() == []
 
     def test_save_template_universal_only(self, mgr):
@@ -202,3 +207,31 @@ class TestTemplatesCRUD:
         m1.save_template("coding", "Coding", None, {"temperature": 0.0})
         m2 = ModelSettingsManager(tmp_path)
         assert m2.get_template("coding") is not None
+
+
+class TestTemplatesPersistence:
+    """The on-disk template file holds only user-created entries. Built-in
+    seed templates were retired in favor of the client-side preset bundle
+    (`omlx/admin/static/omlx_preset.json`); /api/profile-templates is now a
+    pure user-store surface."""
+
+    def test_no_file_created_when_empty(self, tmp_path):
+        ModelSettingsManager(tmp_path)
+        # With no user templates and no shipped builtins, the manager must
+        # not create the templates file proactively.
+        assert not (tmp_path / "global_templates.json").exists()
+
+    def test_user_template_persists_only_itself(self, tmp_path):
+        m1 = ModelSettingsManager(tmp_path)
+        m1.save_template("custom", "Custom", None, {"temperature": 0.1})
+
+        on_disk = json.loads((tmp_path / "global_templates.json").read_text())
+        assert set(on_disk["templates"].keys()) == {"custom"}
+
+        m2 = ModelSettingsManager(tmp_path)
+        names = {t["name"] for t in m2.list_templates()}
+        assert names == {"custom"}
+        # No `is_builtin` is emitted now that builtins are retired; preset
+        # vs user classification lives on the client (preset bundle), not
+        # on this response.
+        assert "is_builtin" not in m2.get_template("custom")

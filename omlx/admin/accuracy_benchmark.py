@@ -72,16 +72,37 @@ class AccuracyBenchmarkRequest(BaseModel):
 
 @dataclass
 class AccuracyBenchmarkRun:
-    """Tracks the state of a running accuracy benchmark."""
+    """Tracks the state of a running accuracy benchmark.
+
+    SSE delivery model mirrors `BenchmarkRun`: append-only `events`
+    log + `cond` for live notification + `terminal` flag set on the
+    final event. See benchmark.py for the rationale.
+    """
 
     bench_id: str
     request: AccuracyBenchmarkRequest
     status: str = "running"  # running, completed, cancelled, error
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    events: list[dict] = field(default_factory=list)
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    terminal: bool = False
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
     last_progress: Optional[dict] = None  # last progress event for reconnect
+    # Finer-grained lifecycle than `status` — surfaces the difference between
+    # "still scoring questions" and "cleaning up after the last result was
+    # emitted". The serialization gate (_queue_running) stays True across
+    # both, but a UI rendering the running row wants to hide it once
+    # phase=="unloading" so the user isn't told "still running" when the
+    # result card has already appeared on screen. Transitions:
+    #   pending → loading → evaluating → unloading → completed
+    # (cancelled / error replace the terminal phase on those branches.)
+    phase: str = "pending"
+
+
+# Accuracy stream closes on `done` (run finished) or `error`. Unlike the
+# throughput bench there's no separate upload phase to ride out.
+_ACCURACY_TERMINAL_TYPES = frozenset({"done", "error"})
 
 
 # --- Run management ---
@@ -134,15 +155,22 @@ def add_to_queue(request: AccuracyBenchmarkRequest) -> None:
 def get_queue_status() -> dict:
     """Get current queue status."""
     last_progress = None
+    phase = None
     if _current_run_id:
         run = get_run(_current_run_id)
         if run:
             last_progress = run.last_progress
+            phase = run.phase
     return {
         "running": _queue_running,
         "current_model": _current_model,
         "current_bench_id": _current_run_id,
         "last_progress": last_progress,
+        # Finer-grained than `running`: distinguishes "still scoring" from
+        # "cleaning up after the last result emitted". Polling UIs hide
+        # the running row once phase becomes "unloading" / "completed" so
+        # the result card alone tells the story.
+        "phase": phase,
         "queue": [
             {"model_id": r.model_id, "benchmarks": list(r.benchmarks.keys())}
             for r in _queue
@@ -251,13 +279,18 @@ async def cancel_queue() -> None:
 
 
 async def _send_event(run: AccuracyBenchmarkRun, event: dict) -> None:
-    """Send an SSE event to the client."""
+    """Append an event to the run's log and wake subscribers.
+
+    Updates `last_progress` (used by the REST `queue/status` endpoint
+    for reconnect hints) and sets `run.terminal` on the final event.
+    """
     if event.get("type") == "progress":
         run.last_progress = event
-    try:
-        await run.queue.put(event)
-    except Exception:
-        pass
+    async with run.cond:
+        run.events.append(event)
+        if event.get("type") in _ACCURACY_TERMINAL_TYPES:
+            run.terminal = True
+        run.cond.notify_all()
 
 
 # --- Benchmark execution ---
@@ -285,6 +318,7 @@ async def run_accuracy_benchmark(
 
     try:
         # Phase 1: Unload all models
+        run.phase = "loading"
         loaded_ids = engine_pool.get_loaded_model_ids()
         if loaded_ids:
             await _send_event(run, {
@@ -335,6 +369,7 @@ async def run_accuracy_benchmark(
                 sampling_kwargs["chat_template_kwargs"] = ms.chat_template_kwargs
 
         # Phase 3: Run each benchmark
+        run.phase = "evaluating"
         completed = 0
         for bench_name, sample_size in request.benchmarks.items():
             if run.status == "cancelled":
@@ -463,7 +498,11 @@ async def run_accuracy_benchmark(
                 "data": result_data,
             })
 
-        # Phase 4: Unload model
+        # Phase 4: Unload model. The result(s) are already emitted by now,
+        # so flip phase so polling clients hide the running indicator
+        # (the result card has already appeared on screen — telling the
+        # user "still running" while we clean up reads as a bug).
+        run.phase = "unloading"
         try:
             await engine_pool._unload_engine(request.model_id)
         except Exception:
@@ -472,6 +511,7 @@ async def run_accuracy_benchmark(
         # Phase 5: Done
         total_time = time.time() - start_time
         run.status = "completed"
+        run.phase = "completed"
 
         await _send_event(run, {
             "type": "done",
@@ -484,6 +524,7 @@ async def run_accuracy_benchmark(
 
     except asyncio.CancelledError:
         run.status = "cancelled"
+        run.phase = "cancelled"
         await _send_event(run, {
             "type": "error",
             "message": "Benchmark cancelled",
@@ -491,6 +532,7 @@ async def run_accuracy_benchmark(
     except Exception as e:
         logger.exception(f"Accuracy benchmark error: {e}")
         run.status = "error"
+        run.phase = "error"
         run.error_message = str(e)
         await _send_event(run, {
             "type": "error",

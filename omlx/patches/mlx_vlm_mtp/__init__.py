@@ -22,6 +22,41 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# Process-wide gate read by ``LanguageModel.__init__`` (in both
+# ``qwen35_moe_vlm_runtime`` and ``qwen35_vlm_runtime``) to decide whether
+# to attach ``MTPModule`` when the config declares ``mtp_num_hidden_layers
+# > 0``. Default True preserves PR #1404 behavior: VLM checkpoints that
+# actually ship persisted ``mtp.*`` weights need the head bound even with
+# ``mtp_enabled=False`` so strict ``load_weights`` succeeds.
+#
+# Caller (``utils/model_loading.py::maybe_apply_pre_load_patches``) flips
+# this to False right before ``mlx_vlm.utils.load()`` runs when the
+# checkpoint declares MTP heads in config but ships no ``mtp.*`` weights
+# (e.g. unsloth Qwen3.6 UD MLX builds, issue #1426). Without the gate,
+# strict load fails with "Missing N parameters" and the engine silently
+# falls back to LLM, dropping vision.
+#
+# Single-thread MLX executor serializes loads, so this is race-free.
+_MTP_ATTACH_ENABLED = True
+
+
+def set_mtp_attach_enabled(enabled: bool) -> None:
+    """Toggle whether subsequent ``mlx_vlm.utils.load()`` calls attach the
+    VLM MTPModule.
+
+    Independent of ``mlx_lm_mtp.set_mtp_active``: attach controls module
+    presence so strict load can bind persisted ``mtp.*`` weights, active
+    controls whether BatchGenerator actually invokes the MTP head during
+    decode.
+    """
+    global _MTP_ATTACH_ENABLED
+    _MTP_ATTACH_ENABLED = bool(enabled)
+
+
+def is_mtp_attach_enabled() -> bool:
+    return _MTP_ATTACH_ENABLED
+
 def apply_mlx_vlm_mtp_patch() -> bool:
     """Apply the mlx-vlm MTP sanitize monkey-patches.
 
