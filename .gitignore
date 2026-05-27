@@ -120,4 +120,8 @@ omlx/admin/tailwindcss-*
 docs/native_app_architecture.md
 
 # UV lockfile
-uv.lockpackaging/_venvstacks_resolved.toml
+uv.lock
+
+# venvstacks build artifact: regenerated from venvstacks.toml + pyproject.toml
+# by packaging/build.py:_generate_venvstacks_toml() on every Swift app build.
+packaging/_venvstacks_resolved.toml
