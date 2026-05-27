@@ -629,10 +629,16 @@ private struct UpdatesSection: View {
                         comment: "Primary update status line while a check is in progress"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
-        case .available(let upd):
+        case .available(let upd), .ready(let upd):
             Text(String(localized: "status.updates.available_primary",
                         defaultValue: "oMLX \(upd.version) is available",
                         comment: "Primary update status line when a new version is available; placeholder is the version string"))
+                .font(.omlxText(13, weight: .medium))
+                .foregroundStyle(theme.text)
+        case .downloading:
+            Text(String(localized: "status.updates.downloading_primary",
+                        defaultValue: "Downloading update…",
+                        comment: "Primary update status line while the new build is downloading"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         case .idle:
@@ -659,6 +665,18 @@ private struct UpdatesSection: View {
                         comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
+        case .downloading(let pct):
+            Text(String(localized: "status.updates.downloading_secondary",
+                        defaultValue: "Downloading · \(pct)%",
+                        comment: "Secondary update status line during download; placeholder is the percent complete"))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textSecondary)
+        case .ready(let upd):
+            Text(String(localized: "status.updates.ready_secondary",
+                        defaultValue: "\(upd.version) is ready to install",
+                        comment: "Secondary update status line once the staged bundle is ready; placeholder is the version"))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textSecondary)
         case .idle(let lastChecked):
             Text(lastCheckedText(lastChecked))
                 .font(.omlxText(11))
@@ -669,13 +687,19 @@ private struct UpdatesSection: View {
     @ViewBuilder
     private var actionButton: some View {
         switch updates.state {
-        case .available:
+        case .available, .ready:
             Button(String(localized: "status.updates.install",
                           defaultValue: "Install & Restart",
                           comment: "Updates action button to install a downloaded update and restart")) {
                 updates.installAndRestart()
             }
                 .buttonStyle(.omlx(.primary, size: .small))
+        case .downloading(let pct):
+            Button(String(localized: "status.updates.downloading_button",
+                          defaultValue: "Downloading… \(pct)%",
+                          comment: "Updates action button label while the download is in progress; placeholder is the percent complete")) { }
+                .buttonStyle(.omlx(.normal, size: .small))
+                .disabled(true)
         case .checking:
             Button(String(localized: "status.updates.checking_button",
                           defaultValue: "Checking…",

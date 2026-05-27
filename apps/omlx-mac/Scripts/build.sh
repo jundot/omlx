@@ -170,8 +170,8 @@ resolve_donor_layers() {
 # the Python package without a second hand-maintained string.
 #
 # CURRENT_PROJECT_VERSION uses `git rev-list --count HEAD` so each commit
-# gives a monotonically-increasing CFBundleVersion — enough for Sparkle's
-# update comparisons.
+# gives a monotonically-increasing CFBundleVersion — enough for the
+# GitHub Releases updater's version comparisons.
 #
 # If either lookup fails the script bails rather than silently shipping
 # stale numbers; falling back to the pbxproj placeholders would mask a
@@ -326,22 +326,7 @@ fi
 #
 # Even with CODE_SIGNING_ALLOWED=NO during xcodebuild, we re-sign the staged
 # bundle ad-hoc so Gatekeeper doesn't refuse to launch it from a non-derived
-# location on first quarantine attribute. The Sparkle inner XPC services
-# need to be signed before the umbrella .framework, which needs to be signed
-# before the outer .app.
-
-if [ -d "$FRAMEWORKS_DIR/Sparkle.framework" ]; then
-    log "Ad-hoc resigning Sparkle.framework…"
-    SPARKLE_BASE="$FRAMEWORKS_DIR/Sparkle.framework/Versions/B"
-    for inner in \
-        "$SPARKLE_BASE/XPCServices/Installer.xpc" \
-        "$SPARKLE_BASE/XPCServices/Downloader.xpc" \
-        "$SPARKLE_BASE/Autoupdate" \
-        "$SPARKLE_BASE/Updater.app"; do
-        [ -e "$inner" ] && codesign --force --sign - "$inner" >/dev/null 2>&1 || true
-    done
-    codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework" >/dev/null 2>&1 || true
-fi
+# location on first quarantine attribute.
 
 log "Ad-hoc resigning outer bundle…"
 codesign --force --sign - "$STAGED_APP" >/dev/null 2>&1 || \

@@ -36,28 +36,6 @@
 	<key>NSSupportsSuddenTermination</key>
 	<false/>
 	<!--
-	  Sparkle (PR 11). The feed URL is overridable per-channel by
-	  SparkleUpdater. SUEnableInstallerLauncherService is the modern
-	  Sparkle 2.x XPC path. SUPublicEDKey is filled in by build.py for
-	  release builds; dev builds rely on the Sparkle TOFU prompt.
-	-->
-	<key>SUFeedURL</key>
-	<string>https://omlx.app/appcast.xml</string>
-	<key>SUEnableAutomaticChecks</key>
-	<true/>
-	<key>SUAllowsAutomaticUpdates</key>
-	<true/>
-	<key>SUEnableInstallerLauncherService</key>
-	<false/>
-	<key>SUPublicEDKey</key>
-	<string></string>
-	<key>SUAllowedChannels</key>
-	<array>
-		<string>stable</string>
-		<string>beta</string>
-		<string>nightly</string>
-	</array>
-	<!--
 	  URL scheme used by AppDelegate.presentAppView() to ask SwiftUI's
 	  Window scene (id "main") to instantiate on first invocation.
 	  The scene's `.handlesExternalEvents(matching: ["main"])` consumes

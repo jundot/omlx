@@ -1,18 +1,17 @@
-// PR 7 (PR 11 update) — Updates section view-model.
+// Updates section view-model.
 //
-// Drives three observable bits the AppView's Status screen renders: the
-// check state (idle / checking / available), the channel (Stable / Beta /
-// Nightly), and two background prefs (autoCheck + autoDownload). Channel +
-// prefs persist to ~/Library/Application Support/oMLX/update-prefs.json
-// so they survive a relaunch.
+// Drives the AppView's Status screen: the check state (idle / checking /
+// available), the channel (Stable / Beta / Nightly), and two background
+// prefs (autoCheck + autoDownload). Channel + prefs persist to
+// `~/Library/Application Support/oMLX/update-prefs.json` so they survive
+// a relaunch.
 //
-// PR 11 swaps the body of `checkForUpdates()` and `installAndRestart()` for
-// SparkleUpdater calls. Channel + auto-* prefs are forwarded to Sparkle on
-// every change so the user's selection takes effect on the next check.
-// When the Sparkle SwiftPM dep isn't resolved (`#if !canImport(Sparkle)`),
-// `SparkleUpdater` is a no-op stub and we keep the 1.4 s simulator from
-// PR 7 so the screen still demos correctly.
+// Update mechanism: GitHub Releases is the single source of truth. The
+// PyObjC menubar app shipped this pattern; the Swift app uses the same
+// flow via `ReleasesChecker` + `AppUpdater`. No appcast XML, no EdDSA
+// keys. Apple's notarization stapled to each .dmg is the trust boundary.
 
+import AppKit
 import Foundation
 
 enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -40,6 +39,9 @@ enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
 struct AvailableUpdate: Equatable, Sendable {
     let version: String
     let sizeText: String?
+    let notes: String
+    let htmlURL: URL
+    let dmgURL: URL?
 }
 
 @MainActor
@@ -47,39 +49,36 @@ final class UpdateController: ObservableObject {
     enum CheckState: Equatable, Sendable {
         case idle(lastChecked: Date?)
         case checking
+        case downloading(percent: Int)
         case available(AvailableUpdate)
+        case ready(AvailableUpdate)
     }
 
     @Published private(set) var state: CheckState = .idle(lastChecked: nil)
+    @Published private(set) var lastError: String?
     @Published var channel: UpdateChannel {
-        didSet { if !suspendPersist { onPrefsChanged() } }
+        didSet { if !suspendPersist { persist() } }
     }
     @Published var autoCheck: Bool {
-        didSet { if !suspendPersist { onPrefsChanged() } }
+        didSet { if !suspendPersist { persist() } }
     }
     @Published var autoDownload: Bool {
-        didSet { if !suspendPersist { onPrefsChanged() } }
+        didSet { if !suspendPersist { persist() } }
     }
 
     private let storeURL: URL
-    private var simulationTask: Task<Void, Never>?
+    private let currentVersion: String
     private var suspendPersist = true
+    private var checkTask: Task<Void, Never>?
+    private var updater: AppUpdater?
+    private var backgroundTimer: Timer?
 
-    /// Lazily constructed so the SPM dep is only required when something
-    /// actually drives an update check. The shim variant of `SparkleUpdater`
-    /// is also lazy — same hook, no behavior.
-    private lazy var sparkle: SparkleUpdater = {
-        let s = SparkleUpdater { [weak self] result in
-            self?.handleSparkleResult(result)
-        }
-        s.channel = channel
-        s.automaticallyChecksForUpdates = autoCheck
-        s.automaticallyDownloadsUpdates = autoDownload
-        return s
-    }()
-
-    init(storeURL: URL = AppConfig.appSupportURL().appendingPathComponent("update-prefs.json")) {
+    init(
+        storeURL: URL = AppConfig.appSupportURL().appendingPathComponent("update-prefs.json"),
+        currentVersion: String = Bundle.main.shortVersionString
+    ) {
         self.storeURL = storeURL
+        self.currentVersion = currentVersion
         let prefs = Self.readPrefs(from: storeURL) ?? Prefs(
             channel: .stable, autoCheck: true, autoDownload: false
         )
@@ -89,88 +88,152 @@ final class UpdateController: ObservableObject {
         self.suspendPersist = false
     }
 
-    /// Idempotent. Call once after AppDelegate stands up so Sparkle's
-    /// background checker is wired and gets the user's stored prefs.
+    /// Idempotent. Call once after AppDelegate stands up so we clean up any
+    /// staged bundle from a prior session and (when enabled) kick off a
+    /// background check.
     func bootstrap() {
-        _ = sparkle  // forces lazy init + applies prefs
+        AppUpdater.cleanupStaged()
         if autoCheck {
-            sparkle.backgroundCheckForUpdates()
+            backgroundCheck()
+            scheduleBackgroundChecker()
         }
     }
 
+    /// User-initiated check.
     func checkForUpdates() {
-        #if canImport(Sparkle)
-        sparkle.checkForUpdates()
-        // Flip to `checking` immediately so the AppView's button shows
-        // the spinner while Sparkle's panel fetches the appcast.
-        // `handleSparkleResult` will flip us back to `.idle` or
-        // `.available` once Sparkle's delegate fires. The timeout is a
-        // belt-and-suspenders so the spinner doesn't hang forever if
-        // Sparkle silently aborts (rare, but seen in dev when the feed
-        // host is unreachable).
+        checkTask?.cancel()
         state = .checking
-        scheduleCheckTimeout(seconds: 30)
-        #else
-        runSimulator()
-        #endif
+        lastError = nil
+        checkTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runCheck(userInitiated: true)
+        }
     }
 
+    /// One-button "Install & Restart" — matches the PyObjC menubar's
+    /// flow. When the state is `.available`, kick off the download and
+    /// auto-finish into `.ready`, then swap + terminate from the
+    /// `onReady` callback below. When the state is already `.ready`
+    /// (auto-download completed in the background), swap immediately.
     func installAndRestart() {
-        #if canImport(Sparkle)
-        sparkle.installAndRestart()
-        #else
-        // No-op in stub builds.
-        #endif
+        switch state {
+        case .available(let info):
+            guard let dmg = info.dmgURL else {
+                lastError = String(localized: "update.error.no_dmg",
+                                   defaultValue: "No installable DMG was attached to this release.",
+                                   comment: "Shown when the release has no matching DMG asset")
+                return
+            }
+            startDownload(info: info, dmgURL: dmg, autoInstall: true)
+        case .ready:
+            performSwap()
+        default:
+            break
+        }
+    }
+
+    private func performSwap() {
+        if AppUpdater.performSwapAndRelaunch() {
+            NSApp.terminate(nil)
+        } else {
+            lastError = String(localized: "update.error.swap_failed",
+                               defaultValue: "Could not find the staged update. Try downloading again.",
+                               comment: "Shown when the swap script can't find the staged bundle")
+            state = .idle(lastChecked: Date())
+        }
     }
 
     // MARK: - Internals
 
-    /// Bridges Sparkle's delegate callbacks back into the AppView's
-    /// observable state. Errors are logged but not surfaced in the pill —
-    /// `CheckState` has no `.error` case yet, and the user already sees
-    /// Sparkle's own error panel for user-initiated checks.
-    private func handleSparkleResult(_ result: SparkleUpdater.CheckResult) {
-        simulationTask?.cancel()
-        switch result {
-        case .upToDate:
-            state = .idle(lastChecked: Date())
-        case .available(let version, let sizeText):
-            state = .available(AvailableUpdate(version: version, sizeText: sizeText))
-        case .error(let message):
-            NSLog("oMLX: update check failed — %@", message)
-            state = .idle(lastChecked: Date())
+    private func backgroundCheck() {
+        checkTask?.cancel()
+        checkTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runCheck(userInitiated: false)
         }
     }
 
-    private func onPrefsChanged() {
-        persist()
-        sparkle.channel = channel
-        sparkle.automaticallyChecksForUpdates = autoCheck
-        sparkle.automaticallyDownloadsUpdates = autoDownload
-    }
-
-    private func runSimulator() {
-        simulationTask?.cancel()
-        state = .checking
-        simulationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(1400))
-            guard !Task.isCancelled, let self else { return }
-            self.state = .idle(lastChecked: Date())
+    private func scheduleBackgroundChecker() {
+        backgroundTimer?.invalidate()
+        // Re-check every 24 h while the app is running.
+        backgroundTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.autoCheck { self.backgroundCheck() }
+            }
         }
     }
 
-    private func scheduleCheckTimeout(seconds: Double) {
-        simulationTask?.cancel()
-        simulationTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(seconds))
-            guard !Task.isCancelled, let self else { return }
-            // If Sparkle hasn't reported back, flip to idle so the UI
-            // doesn't sit in `checking` forever. Sparkle's own panel
-            // remains on screen if a real check is in flight.
-            if case .checking = self.state {
+    private func runCheck(userInitiated: Bool) async {
+        do {
+            let result = try await ReleasesChecker.check(
+                currentVersion: currentVersion,
+                channel: channel
+            )
+            await MainActor.run {
+                if let release = result {
+                    let info = AvailableUpdate(
+                        version: release.version,
+                        sizeText: release.dmgSize.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) },
+                        notes: release.notes,
+                        htmlURL: release.htmlURL,
+                        dmgURL: release.dmgURL
+                    )
+                    self.state = .available(info)
+                    if self.autoDownload, let dmg = info.dmgURL, !userInitiated {
+                        self.startDownload(info: info, dmgURL: dmg, autoInstall: false)
+                    }
+                } else {
+                    self.state = .idle(lastChecked: Date())
+                }
+            }
+        } catch is CancellationError {
+            // Quietly drop — a fresh check is in flight or app is shutting down.
+        } catch {
+            NSLog("oMLX: update check failed — %@", String(describing: error))
+            await MainActor.run {
+                if userInitiated {
+                    self.lastError = String(describing: error)
+                }
                 self.state = .idle(lastChecked: Date())
             }
         }
+    }
+
+    private func startDownload(info: AvailableUpdate, dmgURL: URL, autoInstall: Bool) {
+        let updater = AppUpdater(
+            dmgURL: dmgURL,
+            version: info.version,
+            onProgress: { [weak self] progress in
+                guard let self else { return }
+                switch progress {
+                case .starting, .mounting, .staging:
+                    if case .downloading = self.state { /* keep showing percent */ } else {
+                        self.state = .downloading(percent: 0)
+                    }
+                case .downloading(let pct, _, _):
+                    self.state = .downloading(percent: pct)
+                case .ready:
+                    self.state = .ready(info)
+                }
+            },
+            onError: { [weak self] err in
+                guard let self else { return }
+                self.lastError = String(describing: err)
+                self.state = .available(info)
+                self.updater = nil
+            },
+            onReady: { [weak self] in
+                guard let self else { return }
+                self.state = .ready(info)
+                self.updater = nil
+                if autoInstall {
+                    self.performSwap()
+                }
+            }
+        )
+        self.updater = updater
+        updater.start()
     }
 
     // MARK: - Persistence
@@ -194,5 +257,11 @@ final class UpdateController: ObservableObject {
         )
         guard let data = try? JSONEncoder().encode(prefs) else { return }
         try? data.write(to: storeURL, options: [.atomic])
+    }
+}
+
+private extension Bundle {
+    var shortVersionString: String {
+        (infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
     }
 }
