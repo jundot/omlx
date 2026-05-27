@@ -12,7 +12,7 @@
 
 [[runtimes]]
 name = "cpython-3.14"
-python_implementation = "cpython@3.14.5"
+python_implementation = "cpython@3.14.2"
 requirements = []
 platforms = [
     "macosx_arm64",
