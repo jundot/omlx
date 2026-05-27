@@ -101,6 +101,23 @@ commit)。
     settings env var 问题,1 个 `test_boundary_snapshot_store` 是 full-suite
     ordering flake(isolated 通过, 与本批改动无关).
 
+- **2026-05-27 memory_guard_tier 收尾** — 三段 PR 把 C 组 `c645c9f` 重写
+  落地 + 5 个 follow-up 一起带回, 加 10 个独立 upstream 修复:
+  - **PR #5(backend)**:settings/process_memory_enforcer/engine_pool/server/cli
+    全切到 `memory_guard_tier`. 老字段 deprecated alias 一个 release.
+    `ModelTooLargeError.max_memory` -> `.ceiling`. 4511 pass.
+  - **PR #6(admin UI)**:两个 slider -> tier dropdown, 修了 PR-5 之后
+    admin POST 隐性 500. 4510 pass.
+  - **PR #7(5 个 follow-up)**:acd0533/4cfbc8b/3ef7b94/b129a19/64bd2a2.
+    引入 Metal wired-limit clamp + watermark-tier shrink +
+    tier-aware active-memory reclaim + `custom` tier. 4536 pass.
+  - **PR #8(10 个独立修复)**:boundary-store race 修(消掉
+    `test_cleanup_all_drains_queue` flake), per-engine MLX 线程/流,
+    VLM lazy state, profiles 重构. 4567 pass.
+  - **最终 baseline**:4567 pass / 3 known env-override fails / 36 skip
+    (boundary_snapshot flake 由 #1423 修掉, 不再算).
+  - 全部 sync/* PR 已 self-merge 进 main.
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |
@@ -152,6 +169,45 @@ cherry-pick 一律带 `-x`,commit message 里保留 "cherry picked from commit �
 | `31d31be`(=db07311) | `31d31be` | admin: 用绝对路径调 sysctl | 干净 |
 | `ef1e842`(=7d640c1 #1417) | `ef1e842` | vlm: per-image lookup + whole-request fallback | 干净 |
 | `5e394cf`(=1010fd3) | `5e394cf` | admin: 运行时 propagate `model_dirs` 到 OQManager + HFUploader | 干净 |
+
+### 2026-05-27 memory_guard_tier 三段(PR-1 backend / PR-3 admin UI / 5 个 follow-up)
+
+C 组 `c645c9f` 重写终于动手, 用 3 个 PR 分阶段落地(spike doc § 3.4):
+
+| 阶段 | flyto PR | flyto commits | 内容 |
+|---|---|---|---|
+| spike doc | #4 | `0d2ec29` | 设计稿: `docs/memory-guard-tier-migration-spike.md` |
+| PR-1 backend | #5 | `53ed139` `b9fa4a0` `07e46a6` | settings.py / process_memory_enforcer.py / engine_pool.py / server.py / cli.py: 把 `max_*_memory` 换成 `memory_guard_tier`. 老字段 / 老环境变量 / 老 CLI flag 保留 deprecated alias 一个 release. `ModelTooLargeError.max_memory` -> `.ceiling` |
+| PR-3 admin UI | #6 | `f1c3d43` `80d7066` | 两个 slider 换成 tier dropdown; admin POST handler 修复(PR-1 backend 落地后, `routes.py` 写不存在的 `global_settings.model.max_model_memory` 会 500). i18n en/zh/zh-TW 补翻译; 其余 5 个语言先用英文占位 |
+
+### 2026-05-27 C 组 5 个 follow-up(分支 `sync/memory-guard-tier-followups`,PR #7)
+
+| 上游 commit | flyto commit | 内容 | 冲突处理 |
+|---|---|---|---|
+| `acd0533` | `bd9a159` | scheduler: adaptive prefill throttle + (legacy) user-explicit hard cap | settings.py / server.py / process_memory_enforcer.py 取 HEAD —— `user_explicit_max` / `max_process_memory_is_explicit` 已被 c645c9f 删, scheduler.py + 新 helper(`prefill_transient_tracker.py`)是本 commit 的实用部分; test 里 2 个 `user_explicit_max` 测试删 |
+| `4cfbc8b` | `5b3fe20` | scheduler: 切到 watermark-tier shrink | 干净 |
+| `3ef7b94` | `109ac76` | memory: clamp 到 effective Metal cap + sysctl 警告 | enforcer.py 主体 auto-merge; admin UI(routes/i18n/css/js)取 HEAD —— flyto 的 admin UI 是 PR-3 自己的形状, 上游 UI 改不直接适用; 测试取上游(`TestMetalWiredLimit`) |
+| `b129a19`(#1425) | `7033c3b` | test: catch up renames from c645c9f + 沉默 enforcer 警告 | 干净 |
+| `64bd2a2`(#1431) | `bdda9d2` | memory: tier-aware active-memory reclaim + Custom ceiling | settings.py `memory_guard_custom_ceiling_gb` 字段加; `MemoryGuardTier` Literal 加 `"custom"`; validate() 检查 custom > 0 ceiling; admin UI 取 HEAD(Custom 选项暴露留作后续) |
+
+### 2026-05-28 独立修复批(分支 `sync/upstream-2026-05-28`,PR #8)
+
+10 个跟 memory tier 无关的上游修复, 主要是 boundary-store race + 每引擎 stream + VLM 修复.
+
+| 上游 commit | flyto commit | 内容 | 冲突处理 |
+|---|---|---|---|
+| `4f3a9b9`(#1423) | `7b2e849` | boundary-store: serialize cleanup_all + cleanup_request with writer thread | 干净 —— 消掉一直拖着的 `test_cleanup_all_drains_queue` flake |
+| `bc1c427` | `0a65ddc` | boundary-store: drop unreachable shutdown(cleanup=) path | 干净 |
+| `2916ab4`(#1422) | `89f3b99` | cache: 删 dead TieredCacheManager | 干净 |
+| `56860b3`(#1304) | `fc26ab3` | engine: 每引擎线程 + mx.Stream, 消除 cross-engine 流污染 | scheduler.py / batch_generator.py 多处冲突 —— 取上游(`self._stream` 替模块级 `generation_stream`, 三段 phase timer 重构) |
+| `a62f953` | `b7cb489` | engine: 删 redundant `_ensure_wired_limit` guard | 干净(依赖 56860b3) |
+| `e6d8a3f`(#1445) | `c50d64e` | test(mtp): drop monkeypatch of removed `_get_generation_stream` | 干净 |
+| `2e698ff`(#1437) | `f554f19` | scheduler: wait on generation_stream in store-cache worker | scheduler.py 主体 conflict —— 56860b3 已用更通用的 `_safe_sync_stream(self._stream)` 替, 取 HEAD; paged_ssd_cache 的非冲突部分留 |
+| `9d5bed8` | `ebf2c21` | engine: VLM model lazy state 在 loader 线程实例化 | 干净 |
+| `ff7522b` | `414b843` | load: checkpoint 无 mtp.* 权重时跳过 VLM MTPModule attach | 干净 |
+| `0c881f5`(#1399) | `59d9e7e` | profiles: three-scope template contract + drop is_builtin emission | 干净 |
+
+收尾 baseline: 4567 pass / 3 fail / 36 skip(3 fail 都是已知 OMLX_API_KEY env override flake; boundary_snapshot flake 由 #1423 修掉了).
 
 ## 确认已在 flyto(评估时已存在,勿重复引入)
 
