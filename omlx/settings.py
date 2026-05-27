@@ -27,7 +27,7 @@ import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .config import parse_size
 
@@ -140,7 +140,6 @@ class ModelSettings:
 
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
-    max_model_memory: str = "auto"  # "auto" means 80% of RAM
     model_fallback: bool = False  # Use default model when requested model not found
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
@@ -171,29 +170,11 @@ class ModelSettings:
         """
         return self.get_model_dirs(base_path)[0]
 
-    def get_max_model_memory_bytes(self) -> int | None:
-        """
-        Get max model memory in bytes, or None if disabled.
-
-        Returns:
-            Max model memory in bytes (90% of usable RAM if "auto"),
-            or None if disabled (no limit).
-        """
-        value = self.max_model_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return max(1 * 1024**3, int((total - reserve) * 0.9))
-        return parse_size(self.max_model_memory)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
-            "max_model_memory": self.max_model_memory,
             "model_fallback": self.model_fallback,
         }
 
@@ -204,10 +185,18 @@ class ModelSettings:
         # Backward compatibility: migrate old model_dir to model_dirs
         if not model_dirs and data.get("model_dir"):
             model_dirs = [data["model_dir"]]
+        # Deprecated field warning: max_model_memory was removed in favor of
+        # the memory_guard_tier callback-based ceiling in engine_pool.
+        if "max_model_memory" in data:
+            logger.warning(
+                "settings.json field 'model.max_model_memory' is deprecated and "
+                "ignored. engine_pool now sizes its budget from "
+                "memory.memory_guard_tier via a real-time ceiling. Remove the "
+                "field to silence this warning."
+            )
         return cls(
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
-            max_model_memory=data.get("max_model_memory", "auto"),
             model_fallback=data.get("model_fallback", False),
         )
 
@@ -310,65 +299,109 @@ class CacheSettings:
         )
 
 
+MemoryGuardTier = Literal["safe", "balanced", "aggressive"]
+VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive"}
+
+
+def _infer_tier_from_legacy_max_process_memory(value: str) -> str:
+    """Map a legacy max_process_memory string to the nearest memory_guard_tier.
+
+    Compares system_ram - <value> against each tier's static reserve and picks
+    the closest. Used only for deprecated-alias migration; logs the inference
+    so users notice the field is no longer authoritative.
+    """
+    value = value.strip().lower()
+    if value in ("disabled", ""):
+        return "balanced"
+    if value == "auto":
+        return "balanced"
+    total = get_system_memory()
+    try:
+        if value.endswith("%"):
+            percent = int(value.rstrip("%"))
+            target_bytes = int(total * percent / 100)
+        else:
+            target_bytes = parse_size(value)
+    except (ValueError, OSError):
+        return "balanced"
+    implied_reserve = max(0, total - target_bytes)
+    # Tier static reserves (>= 16 GB systems): safe 12GB, balanced 8GB, aggressive 6GB.
+    # Pick the tier whose reserve is closest to the implied one.
+    tiers = {"safe": 12 * 1024**3, "balanced": 8 * 1024**3, "aggressive": 6 * 1024**3}
+    closest = min(tiers.items(), key=lambda kv: abs(kv[1] - implied_reserve))
+    return closest[0]
+
+
 @dataclass
 class MemorySettings:
-    """Process-level memory enforcement settings."""
+    """Process-level memory enforcement settings.
 
-    max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
-    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
-    # Two-stage watermark on max_process_memory. soft triggers admission pause + LRU eviction,
+    Replaces the old ``max_process_memory`` knob with a tier dropdown.
+    ProcessMemoryEnforcer turns the tier into a real-time ceiling via
+    ``min(static_ceiling, dynamic_ceiling)`` — see process_memory_enforcer.py
+    for the algorithm. Old ``max_process_memory`` / ``max_model_memory``
+    fields are read for one release as deprecated aliases (with a warning)
+    and then dropped.
+    """
+
+    prefill_memory_guard: bool = True  # prefill estimation + generation scheduling defer
+    # Tier selects how much system RAM to reserve for OS / other apps.
+    memory_guard_tier: MemoryGuardTier = "balanced"
+    # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
     # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
-
-    def get_max_process_memory_bytes(self) -> int | None:
-        """
-        Get max process memory in bytes, or None if disabled.
-
-        - "auto": system RAM minus 8GB
-        - "disabled": None (no enforcement)
-        - "XX%": percentage of system RAM (10-99%)
-
-        Returns:
-            Max process memory in bytes, or None if disabled.
-        """
-        value = self.max_process_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return total - reserve
-        # Parse percentage like "80%"
-        percent_str = value.rstrip("%")
-        try:
-            percent = int(percent_str)
-        except ValueError:
-            # Try parsing as absolute size (e.g., "32GB")
-            return parse_size(self.max_process_memory)
-        if not 10 <= percent <= 99:
-            raise ValueError(
-                f"max_process_memory must be 10-99%, got {percent}%"
-            )
-        return int(get_system_memory() * percent / 100)
+    # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio
+    # the next chunk is sized so its predicted transient stays under the cap.
+    # If even prefill_min_chunk_tokens would exceed the cap, the request is
+    # aborted via the same cleanup path the hard-limit RuntimeError uses.
+    prefill_safe_zone_ratio: float = 0.80
+    prefill_min_chunk_tokens: int = 32
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "max_process_memory": self.max_process_memory,
             "prefill_memory_guard": self.prefill_memory_guard,
+            "memory_guard_tier": self.memory_guard_tier,
             "soft_threshold": self.soft_threshold,
             "hard_threshold": self.hard_threshold,
+            "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
+            "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
-        """Create from dictionary."""
+        """Create from dictionary.
+
+        Supports two deprecated aliases for one release:
+        - ``max_process_memory`` (string): inferred to the nearest tier + warn.
+        - ``max_model_memory`` (string): ignored + warn (engine_pool's new
+          callback-based ceiling covers this need).
+        """
+        tier_raw = data.get("memory_guard_tier")
+        if tier_raw is None and "max_process_memory" in data:
+            legacy = str(data["max_process_memory"])
+            tier_raw = _infer_tier_from_legacy_max_process_memory(legacy)
+            logger.warning(
+                "settings.json field 'memory.max_process_memory=%r' is "
+                "deprecated. Inferred memory_guard_tier=%r. Replace with "
+                "'memory_guard_tier' to silence this warning.",
+                legacy, tier_raw,
+            )
+        tier = str(tier_raw or "balanced").lower()
+        if tier not in VALID_MEMORY_GUARD_TIERS:
+            tier = "balanced"
         return cls(
-            max_process_memory=data.get("max_process_memory", "auto"),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+            memory_guard_tier=tier,  # type: ignore[arg-type]
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
+            prefill_safe_zone_ratio=float(
+                data.get("prefill_safe_zone_ratio", 0.80)
+            ),
+            prefill_min_chunk_tokens=int(
+                data.get("prefill_min_chunk_tokens", 32)
+            ),
         )
 
 
@@ -832,12 +865,33 @@ class GlobalSettings:
             dirs = [d.strip() for d in model_dir.split(",") if d.strip()]
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
-        if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
-            self.model.max_model_memory = max_model_memory
+        if os.getenv("OMLX_MAX_MODEL_MEMORY"):
+            logger.warning(
+                "OMLX_MAX_MODEL_MEMORY is deprecated and ignored. engine_pool "
+                "now sizes its budget from OMLX_MEMORY_GUARD_TIER via a "
+                "real-time ceiling. Unset this env var to silence the warning."
+            )
 
         # Memory enforcement settings
-        if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
-            self.memory.max_process_memory = max_process_memory
+        if tier := os.getenv("OMLX_MEMORY_GUARD_TIER"):
+            tier_lower = tier.strip().lower()
+            if tier_lower in VALID_MEMORY_GUARD_TIERS:
+                self.memory.memory_guard_tier = tier_lower  # type: ignore[assignment]
+            else:
+                logger.warning(
+                    "Ignoring OMLX_MEMORY_GUARD_TIER=%r, must be one of %s.",
+                    tier, sorted(VALID_MEMORY_GUARD_TIERS),
+                )
+        if legacy := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
+            inferred = _infer_tier_from_legacy_max_process_memory(legacy)
+            logger.warning(
+                "OMLX_MAX_PROCESS_MEMORY=%r is deprecated. Inferred "
+                "memory_guard_tier=%r. Set OMLX_MEMORY_GUARD_TIER to silence.",
+                legacy, inferred,
+            )
+            # Only apply if OMLX_MEMORY_GUARD_TIER was not set explicitly.
+            if not os.getenv("OMLX_MEMORY_GUARD_TIER"):
+                self.memory.memory_guard_tier = inferred  # type: ignore[assignment]
 
         # Scheduler settings
         max_concurrent = os.getenv("OMLX_MAX_CONCURRENT_REQUESTS") or os.getenv(
@@ -926,14 +980,38 @@ class GlobalSettings:
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
         if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
-            self.model.max_model_memory = args.max_model_memory
+            logger.warning(
+                "--max-model-memory is deprecated and ignored. engine_pool now "
+                "sizes its budget from --memory-guard-tier via a real-time "
+                "ceiling. Drop the flag to silence this warning."
+            )
 
         # Memory enforcement settings
         if (
+            hasattr(args, "memory_guard_tier")
+            and args.memory_guard_tier is not None
+        ):
+            tier_lower = str(args.memory_guard_tier).strip().lower()
+            if tier_lower in VALID_MEMORY_GUARD_TIERS:
+                self.memory.memory_guard_tier = tier_lower  # type: ignore[assignment]
+            else:
+                logger.warning(
+                    "Ignoring --memory-guard-tier=%r, must be one of %s.",
+                    args.memory_guard_tier, sorted(VALID_MEMORY_GUARD_TIERS),
+                )
+        elif (
             hasattr(args, "max_process_memory")
             and args.max_process_memory is not None
         ):
-            self.memory.max_process_memory = args.max_process_memory
+            inferred = _infer_tier_from_legacy_max_process_memory(
+                args.max_process_memory
+            )
+            logger.warning(
+                "--max-process-memory=%r is deprecated. Inferred "
+                "memory_guard_tier=%r. Use --memory-guard-tier instead.",
+                args.max_process_memory, inferred,
+            )
+            self.memory.memory_guard_tier = inferred  # type: ignore[assignment]
 
         # Scheduler settings
         if (
@@ -1080,33 +1158,26 @@ class GlobalSettings:
                 f"(must be one of {valid_keepalive_modes})"
             )
 
-        # Model validation
-        if self.model.max_model_memory.lower() not in ("auto", "disabled"):
-            try:
-                size = parse_size(self.model.max_model_memory)
-                if size <= 0:
-                    errors.append("max_model_memory must be positive")
-            except ValueError as e:
-                errors.append(f"Invalid max_model_memory: {e}")
-
         # Memory enforcement validation
-        mem_val = self.memory.max_process_memory.strip().lower()
-        if mem_val not in ("auto", "disabled"):
-            percent_str = mem_val.rstrip("%")
-            try:
-                percent = int(percent_str)
-                if not 10 <= percent <= 99:
-                    errors.append(
-                        f"max_process_memory must be 10-99%, got {percent}%"
-                    )
-            except ValueError:
-                # Could be absolute size, try parsing
-                try:
-                    size = parse_size(self.memory.max_process_memory)
-                    if size <= 0:
-                        errors.append("max_process_memory must be positive")
-                except ValueError as e:
-                    errors.append(f"Invalid max_process_memory: {e}")
+        if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
+            errors.append(
+                f"Invalid memory_guard_tier: {self.memory.memory_guard_tier!r} "
+                f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
+            )
+        if not 0.0 < self.memory.soft_threshold <= 1.0:
+            errors.append(
+                f"soft_threshold must be in (0.0, 1.0], got "
+                f"{self.memory.soft_threshold}"
+            )
+        if not 0.0 < self.memory.hard_threshold <= 1.0:
+            errors.append(
+                f"hard_threshold must be in (0.0, 1.0], got "
+                f"{self.memory.hard_threshold}"
+            )
+        if self.memory.soft_threshold > self.memory.hard_threshold:
+            errors.append(
+                "soft_threshold must be <= hard_threshold"
+            )
 
         # Scheduler validation
         if self.scheduler.max_concurrent_requests <= 0:
