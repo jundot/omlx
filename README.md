@@ -14,9 +14,23 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
+  <a href="https://github.com/jundot/omlx/releases">
+  </a>
+  <a>
+    <img src="https://img.shields.io/github/v/release/jundot/omlx?include_prereleases&style=for-the-badge" alt="GitHub Release">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License">
+  </a>
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white&style=for-the-badge" alt="Python 3.10+">
+  </a>
+  <a href="https://www.apple.com/apple-silicon/">
+    <img src="https://img.shields.io/badge/Apple%20Silicon-M1--M5-black?logo=apple&style=for-the-badge" alt="Apple Silicon M1-M5">
+  </a>
+  <a href="https://github.com/jundot/omlx/stargazers">
+    <img src="https://img.shields.io/github/stars/jundot/omlx?style=for-the-badge" alt="GitHub Stars">
+  </a>
 </p>
 
 <p align="center">
@@ -360,9 +374,28 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - Performance optimizations
 - Documentation improvements
 
-## License
+## Star History
 
-[Apache 2.0](LICENSE)
+<a href="https://www.star-history.com/?type=date&repos=jundot%2Fomlx">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=jundot/omlx&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=jundot/omlx&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=jundot/omlx&type=date&legend=top-left" />
+ </picture>
+</a>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=jundot/omlx&style=landscape1&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=jundot/omlx&style=landscape1" />
+  <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=jundot/omlx&style=landscape1" />
+</picture>
+
+## Community
+
+- [GitHub Discussions](https://github.com/jundot/omlx/discussions)
+- [GitHub Issues](https://github.com/jundot/omlx/issues)
+- [Contributing Guide](docs/CONTRIBUTING.md)
+- [Security Policy](SECURITY.md)
 
 ## Acknowledgments
 
@@ -372,3 +405,7 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
+
+## License
+
+[Apache 2.0](LICENSE)
