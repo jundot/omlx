@@ -52,7 +52,6 @@ from .vision_feature_cache import (
 )
 
 # Managers
-from .tiered_manager import TieredCacheManager
 from .recovery import CacheRecoveryManager
 
 # Factory
@@ -109,7 +108,6 @@ __all__ = [
     "VisionFeatureSSDCache",
     "VisionFeatureSSDEntry",
     # Managers
-    "TieredCacheManager",
     "CacheRecoveryManager",
     # Factory
     "CacheConfig",
