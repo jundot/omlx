@@ -21,81 +21,12 @@ platforms = [
 [[frameworks]]
 name = "mlx-framework"
 runtime = "cpython-3.11"
-# Hand-curated for flyto fork (NOT generated). Upstream switched to
-# build.py-generated requirements via _generate_venvstacks_toml(); flyto
-# diverges here because we git-pin dflash-mlx, mlx-vlm, mlx-lm and ship
-# the audio extras inline. Migrating to the generation script is a
-# separate Swift-app-build task -- this file is harmless until anyone
-# tries to actually build the .app bundle from this repo.
-requirements = [
-    # Core MLX
-    "mlx==0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
-    # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
-    "regex",
-    # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    # Server dependencies
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
-    # Tokenizers and transformers (aligned with pyproject.toml)
-    # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
-    "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
-    # Other dependencies
-    "numpy>=1.24.0",
-    "tqdm>=4.66.0",
-    "pyyaml>=6.0",
-    "itsdangerous>=2.0",
-    "jinja2>=3.0",
-    "sentencepiece",
-    "tiktoken",
-    "protobuf",
-    "requests>=2.28.0",
-    # SOCKS proxy support (used by httpx via huggingface-hub)
-    "socksio>=1.0.0",
-    "psutil>=5.9.0",
-    "jsonschema>=4.0.0",
-    "tabulate>=0.9.0",
-    # MCP support
-    "mcp>=1.0.0",
-    # Harmony format parser for gpt-oss models
-    "openai-harmony",
-    # mlx-vlm from commit (f96138e) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
-    # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
-    "Pillow>=9.0.0",
-    # ModelScope SDK for downloading models from ModelScope Hub
-    "modelscope>=1.10.0",
-    # python-multipart needed by audio routes (File/Form uploads)
-    "python-multipart>=0.0.5",
-    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
-    "scipy>=1.11.0",
-    "librosa>=0.10.0",
-    "miniaudio>=1.59",
-    "numba>=0.59.0",
-    "pyloudnorm>=0.1.0",
-    "sounddevice>=0.4.6",
-    # mlx-audio [tts] extra deps
-    "misaki>=0.9.4",
-    "num2words>=0.5.14",
-    "spacy>=3.8.4",
-    "phonemizer-fork>=3.3.2",
-    "espeakng-loader>=0.2.4",
-    # mlx-audio [stt] extra deps
-    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
-    # which only exists in mistral-common>=1.10. Without this floor, the
-    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
-    # fails (#1072, #1116).
-    "mistral-common[audio]>=1.10",
-    # mlx-audio [sts] extra deps
-    "webrtcvad>=2.0.10",
-    # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
-    # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm (v0.31.3)
-]
+# Populated by build.py:_generate_venvstacks_toml() from
+# pyproject.toml's [project] dependencies + [project.optional-dependencies] bundle
+# (see _LAYER_REQUIREMENTS_SOURCES["mlx-framework"] = ["project", "bundle"]).
+# Do NOT hand-edit — edit pyproject.toml instead. The merged result lands
+# in packaging/_venvstacks_resolved.toml at build time.
+requirements = []
 platforms = [
     "macosx_arm64",
 ]
