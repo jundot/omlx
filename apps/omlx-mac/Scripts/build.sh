@@ -40,6 +40,8 @@
 #
 # Env overrides:
 #   OMLX_DONOR_APP=/path/to/oMLX.app    # explicit donor (bypasses venvstacks)
+#   OMLX_EXPORT_DIR=/path/to/_export    # override the venvstacks export tree
+#                                       (release builds set this per macOS target)
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
 #   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
 #                                       (default: PATH lookup of python3)
@@ -69,7 +71,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
-LOCAL_EXPORT="$PACKAGING_DIR/_export"
+# OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
+# layers from. Release builds use this to point at a per-target export
+# copy with platform-specific mlx-metal wheels swapped in.
+LOCAL_EXPORT="${OMLX_EXPORT_DIR:-$PACKAGING_DIR/_export}"
 
 # OMLX_DONOR_APP is "explicit" only when the user set it; the default
 # (/Applications/oMLX.app) is treated as a fallback, not an override.
