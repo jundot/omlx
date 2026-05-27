@@ -2176,7 +2176,13 @@ async def create_chat_completion(
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    # Engines that aren't VLMBatchedEngine but expose a multimodal fallback
+    # (DFlashEngine's embedded VLM under Path A) still need image_url parts
+    # preserved so the fallback can process them. See dflash.chat for the
+    # corresponding routing decision.
+    is_vlm = isinstance(engine, VLMBatchedEngine) or getattr(
+        engine, "supports_multimodal_fallback", False
+    )
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
@@ -3648,7 +3654,11 @@ async def create_anthropic_message(
 
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
-    is_vlm = isinstance(engine, VLMBatchedEngine)
+    # See OpenAI path comment: dflash + embedded VLM also wants image_url
+    # parts preserved so the embedded engine can process them.
+    is_vlm = isinstance(engine, VLMBatchedEngine) or getattr(
+        engine, "supports_multimodal_fallback", False
+    )
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":

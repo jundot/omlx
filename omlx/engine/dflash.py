@@ -199,6 +199,39 @@ class DFlashEngine(BaseEngine):
     def model_type(self) -> str | None:
         return self._model_type_str
 
+    @property
+    def supports_multimodal_fallback(self) -> bool:
+        """True when the embedded fallback engine can process images / audio.
+
+        Path A always brings up an embedded BatchedEngine or VLMBatchedEngine;
+        the VLM variant accepts multimodal content parts. server.py reads this
+        to decide whether to preserve image_url parts when extracting the
+        request body (instead of relying on isinstance(engine, VLMBatchedEngine),
+        which is False for DFlashEngine).
+        """
+        if self._embedded_vlm is None:
+            return False
+        from .vlm import VLMBatchedEngine
+        return isinstance(self._embedded_vlm, VLMBatchedEngine)
+
+    @staticmethod
+    def _has_multimodal_content(messages: list[dict[str, Any]]) -> bool:
+        """Detect whether any message carries image / audio content parts.
+
+        Looks for the structured content-array shape that OpenAI / Anthropic
+        use for multimodal requests (`content: [{type: "image_url", ...}, ...]`).
+        Plain-string content is text-only by definition.
+        """
+        image_types = {"image", "image_url", "input_image", "audio", "input_audio"}
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in image_types:
+                    return True
+        return False
+
     @staticmethod
     def _resolve_fallback_engine_type(requested: str, model_name: str) -> str:
         """Resolve fallback_engine_type='auto' by inspecting model config.
@@ -1214,6 +1247,21 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Multimodal requests go to the embedded VLM directly. dflash's
+        # text-only path runs _apply_chat_template (mlx_lm flavor, no image
+        # placeholder injection), so feeding it image_url parts would either
+        # silently drop the image or break the template. The embedded engine
+        # already owns the same target weights, so the VLM pipeline is free
+        # to use here. See docs/upstream-sync.md for the design note on
+        # upstream #1344's lazy fallback vs. Path A's permanent embedded engine.
+        if self.supports_multimodal_fallback and self._has_multimodal_content(messages):
+            return await self._embedded_vlm.chat(
+                messages=messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
@@ -1244,6 +1292,16 @@ class DFlashEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+
+        if self.supports_multimodal_fallback and self._has_multimodal_content(messages):
+            async for output in self._embedded_vlm.stream_chat(
+                messages=messages, max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty, tools=tools, **kwargs,
+            ):
+                yield output
+            return
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
