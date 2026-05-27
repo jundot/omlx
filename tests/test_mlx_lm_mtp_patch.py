@@ -645,6 +645,41 @@ class TestBatchGeneratorDispatch:
         # Nothing streamed yet -> cannot re-prefill; signal plain-drop fallback.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
 
+    def test_reconcile_skips_when_token_count_exceeds_safety_limit(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _RECONCILE_MAX_TOKENS
+
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch,
+            uid=7,
+            tokens=list(range(_RECONCILE_MAX_TOKENS + 1)),
+            queue_entries=[],
+        )
+        old_cache = batch.prompt_cache
+        backbone_called = []
+        real_backbone = bg._call_backbone
+        monkeypatch.setattr(
+            bg,
+            "_call_backbone",
+            lambda *a, **kw: backbone_called.append(1) or real_backbone(*a, **kw),
+        )
+
+        assert bg._reconcile_mtp_to_standard(batch, state) is False
+        assert batch.prompt_cache is old_cache
+        assert not backbone_called, "backbone should not be called for long sequences"
+
+    def test_reconcile_proceeds_at_safety_limit(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _RECONCILE_MAX_TOKENS
+
+        bg, batch, state = self._make_reconcile_batch(
+            monkeypatch,
+            uid=7,
+            tokens=list(range(_RECONCILE_MAX_TOKENS)),
+            queue_entries=[],
+        )
+
+        assert bg._reconcile_mtp_to_standard(batch, state) is True
+        assert batch.prompt_cache[0].offset == _RECONCILE_MAX_TOKENS
+
     def test_reconcile_fallback_on_rebuild_failure(self, monkeypatch):
         import mlx.core as mx
 

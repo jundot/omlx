@@ -77,6 +77,8 @@ from typing import Any, Deque, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+_RECONCILE_MAX_TOKENS = 16384
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -481,6 +483,16 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
 
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
+        return False
+    n_tokens = len(tokens)
+    if n_tokens > _RECONCILE_MAX_TOKENS:
+        logger.warning(
+            "MTP reconcile skipped: token count %d exceeds safety limit %d "
+            "(uid=%s). Falling back to plain drop to avoid unbounded re-prefill.",
+            n_tokens,
+            _RECONCILE_MAX_TOKENS,
+            getattr(state, "uid", "?"),
+        )
         return False
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
