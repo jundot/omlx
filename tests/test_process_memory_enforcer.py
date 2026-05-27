@@ -898,6 +898,74 @@ class TestMemoryLimitPropagation:
             assert scheduler._memory_limit_bytes == 10 * 1024**3
 
 
+class TestUnresolvableSchedulerWarning:
+    """``_propagate_memory_limit`` must complain when a wrapper-chain
+    change makes the scheduler unreachable via ``_resolve_scheduler``.
+
+    Silent no-op was the failure mode that originally hid the
+    dead-memory-guard bug for months — surfacing it as a per-engine-type
+    rate-limited warning closes that gap without spamming logs at
+    request rate.
+    """
+
+    def test_warns_once_per_engine_type(self, enforcer, caplog):
+        """Three propagation calls with an unreachable scheduler emit
+        exactly one WARNING (not three)."""
+        # Engine wrapper with no resolvable scheduler chain: spec=[]
+        # blocks both ``.scheduler`` and ``._engine`` lookups so
+        # ``_resolve_scheduler`` returns None.
+        engine = MagicMock(spec=[])
+        entry = _make_entry("model-broken", engine=engine)
+        enforcer._engine_pool._entries = {"model-broken": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f"Expected exactly one warning per engine type per lifetime, "
+            f"got {len(warnings)}"
+        )
+
+    def test_unresolvable_does_not_block_other_engines(self, enforcer):
+        """If engine A is unresolvable but engine B has a real scheduler,
+        B must still receive the propagation."""
+        # A: unresolvable (no .scheduler / no ._engine).
+        engine_a = MagicMock(spec=[])
+        entry_a = _make_entry("model-a", engine=engine_a)
+
+        # B: real scheduler chain.
+        scheduler_b = MagicMock(spec=[])
+        scheduler_b._memory_limit_bytes = 0
+        scheduler_b._memory_hard_limit_bytes = 0
+        scheduler_b._prefill_memory_guard = False
+        scheduler_b._admission_paused = False
+        scheduler_b._prefill_safe_zone_ratio = 0.0
+        scheduler_b._prefill_min_chunk_tokens = 0
+        scheduler_b.batch_generator = None
+        engine_b = MagicMock(spec=[])
+        engine_b.scheduler = scheduler_b
+        entry_b = _make_entry("model-b", engine=engine_b)
+
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+
+        enforcer._propagate_memory_limit()
+
+        # B got it; A's resolve-failure didn't poison the loop.
+        assert scheduler_b._memory_limit_bytes == 10 * 1024**3
+        assert scheduler_b._prefill_memory_guard is True
+
+
 class TestStoreCacheCapWalk:
     """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""
 
