@@ -186,16 +186,29 @@ def maybe_apply_pre_load_patches(
                 from ..patches.mlx_vlm_mtp import (
                     apply_mlx_vlm_mtp_patch,
                     apply_mlx_vlm_mtp_runtime_patch,
+                    set_mtp_attach_enabled,
                 )
             except Exception:
                 pass
             else:
-                # Sanitize-preservation patch MUST run too: the stock
-                # mlx-vlm Model.sanitize strips every ``mtp.*`` key, so
-                # without this the MTPModule loads at random init (0%
-                # accept). Previously only wired into the oQ path; needed
-                # on the inference load path as well for VLM checkpoints
-                # that ship MTP heads (e.g. PARO + injected guru87 head).
+                # Decide attach-vs-skip BEFORE applying the runtime patch
+                # because the patch wraps ``LanguageModel.__init__`` which
+                # reads the flag at instantiation. Some Qwen3.6 MoE VLM
+                # exports (unsloth UD MLX builds, issue #1426) declare
+                # ``mtp_num_hidden_layers > 0`` in config.json but ship no
+                # ``mtp.*`` weights; attaching MTPModule there causes
+                # strict load_weights to fail with "Missing N parameters"
+                # and silently downgrade the engine to LLM, dropping
+                # vision. Scan the index for actual mtp.* keys and skip
+                # attachment when they're absent.
+                has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+                set_mtp_attach_enabled(has_mtp_weights)
+
+                # Sanitize-preservation patch runs unconditionally: the
+                # stock mlx-vlm Model.sanitize strips every ``mtp.*`` key,
+                # so without this an MTP head with persisted weights would
+                # load at random init (0% accept). When mtp.* weights are
+                # absent the patch is a no-op on the affected paths.
                 if apply_mlx_vlm_mtp_patch():
                     if mtp_enabled:
                         logger.info(
@@ -210,7 +223,15 @@ def maybe_apply_pre_load_patches(
                             model_name,
                         )
                 if apply_mlx_vlm_mtp_runtime_patch():
-                    if mtp_enabled:
+                    if not has_mtp_weights:
+                        logger.info(
+                            "mlx-vlm runtime MTP patch applied for %s "
+                            "(config declares mtp heads but checkpoint "
+                            "ships no mtp.* weights; MTPModule attachment "
+                            "skipped to keep strict load_weights happy)",
+                            model_name,
+                        )
+                    elif mtp_enabled:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s",
                             model_name,
@@ -291,6 +312,63 @@ def _has_mtp_heads(config: dict) -> bool:
         return True
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
+    return False
+
+
+_MTP_WEIGHT_PREFIXES = (
+    "mtp.",
+    "language_model.mtp.",
+    "model.mtp.",
+    "model.language_model.mtp.",
+)
+
+
+def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
+    """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
+
+    Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
+    ``config.json`` but strip the MTP weights during conversion (e.g.
+    ``unsloth/Qwen3.6-35B-A3B-UD-MLX-*bit``). Attaching ``MTPModule`` for
+    such a checkpoint causes mlx-vlm's strict ``load_weights`` to fail with
+    "Missing N parameters: language_model.mtp.*", the engine falls back to
+    LLM, and vision is silently dropped (issue #1426).
+
+    Reads ``model.safetensors.index.json`` when present (no shard I/O).
+    Falls back to the first safetensors shard's metadata header. Returns
+    False when neither resolves — callers treat that as "no MTP weights"
+    (the conservative choice: skip MTPModule attachment).
+    """
+    p = Path(model_path)
+    if not p.is_dir():
+        return False
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            return any(
+                k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map
+            )
+        except Exception as e:
+            logger.debug(
+                "Failed to read %s for mtp weight scan: %s", index_path, e
+            )
+
+    shards = sorted(p.glob("*.safetensors"))
+    if not shards:
+        return False
+    try:
+        import safetensors
+
+        with safetensors.safe_open(str(shards[0]), framework="numpy") as f:
+            for k in f.keys():
+                if k.startswith(_MTP_WEIGHT_PREFIXES):
+                    return True
+    except Exception as e:
+        logger.debug(
+            "Failed to read %s header for mtp weight scan: %s", shards[0], e
+        )
     return False
 
 
