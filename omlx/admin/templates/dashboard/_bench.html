@@ -52,6 +52,33 @@
                         <p class="text-sm text-neutral-500 mt-2">{{ t('bench.description') }}</p>
                     </div>
 
+                    <!-- "Another bench is running" banner. Shown when the
+                         server reports a running run that this tab isn't
+                         attached to (e.g. another tab started one while this
+                         one was viewing a previous result). Lets the user
+                         keep their previous result on screen until they
+                         explicitly choose to view the new run. -->
+                    <div x-show="benchOtherActive" x-cloak
+                         class="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 mb-6 flex items-center justify-between gap-4">
+                        <div class="flex items-center gap-3">
+                            <i data-lucide="info" class="w-5 h-5 text-amber-600 flex-shrink-0"></i>
+                            <div class="text-sm text-amber-900">
+                                Another throughput benchmark is running on
+                                <span class="font-medium" x-text="benchOtherActive?.model_id"></span>.
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <button @click="acceptOtherBench()"
+                                    class="px-3 py-1.5 bg-amber-600 text-white text-xs font-medium rounded-lg hover:bg-amber-700 transition-all">
+                                View live
+                            </button>
+                            <button @click="dismissOtherBench()"
+                                    class="px-3 py-1.5 text-amber-700 text-xs font-medium hover:text-amber-900 transition-all">
+                                Dismiss
+                            </button>
+                        </div>
+                    </div>
+
                     <!-- Configuration Card -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -113,7 +140,8 @@
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
                                         @click="startBenchmark()"
-                                        :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v)"
+                                        :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
+                                        :title="benchOtherActive ? 'Another throughput benchmark is already running in this server.' : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('bench.config.run_button') }}
