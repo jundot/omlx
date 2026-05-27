@@ -73,9 +73,9 @@
 		9BB000000000000000000003 /* HFUploadDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000003 /* HFUploadDTO.swift */; };
 		9BB000000000000000000004 /* BenchDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000004 /* BenchDTO.swift */; };
 		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
-		BBB000000000000000000001 /* SparkleUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000001 /* SparkleUpdater.swift */; };
 		BBB000000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000002 /* Localizable.xcstrings */; };
-		BBB000000000000000000003 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = BDD000000000000000000001 /* Sparkle */; };
+		BBB000000000000000000004 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000003 /* AppUpdater.swift */; };
+		BBB000000000000000000005 /* ReleasesChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000004 /* ReleasesChecker.swift */; };
 		DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000001 /* AppServicesPathTests.swift */; };
 		DBB000000000000000000002 /* AppConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* AppConfigTests.swift */; };
 		DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */; };
@@ -173,8 +173,9 @@
 		9CC000000000000000000003 /* HFUploadDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFUploadDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000004 /* BenchDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTO.swift; sourceTree = "<group>"; };
 		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
-		BCC000000000000000000001 /* SparkleUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SparkleUpdater.swift; sourceTree = "<group>"; };
 		BCC000000000000000000002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		BCC000000000000000000003 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
+		BCC000000000000000000004 /* ReleasesChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesChecker.swift; sourceTree = "<group>"; };
 		DCC000000000000000000001 /* AppServicesPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServicesPathTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000002 /* AppConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfigTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVMStorageDiffTests.swift; sourceTree = "<group>"; };
@@ -198,7 +199,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				BBB000000000000000000003 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -322,7 +322,8 @@
 			isa = PBXGroup;
 			children = (
 				7CC000000000000000000008 /* UpdateController.swift */,
-				BCC000000000000000000001 /* SparkleUpdater.swift */,
+				BCC000000000000000000003 /* AppUpdater.swift */,
+				BCC000000000000000000004 /* ReleasesChecker.swift */,
 			);
 			path = Updater;
 			sourceTree = "<group>";
@@ -458,7 +459,6 @@
 			);
 			name = "oMLX";
 			packageProductDependencies = (
-				BDD000000000000000000001 /* Sparkle */,
 			);
 			productName = "oMLX";
 			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */;
@@ -510,7 +510,6 @@
 			);
 			mainGroup = 1BBBBBBBBBBBBBBBBBBBBBB1;
 			packageReferences = (
-				BEE000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			productRefGroup = 1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */;
 			projectDirPath = "";
@@ -521,25 +520,6 @@
 			);
 		};
 /* End PBXProject section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		BEE000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.6.0;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		BDD000000000000000000001 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = BEE000000000000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
-/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXResourcesBuildPhase section */
 		1EEEEEEEEEEEEEEEEEEEEEE3 /* Resources */ = {
@@ -623,7 +603,8 @@
 				9BB000000000000000000003 /* HFUploadDTO.swift in Sources */,
 				9BB000000000000000000004 /* BenchDTO.swift in Sources */,
 				ABB000000000000000000001 /* WelcomeWindow.swift in Sources */,
-				BBB000000000000000000001 /* SparkleUpdater.swift in Sources */,
+				BBB000000000000000000004 /* AppUpdater.swift in Sources */,
+				BBB000000000000000000005 /* ReleasesChecker.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
