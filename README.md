@@ -335,22 +335,20 @@ pytest -m "not slow"
 
 ### macOS App
 
-Requires Python 3.11+ and [venvstacks](https://venvstacks.lmstudio.ai). venvstacks is declared as a dev dependency, so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version into your environment. `build.py` also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
+The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
-cd packaging
+# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
+apps/omlx-mac/Scripts/build.sh release
 
-# Full build (venvstacks + app bundle + DMG)
-python build.py
+# Result lands at apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# Skip venvstacks (code changes only)
-python build.py --skip-venv
-
-# DMG only
-python build.py --dmg-only
+# Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-See [packaging/README.md](packaging/README.md) for details on the app bundle structure and layer configuration.
+First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
 
 ## Contributing
 
