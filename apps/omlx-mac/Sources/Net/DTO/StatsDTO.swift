@@ -50,14 +50,21 @@ struct StatsDTO: Codable, Equatable, Sendable {
     }
 
     /// Mirrors `_build_runtime_cache_observability` in `omlx/admin/routes.py`.
-    /// Only the totals are surfaced today — per-model breakdown is left off
-    /// the wire to keep the DTO small until a UI consumes it.
+    /// SSD totals + hot-cache (memory tier) totals are both surfaced so
+    /// StatusScreen can show the same two-tier picture the HTML dashboard
+    /// does.
     struct RuntimeCacheDTO: Codable, Equatable, Sendable {
         let basePath: String?
         let ssdCacheDir: String?
         let totalNumFiles: Int
         let totalSizeBytes: Int64
         let effectiveBlockSizes: [Int]?
+        /// Memory-tier (`hot_cache_*`) totals. `hot_cache_max_bytes == 0`
+        /// signals that the memory tier is disabled — the UI hides those
+        /// rows in that case to match the HTML behaviour.
+        let hotCacheMaxBytes: Int64?
+        let hotCacheSizeBytes: Int64?
+        let hotCacheEntries: Int?
     }
 }
 
@@ -66,4 +73,11 @@ struct StatsDTO: Codable, Equatable, Sendable {
 struct ClearSsdCacheResponse: Codable, Sendable {
     let status: String?
     let totalDeleted: Int
+}
+
+/// Response from `POST /admin/api/hot-cache/clear`. Mirrors the SSD-clear
+/// shape so callers can treat both clear endpoints uniformly.
+struct ClearHotCacheResponse: Codable, Sendable {
+    let status: String?
+    let totalCleared: Int?
 }

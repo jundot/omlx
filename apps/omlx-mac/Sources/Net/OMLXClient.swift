@@ -109,6 +109,11 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.ssdCacheClear)
     }
 
+    @discardableResult
+    func clearHotCache() async throws -> ClearHotCacheResponse {
+        try await postEmpty(AdminAPI.hotCacheClear)
+    }
+
     func getLogs(lines: Int = 200, file: String? = nil) async throws -> LogsDTO {
         var q = [URLQueryItem(name: "lines", value: String(lines))]
         if let file, !file.isEmpty {
