@@ -339,6 +339,7 @@ async def lifespan(app: FastAPI):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=_server_state.engine_pool,
             memory_guard_tier=memory_settings.memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_settings.memory_guard_custom_ceiling_gb,
             settings_manager=_server_state.settings_manager,
             prefill_memory_guard=memory_settings.prefill_memory_guard,
             global_settings=_server_state.global_settings,

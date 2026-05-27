@@ -210,7 +210,8 @@ class GlobalSettingsRequest(BaseModel):
 
     # Memory enforcement
     memory_prefill_memory_guard: bool | None = None
-    memory_guard_tier: str | None = None  # "safe" / "balanced" / "aggressive"
+    memory_guard_tier: str | None = None  # "safe" / "balanced" / "aggressive" / "custom"
+    memory_guard_custom_ceiling_gb: float | None = None  # only used when tier == "custom"
 
     # Scheduler settings
     max_concurrent_requests: int | None = None
@@ -645,13 +646,16 @@ async def _reload_models() -> tuple[bool, str]:
 
 
 async def _apply_memory_guard_tier_runtime(
-    tier: str,
+    tier: str | None = None,
+    custom_ceiling_gb: float | None = None,
 ) -> tuple[bool, str]:
     """
-    Apply memory_guard_tier change at runtime.
+    Apply memory_guard_tier (and optionally custom ceiling) at runtime.
 
-    Pushes the new tier into the running ProcessMemoryEnforcer, which
+    Pushes both values into the running ProcessMemoryEnforcer, which
     recomputes static + dynamic ceilings on its next propagation tick.
+    `tier` and `custom_ceiling_gb` can be passed together (Custom tier
+    save) or independently.
 
     Returns:
         Tuple of (success, message)
@@ -659,20 +663,28 @@ async def _apply_memory_guard_tier_runtime(
     from ..server import _server_state
     from ..settings import VALID_MEMORY_GUARD_TIERS
 
-    value = (tier or "").strip().lower()
-    if value not in VALID_MEMORY_GUARD_TIERS:
-        return False, (
-            f"Invalid memory_guard_tier: '{tier}' "
-            f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
-        )
-
     enforcer = _server_state.process_memory_enforcer
     if enforcer is None:
         return False, "Process memory enforcer not initialized"
 
-    old = enforcer.memory_guard_tier
-    enforcer.memory_guard_tier = value
-    return True, f"Memory guard tier: {old} -> {value}"
+    changes = []
+    if tier is not None:
+        value = tier.strip().lower()
+        if value not in VALID_MEMORY_GUARD_TIERS:
+            return False, (
+                f"Invalid memory_guard_tier: '{tier}' "
+                f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
+            )
+        old_tier = enforcer.memory_guard_tier
+        enforcer.memory_guard_tier = value
+        changes.append(f"tier: {old_tier} -> {value}")
+    if custom_ceiling_gb is not None:
+        new_bytes = max(0, int(float(custom_ceiling_gb) * 1024**3))
+        enforcer.memory_guard_custom_ceiling_bytes = new_bytes
+        changes.append(f"custom_ceiling: {custom_ceiling_gb} GB")
+    if not changes:
+        return True, "(no change)"
+    return True, "Memory guard updated — " + ", ".join(changes)
 
 
 async def _apply_cache_settings_runtime(
@@ -1077,6 +1089,23 @@ def get_system_memory_info() -> dict:
     except Exception:
         pass
 
+    # Live macOS vm_stat layers so the admin dashboard can preview the
+    # tier-aware ceiling (free + inactive + active * ratio). Zero on
+    # non-macOS / call failure — JS falls back to available_bytes.
+    free_memory_bytes = 0
+    inactive_memory_bytes = 0
+    active_memory_bytes = 0
+    try:
+        from ..process_memory_enforcer import get_macos_vm_stats
+
+        vm = get_macos_vm_stats()
+        if vm is not None:
+            free_memory_bytes = int(vm.get("free", 0))
+            inactive_memory_bytes = int(vm.get("inactive", 0))
+            active_memory_bytes = int(vm.get("active", 0))
+    except Exception:
+        pass
+
     return {
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
@@ -1086,6 +1115,9 @@ def get_system_memory_info() -> dict:
         "omlx_phys_footprint_bytes": omlx_phys_footprint_bytes,
         "iogpu_wired_limit_bytes": iogpu_wired_limit_bytes,
         "omlx_wired_limit_request_bytes": omlx_wired_limit_request_bytes,
+        "free_memory_bytes": free_memory_bytes,
+        "inactive_memory_bytes": inactive_memory_bytes,
+        "active_memory_bytes": active_memory_bytes,
     }
 
 
@@ -2664,6 +2696,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "memory": {
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
             "memory_guard_tier": global_settings.memory.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": global_settings.memory.memory_guard_custom_ceiling_gb,
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
@@ -2732,6 +2765,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "auto_model_memory": memory_info["auto_limit_formatted"],
             "available_memory_bytes": memory_info["available_bytes"],
             "omlx_phys_footprint_bytes": memory_info["omlx_phys_footprint_bytes"],
+            "free_memory_bytes": memory_info["free_memory_bytes"],
+            "inactive_memory_bytes": memory_info["inactive_memory_bytes"],
+            "active_memory_bytes": memory_info["active_memory_bytes"],
             "iogpu_wired_limit_bytes": memory_info["iogpu_wired_limit_bytes"],
             "omlx_wired_limit_request_bytes": memory_info[
                 "omlx_wired_limit_request_bytes"
@@ -2851,14 +2887,23 @@ async def update_global_settings(
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
 
-    # Apply memory guard tier change (Live)
-    if request.memory_guard_tier is not None:
-        global_settings.memory.memory_guard_tier = (
-            request.memory_guard_tier
-        )
+    # Apply memory guard tier + custom ceiling change (Live)
+    if (
+        request.memory_guard_tier is not None
+        or request.memory_guard_custom_ceiling_gb is not None
+    ):
+        if request.memory_guard_tier is not None:
+            global_settings.memory.memory_guard_tier = (
+                request.memory_guard_tier
+            )
+        if request.memory_guard_custom_ceiling_gb is not None:
+            global_settings.memory.memory_guard_custom_ceiling_gb = float(
+                request.memory_guard_custom_ceiling_gb
+            )
         try:
             success, msg = await _apply_memory_guard_tier_runtime(
-                request.memory_guard_tier
+                tier=request.memory_guard_tier,
+                custom_ceiling_gb=request.memory_guard_custom_ceiling_gb,
             )
             if success:
                 runtime_applied.append("memory_guard_tier")

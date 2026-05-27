@@ -361,7 +361,18 @@
                                             <option value="safe">{{ t('settings.resource.guard_tier.safe') }}</option>
                                             <option value="balanced">{{ t('settings.resource.guard_tier.balanced') }}</option>
                                             <option value="aggressive">{{ t('settings.resource.guard_tier.aggressive') }}</option>
+                                            <option value="custom">{{ t('settings.resource.guard_tier.custom') }}</option>
                                         </select>
+                                        <div x-show="globalSettings.memory.prefill_memory_guard && globalSettings.memory.memory_guard_tier === 'custom'"
+                                             class="flex items-center gap-1">
+                                            <input type="number"
+                                                   x-model.number="globalSettings.memory.memory_guard_custom_ceiling_gb"
+                                                   min="1"
+                                                   step="1"
+                                                   placeholder="{{ t('settings.resource.guard_tier.custom_input_placeholder') }}"
+                                                   class="w-20 px-2 py-1 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                            <span class="text-xs text-neutral-500">GB</span>
+                                        </div>
                                         <button type="button"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
                                                 :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"

@@ -408,30 +408,95 @@ class TestStaticCeiling:
         assert result == 8 * 1024**3
 
 
-class TestDynamicCeiling:
-    """Dynamic ceiling tracks system_available + omlx_phys_footprint."""
+class TestDynamicCeilingActiveRatio:
+    """Dynamic ceiling sums free + inactive + active * tier ratio
+    (host_statistics64 path) for safe / balanced / aggressive."""
 
     @pytest.mark.parametrize(
-        "tier,buffer_bytes",
-        [
-            ("safe", 2 * 1024**3),
-            ("balanced", 1 * 1024**3),
-            ("aggressive", 512 * 1024**2),
-        ],
+        "tier,ratio",
+        [("safe", 0.2), ("balanced", 0.5), ("aggressive", 0.8)],
     )
-    def test_dynamic_ceiling_subtracts_other_app_buffer(
-        self, mock_engine_pool, tier, buffer_bytes
-    ):
+    def test_active_ratio_per_tier(self, mock_engine_pool, tier, ratio):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
         with patch(
             "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=10 * 1024**3,
-        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
-            mock_psutil.virtual_memory.return_value.available = 5 * 1024**3
+            return_value=1 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value={
+                "free": 10 * 1024**3,
+                "inactive": 4 * 1024**3,
+                "active": 8 * 1024**3,
+                "wired": 2 * 1024**3,
+            },
+        ):
             result = enforcer._get_dynamic_ceiling()
-        assert result == 10 * 1024**3 + 5 * 1024**3 - buffer_bytes
+        expected = (
+            1 * 1024**3
+            + 10 * 1024**3
+            + 4 * 1024**3
+            + int(8 * 1024**3 * ratio)
+        )
+        assert result == expected
+
+    def test_non_macos_falls_back_to_psutil_available(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=2 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value=None,
+        ), patch(
+            "omlx.process_memory_enforcer.psutil"
+        ) as mock_psutil:
+            mock_psutil.virtual_memory.return_value.available = 15 * 1024**3
+            result = enforcer._get_dynamic_ceiling()
+        assert result == 2 * 1024**3 + 15 * 1024**3
+
+
+class TestDynamicCeilingCustom:
+    """tier == custom: dynamic is the user-specified value, panic-safe via min()."""
+
+    def test_custom_ceiling_returned_verbatim(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=24.0,
+        )
+        assert enforcer._get_dynamic_ceiling() == 24 * 1024**3
+
+    def test_custom_setter_updates_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=10.0,
+        )
+        enforcer.memory_guard_custom_ceiling_bytes = 30 * 1024**3
+        assert enforcer._get_dynamic_ceiling() == 30 * 1024**3
+
+    def test_custom_clamped_by_static_and_metal_cap(self, mock_engine_pool):
+        """User can type any number; the final ceiling is still min(static,
+        dynamic, metal_cap) so out-of-range values are panic-safe."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=1024.0,  # absurdly large
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=48 * 1024**3,
+        ):
+            ceiling = enforcer._get_hard_limit_bytes()
+        # static = 64 - 8 = 56 GB; metal = 48 GB; custom = 1024 GB
+        # → clamped to metal 48 GB
+        assert ceiling == 48 * 1024**3
 
 
 class TestHardLimitCalculation:
@@ -443,11 +508,22 @@ class TestHardLimitCalculation:
         )
         with patch("omlx.settings.get_system_memory") as mock_mem, patch(
             "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=30 * 1024**3,
-        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
+            return_value=2 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value={
+                "free": 30 * 1024**3,
+                "inactive": 10 * 1024**3,
+                "active": 5 * 1024**3,
+                "wired": 1 * 1024**3,
+            },
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=100 * 1024**3,
+        ):
             mock_mem.return_value = 48 * 1024**3  # static = 40 GB
-            mock_psutil.virtual_memory.return_value.available = 40 * 1024**3
-            # dynamic = 30 + 40 - 2 = 68 GB; static (40) wins
+            # dynamic balanced = 2 + 30 + 10 + 5*0.5 = 44.5 GB
+            # static (40) wins → final ceiling is 40 GB
             assert enforcer._get_hard_limit_bytes() == 40 * 1024**3
 
     def test_picks_dynamic_when_smaller(self, mock_engine_pool):
@@ -456,12 +532,23 @@ class TestHardLimitCalculation:
         )
         with patch("omlx.settings.get_system_memory") as mock_mem, patch(
             "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=10 * 1024**3,
-        ), patch("omlx.process_memory_enforcer.psutil") as mock_psutil:
+            return_value=1 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value={
+                "free": 5 * 1024**3,
+                "inactive": 2 * 1024**3,
+                "active": 4 * 1024**3,
+                "wired": 1 * 1024**3,
+            },
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=100 * 1024**3,
+        ):
             mock_mem.return_value = 48 * 1024**3  # static = 40 GB
-            mock_psutil.virtual_memory.return_value.available = 5 * 1024**3
-            # dynamic = 10 + 5 - 1 (balanced buffer) = 14 GB; dynamic wins
-            assert enforcer._get_hard_limit_bytes() == 14 * 1024**3
+            # dynamic balanced = 1 + 5 + 2 + int(4 * 0.5) = 10 GB
+            # → dynamic wins
+            assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
 
     def test_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

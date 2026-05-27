@@ -32,7 +32,7 @@
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
                 model: { model_dirs: [''] },
-                memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced' },
+                memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
@@ -676,7 +676,7 @@
                             : '';
 
                         // Normalize memory guard tier to one of the known values.
-                        const validTiers = ['safe', 'balanced', 'aggressive'];
+                        const validTiers = ['safe', 'balanced', 'aggressive', 'custom'];
                         if (!validTiers.includes(this.globalSettings.memory.memory_guard_tier)) {
                             this.globalSettings.memory.memory_guard_tier = 'balanced';
                         }
@@ -751,6 +751,7 @@
                             model_fallback: this.globalSettings.model.model_fallback,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             memory_guard_tier: this.globalSettings.memory.memory_guard_tier,
+                            memory_guard_custom_ceiling_gb: this.globalSettings.memory.memory_guard_custom_ceiling_gb,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             cache_enabled: this.globalSettings.cache.enabled,
@@ -3265,75 +3266,98 @@
                 }
             },
 
-            // Description shown next to the Memory guard tier dropdown.
-            // Names the tier and its real-time safety buffer; the line below
-            // (memoryGuardBreakdownHTML) shows the live numbers.
+            // Description text shown next to the Memory guard tier dropdown.
+            // safe / balanced / aggressive get a "free + inactive + N% of
+            // active (via macOS reclaim_method)" sentence. custom shows the
+            // user-supplied ceiling.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
                 const tierLabel = window.t('settings.resource.guard_tier.' + tier);
-                const buffer = { safe: 2, balanced: 1, aggressive: 0.5 }[tier] ?? 1;
-                const template = window.t('settings.resource.guard_tier.description_template');
-                return template
+                if (tier === 'custom') {
+                    const gb = Number(
+                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
+                    ).toFixed(1);
+                    return window
+                        .t('settings.resource.guard_tier.description_custom')
+                        .replace('{custom_gb}', gb);
+                }
+                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
+                const method = window.t(
+                    'settings.resource.guard_tier.reclaim_method.' + tier
+                );
+                return window
+                    .t('settings.resource.guard_tier.description_template')
                     .replace('{tier}', tierLabel)
-                    .replace('{buffer_gb}', Number(buffer).toFixed(1));
+                    .replace('{active_pct}', pct)
+                    .replace('{reclaim_method}', method);
             },
 
-            // Breakdown line under the tier description. Shows which side of
-            // min(static, dynamic) is binding right now and what the inputs
-            // are. Rendered via DOMPurify-sanitized x-html so the GB values
-            // can be wrapped in <strong>.
+            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
+            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
+            // effective ceiling C` (after clamp by static / metal cap).
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
-                const totalBytes = sys.total_memory_bytes || 0;
-                if (!totalBytes) return '';
                 const GB = 1024 ** 3;
-                const totalGB = totalBytes / GB;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
+                const fmt = (gb) => Number(gb).toFixed(1);
+                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
 
+                // Static / metal cap for the final clamp shown to the user.
+                const totalGB = (sys.total_memory_bytes || 0) / GB;
                 const staticReserveGB =
                     totalGB < 16
                         ? 4
-                        : ({ safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8);
-                const otherAppReserveGB =
-                    { safe: 2, balanced: 1, aggressive: 0.5 }[tier] ?? 1;
-                const staticCeiling = totalGB - staticReserveGB;
+                        : { safe: 12, balanced: 8, aggressive: 6, custom: 8 }[tier] ?? 8;
+                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
+                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
-                const availableBytes = sys.available_memory_bytes || 0;
-                const omlxFootprintBytes = sys.omlx_phys_footprint_bytes || 0;
-                const hasLiveData = availableBytes > 0 || omlxFootprintBytes > 0;
-                const dynamicCeiling = hasLiveData
-                    ? Math.max(
-                          0,
-                          (omlxFootprintBytes + availableBytes) / GB
-                              - otherAppReserveGB,
-                      )
-                    : staticCeiling;
+                // Helper: is the kernel iogpu.wired_limit_mb the smallest
+                // of the three candidates? When yes we swap "→ ceiling" for
+                // "/ effective ceiling X (kernel limit)" so the user knows
+                // why the value isn't what their tier math suggested.
+                const kernelBinds = (candidates, finalCeiling) =>
+                    metalCapGB > 0 &&
+                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
+                    candidates.every((c) => c >= metalCapGB - 1e-6);
 
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-                const totalDisplay = bold(totalGB);
-
-                if (hasLiveData && dynamicCeiling < staticCeiling) {
-                    const availableDisplay = bold(availableBytes / GB);
-                    const omlxUsageDisplay = bold(omlxFootprintBytes / GB);
-                    const bufferDisplay = bold(otherAppReserveGB);
+                if (tier === 'custom') {
+                    const custom = Number(
+                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
+                    );
+                    const candidates = [custom, staticCeiling];
+                    if (metalCapGB > 0) candidates.push(metalCapGB);
+                    const ceiling = Math.max(0, Math.min(...candidates));
+                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
+                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                        : 'settings.resource.guard_tier.breakdown_custom';
                     return window
-                        .t('settings.resource.guard_tier.breakdown_dynamic')
-                        .replace('{total}', totalDisplay)
-                        .replace('{available}', availableDisplay)
-                        .replace('{omlx_usage}', omlxUsageDisplay)
-                        .replace('{buffer}', bufferDisplay)
-                        .replace('{tier}', tierLabel);
+                        .t(tmpl)
+                        .replace('{custom_gb}', bold(custom))
+                        .replace('{ceiling}', bold(ceiling));
                 }
-                const reserveDisplay = bold(staticReserveGB);
-                const ceilingDisplay = bold(staticCeiling);
+
+                const freeGB = (sys.free_memory_bytes || 0) / GB;
+                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
+                const activeGB = (sys.active_memory_bytes || 0) / GB;
+                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
+                const pct = Math.round(ratio * 100);
+                const reclaim = activeGB * ratio;
+                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
+                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
+                const candidates = [dynamicCeiling, staticCeiling];
+                if (metalCapGB > 0) candidates.push(metalCapGB);
+                const ceiling = Math.max(0, Math.min(...candidates));
+                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                    ? 'settings.resource.guard_tier.breakdown_kernel_limit'
+                    : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t('settings.resource.guard_tier.breakdown_static')
-                    .replace('{total}', totalDisplay)
-                    .replace('{reserve}', reserveDisplay)
-                    .replace('{tier}', tierLabel)
-                    .replace('{ceiling}', ceilingDisplay);
+                    .t(tmpl)
+                    .replace('{free}', bold(freeGB))
+                    .replace('{inactive}', bold(inactiveGB))
+                    .replace('{active}', bold(activeGB))
+                    .replace(/{active_pct}/g, pct)
+                    .replace('{reclaim}', bold(reclaim))
+                    .replace('{ceiling}', bold(ceiling));
             },
 
             // Computed hot cache size in GB (for manual input)
