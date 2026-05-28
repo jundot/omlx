@@ -523,7 +523,7 @@
         box-sizing: border-box;
         resize: vertical;
         padding: 12px 16px;
-        border: 2px solid #2d3748;
+        border: 2px solid var(--border-normal);
         border-radius: 16px;
         background: var(--bg-primary);
         color: var(--text-primary);
@@ -555,8 +555,10 @@
         align-items: center;
         padding: 0.5rem 0.75rem;
         cursor: pointer;
-        font-size: 0.75rem;
-        color: var(--text-tertiary);
+        font-size: 0.875rem;
+        font-weight: 500;
+        font-family: inherit;
+        color: var(--text-secondary);
         gap: 0.5rem;
         background: var(--bg-secondary);
         border-bottom: 1px solid var(--border-faint);
@@ -574,7 +576,9 @@
 
     .thinking-text {
         flex: 1;
-        font-weight: 400;
+        font-size: inherit;
+        font-weight: inherit;
+        font-family: inherit;
     }
 
     .thinking-toggle {
@@ -1110,11 +1114,11 @@
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
                                                 Copy Markdown
-                                             </button>
-                 </div>
-             </div>
-             </div>
-                                 <template x-if="editingIndex !== index">
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <template x-if="editingIndex !== index">
                                     <div>
                                         <!-- Images from content array -->
                                         <template x-if="getImageUrls(msg.content).length > 0">
@@ -1310,7 +1314,7 @@
                 </template>
 
                 <!-- Streaming Message -->
-                <div x-show="isCurrentChatStreaming()" class="assistant-message message-fade-in">
+                <div x-show="isCurrentChatStreaming()" x-cloak class="assistant-message message-fade-in">
                     <div class="message-header">
                         <div class="flex items-center gap-2 text-sm font-medium" style="color: var(--text-primary);">
                             <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
@@ -1760,29 +1764,25 @@
                     </div>
                 </div>
 
-                <!-- Thinking: Auto / On / Off (limit controls only when On) -->
+                <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
                 <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
-                    <label class="text-xs font-semibold block" style="color: var(--text-primary);">Thinking</label>
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">Thinking</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
-                        <option value="auto">Auto (model default)</option>
-                        <option value="on">On</option>
+                        <option value="auto">Auto</option>
+                        <option value="on_unlimit">On (Unlimit)</option>
+                        <option value="on_limit">On (Limit)</option>
                         <option value="off">Off</option>
                     </select>
-                    <div x-show="thinkingModeValue() === 'on'" x-collapse class="space-y-2">
-                        <select x-model="modelSettings.thinking_budget_enabled" @change="onModelSettingsChange()"
+                    <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                            style="color: var(--text-secondary);">Thinking tokens</label>
+                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
+                            @input="onModelSettingsChange()" placeholder="e.g. 4096" min="1" step="100"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
-                            <option :value="false">No token limit</option>
-                            <option :value="true">Token limit</option>
-                        </select>
-                        <div x-show="modelSettings.thinking_budget_enabled" x-collapse>
-                            <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                                @input="onModelSettingsChange()" placeholder="Tokens (e.g. 1024)" min="1" step="100"
-                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
-                                style="color: var(--text-primary);">
-                        </div>
                     </div>
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
                         KV cache quantization and speculative decoding are configured in Admin → Model Settings (requires model reload).
@@ -1889,6 +1889,9 @@
             // Chat State
             currentChatId: null,
             chatHistory: [],
+            _thinkingDomSeq: 0,
+            _adminModelsList: null,
+            _adminModelsListPromise: null,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2008,14 +2011,24 @@
             },
 
             thinkingModeValue() {
-                if (this.modelSettings.enable_thinking === true) return 'on';
                 if (this.modelSettings.enable_thinking === false) return 'off';
+                if (this.modelSettings.enable_thinking === true) {
+                    return this.modelSettings.thinking_budget_enabled ? 'on_limit' : 'on_unlimit';
+                }
                 return 'auto';
             },
 
             setThinkingMode(mode) {
-                if (mode === 'on') {
+                if (mode === 'on_unlimit') {
                     this.modelSettings.enable_thinking = true;
+                    this.modelSettings.thinking_budget_enabled = false;
+                    this.modelSettings.thinking_budget_tokens = null;
+                } else if (mode === 'on_limit') {
+                    this.modelSettings.enable_thinking = true;
+                    this.modelSettings.thinking_budget_enabled = true;
+                    if (this.modelSettings.thinking_budget_tokens == null) {
+                        this.modelSettings.thinking_budget_tokens = 4096;
+                    }
                 } else if (mode === 'off') {
                     this.modelSettings.enable_thinking = false;
                     this.modelSettings.thinking_budget_enabled = false;
@@ -2771,7 +2784,7 @@
                 const modelId = this.resolveStreamModelId(chatId, stream);
                 const modelData = this.findModelStatsEntry(data, modelId);
                 const claimed = this.getClaimedRequestStats(stream, modelData);
-                const base = { ...(stream._liveFooterStats || this.recentStats || this.emptyStats()) };
+                const base = { ...(stream._liveFooterStats || this.emptyStats()) };
 
                 if (!claimed) {
                     return {
@@ -3153,7 +3166,9 @@
         if (!this.hasVisionSupport()) return;
         const files = event.dataTransfer?.files;
         if (files) {
-            Array.from(files).forEach(f => this.loadImageFile(f));
+            Array.from(files)
+                .filter(f => f.type.startsWith('image/'))
+                .forEach(f => this.loadImageFile(f));
         }
     },
 
@@ -3315,6 +3330,25 @@
         return localStorage.getItem('omlx_chat_api_key') || '';
     },
 
+    combineAbortSignals(signals) {
+        const valid = (signals || []).filter(Boolean);
+        if (!valid.length) return undefined;
+        if (valid.length === 1) return valid[0];
+        if (typeof AbortSignal.any === 'function') {
+            return AbortSignal.any(valid);
+        }
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        for (const signal of valid) {
+            if (signal.aborted) {
+                controller.abort();
+                return controller.signal;
+            }
+            signal.addEventListener('abort', abort, { once: true });
+        }
+        return controller.signal;
+    },
+
             async loadModels() {
         try {
             // Fetch models, admin model list, and server health in parallel
@@ -3352,7 +3386,8 @@
             this.aliasToGateway = {};
             if (adminModelsResponse.ok) {
                 const adminData = await adminModelsResponse.json();
-                for (const m of (adminData.models || [])) {
+                this._adminModelsList = adminData.models || [];
+                for (const m of this._adminModelsList) {
                     const alias = m.settings?.model_alias || m.model_alias;
                     if (alias) {
                         this.aliasToGateway[alias] = m.id;
@@ -3395,13 +3430,32 @@
         }
     },
 
+    async fetchAdminModelsList() {
+        if (this._adminModelsList) return this._adminModelsList;
+        if (this._adminModelsListPromise) return this._adminModelsListPromise;
+        this._adminModelsListPromise = fetch('/admin/api/models', { credentials: 'same-origin' })
+            .then(async (response) => {
+                if (!response.ok) throw new Error('Failed to load admin models');
+                const data = await response.json();
+                this._adminModelsList = data.models || [];
+                return this._adminModelsList;
+            })
+            .finally(() => {
+                this._adminModelsListPromise = null;
+            });
+        try {
+            return await this._adminModelsListPromise;
+        } catch (e) {
+            this._adminModelsList = null;
+            throw e;
+        }
+    },
+
     async loadModelCapabilities(modelId) {
         if (!modelId) return;
         try {
-            const response = await fetch('/admin/api/models', { credentials: 'same-origin' });
-            if (!response.ok) return;
-            const data = await response.json();
-            const model = (data.models || []).find(m => m.id === modelId);
+            const models = await this.fetchAdminModelsList();
+            const model = models.find(m => m.id === modelId);
             if (!model) return;
             this.isMtpCompatible = !!model.mtp_compatible;
             this.isVlm = model.model_type === 'vlm';
@@ -3414,10 +3468,8 @@
     async loadAdminModelDefaults(modelId) {
         if (!modelId) return;
         try {
-            const response = await fetch('/admin/api/models', { credentials: 'same-origin' });
-            if (!response.ok) return;
-            const data = await response.json();
-            const model = (data.models || []).find(m => m.id === modelId);
+            const models = await this.fetchAdminModelsList();
+            const model = models.find(m => m.id === modelId);
             if (!model) return;
 
             this.isMtpCompatible = !!model.mtp_compatible;
@@ -3434,7 +3486,7 @@
                 repetition_penalty: s.repetition_penalty ?? null,
                 presence_penalty: s.presence_penalty ?? null,
                 enable_thinking: s.enable_thinking ?? null,
-                thinking_budget_enabled: !!(s.thinking_budget_enabled && s.thinking_budget_tokens),
+                thinking_budget_enabled: s.thinking_budget_tokens != null,
                 thinking_budget_tokens: s.thinking_budget_tokens ?? null,
             };
             this.speculativeEngine = 'none';
@@ -3470,15 +3522,26 @@
         this.schedulePersistModelSettings();
     },
 
-    schedulePersistModelSettings() {
+    cancelPersistModelSettingsTimer() {
         clearTimeout(this._persistModelSettingsTimer);
+        this._persistModelSettingsTimer = null;
+    },
+
+    schedulePersistModelSettings() {
+        this.cancelPersistModelSettingsTimer();
+        const chatId = this.currentChatId;
         this._persistModelSettingsTimer = setTimeout(() => {
-            if (!this.currentChatId) return;
-            const session = this.getChatSession(this.currentChatId, false);
+            this._persistModelSettingsTimer = null;
+            if (!chatId) return;
+            const session = this.getChatSession(chatId, false);
             if (!session) return;
-            this.syncSessionModelSettingsFromUi(session);
-            this.persistChatSettingsToHistory(this.currentChatId);
-            this.modelSettingsDirty = false;
+            if (chatId === this.currentChatId) {
+                this.syncSessionModelSettingsFromUi(session);
+            }
+            this.persistChatSettingsToHistory(chatId);
+            if (chatId === this.currentChatId) {
+                this.modelSettingsDirty = false;
+            }
         }, 400);
     },
 
@@ -3711,6 +3774,11 @@
         if (history) {
             try {
                 this.chatHistory = JSON.parse(history);
+                this.chatHistory.sort((a, b) => {
+                    const ta = a.updatedAt ? Date.parse(a.updatedAt) : 0;
+                    const tb = b.updatedAt ? Date.parse(b.updatedAt) : 0;
+                    return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
+                });
             } catch (e) {
                 this.chatHistory = [];
             }
@@ -3772,6 +3840,7 @@
     },
 
     async loadChat(chatId) {
+        this.cancelPersistModelSettingsTimer();
         if (this.currentChatId && this.currentChatId !== chatId) {
             const prevSession = this.getChatSession(this.currentChatId, false);
             if (prevSession) {
@@ -3947,7 +4016,7 @@
         });
 
         if (!this.currentChatId) {
-            this.startNewChat();
+            await this.startNewChat();
         }
 
         const chatId = this.currentChatId;
@@ -4240,9 +4309,10 @@
                     try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) { }
                     try {
                         const timeoutSignal = AbortSignal.timeout?.(this.TOOL_TIMEOUT_MS);
-                        const combinedSignal = stream.abortController?.signal && timeoutSignal
-                            ? AbortSignal.any([stream.abortController.signal, timeoutSignal])
-                            : (timeoutSignal || stream.abortController?.signal);
+                        const combinedSignal = this.combineAbortSignals([
+                            stream.abortController?.signal,
+                            timeoutSignal,
+                        ]);
                         const execResp = await fetch('/v1/mcp/execute', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
@@ -4522,40 +4592,25 @@
         const session = this.getChatSession(this.currentChatId, true);
         if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
 
-        const variants = this.getTurnVariantsAt(session.messages, userIndex);
-        if (variants.length <= 1) {
-            let nextUserIdx = session.messages.length;
-            for (let i = userIndex + 1; i < session.messages.length; i++) {
-                if (session.messages[i].role === 'user') {
-                    nextUserIdx = i;
-                    break;
-                }
-            }
-            session.messages = [
-                ...session.messages.slice(0, userIndex),
-                ...session.messages.slice(nextUserIdx),
-            ];
-        } else {
-            const turnMsgs = [];
-            for (let i = userIndex + 1; i < session.messages.length && session.messages[i].role !== 'user'; i++) {
-                turnMsgs.push(session.messages[i]);
-            }
-            const segment = this.splitTurnSegments(turnMsgs).find(s => s.some(m => m.id === variantId));
-            if (!segment) return;
-            const removeIds = new Set(segment.map(m => m.id));
-            session.messages = session.messages.filter(m => !removeIds.has(m.id));
+        const turnMsgs = [];
+        for (let i = userIndex + 1; i < session.messages.length && session.messages[i].role !== 'user'; i++) {
+            turnMsgs.push(session.messages[i]);
+        }
+        const segment = this.splitTurnSegments(turnMsgs).find(s => s.some(m => m.id === variantId));
+        if (!segment) return;
+        const removeIds = new Set(segment.map(m => m.id));
+        session.messages = session.messages.filter(m => !removeIds.has(m.id));
 
-            const user = session.messages[userIndex];
-            const remaining = this.getTurnVariantsAt(session.messages, userIndex);
-            if (remaining.length) {
-                const activeId = user._activeVariantId;
-                const next = remaining.find(v => v.id === activeId) || remaining[remaining.length - 1];
-                user._activeVariantId = next.id;
-                this.applyVariantStats(next);
-            } else {
-                delete user._activeVariantId;
-                this.recentStats = this.emptyStats();
-            }
+        const user = session.messages[userIndex];
+        const remaining = this.getTurnVariantsAt(session.messages, userIndex);
+        if (remaining.length) {
+            const activeId = user._activeVariantId;
+            const next = remaining.find(v => v.id === activeId) || remaining[remaining.length - 1];
+            user._activeVariantId = next.id;
+            this.applyVariantStats(next);
+        } else {
+            delete user._activeVariantId;
+            this.recentStats = this.emptyStats();
         }
 
         this.messages = session.messages;
@@ -4852,7 +4907,7 @@
             thinkingTime = Math.max(1, Math.round(wordCount / wordsPerSecond));
         }
 
-        const uniqueId = `${messageId || Date.now()}_${index}`;
+        const uniqueId = `think_${++this._thinkingDomSeq}`;
 
         return `
                     <div class="thinking-container">
@@ -4884,9 +4939,8 @@
 
             // Add thinking blocks at the beginning if they exist
             if (thinkingBlocks.length > 0) {
-                const messageTimestamp = Date.now();
                 const thinkingHtml = thinkingBlocks.map((block, index) =>
-                    this.renderThinkingBlock(block.content, index, messageTimestamp, block.elapsed)
+                    this.renderThinkingBlock(block.content, index, null, block.elapsed)
                 ).join('');
                 html = thinkingHtml + html;
             }
