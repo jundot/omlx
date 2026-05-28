@@ -2069,6 +2069,25 @@
                 };
             },
 
+            saveModelSettingsForModel(session, modelId) {
+                if (!session || !modelId) return;
+                const key = this.resolveGatewayModelId(modelId);
+                if (!session.modelSettingsByModel) session.modelSettingsByModel = {};
+                session.modelSettingsByModel[key] = this.captureSessionModelSettings();
+            },
+
+            loadModelSettingsForModel(session, modelId) {
+                if (!session || !modelId) return false;
+                const key = this.resolveGatewayModelId(modelId);
+                const saved = session.modelSettingsByModel?.[key];
+                if (!saved) return false;
+                session.modelSettings = this.cloneData(saved.modelSettings);
+                session.speculativeEngine = saved.speculativeEngine ?? 'none';
+                session.speculativeDraftModel = saved.speculativeDraftModel ?? '';
+                this.applySessionModelSettings(session);
+                return true;
+            },
+
             applySessionModelSettings(session) {
                 if (!session?.modelSettings) return false;
                 this.modelSettings = { ...this.defaultModelSettings(), ...this.cloneData(session.modelSettings) };
@@ -2084,6 +2103,9 @@
                 session.modelSettings = snap.modelSettings;
                 session.speculativeEngine = snap.speculativeEngine;
                 session.speculativeDraftModel = snap.speculativeDraftModel;
+                if (session.model) {
+                    this.saveModelSettingsForModel(session, session.model);
+                }
             },
 
             persistChatSettingsToHistory(chatId = this.currentChatId) {
@@ -2103,6 +2125,7 @@
                     modelSettings: snap.modelSettings,
                     speculativeEngine: snap.speculativeEngine,
                     speculativeDraftModel: snap.speculativeDraftModel,
+                    modelSettingsByModel: this.cloneData(session.modelSettingsByModel || {}),
                 };
                 this.saveChatHistory();
             },
@@ -2186,7 +2209,7 @@
                 return segments[segments.length - 1];
             },
 
-            getApiTurnMessages(messages) {
+            getApiTurnMessages(messages, excludeVariantsAtUserIndex = null) {
                 const result = [];
                 let i = 0;
                 while (i < messages.length) {
@@ -2195,6 +2218,7 @@
                         i++;
                         continue;
                     }
+                    const userIdx = i;
                     result.push(msg);
                     i++;
                     const turn = [];
@@ -2202,7 +2226,9 @@
                         turn.push(messages[i]);
                         i++;
                     }
-                    result.push(...this.getActiveVariantChain(turn, msg._activeVariantId));
+                    if (userIdx !== excludeVariantsAtUserIndex) {
+                        result.push(...this.getActiveVariantChain(turn, msg._activeVariantId));
+                    }
                 }
                 return result;
             },
@@ -2341,6 +2367,13 @@
                 return msg;
             },
 
+            attachThinkingToAssistantMessage(msg, thinking) {
+                const content = thinking || null;
+                msg._thinking = content;
+                msg.reasoning_content = content;
+                return msg;
+            },
+
             snapshotGenerationSettings() {
                 const gen = {};
                 const s = this.modelSettings;
@@ -2461,11 +2494,13 @@
                 return { ...(this.snapshotGenerationSettings() || {}) };
             },
 
-            buildMessagesForApi(messages, systemPrompt, variantUserIndex = null) {
+            buildMessagesForApi(messages, systemPrompt, opts = {}) {
+                const variantUserIndex = opts.variantUserIndex ?? null;
+                const excludeVariantsAtUserIndex = opts.excludeVariantsAtUserIndex ?? null;
                 const apiSystemPrompt = this.resolveApiSystemPrompt(
                     messages, systemPrompt, variantUserIndex
                 );
-                const out = this.getApiTurnMessages(messages)
+                const out = this.getApiTurnMessages(messages, excludeVariantsAtUserIndex)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
                         const m = { role: msg.role, content: msg.content ?? null };
@@ -2485,15 +2520,19 @@
                 return out;
             },
 
-            buildChatCompletionBody(messages, context) {
+            buildChatCompletionBody(messages, context, depth = 0) {
                 const variantUserIndex = context._variantUserIndex ?? null;
+                const excludeVariantsAtUserIndex = depth === 0
+                    ? (context._excludeVariantsAtUserIndex ?? null)
+                    : null;
                 const model = this.resolveApiModel(messages, context.model, variantUserIndex);
                 const generation = this.resolveApiGenerationOverrides(messages, variantUserIndex);
                 return {
                     model,
-                    messages: this.buildMessagesForApi(
-                        messages, context.systemPrompt, variantUserIndex
-                    ),
+                    messages: this.buildMessagesForApi(messages, context.systemPrompt, {
+                        variantUserIndex,
+                        excludeVariantsAtUserIndex,
+                    }),
                     stream: true,
                     stream_options: { include_usage: true },
                     ...generation,
@@ -2552,6 +2591,8 @@
                             ? this.cloneData(historyChat.modelSettings) : null,
                         speculativeEngine: historyChat?.speculativeEngine ?? null,
                         speculativeDraftModel: historyChat?.speculativeDraftModel ?? null,
+                        modelSettingsByModel: historyChat?.modelSettingsByModel
+                            ? this.cloneData(historyChat.modelSettingsByModel) : {},
                     };
                 }
                 return this.chatSessions[chatId] || null;
@@ -3408,12 +3449,28 @@
     },
 
     async selectModel(modelId) {
-        this.currentModel = modelId;
         const session = this.getChatSession(this.currentChatId, true);
-        if (session) {
-            session.model = modelId;
+        const gatewayId = this.resolveGatewayModelId(modelId);
+        if (session?.model && session.model !== gatewayId) {
+            this.syncSessionModelSettingsFromUi(session);
+            this.saveModelSettingsForModel(session, session.model);
         }
-        await this.loadModelCapabilities(modelId);
+        this.currentModel = gatewayId;
+        if (session) {
+            session.model = gatewayId;
+            if (!this.loadModelSettingsForModel(session, gatewayId)) {
+                session.modelSettings = null;
+                session.speculativeEngine = null;
+                session.speculativeDraftModel = null;
+                await this.ensureSessionModelSettings(session, gatewayId);
+                this.saveModelSettingsForModel(session, gatewayId);
+            } else {
+                await this.loadModelCapabilities(gatewayId);
+            }
+            this.persistChatSettingsToHistory(this.currentChatId);
+        } else {
+            await this.loadModelCapabilities(gatewayId);
+        }
     },
 
     loadChatHistory() {
@@ -3473,6 +3530,7 @@
             modelSettings: null,
             speculativeEngine: null,
             speculativeDraftModel: null,
+            modelSettingsByModel: {},
         };
         this.chatSessions[chatId] = session;
         this.messages = session.messages;
@@ -3504,7 +3562,21 @@
                 // Resolve legacy alias → gateway id for backward compatibility
                 const gatewayId = this.aliasToGateway[session.model] || session.model;
                 this.currentModel = gatewayId;
-                await this.ensureSessionModelSettings(session, gatewayId);
+                session.model = gatewayId;
+                if (!session.modelSettingsByModel) session.modelSettingsByModel = {};
+                if (session.modelSettings && !session.modelSettingsByModel[gatewayId]) {
+                    session.modelSettingsByModel[gatewayId] = {
+                        modelSettings: this.cloneData(session.modelSettings),
+                        speculativeEngine: session.speculativeEngine,
+                        speculativeDraftModel: session.speculativeDraftModel,
+                    };
+                }
+                if (!this.loadModelSettingsForModel(session, gatewayId)) {
+                    await this.ensureSessionModelSettings(session, gatewayId);
+                    this.saveModelSettingsForModel(session, gatewayId);
+                } else {
+                    await this.loadModelCapabilities(gatewayId);
+                }
             }
             if (session.messages && session.messages.length > 0) {
                 this.syncFooterStatsFromMessages(session.messages);
@@ -3568,6 +3640,9 @@
             modelSettings: settingsSnap.modelSettings,
             speculativeEngine: settingsSnap.speculativeEngine,
             speculativeDraftModel: settingsSnap.speculativeDraftModel,
+            modelSettingsByModel: session
+                ? this.cloneData(session.modelSettingsByModel || {})
+                : {},
             updatedAt: new Date().toISOString()
         };
 
@@ -3578,6 +3653,9 @@
             session.modelSettings = settingsSnap.modelSettings;
             session.speculativeEngine = settingsSnap.speculativeEngine;
             session.speculativeDraftModel = settingsSnap.speculativeDraftModel;
+            if (chatModel) {
+                this.saveModelSettingsForModel(session, chatModel);
+            }
         }
 
         if (existingIndex >= 0) {
@@ -3679,6 +3757,7 @@
             systemPrompt: streamContext?.systemPrompt ?? this.systemPrompt,
             _profile: null,
             _variantUserIndex: streamContext?._variantUserIndex ?? null,
+            _excludeVariantsAtUserIndex: streamContext?._excludeVariantsAtUserIndex ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -3729,7 +3808,7 @@
             stream.streamingContent = '';
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
-        const requestBody = this.buildChatCompletionBody(chatSession.messages, context);
+        const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
         const apiModel = requestBody.model;
         this.setEngineStatus(context.chatId, { text: 'Starting' });
         this.startPrefillPolling(context.chatId, apiModel);
@@ -3994,9 +4073,9 @@
                 model: context.model,
                 meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                 _perfVisible: false,
-                _thinking: stream.streamingThinking || null,
                 _thinkingOpen: false,
             };
+            this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
             this.attachProfileToAssistantMessage(assistantMsg, context._profile);
             chatSession.messages.push(assistantMsg);
             this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
@@ -4024,9 +4103,9 @@
                         model: context.model,
                         meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                         _perfVisible: false,
-                        _thinking: stream.streamingThinking || null,
                         _thinkingOpen: false,
                     };
+                    this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
                     this.attachProfileToAssistantMessage(assistantMsg, context._profile);
                     chatSession.messages.push(assistantMsg);
                     this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
@@ -4126,6 +4205,8 @@
             systemPrompt: this.systemPrompt,
             _profile: profileToUse,
             _variantUserIndex: userIdx,
+            _excludeVariantsAtUserIndex: this.getTurnVariantsAt(session.messages, userIdx).length > 0
+                ? userIdx : null,
         }, 0);
     },
 
