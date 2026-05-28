@@ -353,6 +353,44 @@ class TestParseJsonOutput:
         assert error is not None
         assert "validation failed" in error.lower()
 
+    def test_json_schema_format_explicit_none_schema(self):
+        """Explicit json_schema=None must behave like a missing key.
+
+        Regression test: clients may send
+        response_format={"type": "json_schema", "json_schema": null}; the
+        explicit null bypasses dict.get()'s default and previously raised
+        AttributeError ('NoneType' has no attribute 'get'). With no schema
+        available, the output is treated like json_object: extracted but
+        not validated.
+        """
+        text = '{"name": "John"}'
+        response_format = {"type": "json_schema", "json_schema": None}
+
+        cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
+
+        assert cleaned == text
+        assert parsed == {"name": "John"}
+        assert is_valid is True
+        assert error is None
+
+    def test_json_schema_format_explicit_none_schema_wire_path(self):
+        """Explicit json_schema=None via the ResponseFormat object (real wire path).
+
+        A real client request arrives as a ResponseFormat, not a raw dict, so it
+        takes the isinstance branch, which sets rf_dict["json_schema"] to None.
+        The raw-dict test above skips that normalization, so this pins the
+        production path directly: it must degrade like a missing schema, not raise.
+        """
+        text = '{"name": "John"}'
+        response_format = ResponseFormat(type="json_schema", json_schema=None)
+
+        cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
+
+        assert cleaned == text
+        assert parsed == {"name": "John"}
+        assert is_valid is True
+        assert error is None
+
     def test_json_schema_with_pydantic_model(self):
         """Test with ResponseFormat Pydantic model."""
         text = '{"message": "hello"}'
@@ -431,6 +469,34 @@ class TestBuildJsonSystemPrompt:
         assert result is not None
         assert "person" in result
         assert "A person object" in result
+
+    def test_json_schema_format_explicit_none_schema(self):
+        """Explicit json_schema=None must behave like a missing key.
+
+        Regression test: the explicit null bypasses dict.get()'s default
+        and previously raised AttributeError. The prompt falls back to the
+        default schema name 'response' with an empty schema.
+        """
+        response_format = {"type": "json_schema", "json_schema": None}
+
+        result = build_json_system_prompt(response_format)
+
+        assert result is not None
+        assert "response" in result
+
+    def test_json_schema_format_explicit_none_schema_wire_path(self):
+        """Explicit json_schema=None via the ResponseFormat object (real wire path).
+
+        A real client request arrives as a ResponseFormat whose isinstance branch
+        sets rf_dict["json_schema"] to None; the raw-dict test above skips that
+        normalization. Falls back to the default schema name 'response'.
+        """
+        response_format = ResponseFormat(type="json_schema", json_schema=None)
+
+        result = build_json_system_prompt(response_format)
+
+        assert result is not None
+        assert "response" in result
 
     def test_json_schema_format_with_pydantic(self):
         """Test with ResponseFormat Pydantic model."""
