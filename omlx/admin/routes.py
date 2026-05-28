@@ -4569,6 +4569,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    # Sort local models case-insensitively ascending by name (new behavior for Admin > Models > Manager > Local Models)
+    # This guarantees deterministic, user-friendly order regardless of FS iteration or case-sens Path sorting.
+    models.sort(key=lambda m: m["name"].lower())
     return {"models": models}
 
 

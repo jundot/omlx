@@ -756,6 +756,19 @@ class TestHFDownloaderRoutes:
         (model_b / "config.json").write_text('{"architectures": ["Qwen2ForCausalLM"]}')
         (model_b / "model.safetensors").write_bytes(b"y" * 2048)
 
+        # Mixed-case models for case-insensitive sort verification (TDD RED step)
+        # "Zebra-Model" (Z) comes before "apple-model" (a) in case-sensitive sorted(itertdir)
+        # but must come AFTER in the final case-insensitive ascending output.
+        model_z = model_dir / "Zebra-Model"
+        model_z.mkdir()
+        (model_z / "config.json").write_text('{"architectures": ["TestZ"]}')
+        (model_z / "model.safetensors").write_bytes(b"z" * 512)
+
+        model_apple = model_dir / "apple-model"
+        model_apple.mkdir()
+        (model_apple / "config.json").write_text('{"architectures": ["TestA"]}')
+        (model_apple / "model.safetensors").write_bytes(b"a" * 256)
+
         # Directory without config.json (should be excluded)
         (model_dir / "not-a-model").mkdir()
 
@@ -785,10 +798,12 @@ class TestHFDownloaderRoutes:
             result = await list_hf_models(is_admin=True)
             models = result["models"]
 
-            assert len(models) == 2
+            assert len(models) == 4
             names = [m["name"] for m in models]
             assert "model-a" in names
             assert "model-b" in names
+            assert "Zebra-Model" in names
+            assert "apple-model" in names
             assert "not-a-model" not in names
             assert ".hidden" not in names
 
@@ -796,6 +811,11 @@ class TestHFDownloaderRoutes:
                 assert "size" in m
                 assert "size_formatted" in m
                 assert m["size"] > 0
+
+            # TDD RED: this will FAIL until server-side case-insens sort is added
+            # Current behavior (case-sens Path sorted order) puts "Zebra-Model" before "apple-model"
+            expected = sorted(names, key=str.lower)
+            assert names == expected, f"Local models must be returned case-insensitive ascending by name. Got {names}, expected {expected}"
         finally:
             routes_module._get_global_settings = original
 
