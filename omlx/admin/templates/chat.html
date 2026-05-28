@@ -872,9 +872,13 @@
 
 {% block content %}
 <script>
-    // Apply theme immediately before render to prevent flash
+    // Apply theme immediately before render to prevent flash (match applyTheme / Alpine default)
     (function () {
-        const theme = localStorage.getItem('omlx-chat-theme') || 'light';
+        const stored = localStorage.getItem('omlx-chat-theme');
+        let theme = stored || 'auto';
+        if (theme === 'auto') {
+            theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
@@ -1461,7 +1465,10 @@
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
                         <template x-for="(img, idx) in uploadImages" :key="img.id">
                             <div class="relative group">
-                                <img :src="img.base64" class="h-16 w-16 object-cover rounded-lg border border-line">
+                                <div x-show="!img.base64"
+                                    class="h-16 w-16 rounded-lg border border-line bg-surface-muted animate-pulse"></div>
+                                <img x-show="img.base64" :src="img.base64"
+                                    class="h-16 w-16 object-cover rounded-lg border border-line">
                                 <button @click="removeImage(idx)"
                                     class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
                                     :title="window.t('chat.remove_image')">
@@ -3098,10 +3105,10 @@
         }
     },
 
-    startPrefillPolling(chatId, modelId) {
+    startPrefillPolling(chatId) {
         const stream = this.getStreamSession(chatId, true);
         this.stopPrefillPolling(chatId);
-        stream._prefillInterval = setInterval(() => this._pollPrefill(chatId, modelId), 500);
+        stream._prefillInterval = setInterval(() => this._pollPrefill(chatId), 500);
     },
 
     stopPrefillPolling(chatId) {
@@ -3112,9 +3119,12 @@
         }
     },
 
-            async _pollPrefill(chatId, modelId) {
+            async _pollPrefill(chatId) {
         const stream = this.getStreamSession(chatId, false);
         if (!stream?.isStreaming) return;
+        const session = this.getChatSession(chatId, false);
+        const modelId = stream.sourceModel || session?.model;
+        if (!modelId) return;
         try {
             const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
             if (!resp.ok) return;
@@ -3175,7 +3185,9 @@
     handleImageSelect(event) {
         const files = event.target.files;
         if (!files) return;
-        Array.from(files).forEach(f => this.loadImageFile(f));
+        Array.from(files)
+            .filter(f => f.type.startsWith('image/'))
+            .forEach(f => this.loadImageFile(f));
         event.target.value = '';
     },
 
@@ -3193,14 +3205,19 @@
 
         if (this.uploadImages.length >= 10) return;
 
+        const id = `img_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        this.uploadImages.push({ id, base64: null, _pending: true });
+
         const reader = new FileReader();
         reader.onload = (e) => {
-            this.uploadImages.push({
-                id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-                base64: e.target.result
-            });
+            const entry = this.uploadImages.find(img => img.id === id);
+            if (!entry?._pending) return;
+            entry.base64 = e.target.result;
+            delete entry._pending;
         };
         reader.onerror = () => {
+            const idx = this.uploadImages.findIndex(img => img.id === id);
+            if (idx >= 0) this.uploadImages.splice(idx, 1);
             alert(window.t('chat.error.image_load_failed'));
         };
         reader.readAsDataURL(file);
@@ -3305,12 +3322,19 @@
         });
     },
 
-    saveApiKey() {
+    async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
         localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
         this.apiKeySet = true;
         this.apiKeyInput = '';
-        this.loadModels();
+        try {
+            await this.loadModels();
+            if (this.currentModel) {
+                await this.loadModelCapabilities(this.currentModel);
+            }
+        } catch (e) {
+            console.error('Failed to load models after saving API key:', e);
+        }
         this.loadChatHistory();
     },
 
@@ -4001,7 +4025,7 @@
 
     async sendMessage() {
         const userText = this.inputMessage.trim();
-        const images = [...this.uploadImages];
+        const images = this.uploadImages.filter(img => img.base64);
 
         if (!userText && images.length === 0) return;
         if (!this.currentModel || this.isCurrentChatStreaming()) return;
@@ -4115,9 +4139,8 @@
             context._apiVariantChainId = stream.targetMessageId;
         }
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
-        const apiModel = requestBody.model;
         this.setEngineStatus(context.chatId, { text: 'Starting' });
-        this.startPrefillPolling(context.chatId, apiModel);
+        this.startPrefillPolling(context.chatId);
 
         try {
             const response = await fetch('/v1/chat/completions', {
@@ -4837,7 +4860,7 @@
     },
 
     // Delete chat
-    deleteChat(chatId) {
+    async deleteChat(chatId) {
         if (!confirm(window.t('chat.confirm_delete_chat'))) return;
 
         this.getStreamSession(chatId, false)?.abortController?.abort();
@@ -4849,13 +4872,13 @@
 
         // If deleted current chat, start new
         if (this.currentChatId === chatId) {
-            this.startNewChat();
+            await this.startNewChat();
         }
 
     },
 
     // Clear all history
-    clearAllHistory() {
+    async clearAllHistory() {
         if (!confirm(window.t('chat.confirm_clear_all'))) return;
 
         this.stopAllStreams();
@@ -4863,7 +4886,7 @@
         this.chatSessions = {};
         this.streamSessions = {};
         this.saveChatHistory();
-        this.startNewChat();
+        await this.startNewChat();
 
     },
 
@@ -5055,7 +5078,7 @@
             return;
         }
 
-        const { stableRoot, tailRoot } = this.ensureStreamingRoots(container);
+        const { stableRoot, tailRoot } = this.ensureStreamingRoots(container, stream);
         const cutoff = this.findStableRenderCutoff(text);
         const safeCutoff = Math.max(cutoff, stream.streamRenderState.stableIndex);
 
@@ -5077,23 +5100,23 @@
         });
     },
 
-    ensureStreamingRoots(container) {
+    ensureStreamingRoots(container, stream = this.currentStream()) {
         let stableRoot = container.querySelector('[data-streaming-stable-root]');
         let tailRoot = container.querySelector('[data-streaming-tail-root]');
         if (!stableRoot || !tailRoot) {
-            this.resetStreamingRoots(container);
+            this.resetStreamingRoots(container, stream);
             stableRoot = container.querySelector('[data-streaming-stable-root]');
             tailRoot = container.querySelector('[data-streaming-tail-root]');
         }
         return { stableRoot, tailRoot };
     },
 
-    resetStreamingRoots(container) {
+    resetStreamingRoots(container, stream = this.currentStream()) {
         container.innerHTML = `
                     <div data-streaming-stable-root="true"></div>
                     <div data-streaming-tail-root="true"></div>
                 `;
-        this.resetStreamRenderState(this.currentStream());
+        this.resetStreamRenderState(stream);
     },
 
     resetStreamRenderState(stream = this.currentStream()) {
@@ -5188,6 +5211,12 @@
         });
     },
 
+    _isMarkdownCharEscaped(text, index) {
+        let slashes = 0;
+        for (let j = index - 1; j >= 0 && text[j] === '\\'; j--) slashes++;
+        return slashes % 2 === 1;
+    },
+
     findStableRenderCutoff(text) {
         if (!text) return 0;
 
@@ -5203,10 +5232,9 @@
 
         for (let i = 0; i < text.length; i++) {
             const ch = text[i];
-            const prev = i > 0 ? text[i - 1] : '';
             const nextTwo = text.slice(i, i + 2);
             const nextThree = text.slice(i, i + 3);
-            const escaped = prev === '\\';
+            const escaped = this._isMarkdownCharEscaped(text, i);
 
             if (!inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && nextThree === '```') {
                 inFence = !inFence;
