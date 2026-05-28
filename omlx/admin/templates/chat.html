@@ -194,6 +194,15 @@
         background: color-mix(in srgb, var(--timeline-accent) 12%, var(--bg-secondary));
     }
 
+    .response-tab-group.response-tab-group--active-missing {
+        border: 1.5px solid #ef4444;
+    }
+
+    .response-tab-group.response-tab-group--active-missing:hover {
+        background: color-mix(in srgb, #ef4444 12%, var(--bg-secondary));
+        border-color: #ef4444;
+    }
+
     .response-tab-delete {
         flex: 0 0 auto;
         display: inline-flex;
@@ -1156,7 +1165,10 @@
                                         <template x-for="(variant, vi) in getTurnVariantsForUser(index)"
                                             :key="variant.id">
                                             <div class="response-tab-group"
-                                                :class="{ 'response-tab-group--active': isActiveVariantForUser(index, variant.id) }">
+                                                :class="{
+                                                    'response-tab-group--active': isActiveVariantForUser(index, variant.id) && !variantModelMissing(variant),
+                                                    'response-tab-group--active-missing': isActiveVariantForUser(index, variant.id) && variantModelMissing(variant),
+                                                }">
                                                 <button type="button" class="response-tab text-xs"
                                                     :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
                                                     @click="selectVariant(index, variant.id)"
@@ -1649,7 +1661,7 @@
                         style="color: var(--text-secondary);">Active Model</label>
                     <div class="relative">
                         <select x-model="currentModel"
-                            @change="selectModel($event.target.value); modelSettingsDirty = false;"
+                            @change="selectModel($event.target.value)"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
                             style="color: var(--text-primary);">
                             <template x-for="model in availableModels" :key="model.id">
@@ -1670,7 +1682,7 @@
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Temperature</label>
-                        <input type="number" x-model.number="modelSettings.temperature" @input="modelSettingsDirty = true"
+                        <input type="number" x-model.number="modelSettings.temperature" @input="onModelSettingsChange()"
                             step="0.1" min="0" max="2" placeholder="Default"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
@@ -1678,7 +1690,7 @@
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Max Tokens</label>
-                        <input type="number" x-model.number="modelSettings.max_tokens" @input="modelSettingsDirty = true"
+                        <input type="number" x-model.number="modelSettings.max_tokens" @input="onModelSettingsChange()"
                             min="1" placeholder="Default"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
@@ -1690,7 +1702,7 @@
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Top P</label>
-                        <input type="number" x-model.number="modelSettings.top_p" @input="modelSettingsDirty = true"
+                        <input type="number" x-model.number="modelSettings.top_p" @input="onModelSettingsChange()"
                             step="0.05" min="0" max="1" placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
@@ -1698,7 +1710,7 @@
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Top K</label>
-                        <input type="number" x-model.number="modelSettings.top_k" @input="modelSettingsDirty = true" min="0"
+                        <input type="number" x-model.number="modelSettings.top_k" @input="onModelSettingsChange()" min="0"
                             placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
@@ -1706,7 +1718,7 @@
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Min P</label>
-                        <input type="number" x-model.number="modelSettings.min_p" @input="modelSettingsDirty = true"
+                        <input type="number" x-model.number="modelSettings.min_p" @input="onModelSettingsChange()"
                             step="0.01" min="0" max="1" placeholder="—"
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
@@ -1719,7 +1731,7 @@
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Rep Penalty</label>
                         <input type="number" x-model.number="modelSettings.repetition_penalty"
-                            @input="modelSettingsDirty = true" step="0.05" min="0" placeholder="Default"
+                            @input="onModelSettingsChange()" step="0.05" min="0" placeholder="Default"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
@@ -1727,7 +1739,7 @@
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Pres Penalty</label>
                         <input type="number" x-model.number="modelSettings.presence_penalty"
-                            @input="modelSettingsDirty = true" step="0.05" min="-2" max="2" placeholder="Default"
+                            @input="onModelSettingsChange()" step="0.05" min="-2" max="2" placeholder="Default"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
@@ -1736,11 +1748,11 @@
                 <!-- Thinking Mode Toggle -->
                 <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
                     <div class="flex items-center gap-2">
-                        <input type="checkbox" x-model="modelSettings.enable_thinking" @change="modelSettingsDirty = true"
+                        <input type="checkbox" x-model="modelSettings.enable_thinking" @change="onModelSettingsChange()"
                             class="rounded flex-shrink-0">
                         <label class="text-xs font-semibold flex-1" style="color: var(--text-primary);">Thinking</label>
                         <div x-show="modelSettings.enable_thinking" x-collapse class="flex items-center gap-1.5">
-                            <select x-model="modelSettings.thinking_budget_enabled" @change="modelSettingsDirty = true"
+                            <select x-model="modelSettings.thinking_budget_enabled" @change="onModelSettingsChange()"
                                 class="px-2 py-1 text-[10px] border border-line rounded-lg bg-surface"
                                 style="color: var(--text-primary);">
                                 <option :value="false">No Limit</option>
@@ -1750,7 +1762,7 @@
                     </div>
                     <div x-show="modelSettings.enable_thinking && modelSettings.thinking_budget_enabled" x-collapse>
                         <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @input="modelSettingsDirty = true" placeholder="Tokens (e.g. 1024)"
+                            @input="onModelSettingsChange()" placeholder="Tokens (e.g. 1024)"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
                     </div>
@@ -1764,7 +1776,7 @@
                                 Quantization</label>
                             <p class="text-[10px] mt-0.5" style="color: var(--text-tertiary);">Compress with TurboQuant</p>
                         </div>
-                        <button type="button" @click="if (!isParoquant && speculativeEngine !== 'mtp' && speculativeEngine !== 'vlm_mtp') { modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled; modelSettingsDirty = true; }"
+                        <button type="button" @click="if (!isParoquant && speculativeEngine !== 'mtp' && speculativeEngine !== 'vlm_mtp') { modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled; onModelSettingsChange(); }"
                             :disabled="isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp'"
                             :title="isParoquant ? paroquantReason : (speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp' ? 'MTP is incompatible with TurboQuant' : '')"
                             :style="{
@@ -1781,7 +1793,7 @@
                         <div class="space-y-1">
                             <label class="text-[10px] font-bold uppercase tracking-wider block"
                                 style="color: var(--text-secondary);">Bit Depth</label>
-                            <select x-model="modelSettings.turboquant_kv_bits" @change="modelSettingsDirty = true"
+                            <select x-model="modelSettings.turboquant_kv_bits" @change="onModelSettingsChange()"
                                 class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                                 style="color: var(--text-primary);">
                                 <template x-for="bits in turboquantBitDepths" :key="bits">
@@ -1796,7 +1808,7 @@
                 <div class="p-3 bg-surface-muted rounded-xl space-y-2 border border-line">
                     <label class="text-xs font-semibold block" style="color: var(--text-primary);">Speculative
                         Decoding</label>
-                    <select x-model="speculativeEngine" @change="modelSettingsDirty = true"
+                    <select x-model="speculativeEngine" @change="onModelSettingsChange()"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
                         <option value="none">None</option>
@@ -1809,28 +1821,13 @@
                         class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">Draft Model Path / Alias</label>
-                        <input type="text" x-model="speculativeDraftModel" @input="modelSettingsDirty = true"
+                        <input type="text" x-model="speculativeDraftModel" @input="onModelSettingsChange()"
                             placeholder="e.g. mlx-community/DraftModel"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
                     </div>
                 </div>
 
-                <!-- Save Model Settings button -->
-                <div class="flex justify-center pt-1">
-                    <button @click="saveSessionModelSettings()" :disabled="savingModelSettings || showSavedText"
-                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[10px] font-semibold transition-all duration-200"
-                        :class="modelSettingsDirty && !savingModelSettings && !showSavedText
-                            ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
-                            : showSavedText
-                                ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
-                                : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
-                        <i data-lucide="save" class="w-3 h-3" x-show="!savingModelSettings && !showSavedText"></i>
-                        <span x-show="!savingModelSettings && !showSavedText">Save Setting</span>
-                        <span x-show="savingModelSettings">Saving…</span>
-                        <span x-show="showSavedText">Saved</span>
-                    </button>
-                </div>
             </div>
 
         </div>
@@ -1996,8 +1993,6 @@
             // Right Sidebar State
             rightSidebarOpen: window.innerWidth >= 1200,
             showRightToggle: window.innerWidth < 1200,
-            savingModelSettings: false,
-            showSavedText: false,
             modelSettingsDirty: false,
             speculativeEngine: 'none',
             speculativeDraftModel: '',
@@ -2162,6 +2157,32 @@
                 return this.aliasToGateway[modelId] || modelId;
             },
 
+            isModelAvailableOnServer(modelId) {
+                if (!modelId || !this.availableModels?.length) return false;
+                const gatewayId = this.resolveGatewayModelId(modelId);
+                return this.availableModels.some(m =>
+                    m.id === gatewayId
+                    || m.id === modelId
+                    || m.name === modelId
+                    || m.name === gatewayId
+                );
+            },
+
+            variantModelMissing(variant) {
+                const modelRef = variant?.meta?.modelId || variant?.model;
+                return Boolean(modelRef) && !this.isModelAvailableOnServer(modelRef);
+            },
+
+            resolveDefaultAvailableModel() {
+                if (this.currentModel && this.isModelAvailableOnServer(this.currentModel)) {
+                    return this.resolveGatewayModelId(this.currentModel);
+                }
+                if (this.availableModels?.length) {
+                    return this.availableModels[0].id;
+                }
+                return null;
+            },
+
             /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
             sliceToUserTurn(messages, endIndex) {
                 let userIdx = -1;
@@ -2209,7 +2230,20 @@
                 return segments[segments.length - 1];
             },
 
-            getApiTurnMessages(messages, excludeVariantsAtUserIndex = null) {
+            getVariantChainFrom(turnMessages, variantId) {
+                if (!turnMessages.length || !variantId) return [];
+                const start = turnMessages.findIndex(m => m.id === variantId);
+                if (start < 0) return this.getActiveVariantChain(turnMessages, variantId);
+                const chain = [];
+                for (let i = start; i < turnMessages.length; i++) {
+                    const m = turnMessages[i];
+                    if (i > start && m.role === 'assistant' && m._ui !== false) break;
+                    chain.push(m);
+                }
+                return chain;
+            },
+
+            getApiTurnMessages(messages, excludeVariantsAtUserIndex = null, regenChainId = null) {
                 const result = [];
                 let i = 0;
                 while (i < messages.length) {
@@ -2226,7 +2260,11 @@
                         turn.push(messages[i]);
                         i++;
                     }
-                    if (userIdx !== excludeVariantsAtUserIndex) {
+                    if (userIdx === excludeVariantsAtUserIndex) {
+                        if (regenChainId) {
+                            result.push(...this.getVariantChainFrom(turn, regenChainId));
+                        }
+                    } else {
                         result.push(...this.getActiveVariantChain(turn, msg._activeVariantId));
                     }
                 }
@@ -2307,7 +2345,7 @@
                 this.recentStats = this.emptyStats();
             },
 
-            selectVariant(userIndex, variantId) {
+            async selectVariant(userIndex, variantId) {
                 if (this.isCurrentChatStreaming()) return;
                 const session = this.getChatSession(this.currentChatId, true);
                 if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
@@ -2315,8 +2353,75 @@
                 this.messages = session.messages;
                 const variant = session.messages.find(m => m.id === variantId);
                 this.applyVariantStats(variant);
+                await this.applyVariantPanelSnapshot(variant, session);
                 this.saveCurrentChat(this.currentChatId);
                 this.scheduleEnhanceMessages();
+            },
+
+            applyGenerationSnapshot(generation) {
+                if (!generation || typeof generation !== 'object') return;
+                const s = { ...this.defaultModelSettings(), ...this.modelSettings };
+                const scalarKeys = [
+                    'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
+                    'repetition_penalty', 'presence_penalty',
+                ];
+                for (const key of scalarKeys) {
+                    if (generation[key] != null) s[key] = generation[key];
+                }
+                if (generation.enable_thinking) {
+                    s.enable_thinking = true;
+                    s.thinking_budget_enabled = generation.thinking_budget_tokens != null;
+                    s.thinking_budget_tokens = generation.thinking_budget_tokens ?? s.thinking_budget_tokens;
+                } else {
+                    s.enable_thinking = false;
+                    s.thinking_budget_enabled = false;
+                }
+                this.modelSettings = s;
+            },
+
+            async applyVariantPanelSnapshot(variant, session) {
+                if (!variant || !session) return;
+                const meta = variant.meta || {};
+                const modelMissing = this.variantModelMissing(variant);
+
+                if (modelMissing) {
+                    const fallbackModel = this.resolveDefaultAvailableModel();
+                    if (fallbackModel) {
+                        this.currentModel = fallbackModel;
+                        session.model = fallbackModel;
+                        session.modelSettings = null;
+                        session.speculativeEngine = null;
+                        session.speculativeDraftModel = null;
+                        await this.ensureSessionModelSettings(session, fallbackModel);
+                        this.saveModelSettingsForModel(session, fallbackModel);
+                    }
+                } else {
+                    if (meta.modelId) {
+                        const gatewayId = this.resolveGatewayModelId(meta.modelId);
+                        this.currentModel = gatewayId;
+                        session.model = gatewayId;
+                    }
+                    if (meta.generation) {
+                        this.applyGenerationSnapshot(meta.generation);
+                    }
+                }
+                if (meta.profileName) {
+                    const name = this.normalizeProfileName(meta.profileName);
+                    if (name && this.promptProfiles.some(p => p.name === name)) {
+                        this.activePromptProfile = name;
+                        session.activeProfile = name;
+                    }
+                }
+                if (meta.systemPrompt != null && String(meta.systemPrompt).trim()) {
+                    this.systemPrompt = String(meta.systemPrompt).trim();
+                    session.systemPrompt = this.systemPrompt;
+                }
+                this.syncSessionModelSettingsFromUi(session);
+                this.modelSettingsDirty = false;
+                this.persistChatSettingsToHistory(this.currentChatId);
+                if (this.currentModel) {
+                    await this.loadModelCapabilities(this.currentModel);
+                }
             },
 
             variantTabLabel(variant, index) {
@@ -2497,10 +2602,11 @@
             buildMessagesForApi(messages, systemPrompt, opts = {}) {
                 const variantUserIndex = opts.variantUserIndex ?? null;
                 const excludeVariantsAtUserIndex = opts.excludeVariantsAtUserIndex ?? null;
+                const regenChainId = opts.regenChainId ?? null;
                 const apiSystemPrompt = this.resolveApiSystemPrompt(
                     messages, systemPrompt, variantUserIndex
                 );
-                const out = this.getApiTurnMessages(messages, excludeVariantsAtUserIndex)
+                const out = this.getApiTurnMessages(messages, excludeVariantsAtUserIndex, regenChainId)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
                         const m = { role: msg.role, content: msg.content ?? null };
@@ -2522,8 +2628,9 @@
 
             buildChatCompletionBody(messages, context, depth = 0) {
                 const variantUserIndex = context._variantUserIndex ?? null;
-                const excludeVariantsAtUserIndex = depth === 0
-                    ? (context._excludeVariantsAtUserIndex ?? null)
+                const excludeVariantsAtUserIndex = context._excludeVariantsAtUserIndex ?? null;
+                const regenChainId = excludeVariantsAtUserIndex != null && depth > 0
+                    ? (context._apiVariantChainId ?? null)
                     : null;
                 const model = this.resolveApiModel(messages, context.model, variantUserIndex);
                 const generation = this.resolveApiGenerationOverrides(messages, variantUserIndex);
@@ -2532,6 +2639,7 @@
                     messages: this.buildMessagesForApi(messages, context.systemPrompt, {
                         variantUserIndex,
                         excludeVariantsAtUserIndex,
+                        regenChainId,
                     }),
                     stream: true,
                     stream_options: { include_usage: true },
@@ -3180,22 +3288,21 @@
         this.syncSessionModelSettingsFromUi(session);
     },
 
-    async saveSessionModelSettings() {
-        if (!this.currentChatId) return;
-        this.savingModelSettings = true;
-        try {
-            const session = this.getChatSession(this.currentChatId, true);
+    onModelSettingsChange() {
+        this.modelSettingsDirty = true;
+        this.schedulePersistModelSettings();
+    },
+
+    schedulePersistModelSettings() {
+        clearTimeout(this._persistModelSettingsTimer);
+        this._persistModelSettingsTimer = setTimeout(() => {
+            if (!this.currentChatId) return;
+            const session = this.getChatSession(this.currentChatId, false);
+            if (!session) return;
             this.syncSessionModelSettingsFromUi(session);
             this.persistChatSettingsToHistory(this.currentChatId);
             this.modelSettingsDirty = false;
-            this.showSavedText = true;
-            setTimeout(() => this.showSavedText = false, 2000);
-        } catch (e) {
-            console.error('Error saving session model settings:', e);
-            alert('Error saving settings for this chat.');
-        } finally {
-            this.savingModelSettings = false;
-        }
+        }, 400);
     },
 
     // Poll stats during generation
@@ -3758,6 +3865,7 @@
             _profile: null,
             _variantUserIndex: streamContext?._variantUserIndex ?? null,
             _excludeVariantsAtUserIndex: streamContext?._excludeVariantsAtUserIndex ?? null,
+            _apiVariantChainId: streamContext?._apiVariantChainId ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -3808,6 +3916,9 @@
             stream.streamingContent = '';
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
+        if (stream.targetMessageId) {
+            context._apiVariantChainId = stream.targetMessageId;
+        }
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
         const apiModel = requestBody.model;
         this.setEngineStatus(context.chatId, { text: 'Starting' });
