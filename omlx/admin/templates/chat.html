@@ -127,6 +127,33 @@
         }
     }
 
+    .response-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+        margin-top: 0.5rem;
+        justify-content: flex-end;
+    }
+
+    .response-tab {
+        border: 1px solid var(--border-normal);
+        background: var(--bg-secondary);
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    .response-tab:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .response-tab--active {
+        background: var(--btn-primary);
+        color: var(--btn-primary-text);
+        border-color: var(--btn-primary);
+    }
+
     .assistant-message {
         background: var(--bg-primary);
         border: 1px solid var(--border-faint);
@@ -965,7 +992,8 @@
             <!-- Messages -->
             <div x-show="messages.length > 0" class="max-w-4xl mx-auto px-4 py-6 space-y-4">
                 <template x-for="(msg, index) in messages" :key="msg.id">
-                    <div class="message-fade-in">
+                    <div class="message-fade-in" x-show="isMessageVisible(msg, index)"
+                        :data-msg-index="index">
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
                             <div class="user-message" :class="{ 'is-editing': editingIndex === index }">
@@ -1064,6 +1092,17 @@
                                         </div>
                                     </div>
                                 </template>
+                                <template x-if="getTurnVariantsForUser(index).length > 1">
+                                    <div class="response-tabs w-full">
+                                        <template x-for="(variant, vi) in getTurnVariantsForUser(index)"
+                                            :key="variant.id">
+                                            <button type="button" class="response-tab px-2 py-1 text-xs rounded-lg"
+                                                :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
+                                                @click="selectVariant(index, variant.id)"
+                                                x-text="variantTabLabel(variant, vi)"></button>
+                                        </template>
+                                    </div>
+                                </template>
                             </div>
                         </div>
 
@@ -1073,7 +1112,7 @@
                                 <div class="flex items-center gap-2 text-sm font-medium"
                                     style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
-                                    <span x-text="msg.model || currentModel || window.t('chat.assistant_label')"></span>
+                                    <span x-text="variantModelLabel(msg)"></span>
                                     <span x-show="msg._profile && msg._profile !== 'System Default'"
                                         class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
                                         style="color: var(--text-tertiary);"
@@ -2033,17 +2072,120 @@
                 return result;
             },
 
+            findUserIndexForMessage(messages, msgIndex) {
+                for (let i = msgIndex; i >= 0; i--) {
+                    if (messages[i]?.role === 'user') return i;
+                }
+                return -1;
+            },
+
+            getTurnVariantsForUser(userIndex) {
+                const messages = this.messages;
+                if (!messages[userIndex] || messages[userIndex].role !== 'user') return [];
+                const variants = [];
+                for (let i = userIndex + 1; i < messages.length && messages[i].role !== 'user'; i++) {
+                    const m = messages[i];
+                    if (m.role === 'assistant' && m._ui !== false) variants.push(m);
+                }
+                return variants;
+            },
+
+            getActiveVariantForUser(messages, userIndex) {
+                const variants = [];
+                for (let i = userIndex + 1; i < messages.length && messages[i].role !== 'user'; i++) {
+                    const m = messages[i];
+                    if (m.role === 'assistant' && m._ui !== false) variants.push(m);
+                }
+                if (!variants.length) return null;
+                const activeId = messages[userIndex]._activeVariantId;
+                if (activeId) {
+                    return variants.find(v => v.id === activeId) || variants[variants.length - 1];
+                }
+                return variants[variants.length - 1];
+            },
+
+            isMessageVisible(msg, index) {
+                if (msg._ui === false) return false;
+                if (msg.role !== 'assistant') return true;
+                const userIdx = this.findUserIndexForMessage(this.messages, index);
+                if (userIdx < 0) return true;
+                const active = this.getActiveVariantForUser(this.messages, userIdx);
+                return active ? msg.id === active.id : true;
+            },
+
+            isActiveVariantForUser(userIndex, variantId) {
+                const user = this.messages[userIndex];
+                if (!user) return false;
+                const activeId = user._activeVariantId;
+                const variants = this.getTurnVariantsForUser(userIndex);
+                if (!variants.length) return false;
+                if (activeId) return activeId === variantId;
+                return variants[variants.length - 1].id === variantId;
+            },
+
+            selectVariant(userIndex, variantId) {
+                const session = this.getChatSession(this.currentChatId, true);
+                if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
+                session.messages[userIndex]._activeVariantId = variantId;
+                this.messages = session.messages;
+                this.saveCurrentChat(this.currentChatId);
+                this.scheduleEnhanceMessages();
+            },
+
+            variantTabLabel(variant, index) {
+                const meta = variant.meta || {};
+                const name = meta.modelDisplay || variant.model || `Response ${index + 1}`;
+                return name.length > 28 ? name.slice(0, 26) + '…' : name;
+            },
+
+            variantModelLabel(msg) {
+                const meta = msg.meta || {};
+                return meta.modelDisplay || msg.model || this.currentModel
+                    || window.t('chat.assistant_label');
+            },
+
+            captureGenerationContext(modelId, systemPrompt, profile) {
+                const gatewayId = this.resolveGatewayModelId(modelId || this.currentModel);
+                const displayModel = this.availableModels.find(m => m.id === gatewayId)
+                    || this.availableModels.find(m => m.name === modelId);
+                return {
+                    modelId: gatewayId,
+                    modelDisplay: displayModel?.name || modelId || gatewayId,
+                    profileName: profile ?? this.activePromptProfile ?? null,
+                    systemPrompt: systemPrompt ?? '',
+                    capturedAt: new Date().toISOString(),
+                };
+            },
+
+            resolveApiSystemPrompt(messages, fallback) {
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].role !== 'user') continue;
+                    const variant = this.getActiveVariantForUser(messages, i);
+                    const sp = variant?.meta?.systemPrompt;
+                    if (sp != null && String(sp).trim()) return String(sp).trim();
+                    break;
+                }
+                return fallback?.trim() ? fallback.trim() : '';
+            },
+
             buildMessagesForApi(messages, systemPrompt) {
+                const apiSystemPrompt = this.resolveApiSystemPrompt(messages, systemPrompt);
                 const out = this.getApiTurnMessages(messages)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
                         const m = { role: msg.role, content: msg.content ?? null };
+                        if (msg.reasoning_content) {
+                            m.reasoning_content = msg.reasoning_content;
+                        }
+                        if (!m.reasoning_content && msg.role === 'assistant' && msg._thinking) {
+                            m.reasoning_content = msg._thinking;
+                        }
                         if (msg.tool_calls) m.tool_calls = msg.tool_calls;
                         if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
                         return m;
                     });
-                if (systemPrompt?.trim()) {
-                    out.unshift({ role: 'system', content: systemPrompt.trim() });
+                if (apiSystemPrompt) {
+                    out.unshift({ role: 'system', content: apiSystemPrompt });
                 }
                 return out;
             },
@@ -3043,6 +3185,7 @@
         const session = this.getChatSession(chatId, true);
         if (session) {
             this.ensureMessageIds(session.messages);
+            session.messages.forEach(m => this.ensureVariantMeta(m));
             this.currentChatId = chatId;
             this.messages = session.messages;
             this.systemPrompt = session.systemPrompt || '';
@@ -3210,7 +3353,8 @@
             chatId: streamContext?.chatId || this.currentChatId,
             model: streamContext?.model || this.currentModel,
             systemPrompt: streamContext?.systemPrompt ?? this.systemPrompt,
-            _profile: streamContext?._profile ?? this.activePromptProfile ?? null
+            _profile: streamContext?._profile ?? this.activePromptProfile ?? null,
+            _variantUserIndex: streamContext?._variantUserIndex ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
@@ -3242,6 +3386,14 @@
             stream.targetMessageId = this.newMessageId();
             stream.sourceModel = context.model;
             stream.sourceSystemPrompt = context.systemPrompt;
+            if (context._variantUserIndex == null) {
+                for (let i = chatSession.messages.length - 1; i >= 0; i--) {
+                    if (chatSession.messages[i].role === 'user') {
+                        context._variantUserIndex = i;
+                        break;
+                    }
+                }
+            }
             this.startStatsPolling();
         }
         stream.isStreaming = true;
@@ -3520,11 +3672,12 @@
                 content: stream.streamingContent || '',
                 model: context.model,
                 _profile: context._profile,
+                meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                 _perfVisible: false,
                 _thinking: stream.streamingThinking || null,
                 _thinkingOpen: false,
             });
-            this._setActiveVariant(chatSession, assistantId);
+            this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
             this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
             if (this.currentChatId === context.chatId) {
                 this.scheduleEnhanceMessages();
@@ -3548,11 +3701,12 @@
                         content: stream.streamingContent,
                         model: context.model,
                         _profile: context._profile,
+                        meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                         _perfVisible: false,
                         _thinking: stream.streamingThinking || null,
                         _thinkingOpen: false,
                     });
-                    this._setActiveVariant(chatSession, assistantId);
+                    this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                     this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                     if (this.currentChatId === context.chatId) {
                         this.scheduleEnhanceMessages();
@@ -3567,9 +3721,10 @@
                     content: `Error: ${error.message}`,
                     model: context.model,
                     _profile: context._profile,
+                    meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                     _perfVisible: false,
                 });
-                this._setActiveVariant(chatSession, assistantId);
+                this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
                     this.scheduleEnhanceMessages();
@@ -3630,11 +3785,11 @@
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
 
-        // Find the profile from the assistant message being regenerated
         const origMsg = session.messages[index];
-        const profileToUse = origMsg?._profile ?? this.activePromptProfile ?? null;
+        if (!origMsg || origMsg.role !== 'assistant' || origMsg._ui === false) return;
 
-        session.messages = this.sliceToUserTurn(session.messages, index);
+        const userIdx = this.findUserIndexForMessage(session.messages, index);
+        const profileToUse = origMsg?._profile ?? this.activePromptProfile ?? null;
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
@@ -3642,7 +3797,8 @@
             chatId: this.currentChatId,
             model: this.currentModel,
             systemPrompt: this.systemPrompt,
-            _profile: profileToUse
+            _profile: profileToUse,
+            _variantUserIndex: userIdx,
         }, 0);
     },
 
@@ -3695,13 +3851,20 @@
         this.scheduleEnhanceMessages();
     },
 
-    _setActiveVariant(session, assistantId) {
-        for (let i = session.messages.length - 1; i >= 0; i--) {
-            if (session.messages[i].role === 'user') {
-                session.messages[i]._activeVariantId = assistantId;
-                return;
-            }
+    _setActiveVariant(session, assistantId, userIndex = null) {
+        let u = userIndex;
+        if (u == null || session.messages[u]?.role !== 'user') {
+            const aIdx = session.messages.findIndex(m => m.id === assistantId);
+            u = aIdx >= 0 ? this.findUserIndexForMessage(session.messages, aIdx) : -1;
         }
+        if (u >= 0) {
+            session.messages[u]._activeVariantId = assistantId;
+        }
+    },
+
+    ensureVariantMeta(msg) {
+        if (msg.role !== 'assistant' || msg.meta) return;
+        msg.meta = this.captureGenerationContext(msg.model, '', msg._profile);
     },
 
     branchChat(index) {
@@ -3764,11 +3927,13 @@
         const visible = container.querySelectorAll('.message-fade-in');
         const scrollMax = container.scrollHeight - railHeight;
         const result = [];
-        visible.forEach((el, i) => {
+        visible.forEach((el) => {
             if (el.offsetParent === null) return;
+            const msgIndex = parseInt(el.dataset.msgIndex, 10);
+            if (Number.isNaN(msgIndex)) return;
             const msgTop = el.offsetTop;
             const ratio = scrollMax > 0 ? Math.min(msgTop / scrollMax, 1) : 0;
-            result.push({ index: i, topPx: 16 + (ratio * (railHeight - 32)) });
+            result.push({ index: msgIndex, topPx: 16 + (ratio * (railHeight - 32)) });
         });
         this.timelineDots = result;
     },
@@ -3779,11 +3944,13 @@
         const scrollTop = container.scrollTop;
         const visible = container.querySelectorAll('.message-fade-in');
         let active = this.timelineActive;
-        visible.forEach((el, i) => {
+        visible.forEach((el) => {
             if (el.offsetParent === null) return;
+            const msgIndex = parseInt(el.dataset.msgIndex, 10);
+            if (Number.isNaN(msgIndex)) return;
             const offset = el.offsetTop;
             if (offset <= scrollTop + 60) {
-                active = i;
+                active = msgIndex;
             }
         });
         this.timelineActive = active;
@@ -3809,8 +3976,8 @@
         this.timelineActive = index;
         const container = document.getElementById('messagesContainer');
         if (!container) return;
-        const target = container.querySelectorAll('.message-fade-in')[index];
-        if (target) {
+        const target = container.querySelector(`.message-fade-in[data-msg-index="${index}"]`);
+        if (target && target.offsetParent !== null) {
             target.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
     },
