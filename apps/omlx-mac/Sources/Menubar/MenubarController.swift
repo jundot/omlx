@@ -7,9 +7,9 @@
 //   • Stop Server     (RUNNING / STARTING / STOPPING / UNRESPONSIVE)
 //   • Start Server    (STOPPED / IDLE / FAILED)
 //   • Serving Stats   (Session + All-Time submenu)
-//   • Admin Panel     (enabled when running — opens the SwiftUI AppView
-//                      window via the openAppView callback)
+//   • Admin Panel     (enabled when running — opens /admin in browser)
 //   • Chat with oMLX  (enabled when running — opens /admin/chat in browser)
+//   • Set Port…       (prompt → persist to settings.json → restart server)
 //   • About oMLX
 //   • Quit oMLX       (Cmd-Q)
 //
@@ -25,9 +25,8 @@ final class MenubarController: NSObject {
     // MARK: - Inputs / state
 
     private let server: ServerProcess?
-    private let config: AppConfig
+    private var config: AppConfig
     private let bootstrapError: Error?
-    private let openAppView: () -> Void
     private let requestQuit: () -> Void
 
     private var statusItem: NSStatusItem
@@ -57,13 +56,11 @@ final class MenubarController: NSObject {
         server: ServerProcess?,
         config: AppConfig,
         lastError: Error? = nil,
-        openAppView: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
         self.config = config
         self.bootstrapError = lastError
-        self.openAppView = openAppView
         self.requestQuit = requestQuit
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -170,23 +167,30 @@ final class MenubarController: NSObject {
 
         adminPanelItem = item(String(localized: "menubar.item.admin_panel",
                                      defaultValue: "Admin Panel",
-                                     comment: "Menubar item that opens the main app window / admin panel"),
+                                     comment: "Menubar item that opens the browser-based admin dashboard"),
                               action: #selector(openAdminPanel),
                               symbol: "globe",
                               keyEquivalent: ",")
         menu.addItem(adminPanelItem)
 
         chatItem = item(String(localized: "menubar.item.chat",
-                               defaultValue: "Chat with oMLX",
+                               defaultValue: "Chat with Flyto MLX",
                                comment: "Menubar item that opens the browser-based chat dashboard"),
                         action: #selector(openChat),
                         symbol: "message")
         menu.addItem(chatItem)
 
+        let setPort = item(String(localized: "menubar.item.set_port",
+                                  defaultValue: "Set Port…",
+                                  comment: "Menubar item that prompts for a new server port and restarts"),
+                           action: #selector(promptSetPort),
+                           symbol: "number")
+        menu.addItem(setPort)
+
         menu.addItem(.separator())
 
         let about = item(String(localized: "menubar.item.about",
-                                defaultValue: "About oMLX",
+                                defaultValue: "About Flyto MLX",
                                 comment: "Menubar item that opens the standard About window"),
                          action: #selector(showAbout),
                          symbol: "info.circle")
@@ -195,7 +199,7 @@ final class MenubarController: NSObject {
         menu.addItem(.separator())
 
         let quit = item(String(localized: "menubar.item.quit",
-                               defaultValue: "Quit oMLX",
+                               defaultValue: "Quit Flyto MLX",
                                comment: "Menubar item that terminates the app (Cmd-Q)"),
                         action: #selector(quitApp),
                         symbol: "power",
@@ -490,7 +494,7 @@ final class MenubarController: NSObject {
                     comment: "Substring used when the conflicting process PID couldn't be determined")
         alert.informativeText = conflict.isOMLX
             ? String(localized: "menubar.alert.port_in_use.omlx",
-                     defaultValue: "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
+                     defaultValue: "Another Flyto MLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
                      comment: "Port-conflict alert body when the conflicting process is another oMLX instance")
             : String(localized: "menubar.alert.port_in_use.other",
                      defaultValue: "Another process (\(pidStr)) is listening on port \(String(config.port)). Choose a different port in Settings or terminate that process.",
@@ -503,10 +507,8 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openAdminPanel() {
-        // AppDelegate owns the SwiftUI Window scene; we just ask it to
-        // present. This avoids the Settings-scene + .accessory bug where
-        // `showSettingsWindow:` silently no-ops when no window is up.
-        openAppView()
+        guard let url = URL(string: "http://\(config.host):\(config.port)/admin") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func openChat() {
@@ -514,9 +516,80 @@ final class MenubarController: NSObject {
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func promptSetPort() {
+        guard let server else { return }
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = String(localized: "menubar.set_port.title",
+                                   defaultValue: "Set Server Port",
+                                   comment: "Title of the Set Port prompt")
+        alert.informativeText = String(localized: "menubar.set_port.body",
+                                       defaultValue: "Enter the port for the omlx server. The server will restart to apply it.",
+                                       comment: "Body text of the Set Port prompt")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = String(config.port)
+        field.placeholderString = "8000"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        alert.addButton(withTitle: String(localized: "menubar.set_port.apply",
+                                          defaultValue: "Apply & Restart",
+                                          comment: "Confirm button on the Set Port prompt"))
+        alert.addButton(withTitle: String(localized: "menubar.set_port.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Cancel button on the Set Port prompt"))
+        alert.window.level = .floating
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let raw = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let newPort = Int(raw), (1...65535).contains(newPort) else {
+            let err = NSAlert()
+            err.messageText = String(localized: "menubar.set_port.invalid.title",
+                                     defaultValue: "Invalid Port",
+                                     comment: "Title of the invalid-port alert")
+            err.informativeText = String(localized: "menubar.set_port.invalid.body",
+                                         defaultValue: "Enter a whole number between 1 and 65535.",
+                                         comment: "Body of the invalid-port alert")
+            err.window.level = .floating
+            err.runModal()
+            return
+        }
+        guard newPort != config.port else { return }
+
+        applyPort(newPort, to: server)
+    }
+
+    /// Persist the new port to settings.json, then stop → reconfigure →
+    /// start so the running uvicorn picks it up. ServerProcess.reconfigure
+    /// is only legal while stopped, hence the await stop() first.
+    private func applyPort(_ newPort: Int, to server: ServerProcess) {
+        var updated = config
+        updated.port = newPort
+        do {
+            try updated.save()
+        } catch {
+            NSLog("oMLX: failed to persist port \(newPort) — \(error)")
+            return
+        }
+        config = updated
+        refreshMenuState()
+
+        Task { @MainActor in
+            await server.stop()
+            do {
+                try server.reconfigure(port: newPort)
+                try server.start()
+            } catch {
+                NSLog("oMLX: restart after port change failed — \(error)")
+            }
+            refreshMenuState()
+        }
+    }
+
     @objc private func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Flyto MLX"])
     }
 
     @objc private func quitApp() {

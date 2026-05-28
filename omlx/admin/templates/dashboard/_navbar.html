@@ -3,11 +3,11 @@
             <!-- Logo -->
             <div class="flex items-center gap-2">
                 <a href="/admin/dashboard" class="flex items-center gap-2">
-                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
-                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
+                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="Flyto MLX" class="w-9 h-9">
+                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="Flyto MLX" class="w-9 h-9" x-cloak>
                 </a>
                 <div class="flex flex-col gap-0">
-                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
+                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">Flyto MLX</a>
                     <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
                        class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
                        @mouseenter="versionHover = true" @mouseleave="versionHover = false">

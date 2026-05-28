@@ -2689,7 +2689,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Another oMLX server is already running on this port (%@). Stop it before starting a new instance, or change the port in Settings."
+            "value" : "Another Flyto MLX server is already running on this port (%@). Stop it before starting a new instance, or change the port in Settings."
           }
         }
       }
@@ -2821,7 +2821,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "About oMLX"
+            "value" : "About Flyto MLX"
           }
         }
       }
@@ -2845,7 +2845,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chat with oMLX"
+            "value" : "Chat with Flyto MLX"
           }
         }
       }
@@ -2869,7 +2869,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Quit oMLX"
+            "value" : "Quit Flyto MLX"
           }
         }
       }

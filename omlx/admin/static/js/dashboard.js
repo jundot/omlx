@@ -2531,7 +2531,7 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push('Flyto MLX - LLM inference, optimized for your Mac');
                 lines.push('https://github.com/jundot/omlx');
                 lines.push(`Benchmark Model: ${this.benchModelId}`);
                 lines.push('='.repeat(80));
@@ -3184,7 +3184,7 @@
                 return window.t(`settings.resource.guard_tier_desc.${tier}`) || '';
             },
 
-            // Live breakdown line ("system 64GB, available 22GB, oMLX 18GB").
+            // Live breakdown line ("system 64GB, available 22GB, Flyto MLX 18GB").
             // Currently empty; the active dashboard already polls
             // /api/status and shows ceiling / utilization elsewhere. Stub
             // kept so x-html in the template never reads `undefined`.
