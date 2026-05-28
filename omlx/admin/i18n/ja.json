@@ -642,6 +642,7 @@
   "chat.api_key_continue": "続行",
   "chat.new_chat": "新規チャット",
   "chat.new_chat_title": "新規チャット",
+  "chat.untitled_title": "無題",
   "chat.admin_settings": "管理設定",
   "chat.clear_all_history": "全履歴を削除",
   "chat.change_api_key": "APIキーを変更",

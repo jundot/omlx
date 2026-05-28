@@ -642,6 +642,7 @@
   "chat.api_key_continue": "계속",
   "chat.new_chat": "새 대화",
   "chat.new_chat_title": "새 대화",
+  "chat.untitled_title": "제목 없음",
   "chat.admin_settings": "관리자 설정",
   "chat.clear_all_history": "전체 기록 삭제",
   "chat.change_api_key": "API 키 변경",

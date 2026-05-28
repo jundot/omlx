@@ -642,6 +642,7 @@
   "chat.api_key_continue": "继续",
   "chat.new_chat": "新对话",
   "chat.new_chat_title": "新对话",
+  "chat.untitled_title": "未命名",
   "chat.admin_settings": "管理后台",
   "chat.clear_all_history": "清除所有历史",
   "chat.change_api_key": "更换 API 密钥",

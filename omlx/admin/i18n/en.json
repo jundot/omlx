@@ -642,6 +642,7 @@
   "chat.api_key_continue": "Continue",
   "chat.new_chat": "New Chat",
   "chat.new_chat_title": "New Chat",
+  "chat.untitled_title": "Untitled",
   "chat.admin_settings": "Admin Settings",
   "chat.clear_all_history": "Clear All History",
   "chat.change_api_key": "Change API Key",

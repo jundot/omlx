@@ -642,6 +642,7 @@
   "chat.api_key_continue": "Продолжить",
   "chat.new_chat": "Новый чат",
   "chat.new_chat_title": "Новый чат",
+  "chat.untitled_title": "Без названия",
   "chat.admin_settings": "Настройки админки",
   "chat.clear_all_history": "Очистить всю историю",
   "chat.change_api_key": "Изменить API-ключ",

@@ -984,8 +984,9 @@
                     </template>
                     <template x-if="renamingChatId !== chat.id">
                         <div class="flex items-center gap-0 flex-1 min-w-0">
-                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);" :title="chat.title"
-                                x-text="chat.title || window.t('chat.new_chat_title')"></span>
+                            <span class="text-sm truncate flex-1" style="color: var(--text-primary);"
+                                :title="displayChatTitle(chat)"
+                                x-text="displayChatTitle(chat)"></span>
                             <button @click.stop="startRenamingChat(chat)"
                                 class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
                                 title="{{ t('chat.rename_tooltip') }}">
@@ -1787,9 +1788,13 @@
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">Thinking tokens</label>
                         <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @input="onModelSettingsChange()" @change="clampThinkingBudgetTokens()"
-                            placeholder="4096" min="1" step="100"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                            @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
+                            @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
+                            @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
+                            @input="onThinkingBudgetTokensInput($event)"
+                            @change="clampThinkingBudgetTokens()"
+                            placeholder="4001" min="1" step="1000"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
@@ -1880,6 +1885,20 @@
         }));
     }
 
+    const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
+
+    function resolveChatUntitledLabel() {
+        if (typeof window.t === 'function') {
+            const translated = window.t(CHAT_UNTITLED_I18N_KEY);
+            if (translated
+                && translated !== CHAT_UNTITLED_I18N_KEY
+                && !/^chat\.untitled/.test(translated)) {
+                return translated;
+            }
+        }
+        return 'Untitled';
+    }
+
     function chatApp() {
         return {
             // API Key
@@ -1900,6 +1919,8 @@
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
+            _thinkingBudgetBeforeInput: null,
+            _thinkingBudgetStepping: false,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2027,9 +2048,53 @@
             },
 
             normalizeThinkingBudgetTokens(value) {
+                if (value === '' || value == null) return 4096;
                 const n = Number(value);
-                if (!Number.isFinite(n) || n <= 0) return 4096;
+                if (!Number.isFinite(n)) return 4096;
+                if (n <= 0) return 1;
                 return Math.floor(n);
+            },
+
+            stepThinkingBudgetTokens(direction) {
+                if (this.thinkingModeValue() !== 'on_limit') return;
+                const step = 1024;
+                let v = Number(this.modelSettings.thinking_budget_tokens);
+                if (!Number.isFinite(v) || v <= 0) v = 0;
+
+                if (direction > 0) {
+                    this.modelSettings.thinking_budget_tokens = v <= 0 ? 1 : v + step;
+                } else if (v <= 1) {
+                    this.modelSettings.thinking_budget_tokens = 1;
+                } else if (v <= step) {
+                    this.modelSettings.thinking_budget_tokens = 1;
+                } else {
+                    this.modelSettings.thinking_budget_tokens = v - step;
+                }
+                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
+                this.onModelSettingsChange();
+            },
+
+            onThinkingBudgetTokensInput(event) {
+                if (this._thinkingBudgetStepping) return;
+                const el = event.target;
+                const raw = Number(el.value);
+                const prev = Number(this._thinkingBudgetBeforeInput);
+                if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
+                    const delta = raw - prev;
+                    // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
+                    if (delta !== 0 && Math.abs(delta) < 1024) {
+                        this._thinkingBudgetStepping = true;
+                        this.modelSettings.thinking_budget_tokens = prev;
+                        this.stepThinkingBudgetTokens(delta > 0 ? 1 : -1);
+                        el.value = this.modelSettings.thinking_budget_tokens;
+                        this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
+                        this._thinkingBudgetStepping = false;
+                        return;
+                    }
+                }
+                this._thinkingBudgetBeforeInput = raw;
+                this.modelSettings.thinking_budget_tokens = raw;
+                this.onModelSettingsChange();
             },
 
             clampThinkingBudgetTokens() {
@@ -2037,6 +2102,7 @@
                 this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
                     this.modelSettings.thinking_budget_tokens
                 );
+                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
             },
 
             setThinkingMode(mode) {
@@ -2126,7 +2192,10 @@
                     this.syncSessionModelSettingsFromUi(session);
                 }
                 const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
-                if (existingIndex < 0) return;
+                if (existingIndex < 0) {
+                    this.saveCurrentChat(chatId);
+                    return;
+                }
                 const snap = this.captureSessionModelSettings();
                 this.chatHistory[existingIndex] = {
                     ...this.chatHistory[existingIndex],
@@ -2151,6 +2220,54 @@
                     thinking_tokens: 0,
                     total_tokens: 0
                 };
+            },
+
+            untitledChatTitle() {
+                return resolveChatUntitledLabel();
+            },
+
+            displayChatTitle(chat) {
+                const title = chat?.title;
+                if (this.isPlaceholderChatTitle(title)) {
+                    return this.untitledChatTitle();
+                }
+                return title || this.untitledChatTitle();
+            },
+
+            isPlaceholderChatTitle(title) {
+                if (!title || !String(title).trim()) return true;
+                const normalized = String(title).trim();
+                if (/^chat\.untitled/.test(normalized)) return true;
+                if (normalized === this.untitledChatTitle()) return true;
+                const legacy = window.t('chat.new_chat_title');
+                return !!(legacy && legacy !== 'chat.new_chat_title' && normalized === legacy);
+            },
+
+            deriveChatTitleFromMessages(messages) {
+                for (const msg of messages || []) {
+                    if (msg.role !== 'user') continue;
+                    const text = this.getTextContent(msg.content)?.trim();
+                    if (text) return text.slice(0, 50);
+                }
+                return null;
+            },
+
+            resolveAutoChatTitle(messages, existingChat) {
+                const untitled = this.untitledChatTitle();
+                if (existingChat?.manualTitle) {
+                    return existingChat.title || untitled;
+                }
+                const hasAssistant = (messages || []).some(
+                    m => m.role === 'assistant' && m._ui !== false
+                );
+                const derived = this.deriveChatTitleFromMessages(messages);
+                if (hasAssistant && derived && this.isPlaceholderChatTitle(existingChat?.title)) {
+                    return derived;
+                }
+                if (!this.isPlaceholderChatTitle(existingChat?.title)) {
+                    return existingChat.title;
+                }
+                return untitled;
             },
 
             cloneData(value) {
@@ -3303,7 +3420,7 @@
     getStrippedImageCount(content) {
         if (!Array.isArray(content)) return [];
         const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
-        return new Array(count);
+        return Array.from({ length: count }, (_, i) => i);
     },
 
     // ===== End Image Upload Functions =====
@@ -3380,21 +3497,36 @@
 
     combineAbortSignals(signals) {
         const valid = (signals || []).filter(Boolean);
-        if (!valid.length) return undefined;
-        if (valid.length === 1) return valid[0];
+        if (!valid.length) return { signal: undefined, dispose() {} };
+        if (valid.length === 1) {
+            return { signal: valid[0], dispose() {} };
+        }
         if (typeof AbortSignal.any === 'function') {
-            return AbortSignal.any(valid);
+            return { signal: AbortSignal.any(valid), dispose() {} };
         }
         const controller = new AbortController();
-        const abort = () => controller.abort();
+        const listeners = [];
+        const dispose = () => {
+            for (const { signal, listener } of listeners) {
+                signal.removeEventListener('abort', listener);
+            }
+            listeners.length = 0;
+        };
+        const abort = () => {
+            dispose();
+            if (!controller.signal.aborted) {
+                controller.abort();
+            }
+        };
         for (const signal of valid) {
             if (signal.aborted) {
-                controller.abort();
-                return controller.signal;
+                abort();
+                return { signal: controller.signal, dispose() {} };
             }
-            signal.addEventListener('abort', abort, { once: true });
+            signal.addEventListener('abort', abort);
+            listeners.push({ signal, listener: abort });
         }
-        return controller.signal;
+        return { signal: controller.signal, dispose };
     },
 
             async loadModels() {
@@ -3829,6 +3961,16 @@
                     const tb = b.updatedAt ? Date.parse(b.updatedAt) : 0;
                     return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
                 });
+                let migrated = false;
+                for (const chat of this.chatHistory) {
+                    if (chat.title && /^chat\.untitled/.test(String(chat.title))) {
+                        chat.title = this.untitledChatTitle();
+                        migrated = true;
+                    }
+                }
+                if (migrated) {
+                    this.saveChatHistory();
+                }
             } catch (e) {
                 this.chatHistory = [];
             }
@@ -3863,16 +4005,31 @@
     },
 
     async startNewChat() {
+        this.cancelPersistModelSettingsTimer();
+        const prevChatId = this.currentChatId;
+        if (prevChatId) {
+            const prevSession = this.getChatSession(prevChatId, false);
+            if (prevSession) {
+                prevSession.messages = this.messages;
+                this.saveCurrentChat(prevChatId);
+            }
+        }
+
         const chatId = 'chat_' + Date.now();
-        // Load the System Default profile's prompt
         const sysDefault = this.promptProfiles.find(p => p.name === 'System Default');
         const systemPrompt = sysDefault ? sysDefault.content : '';
         this.currentChatId = chatId;
         this.uploadImages = [];
+        this.inputMessage = '';
         this.systemPrompt = systemPrompt;
         this.activePromptProfile = sysDefault ? sysDefault.name : null;
+        this.editingIndex = null;
+        this.editContent = '';
+        this.editImages = [];
+        this.renamingChatId = null;
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
+
         const session = {
             messages: [],
             model: this.currentModel,
@@ -3886,7 +4043,30 @@
         this.chatSessions[chatId] = session;
         this.messages = session.messages;
         await this.ensureSessionModelSettings(session, this.currentModel);
+        if (this.currentModel) {
+            this.saveModelSettingsForModel(session, this.currentModel);
+        }
         this.resetStreamSession(this.getStreamSession(chatId, true));
+        this.recentStats = this.emptyStats();
+        this.stopStatsPollingIfIdle();
+        this.saveCurrentChat(chatId);
+
+        this.$nextTick(() => {
+            const input = this.$refs.messageInput;
+            if (input) {
+                this.resetTextareaHeight(input);
+                input.focus();
+            }
+            if (window.innerWidth < 768) {
+                this.sidebarOpen = false;
+            }
+            const container = document.getElementById('messagesContainer');
+            if (container) {
+                container.scrollTop = 0;
+            }
+            this.computeTimelineDots();
+            this.computeTimelineActive();
+        });
     },
 
     async loadChat(chatId) {
@@ -3943,8 +4123,8 @@
 
     saveCurrentChat(chatId = this.currentChatId, messages = null, model = null, systemPrompt = null) {
         const session = this.getChatSession(chatId, false);
-        const messagesToSave = messages || session?.messages || (chatId === this.currentChatId ? this.messages : []);
-        if (!chatId || messagesToSave.length === 0) return;
+        const messagesToSave = messages ?? session?.messages ?? (chatId === this.currentChatId ? this.messages : []);
+        if (!chatId) return;
 
         const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
         const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
@@ -3963,10 +4143,7 @@
             };
         });
 
-        const title = existingChat?.manualTitle
-            ? (existingChat.title || window.t('chat.new_chat_title'))
-            : (this.getTextContent(messagesToSave[0]?.content)?.slice(0, 50)
-                || window.t('chat.new_chat_title'));
+        const title = this.resolveAutoChatTitle(messagesToSave, existingChat);
 
         const chatModel = model ?? session?.model ?? (chatId === this.currentChatId ? this.currentModel : null);
         const chatSystemPrompt = systemPrompt ?? session?.systemPrompt ?? (chatId === this.currentChatId ? this.systemPrompt : '');
@@ -4023,7 +4200,7 @@
 
     startRenamingChat(chat) {
         this.renamingChatId = chat.id;
-        this.renameDraft = chat.title || window.t('chat.new_chat_title');
+        this.renameDraft = chat.title || this.untitledChatTitle();
         this.$nextTick(() => {
             const ref = this.$refs.renameInput;
             const input = Array.isArray(ref) ? ref[0] : ref;
@@ -4042,7 +4219,7 @@
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (!chat) return;
 
-        chat.title = this.renameDraft.trim() || window.t('chat.new_chat_title');
+        chat.title = this.renameDraft.trim() || this.untitledChatTitle();
         chat.manualTitle = true;
         chat.updatedAt = new Date().toISOString();
         this.saveChatHistory();
@@ -4358,16 +4535,21 @@
                     try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) { }
                     try {
                         const timeoutSignal = AbortSignal.timeout?.(this.TOOL_TIMEOUT_MS);
-                        const combinedSignal = this.combineAbortSignals([
+                        const { signal: combinedSignal, dispose: disposeCombinedSignal } = this.combineAbortSignals([
                             stream.abortController?.signal,
                             timeoutSignal,
                         ]);
-                        const execResp = await fetch('/v1/mcp/execute', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
-                            body: JSON.stringify({ tool_name: toolName, arguments: args }),
-                            signal: combinedSignal,
-                        });
+                        let execResp;
+                        try {
+                            execResp = await fetch('/v1/mcp/execute', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
+                                body: JSON.stringify({ tool_name: toolName, arguments: args }),
+                                signal: combinedSignal,
+                            });
+                        } finally {
+                            disposeCombinedSignal();
+                        }
                         const elapsed = ((Date.now() - (stream._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
                         if (!execResp.ok) {
                             return { content: `Error: HTTP ${execResp.status}`, error: true, toolName, elapsed };
@@ -4493,8 +4675,6 @@
         } finally {
             // Attach performance timeline and thinking to the final assistant message, once per prompt
             if (depth === 0) {
-                this.stopStatsPollingIfIdle();
-                this.ensureStatsPollingForCurrentChat();
                 let msg = stream.targetMessageId
                     ? chatSession.messages.find(m => m.id === stream.targetMessageId)
                     : null;
@@ -4540,6 +4720,10 @@
             }
             this.resetStreamSession(stream, { preserveFinalContent: true });
             this.thinkingAutoScroll = true;
+            if (depth === 0) {
+                this.stopStatsPollingIfIdle();
+                this.ensureStatsPollingForCurrentChat();
+            }
         }
     },
 
@@ -4693,7 +4877,7 @@
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
-        const branchName = 'Branch of ' + (originalChat?.title || window.t('chat.new_chat_title'));
+        const branchName = 'Branch of ' + (originalChat?.title || this.untitledChatTitle());
 
         const branchId = 'chat_' + Date.now();
         const branchMessages = session.messages.slice(0, index + 1).map(msg => this.cloneData(msg));
@@ -4895,14 +5079,39 @@
         delete this.streamSessions[chatId];
         delete this.chatSessions[chatId];
 
+        const wasCurrent = this.currentChatId === chatId;
         this.chatHistory = this.chatHistory.filter(c => c.id !== chatId);
         this.saveChatHistory();
 
-        // If deleted current chat, start new
-        if (this.currentChatId === chatId) {
-            await this.startNewChat();
+        if (!wasCurrent) return;
+
+        this.cancelPersistModelSettingsTimer();
+        this.currentChatId = null;
+        this.messages = [];
+        this.inputMessage = '';
+        this.uploadImages = [];
+        this.editingIndex = null;
+        this.editContent = '';
+        this.editImages = [];
+        this.recentStats = this.emptyStats();
+        this.stopStatsPollingIfIdle();
+
+        if (this.chatHistory.length > 0) {
+            await this.loadChat(this.chatHistory[0].id);
+            return;
         }
 
+        const sysDefault = this.promptProfiles.find(p => p.name === 'System Default');
+        this.systemPrompt = sysDefault ? sysDefault.content : '';
+        this.activePromptProfile = sysDefault ? sysDefault.name : null;
+
+        this.$nextTick(() => {
+            const container = document.getElementById('messagesContainer');
+            if (container) container.scrollTop = 0;
+            this.computeTimelineDots();
+            this.computeTimelineActive();
+            this.$refs.messageInput?.focus();
+        });
     },
 
     // Clear all history
@@ -5036,17 +5245,21 @@
                 }
 
                 const thinkingContent = remaining.substring(incompleteThinkIndex + '<think>'.length);
+                const streamThinkId = `think_${++this._thinkingDomSeq}`;
 
                 html += `
                             <div class="thinking-container" id="streaming-thinking-container">
-                                <div class="thinking-header" onclick="this.parentElement.querySelector('.thinking-content').classList.toggle('collapsed');">
+                                <div class="thinking-header" onclick="document.getElementById('thinking-content-${streamThinkId}').classList.toggle('collapsed'); document.getElementById('thinking-toggle-${streamThinkId}').classList.toggle('collapsed');">
                                     <svg class="thinking-icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                                         <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
                                         <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                                     </svg>
                                     <span class="thinking-text">Thinking...</span>
+                                    <svg class="thinking-toggle collapsed" id="thinking-toggle-${streamThinkId}" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                        <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                    </svg>
                                 </div>
-                                <div class="thinking-content" id="streaming-thinking-content" style="white-space: pre-wrap;">
+                                <div class="thinking-content collapsed" id="thinking-content-${streamThinkId}" style="white-space: pre-wrap;">
                                     ${this.escapeHtml(thinkingContent)}
                                 </div>
                             </div>
