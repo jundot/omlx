@@ -108,8 +108,8 @@ def _resolve_mlx_version(toml_path: Path) -> str:
     req_file = (
         SCRIPT_DIR
         / "requirements"
-        / "framework-mlx-framework"
-        / "requirements-framework-mlx-framework-macosx_arm64.txt"
+        / "framework-mlx-base"
+        / "requirements-framework-mlx-base-macosx_arm64.txt"
     )
     if req_file.exists():
         import re as _re
@@ -143,7 +143,7 @@ def swap_platform_wheels(
 
     site_packages = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / f"python{python_version}"
         / "site-packages"
@@ -442,7 +442,7 @@ def _write_engine_commits(omlx_pkg_dir: Path):
 # normalized). [bundle] last means a bundle-specific [audio]-extra entry
 # wins over [project]'s plain entry for the same package.
 _LAYER_REQUIREMENTS_SOURCES = {
-    "mlx-framework": ["project", "bundle"],
+    "mlx-base": ["project", "bundle"],
 }
 
 
@@ -746,7 +746,7 @@ def _install_mlx_audio(export_dir: Path):
     # Install into framework site-packages
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -785,7 +785,7 @@ def _install_paroquant(export_dir: Path):
 
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -822,7 +822,7 @@ def _install_spacy_model(export_dir: Path):
 
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -872,7 +872,7 @@ def _strip_unused_packages(export_dir: Path):
     """Remove large packages not needed for inference from exported framework."""
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"

@@ -11,7 +11,7 @@
 //   PYTHONHOME = Contents/Frameworks/cpython-3.11
 //     so the relocated interpreter finds its stdlib without grepping the
 //     host system's /usr/lib.
-//   PYTHONPATH = Contents/Resources : framework-mlx-framework/site-packages
+//   PYTHONPATH = Contents/Resources : framework-mlx-base/site-packages
 //     : __venvstacks__/site-customize
 //     so `python -m omlx.cli` resolves both the omlx package (shipped as a
 //     pure source tree in Resources/omlx/, matching today's Python build)
@@ -71,7 +71,7 @@ struct PythonRuntime {
         if FileManager.default.isExecutableFile(atPath: bundled.path) {
             let resources = bundleRoot.appendingPathComponent("Contents/Resources")
             let mlxFramework = frameworks
-                .appendingPathComponent("framework-mlx-framework/lib/python3.11/site-packages")
+                .appendingPathComponent("framework-mlx-base/lib/python3.11/site-packages")
             return PythonRuntime(
                 executable: bundled,
                 homebrewPaths: defaultHomebrewPaths,

@@ -244,15 +244,15 @@ mkdir -p "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
 resolve_donor_layers
 log "Using donor: $DONOR_SOURCE"
 [ -d "$DONOR_LAYERS/cpython-3.11" ] || die "Donor missing cpython-3.11 at $DONOR_LAYERS"
-[ -d "$DONOR_LAYERS/framework-mlx-framework" ] || die "Donor missing framework-mlx-framework at $DONOR_LAYERS"
+[ -d "$DONOR_LAYERS/framework-mlx-base" ] || die "Donor missing framework-mlx-base at $DONOR_LAYERS"
 
 log "Copying cpython-3.11 from donor…"
 ditto "$DONOR_LAYERS/cpython-3.11" "$FRAMEWORKS_DIR/cpython-3.11"
 ok "  + cpython-3.11"
 
-log "Copying framework-mlx-framework from donor (~1 GB)…"
-ditto "$DONOR_LAYERS/framework-mlx-framework" "$FRAMEWORKS_DIR/framework-mlx-framework"
-ok "  + framework-mlx-framework"
+log "Copying framework-mlx-base from donor (~1 GB)…"
+ditto "$DONOR_LAYERS/framework-mlx-base" "$FRAMEWORKS_DIR/framework-mlx-base"
+ok "  + framework-mlx-base"
 
 if [ -d "$DONOR_LAYERS/__venvstacks__" ]; then
     ditto "$DONOR_LAYERS/__venvstacks__" "$FRAMEWORKS_DIR/__venvstacks__"

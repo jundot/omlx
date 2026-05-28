@@ -50,7 +50,7 @@ packaging/
 | Layer | Contents |
 |-------|----------|
 | Runtime (`cpython-3.11`) | Python 3.11 |
-| Framework (`mlx-framework`) | MLX, mlx-lm, mlx-vlm, FastAPI, transformers, mlx-audio, paroquant, spaCy |
+| Framework (`mlx-base`) | MLX, mlx-lm, mlx-vlm, FastAPI, transformers, mlx-audio, paroquant, spaCy |
 
 No application layer — the Swift app is the application surface.
 
