@@ -117,6 +117,13 @@ class TestCleanOutputText:
         result = clean_output_text("[CLS]Hello[SEP]World[PAD]")
         assert result == "HelloWorld"
 
+    def test_clean_gemma_special_tokens(self):
+        """Gemma special tokens must be stripped from output too (#1087)."""
+        assert clean_output_text("answer<eos>") == "answer"
+        assert clean_output_text("answer<end_of_turn>") == "answer"
+        assert clean_output_text("<start_of_turn>hi") == "hi"
+        assert clean_output_text("<bos>hello<eos>") == "hello"
+
     def test_clean_multiple_tokens(self):
         """Test removing multiple special tokens."""
         result = clean_output_text("<|im_start|>Hello<|im_end|><|endoftext|>")
