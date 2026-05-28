@@ -40,6 +40,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.specprefill_selection import SpecPrefillSelectionCache
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
@@ -813,6 +814,8 @@ class Scheduler:
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
+        self._specprefill_draft_model_name = "specprefill-draft"
+        self._specprefill_selection_cache = SpecPrefillSelectionCache()
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
@@ -3727,6 +3730,7 @@ class Scheduler:
         in compute_block_hash() naturally isolates draft blocks from target.
         """
         self._specprefill_draft_model = draft_model
+        self._specprefill_draft_model_name = draft_model_name or "specprefill-draft"
         self._draft_prefix_cache: Any | None = None
 
         if (
@@ -3737,7 +3741,7 @@ class Scheduler:
                 from .cache.paged_cache import PagedCacheManager
                 from .cache.prefix_cache import BlockAwarePrefixCache
 
-                name = draft_model_name or "specprefill-draft"
+                name = self._specprefill_draft_model_name
                 draft_paged = PagedCacheManager(
                     block_size=self.config.paged_cache_block_size,
                     max_blocks=self.paged_cache_manager.max_blocks,
@@ -4100,6 +4104,29 @@ class Scheduler:
         if n_to_score <= threshold:
             return
 
+        selection_key = self._specprefill_selection_cache.make_key(
+            tokens_to_score,
+            draft_model_name=self._specprefill_draft_model_name,
+            keep_pct=keep_pct,
+            chunk_size=32,
+            prefill_step_size=self.config.prefill_step_size,
+        )
+        cached_selection = self._specprefill_selection_cache.get(selection_key)
+        if cached_selection is not None:
+            selected = mx.array(cached_selection, dtype=mx.int32)
+            n_selected = len(cached_selection)
+            request.specprefill_indices = selected
+            request.specprefill_total_tokens = n_to_score
+            request.specprefill_position_offset = (
+                request.cached_tokens + effective_system
+            )
+            request._specprefill_system_tokens = effective_system
+            logger.info(
+                f"SpecPrefill: reused selection cache for {n_selected}/{n_to_score} "
+                f"tokens (keep={n_selected/n_to_score*100:.0f}%)"
+            )
+            return
+
         tracker = get_prefill_tracker()
         model_id = os.path.basename(self.config.model_name.rstrip("/"))
 
@@ -4164,6 +4191,7 @@ class Scheduler:
                 progress_callback=_score_progress,
             )
             selected = select_chunks(importance, keep_pct=keep_pct)
+            self._specprefill_selection_cache.put(selection_key, selected.tolist())
             t_score = time.monotonic() - t0
 
             n_selected = selected.shape[0]
@@ -6078,6 +6106,7 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        stats["specprefill_selection_cache"] = self._specprefill_selection_cache.stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -6119,6 +6148,7 @@ class Scheduler:
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
+        self._specprefill_selection_cache.clear()
 
         # Clear detokenizers
         self._request_detokenizers.clear()

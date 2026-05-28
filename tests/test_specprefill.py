@@ -73,6 +73,100 @@ class TestSelectChunks:
         assert selected.shape[0] <= expected_tokens + 32
 
 
+class TestSelectionCache:
+    def test_key_changes_when_keep_pct_changes(self):
+        from omlx.cache.specprefill_selection import SpecPrefillSelectionCache
+
+        key_a = SpecPrefillSelectionCache.make_key(
+            [1, 2, 3],
+            draft_model_name="draft",
+            keep_pct=0.2,
+            chunk_size=32,
+            prefill_step_size=2048,
+        )
+        key_b = SpecPrefillSelectionCache.make_key(
+            [1, 2, 3],
+            draft_model_name="draft",
+            keep_pct=0.5,
+            chunk_size=32,
+            prefill_step_size=2048,
+        )
+
+        assert key_a != key_b
+
+    def test_lru_eviction_and_stats(self):
+        from omlx.cache.specprefill_selection import SpecPrefillSelectionCache
+
+        cache = SpecPrefillSelectionCache(max_entries=1)
+        key_a = cache.make_key(
+            [1, 2, 3],
+            draft_model_name="draft",
+            keep_pct=0.2,
+            chunk_size=32,
+            prefill_step_size=2048,
+        )
+        key_b = cache.make_key(
+            [4, 5, 6],
+            draft_model_name="draft",
+            keep_pct=0.2,
+            chunk_size=32,
+            prefill_step_size=2048,
+        )
+
+        cache.put(key_a, [0, 1])
+        assert cache.get(key_a) == (0, 1)
+        cache.put(key_b, [2, 3])
+        assert cache.get(key_a) is None
+        assert cache.get(key_b) == (2, 3)
+        assert cache.stats() == {"entries": 1, "hits": 2, "misses": 1, "evictions": 1}
+
+    def test_scheduler_reuses_selection_without_rescoring(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from omlx.cache.specprefill_selection import SpecPrefillSelectionCache
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        calls = {"score": 0}
+
+        def fake_score_tokens(model, tokens, **kwargs):
+            calls["score"] += 1
+            return mx.arange(len(tokens), dtype=mx.float32), None
+
+        monkeypatch.setattr("omlx.patches.specprefill.score_tokens", fake_score_tokens)
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._specprefill_draft_model = object()
+        scheduler._specprefill_draft_model_name = "draft"
+        scheduler._specprefill_selection_cache = SpecPrefillSelectionCache()
+        scheduler._draft_prefix_cache = None
+        scheduler.config = SchedulerConfig(prefill_step_size=128, model_name="target")
+        scheduler._stream = None
+
+        def make_request(request_id):
+            return SimpleNamespace(
+                request_id=request_id,
+                _specprefill_enabled=True,
+                _specprefill_threshold=4,
+                _specprefill_keep_pct=0.5,
+                vlm_inputs_embeds=None,
+                remaining_tokens=list(range(20)),
+                prompt_token_ids=list(range(20)),
+                specprefill_system_end=0,
+                cached_tokens=0,
+                num_prompt_tokens=20,
+            )
+
+        first = make_request("req-1")
+        second = make_request("req-2")
+
+        Scheduler._try_specprefill_scoring(scheduler, first)
+        Scheduler._try_specprefill_scoring(scheduler, second)
+
+        assert calls["score"] == 1
+        assert first.specprefill_indices.tolist() == second.specprefill_indices.tolist()
+        assert scheduler._specprefill_selection_cache.stats()["hits"] == 1
+
+
 class TestManualRoPE:
     """Tests for manual_rope() at arbitrary positions."""
 
