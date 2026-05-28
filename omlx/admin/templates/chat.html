@@ -1230,7 +1230,7 @@
                                         :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
-                                    <button @click="copyMessage(msg.content)"
+                                    <button @click="copyMarkdown(msg)"
                                         class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary"
                                         title="{{ t('chat.copy_tooltip') }}">
                                         <i data-lucide="copy" class="w-4 h-4"></i>
@@ -3395,6 +3395,11 @@
         return '';
     },
 
+    normalizeCopyText(text) {
+        if (!text) return '';
+        return String(text).replace(/^\n+/, '').trimEnd();
+    },
+
     getCopyableMarkdown(msg) {
         if (!msg) return '';
         const raw = typeof msg.content === 'string'
@@ -3402,7 +3407,7 @@
             : this.getTextContent(msg.content);
         if (!raw) return '';
         const { cleanText } = this.extractThinking(raw);
-        return cleanText.trim();
+        return this.normalizeCopyText(cleanText);
     },
 
     getImageUrls(content) {
@@ -4788,7 +4793,11 @@
     },
 
     copyMessage(content) {
-        this._copyText(this.getTextContent(content));
+        const raw = typeof content === 'string' ? content : this.getTextContent(content);
+        const text = typeof content === 'string'
+            ? this.normalizeCopyText(this.extractThinking(raw).cleanText)
+            : this.normalizeCopyText(raw);
+        this._copyText(text);
     },
 
     copyMarkdown(msg) {
@@ -4808,10 +4817,15 @@
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
+        const chatId = this.currentChatId;
         session.messages = this.sliceBeforeMessage(session.messages, index);
+        if (session.messages.length === 0) {
+            this.deleteChat(chatId, { skipConfirm: true });
+            return;
+        }
         this.messages = session.messages;
         this.syncFooterStatsFromMessages(session.messages);
-        this.saveCurrentChat(this.currentChatId);
+        this.saveCurrentChat(chatId);
         this.scheduleEnhanceMessages();
     },
 
@@ -5072,8 +5086,8 @@
     },
 
     // Delete chat
-    async deleteChat(chatId) {
-        if (!confirm(window.t('chat.confirm_delete_chat'))) return;
+    async deleteChat(chatId, { skipConfirm = false } = {}) {
+        if (!skipConfirm && !confirm(window.t('chat.confirm_delete_chat'))) return;
 
         this.getStreamSession(chatId, false)?.abortController?.abort();
         delete this.streamSessions[chatId];
