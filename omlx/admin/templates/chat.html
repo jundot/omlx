@@ -203,6 +203,15 @@
         border-color: #ef4444;
     }
 
+    .response-tab-streaming-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        background: var(--timeline-accent);
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
     .response-tab-delete {
         flex: 0 0 auto;
         display: inline-flex;
@@ -942,6 +951,9 @@
                     class="group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer hover:bg-surface-muted mb-1"
                     :class="{ 'bg-surface-muted': currentChatId === chat.id }">
                     <i data-lucide="message-square" class="w-4 h-4 flex-shrink-0" style="color: var(--text-muted);"></i>
+                    <button type="button" x-show="isChatStreaming(chat.id)" @click.stop="stopChatStreaming(chat.id)"
+                        class="w-2 h-2 rounded-full flex-shrink-0 animate-pulse p-0 border-0 cursor-pointer"
+                        style="background: var(--timeline-accent);" title="Stop generating"></button>
                     <template x-if="renamingChatId === chat.id">
                         <div class="flex items-center gap-1 flex-1 min-w-0">
                             <input x-model="renameDraft" x-ref="renameInput" @click.stop
@@ -1169,6 +1181,9 @@
                                                     'response-tab-group--active': isActiveVariantForUser(index, variant.id) && !variantModelMissing(variant),
                                                     'response-tab-group--active-missing': isActiveVariantForUser(index, variant.id) && variantModelMissing(variant),
                                                 }">
+                                                <span x-show="isVariantTabStreaming(index, variant.id)"
+                                                    class="response-tab-streaming-dot ml-1"
+                                                    title="Generating"></span>
                                                 <button type="button" class="response-tab text-xs"
                                                     :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
                                                     @click="selectVariant(index, variant.id)"
@@ -2345,8 +2360,16 @@
                 this.recentStats = this.emptyStats();
             },
 
+            isVariantTabStreaming(userIndex, variantId) {
+                const stream = this.getStreamSession(this.currentChatId, false);
+                return Boolean(
+                    stream?.isStreaming
+                    && stream.targetMessageId
+                    && stream.targetMessageId === variantId
+                );
+            },
+
             async selectVariant(userIndex, variantId) {
-                if (this.isCurrentChatStreaming()) return;
                 const session = this.getChatSession(this.currentChatId, true);
                 if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
                 session.messages[userIndex]._activeVariantId = variantId;
@@ -2359,8 +2382,11 @@
             },
 
             applyGenerationSnapshot(generation) {
-                if (!generation || typeof generation !== 'object') return;
-                const s = { ...this.defaultModelSettings(), ...this.modelSettings };
+                const s = { ...this.defaultModelSettings() };
+                if (!generation || typeof generation !== 'object') {
+                    this.modelSettings = s;
+                    return;
+                }
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
                     'repetition_penalty', 'presence_penalty',
@@ -2371,7 +2397,7 @@
                 if (generation.enable_thinking) {
                     s.enable_thinking = true;
                     s.thinking_budget_enabled = generation.thinking_budget_tokens != null;
-                    s.thinking_budget_tokens = generation.thinking_budget_tokens ?? s.thinking_budget_tokens;
+                    s.thinking_budget_tokens = generation.thinking_budget_tokens ?? null;
                 } else {
                     s.enable_thinking = false;
                     s.thinking_budget_enabled = false;
@@ -2401,8 +2427,11 @@
                         this.currentModel = gatewayId;
                         session.model = gatewayId;
                     }
-                    if (meta.generation) {
+                    if (meta.generation && Object.keys(meta.generation).length > 0) {
                         this.applyGenerationSnapshot(meta.generation);
+                    } else if (meta.modelId) {
+                        const gatewayId = this.resolveGatewayModelId(meta.modelId);
+                        await this.loadAdminModelDefaults(gatewayId);
                     }
                 }
                 if (meta.profileName) {
@@ -2679,7 +2708,134 @@
                     _toolTimers: {},
                     _prefillInterval: null,
                     targetMessageId: null,
+                    _statsRequestId: null,
+                    _liveFooterStats: null,
                 };
+            },
+
+            resolveStreamModelId(chatId, stream) {
+                const session = this.getChatSession(chatId, false);
+                return this.resolveGatewayModelId(
+                    session?.model || stream?.sourceModel || this.currentModel
+                );
+            },
+
+            findModelStatsEntry(data, modelId) {
+                if (!data?.active_models?.models || !modelId) return null;
+                const gatewayId = this.resolveGatewayModelId(modelId);
+                return data.active_models.models.find(m =>
+                    m.id === gatewayId || m.id === modelId
+                ) || null;
+            },
+
+            claimStatsRequests(data) {
+                const claimed = new Set();
+                for (const stream of Object.values(this.streamSessions)) {
+                    if (stream?._statsRequestId) claimed.add(stream._statsRequestId);
+                }
+
+                const pending = Object.entries(this.streamSessions)
+                    .filter(([, stream]) => stream?.isStreaming)
+                    .sort((a, b) => (a[1]._statusStart || 0) - (b[1]._statusStart || 0));
+
+                for (const [chatId, stream] of pending) {
+                    const modelId = this.resolveStreamModelId(chatId, stream);
+                    const modelData = this.findModelStatsEntry(data, modelId);
+                    if (!modelData) continue;
+
+                    const isActive = (rid) => {
+                        if (!rid) return false;
+                        return (modelData.prefilling || []).some(p => p.request_id === rid)
+                            || (modelData.generating || []).some(g => g.request_id === rid);
+                    };
+
+                    if (stream._statsRequestId && isActive(stream._statsRequestId)) {
+                        claimed.add(stream._statsRequestId);
+                        continue;
+                    }
+
+                    stream._statsRequestId = null;
+                    const pick = (modelData.generating || []).find(g =>
+                        g.request_id && !claimed.has(g.request_id)
+                    ) || (modelData.prefilling || []).find(p =>
+                        p.request_id && !claimed.has(p.request_id)
+                    );
+                    if (pick?.request_id) {
+                        stream._statsRequestId = pick.request_id;
+                        claimed.add(pick.request_id);
+                    }
+                }
+            },
+
+            getClaimedRequestStats(stream, modelData) {
+                if (!stream?._statsRequestId || !modelData) return null;
+                const rid = stream._statsRequestId;
+                const generating = (modelData.generating || []).find(g => g.request_id === rid);
+                if (generating) {
+                    return {
+                        phase: 'generating',
+                        generated_tokens: generating.generated_tokens || 0,
+                        tokens_per_second: generating.tokens_per_second || 0,
+                        prompt_tokens: generating.prompt_tokens || 0,
+                    };
+                }
+                const prefilling = (modelData.prefilling || []).find(p => p.request_id === rid);
+                if (prefilling) {
+                    const speed = prefilling.speed
+                        || (prefilling.processed && prefilling.total
+                            ? (prefilling.processed / Math.max(prefilling.total, 1)) * 100
+                            : 0);
+                    return {
+                        phase: 'prefilling',
+                        speed,
+                        prompt_tokens: prefilling.prompt_tokens || 0,
+                    };
+                }
+                return null;
+            },
+
+            computeLiveFooterStats(chatId, stream, data) {
+                const modelId = this.resolveStreamModelId(chatId, stream);
+                const modelData = this.findModelStatsEntry(data, modelId);
+                const claimed = this.getClaimedRequestStats(stream, modelData);
+                const base = { ...(stream._liveFooterStats || this.recentStats || this.emptyStats()) };
+
+                if (!claimed) {
+                    return {
+                        ...base,
+                        total_time: stream._statusStart
+                            ? ((Date.now() - stream._statusStart) / 1000).toFixed(1)
+                            : base.total_time,
+                    };
+                }
+
+                if (claimed.phase === 'prefilling') {
+                    base.avg_prefill_tps = claimed.speed || 0;
+                    if (claimed.prompt_tokens > 0) base.prompt_tokens = claimed.prompt_tokens;
+                } else {
+                    base.avg_generation_tps = claimed.tokens_per_second || 0;
+                    if (claimed.prompt_tokens > 0) base.prompt_tokens = claimed.prompt_tokens;
+                    if (claimed.generated_tokens > 0) base.total_tokens = claimed.generated_tokens;
+                    if (claimed.prompt_tokens > 0 && stream._ttft > 0) {
+                        base.avg_prefill_tps = claimed.prompt_tokens / stream._ttft;
+                    }
+                }
+
+                if (stream._statusStart) {
+                    base.total_time = ((Date.now() - stream._statusStart) / 1000).toFixed(1);
+                }
+                if (stream.thinkingState?.isInThinking && stream.thinkingState.thinkingStartTime) {
+                    base.thinking_time = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
+                    if (claimed.phase === 'generating' && claimed.generated_tokens > 0) {
+                        stream._thinkTokens = claimed.generated_tokens;
+                        base.thinking_tokens = claimed.generated_tokens;
+                    }
+                } else if (stream._thinkSecs) {
+                    base.thinking_time = stream._thinkSecs;
+                    base.thinking_tokens = stream._thinkTokens || 0;
+                }
+
+                return base;
             },
 
             getChatSession(chatId = this.currentChatId, create = false) {
@@ -2722,8 +2878,48 @@
                 return Boolean(this.getStreamSession(chatId, false)?.isStreaming);
             },
 
+            anyChatStreaming() {
+                return Object.values(this.streamSessions).some(s => s?.isStreaming);
+            },
+
             isCurrentChatStreaming() {
                 return this.isChatStreaming(this.currentChatId);
+            },
+
+            stopStatsPollingIfIdle() {
+                if (!this.anyChatStreaming()) {
+                    this.stopStatsPolling();
+                }
+            },
+
+            buildStreamRecentStats(stream, totalTime) {
+                const usage = stream?._lastUsage || {};
+                return {
+                    avg_prefill_tps: usage.prompt_tokens_per_second ?? 0,
+                    avg_generation_tps: usage.generation_tokens_per_second ?? 0,
+                    thinking_time: stream?._thinkSecs || 0,
+                    total_time: totalTime,
+                    prompt_tokens: usage.prompt_tokens ?? 0,
+                    thinking_tokens: stream?._thinkTokens || 0,
+                    total_tokens: usage.completion_tokens ?? 0,
+                };
+            },
+
+            stopChatStreaming(chatId) {
+                const stream = this.getStreamSession(chatId, false);
+                if (stream?.abortController) {
+                    stream.abortController.abort();
+                }
+            },
+
+            ensureStatsPollingForCurrentChat() {
+                if (!this.isCurrentChatStreaming()) return;
+                if (this.statsInterval) {
+                    this.fetchStats();
+                    return;
+                }
+                this.fetchStats();
+                this.statsInterval = setInterval(() => this.fetchStats(), 200);
             },
 
             toggleCurrentStreamTimeline() {
@@ -2769,6 +2965,8 @@
                 }
                 stream._toolTimers = {};
                 stream.targetMessageId = null;
+                stream._statsRequestId = null;
+                stream._liveFooterStats = null;
             },
 
             stopAllStreams() {
@@ -2931,6 +3129,9 @@
             const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
             if (!resp.ok) return;
             const data = await resp.json();
+            if (this.anyChatStreaming()) {
+                this.claimStatsRequests(data);
+            }
             const models = data.active_models?.models || [];
             const gatewayId = this.resolveGatewayModelId(modelId);
             const model = models.find(m => m.id === gatewayId || m.id === modelId);
@@ -2938,7 +3139,9 @@
             if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
                 this.setEngineStatus(chatId, { text: 'Loading model' });
             } else if (model?.prefilling?.length > 0) {
-                const p = model.prefilling[0];
+                const p = (stream._statsRequestId
+                    ? model.prefilling.find(entry => entry.request_id === stream._statsRequestId)
+                    : null) || model.prefilling[0];
                 if (p.total > 0) {
                     const pct = Math.round(p.processed / p.total * 100);
                     if (pct >= 100) {
@@ -3279,12 +3482,21 @@
 
     async ensureSessionModelSettings(session, modelId) {
         if (!session || !modelId) return;
-        if (session.modelSettings) {
-            this.applySessionModelSettings(session);
-            await this.loadModelCapabilities(modelId);
+        const gatewayId = this.resolveGatewayModelId(modelId);
+        if (this.loadModelSettingsForModel(session, gatewayId)) {
+            await this.loadModelCapabilities(gatewayId);
             return;
         }
-        await this.loadAdminModelDefaults(modelId);
+        const legacyFlat = session.model === gatewayId && session.modelSettings;
+        if (legacyFlat) {
+            this.applySessionModelSettings(session);
+            await this.loadModelCapabilities(gatewayId);
+            return;
+        }
+        session.modelSettings = null;
+        session.speculativeEngine = null;
+        session.speculativeDraftModel = null;
+        await this.loadAdminModelDefaults(gatewayId);
         this.syncSessionModelSettingsFromUi(session);
     },
 
@@ -3305,104 +3517,49 @@
         }, 400);
     },
 
-    // Poll stats during generation
+    // Poll stats during generation (per-stream request_id claims avoid bleed across chats/models)
     async fetchStats() {
         try {
-            const modelParam = this.currentModel ? `?model=${encodeURIComponent(this.currentModel)}` : '';
-            const resp = await fetch(`/admin/api/stats${modelParam}`, { credentials: 'same-origin' });
-            if (resp.ok) {
-                const data = await resp.json();
+            const resp = await fetch('/admin/api/stats', { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            const data = await resp.json();
 
-                let activePrefillTps = 0;
-                let activeGenTps = 0;
-                let activePromptTokens = 0;
-                let activeGenTokens = 0;
-
-                // Extract active request stats if available
-                if (data.active_models && data.active_models.models) {
-                    const modelData = data.active_models.models.find(m => m.id === this.currentModel);
-                    if (modelData) {
-                        if (modelData.prefilling && modelData.prefilling.length > 0) {
-                            activePrefillTps = modelData.prefilling[0].speed || 0;
-                            activePromptTokens = modelData.prefilling[0].prompt_tokens || 0;
-                        }
-                        if (modelData.generating && modelData.generating.length > 0) {
-                            activeGenTps = modelData.generating[0].tokens_per_second || 0;
-                            activePromptTokens = modelData.generating[0].prompt_tokens || 0;
-                            activeGenTokens = modelData.generating[0].generated_tokens || 0;
-
-                            // If generating, mathematically calculate the exact prefill speed for this active request
-                            if (activePromptTokens > 0) {
-                                const stream = this.getStreamSession(this.currentChatId, false);
-                                if (stream && stream._ttft > 0) {
-                                    activePrefillTps = activePromptTokens / stream._ttft;
-                                }
-                            }
-                        }
-                    }
-                }
-                // Use model average as fallback if prefill was too fast to catch
-                const fallbackPrefill = data.avg_prefill_tps || 0;
-
-                let updatedStats = {
-                    ...this.recentStats,
-                    // Only overwrite prefill while prefilling is actually active.
-                    // Once the request moves to generating, lock the TTFT-derived value
-                    // and do NOT let the poll overwrite it with zero or fallback.
-                    avg_prefill_tps: (() => {
-                        if (activePrefillTps > 0) return activePrefillTps;
-                        // Generating but prefill already resolved — keep the locked value
-                        if (activeGenTokens > 0 && this.recentStats?.avg_prefill_tps > 0) return this.recentStats.avg_prefill_tps;
-                        return fallbackPrefill;
-                    })(),
-                    avg_generation_tps: activeGenTps > 0 ? activeGenTps : (this.recentStats?.avg_generation_tps || 0),
-                    prompt_tokens: activePromptTokens > 0 ? activePromptTokens : (this.recentStats?.prompt_tokens || 0),
-                    total_tokens: activeGenTokens > 0 ? activeGenTokens : (this.recentStats?.total_tokens || 0)
-                };
-
-                // Live calculate timer if streaming
-                const stream = this.getStreamSession(this.currentChatId, false);
-                if (stream && stream.isStreaming && stream._statusStart) {
-                    updatedStats.total_time = ((Date.now() - stream._statusStart) / 1000).toFixed(1);
-                    if (stream.thinkingState?.isInThinking && stream.thinkingState.thinkingStartTime) {
-                        updatedStats.thinking_time = ((Date.now() - stream.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                        // Snapshot thinking tokens live while in thinking phase
-                        stream._thinkTokens = activeGenTokens;
-                        updatedStats.thinking_tokens = activeGenTokens;
-                    } else if (stream._thinkSecs) {
-                        // Thinking phase ended — freeze the locked values
-                        updatedStats.thinking_time = stream._thinkSecs;
-                        updatedStats.thinking_tokens = stream._thinkTokens || 0;
-                    }
-                } else if (!stream?.isStreaming) {
-                    // Stream finished — preserve thinking tokens from last known state
-                    if (this.recentStats?.thinking_tokens > 0) {
-                        updatedStats.thinking_tokens = this.recentStats.thinking_tokens;
-                    }
-                }
-
-                this.recentStats = updatedStats;
+            if (this.anyChatStreaming()) {
+                this.claimStatsRequests(data);
             }
+
+            for (const [chatId, stream] of Object.entries(this.streamSessions)) {
+                if (!stream?.isStreaming) continue;
+                stream._liveFooterStats = this.computeLiveFooterStats(chatId, stream, data);
+            }
+
+            const stream = this.getStreamSession(this.currentChatId, false);
+            if (!stream?.isStreaming) return;
+
+            this.recentStats = stream._liveFooterStats
+                ? { ...stream._liveFooterStats }
+                : this.computeLiveFooterStats(this.currentChatId, stream, data);
         } catch (e) {
             console.error('Failed to fetch stats:', e);
         }
     },
 
-    startStatsPolling() {
-        this.stopStatsPolling();
-        this.recentStats = {
-            avg_prefill_tps: 0,
-            avg_generation_tps: 0,
-            thinking_time: 0,
-            total_time: 0,
-            prompt_tokens: 0,
-            thinking_tokens: 0,
-            total_tokens: 0
-        };
-        this.fetchStats(); // initial immediate fetch
-        this.statsInterval = setInterval(() => {
-            this.fetchStats();
-        }, 200);
+    startStatsPolling(chatId = this.currentChatId) {
+        if (!this.statsInterval) {
+            this.statsInterval = setInterval(() => this.fetchStats(), 200);
+        }
+        this.fetchStats();
+        if (chatId === this.currentChatId) {
+            this.recentStats = {
+                avg_prefill_tps: 0,
+                avg_generation_tps: 0,
+                thinking_time: 0,
+                total_time: 0,
+                prompt_tokens: 0,
+                thinking_tokens: 0,
+                total_tokens: 0,
+            };
+        }
     },
 
     stopStatsPolling() {
@@ -3646,14 +3803,13 @@
     },
 
     async loadChat(chatId) {
-        Object.keys(this.streamSessions).forEach((id) => {
-            if (id === chatId) return;
-            const other = this.getStreamSession(id, false);
-            if (other?.isStreaming) {
-                other.abortController?.abort();
-                this.resetStreamSession(other);
+        if (this.currentChatId && this.currentChatId !== chatId) {
+            const prevSession = this.getChatSession(this.currentChatId, false);
+            if (prevSession) {
+                prevSession.messages = this.messages;
+                this.saveCurrentChat(this.currentChatId);
             }
-        });
+        }
 
         const session = this.getChatSession(chatId, true);
         if (session) {
@@ -3691,6 +3847,7 @@
                 this.recentStats = this.emptyStats();
             }
             this.scheduleEnhanceMessages();
+            this.ensureStatsPollingForCurrentChat();
         }
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
@@ -3907,7 +4064,7 @@
                     }
                 }
             }
-            this.startStatsPolling();
+            this.startStatsPolling(context.chatId);
         }
         stream.isStreaming = true;
             stream.sourceModel = context.model;
@@ -4248,7 +4405,8 @@
         } finally {
             // Attach performance timeline and thinking to the final assistant message, once per prompt
             if (depth === 0) {
-                this.stopStatsPolling();
+                this.stopStatsPollingIfIdle();
+                this.ensureStatsPollingForCurrentChat();
                 let msg = stream.targetMessageId
                     ? chatSession.messages.find(m => m.id === stream.targetMessageId)
                     : null;
@@ -4267,9 +4425,11 @@
                             msg._perfLog = [...stream.statusLog];
                             msg._perfTotal = totalTime + 's total';
                         }
-                        this.recentStats.total_time = totalTime;
-                        this.recentStats.thinking_time = stream._thinkSecs || 0;
-                        msg._recentStats = { ...this.recentStats };
+                        const msgStats = this.buildStreamRecentStats(stream, totalTime);
+                        msg._recentStats = msgStats;
+                        if (this.currentChatId === context.chatId) {
+                            this.recentStats = { ...msgStats };
+                        }
                         if (stream.streamingThinking) {
                             this.attachThinkingToAssistantMessage(msg, stream.streamingThinking);
                         }
@@ -4296,14 +4456,8 @@
     },
 
     stopStreaming() {
-        const stream = this.currentStream();
-        console.log('[stopStreaming] called, abortController:', stream?.abortController || null);
-        if (stream?.abortController) {
-            console.log('[stopStreaming] calling abort()');
-            stream.abortController.abort();
-            console.log('[stopStreaming] abort() called');
-        } else {
-            console.log('[stopStreaming] abortController is null');
+        if (this.currentChatId) {
+            this.stopChatStreaming(this.currentChatId);
         }
     },
 
@@ -4373,6 +4527,7 @@
     },
 
     deleteMessage(index) {
+        if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
         session.messages = this.sliceBeforeMessage(session.messages, index);
@@ -4456,6 +4611,7 @@
     },
 
     branchChat(index) {
+        if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
         const branchName = 'Branch of ' + (originalChat?.title || window.t('chat.new_chat_title'));
