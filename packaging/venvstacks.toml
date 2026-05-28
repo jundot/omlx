@@ -41,6 +41,16 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
+    # Any .dSYM bundle ships a debug copy of a .dylib (e.g. xgrammar's
+    # libxgrammar_bindings.dylib.dSYM/Contents/Resources/DWARF/...).
+    # venvstacks matches dynlib_exclude with recursive globs, so `**`
+    # is needed to reach the DWARF dir several levels down. Drop every
+    # in-dSYM lib so the venv dynlib symlink target stays unambiguous.
+    "**/*.dSYM/**",
+    # libomp.dylib appears in both sklearn/.dylibs/ and torch/lib/. Keep
+    # torch's copy (the inference path that actually loads it) and drop
+    # sklearn's duplicate.
+    "sklearn/.dylibs/libomp*",
 ]
 
 [tool.uv]
