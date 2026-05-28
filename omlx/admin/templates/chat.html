@@ -435,7 +435,7 @@
         border: 1px solid var(--border-faint);
         padding: 0.5em 0.75em;
         text-align: left;
-        white-space: nowrap;
+        word-break: break-word;
     }
 
     .markdown-content th {
@@ -3444,7 +3444,7 @@
 
             // Auto-select default model if set, otherwise first model (gateway id)
             if (!this.currentModel && this.availableModels.length > 0) {
-                this.currentModel = this.aliasToGateway[this.availableModels[0].name] || this.availableModels[0].name;
+                this.currentModel = this.availableModels[0].id;
                 if (defaultModel) {
                     this.currentModel = this.aliasToGateway[defaultModel] || defaultModel;
                 }
@@ -4215,9 +4215,9 @@
                                 const names = Object.values(toolCallsMap).map(t => t.function.name).filter(Boolean);
                                 if (names.length > 0) {
                                     const unique = [...new Set(names)];
-                                    const liveLabel = names.length > 3
-                                        ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
-                                        : `Calling ${names.join(', ')}`;
+                                    const liveLabel = unique.length > 3
+                                        ? `Calling ${unique.slice(0, 2).join(', ')} +${unique.length - 2} more`
+                                        : `Calling ${unique.join(', ')}`;
                                     stream.engineStatus = { text: liveLabel, icon: 'wrench' };
                                 }
                             }
@@ -4847,12 +4847,14 @@
         // Use profile from last assistant message before edit, or current active profile
         const lastAsstBeforeEdit = [...session.messages.slice(0, index)].reverse().find(m => m.role === 'assistant' && m._ui !== false);
         const editProfile = lastAsstBeforeEdit?._profile ?? this.activePromptProfile ?? null;
+        const variantUserIndex = session.messages.length - 1;
         try {
             await this.streamResponse({
                 chatId: this.currentChatId,
                 model: this.currentModel,
                 systemPrompt: this.systemPrompt,
-                _profile: editProfile
+                _profile: editProfile,
+                _variantUserIndex: variantUserIndex,
             }, 0);
         } catch (e) {
             console.error('saveEdit stream failed:', e);
@@ -5233,20 +5235,22 @@
         for (let i = 0; i < text.length; i++) {
             const ch = text[i];
             const nextTwo = text.slice(i, i + 2);
-            const nextThree = text.slice(i, i + 3);
             const escaped = this._isMarkdownCharEscaped(text, i);
 
-            if (!inInlineCode && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && nextThree === '```') {
-                inFence = !inFence;
-                i += 2;
-                lastWasNewline = false;
-                continue;
-            }
-
-            if (!inFence && !inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && ch === '`' && !escaped) {
-                inInlineCode = !inInlineCode;
-                lastWasNewline = false;
-                continue;
+            if (!inInlineMath && !inDisplayMath && !inParenMath && !inBracketMath && ch === '`' && !escaped) {
+                let tickCount = 0;
+                while (i + tickCount < text.length && text[i + tickCount] === '`') tickCount++;
+                if (tickCount >= 3) {
+                    inFence = !inFence;
+                    i += tickCount - 1;
+                    lastWasNewline = false;
+                    continue;
+                }
+                if (!inFence && tickCount === 1) {
+                    inInlineCode = !inInlineCode;
+                    lastWasNewline = false;
+                    continue;
+                }
             }
 
             if (!inFence && !inInlineCode) {
