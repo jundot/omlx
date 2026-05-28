@@ -1413,7 +1413,7 @@
                                 x-html="renderMarkdown(currentStream()?.streamingThinking || '')"></div>
                         </div>
                         <div x-show="currentStream()?.streamingContent" class="markdown-content" x-ref="streamingOutput"
-                            x-effect="updateStreamingDOM()"></div>
+                            x-effect="currentStream()?.isStreaming && updateStreamingDOM(currentStream()?.streamingContent)"></div>
                     </div>
                 </div>
             </div>
@@ -2940,6 +2940,10 @@
                 stream.targetMessageId = null;
                 stream._statsRequestId = null;
                 stream._liveFooterStats = null;
+                if (stream._domUpdateRaf) {
+                    cancelAnimationFrame(stream._domUpdateRaf);
+                    stream._domUpdateRaf = null;
+                }
             },
 
             stopAllStreams() {
@@ -3216,6 +3220,16 @@
             return content.filter(p => p.type === 'text').map(p => p.text).join('\n');
         }
         return '';
+    },
+
+    getCopyableMarkdown(msg) {
+        if (!msg) return '';
+        const raw = typeof msg.content === 'string'
+            ? msg.content
+            : this.getTextContent(msg.content);
+        if (!raw) return '';
+        const { cleanText } = this.extractThinking(raw);
+        return cleanText.trim();
     },
 
     getImageUrls(content) {
@@ -3666,25 +3680,29 @@
     async selectModel(modelId) {
         const session = this.getChatSession(this.currentChatId, true);
         const gatewayId = this.resolveGatewayModelId(modelId);
-        if (session?.model && session.model !== gatewayId) {
-            this.syncSessionModelSettingsFromUi(session);
-            this.saveModelSettingsForModel(session, session.model);
-        }
-        this.currentModel = gatewayId;
-        if (session) {
-            session.model = gatewayId;
-            if (!this.loadModelSettingsForModel(session, gatewayId)) {
-                session.modelSettings = null;
-                session.speculativeEngine = null;
-                session.speculativeDraftModel = null;
-                await this.ensureSessionModelSettings(session, gatewayId);
-                this.saveModelSettingsForModel(session, gatewayId);
+        try {
+            if (session?.model && session.model !== gatewayId) {
+                this.syncSessionModelSettingsFromUi(session);
+                this.saveModelSettingsForModel(session, session.model);
+            }
+            this.currentModel = gatewayId;
+            if (session) {
+                session.model = gatewayId;
+                if (!this.loadModelSettingsForModel(session, gatewayId)) {
+                    session.modelSettings = null;
+                    session.speculativeEngine = null;
+                    session.speculativeDraftModel = null;
+                    await this.ensureSessionModelSettings(session, gatewayId);
+                    this.saveModelSettingsForModel(session, gatewayId);
+                } else {
+                    await this.loadModelCapabilities(gatewayId);
+                }
+                this.persistChatSettingsToHistory(this.currentChatId);
             } else {
                 await this.loadModelCapabilities(gatewayId);
             }
-            this.persistChatSettingsToHistory(this.currentChatId);
-        } else {
-            await this.loadModelCapabilities(gatewayId);
+        } catch (e) {
+            console.error('Failed to switch model:', e);
         }
     },
 
@@ -4471,10 +4489,16 @@
     },
 
     copyMarkdown(msg) {
-        const raw = typeof msg.content === 'string' ? msg.content : '';
-        if (raw) {
-            this._copyText(raw);
+        const text = this.getCopyableMarkdown(msg);
+        if (!text) {
+            const hasImages = Array.isArray(msg?.content)
+                && msg.content.some(p => p.type === 'image_url');
+            if (hasImages) {
+                this._copyText(this.getTextContent(msg.content));
+            }
+            return;
         }
+        this._copyText(text);
     },
 
     deleteMessage(index) {
@@ -4709,6 +4733,7 @@
         if (!session) return;
 
         const newContent = this.editContent.trim();
+        const editImages = [...this.editImages];
 
         // Remove all messages from this index onwards
         session.messages = session.messages.slice(0, index);
@@ -4717,9 +4742,9 @@
 
         // Build message content, preserving images
         let content;
-        if (this.editImages.length > 0) {
+        if (editImages.length > 0) {
             content = [];
-            for (const img of this.editImages) {
+            for (const img of editImages) {
                 content.push({ type: 'image_url', image_url: { url: img } });
             }
             content.push({ type: 'text', text: newContent });
@@ -4734,7 +4759,7 @@
             content
         });
 
-        // Reset edit state
+        // Reset edit state before streaming (avoids leaking images if stream throws)
         this.editingIndex = null;
         this.editContent = '';
         this.editImages = [];
@@ -4744,12 +4769,16 @@
         // Use profile from last assistant message before edit, or current active profile
         const lastAsstBeforeEdit = [...session.messages.slice(0, index)].reverse().find(m => m.role === 'assistant' && m._ui !== false);
         const editProfile = lastAsstBeforeEdit?._profile ?? this.activePromptProfile ?? null;
-        await this.streamResponse({
-            chatId: this.currentChatId,
-            model: this.currentModel,
-            systemPrompt: this.systemPrompt,
-            _profile: editProfile
-        }, 0);
+        try {
+            await this.streamResponse({
+                chatId: this.currentChatId,
+                model: this.currentModel,
+                systemPrompt: this.systemPrompt,
+                _profile: editProfile
+            }, 0);
+        } catch (e) {
+            console.error('saveEdit stream failed:', e);
+        }
     },
 
     // Delete chat
@@ -4785,9 +4814,11 @@
 
     // Thinking/Reasoning tag processing
     escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return String(text ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
     },
 
     extractThinking(text) {
@@ -4910,8 +4941,8 @@
                                     </svg>
                                     <span class="thinking-text">Thinking...</span>
                                 </div>
-                                <div class="thinking-content" id="streaming-thinking-content">
-                                    ${this.escapeHtml(thinkingContent).replace(/\n/g, '<br>')}
+                                <div class="thinking-content" id="streaming-thinking-content" style="white-space: pre-wrap;">
+                                    ${this.escapeHtml(thinkingContent)}
                                 </div>
                             </div>
                         `;
@@ -4926,7 +4957,17 @@
     },
 
     // Efficiently update streaming DOM without destroying thinking container
-    updateStreamingDOM() {
+    updateStreamingDOM(_contentTick) {
+        const stream = this.currentStream();
+        if (!stream?.isStreaming) return;
+        if (stream._domUpdateRaf) cancelAnimationFrame(stream._domUpdateRaf);
+        stream._domUpdateRaf = requestAnimationFrame(() => {
+            stream._domUpdateRaf = null;
+            this._updateStreamingDOMImpl();
+        });
+    },
+
+    _updateStreamingDOMImpl() {
         const container = this.$refs.streamingOutput;
         const stream = this.currentStream();
         if (!container) return;
