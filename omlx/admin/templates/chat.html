@@ -1787,7 +1787,8 @@
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">Thinking tokens</label>
                         <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @input="onModelSettingsChange()" placeholder="e.g. 4096" min="1" step="100"
+                            @input="onModelSettingsChange()" @change="clampThinkingBudgetTokens()"
+                            placeholder="4096" min="1" step="100"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
                     </div>
@@ -2025,6 +2026,19 @@
                 return 'auto';
             },
 
+            normalizeThinkingBudgetTokens(value) {
+                const n = Number(value);
+                if (!Number.isFinite(n) || n <= 0) return 4096;
+                return Math.floor(n);
+            },
+
+            clampThinkingBudgetTokens() {
+                if (this.thinkingModeValue() !== 'on_limit') return;
+                this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                    this.modelSettings.thinking_budget_tokens
+                );
+            },
+
             setThinkingMode(mode) {
                 if (mode === 'on_unlimit') {
                     this.modelSettings.enable_thinking = true;
@@ -2033,9 +2047,9 @@
                 } else if (mode === 'on_limit') {
                     this.modelSettings.enable_thinking = true;
                     this.modelSettings.thinking_budget_enabled = true;
-                    if (this.modelSettings.thinking_budget_tokens == null) {
-                        this.modelSettings.thinking_budget_tokens = 4096;
-                    }
+                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        this.modelSettings.thinking_budget_tokens
+                    );
                 } else if (mode === 'off') {
                     this.modelSettings.enable_thinking = false;
                     this.modelSettings.thinking_budget_enabled = false;
@@ -2049,6 +2063,11 @@
             },
 
             captureSessionModelSettings() {
+                if (this.modelSettings.thinking_budget_enabled) {
+                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        this.modelSettings.thinking_budget_tokens
+                    );
+                }
                 return {
                     modelSettings: this.cloneData(this.modelSettings),
                     speculativeEngine: this.speculativeEngine,
@@ -2078,6 +2097,11 @@
             applySessionModelSettings(session) {
                 if (!session?.modelSettings) return false;
                 this.modelSettings = { ...this.defaultModelSettings(), ...this.cloneData(session.modelSettings) };
+                if (this.modelSettings.thinking_budget_enabled) {
+                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        this.modelSettings.thinking_budget_tokens
+                    );
+                }
                 this.speculativeEngine = session.speculativeEngine ?? 'none';
                 this.speculativeDraftModel = session.speculativeDraftModel ?? '';
                 this.modelSettingsDirty = false;
@@ -2385,7 +2409,7 @@
                 if (budget != null) {
                     s.enable_thinking = true;
                     s.thinking_budget_enabled = true;
-                    s.thinking_budget_tokens = budget;
+                    s.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(budget);
                 } else if (s.enable_thinking === true) {
                     s.thinking_budget_enabled = false;
                     s.thinking_budget_tokens = null;
@@ -2511,8 +2535,8 @@
                 }
                 if (s.enable_thinking === true) {
                     gen.chat_template_kwargs = { enable_thinking: true };
-                    if (s.thinking_budget_enabled && s.thinking_budget_tokens != null) {
-                        gen.thinking_budget = s.thinking_budget_tokens;
+                    if (s.thinking_budget_enabled) {
+                        gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
                     }
                 } else if (s.enable_thinking === false) {
                     gen.chat_template_kwargs = { enable_thinking: false };
@@ -3510,8 +3534,10 @@
                 repetition_penalty: s.repetition_penalty ?? null,
                 presence_penalty: s.presence_penalty ?? null,
                 enable_thinking: s.enable_thinking ?? null,
-                thinking_budget_enabled: s.thinking_budget_tokens != null,
-                thinking_budget_tokens: s.thinking_budget_tokens ?? null,
+                thinking_budget_enabled: !!(s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0)),
+                thinking_budget_tokens: (s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0))
+                    ? this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens)
+                    : null,
             };
             this.speculativeEngine = 'none';
             this.speculativeDraftModel = '';
