@@ -964,7 +964,7 @@
 
             <!-- Messages -->
             <div x-show="messages.length > 0" class="max-w-4xl mx-auto px-4 py-6 space-y-4">
-                <template x-for="(msg, index) in messages" :key="index">
+                <template x-for="(msg, index) in messages" :key="msg.id">
                     <div class="message-fade-in">
                         <!-- User Message -->
                         <div x-show="msg.role === 'user'" class="flex justify-end">
@@ -1949,6 +1949,105 @@
                 return value == null ? value : JSON.parse(JSON.stringify(value));
             },
 
+            newMessageId() {
+                return 'msg_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 9);
+            },
+
+            ensureMessageIds(messages) {
+                if (!messages) return;
+                for (const msg of messages) {
+                    if (!msg.id) msg.id = this.newMessageId();
+                }
+            },
+
+            resolveGatewayModelId(modelId) {
+                if (!modelId) return modelId;
+                return this.aliasToGateway[modelId] || modelId;
+            },
+
+            /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
+            sliceToUserTurn(messages, endIndex) {
+                let userIdx = -1;
+                const limit = Math.min(endIndex, messages.length);
+                for (let i = limit - 1; i >= 0; i--) {
+                    if (messages[i].role === 'user') {
+                        userIdx = i;
+                        break;
+                    }
+                }
+                if (userIdx < 0) return messages.slice(0, endIndex);
+                return messages.slice(0, userIdx + 1);
+            },
+
+            /** Delete/edit slice: user row drops from index; assistant drops back to preceding user. */
+            sliceBeforeMessage(messages, index) {
+                const msg = messages[index];
+                if (!msg) return messages;
+                if (msg.role === 'user') return messages.slice(0, index);
+                return this.sliceToUserTurn(messages, index);
+            },
+
+            splitTurnSegments(turnMessages) {
+                const segments = [];
+                let current = [];
+                for (const m of turnMessages) {
+                    current.push(m);
+                    if (m.role === 'assistant' && m._ui !== false) {
+                        segments.push(current);
+                        current = [];
+                    }
+                }
+                if (current.length) segments.push(current);
+                return segments.length ? segments : [turnMessages];
+            },
+
+            getActiveVariantChain(turnMessages, activeVariantId) {
+                if (!turnMessages.length) return [];
+                const segments = this.splitTurnSegments(turnMessages);
+                if (segments.length <= 1) return turnMessages;
+                if (activeVariantId) {
+                    const match = segments.find(s => s.some(m => m.id === activeVariantId));
+                    if (match) return match;
+                }
+                return segments[segments.length - 1];
+            },
+
+            getApiTurnMessages(messages) {
+                const result = [];
+                let i = 0;
+                while (i < messages.length) {
+                    const msg = messages[i];
+                    if (msg.role !== 'user') {
+                        i++;
+                        continue;
+                    }
+                    result.push(msg);
+                    i++;
+                    const turn = [];
+                    while (i < messages.length && messages[i].role !== 'user') {
+                        turn.push(messages[i]);
+                        i++;
+                    }
+                    result.push(...this.getActiveVariantChain(turn, msg._activeVariantId));
+                }
+                return result;
+            },
+
+            buildMessagesForApi(messages, systemPrompt) {
+                const out = this.getApiTurnMessages(messages)
+                    .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
+                    .map(msg => {
+                        const m = { role: msg.role, content: msg.content ?? null };
+                        if (msg.tool_calls) m.tool_calls = msg.tool_calls;
+                        if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
+                        return m;
+                    });
+                if (systemPrompt?.trim()) {
+                    out.unshift({ role: 'system', content: systemPrompt.trim() });
+                }
+                return out;
+            },
+
             createThinkingState() {
                 return {
                     isInThinking: false,
@@ -1978,6 +2077,7 @@
                     _statusStart: 0,
                     _toolTimers: {},
                     _prefillInterval: null,
+                    targetMessageId: null,
                 };
             },
 
@@ -1985,8 +2085,10 @@
                 if (!chatId) return null;
                 if (!this.chatSessions[chatId] && create) {
                     const historyChat = this.chatHistory.find(c => c.id === chatId);
+                    const loadedMessages = this.cloneData(historyChat?.messages || (this.currentChatId === chatId ? this.messages : [])) || [];
+                    this.ensureMessageIds(loadedMessages);
                     this.chatSessions[chatId] = {
-                        messages: this.cloneData(historyChat?.messages || (this.currentChatId === chatId ? this.messages : [])) || [],
+                        messages: loadedMessages,
                         model: historyChat?.model || (this.currentChatId === chatId ? this.currentModel : null),
                         systemPrompt: historyChat?.systemPrompt ?? (this.currentChatId === chatId
                             ? this.systemPrompt
@@ -2058,6 +2160,7 @@
                     stream.finalContent = false;
                 }
                 stream._toolTimers = {};
+                stream.targetMessageId = null;
             },
 
             stopAllStreams() {
@@ -2145,13 +2248,24 @@
                 map[m.id] = m.model_type || 'llm';
             }
             this.modelTypeMap = map;
+            this._mirrorAliasModelTypes();
         } catch (e) {
             // Model status endpoint unavailable
         }
     },
 
+    _mirrorAliasModelTypes() {
+        for (const [alias, gatewayId] of Object.entries(this.aliasToGateway)) {
+            const t = this.modelTypeMap[gatewayId];
+            if (t && !this.modelTypeMap[alias]) {
+                this.modelTypeMap[alias] = t;
+            }
+        }
+    },
+
     hasVisionSupport() {
-        return this.modelTypeMap[this.currentModel] === 'vlm';
+        const id = this.resolveGatewayModelId(this.currentModel);
+        return this.modelTypeMap[id] === 'vlm';
     },
 
             // ===== MCP Tools =====
@@ -2210,7 +2324,8 @@
             if (!resp.ok) return;
             const data = await resp.json();
             const models = data.active_models?.models || [];
-            const model = models.find(m => m.id === modelId);
+            const gatewayId = this.resolveGatewayModelId(modelId);
+            const model = models.find(m => m.id === gatewayId || m.id === modelId);
             if (stream.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
             if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
                 this.setEngineStatus(chatId, { text: 'Loading model' });
@@ -2446,6 +2561,7 @@
                     }
                 }
             }
+            this._mirrorAliasModelTypes();
 
             const modelsData = await modelsResponse.json();
             const allModels = modelsData.data || [];
@@ -2867,7 +2983,30 @@
     },
 
     saveChatHistory() {
-        localStorage.setItem('omlx_chat_history', JSON.stringify(this.chatHistory));
+        const key = 'omlx_chat_history';
+        const persist = () => localStorage.setItem(key, JSON.stringify(this.chatHistory));
+        try {
+            persist();
+        } catch (e) {
+            if (e?.name !== 'QuotaExceededError' && !/quota/i.test(String(e?.message || ''))) {
+                console.error('Failed to save chat history:', e);
+                return;
+            }
+            while (this.chatHistory.length > 1) {
+                this.chatHistory.pop();
+                try {
+                    persist();
+                    console.warn('Chat history trimmed to fit localStorage quota');
+                    return;
+                } catch (retryErr) {
+                    if (retryErr?.name !== 'QuotaExceededError' && !/quota/i.test(String(retryErr?.message || ''))) {
+                        console.error('Failed to save trimmed chat history:', retryErr);
+                        return;
+                    }
+                }
+            }
+            console.error('Chat history too large for localStorage even after trimming');
+        }
     },
 
     startNewChat() {
@@ -2892,8 +3031,18 @@
     },
 
     loadChat(chatId) {
+        Object.keys(this.streamSessions).forEach((id) => {
+            if (id === chatId) return;
+            const other = this.getStreamSession(id, false);
+            if (other?.isStreaming) {
+                other.abortController?.abort();
+                this.resetStreamSession(other);
+            }
+        });
+
         const session = this.getChatSession(chatId, true);
         if (session) {
+            this.ensureMessageIds(session.messages);
             this.currentChatId = chatId;
             this.messages = session.messages;
             this.systemPrompt = session.systemPrompt || '';
@@ -3049,7 +3198,8 @@
             content = userText;
         }
 
-        chatSession.messages.push({ role: 'user', content });
+        const userMsg = { id: this.newMessageId(), role: 'user', content };
+        chatSession.messages.push(userMsg);
         this.messages = chatSession.messages;
         this.forceScrollToBottom();
         await this.streamResponse({ chatId, model: sourceModel, systemPrompt: sourceSystemPrompt }, 0);
@@ -3066,11 +3216,15 @@
         const stream = this.getStreamSession(context.chatId, true);
         context.model = context.model || chatSession?.model || this.currentModel;
         context.systemPrompt = context.systemPrompt ?? chatSession?.systemPrompt ?? '';
+        if (context.chatId === this.currentChatId && context.systemPrompt !== this.systemPrompt) {
+            this.systemPrompt = context.systemPrompt;
+        }
         chatSession.model = context.model;
         chatSession.systemPrompt = context.systemPrompt;
 
         if (depth > this.MAX_TOOL_DEPTH) {
             chatSession.messages.push({
+                id: this.newMessageId(),
                 role: 'assistant',
                 content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
                 model: context.model,
@@ -3085,6 +3239,7 @@
         if (depth === 0) {
             this.resetStreamSession(stream);
             stream._statusStart = Date.now();
+            stream.targetMessageId = this.newMessageId();
             stream.sourceModel = context.model;
             stream.sourceSystemPrompt = context.systemPrompt;
             this.startStatsPolling();
@@ -3098,22 +3253,7 @@
         this.setEngineStatus(context.chatId, { text: 'Starting' });
         this.startPrefillPolling(context.chatId, context.model);
 
-        // Build messages for API - pass through tool_calls/tool_call_id for MCP loop
-        const messagesForApi = chatSession.messages
-            .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
-            .map(msg => {
-                const m = { role: msg.role, content: msg.content ?? null };
-                if (msg.tool_calls) m.tool_calls = msg.tool_calls;
-                if (msg.tool_call_id) m.tool_call_id = msg.tool_call_id;
-                return m;
-            });
-        // Prepend system prompt if set
-        if (context.systemPrompt.trim()) {
-            messagesForApi.unshift({
-                role: 'system',
-                content: context.systemPrompt.trim()
-            });
-        }
+        const messagesForApi = this.buildMessagesForApi(chatSession.messages, context.systemPrompt);
 
         try {
             const response = await fetch('/v1/chat/completions', {
@@ -3291,6 +3431,7 @@
 
                 // Store the assistant tool_calls turn (hidden from chat UI)
                 chatSession.messages.push({
+                    id: this.newMessageId(),
                     role: 'assistant',
                     content: stream.streamingContent || null,
                     model: context.model,
@@ -3346,7 +3487,13 @@
 
                 // Push hidden tool result messages
                 toolCalls.forEach((tc, i) => {
-                    chatSession.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i].content, _ui: false });
+                    chatSession.messages.push({
+                        id: this.newMessageId(),
+                        role: 'tool',
+                        tool_call_id: tc.id,
+                        content: results[i].content,
+                        _ui: false
+                    });
                 });
 
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
@@ -3366,7 +3513,9 @@
             // Always push the completed assistant message — even if content is empty.
             // This prevents the streaming box from disappearing with no replacement
             // when the model emits only whitespace, only reasoning tokens, or nothing at all.
+            const assistantId = stream.targetMessageId || this.newMessageId();
             chatSession.messages.push({
+                id: assistantId,
                 role: 'assistant',
                 content: stream.streamingContent || '',
                 model: context.model,
@@ -3375,6 +3524,7 @@
                 _thinking: stream.streamingThinking || null,
                 _thinkingOpen: false,
             });
+            this._setActiveVariant(chatSession, assistantId);
             this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
             if (this.currentChatId === context.chatId) {
                 this.scheduleEnhanceMessages();
@@ -3391,7 +3541,9 @@
                 }
                 // Stream was stopped by user — push whatever was accumulated
                 if (stream.streamingContent || stream.streamingThinking) {
+                    const assistantId = stream.targetMessageId || this.newMessageId();
                     chatSession.messages.push({
+                        id: assistantId,
                         role: 'assistant',
                         content: stream.streamingContent,
                         model: context.model,
@@ -3400,6 +3552,7 @@
                         _thinking: stream.streamingThinking || null,
                         _thinkingOpen: false,
                     });
+                    this._setActiveVariant(chatSession, assistantId);
                     this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                     if (this.currentChatId === context.chatId) {
                         this.scheduleEnhanceMessages();
@@ -3407,13 +3560,16 @@
                 }
             } else {
                 console.error('Streaming error:', error);
+                const assistantId = stream.targetMessageId || this.newMessageId();
                 chatSession.messages.push({
+                    id: assistantId,
                     role: 'assistant',
                     content: `Error: ${error.message}`,
                     model: context.model,
                     _profile: context._profile,
                     _perfVisible: false,
                 });
+                this._setActiveVariant(chatSession, assistantId);
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
                     this.scheduleEnhanceMessages();
@@ -3423,9 +3579,19 @@
             // Attach performance timeline and thinking to the final assistant message, once per prompt
             if (depth === 0) {
                 this.stopStatsPolling();
-                for (let i = chatSession.messages.length - 1; i >= 0; i--) {
-                    const msg = chatSession.messages[i];
-                    if (msg.role === 'assistant' && msg._ui !== false) {
+                let msg = stream.targetMessageId
+                    ? chatSession.messages.find(m => m.id === stream.targetMessageId)
+                    : null;
+                if (!msg) {
+                    for (let i = chatSession.messages.length - 1; i >= 0; i--) {
+                        const candidate = chatSession.messages[i];
+                        if (candidate.role === 'assistant' && candidate._ui !== false) {
+                            msg = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (msg) {
                         const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2);
                         if (stream.statusLog.length > 0) {
                             msg._perfLog = [...stream.statusLog];
@@ -3437,8 +3603,6 @@
                         if (stream.streamingThinking) {
                             msg._thinking = stream.streamingThinking;
                         }
-                        break;
-                    }
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
@@ -3470,9 +3634,7 @@
         const origMsg = session.messages[index];
         const profileToUse = origMsg?._profile ?? this.activePromptProfile ?? null;
 
-        // Find the user message before this assistant message
-        const messagesToKeep = session.messages.slice(0, index);
-        session.messages = messagesToKeep;
+        session.messages = this.sliceToUserTurn(session.messages, index);
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
@@ -3527,10 +3689,19 @@
     deleteMessage(index) {
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
-        session.messages = session.messages.slice(0, index);
+        session.messages = this.sliceBeforeMessage(session.messages, index);
         this.messages = session.messages;
         this.saveCurrentChat(this.currentChatId);
         this.scheduleEnhanceMessages();
+    },
+
+    _setActiveVariant(session, assistantId) {
+        for (let i = session.messages.length - 1; i >= 0; i--) {
+            if (session.messages[i].role === 'user') {
+                session.messages[i]._activeVariantId = assistantId;
+                return;
+            }
+        }
     },
 
     branchChat(index) {
@@ -3686,6 +3857,7 @@
 
         // Add edited user message
         session.messages.push({
+            id: this.newMessageId(),
             role: 'user',
             content
         });
@@ -3855,7 +4027,7 @@
                     html += DOMPurify.sanitize(marked.parse(beforeIncomplete));
                 }
 
-                const thinkingContent = remaining.substring(incompleteThinkIndex + 7);
+                const thinkingContent = remaining.substring(incompleteThinkIndex + '<think>'.length);
 
                 html += `
                             <div class="thinking-container" id="streaming-thinking-container">
