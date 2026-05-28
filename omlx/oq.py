@@ -2628,6 +2628,7 @@ def quantize_oq_streaming(
         "chat_template.json",
         "chat_template.jinja",
         "preprocessor_config.json",
+        "processor_config.json",
         "added_tokens.json",
         "merges.txt",
         "vocab.json",

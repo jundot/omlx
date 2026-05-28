@@ -178,6 +178,21 @@ class BlockAwarePrefixCache(CacheManager):
         if paged_ssd_cache_manager is not None:
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
+    def _unlink_stale_ssd_block(self, block_hash: bytes | None) -> None:
+        """Permanently remove a stale block from SSD so the mismatch
+        warning does not fire on every subsequent request for the same
+        prefix. Catches cases that bypass the startup scan (e.g., a model
+        swap during a single server lifetime, or partially-written blocks
+        from an interrupted upgrade). Safe no-op when SSD cache is
+        disabled or the block has no hash.
+        """
+        if self.paged_ssd_cache is None or block_hash is None:
+            return
+        try:
+            self.paged_ssd_cache.delete_block(block_hash)
+        except Exception as e:
+            logger.debug(f"Failed to delete stale SSD block: {e}")
+
     def _detect_window_padding_from_blocks(
         self,
         block_ids: list[int],
@@ -1498,6 +1513,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Block has no model_name (legacy cache), "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
                         elif block_model_name != current_model_name:
                             # Block is from a different model
@@ -1505,6 +1521,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache model mismatch: block is for '{block_model_name}', "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                     # Validate num_layers to catch cross-model cache issues
@@ -1515,6 +1532,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache layer count mismatch: block has {block_num_layers} layers, "
                                 f"expected {self.expected_num_layers}. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                 # Extract type info from block metadata

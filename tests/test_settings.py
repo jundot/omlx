@@ -24,7 +24,6 @@ from omlx.settings import (
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
-    _adaptive_system_reserve,
     get_settings,
     get_ssd_capacity,
     get_system_memory,
@@ -118,54 +117,6 @@ class TestModelSettings:
         settings = ModelSettings()
         assert settings.model_dirs == []
         assert settings.model_dir is None
-        assert settings.max_model_memory == "auto"
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_get_max_model_memory_bytes_auto(self, mock_mem):
-        """Test auto memory calculation with adaptive reserve."""
-        settings = ModelSettings(max_model_memory="auto")
-        # 64GB: reserve=8GB (20%=12.8GB, capped), usable=56GB, model=50.4GB
-        expected = int((64 - 8) * 1024**3 * 0.9)
-        assert settings.get_max_model_memory_bytes() == expected
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_get_max_model_memory_bytes_auto_uppercase(self, mock_mem):
-        """Test auto memory calculation with uppercase AUTO."""
-        settings = ModelSettings(max_model_memory="AUTO")
-        expected = int((64 - 8) * 1024**3 * 0.9)
-        assert settings.get_max_model_memory_bytes() == expected
-
-    @patch("omlx.settings.get_system_memory", return_value=8 * 1024**3)
-    def test_get_max_model_memory_bytes_auto_8gb(self, mock_mem):
-        """Issue #137: 8GB device must return usable memory, not 0."""
-        settings = ModelSettings(max_model_memory="auto")
-        result = settings.get_max_model_memory_bytes()
-        # reserve=2GB (min clamp), usable=6GB, model=5.4GB
-        assert result == int((8 - 2) * 1024**3 * 0.9)
-        assert result > 0
-
-    def test_get_max_model_memory_bytes_explicit(self):
-        """Test explicit memory value."""
-        settings = ModelSettings(max_model_memory="16GB")
-        assert settings.get_max_model_memory_bytes() == 16 * 1024**3
-
-    def test_get_max_model_memory_bytes_various_units(self):
-        """Test explicit memory with various units."""
-        settings = ModelSettings(max_model_memory="512MB")
-        assert settings.get_max_model_memory_bytes() == 512 * 1024**2
-
-        settings = ModelSettings(max_model_memory="1TB")
-        assert settings.get_max_model_memory_bytes() == 1024**4
-
-    def test_get_max_model_memory_bytes_disabled(self):
-        """Test disabled memory returns None."""
-        settings = ModelSettings(max_model_memory="disabled")
-        assert settings.get_max_model_memory_bytes() is None
-
-    def test_get_max_model_memory_bytes_disabled_case_insensitive(self):
-        """Test disabled is case-insensitive."""
-        settings = ModelSettings(max_model_memory="DISABLED")
-        assert settings.get_max_model_memory_bytes() is None
 
     def test_get_model_dirs_default(self):
         """Test default model directories."""
@@ -206,22 +157,27 @@ class TestModelSettings:
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = ModelSettings(model_dirs=["/models"], max_model_memory="32GB")
+        settings = ModelSettings(model_dirs=["/models"])
         result = settings.to_dict()
         assert result == {
             "model_dirs": ["/models"],
             "model_dir": "/models",
-            "max_model_memory": "32GB",
             "model_fallback": False,
         }
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"model_dirs": ["/models"], "max_model_memory": "64GB"}
+        data = {"model_dirs": ["/models"]}
         settings = ModelSettings.from_dict(data)
         assert settings.model_dirs == ["/models"]
-        assert settings.max_model_memory == "64GB"
         assert settings.model_fallback is False
+
+    def test_from_dict_ignores_legacy_max_model_memory(self):
+        """Legacy max_model_memory key in settings.json is silently ignored."""
+        data = {"model_dirs": ["/models"], "max_model_memory": "32GB"}
+        settings = ModelSettings.from_dict(data)
+        assert settings.model_dirs == ["/models"]
+        assert not hasattr(settings, "max_model_memory")
 
     def test_model_fallback_default(self):
         """Test model_fallback defaults to False."""
@@ -248,7 +204,7 @@ class TestModelSettings:
 
     def test_from_dict_backward_compat(self):
         """Test from_dict migrates old model_dir to model_dirs."""
-        data = {"model_dir": "/legacy/models", "max_model_memory": "64GB"}
+        data = {"model_dir": "/legacy/models"}
         settings = ModelSettings.from_dict(data)
         assert settings.model_dirs == ["/legacy/models"]
         assert settings.model_dir == "/legacy/models"
@@ -261,11 +217,13 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
+        assert settings.embedding_batch_size == 32
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = SchedulerSettings(max_concurrent_requests=128)
+        settings = SchedulerSettings(max_concurrent_requests=128, embedding_batch_size=16)
         assert settings.max_concurrent_requests == 128
+        assert settings.embedding_batch_size == 16
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
@@ -273,6 +231,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "embedding_batch_size": 32,
             "chunked_prefill": False,
         }
 
@@ -281,6 +240,12 @@ class TestSchedulerSettings:
         data = {"max_concurrent_requests": 512}
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_concurrent_requests == 512
+        assert settings.embedding_batch_size == 32
+
+        data = {"max_concurrent_requests": 512, "embedding_batch_size": 24}
+        settings = SchedulerSettings.from_dict(data)
+        assert settings.max_concurrent_requests == 512
+        assert settings.embedding_batch_size == 24
 
     def test_from_dict_backwards_compat(self):
         """Test creation from dictionary with old keys."""
@@ -621,85 +586,55 @@ class TestMemorySettings:
     """Tests for MemorySettings dataclass."""
 
     def test_defaults(self):
-        """Test default value is auto."""
+        """Memory guard defaults to balanced tier and guard on."""
         settings = MemorySettings()
-        assert settings.max_process_memory == "auto"
-
-    def test_disabled_returns_none(self):
-        """Test disabled returns None bytes."""
-        settings = MemorySettings(max_process_memory="disabled")
-        assert settings.get_max_process_memory_bytes() is None
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_auto_returns_total_minus_reserve(self, mock_mem):
-        """Test auto calculates total - adaptive_reserve."""
-        settings = MemorySettings(max_process_memory="auto")
-        result = settings.get_max_process_memory_bytes()
-        # 64GB: reserve=8GB (capped) → 56GB
-        expected = (64 - 8) * 1024**3
-        assert result == expected
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_percent_parsing(self, mock_mem):
-        """Test percentage parsing (e.g., '80%')."""
-        settings = MemorySettings(max_process_memory="80%")
-        result = settings.get_max_process_memory_bytes()
-        expected = int(64 * 1024**3 * 0.80)
-        assert result == expected
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_percent_range_low(self, mock_mem):
-        """Test percentage below 10% raises ValueError."""
-        settings = MemorySettings(max_process_memory="5%")
-        with pytest.raises(ValueError, match="10-99%"):
-            settings.get_max_process_memory_bytes()
-
-    @patch("omlx.settings.get_system_memory", return_value=64 * 1024**3)
-    def test_percent_range_high(self, mock_mem):
-        """Test percentage above 99% raises ValueError."""
-        settings = MemorySettings(max_process_memory="100%")
-        with pytest.raises(ValueError, match="10-99%"):
-            settings.get_max_process_memory_bytes()
-
-    @patch("omlx.settings.get_system_memory", return_value=12 * 1024**3)
-    def test_auto_with_small_memory(self, mock_mem):
-        """Test auto with small system memory uses adaptive reserve."""
-        settings = MemorySettings(max_process_memory="auto")
-        result = settings.get_max_process_memory_bytes()
-        # 12GB: reserve=max(2GB, min(2.4GB, 8GB))=2.4GB → 9.6GB
-        expected = 12 * 1024**3 - int(12 * 1024**3 * 0.20)
-        assert result == expected
+        assert settings.prefill_memory_guard is True
+        assert settings.memory_guard_tier == "balanced"
 
     def test_to_dict(self):
         """Test serialization."""
-        settings = MemorySettings(max_process_memory="75%")
+        settings = MemorySettings(memory_guard_tier="safe")
         d = settings.to_dict()
-        assert d == {
-            "max_process_memory": "75%",
-            "prefill_memory_guard": True,
-            "soft_threshold": 0.85,
-            "hard_threshold": 0.95,
-        }
+        assert d["memory_guard_tier"] == "safe"
+        assert d["prefill_memory_guard"] is True
+        assert d["soft_threshold"] == 0.85
+        assert d["hard_threshold"] == 0.95
+        # Removed fields must not be present.
+        assert "max_process_memory" not in d
+        assert "max_process_memory_is_explicit" not in d
 
     def test_to_dict_guard_disabled(self):
         """Test serialization with prefill guard disabled."""
-        settings = MemorySettings(
-            max_process_memory="75%", prefill_memory_guard=False
-        )
+        settings = MemorySettings(prefill_memory_guard=False)
         d = settings.to_dict()
         assert d["prefill_memory_guard"] is False
 
     def test_from_dict(self):
-        """Test deserialization."""
-        settings = MemorySettings.from_dict({"max_process_memory": "90%"})
-        assert settings.max_process_memory == "90%"
+        """Test deserialization picks up tier value."""
+        settings = MemorySettings.from_dict({"memory_guard_tier": "aggressive"})
+        assert settings.memory_guard_tier == "aggressive"
         assert settings.prefill_memory_guard is True  # default
 
     def test_from_dict_defaults(self):
         """Test deserialization with empty dict uses defaults."""
         settings = MemorySettings.from_dict({})
-        assert settings.max_process_memory == "auto"
+        assert settings.memory_guard_tier == "balanced"
         assert settings.prefill_memory_guard is True
+
+    def test_from_dict_invalid_tier_falls_back_to_balanced(self):
+        """Unknown tier values silently degrade to balanced."""
+        settings = MemorySettings.from_dict({"memory_guard_tier": "wild"})
+        assert settings.memory_guard_tier == "balanced"
+
+    def test_from_dict_ignores_legacy_keys(self):
+        """Legacy max_process_memory / is_explicit keys in old settings.json are ignored."""
+        settings = MemorySettings.from_dict({
+            "max_process_memory": "80%",
+            "max_process_memory_is_explicit": True,
+            "memory_guard_tier": "safe",
+        })
+        assert settings.memory_guard_tier == "safe"
+        assert not hasattr(settings, "max_process_memory")
 
     def test_from_dict_guard_disabled(self):
         """Test deserialization with prefill guard disabled."""
@@ -716,8 +651,9 @@ class TestGlobalSettings:
             settings = GlobalSettings(base_path=Path(tmpdir))
             assert settings.server.host == "127.0.0.1"
             assert settings.server.port == 8000
-            assert settings.model.max_model_memory == "auto"
+            assert settings.memory.memory_guard_tier == "balanced"
             assert settings.scheduler.max_concurrent_requests == 8
+            assert settings.scheduler.embedding_batch_size == 32
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
@@ -750,9 +686,11 @@ class TestGlobalSettings:
                     {
                         "version": "1.0",
                         "server": {"host": "0.0.0.0", "port": 9000, "log_level": "debug"},
-                        "model": {"model_dir": "/models", "max_model_memory": "64GB"},
+                        "model": {"model_dir": "/models"},
+                        "memory": {"memory_guard_tier": "safe"},
                         "scheduler": {
                             "max_concurrent_requests": 128,
+                            "embedding_batch_size": 24,
                         },
                         "cache": {
                             "enabled": False,
@@ -771,8 +709,9 @@ class TestGlobalSettings:
             assert settings.server.log_level == "debug"
             assert settings.model.model_dirs == ["/models"]  # Migrated from model_dir
             assert settings.model.model_dir == "/models"  # Backward compat field
-            assert settings.model.max_model_memory == "64GB"
+            assert settings.memory.memory_guard_tier == "safe"
             assert settings.scheduler.max_concurrent_requests == 128
+            assert settings.scheduler.embedding_batch_size == 24
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.auth.api_key == "secret"
@@ -968,19 +907,20 @@ class TestGlobalSettings:
             errors = settings.validate()
             assert errors == []
 
-    def test_validate_disabled_max_model_memory(self):
-        """Test validation accepts 'disabled' value."""
-        settings = GlobalSettings()
-        settings.model.max_model_memory = "disabled"
-        errors = settings.validate()
-        assert not any("max_model_memory" in e.lower() for e in errors)
+    def test_validate_memory_guard_tier_valid(self):
+        """Test validation accepts each known tier."""
+        for tier in ("safe", "balanced", "aggressive"):
+            settings = GlobalSettings()
+            settings.memory.memory_guard_tier = tier
+            errors = settings.validate()
+            assert not any("memory_guard_tier" in e for e in errors)
 
-    def test_validate_invalid_max_model_memory(self):
-        """Test validation catches invalid memory size."""
+    def test_validate_memory_guard_tier_invalid(self):
+        """Test validation flags unknown tier values."""
         settings = GlobalSettings()
-        settings.model.max_model_memory = "invalid"
+        settings.memory.memory_guard_tier = "extreme"  # type: ignore[assignment]
         errors = settings.validate()
-        assert any("max_model_memory" in e.lower() for e in errors)
+        assert any("memory_guard_tier" in e for e in errors)
 
     def test_validate_invalid_scheduler_values(self):
         """Test validation catches invalid scheduler values."""
@@ -988,6 +928,11 @@ class TestGlobalSettings:
         settings.scheduler.max_concurrent_requests = 0
         errors = settings.validate()
         assert any("max_concurrent_requests" in e.lower() for e in errors)
+
+        settings = GlobalSettings()
+        settings.scheduler.embedding_batch_size = 0
+        errors = settings.validate()
+        assert any("embedding_batch_size" in e.lower() for e in errors)
 
     def test_validate_invalid_cache_size(self):
         """Test validation catches invalid cache size."""
@@ -1013,7 +958,7 @@ class TestGlobalSettings:
         settings = GlobalSettings()
         settings.server.port = 0
         settings.scheduler.max_concurrent_requests = -1
-        settings.model.max_model_memory = "invalid"
+        settings.memory.memory_guard_tier = "extreme"  # type: ignore[assignment]
         errors = settings.validate()
         assert len(errors) >= 3
 
@@ -1062,13 +1007,11 @@ class TestGlobalSettings:
                 os.environ,
                 {
                     "OMLX_MODEL_DIR": "/env/models",
-                    "OMLX_MAX_MODEL_MEMORY": "128GB",
                 },
                 clear=False,
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.model.model_dir == "/env/models"
-                assert settings.model.max_model_memory == "128GB"
 
     def test_env_override_scheduler(self):
         """Test environment variable override for scheduler settings."""
@@ -1080,6 +1023,17 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.scheduler.max_concurrent_requests == 512
+
+    def test_env_override_embedding_batch_size(self):
+        """Test environment variable override for embedding batch size."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_EMBEDDING_BATCH_SIZE": "24"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.scheduler.embedding_batch_size == 24
 
     def test_env_override_scheduler_legacy_fallback(self):
         """Test legacy OMLX_MAX_NUM_SEQS env var is accepted as fallback."""
@@ -1213,7 +1167,6 @@ class TestGlobalSettings:
                 host="0.0.0.0",
                 log_level="warning",
                 model_dir="/cli/models",
-                max_model_memory="32GB",
                 api_key="cli-key",
             )
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
@@ -1221,7 +1174,6 @@ class TestGlobalSettings:
             assert settings.server.host == "0.0.0.0"
             assert settings.server.log_level == "warning"
             assert settings.model.model_dir == "/cli/models"
-            assert settings.model.max_model_memory == "32GB"
             assert settings.auth.api_key == "cli-key"
 
     def test_cli_override_partial(self):
@@ -1236,9 +1188,10 @@ class TestGlobalSettings:
     def test_cli_override_scheduler(self):
         """Test CLI override for scheduler settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            args = Namespace(max_concurrent_requests=64)
+            args = Namespace(max_concurrent_requests=64, embedding_batch_size=12)
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.scheduler.max_concurrent_requests == 64
+            assert settings.scheduler.embedding_batch_size == 12
 
     def test_cli_override_cache(self):
         """Test CLI override for cache settings."""
@@ -1347,10 +1300,12 @@ class TestGlobalSettings:
         """Test conversion to SchedulerConfig."""
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
+        settings.scheduler.embedding_batch_size = 12
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.completion_batch_size == 128
+        assert scheduler_config.embedding_batch_size == 12
         assert scheduler_config.initial_cache_blocks == 256  # default
 
     def test_to_scheduler_config_initial_cache_blocks(self):
@@ -1463,35 +1418,6 @@ class TestHelperFunctions:
         """Test SSD capacity with tilde path expansion."""
         capacity = get_ssd_capacity("~/")
         assert capacity > 0
-
-
-class TestAdaptiveSystemReserve:
-    """Tests for _adaptive_system_reserve helper."""
-
-    def test_min_clamp(self):
-        """Small RAM: reserve clamped to 2GB minimum."""
-        # 8GB: 20% = 1.6GB, clamped up to 2GB
-        assert _adaptive_system_reserve(8 * 1024**3) == 2 * 1024**3
-
-    def test_max_clamp(self):
-        """Large RAM: reserve capped at 8GB."""
-        # 64GB: 20% = 12.8GB, capped down to 8GB
-        assert _adaptive_system_reserve(64 * 1024**3) == 8 * 1024**3
-
-    def test_mid_range(self):
-        """Mid-range: 20% of total."""
-        # 32GB: 20% = 6.4GB, within [2GB, 8GB]
-        total = 32 * 1024**3
-        assert _adaptive_system_reserve(total) == int(total * 0.20)
-
-    def test_16gb(self):
-        """16GB: 20% = 3.2GB, above min clamp."""
-        total = 16 * 1024**3
-        assert _adaptive_system_reserve(total) == int(total * 0.20)
-
-    def test_192gb(self):
-        """192GB: 20% = 38.4GB, capped at 8GB."""
-        assert _adaptive_system_reserve(192 * 1024**3) == 8 * 1024**3
 
 
 class TestSettingsVersionMigration:
@@ -1839,7 +1765,6 @@ class TestCORSMiddleware:
             settings = GlobalSettings(base_path=Path(tmpdir))
             init_server(
                 model_dirs=[tmpdir],
-                max_model_memory=0,
                 global_settings=settings,
             )
 

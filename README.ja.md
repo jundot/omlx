@@ -210,7 +210,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### macOSメニューバーアプリ
 
-ネイティブPyObjCメニューバーアプリ（Electronではありません）。ターミナルを開かずにサーバーの起動、停止、監視が可能です。永続的な配信統計（再起動後も維持）、クラッシュ時の自動再起動、アプリ内自動アップデートを含みます。
+ネイティブ Swift / SwiftUI メニューバーアプリ（Electron ではありません）。ターミナルを開かずにサーバーの起動、停止、監視が可能です。永続的な配信統計（再起動後も維持）、クラッシュ時の自動再起動、Sparkle による自動アップデートを含みます。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX メニューバー統計" width="400">
@@ -335,22 +335,20 @@ pytest -m "not slow"
 
 ### macOSアプリ
 
-Python 3.11+と[venvstacks](https://venvstacks.lmstudio.ai)（`pip install venvstacks`）が必要です。
+ネイティブ SwiftUI アプリは `apps/omlx-mac/` にあります。Xcode 26.5+ と Python 3.11+ が必要です。venvstacks は dev 依存として宣言されているため、`pip install -e ".[dev]"`（または `uv sync --dev`）でピン留めされたバージョンが入ります。ホスト全体のツールランナーを使いたい場合は `uvx venvstacks` や `pipx run venvstacks` でも動作します。
 
 ```bash
-cd packaging
+# 実行可能な oMLX.app をステージング（xcodebuild + venvstacks Python レイヤー + ad-hoc 署名）
+apps/omlx-mac/Scripts/build.sh release
 
-# フルビルド（venvstacks + アプリバンドル + DMG）
-python build.py
+# 出力は apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# venvstacksをスキップ（コード変更のみ）
-python build.py --skip-venv
-
-# DMGのみ
-python build.py --dmg-only
+# venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-アプリバンドルの構造とレイヤー設定の詳細は[packaging/README.md](packaging/README.md)を参照してください。
+初回 cold ビルドは 10–20 分かかります（venvstacks Python レイヤーの組み立て）。以降のビルドは `packaging/_export/` のキャッシュを再利用し、約 4 分で完了します。レイヤー構成は [packaging/README.md](packaging/README.md)、Swift ソースは [apps/omlx-mac/](apps/omlx-mac/) を参照してください。
 
 ## コントリビューション
 

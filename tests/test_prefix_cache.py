@@ -442,6 +442,37 @@ class TestBlockAwarePrefixCacheWithSSD:
 
         assert result is None
 
+    def test_unlink_stale_ssd_block_calls_delete(self, prefix_cache_with_ssd):
+        """The helper forwards to PagedSSDCacheManager.delete_block so the
+        mismatch warning does not fire again for the same block_hash on the
+        next request."""
+        block_hash = b"\xab" * 32
+        prefix_cache_with_ssd._unlink_stale_ssd_block(block_hash)
+
+        prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_called_once_with(
+            block_hash
+        )
+
+    def test_unlink_stale_ssd_block_noop_when_hash_missing(
+        self, prefix_cache_with_ssd
+    ):
+        """No hash means the block was never persisted to SSD — nothing to
+        delete."""
+        prefix_cache_with_ssd._unlink_stale_ssd_block(None)
+        prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
+
+    def test_unlink_stale_ssd_block_noop_without_ssd(self, paged_cache):
+        """Pure paged-cache deployments have no SSD manager attached — the
+        helper must not raise."""
+        model = MockModel(num_layers=4)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=None,
+        )
+        # Should not raise.
+        cache._unlink_stale_ssd_block(b"\xab" * 32)
+
 
 class TestPrefixIndexOperations:
     """Tests for prefix index operations."""

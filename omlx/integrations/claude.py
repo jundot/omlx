@@ -46,12 +46,7 @@ class ClaudeCodeIntegration(Integration):
         extra_args: list[str] | None = None,
         **kwargs,
     ) -> None:
-        env = os.environ.copy()
-        # Remove omlx-cli Python env vars so Claude Code's subprocess hooks
-        # don't inherit our bundled Python 3.11 environment.
-        for _key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
-            env.pop(_key, None)
-
+        env = self._scrubbed_env()
         env["ANTHROPIC_BASE_URL"] = f"http://{host}:{port}"
         # Use the actual omlx API key so Claude Code authenticates correctly.
         # Fallback to "omlx" only when no API key is configured (open server).

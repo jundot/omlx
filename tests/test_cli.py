@@ -13,6 +13,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from omlx._version import __version__
+
 
 class TestCLIModule:
     """Tests for CLI module existence and basic functionality."""
@@ -44,6 +46,18 @@ class TestCLIHelp:
         assert result.returncode == 0
         # Should show available commands
         assert "serve" in result.stdout.lower()
+
+    def test_main_version(self):
+        """Test main CLI version output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == __version__
+        assert result.stderr == ""
 
     def test_serve_help(self):
         """Test serve command help output."""
@@ -112,15 +126,16 @@ class TestServeCommandOptions:
         )
         assert "--model-dir" in result.stdout
 
-    def test_serve_has_max_model_memory_option(self):
-        """Test that serve command has --max-model-memory option."""
+    def test_serve_has_no_max_memory_options(self):
+        """The --max-model-memory and --max-process-memory CLI flags are removed."""
         result = subprocess.run(
             [sys.executable, "-m", "omlx.cli", "serve", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
         )
-        assert "--max-model-memory" in result.stdout
+        assert "--max-model-memory" not in result.stdout
+        assert "--max-process-memory" not in result.stdout
 
     def test_serve_no_model_specific_options(self):
         """Test that serve command does not have model-specific options (managed via admin page)."""
@@ -159,6 +174,7 @@ class TestServeCommandOptions:
             timeout=10,
         )
         assert "--max-concurrent-requests" in result.stdout
+        assert "--embedding-batch-size" in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""
@@ -381,6 +397,28 @@ class TestServeCommandFunctions:
         # Help text should mention ~/.omlx/models or similar
         assert ".omlx" in result.stdout or "model" in result.stdout.lower()
 
+    def test_invalid_embedding_batch_size_is_not_persisted(self, tmp_path):
+        """Invalid CLI scheduler values should fail before saving settings.json."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omlx.cli",
+                "serve",
+                "--base-path",
+                str(tmp_path),
+                "--embedding-batch-size",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode != 0
+        assert "embedding_batch_size" in result.stdout
+        assert not (tmp_path / "settings.json").exists()
+
 
 
 class TestHasCliOverrides:
@@ -392,10 +430,9 @@ class TestHasCliOverrides:
         defaults = {
             "model_dir": None,
             "port": None,
-            "max_model_memory": None,
-            "max_process_memory": None,
             "host": None,
             "log_level": None,
+            "embedding_batch_size": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -419,19 +456,14 @@ class TestHasCliOverrides:
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(model_dir="/tmp/models")) is True
 
-    def test_max_model_memory_explicit(self):
-        from omlx.cli import _has_cli_overrides
-        assert _has_cli_overrides(self._make_args(max_model_memory="auto")) is True
-        assert _has_cli_overrides(self._make_args(max_model_memory="32GB")) is True
-
-    def test_max_process_memory_explicit(self):
-        from omlx.cli import _has_cli_overrides
-        assert _has_cli_overrides(self._make_args(max_process_memory="64GB")) is True
-
     def test_log_level_explicit(self):
         from omlx.cli import _has_cli_overrides
         assert _has_cli_overrides(self._make_args(log_level="info")) is True
         assert _has_cli_overrides(self._make_args(log_level="debug")) is True
+
+    def test_embedding_batch_size_explicit(self):
+        from omlx.cli import _has_cli_overrides
+        assert _has_cli_overrides(self._make_args(embedding_batch_size=4)) is True
 
     def test_multiple_overrides(self):
         from omlx.cli import _has_cli_overrides

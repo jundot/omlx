@@ -26,9 +26,7 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
 
 
-def extract_thinking(
-    text: str, start_in_thinking: bool = False
-) -> Tuple[str, str]:
+def extract_thinking(text: str) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -42,14 +40,14 @@ def extract_thinking(
       occasionally skip the ``</think>`` boundary token. Without this
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
-    - Native reasoning (``start_in_thinking=True``): when the prompt
-      pre-opened ``<think>`` and generation contains no tags at all,
-      the entire output is treated as thinking with empty content.
+
+    Tag-free text is always classified as content. Mirrors
+    ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
+    fallback): when the model emits no thinking markers, surface the body
+    as the answer so the response is never empty.
 
     Args:
         text: Complete model output text.
-        start_in_thinking: If True, treat tag-free text as thinking
-            (native-reasoning mode where the prompt pre-opens <think>).
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -87,11 +85,6 @@ def extract_thinking(
         before = text[:idx]
         after = text[idx + _OPEN_LEN:]
         return ("", (before + after).strip())
-
-    # Native-reasoning fallback: prompt pre-opened <think>, generation
-    # contains no tags at all — treat the whole output as thinking.
-    if start_in_thinking and '<think>' not in text and '</think>' not in text:
-        return (text.strip(), "")
 
     return ("", text)
 

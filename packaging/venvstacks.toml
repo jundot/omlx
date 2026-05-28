@@ -1,5 +1,14 @@
-# oMLX venvstacks configuration
-# Build portable macOS app with MLX bundled
+# oMLX venvstacks layer template
+#
+# Layer structure + runtime pin + uv resolver settings live here. The
+# actual `requirements = [...]` for the mlx-framework layer is generated
+# at build time by packaging/build.py:_generate_venvstacks_toml() from
+# pyproject.toml's [project] dependencies + [bundle] optional extra, so
+# this file does not list package versions. Single source of truth for
+# Python deps is pyproject.toml.
+#
+# No [[applications]] block: the Swift app is the application surface,
+# so the venvstacks export only ships a runtime + framework layer.
 
 [[runtimes]]
 name = "cpython-3.11"
@@ -12,75 +21,8 @@ platforms = [
 [[frameworks]]
 name = "mlx-framework"
 runtime = "cpython-3.11"
-requirements = [
-    # Core MLX
-    "mlx==0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - aligned with pyproject.toml
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
-    # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
-    "regex",
-    # mlx-embeddings from latest commit (32981fa) - aligned with pyproject.toml
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    # Server dependencies
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
-    # Tokenizers and transformers (aligned with pyproject.toml)
-    # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
-    "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
-    # Other dependencies
-    "numpy>=1.24.0",
-    "tqdm>=4.66.0",
-    "pyyaml>=6.0",
-    "itsdangerous>=2.0",
-    "jinja2>=3.0",
-    "sentencepiece",
-    "tiktoken",
-    "protobuf",
-    "requests>=2.28.0",
-    # SOCKS proxy support (used by httpx via huggingface-hub)
-    "socksio>=1.0.0",
-    "psutil>=5.9.0",
-    "jsonschema>=4.0.0",
-    "tabulate>=0.9.0",
-    # MCP support
-    "mcp>=1.0.0",
-    # Harmony format parser for gpt-oss models
-    "openai-harmony",
-    # mlx-vlm from commit (f96138e) - aligned with pyproject.toml
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
-    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@1ba671372b289c025b435c1a13aabb4bfb80b183",
-    "Pillow>=9.0.0",
-    # ModelScope SDK for downloading models from ModelScope Hub
-    "modelscope>=1.10.0",
-    # python-multipart needed by audio routes (File/Form uploads)
-    "python-multipart>=0.0.5",
-    # mlx-audio runtime deps (mlx-audio itself installed --no-deps in build.py)
-    "scipy>=1.11.0",
-    "librosa>=0.10.0",
-    "miniaudio>=1.59",
-    "numba>=0.59.0",
-    "pyloudnorm>=0.1.0",
-    "sounddevice>=0.4.6",
-    # mlx-audio [tts] extra deps
-    "misaki>=0.9.4",
-    "num2words>=0.5.14",
-    "spacy>=3.8.4",
-    "phonemizer-fork>=3.3.2",
-    "espeakng-loader>=0.2.4",
-    # mlx-audio [stt] extra deps
-    # transformers 5.x's tokenization_mistral_common imports ReasoningEffort
-    # which only exists in mistral-common>=1.10. Without this floor, the
-    # resolver lands on 1.9.x and WhisperProcessor.from_pretrained() silently
-    # fails (#1072, #1116).
-    "mistral-common[audio]>=1.10",
-    # mlx-audio [sts] extra deps
-    "webrtcvad>=2.0.10",
-    # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
-    # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm (v0.31.3)
-]
+# Populated by _generate_venvstacks_toml() — do not hand-edit.
+requirements = []
 platforms = [
     "macosx_arm64",
 ]
@@ -95,19 +37,6 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
-]
-
-[[applications]]
-name = "omlx-app"
-launch_module = "omlx_app"
-frameworks = ["mlx-framework"]
-requirements = [
-    # PyObjC for native macOS menubar app
-    "pyobjc-core>=10.0",
-    "pyobjc-framework-Cocoa>=10.0",
-]
-platforms = [
-    "macosx_arm64",
 ]
 
 [tool.uv]

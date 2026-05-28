@@ -36,6 +36,7 @@ class TestSchedulerConfig:
         assert config.max_num_batched_tokens == 8192
         assert config.policy == SchedulingPolicy.FCFS
         assert config.completion_batch_size == 32
+        assert config.embedding_batch_size == 32
         assert config.prefill_step_size == 2048
         assert config.paged_cache_block_size == 256
         assert config.max_cache_blocks is None
@@ -53,6 +54,7 @@ class TestSchedulerConfig:
             max_num_batched_tokens=4096,
             policy=SchedulingPolicy.PRIORITY,
             completion_batch_size=16,
+            embedding_batch_size=12,
             prefill_step_size=1024,
             paged_cache_block_size=128,
             max_cache_blocks=500,
@@ -68,6 +70,7 @@ class TestSchedulerConfig:
         assert config.max_num_batched_tokens == 4096
         assert config.policy == SchedulingPolicy.PRIORITY
         assert config.completion_batch_size == 16
+        assert config.embedding_batch_size == 12
         assert config.prefill_step_size == 1024
         assert config.paged_cache_block_size == 128
         assert config.max_cache_blocks == 500
@@ -720,6 +723,74 @@ class TestSchedulerReset:
         assert len(scheduler.requests) == 0
         assert scheduler.batch_generator is None
 
+    def test_reset_clears_async_store_cache_bookkeeping(
+        self, mock_model, mock_tokenizer
+    ):
+        """reset() must drop _pending_async_removes and _inflight_store_futures.
+
+        Regression for #1459: when a slow async store_cache worker finishes
+        between scheduler.shutdown()'s 30s wait timeout and the subsequent
+        executor.shutdown(wait=True), the deferred _drain_pending_async_removes
+        step that nulls req._extracted_cache never runs again. If reset()
+        leaves these two containers populated, the futures keep Request
+        references alive and the KV cache stays pinned for the rest of the
+        process lifetime. Clearing them in reset() is the second line of
+        defense after shutdown()'s final drain.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_future = MagicMock()
+        scheduler._pending_async_removes.append(
+            (999, "req-leaked", fake_future)
+        )
+        scheduler._inflight_store_futures["req-leaked"] = fake_future
+
+        scheduler.reset()
+
+        assert len(scheduler._pending_async_removes) == 0
+        assert len(scheduler._inflight_store_futures) == 0
+
+    def test_shutdown_drains_after_executor_join(self, mock_model, mock_tokenizer):
+        """shutdown() must drain pending removes again after executor join.
+
+        Regression for #1459. When the 30s `wait()` times out, the first
+        drain skips not-yet-done futures (deque break on `not future.done()`).
+        `executor.shutdown(wait=True)` then joins all workers — by the time
+        it returns, every future is done — but without a second drain those
+        skipped entries stay pinned, keeping the request's KV cache alive
+        for the rest of the process lifetime.
+
+        Asserts: drain runs both before and after executor.shutdown.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+
+        # Seed an inflight future so shutdown() enters the wait branch.
+        scheduler._inflight_store_futures["req-slow"] = MagicMock()
+
+        call_order = []
+        original_drain = scheduler._drain_pending_async_removes
+
+        def record_drain():
+            call_order.append("drain")
+            original_drain()
+
+        def record_executor_shutdown(wait=True):
+            call_order.append("executor_shutdown")
+
+        fake_executor.shutdown.side_effect = record_executor_shutdown
+        scheduler._drain_pending_async_removes = record_drain
+
+        with patch("concurrent.futures.wait"):
+            scheduler.shutdown()
+
+        assert call_order == ["drain", "executor_shutdown", "drain"], (
+            f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        )
+
 
 class TestSchedulerStopTokens:
     """Tests for stop token handling."""
@@ -822,6 +893,74 @@ class TestSyncAndClearCache:
             with pytest.raises(RuntimeError, match="default stream failure"):
                 sched_mod._sync_and_clear_cache()
             clear_cache.assert_not_called()
+
+
+class TestStoreCacheWorkerSync:
+    """Tests for store-cache worker stream-scoped sync (#1437).
+
+    Worker must wait on generation_stream specifically, not on the
+    default stream. mx.synchronize() with no args only blocks on the
+    default stream (gpu:0) and leaves the gpu:2 dispatched work
+    unwaited, racing the buffer-protocol access in
+    _extract_tensor_bytes -> SIGABRT in get_command_encoder(gpu:2).
+    """
+
+    def test_safe_sync_passes_generation_stream(self):
+        """_safe_sync_stream() with no args must invoke mx.synchronize with
+        the module-level _default_generation_stream object, not call the
+        no-args variant.
+
+        Regression: PR #1146 wired the worker to bare mx.synchronize()
+        under the (incorrect) assumption that it was a global barrier
+        and that stream-scoped sync was unsafe cross-thread. Both
+        assumptions are wrong: synchronize() defaults to a single
+        stream, and Stream objects are not thread-local. The worker
+        path now routes through this helper so the regression has a
+        single chokepoint to assert against.
+        """
+        from omlx import scheduler as sched_mod
+
+        calls = []
+
+        def fake_sync(*args, **kwargs):
+            calls.append(args)
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_stream()
+
+        assert len(calls) == 1
+        assert calls[0] and calls[0][0] is sched_mod._default_generation_stream, (
+            f"Worker sync must target _default_generation_stream, got: {calls}"
+        )
+
+    def test_safe_sync_swallows_no_stream_runtime_error(self):
+        """A 'no Stream' RuntimeError from cross-thread sync must be
+        swallowed so the worker can still proceed to extract bytes.
+
+        On some MLX builds mx.synchronize(stream) raises 'There is no
+        Stream(gpu, X) in current thread' from a thread that has not
+        submitted work to that stream. In the store-cache worker that
+        condition means there is no in-flight gpu:2 work to drain, so
+        it is safe to continue.
+        """
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("There is no Stream(gpu, 2) in current thread.")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            sched_mod._safe_sync_stream()
+
+    def test_safe_sync_propagates_other_runtime_errors(self):
+        """Real GPU errors must not be silently swallowed."""
+        from omlx import scheduler as sched_mod
+
+        def fake_sync(*args, **kwargs):
+            raise RuntimeError("Metal command buffer execution failed")
+
+        with patch.object(sched_mod.mx, "synchronize", side_effect=fake_sync):
+            with pytest.raises(RuntimeError, match="command buffer execution failed"):
+                sched_mod._safe_sync_stream()
 
 
 class TestSchedulerFormatBytes:
@@ -1095,7 +1234,14 @@ class TestSchedulerBoundarySnapshots:
     def test_prefill_boundary_snapshot_records_rotating_cache(
         self, mock_model, mock_tokenizer
     ):
-        """Prefill callback should store rotating boundary snapshots."""
+        """Prefill callback should store rotating boundary snapshots.
+
+        Regression: deliberately leave ``request_id_to_uid`` /
+        ``uid_to_request_id`` unset, matching what happens in production
+        during prefill (the request has not been inserted into
+        BatchGenerator yet). The earlier shape passed a uid that
+        resolved to None and silently dropped the snapshot.
+        """
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,
@@ -1108,16 +1254,15 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        uid = 77
         scheduler.requests[request.request_id] = request
         scheduler.running[request.request_id] = request
-        scheduler.request_id_to_uid[request.request_id] = uid
-        scheduler.uid_to_request_id[uid] = request.request_id
 
         RotatingStub = type("RotatingKVCache", (), {})
         snapshot_cache = [RotatingStub()]
 
-        scheduler._on_prefill_boundary_snapshot(uid, snapshot_cache, 4)
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, snapshot_cache, 4
+        )
 
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
         assert scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
@@ -1139,16 +1284,56 @@ class TestSchedulerBoundarySnapshots:
             prompt="hello",
             sampling_params=SamplingParams(),
         )
-        uid = 78
         scheduler.requests[request.request_id] = request
         scheduler.running[request.request_id] = request
-        scheduler.request_id_to_uid[request.request_id] = uid
-        scheduler.uid_to_request_id[uid] = request.request_id
 
         RotatingStub = type("RotatingKVCache", (), {})
-        scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 3)
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id, [RotatingStub()], 3
+        )
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
+
+    def test_emit_prefill_boundary_snapshot_persists_before_uid_assignment(
+        self, mock_model, mock_tokenizer
+    ):
+        """Snapshots emitted during prefill must persist even though the
+        request has not yet been inserted into BatchGenerator.
+
+        The regression this guards against: the wrapper used to route
+        through ``request_id_to_uid.get(rid, -1)`` →
+        ``uid_to_request_id.get(-1)`` → ``None`` → silent return, so
+        every block-boundary snapshot during prefill was dropped. For
+        hybrid (ArraysCache / GDN) models that meant every non-last
+        cached block stored a placeholder and identical-prefix re-
+        uploads re-prefilled from scratch.
+        """
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+
+        request = Request(
+            request_id="req-prefill-pre-insert",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        # Deliberately do NOT populate request_id_to_uid /
+        # uid_to_request_id — that mirrors production state at the
+        # time _emit_prefill_boundary_snapshot fires.
+        assert request.request_id not in scheduler.request_id_to_uid
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        prompt_cache = [RotatingStub()]
+
+        scheduler._emit_prefill_boundary_snapshot(request, prompt_cache, 4)
+
+        assert request.request_id in scheduler._boundary_cache_snapshots
+        assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
 
 
 class TestSchedulerRotatingBlockAlignment:

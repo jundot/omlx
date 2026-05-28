@@ -264,6 +264,30 @@ class TestHFUploaderListModels:
         models = await uploader.list_oq_models()
         assert models == []
 
+    @pytest.mark.asyncio
+    async def test_update_model_dirs_picks_up_added_dir(self, model_dirs, tmp_path):
+        # Simulates the Settings UI flow: start with one dir, add a second one
+        # at runtime, then verify the new dir's oQ models become visible.
+        uploader = HFUploader(model_dirs=model_dirs)
+        before = {m["name"] for m in await uploader.list_oq_models()}
+        assert "Llama-3B-oQ4" in before
+        assert "Phi-3B-oQ4" not in before
+
+        extra_dir = tmp_path / "models2"
+        extra_dir.mkdir()
+        extra_model = extra_dir / "Phi-3B-oQ4"
+        extra_model.mkdir()
+        (extra_model / "config.json").write_text(json.dumps({
+            "model_type": "phi",
+            "quantization": {"bits": 4, "group_size": 64},
+        }))
+        (extra_model / "model.safetensors").write_bytes(b"\x00" * 1024)
+
+        uploader.update_model_dirs(model_dirs + [str(extra_dir)])
+        after = {m["name"] for m in await uploader.list_oq_models()}
+        assert "Llama-3B-oQ4" in after
+        assert "Phi-3B-oQ4" in after
+
 
 class TestHFUploaderValidateToken:
     """Test token validation."""

@@ -167,9 +167,15 @@
                                                 </template>
                                                 <!-- Idle -->
                                                 <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
-                                                    <div class="flex items-center gap-1.5">
+                                                    <div class="flex items-center gap-1.5 flex-wrap">
                                                         <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
                                                         <span class="text-xs text-neutral-400">idle</span>
+                                                        <template x-if="m.idle_seconds != null">
+                                                            <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
+                                                        </template>
+                                                        <template x-if="m.ttl_remaining_seconds != null">
+                                                            <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + ' left'"></span>
+                                                        </template>
                                                     </div>
                                                 </template>
                                             </div>

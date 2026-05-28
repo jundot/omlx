@@ -315,12 +315,7 @@ class STTEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

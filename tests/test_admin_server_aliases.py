@@ -4,7 +4,8 @@
 
 import asyncio
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -258,3 +259,127 @@ class TestUpdateGlobalSettingsAliases:
             )
 
         assert gs.server.server_aliases == []
+
+
+class TestUpdateGlobalSettingsEmbeddingBatchSize:
+    """update_global_settings: saving and hot-applying embedding batch size."""
+
+    def _make_scheduler_settings(self):
+        return SimpleNamespace(
+            max_concurrent_requests=8,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+
+    def test_saves_and_hot_applies_embedding_batch_size(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with _patched_global_settings(gs), patch.object(
+            omlx.server,
+            "_server_state",
+            server_state,
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "embedding_batch_size" in result["runtime_applied"]
+        assert gs.scheduler.embedding_batch_size == 5
+        pool.apply_embedding_batch_size.assert_awaited_once_with(5)
+        gs.save.assert_called_once()
+
+    def test_rejects_invalid_embedding_batch_size(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        request = GlobalSettingsRequest(embedding_batch_size=0)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "embedding_batch_size" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_does_not_hot_apply_embedding_batch_size_when_validation_fails(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = ["invalid unrelated setting"]
+        gs.save.return_value = None
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with _patched_global_settings(gs), patch.object(
+            omlx.server,
+            "_server_state",
+            server_state,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32
+        gs.save.assert_not_called()
+
+    def test_does_not_mutate_embedding_batch_size_when_api_key_is_invalid(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5, api_key="abc")
+
+        with _patched_global_settings(gs), patch.object(
+            omlx.server,
+            "_server_state",
+            server_state,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32
+        gs.save.assert_not_called()
+
+    def test_does_not_hot_apply_embedding_batch_size_when_save_fails(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.side_effect = OSError("disk full")
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with _patched_global_settings(gs), patch.object(
+            omlx.server,
+            "_server_state",
+            server_state,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 500
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32

@@ -258,12 +258,7 @@ class TTSEngine(BaseNonStreamingEngine):
             )
             return result
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
 
     async def stream_synthesize_pcm(
         self,
@@ -378,12 +373,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 )
                 yield sample_rate, channels, sample_width, pcm_bytes
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
             logger.info(
                 "TTS native stream done: model=%s, %.2fs, chunks=%d, pcm_bytes=%d",
                 self._model_name, time.monotonic() - t0, chunk_count, total_bytes,

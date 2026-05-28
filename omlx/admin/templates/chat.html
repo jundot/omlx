@@ -4343,9 +4343,11 @@
             stream.streamingContent = '';
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
+              
         if (stream.targetMessageId) {
             context._apiVariantChainId = stream.targetMessageId;
         }
+        
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
         this.setEngineStatus(context.chatId, { text: 'Starting' });
         this.startPrefillPolling(context.chatId);
@@ -4524,6 +4526,7 @@
                     id: this.newMessageId(),
                     role: 'assistant',
                     content: stream.streamingContent || null,
+                    reasoning_content: stream.streamingThinking || null,
                     model: context.model,
                     tool_calls: toolCalls,
                     _profile: context._profile,
@@ -4614,6 +4617,7 @@
                 id: assistantId,
                 role: 'assistant',
                 content: stream.streamingContent || '',
+                reasoning_content: stream.streamingThinking || null,
                 model: context.model,
                 meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                 _perfVisible: false,
@@ -4644,6 +4648,7 @@
                         id: assistantId,
                         role: 'assistant',
                         content: stream.streamingContent,
+                        reasoning_content: stream.streamingThinking || null,
                         model: context.model,
                         meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                         _perfVisible: false,

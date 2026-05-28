@@ -801,6 +801,167 @@ class TestPagedSSDCacheManagerWithMLX:
         # Index scan ran in __init__. The legacy file should not appear.
         assert not manager_after_scan.has_block(block_hash)
 
+    def _write_versioned_fixture_block(
+        self,
+        cache_dir: Path,
+        mx,
+        block_hash: bytes,
+        *,
+        num_layers: int,
+        model_name: str,
+    ) -> Path:
+        """Drop a minimally-valid versioned block on disk so we can exercise
+        the startup scan without relying on the background writer."""
+        from omlx.cache.paged_ssd_cache import _CACHE_FORMAT_VERSION
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        block_hash_hex = block_hash.hex()
+        sub_dir = cache_dir / block_hash_hex[0]
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        file_path = sub_dir / f"{block_hash_hex}.safetensors"
+
+        tensors = {}
+        for i in range(num_layers):
+            tensors[f"layer_{i}_keys"] = mx.zeros((1, 8, 32, 64))
+            tensors[f"layer_{i}_values"] = mx.zeros((1, 8, 32, 64))
+
+        mx.save_safetensors(
+            str(file_path),
+            tensors,
+            metadata={
+                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+                "block_hash": block_hash_hex,
+                "token_count": "32",
+                "num_layers": str(num_layers),
+                "model_name": model_name,
+                "created_at": "0",
+            },
+        )
+        return file_path
+
+    def test_scan_invalidates_layer_count_mismatch(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks with num_layers != expected_num_layers are unlinked at scan.
+
+        Models that change their effective layer count across versions (e.g.,
+        #1404 attaching MTPModule changed 30 → 40) would otherwise leave the
+        old blocks on disk forever, hitting the layer-mismatch reject path on
+        every prefix lookup. See #1413.
+        """
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        stale_hash = b"\x10" + b"\x00" * 31
+        fresh_hash = b"\x20" + b"\x00" * 31
+        stale_path = self._write_versioned_fixture_block(
+            cache_dir, mx, stale_hash, num_layers=30, model_name="qwen3.6"
+        )
+        fresh_path = self._write_versioned_fixture_block(
+            cache_dir, mx, fresh_hash, num_layers=40, model_name="qwen3.6"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+        )
+
+        assert not stale_path.exists()
+        assert fresh_path.exists()
+        assert not manager.has_block(stale_hash)
+        assert manager.has_block(fresh_hash)
+
+    def test_scan_invalidates_model_name_mismatch(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks from a different model are unlinked, even when layer count
+        happens to match."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        other_hash = b"\x30" + b"\x00" * 31
+        match_hash = b"\x40" + b"\x00" * 31
+        other_path = self._write_versioned_fixture_block(
+            cache_dir, mx, other_hash, num_layers=40, model_name="llama"
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir, mx, match_hash, num_layers=40, model_name="qwen3.6"
+        )
+
+        PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+        )
+
+        assert not other_path.exists()
+        assert match_path.exists()
+
+    def test_scan_keeps_blocks_when_expected_fields_unset(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Backwards compatibility: callers that omit the new init args see
+        no behavior change. All blocks survive scan regardless of metadata."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        h1 = b"\x50" + b"\x00" * 31
+        h2 = b"\x60" + b"\x00" * 31
+        p1 = self._write_versioned_fixture_block(
+            cache_dir, mx, h1, num_layers=30, model_name="a"
+        )
+        p2 = self._write_versioned_fixture_block(
+            cache_dir, mx, h2, num_layers=40, model_name="b"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert p1.exists()
+        assert p2.exists()
+        assert manager.has_block(h1)
+        assert manager.has_block(h2)
+
+    def test_scan_logs_invalidated_count(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """The completion log line surfaces the cleanup count so operators
+        can tell when stale data was purged at boot."""
+        import logging
+
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        for i in range(3):
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x70 + i]) + b"\x00" * 31,
+                num_layers=30,
+                model_name="old",
+            )
+
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=1024**3,
+                expected_model_name="old",
+                expected_num_layers=40,
+            )
+
+        scan_lines = [
+            r.message
+            for r in caplog.records
+            if "SSD cache scan complete" in r.message
+        ]
+        assert scan_lines, "scan completion log not emitted"
+        assert "invalidated_stale=3 blocks" in scan_lines[-1]
+
 
 class TestPagedSSDCacheManagerCacheList:
     """Tests for CacheList support in PagedSSDCacheManager."""
