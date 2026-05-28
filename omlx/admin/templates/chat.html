@@ -1180,10 +1180,10 @@
                                     style="color: var(--text-primary);">
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                                     <span x-text="variantModelLabel(msg)"></span>
-                                    <span x-show="msg._profile && msg._profile !== 'System Default'"
+                                    <span x-show="variantProfileLabel(msg)"
                                         class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
                                         style="color: var(--text-tertiary);"
-                                        x-text="msg._profile"></span>
+                                        x-text="variantProfileLabel(msg)"></span>
                                 </div>
                                 <div class="flex gap-1" x-data="{ contextOpen: false }">
                                     <!-- Timeline toggle: only visible when timeline data is attached -->
@@ -1289,6 +1289,10 @@
                             <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                             <span
                                 x-text="currentStream()?.sourceModel || currentModel || window.t('chat.assistant_label')"></span>
+                            <span x-show="currentStream()?.sourceProfile && currentStream()?.sourceProfile !== 'System Default'"
+                                class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
+                                style="color: var(--text-tertiary);"
+                                x-text="currentStream()?.sourceProfile"></span>
                         </div>
                         <div class="flex gap-1">
                             <!-- Timeline toggle for streaming -->
@@ -1814,7 +1818,7 @@
 
                 <!-- Save Model Settings button -->
                 <div class="flex justify-center pt-1">
-                    <button @click="saveAdminModelSettings()" :disabled="savingModelSettings || showSavedText"
+                    <button @click="saveSessionModelSettings()" :disabled="savingModelSettings || showSavedText"
                         class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[10px] font-semibold transition-all duration-200"
                         :class="modelSettingsDirty && !savingModelSettings && !showSavedText
                             ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
@@ -2039,6 +2043,70 @@
                 turboquant_skip_last: true,
             },
 
+            defaultModelSettings() {
+                return {
+                    temperature: null,
+                    max_tokens: null,
+                    top_p: null,
+                    top_k: null,
+                    min_p: null,
+                    repetition_penalty: null,
+                    presence_penalty: null,
+                    enable_thinking: false,
+                    thinking_budget_enabled: false,
+                    thinking_budget_tokens: null,
+                    turboquant_kv_enabled: false,
+                    turboquant_kv_bits: 4,
+                    turboquant_skip_last: true,
+                };
+            },
+
+            captureSessionModelSettings() {
+                return {
+                    modelSettings: this.cloneData(this.modelSettings),
+                    speculativeEngine: this.speculativeEngine,
+                    speculativeDraftModel: this.speculativeDraftModel,
+                };
+            },
+
+            applySessionModelSettings(session) {
+                if (!session?.modelSettings) return false;
+                this.modelSettings = { ...this.defaultModelSettings(), ...this.cloneData(session.modelSettings) };
+                this.speculativeEngine = session.speculativeEngine ?? 'none';
+                this.speculativeDraftModel = session.speculativeDraftModel ?? '';
+                this.modelSettingsDirty = false;
+                return true;
+            },
+
+            syncSessionModelSettingsFromUi(session) {
+                if (!session) return;
+                const snap = this.captureSessionModelSettings();
+                session.modelSettings = snap.modelSettings;
+                session.speculativeEngine = snap.speculativeEngine;
+                session.speculativeDraftModel = snap.speculativeDraftModel;
+            },
+
+            persistChatSettingsToHistory(chatId = this.currentChatId) {
+                const session = this.getChatSession(chatId, false);
+                if (!session || !chatId) return;
+                if (chatId === this.currentChatId) {
+                    this.syncSessionModelSettingsFromUi(session);
+                }
+                const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
+                if (existingIndex < 0) return;
+                const snap = this.captureSessionModelSettings();
+                this.chatHistory[existingIndex] = {
+                    ...this.chatHistory[existingIndex],
+                    model: session.model ?? this.chatHistory[existingIndex].model,
+                    systemPrompt: session.systemPrompt ?? this.chatHistory[existingIndex].systemPrompt,
+                    activeProfile: session.activeProfile ?? this.chatHistory[existingIndex].activeProfile,
+                    modelSettings: snap.modelSettings,
+                    speculativeEngine: snap.speculativeEngine,
+                    speculativeDraftModel: snap.speculativeDraftModel,
+                };
+                this.saveChatHistory();
+            },
+
             emptyStats() {
                 return {
                     avg_prefill_tps: 0,
@@ -2237,6 +2305,42 @@
                     || window.t('chat.assistant_label');
             },
 
+            normalizeProfileName(name) {
+                const n = String(name ?? '').trim();
+                if (!n || n === 'System Default') return null;
+                return n;
+            },
+
+            resolveStreamProfile(streamContext = null, session = null) {
+                const chatSession = session || this.getChatSession(
+                    streamContext?.chatId || this.currentChatId, false
+                );
+                return this.normalizeProfileName(streamContext?._profile)
+                    || this.normalizeProfileName(this.activePromptProfile)
+                    || this.normalizeProfileName(chatSession?.activeProfile)
+                    || null;
+            },
+
+            resolveMessageProfile(msg) {
+                return this.normalizeProfileName(msg?._profile)
+                    || this.normalizeProfileName(msg?.meta?.profileName)
+                    || null;
+            },
+
+            variantProfileLabel(msg) {
+                return this.resolveMessageProfile(msg) || '';
+            },
+
+            attachProfileToAssistantMessage(msg, profileLabel) {
+                const name = this.normalizeProfileName(profileLabel);
+                if (name) {
+                    msg._profile = name;
+                    if (!msg.meta) msg.meta = {};
+                    msg.meta.profileName = name;
+                }
+                return msg;
+            },
+
             snapshotGenerationSettings() {
                 const gen = {};
                 const s = this.modelSettings;
@@ -2260,10 +2364,12 @@
                 const gatewayId = this.resolveGatewayModelId(modelId || this.currentModel);
                 const displayModel = this.availableModels.find(m => m.id === gatewayId)
                     || this.availableModels.find(m => m.name === modelId);
+                const profileName = this.normalizeProfileName(profile)
+                    || this.normalizeProfileName(this.activePromptProfile);
                 return {
                     modelId: gatewayId,
                     modelDisplay: displayModel?.name || modelId || gatewayId,
-                    profileName: profile ?? this.activePromptProfile ?? null,
+                    profileName,
                     systemPrompt: systemPrompt ?? '',
                     generation: this.snapshotGenerationSettings(),
                     capturedAt: new Date().toISOString(),
@@ -2407,6 +2513,7 @@
                     chatId,
                     sourceModel: null,
                     sourceSystemPrompt: '',
+                    sourceProfile: null,
                     isStreaming: false,
                     streamingContent: '',
                     abortController: null,
@@ -2439,7 +2546,12 @@
                         model: historyChat?.model || (this.currentChatId === chatId ? this.currentModel : null),
                         systemPrompt: historyChat?.systemPrompt ?? (this.currentChatId === chatId
                             ? this.systemPrompt
-                            : (localStorage.getItem('omlx_chat_system_prompt') || ''))
+                            : (localStorage.getItem('omlx_chat_system_prompt') || '')),
+                        activeProfile: historyChat?.activeProfile ?? null,
+                        modelSettings: historyChat?.modelSettings
+                            ? this.cloneData(historyChat.modelSettings) : null,
+                        speculativeEngine: historyChat?.speculativeEngine ?? null,
+                        speculativeDraftModel: historyChat?.speculativeDraftModel ?? null,
                     };
                 }
                 return this.chatSessions[chatId] || null;
@@ -2532,7 +2644,7 @@
             this.apiKeySet = true;
             await this.loadModels();
             if (this.currentModel) {
-                await this.loadAdminModelSettings(this.currentModel);
+                await this.loadModelCapabilities(this.currentModel);
             }
             this.loadChatHistory();
             this.fetchMcpTools();
@@ -2944,116 +3056,102 @@
         }
     },
 
-    // Load admin settings from /admin/api/models
-    async loadAdminModelSettings(modelId) {
+    async loadModelCapabilities(modelId) {
         if (!modelId) return;
         try {
             const response = await fetch('/admin/api/models', { credentials: 'same-origin' });
-            if (response.ok) {
-                const data = await response.json();
-                const model = (data.models || []).find(m => m.id === modelId);
-                if (model) {
-                    this.isMtpCompatible = !!model.mtp_compatible;
-                    this.isVlm = model.model_type === 'vlm';
-                    this.isParoquant = model.is_paroquant === true;
-                    this.paroquantReason = model.paroquant_reason || '';
-
-                    // Map existing setting parameters
-                    const s = model.settings || {};
-                    this.modelSettings.temperature = s.temperature;
-                    this.modelSettings.max_tokens = s.max_tokens;
-                    this.modelSettings.top_p = s.top_p;
-                    this.modelSettings.top_k = s.top_k;
-                    this.modelSettings.min_p = s.min_p;
-                    this.modelSettings.repetition_penalty = s.repetition_penalty;
-                    this.modelSettings.presence_penalty = s.presence_penalty;
-                    this.modelSettings.enable_thinking = !!s.enable_thinking;
-                    this.modelSettings.thinking_budget_enabled = !!s.thinking_budget_enabled;
-                    this.modelSettings.thinking_budget_tokens = s.thinking_budget_tokens;
-                    this.modelSettings.turboquant_kv_enabled = !!s.turboquant_kv_enabled;
-                    this.modelSettings.turboquant_kv_bits = s.turboquant_kv_bits || 4;
-                    this.modelSettings.turboquant_skip_last = s.turboquant_skip_last !== false;
-
-                    // Map speculative engine single value selector
-                    if (s.dflash_enabled) {
-                        this.speculativeEngine = 'dflash';
-                        this.speculativeDraftModel = s.dflash_draft_model || '';
-                    } else if (s.mtp_enabled) {
-                        this.speculativeEngine = 'mtp';
-                        this.speculativeDraftModel = '';
-                    } else if (s.vlm_mtp_enabled) {
-                        this.speculativeEngine = 'vlm_mtp';
-                        this.speculativeDraftModel = s.vlm_mtp_draft_model || '';
-                    } else if (s.specprefill_enabled) {
-                        this.speculativeEngine = 'specprefill';
-                        this.speculativeDraftModel = s.specprefill_draft_model || '';
-                    } else {
-                        this.speculativeEngine = 'none';
-                        this.speculativeDraftModel = '';
-                    }
-                    // Reset dirty flags after loading
-                    this.modelSettingsDirty = false;
-                }
-            }
+            if (!response.ok) return;
+            const data = await response.json();
+            const model = (data.models || []).find(m => m.id === modelId);
+            if (!model) return;
+            this.isMtpCompatible = !!model.mtp_compatible;
+            this.isVlm = model.model_type === 'vlm';
+            this.isParoquant = model.is_paroquant === true;
+            this.paroquantReason = model.paroquant_reason || '';
         } catch (e) {
-            console.error('Failed to load admin model settings:', e);
+            console.error('Failed to load model capabilities:', e);
         }
     },
 
-    // Save model settings to PUT /admin/api/models/{model_id}/settings
-    async saveAdminModelSettings() {
-        if (!this.currentModel) return;
-        this.savingModelSettings = true;
+    /** One-time defaults from admin when a chat session has no saved settings yet. */
+    async loadAdminModelDefaults(modelId) {
+        if (!modelId) return;
         try {
-            // Build request body matching ModelSettingsRequest
-            const body = {
-                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
-                max_tokens: Number.isFinite(this.modelSettings.max_tokens) ? this.modelSettings.max_tokens : null,
-                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
-                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
-                min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
-                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
-                presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
-                enable_thinking: this.modelSettings.enable_thinking,
-                thinking_budget_enabled: this.modelSettings.thinking_budget_enabled,
-                thinking_budget_tokens: this.modelSettings.thinking_budget_enabled ? (this.modelSettings.thinking_budget_tokens || 0) : 0,
+            const response = await fetch('/admin/api/models', { credentials: 'same-origin' });
+            if (!response.ok) return;
+            const data = await response.json();
+            const model = (data.models || []).find(m => m.id === modelId);
+            if (!model) return;
 
-                // Set speculative engines mutually exclusively
-                dflash_enabled: this.speculativeEngine === 'dflash',
-                dflash_draft_model: this.speculativeEngine === 'dflash' ? this.speculativeDraftModel : null,
+            this.isMtpCompatible = !!model.mtp_compatible;
+            this.isVlm = model.model_type === 'vlm';
+            this.isParoquant = model.is_paroquant === true;
+            this.paroquantReason = model.paroquant_reason || '';
 
-                mtp_enabled: this.speculativeEngine === 'mtp',
-
-                vlm_mtp_enabled: this.speculativeEngine === 'vlm_mtp',
-                vlm_mtp_draft_model: this.speculativeEngine === 'vlm_mtp' ? this.speculativeDraftModel : null,
-
-                specprefill_enabled: this.speculativeEngine === 'specprefill',
-                specprefill_draft_model: this.speculativeEngine === 'specprefill' ? this.speculativeDraftModel : null,
-
-                // TurboQuant KV cache
-                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                turboquant_kv_bits: this.modelSettings.turboquant_kv_bits,
-                turboquant_skip_last: this.modelSettings.turboquant_skip_last
+            const s = model.settings || {};
+            this.modelSettings = {
+                ...this.defaultModelSettings(),
+                temperature: s.temperature ?? null,
+                max_tokens: s.max_tokens ?? null,
+                top_p: s.top_p ?? null,
+                top_k: s.top_k ?? null,
+                min_p: s.min_p ?? null,
+                repetition_penalty: s.repetition_penalty ?? null,
+                presence_penalty: s.presence_penalty ?? null,
+                enable_thinking: !!s.enable_thinking,
+                thinking_budget_enabled: !!s.thinking_budget_enabled,
+                thinking_budget_tokens: s.thinking_budget_tokens ?? null,
+                turboquant_kv_enabled: !!s.turboquant_kv_enabled,
+                turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                turboquant_skip_last: s.turboquant_skip_last !== false,
             };
 
-            const response = await fetch(`/admin/api/models/${encodeURIComponent(this.currentModel)}/settings`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-                credentials: 'same-origin'
-            });
-
-            if (response.ok) {
-                await this.loadAdminModelSettings(this.currentModel);
-                this.showSavedText = true;
-                setTimeout(() => this.showSavedText = false, 2000);
+            if (s.dflash_enabled) {
+                this.speculativeEngine = 'dflash';
+                this.speculativeDraftModel = s.dflash_draft_model || '';
+            } else if (s.mtp_enabled) {
+                this.speculativeEngine = 'mtp';
+                this.speculativeDraftModel = '';
+            } else if (s.vlm_mtp_enabled) {
+                this.speculativeEngine = 'vlm_mtp';
+                this.speculativeDraftModel = s.vlm_mtp_draft_model || '';
+            } else if (s.specprefill_enabled) {
+                this.speculativeEngine = 'specprefill';
+                this.speculativeDraftModel = s.specprefill_draft_model || '';
             } else {
-                const data = await response.json();
-                alert(`Failed to save: ${data.detail || 'Unknown error'}`);
+                this.speculativeEngine = 'none';
+                this.speculativeDraftModel = '';
             }
+            this.modelSettingsDirty = false;
         } catch (e) {
-            console.error('Error saving model settings:', e);
-            alert('Error saving settings to backend.');
+            console.error('Failed to load admin model defaults:', e);
+        }
+    },
+
+    async ensureSessionModelSettings(session, modelId) {
+        if (!session || !modelId) return;
+        if (session.modelSettings) {
+            this.applySessionModelSettings(session);
+            await this.loadModelCapabilities(modelId);
+            return;
+        }
+        await this.loadAdminModelDefaults(modelId);
+        this.syncSessionModelSettingsFromUi(session);
+    },
+
+    async saveSessionModelSettings() {
+        if (!this.currentChatId) return;
+        this.savingModelSettings = true;
+        try {
+            const session = this.getChatSession(this.currentChatId, true);
+            this.syncSessionModelSettingsFromUi(session);
+            this.persistChatSettingsToHistory(this.currentChatId);
+            this.modelSettingsDirty = false;
+            this.showSavedText = true;
+            setTimeout(() => this.showSavedText = false, 2000);
+        } catch (e) {
+            console.error('Error saving session model settings:', e);
+            alert('Error saving settings for this chat.');
         } finally {
             this.savingModelSettings = false;
         }
@@ -3315,7 +3413,7 @@
         if (session) {
             session.model = modelId;
         }
-        await this.loadAdminModelSettings(modelId);
+        await this.loadModelCapabilities(modelId);
     },
 
     loadChatHistory() {
@@ -3356,7 +3454,7 @@
         }
     },
 
-    startNewChat() {
+    async startNewChat() {
         const chatId = 'chat_' + Date.now();
         // Load the System Default profile's prompt
         const sysDefault = this.promptProfiles.find(p => p.name === 'System Default');
@@ -3367,17 +3465,22 @@
         this.activePromptProfile = sysDefault ? sysDefault.name : null;
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
-        this.chatSessions[chatId] = {
+        const session = {
             messages: [],
             model: this.currentModel,
             systemPrompt,
-            activeProfile: this.activePromptProfile
+            activeProfile: this.activePromptProfile,
+            modelSettings: null,
+            speculativeEngine: null,
+            speculativeDraftModel: null,
         };
-        this.messages = this.chatSessions[chatId].messages;
+        this.chatSessions[chatId] = session;
+        this.messages = session.messages;
+        await this.ensureSessionModelSettings(session, this.currentModel);
         this.resetStreamSession(this.getStreamSession(chatId, true));
     },
 
-    loadChat(chatId) {
+    async loadChat(chatId) {
         Object.keys(this.streamSessions).forEach((id) => {
             if (id === chatId) return;
             const other = this.getStreamSession(id, false);
@@ -3401,7 +3504,7 @@
                 // Resolve legacy alias → gateway id for backward compatibility
                 const gatewayId = this.aliasToGateway[session.model] || session.model;
                 this.currentModel = gatewayId;
-                this.loadAdminModelSettings(gatewayId);
+                await this.ensureSessionModelSettings(session, gatewayId);
             }
             if (session.messages && session.messages.length > 0) {
                 this.syncFooterStatsFromMessages(session.messages);
@@ -3443,6 +3546,16 @@
 
         const chatModel = model ?? session?.model ?? (chatId === this.currentChatId ? this.currentModel : null);
         const chatSystemPrompt = systemPrompt ?? session?.systemPrompt ?? (chatId === this.currentChatId ? this.systemPrompt : '');
+        if (session && chatId === this.currentChatId) {
+            this.syncSessionModelSettingsFromUi(session);
+        }
+        const settingsSnap = session
+            ? {
+                modelSettings: session.modelSettings,
+                speculativeEngine: session.speculativeEngine,
+                speculativeDraftModel: session.speculativeDraftModel,
+            }
+            : this.captureSessionModelSettings();
 
         const chatData = {
             id: chatId,
@@ -3452,6 +3565,9 @@
             model: chatModel,
             systemPrompt: chatSystemPrompt,
             activeProfile: session?.activeProfile ?? this.activePromptProfile ?? null,
+            modelSettings: settingsSnap.modelSettings,
+            speculativeEngine: settingsSnap.speculativeEngine,
+            speculativeDraftModel: settingsSnap.speculativeDraftModel,
             updatedAt: new Date().toISOString()
         };
 
@@ -3459,6 +3575,9 @@
             session.messages = messagesToSave;
             session.model = chatModel;
             session.systemPrompt = chatSystemPrompt;
+            session.modelSettings = settingsSnap.modelSettings;
+            session.speculativeEngine = settingsSnap.speculativeEngine;
+            session.speculativeDraftModel = settingsSnap.speculativeDraftModel;
         }
 
         if (existingIndex >= 0) {
@@ -3545,7 +3664,12 @@
         chatSession.messages.push(userMsg);
         this.messages = chatSession.messages;
         this.forceScrollToBottom();
-        await this.streamResponse({ chatId, model: sourceModel, systemPrompt: sourceSystemPrompt }, 0);
+        await this.streamResponse({
+            chatId,
+            model: sourceModel,
+            systemPrompt: sourceSystemPrompt,
+            _profile: this.resolveStreamProfile(null, chatSession),
+        }, 0);
     },
 
             async streamResponse(streamContext = null, depth = 0) {
@@ -3553,11 +3677,12 @@
             chatId: streamContext?.chatId || this.currentChatId,
             model: streamContext?.model || this.currentModel,
             systemPrompt: streamContext?.systemPrompt ?? this.systemPrompt,
-            _profile: streamContext?._profile ?? this.activePromptProfile ?? null,
+            _profile: null,
             _variantUserIndex: streamContext?._variantUserIndex ?? null,
         };
         const chatSession = this.getChatSession(context.chatId, true);
         const stream = this.getStreamSession(context.chatId, true);
+        context._profile = this.resolveStreamProfile(streamContext, chatSession);
         context.model = context.model || chatSession?.model || this.currentModel;
         context.systemPrompt = context.systemPrompt ?? chatSession?.systemPrompt ?? '';
         if (context.chatId === this.currentChatId && context.systemPrompt !== this.systemPrompt) {
@@ -3586,6 +3711,7 @@
             stream.targetMessageId = this.newMessageId();
             stream.sourceModel = context.model;
             stream.sourceSystemPrompt = context.systemPrompt;
+            stream.sourceProfile = context._profile;
             if (context._variantUserIndex == null) {
                 for (let i = chatSession.messages.length - 1; i >= 0; i--) {
                     if (chatSession.messages[i].role === 'user') {
@@ -3597,9 +3723,10 @@
             this.startStatsPolling();
         }
         stream.isStreaming = true;
-        stream.sourceModel = context.model;
-        stream.sourceSystemPrompt = context.systemPrompt;
-        stream.streamingContent = '';
+            stream.sourceModel = context.model;
+            stream.sourceSystemPrompt = context.systemPrompt;
+            stream.sourceProfile = context._profile;
+            stream.streamingContent = '';
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context);
@@ -3860,17 +3987,18 @@
             // This prevents the streaming box from disappearing with no replacement
             // when the model emits only whitespace, only reasoning tokens, or nothing at all.
             const assistantId = stream.targetMessageId || this.newMessageId();
-            chatSession.messages.push({
+            const assistantMsg = {
                 id: assistantId,
                 role: 'assistant',
                 content: stream.streamingContent || '',
                 model: context.model,
-                _profile: context._profile,
                 meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                 _perfVisible: false,
                 _thinking: stream.streamingThinking || null,
                 _thinkingOpen: false,
-            });
+            };
+            this.attachProfileToAssistantMessage(assistantMsg, context._profile);
+            chatSession.messages.push(assistantMsg);
             this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
             this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
             if (this.currentChatId === context.chatId) {
@@ -3889,17 +4017,18 @@
                 // Stream was stopped by user — push whatever was accumulated
                 if (stream.streamingContent || stream.streamingThinking) {
                     const assistantId = stream.targetMessageId || this.newMessageId();
-                    chatSession.messages.push({
+                    const assistantMsg = {
                         id: assistantId,
                         role: 'assistant',
                         content: stream.streamingContent,
                         model: context.model,
-                        _profile: context._profile,
                         meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                         _perfVisible: false,
                         _thinking: stream.streamingThinking || null,
                         _thinkingOpen: false,
-                    });
+                    };
+                    this.attachProfileToAssistantMessage(assistantMsg, context._profile);
+                    chatSession.messages.push(assistantMsg);
                     this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                     this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                     if (this.currentChatId === context.chatId) {
@@ -3909,15 +4038,16 @@
             } else {
                 console.error('Streaming error:', error);
                 const assistantId = stream.targetMessageId || this.newMessageId();
-                chatSession.messages.push({
+                const errorMsg = {
                     id: assistantId,
                     role: 'assistant',
                     content: `Error: ${error.message}`,
                     model: context.model,
-                    _profile: context._profile,
                     meta: this.captureGenerationContext(context.model, context.systemPrompt, context._profile),
                     _perfVisible: false,
-                });
+                };
+                this.attachProfileToAssistantMessage(errorMsg, context._profile);
+                chatSession.messages.push(errorMsg);
                 this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
@@ -3986,7 +4116,7 @@
         if (!origMsg || origMsg.role !== 'assistant' || origMsg._ui === false) return;
 
         const userIdx = this.findUserIndexForMessage(session.messages, index);
-        const profileToUse = origMsg?._profile ?? this.activePromptProfile ?? null;
+        const profileToUse = this.resolveStreamProfile(null, session);
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
@@ -4112,8 +4242,11 @@
     },
 
     ensureVariantMeta(msg) {
-        if (msg.role !== 'assistant' || msg.meta) return;
-        msg.meta = this.captureGenerationContext(msg.model, '', msg._profile);
+        if (msg.role !== 'assistant') return;
+        if (!msg.meta) {
+            msg.meta = this.captureGenerationContext(msg.model, '', msg._profile);
+        }
+        this.attachProfileToAssistantMessage(msg, this.resolveMessageProfile(msg));
     },
 
     branchChat(index) {
@@ -4132,7 +4265,10 @@
             messages: branchMessages,
             model: session.model || this.currentModel,
             systemPrompt: session.systemPrompt || '',
-            activeProfile: branchProfile
+            activeProfile: branchProfile,
+            modelSettings: session.modelSettings ? this.cloneData(session.modelSettings) : null,
+            speculativeEngine: session.speculativeEngine ?? null,
+            speculativeDraftModel: session.speculativeDraftModel ?? null,
         };
         this.chatSessions[branchId] = branchSession;
 
@@ -4157,6 +4293,9 @@
             model: branchSession.model,
             systemPrompt: branchSession.systemPrompt,
             activeProfile: branchSession.activeProfile,
+            modelSettings: branchSession.modelSettings,
+            speculativeEngine: branchSession.speculativeEngine,
+            speculativeDraftModel: branchSession.speculativeDraftModel,
             updatedAt: new Date().toISOString()
         };
 
