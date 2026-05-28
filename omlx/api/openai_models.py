@@ -228,6 +228,8 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -327,6 +329,8 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None

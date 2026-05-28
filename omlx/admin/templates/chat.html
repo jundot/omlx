@@ -1760,87 +1760,33 @@
                     </div>
                 </div>
 
-                <!-- Thinking Mode Toggle -->
+                <!-- Thinking: Auto / On / Off (limit controls only when On) -->
                 <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
-                    <div class="flex items-center gap-2">
-                        <input type="checkbox" x-model="modelSettings.enable_thinking" @change="onModelSettingsChange()"
-                            class="rounded flex-shrink-0">
-                        <label class="text-xs font-semibold flex-1" style="color: var(--text-primary);">Thinking</label>
-                        <div x-show="modelSettings.enable_thinking" x-collapse class="flex items-center gap-1.5">
-                            <select x-model="modelSettings.thinking_budget_enabled" @change="onModelSettingsChange()"
-                                class="px-2 py-1 text-[10px] border border-line rounded-lg bg-surface"
-                                style="color: var(--text-primary);">
-                                <option :value="false">No Limit</option>
-                                <option :value="true">Limit</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div x-show="modelSettings.enable_thinking && modelSettings.thinking_budget_enabled" x-collapse>
-                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @input="onModelSettingsChange()" placeholder="Tokens (e.g. 1024)"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
-                            style="color: var(--text-primary);">
-                    </div>
-                </div>
-
-                <!-- KV Cache Quantization (TurboQuant) -->
-                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
-                    <div class="flex items-start justify-between gap-3">
-                        <div class="min-w-0">
-                            <label class="text-xs font-semibold block" style="color: var(--text-primary);">KV Cache
-                                Quantization</label>
-                            <p class="text-[10px] mt-0.5" style="color: var(--text-tertiary);">Compress with TurboQuant</p>
-                        </div>
-                        <button type="button" @click="if (!isParoquant && speculativeEngine !== 'mtp' && speculativeEngine !== 'vlm_mtp') { modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled; onModelSettingsChange(); }"
-                            :disabled="isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp'"
-                            :title="isParoquant ? paroquantReason : (speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp' ? 'MTP is incompatible with TurboQuant' : '')"
-                            :style="{
-                                backgroundColor: modelSettings.turboquant_kv_enabled ? 'var(--text-primary)' : 'var(--border-normal)',
-                                opacity: (isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp') ? 0.4 : 1,
-                                cursor: (isParoquant || speculativeEngine === 'mtp' || speculativeEngine === 'vlm_mtp') ? 'not-allowed' : 'pointer'
-                            }"
-                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none">
-                            <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                        </button>
-                    </div>
-                    <div x-show="modelSettings.turboquant_kv_enabled" x-collapse class="space-y-2">
-                        <div class="space-y-1">
-                            <label class="text-[10px] font-bold uppercase tracking-wider block"
-                                style="color: var(--text-secondary);">Bit Depth</label>
-                            <select x-model="modelSettings.turboquant_kv_bits" @change="onModelSettingsChange()"
-                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
-                                style="color: var(--text-primary);">
-                                <template x-for="bits in turboquantBitDepths" :key="bits">
-                                    <option :value="bits" x-text="bits + '-bit'"></option>
-                                </template>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Speculative Decoding Selector -->
-                <div class="p-3 bg-surface-muted rounded-xl space-y-2 border border-line">
-                    <label class="text-xs font-semibold block" style="color: var(--text-primary);">Speculative
-                        Decoding</label>
-                    <select x-model="speculativeEngine" @change="onModelSettingsChange()"
+                    <label class="text-xs font-semibold block" style="color: var(--text-primary);">Thinking</label>
+                    <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
-                        <option value="none">None</option>
-                        <option value="dflash">DFlash (Diffusion SpecDec)</option>
-                        <option value="mtp" :disabled="!isMtpCompatible">Native MTP</option>
-                        <option value="vlm_mtp" :disabled="!isVlm">VLM MTP</option>
-                        <option value="specprefill">SpecPrefill</option>
+                        <option value="auto">Auto (model default)</option>
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
                     </select>
-                    <div x-show="['dflash', 'vlm_mtp', 'specprefill'].includes(speculativeEngine)" x-collapse
-                        class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">Draft Model Path / Alias</label>
-                        <input type="text" x-model="speculativeDraftModel" @input="onModelSettingsChange()"
-                            placeholder="e.g. mlx-community/DraftModel"
+                    <div x-show="thinkingModeValue() === 'on'" x-collapse class="space-y-2">
+                        <select x-model="modelSettings.thinking_budget_enabled" @change="onModelSettingsChange()"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
+                            <option :value="false">No token limit</option>
+                            <option :value="true">Token limit</option>
+                        </select>
+                        <div x-show="modelSettings.thinking_budget_enabled" x-collapse>
+                            <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
+                                @input="onModelSettingsChange()" placeholder="Tokens (e.g. 1024)" min="1" step="100"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                                style="color: var(--text-primary);">
+                        </div>
                     </div>
+                    <p class="text-[10px]" style="color: var(--text-tertiary);">
+                        KV cache quantization and speculative decoding are configured in Admin → Model Settings (requires model reload).
+                    </p>
                 </div>
 
             </div>
@@ -2033,10 +1979,6 @@
             timelineActive: -1,
             timelineTooltip: { show: false, content: '', x: 0, y: 0 },
 
-            isParoquant: false,
-            paroquantReason: '',
-            turboquantBitDepths: [2, 2.5, 3, 3.5, 4, 6, 8],
-
             modelSettings: {
                 temperature: null,
                 max_tokens: null,
@@ -2045,12 +1987,9 @@
                 min_p: null,
                 repetition_penalty: null,
                 presence_penalty: null,
-                enable_thinking: false,
+                enable_thinking: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
-                turboquant_kv_enabled: false,
-                turboquant_kv_bits: 4,
-                turboquant_skip_last: true,
             },
 
             defaultModelSettings() {
@@ -2062,13 +2001,31 @@
                     min_p: null,
                     repetition_penalty: null,
                     presence_penalty: null,
-                    enable_thinking: false,
+                    enable_thinking: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
-                    turboquant_kv_enabled: false,
-                    turboquant_kv_bits: 4,
-                    turboquant_skip_last: true,
                 };
+            },
+
+            thinkingModeValue() {
+                if (this.modelSettings.enable_thinking === true) return 'on';
+                if (this.modelSettings.enable_thinking === false) return 'off';
+                return 'auto';
+            },
+
+            setThinkingMode(mode) {
+                if (mode === 'on') {
+                    this.modelSettings.enable_thinking = true;
+                } else if (mode === 'off') {
+                    this.modelSettings.enable_thinking = false;
+                    this.modelSettings.thinking_budget_enabled = false;
+                    this.modelSettings.thinking_budget_tokens = null;
+                } else {
+                    this.modelSettings.enable_thinking = null;
+                    this.modelSettings.thinking_budget_enabled = false;
+                    this.modelSettings.thinking_budget_tokens = null;
+                }
+                this.onModelSettingsChange();
             },
 
             captureSessionModelSettings() {
@@ -2394,13 +2351,27 @@
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
                 }
-                if (generation.enable_thinking) {
+                const ctk = generation.chat_template_kwargs;
+                if (ctk && typeof ctk.enable_thinking === 'boolean') {
+                    s.enable_thinking = ctk.enable_thinking;
+                } else if (generation.enable_thinking === true) {
                     s.enable_thinking = true;
-                    s.thinking_budget_enabled = generation.thinking_budget_tokens != null;
-                    s.thinking_budget_tokens = generation.thinking_budget_tokens ?? null;
-                } else {
+                } else if (generation.enable_thinking === false) {
                     s.enable_thinking = false;
+                } else if (generation.thinking_budget != null) {
+                    s.enable_thinking = true;
+                }
+                const budget = generation.thinking_budget ?? generation.thinking_budget_tokens;
+                if (budget != null) {
+                    s.enable_thinking = true;
+                    s.thinking_budget_enabled = true;
+                    s.thinking_budget_tokens = budget;
+                } else if (s.enable_thinking === true) {
                     s.thinking_budget_enabled = false;
+                    s.thinking_budget_tokens = null;
+                } else {
+                    s.thinking_budget_enabled = false;
+                    s.thinking_budget_tokens = null;
                 }
                 this.modelSettings = s;
             },
@@ -2518,11 +2489,13 @@
                 for (const key of scalarKeys) {
                     if (s[key] != null) gen[key] = s[key];
                 }
-                if (s.enable_thinking) {
-                    gen.enable_thinking = true;
+                if (s.enable_thinking === true) {
+                    gen.chat_template_kwargs = { enable_thinking: true };
                     if (s.thinking_budget_enabled && s.thinking_budget_tokens != null) {
-                        gen.thinking_budget_tokens = s.thinking_budget_tokens;
+                        gen.thinking_budget = s.thinking_budget_tokens;
                     }
+                } else if (s.enable_thinking === false) {
+                    gen.chat_template_kwargs = { enable_thinking: false };
                 }
                 return Object.keys(gen).length ? gen : null;
             },
@@ -3418,8 +3391,6 @@
             if (!model) return;
             this.isMtpCompatible = !!model.mtp_compatible;
             this.isVlm = model.model_type === 'vlm';
-            this.isParoquant = model.is_paroquant === true;
-            this.paroquantReason = model.paroquant_reason || '';
         } catch (e) {
             console.error('Failed to load model capabilities:', e);
         }
@@ -3437,8 +3408,6 @@
 
             this.isMtpCompatible = !!model.mtp_compatible;
             this.isVlm = model.model_type === 'vlm';
-            this.isParoquant = model.is_paroquant === true;
-            this.paroquantReason = model.paroquant_reason || '';
 
             const s = model.settings || {};
             this.modelSettings = {
@@ -3450,30 +3419,12 @@
                 min_p: s.min_p ?? null,
                 repetition_penalty: s.repetition_penalty ?? null,
                 presence_penalty: s.presence_penalty ?? null,
-                enable_thinking: !!s.enable_thinking,
-                thinking_budget_enabled: !!s.thinking_budget_enabled,
+                enable_thinking: s.enable_thinking ?? null,
+                thinking_budget_enabled: !!(s.thinking_budget_enabled && s.thinking_budget_tokens),
                 thinking_budget_tokens: s.thinking_budget_tokens ?? null,
-                turboquant_kv_enabled: !!s.turboquant_kv_enabled,
-                turboquant_kv_bits: s.turboquant_kv_bits || 4,
-                turboquant_skip_last: s.turboquant_skip_last !== false,
             };
-
-            if (s.dflash_enabled) {
-                this.speculativeEngine = 'dflash';
-                this.speculativeDraftModel = s.dflash_draft_model || '';
-            } else if (s.mtp_enabled) {
-                this.speculativeEngine = 'mtp';
-                this.speculativeDraftModel = '';
-            } else if (s.vlm_mtp_enabled) {
-                this.speculativeEngine = 'vlm_mtp';
-                this.speculativeDraftModel = s.vlm_mtp_draft_model || '';
-            } else if (s.specprefill_enabled) {
-                this.speculativeEngine = 'specprefill';
-                this.speculativeDraftModel = s.specprefill_draft_model || '';
-            } else {
-                this.speculativeEngine = 'none';
-                this.speculativeDraftModel = '';
-            }
+            this.speculativeEngine = 'none';
+            this.speculativeDraftModel = '';
             this.modelSettingsDirty = false;
         } catch (e) {
             console.error('Failed to load admin model defaults:', e);

@@ -832,6 +832,8 @@ def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
     model_id: str | None = None,
+    req_top_k: int | None = None,
+    req_repetition_penalty: float | None = None,
     req_min_p: float | None = None,
     req_presence_penalty: float | None = None,
     req_frequency_penalty: float | None = None,
@@ -905,13 +907,19 @@ def get_sampling_params(
         else:
             top_p = global_sampling.top_p
 
-        if model_settings and model_settings.top_k is not None:
+        if req_top_k is not None:
+            top_k = req_top_k
+        elif model_settings and model_settings.top_k is not None:
             top_k = model_settings.top_k
+        elif ocr_defaults and "top_k" in ocr_defaults:
+            top_k = ocr_defaults["top_k"]
         else:
             top_k = global_sampling.top_k
 
-    # Repetition penalty: model settings > ocr_defaults > global default (1.0)
-    if model_settings and model_settings.repetition_penalty is not None:
+    # Repetition penalty: request > model settings > ocr_defaults > global (1.0)
+    if req_repetition_penalty is not None:
+        repetition_penalty = req_repetition_penalty
+    elif model_settings and model_settings.repetition_penalty is not None:
         repetition_penalty = model_settings.repetition_penalty
     elif ocr_defaults and "repetition_penalty" in ocr_defaults:
         repetition_penalty = ocr_defaults["repetition_penalty"]
@@ -1987,6 +1995,8 @@ async def create_completion(
 
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
             request.temperature, request.top_p, request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
             req_min_p=getattr(request, 'min_p', None),
             req_presence_penalty=getattr(request, 'presence_penalty', None),
             req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2212,6 +2222,8 @@ async def create_chat_completion(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2655,6 +2667,8 @@ async def stream_completion(
 
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -3507,6 +3521,8 @@ async def create_anthropic_message(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_max_tokens=request.max_tokens,
     )
 
@@ -3944,7 +3960,14 @@ async def create_response(
 
     # Build sampling kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
-        get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
+        get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
+            req_max_tokens=request.max_output_tokens,
+        )
     )
     chat_kwargs = {
         "max_tokens": max_tokens,
