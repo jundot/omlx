@@ -149,9 +149,68 @@
     }
 
     .response-tab--active {
-        background: var(--btn-primary);
-        color: var(--btn-primary-text);
-        border-color: var(--btn-primary);
+        color: var(--text-primary);
+        font-weight: 500;
+    }
+
+    .response-tab-group {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 0.5rem;
+        overflow: hidden;
+        border: 1px solid var(--border-normal);
+        background: var(--bg-secondary);
+        transition: border-color 0.15s ease, background 0.15s ease;
+    }
+
+    .response-tab-group:hover {
+        background: color-mix(in srgb, var(--timeline-accent) 10%, var(--bg-secondary));
+        border-color: color-mix(in srgb, var(--timeline-accent) 40%, var(--border-normal));
+    }
+
+    .response-tab-group .response-tab {
+        flex: 1 1 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        min-width: 0;
+        border: none;
+        border-radius: 0;
+        background: transparent;
+        padding: 0.35rem 0.5rem;
+    }
+
+    .response-tab-group .response-tab:hover {
+        background: transparent;
+        color: var(--text-primary);
+    }
+
+    .response-tab-group.response-tab-group--active {
+        border: 1.5px solid var(--timeline-accent);
+    }
+
+    .response-tab-group.response-tab-group--active:hover {
+        background: color-mix(in srgb, var(--timeline-accent) 12%, var(--bg-secondary));
+    }
+
+    .response-tab-delete {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        align-self: stretch;
+        padding: 0.35rem 0.4rem;
+        border: none;
+        background: transparent;
+        color: var(--text-tertiary);
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    .response-tab-delete:hover {
+        background: var(--bg-danger-hover, rgba(239, 68, 68, 0.12));
+        color: var(--text-danger);
     }
 
     .assistant-message {
@@ -1096,10 +1155,18 @@
                                     <div class="response-tabs w-full">
                                         <template x-for="(variant, vi) in getTurnVariantsForUser(index)"
                                             :key="variant.id">
-                                            <button type="button" class="response-tab px-2 py-1 text-xs rounded-lg"
-                                                :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
-                                                @click="selectVariant(index, variant.id)"
-                                                x-text="variantTabLabel(variant, vi)"></button>
+                                            <div class="response-tab-group"
+                                                :class="{ 'response-tab-group--active': isActiveVariantForUser(index, variant.id) }">
+                                                <button type="button" class="response-tab text-xs"
+                                                    :class="{ 'response-tab--active': isActiveVariantForUser(index, variant.id) }"
+                                                    @click="selectVariant(index, variant.id)"
+                                                    x-text="variantTabLabel(variant, vi)"></button>
+                                                <button type="button" class="response-tab-delete"
+                                                    title="Delete this response"
+                                                    @click="deleteVariant(index, variant.id, $event)">
+                                                    <i data-lucide="trash-2" class="w-3 h-3"></i>
+                                                </button>
+                                            </div>
                                         </template>
                                     </div>
                                 </template>
@@ -2079,8 +2146,7 @@
                 return -1;
             },
 
-            getTurnVariantsForUser(userIndex) {
-                const messages = this.messages;
+            getTurnVariantsAt(messages, userIndex) {
                 if (!messages[userIndex] || messages[userIndex].role !== 'user') return [];
                 const variants = [];
                 for (let i = userIndex + 1; i < messages.length && messages[i].role !== 'user'; i++) {
@@ -2088,6 +2154,10 @@
                     if (m.role === 'assistant' && m._ui !== false) variants.push(m);
                 }
                 return variants;
+            },
+
+            getTurnVariantsForUser(userIndex) {
+                return this.getTurnVariantsAt(this.messages, userIndex);
             },
 
             getActiveVariantForUser(messages, userIndex) {
@@ -2123,11 +2193,34 @@
                 return variants[variants.length - 1].id === variantId;
             },
 
+            applyVariantStats(variant) {
+                if (variant?._recentStats) {
+                    this.recentStats = { ...variant._recentStats };
+                } else {
+                    this.recentStats = this.emptyStats();
+                }
+            },
+
+            syncFooterStatsFromMessages(messages) {
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].role !== 'user') continue;
+                    const variant = this.getActiveVariantForUser(messages, i);
+                    if (variant) {
+                        this.applyVariantStats(variant);
+                        return;
+                    }
+                }
+                this.recentStats = this.emptyStats();
+            },
+
             selectVariant(userIndex, variantId) {
+                if (this.isCurrentChatStreaming()) return;
                 const session = this.getChatSession(this.currentChatId, true);
                 if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
                 session.messages[userIndex]._activeVariantId = variantId;
                 this.messages = session.messages;
+                const variant = session.messages.find(m => m.id === variantId);
+                this.applyVariantStats(variant);
                 this.saveCurrentChat(this.currentChatId);
                 this.scheduleEnhanceMessages();
             },
@@ -2144,6 +2237,25 @@
                     || window.t('chat.assistant_label');
             },
 
+            snapshotGenerationSettings() {
+                const gen = {};
+                const s = this.modelSettings;
+                const scalarKeys = [
+                    'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
+                    'repetition_penalty', 'presence_penalty'
+                ];
+                for (const key of scalarKeys) {
+                    if (s[key] != null) gen[key] = s[key];
+                }
+                if (s.enable_thinking) {
+                    gen.enable_thinking = true;
+                    if (s.thinking_budget_enabled && s.thinking_budget_tokens != null) {
+                        gen.thinking_budget_tokens = s.thinking_budget_tokens;
+                    }
+                }
+                return Object.keys(gen).length ? gen : null;
+            },
+
             captureGenerationContext(modelId, systemPrompt, profile) {
                 const gatewayId = this.resolveGatewayModelId(modelId || this.currentModel);
                 const displayModel = this.availableModels.find(m => m.id === gatewayId)
@@ -2153,13 +2265,33 @@
                     modelDisplay: displayModel?.name || modelId || gatewayId,
                     profileName: profile ?? this.activePromptProfile ?? null,
                     systemPrompt: systemPrompt ?? '',
+                    generation: this.snapshotGenerationSettings(),
                     capturedAt: new Date().toISOString(),
                 };
             },
 
-            resolveApiSystemPrompt(messages, fallback) {
+            resolveApiSystemPrompt(messages, fallback, variantUserIndex = null) {
+                if (variantUserIndex != null && messages[variantUserIndex]?.role === 'user') {
+                    const variantsAtTurn = this.getTurnVariantsAt(messages, variantUserIndex);
+                    if (variantsAtTurn.length > 0) {
+                        if (fallback?.trim()) return fallback.trim();
+                        const variant = this.getActiveVariantForUser(messages, variantUserIndex);
+                        const sp = variant?.meta?.systemPrompt;
+                        if (sp != null && String(sp).trim()) return String(sp).trim();
+                        return '';
+                    }
+                    for (let i = variantUserIndex - 1; i >= 0; i--) {
+                        if (messages[i].role !== 'user') continue;
+                        const variant = this.getActiveVariantForUser(messages, i);
+                        const sp = variant?.meta?.systemPrompt;
+                        if (sp != null && String(sp).trim()) return String(sp).trim();
+                        break;
+                    }
+                    return fallback?.trim() ? fallback.trim() : '';
+                }
                 for (let i = messages.length - 1; i >= 0; i--) {
                     if (messages[i].role !== 'user') continue;
+                    if (!this.getTurnVariantsAt(messages, i).length) continue;
                     const variant = this.getActiveVariantForUser(messages, i);
                     const sp = variant?.meta?.systemPrompt;
                     if (sp != null && String(sp).trim()) return String(sp).trim();
@@ -2168,8 +2300,65 @@
                 return fallback?.trim() ? fallback.trim() : '';
             },
 
-            buildMessagesForApi(messages, systemPrompt) {
-                const apiSystemPrompt = this.resolveApiSystemPrompt(messages, systemPrompt);
+            resolveApiModel(messages, fallbackModel, variantUserIndex = null) {
+                const fallback = this.resolveGatewayModelId(fallbackModel);
+                if (variantUserIndex != null) {
+                    if (this.getTurnVariantsAt(messages, variantUserIndex).length > 0) {
+                        return fallback;
+                    }
+                    for (let i = variantUserIndex - 1; i >= 0; i--) {
+                        if (messages[i].role !== 'user') continue;
+                        const variant = this.getActiveVariantForUser(messages, i);
+                        if (variant?.meta?.modelId) {
+                            return this.resolveGatewayModelId(variant.meta.modelId);
+                        }
+                        break;
+                    }
+                    return fallback;
+                }
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].role !== 'user') continue;
+                    if (!this.getTurnVariantsAt(messages, i).length) continue;
+                    const variant = this.getActiveVariantForUser(messages, i);
+                    if (variant?.meta?.modelId) {
+                        return this.resolveGatewayModelId(variant.meta.modelId);
+                    }
+                    break;
+                }
+                return fallback;
+            },
+
+            resolveApiGenerationOverrides(messages, variantUserIndex = null) {
+                const fromMeta = (variant) => {
+                    const gen = variant?.meta?.generation;
+                    return gen && typeof gen === 'object' ? { ...gen } : {};
+                };
+                if (variantUserIndex != null) {
+                    if (this.getTurnVariantsAt(messages, variantUserIndex).length > 0) {
+                        return { ...(this.snapshotGenerationSettings() || {}) };
+                    }
+                    for (let i = variantUserIndex - 1; i >= 0; i--) {
+                        if (messages[i].role !== 'user') continue;
+                        const variant = this.getActiveVariantForUser(messages, i);
+                        if (variant) return fromMeta(variant);
+                        break;
+                    }
+                    return { ...(this.snapshotGenerationSettings() || {}) };
+                }
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].role !== 'user') continue;
+                    if (!this.getTurnVariantsAt(messages, i).length) continue;
+                    const variant = this.getActiveVariantForUser(messages, i);
+                    if (variant) return fromMeta(variant);
+                    break;
+                }
+                return { ...(this.snapshotGenerationSettings() || {}) };
+            },
+
+            buildMessagesForApi(messages, systemPrompt, variantUserIndex = null) {
+                const apiSystemPrompt = this.resolveApiSystemPrompt(
+                    messages, systemPrompt, variantUserIndex
+                );
                 const out = this.getApiTurnMessages(messages)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
@@ -2188,6 +2377,22 @@
                     out.unshift({ role: 'system', content: apiSystemPrompt });
                 }
                 return out;
+            },
+
+            buildChatCompletionBody(messages, context) {
+                const variantUserIndex = context._variantUserIndex ?? null;
+                const model = this.resolveApiModel(messages, context.model, variantUserIndex);
+                const generation = this.resolveApiGenerationOverrides(messages, variantUserIndex);
+                return {
+                    model,
+                    messages: this.buildMessagesForApi(
+                        messages, context.systemPrompt, variantUserIndex
+                    ),
+                    stream: true,
+                    stream_options: { include_usage: true },
+                    ...generation,
+                    ...(this.mcpTools.length > 0 && { tools: this.mcpTools }),
+                };
             },
 
             createThinkingState() {
@@ -3199,12 +3404,7 @@
                 this.loadAdminModelSettings(gatewayId);
             }
             if (session.messages && session.messages.length > 0) {
-                const lastAsst = [...session.messages].reverse().find(m => m.role === 'assistant');
-                if (lastAsst) {
-                    this.recentStats = lastAsst._recentStats ? { ...lastAsst._recentStats } : this.emptyStats();
-                } else {
-                    this.recentStats = this.emptyStats();
-                }
+                this.syncFooterStatsFromMessages(session.messages);
             } else {
                 this.recentStats = this.emptyStats();
             }
@@ -3402,10 +3602,10 @@
         stream.streamingContent = '';
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
+        const requestBody = this.buildChatCompletionBody(chatSession.messages, context);
+        const apiModel = requestBody.model;
         this.setEngineStatus(context.chatId, { text: 'Starting' });
-        this.startPrefillPolling(context.chatId, context.model);
-
-        const messagesForApi = this.buildMessagesForApi(chatSession.messages, context.systemPrompt);
+        this.startPrefillPolling(context.chatId, apiModel);
 
         try {
             const response = await fetch('/v1/chat/completions', {
@@ -3414,13 +3614,7 @@
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${this.getApiKey()}`
                 },
-                body: JSON.stringify({
-                    model: context.model,
-                    messages: messagesForApi,
-                    stream: true,
-                    stream_options: { include_usage: true },
-                    ...(this.mcpTools.length > 0 && { tools: this.mcpTools })
-                }),
+                body: JSON.stringify(requestBody),
                 signal: stream.abortController.signal
             });
 
@@ -3758,6 +3952,9 @@
                         if (stream.streamingThinking) {
                             msg._thinking = stream.streamingThinking;
                         }
+                        if (this.currentChatId === context.chatId) {
+                            this.applyVariantStats(msg);
+                        }
                 }
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, context.model, context.systemPrompt);
@@ -3846,6 +4043,58 @@
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
         session.messages = this.sliceBeforeMessage(session.messages, index);
+        this.messages = session.messages;
+        this.syncFooterStatsFromMessages(session.messages);
+        this.saveCurrentChat(this.currentChatId);
+        this.scheduleEnhanceMessages();
+    },
+
+    deleteVariant(userIndex, variantId, event) {
+        if (event) {
+            event.stopPropagation();
+            event.preventDefault();
+        }
+        if (this.isCurrentChatStreaming()) return;
+
+        const session = this.getChatSession(this.currentChatId, true);
+        if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
+
+        const variants = this.getTurnVariantsAt(session.messages, userIndex);
+        if (variants.length <= 1) {
+            let nextUserIdx = session.messages.length;
+            for (let i = userIndex + 1; i < session.messages.length; i++) {
+                if (session.messages[i].role === 'user') {
+                    nextUserIdx = i;
+                    break;
+                }
+            }
+            session.messages = [
+                ...session.messages.slice(0, userIndex),
+                ...session.messages.slice(nextUserIdx),
+            ];
+        } else {
+            const turnMsgs = [];
+            for (let i = userIndex + 1; i < session.messages.length && session.messages[i].role !== 'user'; i++) {
+                turnMsgs.push(session.messages[i]);
+            }
+            const segment = this.splitTurnSegments(turnMsgs).find(s => s.some(m => m.id === variantId));
+            if (!segment) return;
+            const removeIds = new Set(segment.map(m => m.id));
+            session.messages = session.messages.filter(m => !removeIds.has(m.id));
+
+            const user = session.messages[userIndex];
+            const remaining = this.getTurnVariantsAt(session.messages, userIndex);
+            if (remaining.length) {
+                const activeId = user._activeVariantId;
+                const next = remaining.find(v => v.id === activeId) || remaining[remaining.length - 1];
+                user._activeVariantId = next.id;
+                this.applyVariantStats(next);
+            } else {
+                delete user._activeVariantId;
+                this.recentStats = this.emptyStats();
+            }
+        }
+
         this.messages = session.messages;
         this.saveCurrentChat(this.currentChatId);
         this.scheduleEnhanceMessages();
