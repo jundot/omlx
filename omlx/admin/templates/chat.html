@@ -3551,7 +3551,7 @@
         const session = this.getChatSession(chatId, true);
         if (session) {
             this.ensureMessageIds(session.messages);
-            session.messages.forEach(m => this.ensureVariantMeta(m));
+            session.messages.forEach(m => this.ensureVariantMeta(m, session));
             this.currentChatId = chatId;
             this.messages = session.messages;
             this.systemPrompt = session.systemPrompt || '';
@@ -3858,6 +3858,7 @@
                             // Usage chunk arrives as { choices: [], usage: {...} }
                             if (data.usage && !delta) {
                                 lastUsage = data.usage;
+                                stream._lastUsage = data.usage;
                                 continue;
                             }
 
@@ -4159,7 +4160,17 @@
                         this.recentStats.thinking_time = stream._thinkSecs || 0;
                         msg._recentStats = { ...this.recentStats };
                         if (stream.streamingThinking) {
-                            msg._thinking = stream.streamingThinking;
+                            this.attachThinkingToAssistantMessage(msg, stream.streamingThinking);
+                        }
+                        if (stream._lastUsage) {
+                            if (!msg.meta) {
+                                msg.meta = this.captureGenerationContext(
+                                    msg.model || context.model,
+                                    context.systemPrompt,
+                                    context._profile
+                                );
+                            }
+                            msg.meta.usage = this.cloneData(stream._lastUsage);
                         }
                         if (this.currentChatId === context.chatId) {
                             this.applyVariantStats(msg);
@@ -4322,10 +4333,13 @@
         }
     },
 
-    ensureVariantMeta(msg) {
+    ensureVariantMeta(msg, session = null) {
         if (msg.role !== 'assistant') return;
+        const systemPrompt = (typeof session === 'string' ? session : session?.systemPrompt) || '';
         if (!msg.meta) {
-            msg.meta = this.captureGenerationContext(msg.model, '', msg._profile);
+            msg.meta = this.captureGenerationContext(msg.model, systemPrompt, msg._profile);
+        } else if (!String(msg.meta.systemPrompt || '').trim() && String(systemPrompt).trim()) {
+            msg.meta.systemPrompt = systemPrompt.trim();
         }
         this.attachProfileToAssistantMessage(msg, this.resolveMessageProfile(msg));
     },
@@ -4336,10 +4350,11 @@
         const branchName = 'Branch of ' + (originalChat?.title || window.t('chat.new_chat_title'));
 
         const branchId = 'chat_' + Date.now();
-        const branchMessages = session.messages.slice(0, index + 1).map(msg => ({ ...msg }));
+        const branchMessages = session.messages.slice(0, index + 1).map(msg => this.cloneData(msg));
+        this.ensureMessageIds(branchMessages);
 
         // Use profile from the message at branch point
-        const branchMsg = session.messages[index];
+        const branchMsg = branchMessages[index];
         const branchProfile = branchMsg?._profile ?? session.activeProfile ?? null;
 
         const branchSession = {
@@ -4350,6 +4365,8 @@
             modelSettings: session.modelSettings ? this.cloneData(session.modelSettings) : null,
             speculativeEngine: session.speculativeEngine ?? null,
             speculativeDraftModel: session.speculativeDraftModel ?? null,
+            modelSettingsByModel: session.modelSettingsByModel
+                ? this.cloneData(session.modelSettingsByModel) : {},
         };
         this.chatSessions[branchId] = branchSession;
 
@@ -4377,6 +4394,7 @@
             modelSettings: branchSession.modelSettings,
             speculativeEngine: branchSession.speculativeEngine,
             speculativeDraftModel: branchSession.speculativeDraftModel,
+            modelSettingsByModel: this.cloneData(branchSession.modelSettingsByModel || {}),
             updatedAt: new Date().toISOString()
         };
 
