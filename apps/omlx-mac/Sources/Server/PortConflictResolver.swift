@@ -8,8 +8,22 @@ struct PortConflictResolver: Sendable {
     let host: String
     let port: Int
 
+    /// Host to use for our OWN local probes. The server may bind a wildcard
+    /// (`0.0.0.0` / `::`) so external clients can reach it, but you can't use
+    /// a wildcard as a connect target: URLSession rejects `http://0.0.0.0:…`
+    /// as a "bad URL", and `connect(0.0.0.0)` is meaningless. Loop back to
+    /// localhost — the wildcard-bound server is reachable there. Without this
+    /// the health check never succeeds and the menubar stays stuck on
+    /// "starting" even though the server is up (seen on m5max, host 0.0.0.0).
+    private var probeHost: String {
+        switch host {
+        case "0.0.0.0", "", "::", "[::]", "*": return "127.0.0.1"
+        default:                                return host
+        }
+    }
+
     private var healthURL: URL {
-        URL(string: "http://\(host):\(port)/health")!
+        URL(string: "http://\(probeHost):\(port)/health")!
     }
 
     // MARK: - Sync probes (cheap; called from start() before spawn)
@@ -28,10 +42,10 @@ struct PortConflictResolver: Sendable {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr.s_addr = inet_addr(host)
+        addr.sin_addr.s_addr = inet_addr(probeHost)
         if addr.sin_addr.s_addr == INADDR_NONE {
-            // host wasn't a literal IPv4 — try IN6 / DNS… for our case
-            // (host is always 127.0.0.1) just bail.
+            // probeHost wasn't a literal IPv4 (e.g. a hostname). We only need
+            // the conflict probe for the common loopback case; bail otherwise.
             return false
         }
 
