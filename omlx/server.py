@@ -1014,10 +1014,24 @@ def resolve_model_id(model_id: str | None) -> str | None:
     """
     if model_id is None:
         return None
+    global_settings = _server_state.global_settings
+    if global_settings is not None:
+        claude_code = getattr(global_settings, "claude_code", None)
+        if claude_code is not None and claude_code.mode == "local":
+            model_id_lower = model_id.lower()
+            if model_id_lower.startswith("claude-"):
+                parts = model_id_lower.split("-")
+                for tier in ("opus", "sonnet", "haiku"):
+                    if tier in parts:
+                        configured_model = getattr(claude_code, f"{tier}_model")
+                        if configured_model:
+                            model_id = configured_model
+                        break
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    resolved_model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    return resolved_model_id or model_id
 
 
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
