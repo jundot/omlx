@@ -73,52 +73,35 @@ final class MenubarVisibilityWatcher {
         // Bring our process forward so the alert isn't behind another window.
         NSApp.activate(ignoringOtherApps: true)
 
-        let mac = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
-        let isTahoeOrNewer = mac >= 26
-
         let alert = NSAlert()
-        alert.messageText = "The oMLX menubar icon isn't showing up."
+        alert.messageText = "The Flyto MLX menubar icon may be hidden."
+        alert.informativeText = """
+        macOS can hide the icon when the menu bar runs out of room — on \
+        MacBooks with a notch, extra status items get pushed under the \
+        notch and disappear. Free up menu-bar space (quit a few menu-bar \
+        apps) and the icon should reappear.
 
-        if isTahoeOrNewer {
-            alert.informativeText = """
-            macOS Tahoe added per-app menu-bar visibility controls. Open \
-            System Settings → Menu Bar and confirm oMLX is enabled.
-
-            If a menu-bar manager (Bartender, Ice) is filtering items, \
-            oMLX may be excluded by its rules. Bartender in particular \
-            tends to hide PyObjC-style status items and now Swift apps \
-            built the same way.
-            """
-            alert.addButton(withTitle: "Open Menu Bar Settings…")
-            alert.addButton(withTitle: "Quit oMLX")
-            alert.addButton(withTitle: "OK")
-        } else {
-            alert.informativeText = """
-            Try quitting and relaunching oMLX. If the icon still \
-            doesn't appear, check your menu-bar manager (Bartender, Ice, \
-            etc.) — third-party apps sometimes filter status items by \
-            category and may exclude oMLX.
-            """
-            alert.addButton(withTitle: "Quit oMLX")
-            alert.addButton(withTitle: "OK")
-        }
-
+        If you use a menu-bar manager (Bartender, Ice), allow Flyto MLX in \
+        its rules. On macOS Tahoe, you can also check \
+        System Settings → Menu Bar.
+        """
+        // OK is added first so it is the default (Enter) button — a stray
+        // keystroke must never quit the app, since the menu bar item is the
+        // whole UI. Quit is last so it can't be hit by accident.
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Open Menu Bar Settings…")
+        alert.addButton(withTitle: "Quit Flyto MLX")
         alert.window.level = .floating
-        let response = alert.runModal()
 
-        if isTahoeOrNewer {
-            switch response {
-            case .alertFirstButtonReturn:
-                if let url = URL(string: "x-apple.systempreferences:com.apple.MenuBar-Settings.extension") {
-                    NSWorkspace.shared.open(url)
-                }
-            case .alertSecondButtonReturn:
-                NSApp.terminate(nil)
-            default:
-                break
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
+            if let url = URL(string: "x-apple.systempreferences:com.apple.MenuBar-Settings.extension") {
+                NSWorkspace.shared.open(url)
             }
-        } else if response == .alertFirstButtonReturn {
+        case .alertThirdButtonReturn:
             NSApp.terminate(nil)
+        default:
+            break   // OK — dismiss, leave the server running.
         }
     }
 }

@@ -1,37 +1,28 @@
-// PR 2 (PR 11 follow-up) — locate the Python interpreter the parent will
-// spawn.
+// Locate the Python interpreter the parent will spawn `omlx serve` with.
+//
+// Thin-shell model: we do NOT embed a Python runtime in the .app. Instead
+// we shell out to the project's own virtualenv on the host, so editing a
+// .py file in the worktree + restarting the server takes effect immediately
+// (the bundle-hack workflow). The interpreter lives at
+// `~/Code/omlx/.venv/bin/python` on the deploy machines (see CLAUDE.md —
+// servers run at ~/Code/omlx).
 //
 // Resolution order (first match wins):
-//   1. OMLX_PYTHON_OVERRIDE env var — dev escape hatch.
-//   2. Bundle.main/Contents/Frameworks/cpython-3.11/bin/python3 — production.
-//      Layout matches the venvstacks export tree, which
-//      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
-//
-// In the bundled case the spawn environment also sets:
-//   PYTHONHOME = Contents/Frameworks/cpython-3.11
-//     so the relocated interpreter finds its stdlib without grepping the
-//     host system's /usr/lib.
-//   PYTHONPATH = Contents/Resources : framework-mlx-framework/site-packages
-//     : __venvstacks__/site-customize
-//     so `python -m omlx.cli` resolves both the omlx package (shipped as a
-//     pure source tree in Resources/omlx/, matching today's Python build)
-//     and the framework layer's wheels (mlx, transformers, fastapi, …).
-//   PYTHONDONTWRITEBYTECODE = 1
-//     so the read-only app bundle doesn't try to scribble .pyc files into
-//     itself at first import.
+//   1. OMLX_PYTHON_OVERRIDE env var — dev/test escape hatch.
+//   2. ~/Code/omlx/.venv/bin/python — the project venv. The venv already
+//      has omlx importable, so no PYTHONHOME/PYTHONPATH wiring is needed:
+//      running the venv's own python binary makes its site-packages the
+//      default search path.
 
 import Foundation
 
 struct PythonRuntime {
     let executable: URL
-    /// Extra PATH entries to prepend, matching today's Python menubar
-    /// (server_manager.py:328-340 — Homebrew paths needed for ffmpeg, etc.).
+    /// Extra PATH entries to prepend so the server finds Homebrew tools
+    /// (ffmpeg, etc.) the way the legacy Python menubar did.
     let homebrewPaths: [String]
-    /// PYTHONPATH entries to prepend. Empty when the override path is used.
-    let pythonPath: [URL]
-    /// PYTHONHOME — the cpython layer root. nil when using a system Python.
-    let pythonHome: URL?
-    /// True when the bundled runtime was found; false if we fell back.
+    /// Always false in the thin shell — we never embed an interpreter.
+    /// Kept so callers that distinguish bundled vs. host Python still build.
     let isBundled: Bool
 
     enum ResolutionError: Error, CustomStringConvertible {
@@ -56,38 +47,27 @@ struct PythonRuntime {
                 return PythonRuntime(
                     executable: url,
                     homebrewPaths: defaultHomebrewPaths,
-                    pythonPath: [],
-                    pythonHome: nil,
                     isBundled: false
                 )
             }
         }
 
-        let bundleRoot = Bundle.main.bundleURL
-        let frameworks = bundleRoot.appendingPathComponent("Contents/Frameworks")
-        let cpython = frameworks.appendingPathComponent("cpython-3.11")
-        let bundled = cpython.appendingPathComponent("bin/python3")
-        tried.append(bundled.path)
-        if FileManager.default.isExecutableFile(atPath: bundled.path) {
-            let resources = bundleRoot.appendingPathComponent("Contents/Resources")
-            let mlxFramework = frameworks
-                .appendingPathComponent("framework-mlx-framework/lib/python3.11/site-packages")
+        let venvPython = defaultVenvPython
+        tried.append(venvPython.path)
+        if FileManager.default.isExecutableFile(atPath: venvPython.path) {
             return PythonRuntime(
-                executable: bundled,
+                executable: venvPython,
                 homebrewPaths: defaultHomebrewPaths,
-                pythonPath: [resources, mlxFramework],
-                pythonHome: cpython,
-                isBundled: true
+                isBundled: false
             )
         }
 
         throw ResolutionError.notFound(triedPaths: tried)
     }
 
-    /// Build the spawn environment: parent env + Homebrew PATH + PYTHONPATH +
-    /// PYTHONHOME. `PYTHONDONTWRITEBYTECODE=1` is set in bundled mode so the
-    /// read-only app bundle doesn't try to scribble `__pycache__/` into
-    /// itself.
+    /// Build the spawn environment: parent env + Homebrew PATH. The venv's
+    /// own python resolves omlx and its deps without PYTHONHOME/PYTHONPATH,
+    /// so we touch only PATH here.
     func makeEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
 
@@ -97,21 +77,13 @@ struct PythonRuntime {
         }
         env["PATH"] = path
 
-        if !pythonPath.isEmpty {
-            let joined = pythonPath.map(\.path).joined(separator: ":")
-            if let existing = env["PYTHONPATH"], !existing.isEmpty {
-                env["PYTHONPATH"] = "\(joined):\(existing)"
-            } else {
-                env["PYTHONPATH"] = joined
-            }
-        }
-
-        if let home = pythonHome {
-            env["PYTHONHOME"] = home.path
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-        }
-
         return env
+    }
+
+    /// `~/Code/omlx/.venv/bin/python` — the project virtualenv interpreter.
+    private static var defaultVenvPython: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Code/omlx/.venv/bin/python")
     }
 
     private static let defaultHomebrewPaths = [

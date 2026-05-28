@@ -1,16 +1,8 @@
 {
   "images" : [
-    {
-      "filename" : "menubar-outline.svg",
-      "idiom" : "universal"
-    }
+    { "filename" : "menubar-flyto.png", "idiom" : "universal", "scale" : "1x" },
+    { "filename" : "menubar-flyto@2x.png", "idiom" : "universal", "scale" : "2x" }
   ],
-  "info" : {
-    "author" : "xcode",
-    "version" : 1
-  },
-  "properties" : {
-    "preserves-vector-representation" : true,
-    "template-rendering-intent" : "template"
-  }
+  "info" : { "author" : "xcode", "version" : 1 },
+  "properties" : { "template-rendering-intent" : "template" }
 }
