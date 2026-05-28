@@ -319,7 +319,7 @@ private struct CacheSection: View {
 final class PerformanceScreenVM: ObservableObject {
     // Scheduler
     @Published var maxConcurrentText: String = "8"
-    @Published var embeddingBatchSizeText: String = "8"
+    @Published var embeddingBatchSizeText: String = "32"
     @Published var chunkedPrefill: Bool = false
 
     // Memory & Lifecycle
@@ -339,7 +339,7 @@ final class PerformanceScreenVM: ObservableObject {
 
     // Loaded baselines (everything that drives Apply's enabled state)
     @Published private(set) var loadedMaxConcurrent: Int = 8
-    @Published private(set) var loadedEmbeddingBatchSize: Int = 8
+    @Published private(set) var loadedEmbeddingBatchSize: Int = 32
     @Published private(set) var loadedChunkedPrefill: Bool = false
     @Published private(set) var loadedMaxProcessMemory: String = ""
     @Published private(set) var loadedMaxModelMemory: String = ""
@@ -379,7 +379,7 @@ final class PerformanceScreenVM: ObservableObject {
             if let sched = s.scheduler {
                 self.maxConcurrentText = String(sched.maxConcurrentRequests)
                 self.loadedMaxConcurrent = sched.maxConcurrentRequests
-                let embeddingBatchSize = sched.embeddingBatchSize ?? 8
+                let embeddingBatchSize = sched.embeddingBatchSize ?? 32
                 self.embeddingBatchSizeText = String(embeddingBatchSize)
                 self.loadedEmbeddingBatchSize = embeddingBatchSize
                 self.chunkedPrefill = sched.chunkedPrefill ?? false

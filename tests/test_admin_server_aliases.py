@@ -267,7 +267,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
     def _make_scheduler_settings(self):
         return SimpleNamespace(
             max_concurrent_requests=8,
-            embedding_batch_size=8,
+            embedding_batch_size=32,
             chunked_prefill=False,
         )
 
@@ -334,7 +334,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
 
         assert exc_info.value.status_code == 400
         pool.apply_embedding_batch_size.assert_not_awaited()
-        assert gs.scheduler.embedding_batch_size == 8
+        assert gs.scheduler.embedding_batch_size == 32
         gs.save.assert_not_called()
 
     def test_does_not_mutate_embedding_batch_size_when_api_key_is_invalid(self):
@@ -358,7 +358,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
 
         assert exc_info.value.status_code == 400
         pool.apply_embedding_batch_size.assert_not_awaited()
-        assert gs.scheduler.embedding_batch_size == 8
+        assert gs.scheduler.embedding_batch_size == 32
         gs.save.assert_not_called()
 
     def test_does_not_hot_apply_embedding_batch_size_when_save_fails(self):
@@ -382,4 +382,4 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
 
         assert exc_info.value.status_code == 500
         pool.apply_embedding_batch_size.assert_not_awaited()
-        assert gs.scheduler.embedding_batch_size == 8
+        assert gs.scheduler.embedding_batch_size == 32

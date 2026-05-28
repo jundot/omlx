@@ -782,7 +782,7 @@ class TestEmbeddingEngine:
             scheduler_config=SchedulerConfig(completion_batch_size=6),
         )
 
-        assert engine.get_stats()["batch_size"] == 8
+        assert engine.get_stats()["batch_size"] == 32
 
     def test_engine_preserves_positional_batch_size_argument(self):
         """Keep EmbeddingEngine(model, trust_remote_code, batch_size) working."""

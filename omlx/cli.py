@@ -561,7 +561,7 @@ Example directory structure:
         "--embedding-batch-size",
         type=int,
         default=None,
-        help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 8)",
+        help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
 
     # paged SSD cache options

@@ -164,7 +164,7 @@ class TestSchedulerConfig:
         config = SchedulerConfig()
         assert config.max_num_seqs == 8
         assert config.completion_batch_size == 8
-        assert config.embedding_batch_size == 8
+        assert config.embedding_batch_size == 32
         assert config.stream_interval == 1
         assert config.enable_thinking is None
 

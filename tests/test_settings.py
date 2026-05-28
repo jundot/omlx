@@ -217,7 +217,7 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
-        assert settings.embedding_batch_size == 8
+        assert settings.embedding_batch_size == 32
 
     def test_custom_values(self):
         """Test custom values."""
@@ -231,7 +231,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
-            "embedding_batch_size": 8,
+            "embedding_batch_size": 32,
             "chunked_prefill": False,
         }
 
@@ -240,7 +240,7 @@ class TestSchedulerSettings:
         data = {"max_concurrent_requests": 512}
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_concurrent_requests == 512
-        assert settings.embedding_batch_size == 8
+        assert settings.embedding_batch_size == 32
 
         data = {"max_concurrent_requests": 512, "embedding_batch_size": 24}
         settings = SchedulerSettings.from_dict(data)
@@ -653,7 +653,7 @@ class TestGlobalSettings:
             assert settings.server.port == 8000
             assert settings.memory.memory_guard_tier == "balanced"
             assert settings.scheduler.max_concurrent_requests == 8
-            assert settings.scheduler.embedding_batch_size == 8
+            assert settings.scheduler.embedding_batch_size == 32
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None

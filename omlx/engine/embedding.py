@@ -56,9 +56,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         self._trust_remote_code = trust_remote_code
         if batch_size is None:
             batch_size = (
-                getattr(scheduler_config, "embedding_batch_size", 8)
+                getattr(scheduler_config, "embedding_batch_size", 32)
                 if scheduler_config is not None
-                else 8
+                else 32
             )
         self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None

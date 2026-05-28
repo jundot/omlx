@@ -189,7 +189,7 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
-    embedding_batch_size: int = 8
+    embedding_batch_size: int = 32
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
@@ -209,7 +209,7 @@ class SchedulerSettings:
             value = data.get("completion_batch_size")
         if value is None:
             value = 8
-        embedding_batch_size = data.get("embedding_batch_size", 8)
+        embedding_batch_size = data.get("embedding_batch_size", 32)
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
