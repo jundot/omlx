@@ -799,9 +799,26 @@ class ProcessMemoryEnforcer:
                             for e in self._engine_pool._entries.values()
                         )
                         if has_loaded:
+                            # Nothing to evict (all pinned) and no load to
+                            # abort — but the resident footprint may still hold
+                            # reclaimable Metal transients from a finished turn.
+                            # Ask each loaded scheduler to trim them between
+                            # turns. This only sets a flag; the actual reclaim
+                            # runs on the inference thread when it is idle, so
+                            # we never touch Metal from the enforcer thread.
+                            requested = 0
+                            for entry in self._engine_pool._entries.values():
+                                sched = self._resolve_scheduler(entry)
+                                if sched is not None and hasattr(
+                                    sched, "request_idle_reclaim"
+                                ):
+                                    sched.request_idle_reclaim()
+                                    requested += 1
                             logger.warning(
-                                "Hard memory pressure but all loaded models "
-                                "are pinned and no loads in progress."
+                                "Hard memory pressure, all loaded models "
+                                "pinned and no loads in progress: requested "
+                                "idle reclaim on %d scheduler(s).",
+                                requested,
                             )
                         else:
                             logger.warning(

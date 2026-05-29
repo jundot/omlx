@@ -777,6 +777,13 @@ class Scheduler:
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: set[str] = set()
 
+        # Deferred between-turn Metal reclaim, requested by the (asyncio-thread)
+        # ProcessMemoryEnforcer under pinned-model memory pressure. A bare bool
+        # is GIL-atomic to set; it is drained on the inference thread at the top
+        # of step() (same cross-thread idiom as _pending_abort_ids) because the
+        # enforcer must never touch Metal directly.
+        self._pending_reclaim_request: bool = False
+
         # Lock-free admin snapshot. Published at the end of each step() while
         # the engine thread is the sole writer of running/waiting; the admin
         # endpoint reads the dict reference atomically (GIL) and never iterates
@@ -1839,6 +1846,9 @@ class Scheduler:
                 if lm is not None and hasattr(lm, "_rope_deltas"):
                     _saved_rope_deltas = lm._rope_deltas
                     lm._rope_deltas = None
+            # Stash so the #1405 requeue path can restore it if this prefill
+            # raises before the normal restore below runs.
+            request._prefill_saved_rope_deltas = _saved_rope_deltas
 
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
@@ -1874,6 +1884,7 @@ class Scheduler:
                 n_to_process,
                 request_id=request.request_id,
                 loop_label="external",
+                kv_len=base_size + processed_tokens,
             )
 
             model_kwargs: dict[str, Any] = {}
@@ -1948,13 +1959,26 @@ class Scheduler:
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
                 ):
-                    logger.warning(
-                        f"Prefill force-stopped at {processed_tokens} "
-                        f"tokens: memory {current / 1024**3:.1f}GB "
-                        f"exceeds ceiling "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                    # Reclaim the just-computed chunk's Metal transients before
+                    # giving up — they are still resident at this pre-clear
+                    # check and are usually what tipped us over the ceiling.
+                    current = self._reclaim_prefill_headroom()
+                    if current > self._memory_hard_limit_bytes:
+                        logger.warning(
+                            f"Prefill force-stopped at {processed_tokens} "
+                            f"tokens: memory {current / 1024**3:.1f}GB "
+                            f"exceeds ceiling "
+                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB "
+                            f"(after reclaim)"
+                        )
+                        raise RuntimeError("Memory limit exceeded during prefill")
+                    logger.info(
+                        "Prefill recovered after reclaim at %d tokens "
+                        "(%.1fGB <= ceiling %.1fGB)",
+                        processed_tokens,
+                        current / 1024**3,
+                        self._memory_hard_limit_bytes / 1024**3,
                     )
-                    raise RuntimeError("Memory limit exceeded during prefill")
                 elif current > self._memory_limit_bytes:
                     logger.warning(
                         f"Prefill above max_bytes at "
@@ -1997,6 +2021,7 @@ class Scheduler:
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
         if vlm_embeds is not None and _saved_rope_deltas is not None:
             self.model._language_model._rope_deltas = _saved_rope_deltas
+        request._prefill_saved_rope_deltas = None
 
         return prompt_cache, last_token
 
@@ -2010,36 +2035,49 @@ class Scheduler:
     # headroom for the next chunk's intermediates.
     _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512, 256, 128)
 
+    # Safety margin applied to the headroom (hard_cap - current) when sizing
+    # a chunk predictively. The remaining 10% absorbs estimator error and the
+    # newly-allocated KV growth for this chunk that is not yet reflected in
+    # ``current`` (it is eval'd into residency after the forward pass).
+    _PREFILL_HEADROOM_SAFETY: float = 0.90
+
     def _adaptive_chunk_size(
         self,
         requested: int,
         *,
         request_id: str,
         loop_label: str,
+        kv_len: int = 0,
     ) -> int:
-        """Shrink the next prefill chunk by bucketing how far current
-        memory has crossed the soft watermark.
+        """Size the next prefill chunk so its predicted peak stays under a
+        safety margin below the hard cap.
 
-        The approach is intentionally measurement-free and model-agnostic.
-        Once current memory passes the soft watermark
-        (``max_bytes * prefill_safe_zone_ratio``, default 0.80) the chunk
-        size drops in discrete tiers as we approach the hard cap. This is
-        the auto equivalent of PR #1397's manual ``prefill_step_size``
-        override — users do not pick a value, the scheduler picks one
-        only when memory pressure shows up.
+        The chunk is sized so that ``current + predicted_transient(n) <=
+        hard_cap * safety``. If the full requested chunk already fits, it runs
+        unchanged — no behavior change on healthy traffic. Crucially the gate
+        is on the *predicted peak*, not on current memory crossing the soft
+        watermark: a single large chunk's transient (e.g. MoE prefill at tens
+        of MB/token) can blow the ceiling from a low baseline before current
+        ever reaches the watermark, which is the failure this prevents.
 
-        Tiers (relative to soft → hard band):
-          - current < soft watermark        → full chunk (no throttle)
-          - first 25% of band               → 1024
-          - 25%–50%                          → 512
-          - 50%–75%                          → 256
-          - 75%+                             → 128 (floor at min_chunk)
+        Two predictors feed the sizing:
+          - Measured: once the per-scheduler EWMA has samples, use its
+            ``bytes_per_token`` (× the same 1.2 safety factor ``predict()``
+            applies) — this is measurement-based and model-agnostic.
+          - First chunk (no samples yet): fall back to the static SDPA
+            estimate ``memory_monitor.estimate_chunk_transient_bytes(1,
+            kv_len + 1)`` per token. ``kv_len`` is the current context span
+            (cached prefix + already-prefilled tokens), so a large
+            prefix-cache hit with a small suffix is throttled correctly.
+
+        The discrete watermark tiers are retained as a *secondary clamp* —
+        they only ever shrink further, never enlarge the predicted size.
 
         The chunk-end memory check (``self._memory_hard_limit_bytes``
-        comparison in the prefill loops) remains as the safety net: if
-        memory still exceeds hard cap after this shrink, RuntimeError is
-        raised and the #1405 cleanup path emits ``finish_reason="error"``
-        to the client.
+        comparison in the prefill loops) remains the safety net: if memory
+        still exceeds the cap after this shrink, the loop attempts reclaim
+        (``_reclaim_prefill_headroom``) and, failing that, raises so the
+        #1405 cleanup path can requeue or emit ``finish_reason="error"``.
 
         Args:
             requested: The chunk size the caller would have used without
@@ -2047,6 +2085,8 @@ class Scheduler:
             request_id: For debug log correlation.
             loop_label: "external" or "chunked_step", used only for debug
                 log identification.
+            kv_len: Current context span (base/cached + processed tokens)
+                used for the first-chunk static transient estimate.
 
         Returns:
             The chunk size to actually process (>= 1, <= requested).
@@ -2057,41 +2097,82 @@ class Scheduler:
             return requested
 
         current = max(mx.get_active_memory(), get_phys_footprint())
+        min_chunk = max(1, self._prefill_min_chunk_tokens)
+
+        # Per-token transient estimate: measured EWMA once we have samples,
+        # else the static first-chunk SDPA estimate at the current span.
+        tracker = self._prefill_transient_tracker
+        per_token = 0.0
+        predictor = "none"
+        if tracker is not None and tracker.samples > 0 and tracker.bytes_per_token > 0:
+            per_token = tracker.bytes_per_token * 1.2  # matches predict() safety_factor
+            predictor = "ewma"
+        elif self.memory_monitor is not None:
+            per_token = float(
+                self.memory_monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
+            )
+            predictor = "static"
+
+        # The peak we keep each chunk under — a safety margin below the cap.
+        safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
 
-        if current < soft_watermark:
-            return requested
-
-        # Bucket by how far into the soft → hard band we are.
-        band = max(hard_cap - soft_watermark, 1)
-        over_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
-
-        if over_ratio < 0.25:
-            target = self._PREFILL_STEP_TIERS[0]    # 1024
-        elif over_ratio < 0.50:
-            target = self._PREFILL_STEP_TIERS[1]    # 512
-        elif over_ratio < 0.75:
-            target = self._PREFILL_STEP_TIERS[2]    # 256
+        if per_token <= 0:
+            # No usable predictor (e.g. head_dim<=128 fused kernel where the
+            # transient is O(n), or model info unavailable). Fall back to the
+            # legacy watermark gate so we never run unbounded.
+            if current < soft_watermark:
+                return requested
+            n_fit = requested
         else:
-            target = self._PREFILL_STEP_TIERS[3]    # 128
+            # Predicted-peak gate: if the FULL requested chunk fits under the
+            # target it runs unchanged (covers all healthy traffic). This must
+            # NOT depend on current crossing the soft watermark — a single big
+            # chunk's transient can blow the ceiling from a low baseline (e.g.
+            # MoE prefill at ~18MB/token), which is the failure this prevents.
+            if current + per_token * requested <= safe_target:
+                return requested
+            headroom = max(safe_target - current, 0)
+            n_fit = int(headroom / per_token)
 
-        target = max(target, self._prefill_min_chunk_tokens)
-        if requested <= target:
-            return requested
+        n = max(min_chunk, min(requested, n_fit))
 
-        logger.debug(
-            "[throttle:%s] shrink rid=%s chunk %d -> %d "
-            "(current=%.2fGB shrink_at=%.2fGB ceiling=%.2fGB band_ratio=%.2f)",
-            loop_label,
-            request_id,
-            requested,
-            target,
-            current / 1024**3,
-            soft_watermark / 1024**3,
-            hard_cap / 1024**3,
-            over_ratio,
-        )
-        return target
+        # Secondary clamp: once in the watermark caution zone, cap by the
+        # discrete tiers so a mispredicting EWMA can't run an oversized chunk
+        # in deep pressure. Skipped below the watermark so a low-baseline chunk
+        # with ample headroom isn't needlessly shrunk.
+        band_ratio = -1.0
+        if current >= soft_watermark and hard_cap > soft_watermark:
+            band = hard_cap - soft_watermark
+            band_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
+            if band_ratio < 0.25:
+                bucket = self._PREFILL_STEP_TIERS[0]    # 1024
+            elif band_ratio < 0.50:
+                bucket = self._PREFILL_STEP_TIERS[1]    # 512
+            elif band_ratio < 0.75:
+                bucket = self._PREFILL_STEP_TIERS[2]    # 256
+            else:
+                bucket = self._PREFILL_STEP_TIERS[3]    # 128
+            n = max(min_chunk, min(n, bucket))
+
+        if n < requested:
+            logger.debug(
+                "[throttle:%s] shrink rid=%s chunk %d -> %d "
+                "(predictor=%s per_token=%.1fKB current=%.2fGB "
+                "safe_target=%.2fGB ceiling=%.2fGB kv_len=%d band_ratio=%.2f)",
+                loop_label,
+                request_id,
+                requested,
+                n,
+                predictor,
+                per_token / 1024,
+                current / 1024**3,
+                safe_target / 1024**3,
+                hard_cap / 1024**3,
+                kv_len,
+                band_ratio,
+            )
+        return n
 
     def _record_chunk_transient(
         self,
@@ -2125,6 +2206,28 @@ class Scheduler:
             self._prefill_transient_tracker.bytes_per_token / 1024,
             self._prefill_transient_tracker.samples,
         )
+
+    def _reclaim_prefill_headroom(self) -> int:
+        """Reclaim Metal headroom mid-prefill and return the re-measured usage.
+
+        The prefill loops measure the hard-limit at the chunk boundary, which
+        is *before* the per-chunk ``_sync_and_clear_cache`` runs — so the
+        just-completed forward pass's SDPA intermediates are still resident
+        when the limit is checked. Synchronizing and clearing the Metal buffer
+        cache here releases those transients, which is exactly the spike that
+        drives prefill OOM (observed: 42.8GB at the check → 24.6GB after the
+        buffers are reclaimed). This is the only lever that actually lowers
+        the physical footprint: paged-cache block eviction merely recycles
+        ``CacheBlock`` metadata back into the free queue (the pool never
+        shrinks, see ``PagedCacheManager._grow_blocks``), so it is deliberately
+        not attempted here — it would drop reusable prefix-cache entries for no
+        memory benefit.
+
+        Returns:
+            ``max(active, phys_footprint)`` after reclaim.
+        """
+        _sync_and_clear_cache(self._stream)
+        return max(mx.get_active_memory(), get_phys_footprint())
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -2219,6 +2322,7 @@ class Scheduler:
             n,
             request_id=state.request.request_id,
             loop_label="chunked_step",
+            kv_len=state.base_size + state.tokens_processed,
         )
 
         chunk = state.tokens_remaining[:, :n]
@@ -2290,11 +2394,24 @@ class Scheduler:
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
             ):
-                raise RuntimeError(
-                    f"Memory limit exceeded during chunked prefill at "
-                    f"{state.tokens_processed}/{state.total_length - 1} tokens: "
-                    f"{current / 1024**3:.1f}GB exceeds ceiling "
-                    f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                # Reclaim the just-computed chunk's Metal transients before
+                # giving up (mirrors the external prefill loop).
+                current = self._reclaim_prefill_headroom()
+                if current > self._memory_hard_limit_bytes:
+                    raise RuntimeError(
+                        f"Memory limit exceeded during chunked prefill at "
+                        f"{state.tokens_processed}/{state.total_length - 1} tokens: "
+                        f"{current / 1024**3:.1f}GB exceeds ceiling "
+                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB "
+                        f"(after reclaim)"
+                    )
+                logger.info(
+                    "Chunked prefill recovered after reclaim at %d/%d tokens "
+                    "(%.1fGB <= ceiling %.1fGB)",
+                    state.tokens_processed,
+                    state.total_length - 1,
+                    current / 1024**3,
+                    self._memory_hard_limit_bytes / 1024**3,
                 )
             elif current > self._memory_limit_bytes:
                 logger.warning(
@@ -2426,6 +2543,12 @@ class Scheduler:
                 # forward / mx.eval transients. Without this, enforcer keeps
                 # seeing the burst footprint until the next mx.clear_cache().
                 _sync_and_clear_cache()
+                # Try a bounded requeue before surfacing the failure: a
+                # memory-pressure prefill gets a fresh, better-throttled
+                # attempt. Only after the retry budget is exhausted (or for
+                # non-memory errors) do we emit the client-facing error.
+                if self._requeue_or_fail_prefill(request, e):
+                    continue
                 # Surface the failure to the engine. Without this, the
                 # request is silently dropped and the client hangs.
                 rejected.append(
@@ -4334,6 +4457,38 @@ class Scheduler:
             request_id = self._pending_abort_ids.pop()
             self._do_abort_request(request_id)
 
+    def request_idle_reclaim(self) -> None:
+        """Enqueue a between-turn Metal reclaim (thread-safe, no Metal touch).
+
+        Called by ProcessMemoryEnforcer (asyncio thread) when memory pressure
+        is hard but every loaded model is pinned and no load is in progress —
+        the case where there is nothing to evict. Setting the flag is
+        GIL-atomic; the actual ``_sync_and_clear_cache`` runs on the inference
+        thread when step() drains it, and only when the scheduler is idle.
+        """
+        self._pending_reclaim_request = True
+
+    def _process_pending_reclaim(self) -> None:
+        """Drain a deferred idle reclaim request (inference-thread side).
+
+        Only reclaims when truly idle (no running / prefilling / waiting work)
+        so we never clear Metal buffers an in-flight decode or prefill still
+        references.
+        """
+        if not self._pending_reclaim_request:
+            return
+        self._pending_reclaim_request = False
+        if self.running or self.prefilling or self.waiting:
+            return
+        before = max(mx.get_active_memory(), get_phys_footprint())
+        after = self._reclaim_prefill_headroom()
+        logger.info(
+            "Idle reclaim: trimmed Metal transients between turns "
+            "(%.1fGB -> %.1fGB)",
+            before / 1024**3,
+            after / 1024**3,
+        )
+
     def _do_abort_request(self, request_id: str) -> bool:
         """
         Actually abort a request. Must be called from the step() context.
@@ -5058,6 +5213,8 @@ class Scheduler:
                         # Drop Metal cache pool buffers held by the aborted
                         # first chunk's forward / mx.eval transients.
                         _sync_and_clear_cache()
+                        if self._requeue_or_fail_prefill(request, e):
+                            continue
                         rejected_outputs.append(
                             RequestOutput(
                                 request_id=request.request_id,
@@ -5110,6 +5267,8 @@ class Scheduler:
                     # Drop Metal cache pool buffers held by the aborted
                     # chunk's forward / mx.eval transients.
                     _sync_and_clear_cache()
+                    if self._requeue_or_fail_prefill(request, e):
+                        continue
                     rejected_outputs.append(
                         RequestOutput(
                             request_id=request.request_id,
@@ -5868,6 +6027,87 @@ class Scheduler:
             logger.info(f"Rescheduled {count} requests for re-prefill")
         return failed_ids
 
+    # Max times a single request is requeued after a prefill memory-pressure
+    # failure before we give up and emit a clean error to the client.
+    _MAX_PREFILL_OOM_RETRIES = 2
+
+    def _requeue_or_fail_prefill(self, request: "Request", error: Exception) -> bool:
+        """Decide whether to requeue a prefill that hit the memory ceiling.
+
+        The three #1405 catch sites have already torn the request down
+        (released paged cache, popped ``self.requests``, removed the prefill
+        tracker entry, cleared Metal). This either resets the request and puts
+        it back on the waiting queue for a fresh attempt (returns ``True`` —
+        caller continues without emitting an error), or — when the retry
+        budget is exhausted or the failure is not a memory-pressure error —
+        returns ``False`` so the caller emits the clean
+        ``finish_reason="error"``.
+
+        Only memory-limit failures are retried; any other RuntimeError fails
+        immediately so genuine model errors don't loop.
+        """
+        if "Memory limit exceeded" not in str(error):
+            return False
+        if request.prefill_oom_retries >= self._MAX_PREFILL_OOM_RETRIES:
+            logger.warning(
+                "Prefill for %s exhausted %d memory-pressure retries; "
+                "failing with a clean error.",
+                request.request_id,
+                self._MAX_PREFILL_OOM_RETRIES,
+            )
+            return False
+        request.prefill_oom_retries += 1
+
+        # Reclaim before requeue so the retry starts from a lower baseline.
+        self._reclaim_prefill_headroom()
+
+        # Clear any SpecPrefill RoPE patch tied to this request so the retry
+        # re-scores cleanly.
+        if self._specprefill_active_request_id == request.request_id:
+            self._specprefill_active_request_id = None
+
+        # Restore mRoPE deltas if an external VLM prefill was interrupted before
+        # its own restore ran (value stashed on the request in
+        # _do_external_prefill). Benign for non-VLM requests (stash is None).
+        saved = getattr(request, "_prefill_saved_rope_deltas", None)
+        if saved is not None:
+            lm = getattr(self.model, "_language_model", None)
+            if lm is not None and hasattr(lm, "_rope_deltas"):
+                lm._rope_deltas = saved
+            request._prefill_saved_rope_deltas = None
+
+        # Reset scheduling + cache + output state to a clean pre-prefill state
+        # (mirrors _reschedule_running_requests). We deliberately drop
+        # cached_tokens / block_table so the retry does a cold full prefill and
+        # does not re-attach the large cached prefix that produced the same
+        # oversized SDPA span. VLM inputs/embeds are preserved.
+        request.status = RequestStatus.WAITING
+        request.batch_uid = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request.output_token_ids = []
+        request.output_text = ""
+        request.num_computed_tokens = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        request.think_prefix_sent = False
+
+        # Re-register (the catch site popped it) and requeue at the front. The
+        # retry is throttled from its first chunk by the now-populated transient
+        # EWMA, so it is strictly better-informed than this attempt.
+        self.requests[request.request_id] = request
+        self.waiting.appendleft(request)
+        logger.warning(
+            "Requeued %s for prefill retry %d/%d after memory pressure.",
+            request.request_id,
+            request.prefill_oom_retries,
+            self._MAX_PREFILL_OOM_RETRIES,
+        )
+        return True
+
     def step(self) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
@@ -5886,6 +6126,10 @@ class Scheduler:
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
+
+        # Drain a deferred between-turn reclaim requested by the memory
+        # enforcer (only acts when the scheduler is idle).
+        self._process_pending_reclaim()
 
         # Drain async store_cache completions from prior steps. Each completed
         # entry triggers the deferred batch_generator.remove(uid) on the

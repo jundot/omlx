@@ -357,7 +357,8 @@ class TestAdvanceChunkedPrefills:
         assert rejected == []
 
     def test_runtime_error_surfaces_as_request_error(self):
-        """RuntimeError mid-chunk yields a finish_reason=\"error\" RequestOutput."""
+        """A non-memory RuntimeError mid-chunk yields a finish_reason="error"
+        RequestOutput immediately (only memory-pressure errors are requeued)."""
         sched = _make_scheduler()
         req = _make_request("oom")
         sched.requests[req.request_id] = req
@@ -367,7 +368,7 @@ class TestAdvanceChunkedPrefills:
 
         with patch.object(
             sched, "_step_prefill_chunk",
-            side_effect=RuntimeError("Memory limit exceeded")
+            side_effect=RuntimeError("kernel panic")
         ):
             scheduled = []
             rejected = []
@@ -382,7 +383,33 @@ class TestAdvanceChunkedPrefills:
         assert out.request_id == "oom"
         assert out.finished is True
         assert out.finish_reason == "error"
-        assert "Memory limit" in out.error
+        assert "kernel panic" in out.error
+
+    def test_memory_error_requeues_instead_of_surfacing(self):
+        """A memory-pressure RuntimeError mid-chunk requeues the request for a
+        fresh attempt instead of immediately surfacing an error to the client."""
+        sched = _make_scheduler()
+        req = _make_request("oom-mem")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        with patch.object(
+            sched, "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded during chunked prefill")
+        ):
+            scheduled = []
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
+
+        # No client-facing error; the request is reset and back on the queue.
+        assert rejected == []
+        assert req.request_id not in sched._prefill_states
+        assert req not in sched.prefilling
+        assert sched.requests.get(req.request_id) is req
+        assert req in sched.waiting
+        assert req.prefill_oom_retries == 1
 
     def test_multiple_requests_all_advanced(self):
         """All requests in prefilling get one chunk advanced per call."""
@@ -740,7 +767,7 @@ class TestPrefillRejectionReleasesPagedCache:
 
         with patch.object(
             sched, "_do_external_prefill",
-            side_effect=RuntimeError("Memory limit exceeded during prefill"),
+            side_effect=RuntimeError("kernel panic"),
         ):
             sched._schedule_waiting()
 
@@ -764,7 +791,7 @@ class TestPrefillRejectionReleasesPagedCache:
         ):
             with patch.object(
                 sched, "_step_prefill_chunk",
-                side_effect=RuntimeError("Memory limit exceeded"),
+                side_effect=RuntimeError("kernel panic"),
             ):
                 sched._schedule_waiting()
 
