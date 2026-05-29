@@ -73,6 +73,13 @@ class SamplingParams:
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
 
+    # Explicit close-think token id(s) for the thinking-budget processor, used
+    # when the model's reasoning format is NOT one the tokenizer exposes via
+    # mlx-lm's think_end_id (e.g. gemma4's ``<channel|>`` channel format). When
+    # set, the budget processor uses these directly and does not require the
+    # prompt to end in a ``<think>`` open tag.
+    think_end_token_ids: Optional[List[int]] = None
+
     # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None

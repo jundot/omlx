@@ -363,6 +363,7 @@ class TestCachedTokensSurfacedFromPrefixFlow:
         # cached_tokens=42 in metrics.
         async def _fake_run_streaming_via_queue(
             prompt_tokens, max_tokens, temperature, queue, loop, stop_event,
+            *_extra,  # compiled_grammar, top_p, top_k, min_p (signature-agnostic)
         ):
             await queue.put(("hello", [10], False, None))
             await queue.put((" world", [20], False, None))

@@ -439,6 +439,12 @@ class DFlashEngine(BaseEngine):
         from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
         install_dflash_lifecycle_wrap()
 
+        # Wire xgrammar into the dflash verify loop so grammar-constrained
+        # (response_format json_schema) requests routed to the speculative
+        # path are enforced. Idempotent; no-op for non-grammar requests.
+        from ..patches.dflash_grammar import install_dflash_grammar_patches
+        install_dflash_grammar_patches()
+
         if embedded_model is None:
             embedded_model = getattr(self._embedded_vlm, "_vlm_model", None) \
                 or getattr(self._embedded_vlm, "_model", None)
@@ -718,11 +724,20 @@ class DFlashEngine(BaseEngine):
                 pass
         return None
 
-    def _route(self, prompt_tokens: list[int]) -> str:
+    def _route(self, prompt_tokens: list[int], has_grammar: bool = False) -> str:
         """Decide whether this request runs on dflash or the embedded BG engine.
 
         Path A signals (D3 layout):
 
+          * If the request carries a compiled grammar (structured output),
+            route to BG. The dflash speculative verify loop enforces grammar
+            only via a fragile monkey-patch, and for thinking models the
+            structural-tag (reason-then-constrain) flow needs clean
+            token-by-token matcher advancement that the speculative
+            over-advance/rollback does not reliably provide -- the embedded
+            engine applies the same compiled grammar correctly. Grammar is a
+            minority of traffic, so trading dflash speedup for correctness
+            here is the right call.
           * If we're already at the dflash concurrency cap, route to BG.
           * If the embedded engine's paged KV cache usage exceeds the
             configured pressure threshold, route to BG (avoid evicting
@@ -743,6 +758,10 @@ class DFlashEngine(BaseEngine):
         again from ``generate`` / ``stream_generate``.
         """
         ctx_len = len(prompt_tokens)
+        if has_grammar:
+            self._record_route("bg", "grammar", ctx_len, None)
+            return "bg"
+
         if self._max_dflash_concurrent is not None \
                 and self._active_count >= self._max_dflash_concurrent:
             self._record_route("bg", "concurrency", ctx_len, None)
@@ -856,16 +875,54 @@ class DFlashEngine(BaseEngine):
         tag = getattr(self._tokenizer_obj, 'think_start', '<think>')
         return f"{tag}\n"
 
+    def _resolve_stop_token_ids(self) -> list[int]:
+        """Stop token ids for dflash generation.
+
+        ``dflash_mlx.runtime.get_stop_token_ids`` only reads the tokenizer's
+        scalar ``eos_token_id``. Some models (gemma4) declare MULTIPLE eos ids
+        in ``generation_config.json`` (e.g. ``<eos>`` AND ``<turn|>``) and end
+        their turns on the non-scalar one. Without those ids dflash never sees a
+        stop and runs every request to ``max_tokens`` -- a long-standing gemma
+        runaway (the helper can also raise ``int object is not iterable`` on a
+        scalar ``eos_token_ids``). Union the helper's result with the model's
+        full ``generation_config`` eos set so generation actually terminates.
+        """
+        from dflash_mlx.runtime import get_stop_token_ids
+
+        ids: set[int] = set()
+        try:
+            ids.update(int(t) for t in (get_stop_token_ids(self._executor_tokenizer) or []))
+        except Exception as exc:
+            logger.debug("get_stop_token_ids failed (%s); using config eos only", exc)
+        eid = getattr(self._executor_tokenizer, "eos_token_id", None)
+        if isinstance(eid, int):
+            ids.add(eid)
+
+        import json
+        from pathlib import Path
+
+        gc_path = Path(str(self._model_name)) / "generation_config.json"
+        try:
+            eos = json.loads(gc_path.read_text()).get("eos_token_id")
+            if isinstance(eos, int):
+                ids.add(eos)
+            elif isinstance(eos, (list, tuple)):
+                ids.update(int(t) for t in eos)
+        except Exception as exc:
+            logger.debug("could not read eos from %s: %s", gc_path, exc)
+
+        return sorted(ids)
+
     def _stream_dflash_events(
         self,
         prompt_tokens: list[int],
         max_tokens: int,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
-        from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+        from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
-        stop_ids = get_stop_token_ids(self._executor_tokenizer)
+        stop_ids = self._resolve_stop_token_ids()
 
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and
@@ -908,6 +965,10 @@ class DFlashEngine(BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        compiled_grammar: Any = None,
+        top_p: float = 0.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -918,6 +979,15 @@ class DFlashEngine(BaseEngine):
         """
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
+        from ..patches.dflash_grammar import clear_session, set_session
+
+        set_session(
+            compiled_grammar,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
         event_iter = None
         try:
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -1019,6 +1089,7 @@ class DFlashEngine(BaseEngine):
                 queue.put(("", [], True, {"aborted": stop_event.is_set()})),
                 loop,
             )
+            clear_session()
             self._active_count -= 1
 
     async def generate(
@@ -1044,7 +1115,10 @@ class DFlashEngine(BaseEngine):
         # eviction / reload is involved on either branch. ``_route`` records
         # the decision internally (counters + jsonl metric); callers must
         # NOT invoke ``_record_route`` again.
-        route = self._route(prompt_tokens)
+        route = self._route(
+            prompt_tokens,
+            has_grammar=kwargs.get("compiled_grammar") is not None,
+        )
         if route == "bg":
             return await self._embedded_vlm.generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
@@ -1070,8 +1144,19 @@ class DFlashEngine(BaseEngine):
             loop = asyncio.get_running_loop()
             stop_event = threading.Event()
 
+            compiled_grammar = kwargs.get("compiled_grammar", None)
+
             def _run():
                 event_iter = None
+                from ..patches.dflash_grammar import clear_session, set_session
+
+                set_session(
+                    compiled_grammar,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                )
                 try:
                     event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                         prompt_tokens=prompt_tokens,
@@ -1106,6 +1191,7 @@ class DFlashEngine(BaseEngine):
                                 close()
                             except Exception as exc:
                                 logger.debug(f"event_iter.close() raised: {exc}")
+                    clear_session()
                     self._active_count -= 1
 
             self._active_count += 1
@@ -1181,7 +1267,10 @@ class DFlashEngine(BaseEngine):
         # routing decision; the dflash side keeps its concurrency cap via
         # the semaphore released in the finally clause below. ``_route``
         # records the decision; do not call ``_record_route`` again here.
-        route = self._route(prompt_tokens)
+        route = self._route(
+            prompt_tokens,
+            has_grammar=kwargs.get("compiled_grammar") is not None,
+        )
         if route == "bg":
             async for output in self._embedded_vlm.stream_generate(
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
@@ -1226,6 +1315,10 @@ class DFlashEngine(BaseEngine):
             queue,
             loop,
             stop_event,
+            kwargs.get("compiled_grammar", None),
+            top_p,
+            top_k,
+            min_p,
         )
 
         total_text = ""

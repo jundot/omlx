@@ -2561,19 +2561,36 @@ class Scheduler:
             ),
         )
 
-        # Add thinking budget processor for reasoning models
-        if (
+        # Add thinking budget processor for reasoning models.
+        #
+        # Two ways to qualify:
+        #   * Builtin formats: the prompt ends in a <think> open tag
+        #     (needs_think_prefix) and the tokenizer exposes think_end_id.
+        #   * Custom formats (e.g. gemma4 channel): the request carries an
+        #     explicit close-think id (think_end_token_ids). These start in
+        #     thinking by construction (the structural tag forces the open
+        #     channel) so they don't need the <think>-prefix check.
+        explicit_end = getattr(sampling_params, "think_end_token_ids", None)
+        budget_active = (
             sampling_params.thinking_budget is not None
-            and request is not None
-            and getattr(request, "needs_think_prefix", False)
-            and not getattr(request, "is_harmony_model", False)
-        ):
-            think_end_ids = self._resolve_think_end_token_ids()
+            and not (request is not None and getattr(request, "is_harmony_model", False))
+        )
+        qualifies = bool(explicit_end) or (
+            request is not None and getattr(request, "needs_think_prefix", False)
+        )
+        if budget_active and qualifies:
+            if explicit_end:
+                # Force just the close marker; no leading/trailing wrap.
+                think_end_ids = [int(t) for t in explicit_end]
+                think_start_id = None
+                leading_ids = trailing_ids = None
+            else:
+                think_end_ids = self._resolve_think_end_token_ids()
+                think_start_id = self._get_think_token_id("think_start_id")
+                leading_ids, trailing_ids = self._resolve_think_close_pattern()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
-                think_start_id = self._get_think_token_id("think_start_id")
-                leading_ids, trailing_ids = self._resolve_think_close_pattern()
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
                     budget=sampling_params.thinking_budget,
