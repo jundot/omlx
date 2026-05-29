@@ -7,9 +7,18 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from omlx.engine_pool import EngineEntry
 from omlx.exceptions import ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
+from omlx.server import (
+    EngineType,
+    SamplingDefaults,
+    ServerState,
+    app,
+    get_engine,
+    get_max_context_window,
+    get_sampling_params,
+)
 from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
 
 
@@ -423,3 +432,75 @@ class TestGetEngineLLMTypeValidation:
 
         engine = await get_engine("llama-3", EngineType.LLM)
         assert engine is llm
+
+
+class TestGetMaxContextWindow:
+    """Tests for get_max_context_window precedence rule (#1308).
+
+    Resolution order:
+        1. Explicit per-model setting (admin / settings.json).
+        2. Context length discovered from the model's config.json at
+           startup (EngineEntry.model_context_length).
+        3. Global SamplingDefaults.max_context_window (32K).
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    @staticmethod
+    def _entry(model_id: str, ctx_length: int | None) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/fake/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=0,
+            model_context_length=ctx_length,
+        )
+
+    def _mount_pool(self, entries: dict):
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_entry.side_effect = lambda mid: entries.get(mid)
+        self._state.engine_pool = pool
+
+    def _mount_settings(self, overrides: dict):
+        """Mount a settings_manager that returns the given per-model overrides."""
+        manager = MagicMock()
+        manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        self._state.settings_manager = manager
+
+    def test_global_default_when_nothing_discovered(self):
+        """No model context, no per-model override → global default."""
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        assert get_max_context_window("llama-3") == 32768
+
+    def test_discovered_context_returned_when_no_override(self):
+        """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        assert get_max_context_window("qwen3-coder") == 262144
+
+    def test_per_model_override_wins_over_discovery(self):
+        """Admin set 16384 → that wins over the model's declared 262144."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        self._mount_settings({"qwen3-coder": ModelSettings(max_context_window=16384)})
+        assert get_max_context_window("qwen3-coder") == 16384
+
+    def test_per_model_override_wins_over_global(self):
+        """Override of 8192 wins even when the model didn't declare a value."""
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        self._mount_settings({"llama-3": ModelSettings(max_context_window=8192)})
+        assert get_max_context_window("llama-3") == 8192
+
+    def test_no_model_id_returns_global_default(self):
+        """A bare /v1/messages-style call with no model id falls to the default."""
+        assert get_max_context_window(None) == 32768
+
+    def test_unknown_model_id_returns_global_default(self):
+        """An unknown model id doesn't crash — falls through to the default."""
+        self._mount_pool({})
+        assert get_max_context_window("ghost-model") == 32768

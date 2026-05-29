@@ -1041,10 +1041,19 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority: model setting > global setting.
+    Priority (#1308):
+        1. Explicit per-model setting (admin UI / settings.json override).
+        2. Context length discovered from the model's ``config.json`` at
+           server startup (``max_position_embeddings`` etc.); without
+           this tier the server would advertise the 32 K global default
+           even for models that declare 256 K+ natively.
+        3. Global default from ``SamplingConfig`` — last-resort fallback
+           for models whose config files don't expose a context length.
 
     Returns:
-        Max context window token count, or None if not set.
+        Max context window token count, or ``None`` if no tier resolves
+        (only possible when neither the model nor the global default
+        provides a value, which shouldn't happen in practice).
     """
     # Resolve alias so per-model settings are found by real model ID
     model_id = resolve_model_id(model_id)
@@ -1055,6 +1064,12 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
+
+    pool = _server_state.engine_pool
+    if model_id and pool is not None:
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.model_context_length is not None:
+            return entry.model_context_length
 
     return _server_state.sampling.max_context_window
 
@@ -1693,6 +1708,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
+                    max_model_len=get_max_context_window(model_id),
                 )
             )
 

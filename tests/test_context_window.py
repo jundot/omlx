@@ -19,6 +19,10 @@ class TestGetMaxContextWindow:
         state = MagicMock()
         state.sampling = SamplingDefaults(max_context_window=global_max_ctx)
         state.settings_manager = None
+        # Discovery-tier (#1308) lookups are exercised in TestGetMaxContextWindow
+        # in test_server.py; nulling the pool here keeps these focused on the
+        # per-model-setting → global fallback path.
+        state.engine_pool = None
         return state
 
     def test_returns_global_default(self):
