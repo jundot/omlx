@@ -453,26 +453,70 @@
     }
 
     .code-copy-btn {
-        position: absolute;
-        top: 0.5em;
-        right: 0.5em;
         background: var(--bg-secondary);
         border: 1px solid var(--border-faint);
         border-radius: 0.375em;
         padding: 0.25em 0.5em;
         font-size: 0.7em;
         cursor: pointer;
-        opacity: 0;
-        transition: opacity 0.2s;
         color: var(--text-secondary);
-    }
-
-    .code-block-wrapper:hover .code-copy-btn {
-        opacity: 1;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35em;
+        flex-shrink: 0;
     }
 
     .code-copy-btn:hover {
         background: var(--bg-tertiary);
+    }
+
+    .svg-render-btn {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-faint);
+        border-radius: 0.375em;
+        padding: 0.25em 0.5em;
+        font-size: 0.7em;
+        cursor: pointer;
+        color: var(--text-secondary);
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35em;
+        flex-shrink: 0;
+    }
+
+    .svg-render-btn:hover {
+        background: var(--bg-tertiary);
+    }
+
+    .code-btn-row {
+        position: absolute;
+        top: 0.5em;
+        right: 0.5em;
+        display: flex;
+        gap: 0.35em;
+        opacity: 0;
+        transition: opacity 0.2s;
+        z-index: 1;
+    }
+
+    .code-block-wrapper:hover .code-btn-row {
+        opacity: 1;
+    }
+
+    .svg-preview-container {
+        margin: 0.5em 0;
+        padding: 1em;
+        background: #ffffff;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.5em;
+        text-align: center;
+        overflow: auto;
+        max-height: 2160px;
+    }
+
+    .svg-preview-container svg {
+        max-width: 100%;
+        height: auto;
     }
 
     /* User message edit button */
@@ -1227,7 +1271,7 @@
                                         @click="msg._perfVisible = !msg._perfVisible"
                                         class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                         :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                        :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
+                                        :title="msg._perfVisible ? 'Hide info' : 'Show info (' + msg._perfTotal + ')'">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
                                     <button @click="copyMarkdown(msg)"
@@ -1335,7 +1379,7 @@
                             <button @click="toggleCurrentStreamTimeline()"
                                 class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                 :style="currentStream()?.statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                title="Toggle timeline">
+                                title="Toggle info">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
                             </button>
                             <button @click="stopStreaming()"
@@ -2316,6 +2360,48 @@
                 return null;
             },
 
+            /** Collapse duplicate gateway ids (aliases + duplicate /v1/models rows). */
+            dedupeAvailableModels(models) {
+                const byId = new Map();
+                for (const m of models) {
+                    const existing = byId.get(m.id);
+                    if (!existing) {
+                        byId.set(m.id, { ...m });
+                        continue;
+                    }
+                    // Prefer a human-friendly alias label over the raw directory id.
+                    if (m.name && m.name !== m.id && existing.name === existing.id) {
+                        existing.name = m.name;
+                    }
+                }
+                return Array.from(byId.values()).sort((a, b) =>
+                    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+                );
+            },
+
+            resolvePreferredDefaultModel(defaultModel) {
+                if (!this.availableModels?.length) return null;
+                if (defaultModel) {
+                    const candidate = this.resolveGatewayModelId(defaultModel);
+                    if (this.isModelAvailableOnServer(candidate)) {
+                        return candidate;
+                    }
+                }
+                return this.availableModels[0].id;
+            },
+
+            reconcileCurrentModelAfterLoad(defaultModel) {
+                if (!this.availableModels?.length) {
+                    this.currentModel = null;
+                    return;
+                }
+                if (!this.currentModel || !this.isModelAvailableOnServer(this.currentModel)) {
+                    this.currentModel = this.resolvePreferredDefaultModel(defaultModel);
+                } else {
+                    this.currentModel = this.resolveGatewayModelId(this.currentModel);
+                }
+            },
+
             /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
             sliceToUserTurn(messages, endIndex) {
                 let userIdx = -1;
@@ -3176,6 +3262,23 @@
             }, 200);
         });
 
+        // Refresh model list when returning to chat (e.g. after HF download on dashboard).
+        this._modelsVisibilityTimer = null;
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible' || !this.apiKeySet) return;
+            clearTimeout(this._modelsVisibilityTimer);
+            this._modelsVisibilityTimer = setTimeout(async () => {
+                try {
+                    await this.loadModels();
+                    if (this.currentModel) {
+                        await this.loadModelCapabilities(this.currentModel);
+                    }
+                } catch (e) {
+                    console.error('Failed to refresh models on visibility:', e);
+                }
+            }, 300);
+        });
+
     },
 
             // ===== VLM Detection =====
@@ -3536,18 +3639,14 @@
 
             async loadModels() {
         try {
+            this._adminModelsList = null;
+            const apiHeaders = this.getApiKey()
+                ? { 'Authorization': `Bearer ${this.getApiKey()}` }
+                : {};
             // Fetch models, admin model list, and server health in parallel
             const [modelsResponse, adminModelsResponse, healthResponse] = await Promise.all([
-                fetch('/v1/models', {
-                    headers: {
-                        'Authorization': `Bearer ${this.getApiKey()}`
-                    }
-                }),
-                fetch('/admin/api/models', {
-                    headers: {
-                        'Authorization': `Bearer ${this.getApiKey()}`
-                    }
-                }),
+                fetch('/v1/models', { headers: apiHeaders }),
+                fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
                 fetch('/health')
             ]);
 
@@ -3586,15 +3685,17 @@
 
             // Build available models with gateway id (directory name) as the value
             // Store alias for display (in case we want to show it later)
-            this.availableModels = allModels.filter(m => {
-                const gatewayId = this.aliasToGateway[m.id] || m.id;
-                const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
-            }).map(m => ({
-                id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
-                name: m.id, // original name (alias or directory name) for display
-                owned_by: m.owned_by
-            }));
+            this.availableModels = this.dedupeAvailableModels(
+                allModels.filter(m => {
+                    const gatewayId = this.aliasToGateway[m.id] || m.id;
+                    const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
+                    return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                }).map(m => ({
+                    id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
+                    name: m.id, // original name (alias or directory name) for display
+                    owned_by: m.owned_by
+                }))
+            );
 
             // Get default model from health endpoint
             let defaultModel = null;
@@ -3603,20 +3704,14 @@
                 defaultModel = healthData.default_model;
             }
 
-            // Auto-select default model if set, otherwise first model (gateway id)
-            if (!this.currentModel && this.availableModels.length > 0) {
-                this.currentModel = this.availableModels[0].id;
-                if (defaultModel) {
-                    this.currentModel = this.aliasToGateway[defaultModel] || defaultModel;
-                }
-            }
+            this.reconcileCurrentModelAfterLoad(defaultModel);
         } catch (error) {
             console.error('Error loading models:', error);
         }
     },
 
-    async fetchAdminModelsList() {
-        if (this._adminModelsList) return this._adminModelsList;
+    async fetchAdminModelsList({ force = false } = {}) {
+        if (!force && this._adminModelsList) return this._adminModelsList;
         if (this._adminModelsListPromise) return this._adminModelsListPromise;
         this._adminModelsListPromise = fetch('/admin/api/models', { credentials: 'same-origin' })
             .then(async (response) => {
@@ -4341,6 +4436,8 @@
             stream.sourceSystemPrompt = context.systemPrompt;
             stream.sourceProfile = context._profile;
             stream.streamingContent = '';
+            stream.streamingThinking = '';
+            stream.streamingThinkingOpen = false;
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
               
@@ -4601,6 +4698,8 @@
                 }
 
                 stream.streamingContent = '';
+                stream.streamingThinking = '';
+                stream.streamingThinkingOpen = false;
                 this.resetStreamRenderState(stream);
 
                 // Recurse — model synthesises final answer using tool results
@@ -4699,8 +4798,37 @@
                 }
                 if (msg) {
                         const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2);
-                        if (stream.statusLog.length > 0) {
-                            msg._perfLog = [...stream.statusLog];
+                        const perfEntries = [];
+                        const meta = msg.meta || {};
+                        const gen = meta.generation || {};
+                        const parts = [];
+                        const scalarLabels = [
+                            ['temperature', 'temp'],
+                            ['max_tokens', 'max_tok'],
+                            ['top_p', 'top_p'],
+                            ['top_k', 'top_k'],
+                            ['min_p', 'min_p'],
+                            ['repetition_penalty', 'rep_pen'],
+                            ['presence_penalty', 'pres_pen'],
+                        ];
+                        for (const [key, label] of scalarLabels) {
+                            if (gen[key] != null) parts.push(`${label}=${gen[key]}`);
+                        }
+                        const ctk = gen.chat_template_kwargs;
+                        if (ctk && typeof ctk.enable_thinking === 'boolean') {
+                            parts.push(`think=${ctk.enable_thinking ? 'on' : 'off'}`);
+                        }
+                        if (gen.thinking_budget != null) parts.push(`think_budget=${gen.thinking_budget}`);
+                        const modelLabel = meta.modelDisplay
+                            || this.availableModels.find(m => m.id === (stream.sourceModel || context.model))?.name
+                            || stream.sourceModel
+                            || context.model
+                            || '?';
+                        const summary = parts.length ? `${modelLabel} · ${parts.join(', ')}` : modelLabel;
+                        perfEntries.push({ t: '', text: summary, icon: null });
+                        perfEntries.push(...stream.statusLog);
+                        if (perfEntries.length > 0) {
+                            msg._perfLog = perfEntries;
                             msg._perfTotal = totalTime + 's total';
                         }
                         const msgStats = this.buildStreamRecentStats(stream, totalTime);
@@ -4967,6 +5095,8 @@
             if (el.offsetParent === null) return;
             const msgIndex = parseInt(el.dataset.msgIndex, 10);
             if (Number.isNaN(msgIndex)) return;
+            const msg = this.messages[msgIndex];
+            if (!msg || msg.role !== 'user') return;
             const msgTop = el.offsetTop;
             const ratio = scrollMax > 0 ? Math.min(msgTop / scrollMax, 1) : 0;
             result.push({ index: msgIndex, topPx: 16 + (ratio * (railHeight - 32)) });
@@ -4984,6 +5114,8 @@
             if (el.offsetParent === null) return;
             const msgIndex = parseInt(el.dataset.msgIndex, 10);
             if (Number.isNaN(msgIndex)) return;
+            const msg = this.messages[msgIndex];
+            if (!msg || msg.role !== 'user') return;
             const offset = el.offsetTop;
             if (offset <= scrollTop + 60) {
                 active = msgIndex;
@@ -5401,22 +5533,68 @@
                 wrapper.appendChild(pre);
             }
 
-            // Check if button already exists
-            if (pre.parentElement.querySelector('.code-copy-btn')) return;
+            // Check if button row already exists
+            if (pre.parentElement.querySelector('.code-btn-row')) return;
+
+            // Detect SVG code blocks
+            const rawText = codeBlock.textContent;
+            const isSvg = /^\s*(?:<\?xml[^?]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)?<svg[\s>]/i.test(rawText);
+
+            // Create button row
+            const btnRow = document.createElement('div');
+            btnRow.className = 'code-btn-row';
+
+            // Create SVG render button (only for SVG blocks)
+            if (isSvg) {
+                const wandIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/></svg>';
+                const renderBtn = document.createElement('button');
+                renderBtn.className = 'svg-render-btn';
+                renderBtn.innerHTML = wandIcon + ' Render';
+                renderBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const wrapper = pre.parentElement;
+                    const copyBtn = wrapper.querySelector('.code-copy-btn');
+                    let preview = wrapper.querySelector('.svg-preview-container');
+                    if (preview) {
+                        // Toggle back to code view
+                        preview.remove();
+                        pre.style.display = '';
+                        if (copyBtn) copyBtn.style.display = '';
+                        renderBtn.innerHTML = wandIcon + ' Render';
+                        return;
+                    }
+                    const sanitized = DOMPurify.sanitize(rawText, {
+                        ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'g', 'defs', 'clipPath', 'text', 'tspan', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'pattern', 'mask', 'title', 'desc'],
+                        ADD_ATTR: ['viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'd', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points', 'transform', 'clip-path', 'opacity', 'gradientUnits', 'gradientTransform', 'offset', 'stop-color', 'stop-opacity', 'font-size', 'font-family', 'text-anchor', 'dominant-baseline', 'width', 'height', 'preserveAspectRatio', 'filter', 'flood-color', 'flood-opacity', 'in', 'in2', 'type', 'values', 'stdDeviation', 'result', 'patternTransform', 'patternUnits', 'spreadMethod', 'fx', 'fy'],
+                    });
+                    if (!sanitized || !sanitized.includes('<svg')) return;
+                    preview = document.createElement('div');
+                    preview.className = 'svg-preview-container';
+                    preview.innerHTML = sanitized;
+                    pre.style.display = 'none';
+                    if (copyBtn) copyBtn.style.display = 'none';
+                    wrapper.appendChild(preview);
+                    renderBtn.innerHTML = '\u2190 Back';
+                };
+                btnRow.appendChild(renderBtn);
+            }
 
             // Create copy button
+            const copyIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy-btn';
-            copyBtn.textContent = 'Copy';
+            copyBtn.innerHTML = copyIcon + ' Copy';
             copyBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 this._copyText(codeBlock.textContent).then(() => {
-                    copyBtn.textContent = 'Copied!';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.innerHTML = copyIcon + ' Copied!';
+                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' Copy', 2000);
                 });
             };
-            pre.parentElement.appendChild(copyBtn);
+            btnRow.appendChild(copyBtn);
+            pre.parentElement.appendChild(btnRow);
         });
     },
 
