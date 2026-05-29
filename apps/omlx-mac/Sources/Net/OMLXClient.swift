@@ -243,6 +243,18 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// Fetch the README for a Hugging Face repo, the same payload the
+    /// browser admin renders in its model-card slide-over. Cache-aware
+    /// on the server (uses `hf_hub_download` under the hood), so post-
+    /// download lookups skip the network. Returns an empty
+    /// `modelCard` string when the upstream repo has no README — that
+    /// is a "no card" state, not an error.
+    func getHFModelCard(repoId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.hfModelInfo, query: [
+            URLQueryItem(name: "repo_id", value: repoId),
+        ])
+    }
+
     // MARK: - ModelScope (Phase 2)
     //
     // 1:1 mirror of the /hf/* surface above, pointed at the parallel
@@ -300,6 +312,15 @@ final class OMLXClient: ObservableObject {
             URLQueryItem(name: "sort", value: sort),
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ])
+    }
+
+    /// ModelScope mirror of `getHFModelCard(repoId:)`. Returns the same
+    /// shape (`{model_card: "<markdown>"}`); empty string when the
+    /// upstream repo has no README.
+    func getMSModelCard(modelId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.msModelInfo, query: [
+            URLQueryItem(name: "model_id", value: modelId),
         ])
     }
 

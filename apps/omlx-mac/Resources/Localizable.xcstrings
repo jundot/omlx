@@ -1695,6 +1695,18 @@
         }
       }
     },
+    "downloads.button.show_card" : {
+      "comment" : "Tooltip on the info button that opens a model's README sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View model card"
+          }
+        }
+      }
+    },
     "downloads.cancel.help" : {
       "comment" : "Tooltip on the X button that cancels or removes a download task",
       "extractionState" : "manual",
@@ -1703,6 +1715,162 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Cancel"
+          }
+        }
+      }
+    },
+    "downloads.card.close" : {
+      "comment" : "Tooltip on the model card sheet's close button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        }
+      }
+    },
+    "downloads.card.download" : {
+      "comment" : "Primary button in the model card sheet that starts downloading the displayed model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download"
+          }
+        }
+      }
+    },
+    "downloads.card.empty" : {
+      "comment" : "Empty state shown when the upstream repo has no model card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model doesn't ship a README."
+          }
+        }
+      }
+    },
+    "downloads.card.files.empty" : {
+      "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No files reported."
+          }
+        }
+      }
+    },
+    "downloads.card.error" : {
+      "comment" : "Title shown in the model card sheet when the fetch failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't load model card"
+          }
+        }
+      }
+    },
+    "downloads.card.loading" : {
+      "comment" : "Status text shown while the model README is being fetched",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading model card…"
+          }
+        }
+      }
+    },
+    "downloads.card.lora_warning" : {
+      "comment" : "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX."
+          }
+        }
+      }
+    },
+    "downloads.card.retry" : {
+      "comment" : "Retry button shown after the model card fetch failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Retry"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.card" : {
+      "comment" : "Tab label in the model card sheet for the README content",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model Card"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.files" : {
+      "comment" : "Tab label in the model card sheet for the repo file list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Files"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.tags" : {
+      "comment" : "Tab label in the model card sheet for the repo tag list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tags"
+          }
+        }
+      }
+    },
+    "downloads.card.tags.empty" : {
+      "comment" : "Empty state in the Tags tab when the upstream API doesn't list any tags",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No tags."
+          }
+        }
+      }
+    },
+    "downloads.card.view_upstream" : {
+      "comment" : "Link button in the model card sheet that opens the upstream model page; placeholder is 'Hugging Face' or 'ModelScope'",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View on %@"
           }
         }
       }

@@ -67,6 +67,9 @@
 		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
 		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
+		DBB000000000000000000101 /* ModelCardDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000101 /* ModelCardDTO.swift */; };
+		DBB000000000000000000102 /* ModelCardSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000102 /* ModelCardSheet.swift */; };
+		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
 		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
 		9BB000000000000000000002 /* OQDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000002 /* OQDTO.swift */; };
@@ -92,6 +95,7 @@
 		DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */; };
 		DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000F /* LocalizationSmokeTests.swift */; };
 		DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000100 /* MenubarControllerPortTests.swift */; };
+		DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -168,6 +172,8 @@
 		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
+		DCC000000000000000000101 /* ModelCardDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTO.swift; sourceTree = "<group>"; };
+		DCC000000000000000000102 /* ModelCardSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardSheet.swift; sourceTree = "<group>"; };
 		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
 		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000002 /* OQDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OQDTO.swift; sourceTree = "<group>"; };
@@ -193,6 +199,7 @@
 		DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000F /* LocalizationSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationSmokeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000100 /* MenubarControllerPortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerPortTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTODecodeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -201,6 +208,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EBB000000000000000000001 /* MarkdownUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -251,6 +259,7 @@
 				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
 				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
 				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
+				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -317,6 +326,7 @@
 				9CC000000000000000000003 /* HFUploadDTO.swift */,
 				9CC000000000000000000004 /* BenchDTO.swift */,
 				9CC000000000000000000005 /* PresetBundleDTO.swift */,
+				DCC000000000000000000101 /* ModelCardDTO.swift */,
 			);
 			path = DTO;
 			sourceTree = "<group>";
@@ -353,6 +363,7 @@
 				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
 				6CC00000000000000000000F /* NetworkScreen.swift */,
 				6CC000000000000000000010 /* PerformanceScreen.swift */,
+				DCC000000000000000000102 /* ModelCardSheet.swift */,
 			);
 			path = Screens;
 			sourceTree = "<group>";
@@ -462,6 +473,7 @@
 			);
 			name = "oMLX";
 			packageProductDependencies = (
+				ECC000000000000000000001 /* MarkdownUI */,
 			);
 			productName = "oMLX";
 			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */;
@@ -513,6 +525,7 @@
 			);
 			mainGroup = 1BBBBBBBBBBBBBBBBBBBBBB1;
 			packageReferences = (
+				EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
 			);
 			productRefGroup = 1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */;
 			projectDirPath = "";
@@ -594,6 +607,8 @@
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB00000000000000000000A /* MSTaskDTO.swift in Sources */,
 				9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */,
+				DBB000000000000000000101 /* ModelCardDTO.swift in Sources */,
+				DBB000000000000000000102 /* ModelCardSheet.swift in Sources */,
 				9BB000000000000000000006 /* PresetBundleStore.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
 				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
@@ -631,6 +646,7 @@
 				DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */,
 				DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */,
 				DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */,
+				DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -881,6 +897,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.4.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		ECC000000000000000000001 /* MarkdownUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
+			productName = MarkdownUI;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
 }
