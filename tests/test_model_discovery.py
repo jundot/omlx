@@ -410,6 +410,51 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_lfm_text_moe_family_as_llm_not_audio_sts(self, tmp_path):
+        """LFM text MoE (lfm*_moe + *ForCausalLM) must not use mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_future_moe_variant_as_llm_not_audio_sts(self, tmp_path):
+        """Any lfm*_moe text type with *ForCausalLM uses LLM, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_5_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
+        """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": ["LFM2AudioModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_lfm_audio_model_type_as_sts(self, tmp_path):
+        """lfm_audio model_type is STS even without a recognized architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": [],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_unknown_lfm_prefix_without_causal_lm_as_sts(self, tmp_path):
+        """Unknown mlx-audio lfm* types without CausalLM still use prefix fallback."""
+        config = {
+            "model_type": "lfm_custom_audio",
+            "architectures": ["SomeLegacyLFMAudioWrapper"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""

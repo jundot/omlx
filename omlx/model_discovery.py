@@ -395,6 +395,16 @@ def _has_vision_subconfig(config: dict) -> bool:
     )
 
 
+def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
+    """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
+
+    Liquid LFM text checkpoints (LFM2, LFM2.5 MoE, etc.) use ``lfm*`` model
+    types and ``*ForCausalLM`` classes. mlx-audio LFM STS uses ``LFM2AudioModel``
+    and is handled earlier via :data:`AUDIO_STS_ARCHITECTURES`.
+    """
+    return any("causallm" in arch.lower() for arch in architectures)
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
@@ -546,8 +556,12 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
+    # mlx-audio LFM STS may use an "lfm*" model_type without a known architecture
+    # string yet. Liquid LFM *text* checkpoints share that prefix — disambiguate
+    # with CausalLM architecture names (LFM2 / LFM2.5 MoE, future lfm* LMs).
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        if _architecture_indicates_causal_lm(architectures):
+            return "llm"
         return "audio_sts"
 
     return "llm"
