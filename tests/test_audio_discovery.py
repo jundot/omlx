@@ -389,6 +389,14 @@ class TestDetectSTSModelType:
         })
         assert detect_model_type(tmp_path) == "audio_sts"
 
+    def test_lfm2_audio_for_conditional_generation_returns_audio_sts(self, tmp_path):
+        """Real LFM2.5-Audio configs use Lfm2AudioForConditionalGeneration."""
+        _write_config(tmp_path, {
+            "model_type": "lfm_audio",
+            "architectures": ["Lfm2AudioForConditionalGeneration"],
+        })
+        assert detect_model_type(tmp_path) == "audio_sts"
+
     def test_sts_model_types_set_contains_expected_entries(self):
         """AUDIO_STS_MODEL_TYPES contains the expected STS model families."""
         # When mlx-audio is installed these come from directory scanning;

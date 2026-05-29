@@ -410,6 +410,50 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_lfm2_text_model_is_llm(self, tmp_path):
+        """LiquidAI LFM2 text models use model_type='lfm2' and should not be embeddings."""
+        model_dir = tmp_path / "LFM2.5-1.2B-Instruct"
+        model_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2ForCausalLM"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(model_dir) == "llm"
+
+    def test_detect_lfm2_moe_text_model_is_llm(self, tmp_path):
+        """LiquidAI LFM2 MoE text models should not fall through to audio_sts."""
+        model_dir = tmp_path / "LFM2.5-8B-A1B-MLX-8bit"
+        model_dir.mkdir()
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(model_dir) == "llm"
+
+    def test_detect_lfm2_embedding_model_by_name(self, tmp_path):
+        """LFM2 embedding variants can still opt into embedding routing by name."""
+        embed_dir = tmp_path / "LFM2-Embedding-4bit"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2ForCausalLM"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_detect_lfm2_vl_model_is_vlm(self, tmp_path):
+        """LiquidAI LFM2-VL models should route through the VLM engine."""
+        config = {
+            "model_type": "lfm2_vl",
+            "architectures": ["Lfm2VlForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1024},
+            "text_config": {"model_type": "lfm2"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""

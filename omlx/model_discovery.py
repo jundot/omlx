@@ -59,6 +59,7 @@ VLM_MODEL_TYPES = {
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+    "lfm2_vl",
 }
 
 # Known VLM architectures
@@ -79,6 +80,7 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "Lfm2VlForConditionalGeneration",
 }
 
 # Known embedding model types from mlx-embeddings
@@ -90,7 +92,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -99,6 +100,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures
@@ -134,6 +136,7 @@ CAUSAL_LM_RERANKER_ARCHITECTURES = {
 # (no lm_head weights). Detected by architecture + directory name heuristic.
 CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
     "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
+    "Lfm2ForCausalLM",  # LFM2 embedding variants share the base text arch
 }
 
 # Multimodal (VLM-based) reranker architectures.
@@ -262,6 +265,7 @@ AUDIO_STS_ARCHITECTURES = {
     "MossFormer2SEModel",
     "SAMAudio",
     "LFM2AudioModel",
+    "Lfm2AudioForConditionalGeneration",
 }
 
 
@@ -545,9 +549,6 @@ def detect_model_type(model_path: Path) -> ModelType:
     if normalized_type in AUDIO_STT_MODEL_TYPES or model_type in AUDIO_STT_MODEL_TYPES:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
-        return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
-    if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
         return "audio_sts"
 
     return "llm"
