@@ -4209,6 +4209,23 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
                     model_id,
                     exc,
                 )
+
+        # MRU partials remain correctness-valid after a hot-cache clear
+        # (parent block_hashes survive in the SSD index), but they hold
+        # KV bytes in memory that an operator clicking "clear hot cache"
+        # is asking to free.  Wipe is a deliberate memory-pressure
+        # choice, not a correctness requirement.
+        block_aware_cache = getattr(scheduler, "block_aware_cache", None)
+        if block_aware_cache is not None:
+            try:
+                block_aware_cache.clear_mru_partials()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear MRU partials for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()

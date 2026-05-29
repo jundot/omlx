@@ -3112,14 +3112,16 @@ class BlockAwarePrefixCache(CacheManager):
     def clear_mru_partials(self) -> int:
         """Wipe only the MRU partial cache, leaving paged blocks intact.
 
-        Intended consumer: admin-triggered cache-tier clears that drop
-        the backing block storage (``clear_ssd_cache`` admin endpoint,
-        and the future ``clear_hot_cache`` endpoint once PR #1183
-        lands).  Without this hook, a stash whose ``parent_hash`` chains
-        from a paged block whose underlying KV bytes were just flushed
-        from the hot/SSD tier would survive in memory and waste a
-        reconstruct attempt on the next request before being naturally
-        evicted by LRU.
+        Two intended admin-endpoint consumers, with different rationales:
+
+        - ``/api/ssd-cache/clear``: the underlying paged block files are
+          gone, so a stash whose ``parent_hash`` chains from one of them
+          would survive in memory referencing dead data — wipe is a
+          correctness requirement.
+        - ``/api/hot-cache/clear``: the SSD index and ``allocated_blocks``
+          mapping survive a hot-cache clear, so MRU entries remain
+          correctness-valid; wipe is a memory-pressure choice that
+          matches the operator's "free RAM" intent for that button.
 
         Distinct from ``clear()``: this method only drops MRU entries
         and does not touch the paged cache, prefix index, or stats
