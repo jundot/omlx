@@ -162,6 +162,77 @@ class TestServerInfoEndpoint:
         assert exc_info.value.status_code == 503
 
 
+class TestGetGlobalSettingsCache:
+    """get_global_settings: cache settings should expose raw save values."""
+
+    def _memory_info(self):
+        return {
+            "total_bytes": 64 * 1024**3,
+            "total_formatted": "64GB",
+            "auto_limit_formatted": "51GB",
+            "available_bytes": 32 * 1024**3,
+            "omlx_phys_footprint_bytes": 0,
+            "free_memory_bytes": 16 * 1024**3,
+            "inactive_memory_bytes": 8 * 1024**3,
+            "active_memory_bytes": 40 * 1024**3,
+            "iogpu_wired_limit_bytes": 0,
+            "omlx_wired_limit_request_bytes": 0,
+        }
+
+    def _disk_info(self):
+        return {
+            "total_bytes": 100 * 1024**3,
+            "total_formatted": "100GB",
+        }
+
+    def test_preserves_raw_auto_ssd_cache_size_in_settings_response(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.cache.ssd_cache_dir = "/tmp/omlx/cache"
+        gs.cache.ssd_cache_max_size = "auto"
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                admin_routes,
+                "get_system_memory_info",
+                return_value=self._memory_info(),
+            ),
+            patch.object(
+                admin_routes,
+                "get_ssd_disk_info",
+                return_value=self._disk_info(),
+            ),
+            patch("omlx.settings.get_ssd_capacity", return_value=100 * 1024**3),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["ssd_cache_max_size"] == "auto"
+        assert result["cache"]["ssd_cache_max_size_resolved"] == "10GB"
+
+    def test_returns_explicit_ssd_cache_size_in_settings_response(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.cache.ssd_cache_dir = "/tmp/omlx/cache"
+        gs.cache.ssd_cache_max_size = "25GB"
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                admin_routes,
+                "get_system_memory_info",
+                return_value=self._memory_info(),
+            ),
+            patch.object(
+                admin_routes,
+                "get_ssd_disk_info",
+                return_value=self._disk_info(),
+            ),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["ssd_cache_max_size"] == "25GB"
+        assert result["cache"]["ssd_cache_max_size_resolved"] == "25GB"
+
+
 # =============================================================================
 # /admin/api/global-settings save path for server_aliases
 # =============================================================================

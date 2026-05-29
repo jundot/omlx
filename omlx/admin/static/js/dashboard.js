@@ -703,8 +703,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.hotCachePercent = this.parseHotCacheToPercent(
@@ -3310,8 +3308,8 @@
                 else if (unit === 'GB') bytes *= 1024 * 1024 * 1024;
                 else if (unit === 'MB') bytes *= 1024 * 1024;
 
-                const percent = Math.round((bytes / totalBytes) * 100);
-                return Math.min(100, percent);
+                const percent = Math.round((bytes / totalBytes) * 10000) / 100;
+                return Math.min(100, Math.max(0.01, percent));
             },
 
             // Convert percent to cache size string
@@ -3549,7 +3547,8 @@
                 const totalBytes = this.globalSettings.system?.ssd_total_bytes || 0;
                 if (totalBytes > 0) {
                     const bytes = gb * 1024 * 1024 * 1024;
-                    this.cachePercent = Math.min(100, Math.round((bytes / totalBytes) * 100));
+                    const percent = Math.round((bytes / totalBytes) * 10000) / 100;
+                    this.cachePercent = Math.min(100, Math.max(0.01, percent));
                 }
             },
 

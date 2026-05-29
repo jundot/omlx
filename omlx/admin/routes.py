@@ -2716,6 +2716,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     )
     disk_info = get_ssd_disk_info(cache_dir)
+    ssd_cache_max_size_resolved = _format_cache_size(
+        global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
+    )
 
     return {
         "base_path": str(global_settings.base_path),
@@ -2746,10 +2749,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
-            # Resolve "auto" to actual value (10% of SSD capacity)
-            "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(global_settings.base_path)
-            ),
+            "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
+            "ssd_cache_max_size_resolved": ssd_cache_max_size_resolved,
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
