@@ -51,7 +51,6 @@ struct ServerScreen: View {
                     isLast: true
                 ) {
                     TextInput(text: $vm.portText, mono: true, width: 90)
-                        .onSubmit { vm.savePort(services: services) }
                 }
             }
 
@@ -136,21 +135,21 @@ struct ServerScreen: View {
                     TextInput(text: $vm.modelDirText, mono: true, width: 280)
                 }
             }
+            ServerAdvancedSection(vm: vm)
+
             HStack {
                 Spacer()
                 Button(String(localized: "server.button.apply",
                               defaultValue: "Apply",
-                              comment: "Button to apply pending storage changes")) {
-                    vm.applyStorage(services: services)
+                              comment: "Button to apply pending server settings: port, default profile, storage, and aliases")) {
+                    vm.applyServerSettings(services: services)
                 }
                     .buttonStyle(.omlx(.primary))
-                    .disabled(!vm.hasPendingStorageChanges(services: services)
+                    .disabled(!vm.hasPendingServerChanges(services: services)
                               || vm.isMovingBasePath)
             }
             .padding(.horizontal, 18)
             .padding(.top, 6)
-
-            ServerAdvancedSection(vm: vm)
 
             HintFooter(error: vm.lastError)
         }
@@ -375,7 +374,6 @@ private struct ServerDefaultProfileEditor: View {
                                      defaultValue: "Maximum prompt + completion tokens.",
                                      comment: "Sublabel for the context window field")) {
                     TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: 110)
-                        .onSubmit { vm.saveSamplingContext() }
                 }
                 Row(label: String(localized: "server.profile.max_tokens",
                                   defaultValue: "Max Tokens",
@@ -384,7 +382,6 @@ private struct ServerDefaultProfileEditor: View {
                                      defaultValue: "Server-wide cap on generated tokens.",
                                      comment: "Sublabel for the max tokens field")) {
                     TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: 110)
-                        .onSubmit { vm.saveSamplingMaxTokens() }
                 }
                 Row(label: String(localized: "server.profile.temperature",
                                   defaultValue: "Temperature",
@@ -393,7 +390,6 @@ private struct ServerDefaultProfileEditor: View {
                                      defaultValue: "Sampling randomness (0–2).",
                                      comment: "Sublabel for the temperature field")) {
                     TextInput(text: $vm.samplingTemperatureText, placeholder: "0.7", mono: true, width: 90)
-                        .onSubmit { vm.saveSamplingTemperature() }
                 }
                 Row(label: String(localized: "server.profile.top_p",
                                   defaultValue: "Top P",
@@ -402,7 +398,6 @@ private struct ServerDefaultProfileEditor: View {
                                      defaultValue: "Nucleus sampling cutoff (0–1).",
                                      comment: "Sublabel for the Top P field")) {
                     TextInput(text: $vm.samplingTopPText, mono: true, width: 90)
-                        .onSubmit { vm.saveSamplingTopP() }
                 }
                 Row(label: String(localized: "server.profile.top_k",
                                   defaultValue: "Top K",
@@ -411,7 +406,6 @@ private struct ServerDefaultProfileEditor: View {
                                      defaultValue: "Limit candidates to top K. 0 = disabled.",
                                      comment: "Sublabel for the Top K field")) {
                     TextInput(text: $vm.samplingTopKText, mono: true, width: 90)
-                        .onSubmit { vm.saveSamplingTopK() }
                 }
                 Row(label: String(localized: "server.profile.repetition_penalty",
                                   defaultValue: "Repetition Penalty",
@@ -422,7 +416,6 @@ private struct ServerDefaultProfileEditor: View {
                     isLast: !expanded
                 ) {
                     TextInput(text: $vm.samplingRepetitionPenaltyText, mono: true, width: 90)
-                        .onSubmit { vm.saveSamplingRepetitionPenalty() }
                 }
                 if expanded {
                     // The remaining design rows aren't server-backed yet —
@@ -641,7 +634,6 @@ private struct ServerAdvancedSection: View {
                             mono: true,
                             width: 320
                         )
-                        .onSubmit { vm.saveServerAliases() }
                     }
                 }
             }
@@ -658,8 +650,8 @@ private struct HintFooter: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HintLine(text: String(localized: "server.footer.hint",
-                                  defaultValue: "Endpoints update live as you change Listen Address and Port. Some changes (host, port) take effect after a server restart.",
-                                  comment: "Hint footer text under the Server screen explaining endpoint behavior"))
+                                  defaultValue: "Listen Address, Log Level, and SSE Keep-Alive Mode apply the moment you change them. The rest (port, default profile, storage, aliases) commits when you click Apply. Port and storage changes take effect after a server restart.",
+                                  comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"))
             if let error {
                 Text(error)
                     .font(.omlxText(11))
@@ -704,6 +696,22 @@ final class ServerScreenVM: ObservableObject {
     @Published var effectiveHost: String = "127.0.0.1"
     @Published var effectivePort: Int = 8080
 
+    /// Apply-button baselines: snapshots of each Apply-managed draft taken
+    /// after a successful `load()` or `applyServerSettings()`. The button's
+    /// `disabled` state is `drafts == baselines`, so re-snapshotting on
+    /// success collapses the page back to "no pending changes".
+    ///
+    /// Listen Address / Log Level / SSE Keep-Alive Mode auto-apply via the
+    /// `bind()` wrapper and don't need baselines here.
+    private var baselinePortText: String = "8080"
+    private var baselineSamplingContextText: String = "32768"
+    private var baselineSamplingMaxTokensText: String = "32768"
+    private var baselineSamplingTemperatureText: String = "1.0"
+    private var baselineSamplingTopPText: String = "0.95"
+    private var baselineSamplingTopKText: String = "0"
+    private var baselineSamplingRepetitionPenaltyText: String = "1.0"
+    private var baselineServerAliasesText: String = ""
+
     private weak var client: OMLXClient?
     private var hasLoaded = false
 
@@ -728,74 +736,199 @@ final class ServerScreenVM: ObservableObject {
             }
             self.lastError = nil
             self.hasLoaded = true
+            self.snapshotApplyBaselines()
         } catch {
             self.lastError = error.omlxDescription
         }
     }
 
-    // MARK: - Default-profile saves
+    // MARK: - Apply orchestrator
 
-    func saveSamplingContext() {
-        guard let n = Int(samplingContextText.trimmingCharacters(in: .whitespaces)), n > 0 else {
-            self.lastError = String(localized: "server.error.context_window_invalid",
-                                    defaultValue: "Context Window must be a positive integer.",
-                                    comment: "Server screen error when Context Window input is invalid")
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(samplingMaxContextWindow: n)) }
+    /// Snapshot current draft values as the new "applied" baseline. Called
+    /// at the end of `load()` and after a successful `applyServerSettings()`.
+    private func snapshotApplyBaselines() {
+        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
+        baselinePortText = t(portText)
+        baselineSamplingContextText = t(samplingContextText)
+        baselineSamplingMaxTokensText = t(samplingMaxTokensText)
+        baselineSamplingTemperatureText = t(samplingTemperatureText)
+        baselineSamplingTopPText = t(samplingTopPText)
+        baselineSamplingTopKText = t(samplingTopKText)
+        baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
+        baselineServerAliasesText = serverAliasesText
     }
 
-    func saveSamplingMaxTokens() {
-        guard let n = Int(samplingMaxTokensText.trimmingCharacters(in: .whitespaces)), n > 0 else {
-            self.lastError = String(localized: "server.error.max_tokens_invalid",
-                                    defaultValue: "Max Tokens must be a positive integer.",
-                                    comment: "Server screen error when Max Tokens input is invalid")
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(samplingMaxTokens: n)) }
+    /// Apply-button gate: true when any Apply-managed draft diverges from
+    /// its baseline, or when Storage has uncommitted changes. Listen
+    /// Address / Log Level / SSE Keep-Alive Mode auto-apply via `bind()`
+    /// and are intentionally excluded from this check.
+    func hasPendingServerChanges(services: AppServices) -> Bool {
+        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
+        if t(portText) != baselinePortText { return true }
+        if t(samplingContextText) != baselineSamplingContextText { return true }
+        if t(samplingMaxTokensText) != baselineSamplingMaxTokensText { return true }
+        if t(samplingTemperatureText) != baselineSamplingTemperatureText { return true }
+        if t(samplingTopPText) != baselineSamplingTopPText { return true }
+        if t(samplingTopKText) != baselineSamplingTopKText { return true }
+        if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
+        if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        return hasPendingStorageChanges(services: services)
     }
 
-    func saveSamplingTemperature() {
-        guard let v = Double(samplingTemperatureText.trimmingCharacters(in: .whitespaces)),
-              v >= 0, v <= 2 else {
-            self.lastError = String(localized: "server.error.temperature_invalid",
-                                    defaultValue: "Temperature must be a number in [0, 2].",
-                                    comment: "Server screen error when Temperature input is out of range")
+    /// Page-wide Apply. Validates every dirty Apply-managed field upfront
+    /// (bail loudly on bad input — no partial patches), bundles the
+    /// non-storage changes into a single `GlobalSettingsPatch`, then runs
+    /// the storage move flow if needed. Storage moves restart the server,
+    /// which picks up the new port from settings.json that we PATCHed
+    /// first — so we only invoke `applyServerEndpoint` for port-only
+    /// changes.
+    func applyServerSettings(services: AppServices) {
+        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
+        var patch = GlobalSettingsPatch()
+        var nextPort: Int? = nil
+
+        if t(portText) != baselinePortText {
+            guard let p = Int(t(portText)), (1...65535).contains(p) else {
+                self.lastError = String(localized: "server.error.port_invalid",
+                                        defaultValue: "Port must be a number between 1 and 65535.",
+                                        comment: "Server screen error when port value is out of valid range")
+                return
+            }
+            patch.port = p
+            nextPort = p
+        }
+        if t(samplingContextText) != baselineSamplingContextText {
+            guard let n = Int(t(samplingContextText)), n > 0 else {
+                self.lastError = String(localized: "server.error.context_window_invalid",
+                                        defaultValue: "Context Window must be a positive integer.",
+                                        comment: "Server screen error when Context Window input is invalid")
+                return
+            }
+            patch.samplingMaxContextWindow = n
+        }
+        if t(samplingMaxTokensText) != baselineSamplingMaxTokensText {
+            guard let n = Int(t(samplingMaxTokensText)), n > 0 else {
+                self.lastError = String(localized: "server.error.max_tokens_invalid",
+                                        defaultValue: "Max Tokens must be a positive integer.",
+                                        comment: "Server screen error when Max Tokens input is invalid")
+                return
+            }
+            patch.samplingMaxTokens = n
+        }
+        if t(samplingTemperatureText) != baselineSamplingTemperatureText {
+            guard let v = Double(t(samplingTemperatureText)), v >= 0, v <= 2 else {
+                self.lastError = String(localized: "server.error.temperature_invalid",
+                                        defaultValue: "Temperature must be a number in [0, 2].",
+                                        comment: "Server screen error when Temperature input is out of range")
+                return
+            }
+            patch.samplingTemperature = v
+        }
+        if t(samplingTopPText) != baselineSamplingTopPText {
+            guard let v = Double(t(samplingTopPText)), v >= 0, v <= 1 else {
+                self.lastError = String(localized: "server.error.top_p_invalid",
+                                        defaultValue: "Top P must be a number in [0, 1].",
+                                        comment: "Server screen error when Top P input is out of range")
+                return
+            }
+            patch.samplingTopP = v
+        }
+        if t(samplingTopKText) != baselineSamplingTopKText {
+            guard let n = Int(t(samplingTopKText)), n >= 0 else {
+                self.lastError = String(localized: "server.error.top_k_invalid",
+                                        defaultValue: "Top K must be ≥ 0.",
+                                        comment: "Server screen error when Top K input is negative or not a number")
+                return
+            }
+            patch.samplingTopK = n
+        }
+        if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText {
+            guard let v = Double(t(samplingRepetitionPenaltyText)), v >= 0 else {
+                self.lastError = String(localized: "server.error.repetition_penalty_invalid",
+                                        defaultValue: "Repetition Penalty must be a non-negative number.",
+                                        comment: "Server screen error when Repetition Penalty is invalid")
+                return
+            }
+            patch.samplingRepetitionPenalty = v
+        }
+
+        let newAliases = parseAliases(serverAliasesText)
+        if newAliases != parseAliases(baselineServerAliasesText) {
+            patch.serverAliases = newAliases
+        }
+
+        let diff = storageDiff(services: services)
+        if diff.baseChanged && diff.normalizedBase.isEmpty {
+            self.lastError = String(localized: "server.error.base_path_empty",
+                                    defaultValue: "Base path cannot be empty.",
+                                    comment: "Server screen error when Base Path is empty on Apply")
             return
         }
-        Task { await commit(GlobalSettingsPatch(samplingTemperature: v)) }
+        if diff.dirChanged && diff.normalizedModelDir.isEmpty {
+            self.lastError = String(localized: "server.error.models_dir_empty",
+                                    defaultValue: "Models Directory cannot be empty.",
+                                    comment: "Server screen error when Models Directory is empty on Apply")
+            return
+        }
+
+        let patchHasFields = patch.port != nil
+            || patch.samplingMaxContextWindow != nil
+            || patch.samplingMaxTokens != nil
+            || patch.samplingTemperature != nil
+            || patch.samplingTopP != nil
+            || patch.samplingTopK != nil
+            || patch.samplingRepetitionPenalty != nil
+            || patch.serverAliases != nil
+
+        if !patchHasFields && !diff.hasChanges {
+            self.lastError = String(localized: "server.error.nothing_to_apply",
+                                    defaultValue: "Nothing to apply — every field matches the current config.",
+                                    comment: "Server screen error when Apply is tapped with no pending changes")
+            return
+        }
+
+        if diff.hasChanges { isMovingBasePath = true }
+        Task {
+            defer {
+                Task { @MainActor in
+                    if self.isMovingBasePath { self.isMovingBasePath = false }
+                }
+            }
+            do {
+                if patchHasFields, let client {
+                    _ = try await client.updateGlobalSettings(patch)
+                }
+                if diff.hasChanges {
+                    try await services.applyStorageChanges(
+                        basePath: diff.baseChanged ? diff.normalizedBase : nil,
+                        modelDir: diff.dirChanged ? diff.normalizedModelDir : nil
+                    )
+                    self.basePathText = services.config.basePath
+                    self.modelDirText = services.config.modelDir
+                    if let p = nextPort { self.effectivePort = p }
+                } else if let p = nextPort {
+                    try await services.applyServerEndpoint(port: p)
+                    self.effectivePort = p
+                }
+                self.lastError = nil
+                self.snapshotApplyBaselines()
+            } catch {
+                self.lastError = error.omlxDescription
+            }
+        }
     }
 
-    func saveSamplingTopP() {
-        guard let v = Double(samplingTopPText.trimmingCharacters(in: .whitespaces)),
-              v >= 0, v <= 1 else {
-            self.lastError = String(localized: "server.error.top_p_invalid",
-                                    defaultValue: "Top P must be a number in [0, 1].",
-                                    comment: "Server screen error when Top P input is out of range")
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(samplingTopP: v)) }
-    }
-
-    func saveSamplingTopK() {
-        guard let n = Int(samplingTopKText.trimmingCharacters(in: .whitespaces)), n >= 0 else {
-            self.lastError = String(localized: "server.error.top_k_invalid",
-                                    defaultValue: "Top K must be ≥ 0.",
-                                    comment: "Server screen error when Top K input is negative or not a number")
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(samplingTopK: n)) }
-    }
-
-    func saveSamplingRepetitionPenalty() {
-        guard let v = Double(samplingRepetitionPenaltyText.trimmingCharacters(in: .whitespaces)),
-              v >= 0 else {
-            self.lastError = String(localized: "server.error.repetition_penalty_invalid",
-                                    defaultValue: "Repetition Penalty must be a non-negative number.",
-                                    comment: "Server screen error when Repetition Penalty is invalid")
-            return
-        }
-        Task { await commit(GlobalSettingsPatch(samplingRepetitionPenalty: v)) }
+    /// Parse the comma-separated aliases text into a dedupe-preserving list.
+    /// Used both to build the outbound patch and to diff drafts against the
+    /// saved baseline (which is also parsed before compare so reordering /
+    /// whitespace-only edits don't false-trigger Apply).
+    private func parseAliases(_ text: String) -> [String] {
+        let parts = text
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var seen = Set<String>()
+        return parts.filter { seen.insert($0).inserted }
     }
 
     /// Format a double for an editable field: `1.0` → `"1.0"`, `0.95` →
@@ -835,78 +968,11 @@ final class ServerScreenVM: ObservableObject {
         }
     }
 
-    func savePort(services: AppServices) {
-        guard let port = Int(portText.trimmingCharacters(in: .whitespaces)),
-              (1...65535).contains(port) else {
-            self.lastError = String(localized: "server.error.port_invalid",
-                                    defaultValue: "Port must be a number between 1 and 65535.",
-                                    comment: "Server screen error when port value is out of valid range")
-            return
-        }
-        // Patch settings.json on the running server first so its persisted
-        // GlobalSettings stays consistent with the next bind, then bounce
-        // the parent's ServerProcess on the new port.
-        Task {
-            await commit(GlobalSettingsPatch(port: port))
-            do {
-                try await services.applyServerEndpoint(port: port)
-                self.effectivePort = port
-            } catch {
-                self.lastError = error.omlxDescription
-            }
-        }
-    }
-
     /// True when either Storage text field differs from the current config.
     /// Drives the Apply button's `disabled` state so we don't bounce the
     /// server for an idempotent click.
     func hasPendingStorageChanges(services: AppServices) -> Bool {
         storageDiff(services: services).hasChanges
-    }
-
-    /// Apply the Storage text fields. Restart only fires when at least one
-    /// of basePath / modelDir has actually changed; matching values are
-    /// no-ops and reach the user as a `sameAsCurrent` error rather than a
-    /// silent bounce.
-    func applyStorage(services: AppServices) {
-        let diff = storageDiff(services: services)
-
-        if !diff.baseChanged && !diff.dirChanged {
-            self.lastError = String(localized: "server.error.nothing_to_apply",
-                                    defaultValue: "Nothing to apply — both fields match the current config.",
-                                    comment: "Server screen error when Apply is tapped with no pending changes")
-            return
-        }
-        if diff.baseChanged && diff.normalizedBase.isEmpty {
-            self.lastError = String(localized: "server.error.base_path_empty",
-                                    defaultValue: "Base path cannot be empty.",
-                                    comment: "Server screen error when Base Path is empty on Apply")
-            return
-        }
-        if diff.dirChanged && diff.normalizedModelDir.isEmpty {
-            self.lastError = String(localized: "server.error.models_dir_empty",
-                                    defaultValue: "Models Directory cannot be empty.",
-                                    comment: "Server screen error when Models Directory is empty on Apply")
-            return
-        }
-
-        isMovingBasePath = true
-        Task {
-            defer { Task { @MainActor in self.isMovingBasePath = false } }
-            do {
-                try await services.applyStorageChanges(
-                    basePath: diff.baseChanged ? diff.normalizedBase : nil,
-                    modelDir: diff.dirChanged ? diff.normalizedModelDir : nil
-                )
-                // Echo the now-applied values back so the Apply button
-                // disables itself.
-                self.basePathText = services.config.basePath
-                self.modelDirText = services.config.modelDir
-                self.lastError = nil
-            } catch {
-                self.lastError = error.omlxDescription
-            }
-        }
     }
 
     /// Computed diff against `services.config`, with tilde expansion + path
@@ -994,21 +1060,6 @@ final class ServerScreenVM: ObservableObject {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
-    }
-
-    /// Parses the comma-separated text into a deduped, trimmed `[String]`
-    /// and pushes the patch. Empty input sends `[]`, which clears all
-    /// aliases on the server. Server treats a `null` field as "leave
-    /// alone" — we never want that here since we mean "this is the new
-    /// list" — so we always send an array even when empty.
-    func saveServerAliases() {
-        let parts = serverAliasesText
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        var seen = Set<String>()
-        let aliases = parts.filter { seen.insert($0).inserted }
-        Task { await commit(GlobalSettingsPatch(serverAliases: aliases)) }
     }
 
     /// Build a `Binding` that calls `save` after the value changes. Used for

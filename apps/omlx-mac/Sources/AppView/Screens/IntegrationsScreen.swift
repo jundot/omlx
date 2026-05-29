@@ -142,9 +142,22 @@ private struct ClaudeCodeSection: View {
                         suffix: "tk",
                         width: 130
                     )
-                    .onSubmit { Task { await vm.save(.targetContextSize, client: client) } }
                 }
             }
+        }
+        if vm.contextScaling {
+            HStack {
+                Spacer()
+                Button(String(localized: "integrations.target_context.apply",
+                              defaultValue: "Apply",
+                              comment: "Apply button for the Claude Code target context size field")) {
+                    Task { await vm.save(.targetContextSize, client: client) }
+                }
+                .buttonStyle(.omlx(.primary))
+                .disabled(!vm.hasPendingContextSizeChange)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 6)
         }
     }
 }
@@ -489,6 +502,11 @@ final class IntegrationsScreenVM: ObservableObject {
     /// user can type/clear without intermediate parse errors and we validate
     /// on save.
     @Published var targetContextSizeText: String = "200000"
+    /// Last value persisted to the server. Drives the per-section Apply
+    /// button under Target Context Size — diverges from
+    /// `targetContextSizeText` whenever the user has unsaved edits,
+    /// converges on a successful save. Mirrors `mcpConfigLoaded` below.
+    @Published private(set) var targetContextSizeLoaded: String = "200000"
 
     // Other integrations
     @Published var codexModel: String = ""
@@ -585,6 +603,13 @@ final class IntegrationsScreenVM: ObservableObject {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
     }
 
+    /// True when the Target Context Size draft diverges from the saved
+    /// baseline. The per-section Apply button under that field uses this
+    /// to gate its `disabled` state.
+    var hasPendingContextSizeChange: Bool {
+        targetContextSizeText.trimmingCharacters(in: .whitespaces) != targetContextSizeLoaded
+    }
+
     func bind<T: Equatable>(
         _ binding: Binding<T>,
         save: @escaping () -> Void
@@ -610,7 +635,9 @@ final class IntegrationsScreenVM: ObservableObject {
                 self.haikuModel      = cc.haikuModel ?? ""
                 self.contextScaling  = cc.contextScalingEnabled ?? false
                 if let target = cc.targetContextSize {
-                    self.targetContextSizeText = String(target)
+                    let s = String(target)
+                    self.targetContextSizeText = s
+                    self.targetContextSizeLoaded = s
                 }
             }
             if let it = settings.integrations {
@@ -679,8 +706,13 @@ final class IntegrationsScreenVM: ObservableObject {
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
-            if case .mcpConfig = field {
+            switch field {
+            case .mcpConfig:
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+            case .targetContextSize:
+                self.targetContextSizeLoaded = targetContextSizeText.trimmingCharacters(in: .whitespaces)
+            default:
+                break
             }
         } catch {
             self.lastError = error.omlxDescription

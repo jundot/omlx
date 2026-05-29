@@ -333,9 +333,10 @@ final class AppServices: NSObject, ObservableObject {
     }
 
     /// Persist a new host/port to AppConfig, reconfigure the running server
-    /// process, and bounce it. Without this, ServerScreenVM.savePort would
-    /// only update the server's `settings.json`, but the next spawn still
-    /// uses the cached --host / --port arguments captured at app launch.
+    /// process, and bounce it. Without this, ServerScreenVM's port path in
+    /// `applyServerSettings` (and `saveHost` for Listen Address) would only
+    /// update the server's `settings.json`, but the next spawn still uses
+    /// the cached --host / --port arguments captured at app launch.
     ///
     /// The Python server is the canonical writer of `settings.json` while
     /// it's running — the caller already PATCHed it before us, so we don't
