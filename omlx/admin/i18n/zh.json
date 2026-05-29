@@ -691,6 +691,8 @@
   "chat.error.invalid_image_type": "请选择图像文件",
   "chat.error.image_too_large": "图像大小不能超过 10MB",
   "chat.error.image_load_failed": "无法加载图片，请重试。",
+  "chat.allow_svg": "允许 SVG",
+  "chat.allow_svg_warning": "注意：可能注入恶意代码。",
   "js.error.required_fields": "以下必填字段不能为空：{fields}",
   "js.error.api_key_min_length": "API 密钥至少需要 4 个字符",
   "js.error.api_key_no_whitespace": "API 密钥不能包含空白字符",

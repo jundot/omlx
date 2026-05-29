@@ -691,6 +691,8 @@
   "chat.error.invalid_image_type": "画像ファイルを選択してください",
   "chat.error.image_too_large": "画像サイズは10MB以下にしてください",
   "chat.error.image_load_failed": "画像の読み込みに失敗しました。もう一度お試しください。",
+  "chat.allow_svg": "SVGを許可",
+  "chat.allow_svg_warning": "悪意のあるコード注入に注意してください。",
   "js.error.required_fields": "必須項目が空です: {fields}",
   "js.error.api_key_min_length": "APIキーは4文字以上必要です",
   "js.error.api_key_no_whitespace": "APIキーにスペースを含めることはできません",

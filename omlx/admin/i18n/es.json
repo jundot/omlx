@@ -691,6 +691,8 @@
   "chat.error.invalid_image_type": "Por favor selecciona un archivo de imagen",
   "chat.error.image_too_large": "El tamaño de la imagen debe ser menor a 10MB",
   "chat.error.image_load_failed": "Error al cargar la imagen. Por favor intenta de nuevo.",
+  "chat.allow_svg": "Permitir SVG",
+  "chat.allow_svg_warning": "Cuidado con la inyección de código malicioso.",
   "js.error.required_fields": "Los campos obligatorios no pueden estar vacíos: {fields}",
   "js.error.api_key_min_length": "La clave API debe tener al menos 4 caracteres",
   "js.error.api_key_no_whitespace": "La clave API no debe contener espacios",

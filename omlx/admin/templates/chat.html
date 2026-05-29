@@ -519,6 +519,63 @@
         height: auto;
     }
 
+    .svg-allow-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+    }
+
+    .svg-allow-label {
+        display: flex;
+        align-items: center;
+        gap: 0.375rem;
+        min-width: 0;
+        flex: 1;
+    }
+
+    .svg-allow-switch {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        width: 2rem;
+        height: 1.125rem;
+        flex-shrink: 0;
+        border: none;
+        border-radius: 9999px;
+        padding: 0;
+        cursor: pointer;
+        background: var(--border-normal);
+        transition: background-color 0.2s ease;
+    }
+
+    .svg-allow-switch.is-on {
+        background: var(--timeline-accent);
+    }
+
+    .svg-allow-switch-knob {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 0.875rem;
+        height: 0.875rem;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+        transition: transform 0.2s ease;
+    }
+
+    .svg-allow-switch.is-on .svg-allow-switch-knob {
+        transform: translateX(0.875rem);
+    }
+
+    .svg-allow-warning {
+        margin-top: 0.25rem;
+        font-size: 10px;
+        line-height: 1.35;
+        color: var(--text-tertiary);
+    }
+
     /* User message edit button */
     .user-message {
         position: relative;
@@ -1054,6 +1111,23 @@
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.admin_settings') }}
             </a>
+            <div class="svg-allow-setting px-2 py-1.5">
+                <div class="svg-allow-row">
+                    <div class="svg-allow-label">
+                        <i data-lucide="wand-sparkles" class="w-3 h-3 shrink-0" style="color: var(--text-tertiary);"></i>
+                        <span class="text-xs truncate" style="color: var(--text-tertiary);"
+                            x-text="window.t('chat.allow_svg')"></span>
+                    </div>
+                    <button type="button" role="switch" class="svg-allow-switch"
+                        :class="{ 'is-on': allowSvg }"
+                        :aria-checked="allowSvg ? 'true' : 'false'"
+                        :aria-label="window.t('chat.allow_svg')"
+                        @click="setAllowSvg(!allowSvg)">
+                        <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                    </button>
+                </div>
+                <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
+            </div>
             <!-- Theme Select -->
             <div class="relative w-full">
                 <div
@@ -1954,6 +2028,7 @@
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            allowSvg: localStorage.getItem('omlx-chat-allow-svg') === 'true',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
 
@@ -5517,6 +5592,28 @@
         stream.streamRenderState.stableText = '';
     },
 
+    setAllowSvg(enabled) {
+        this.allowSvg = !!enabled;
+        localStorage.setItem('omlx-chat-allow-svg', this.allowSvg ? 'true' : 'false');
+        this.refreshCodeBlockButtons();
+    },
+
+    refreshCodeBlockButtons() {
+        const container = document.getElementById('messagesContainer');
+        if (!container) return;
+
+        container.querySelectorAll('.svg-preview-container').forEach(preview => {
+            const wrapper = preview.parentElement;
+            const pre = wrapper?.querySelector('pre');
+            if (pre) pre.style.display = '';
+            const copyBtn = wrapper?.querySelector('.code-copy-btn');
+            if (copyBtn) copyBtn.style.display = '';
+            preview.remove();
+        });
+        container.querySelectorAll('.code-btn-row').forEach(row => row.remove());
+        this.addCodeCopyButtons(container);
+    },
+
     addCodeCopyButtons(root = null) {
         const container = root || document.getElementById('messagesContainer');
         if (!container) return;
@@ -5544,8 +5641,8 @@
             const btnRow = document.createElement('div');
             btnRow.className = 'code-btn-row';
 
-            // Create SVG render button (only for SVG blocks)
-            if (isSvg) {
+            // Create SVG render button (only for SVG blocks when allowed)
+            if (isSvg && this.allowSvg) {
                 const wandIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/></svg>';
                 const renderBtn = document.createElement('button');
                 renderBtn.className = 'svg-render-btn';

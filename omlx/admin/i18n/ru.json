@@ -691,6 +691,8 @@
   "chat.error.invalid_image_type": "Выберите файл изображения",
   "chat.error.image_too_large": "Размер изображения должен быть меньше 10 МБ",
   "chat.error.image_load_failed": "Не удалось загрузить изображение. Попробуйте еще раз.",
+  "chat.allow_svg": "Разрешить SVG",
+  "chat.allow_svg_warning": "Осторожно: возможно внедрение вредоносного кода.",
   "js.error.required_fields": "Обязательные поля не могут быть пустыми: {fields}",
   "js.error.api_key_min_length": "API-ключ должен содержать не менее 4 символов",
   "js.error.api_key_no_whitespace": "API-ключ не должен содержать пробелов",
