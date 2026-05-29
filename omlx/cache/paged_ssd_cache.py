@@ -765,8 +765,15 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache_total_bytes += entry_size
 
         # Flush evicted entries to SSD outside the hot cache lock
-        for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+        # Skip SSD write when hot_cache_only=True (evicted entries are discarded)
+        if not self._hot_cache_only:
+            for evicted_hash, evicted in evicted_entries:
+                self._enqueue_ssd_write(evicted_hash, evicted)
+        elif evicted_entries:
+            logger.debug(
+                f"Discarding {len(evicted_entries)} evicted blocks "
+                f"(hot_cache_only=True)"
+            )
 
     def _enqueue_ssd_write(
         self, block_hash: bytes, entry: dict, *, blocking: bool = False,
@@ -1362,6 +1369,10 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
+            # Materialize lazy arrays on the inference thread (Metal-safe).
+            if self._hot_cache_only and arrays:
+                mx.eval(*arrays.values())  # noqa: S307 — MLX tensor eval, not Python eval
+
             # Caller (scheduler._cleanup_finished, async store-cache path)
             # dispatches real KV arrays via mx.async_eval on the inference
             # thread's generation_stream before submitting to the
@@ -1413,6 +1424,21 @@ class PagedSSDCacheManager(CacheManager):
                 "block_metadata": block_metadata,
             }
 
+            if self._hot_cache_only:
+                # Hot cache only mode: store mx.array directly (not tensors_raw).
+                # This avoids memory doubling on cache hit - we reuse the same
+                # GPU memory instead of creating new mx.array objects.
+                cache_entry = {
+                    "arrays": arrays,
+                    "file_metadata": metadata,
+                    "num_layers": len(cache_data),
+                    "layer_cache_types": layer_cache_types,
+                    "block_metadata": block_metadata,
+                }
+                self._hot_cache_put(block_hash, cache_entry)
+                self._stats["saves"] += 1
+                return True
+
             if self._hot_cache_enabled:
                 # Write-back mode: store only in hot cache, no SSD index entry.
                 # SSD index entry is created later when block is evicted or
@@ -1420,10 +1446,6 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache_put(block_hash, cache_entry)
                 self._stats["saves"] += 1
                 return True
-
-            if self._hot_cache_only:
-                # Hot cache disabled but hot_cache_only set: block is not retained.
-                return False
 
             # SSD path: add to index for SSD file tracking
             self._index.add(block_metadata)
@@ -1701,18 +1723,24 @@ class PagedSSDCacheManager(CacheManager):
         # Check hot cache first (in-memory, no I/O)
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
-            # Entries from _promote_to_hot_cache() store mx.array objects directly
-            # (safe — they come from SSD loads, not active inference).
-            # Entries from save_block() use tensors_raw (raw bytes).
-            arrays = entry.get("arrays") or self._arrays_from_tensors_raw(
-                entry["tensors_raw"]
-            )
-            cache_data = self._reconstruct_cache_data(
-                arrays,
-                entry["file_metadata"],
-                entry["num_layers"],
-                entry["layer_cache_types"],
-            )
+            # Check for "arrays" first (direct mx.array storage).
+            # This is the fast path for hot_cache_only mode.
+            if "arrays" in entry:
+                cache_data = self._reconstruct_cache_data(
+                    entry["arrays"],
+                    entry["file_metadata"],
+                    entry["num_layers"],
+                    entry["layer_cache_types"],
+                )
+            else:
+                # Fallback: tensors_raw path
+                arrays = self._arrays_from_tensors_raw(entry["tensors_raw"])
+                cache_data = self._reconstruct_cache_data(
+                    arrays,
+                    entry["file_metadata"],
+                    entry["num_layers"],
+                    entry["layer_cache_types"],
+                )
             if cache_data is not None:
                 self._index.touch(block_hash)
                 self._stats["loads"] += 1
@@ -1857,15 +1885,24 @@ class PagedSSDCacheManager(CacheManager):
         entry = self._hot_cache_get(block_hash)
         if entry is not None:
             blk_meta = entry["block_metadata"]
-            arrays = entry.get("arrays") or self._arrays_from_tensors_raw(
-                entry["tensors_raw"]
-            )
-            cache_data = self._reconstruct_cache_data(
-                arrays,
-                entry["file_metadata"],
-                entry["num_layers"],
-                entry["layer_cache_types"],
-            )
+            # Check for "arrays" first (direct mx.array storage)
+            # This is the fast path for hot_cache_only mode.
+            if "arrays" in entry:
+                cache_data = self._reconstruct_cache_data(
+                    entry["arrays"],
+                    entry["file_metadata"],
+                    entry["num_layers"],
+                    entry["layer_cache_types"],
+                )
+            else:
+                # Fallback: tensors_raw path
+                arrays = self._arrays_from_tensors_raw(entry["tensors_raw"])
+                cache_data = self._reconstruct_cache_data(
+                    arrays,
+                    entry["file_metadata"],
+                    entry["num_layers"],
+                    entry["layer_cache_types"],
+                )
             if cache_data is None:
                 return None, None
 

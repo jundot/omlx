@@ -947,11 +947,9 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                     )
                 elif cache_type_name == "RotatingKVCache":
-                    # RotatingKVCache: last-block-only or boundary-snapshot strategy
-                    has_valid_state = is_last_block or (
-                        snapshot_cache_data is not None
-                        and layer_idx < len(snapshot_cache_data)
-                    )
+                    # RotatingKVCache: Always store actual data for all blocks.
+                    # This enables walk-back during restore without boundary snapshots.
+                    has_valid_state = True
                     if has_valid_state:
                         # Use snapshot state if available, otherwise use main state
                         if (
@@ -1100,15 +1098,10 @@ class BlockAwarePrefixCache(CacheManager):
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 else:
                     # Other non-sliceable cache (ArraysCache/MambaCache)
-                    # GDN recurrent state summarizes the ENTIRE sequence in a
-                    # fixed-size matrix. Each block boundary snapshot captures
-                    # the state at that point in the sequence. Without a snapshot,
-                    # non-last blocks get a placeholder so partial matches are
-                    # detected and rejected during reconstruction.
-                    has_valid_state = is_last_block or (
-                        snapshot_cache_data is not None
-                        and layer_idx < len(snapshot_cache_data)
-                    )
+                    # GDN recurrent state summarizes the ENTIRE sequence.
+                    # Always store actual data for all blocks to enable walk-back
+                    # during restore without boundary snapshots.
+                    has_valid_state = True
                     if has_valid_state:
                         # Use snapshot state if available, otherwise main state
                         if (
@@ -1908,19 +1901,18 @@ class BlockAwarePrefixCache(CacheManager):
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
                             tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
+                        # Keep TurboQuantKVCache in quantized form to avoid memory doubling.
                         # TQ will be re-applied at decode start (lazy quantization).
+                        # This avoids the dequantize() step which creates FP16 copy.
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
                         _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+
+                        # Use TurboQuantKVCache directly without dequantizing
+                        # This keeps memory at quantized level (vs 16-bit)
+                        reconstructed_caches.append(tq)
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"

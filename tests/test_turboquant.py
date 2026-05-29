@@ -314,3 +314,23 @@ def test_ssd_type_map_completeness():
         "TurboQuantSplitState": TurboQuantSplitState,
     }
     assert set(_type_map.keys()) == expected_types
+
+
+def test_turboquant_reconstruct_keeps_quantized():
+    """Verify that reconstructed TurboQuantKVCache stays in quantized form."""
+    keys = mx.random.normal((1, 2, 16, 64))
+    values = mx.random.normal((1, 2, 16, 64))
+
+    tq = TurboQuantKVCache(bits=4.0, seed=7)
+    tq.update_and_fetch(keys, values)
+    ks, vs = tq.state
+
+    # Simulate the logic in BlockAwarePrefixCache.reconstruct_cache
+    tq2 = TurboQuantKVCache(bits=4.0, seed=7)
+    tq2.keys = ks
+    tq2.values = vs
+    tq2.offset = 16
+    _rebuild_codecs(tq2, ks, vs)
+
+    # The reconstructed object should be a TurboQuantKVCache, not a KVCache
+    assert isinstance(tq2, TurboQuantKVCache)

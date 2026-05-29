@@ -642,6 +642,81 @@ class TestPagedSSDCacheManagerWithMLX:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
 
+    def test_save_block_hot_cache_only_arrays_vs_tensors_raw(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Contrast storage format between hot_cache_only=True and False."""
+        mx = mock_mlx
+        block_hash = b"format_contrast_hash"
+        cache_data = [(mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))]
+
+        # Case 1: hot_cache_only = True (should store as 'arrays')
+        mgr_true = PagedSSDCacheManager(
+            cache_dir=tmp_path / "cache_true",
+            max_size_bytes=1024**3,
+            hot_cache_only=True,
+        )
+        mgr_true.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+        entry_true = mgr_true._hot_cache_get(block_hash)
+        assert entry_true is not None
+        assert "arrays" in entry_true
+        assert "tensors_raw" not in entry_true
+        mgr_true.close()
+
+        # Case 2: hot_cache_only = False (should store as 'tensors_raw')
+        mgr_false = PagedSSDCacheManager(
+            cache_dir=tmp_path / "cache_false",
+            max_size_bytes=1024**3,
+            hot_cache_only=False,
+        )
+        mgr_false.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+        entry_false = mgr_false._hot_cache_get(block_hash)
+        assert entry_false is not None
+        assert "tensors_raw" in entry_false
+        assert "arrays" not in entry_false
+        mgr_false.close()
+
+    def test_load_block_arrays_vs_tensors_raw_path(self, tmp_path: Path, mock_mlx):
+        """Contrast load paths: fast path (arrays) vs fallback (tensors_raw)."""
+        mx = mock_mlx
+        block_hash = b"load_path_contrast"
+        cache_data = [(mx.zeros((1, 4, 16, 16)), mx.zeros((1, 4, 16, 16)))]
+
+        # 1. Test Fast Path (hot_cache_only=True)
+        mgr_true = PagedSSDCacheManager(
+            cache_dir=tmp_path / "load_true",
+            max_size_bytes=1024**3,
+            hot_cache_only=True,
+        )
+        mgr_true.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+
+        # We can verify the fast path by mocking _arrays_from_tensors_raw and seeing it's NOT called
+        with patch.object(
+            PagedSSDCacheManager, "_arrays_from_tensors_raw"
+        ) as mock_fallback:
+            loaded = mgr_true.load_block(block_hash)
+            assert loaded is not None
+            mock_fallback.assert_not_called()
+        mgr_true.close()
+
+        # 2. Test Fallback Path (hot_cache_only=False)
+        mgr_false = PagedSSDCacheManager(
+            cache_dir=tmp_path / "load_false",
+            max_size_bytes=1024**3,
+            hot_cache_only=False,
+        )
+        mgr_false.save_block(block_hash, cache_data, 16, layer_cache_types=["KVCache"])
+
+        with patch.object(
+            PagedSSDCacheManager,
+            "_arrays_from_tensors_raw",
+            wraps=mgr_false._arrays_from_tensors_raw,
+        ) as mock_fallback:
+            loaded = mgr_false.load_block(block_hash)
+            assert loaded is not None
+            mock_fallback.assert_called()
+        mgr_false.close()
+
     def test_load_block_with_metadata(self, tmp_path: Path, mock_mlx):
         """Test loading block with metadata."""
         mx = mock_mlx

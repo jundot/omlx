@@ -305,10 +305,10 @@ class TestExtractBlockTensorSliceLastBlock:
         keys0, values0 = result[0]
         assert keys0.shape == (1, 8, 4, 64)
 
-        # RotatingKVCache layer: placeholder
+        # RotatingKVCache layer: full state (always stored to enable walk-back)
         keys1, values1 = result[1]
-        assert keys1.shape == (1,)
-        assert values1.shape == (1,)
+        assert keys1.shape == (1, 8, 256, 64)
+        assert values1.shape == (1, 8, 256, 64)
 
     def test_rotating_last_block_full_state(self, prefix_cache):
         """Test RotatingKVCache last block stores full state."""
@@ -349,15 +349,15 @@ class TestExtractBlockTensorSliceLastBlock:
         )
         assert block0 is not None
         assert block0[0][0].shape == (1, 8, 4, 64)  # KVCache slice
-        assert block0[1][0].shape == (1,)  # RotatingKVCache placeholder
+        assert block0[1][0].shape == (1, 8, 256, 64)  # RotatingKVCache full state
 
-        # Block 1 (non-last): KVCache sliced, RotatingKVCache placeholder
+        # Block 1 (non-last): KVCache sliced, RotatingKVCache full state
         block1 = prefix_cache._extract_block_tensor_slice(
             cache_data, 4, 8, model_cache_config=config, is_last_block=False
         )
         assert block1 is not None
         assert block1[0][0].shape == (1, 8, 4, 64)
-        assert block1[1][0].shape == (1,)
+        assert block1[1][0].shape == (1, 8, 256, 64)
 
         # Block 3 (last): KVCache sliced, RotatingKVCache full state
         block3 = prefix_cache._extract_block_tensor_slice(

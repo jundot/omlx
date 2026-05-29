@@ -1792,7 +1792,8 @@ class Scheduler:
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (
-            block_size > 0
+            not self.config.hot_cache_only
+            and block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
@@ -5630,6 +5631,17 @@ class Scheduler:
                                 f"{len(request.prompt_token_ids)} prompt + "
                                 f"{len(request.output_token_ids)} output)"
                             )
+                            # Immediately release _extracted_cache to free copy #1
+                            # (store_cache already cloned to PagedCache blocks)
+                            request._extracted_cache = None
+
+                            # Clear boundary snapshots for this request after store to prevent memory leak.
+                            # Boundary snapshots were needed for proper block storage but are no longer needed.
+                            if request_id in self._boundary_cache_snapshots:
+                                del self._boundary_cache_snapshots[request_id]
+                                logger.debug(
+                                    f"Cleared boundary snapshots for request {request_id}"
+                                )
                         except Exception as e:
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
