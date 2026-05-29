@@ -54,6 +54,31 @@ def _has_cli_overrides(args) -> bool:
     return False
 
 
+def _resolve_ssd_cache_max_size_bytes(size: str, cache_dir: str) -> int:
+    """Resolve a CLI SSD cache size through the central settings validator."""
+    from pathlib import Path
+
+    from .config import parse_size
+    from .settings import (
+        SSD_CACHE_SIZE_AUTO,
+        get_ssd_capacity,
+        normalize_ssd_cache_max_size,
+    )
+
+    normalized = normalize_ssd_cache_max_size(size)
+    if normalized == SSD_CACHE_SIZE_AUTO:
+        return int(get_ssd_capacity(Path(cache_dir)) * 0.1)
+    return parse_size(normalized)
+
+
+def _resolve_hot_cache_max_size_bytes(size: str) -> int:
+    """Resolve a CLI hot-cache size through the central settings validator."""
+    from .config import parse_size
+    from .settings import normalize_hot_cache_max_size
+
+    return parse_size(normalize_hot_cache_max_size(size))
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -167,7 +192,6 @@ def serve_command(args):
 
     # Import server and config
     from .server import app, init_server
-    from .config import parse_size
 
     model_dirs = settings.model.get_model_dirs(settings.base_path)
     print(f"Base path: {settings.base_path}")
@@ -202,8 +226,14 @@ def serve_command(args):
     # Determine cache max size: CLI arg > settings (with auto resolution)
     if paged_ssd_cache_dir:
         if args.paged_ssd_cache_max_size:
-            # CLI argument specified explicitly
-            cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
+            try:
+                cache_max_size_bytes = _resolve_ssd_cache_max_size_bytes(
+                    args.paged_ssd_cache_max_size,
+                    paged_ssd_cache_dir,
+                )
+            except ValueError as e:
+                print(f"Configuration error: {e}")
+                sys.exit(1)
         else:
             # Use settings value (handles "auto" -> 10% of SSD capacity)
             cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(settings.base_path)
@@ -215,7 +245,13 @@ def serve_command(args):
     # Hot cache: CLI arg > settings
     if paged_ssd_cache_dir:
         if args.hot_cache_max_size:
-            hot_cache_max_bytes = parse_size(args.hot_cache_max_size)
+            try:
+                hot_cache_max_bytes = _resolve_hot_cache_max_size_bytes(
+                    args.hot_cache_max_size
+                )
+            except ValueError as e:
+                print(f"Configuration error: {e}")
+                sys.exit(1)
         else:
             hot_cache_max_bytes = settings.cache.get_hot_cache_max_size_bytes()
         scheduler_config.hot_cache_max_size = hot_cache_max_bytes

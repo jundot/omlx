@@ -28,6 +28,8 @@ from omlx.settings import (
     get_ssd_capacity,
     get_system_memory,
     init_settings,
+    normalize_hot_cache_max_size,
+    normalize_ssd_cache_max_size,
     reset_settings,
 )
 
@@ -294,6 +296,51 @@ class TestCacheSettings:
         settings = CacheSettings(ssd_cache_max_size="100GB")
         base_path = Path("/tmp/omlx")
         assert settings.get_ssd_cache_max_size_bytes(base_path) == 100 * 1024**3
+
+    def test_normalize_ssd_cache_max_size_rejects_zero(self):
+        """Zero is not a disable sentinel for SSD cache size."""
+        with pytest.raises(ValueError, match="must be positive"):
+            normalize_ssd_cache_max_size("0GB")
+
+    def test_normalize_legacy_zero_ssd_cache_max_size_to_auto(self):
+        """Legacy persisted zero values recover to auto on load."""
+        assert (
+            normalize_ssd_cache_max_size("0GB", legacy_zero_to_auto=True)
+            == "auto"
+        )
+
+    def test_normalize_legacy_ssd_cache_max_size_rejects_negative(self):
+        """Only legacy zero values recover; negative sizes remain invalid."""
+        with pytest.raises(ValueError, match="must be positive"):
+            normalize_ssd_cache_max_size("-1GB", legacy_zero_to_auto=True)
+
+    def test_normalize_ssd_cache_max_size_rejects_non_finite(self):
+        """Non-finite sizes should surface as validation errors."""
+        with pytest.raises(ValueError, match="ssd_cache_max_size"):
+            normalize_ssd_cache_max_size("infGB")
+
+    def test_normalize_hot_cache_max_size_allows_zero(self):
+        """Hot cache uses zero as its disabled sentinel."""
+        assert normalize_hot_cache_max_size("0GB") == "0"
+        assert normalize_hot_cache_max_size("0") == "0"
+        assert normalize_hot_cache_max_size("8GB") == "8GB"
+
+    def test_normalize_hot_cache_max_size_rejects_auto(self):
+        """Hot cache auto is not a persisted size setting."""
+        with pytest.raises(ValueError, match="hot_cache_max_size"):
+            normalize_hot_cache_max_size("auto")
+
+    def test_normalize_hot_cache_max_size_rejects_non_finite(self):
+        """Non-finite hot cache sizes should surface as validation errors."""
+        with pytest.raises(ValueError, match="hot_cache_max_size"):
+            normalize_hot_cache_max_size("1e309GB")
+
+    def test_normalize_legacy_hot_cache_auto_to_disabled(self):
+        """Legacy hot cache auto values recover to the disabled sentinel."""
+        assert (
+            normalize_hot_cache_max_size("auto", legacy_auto_to_disabled=True)
+            == "0"
+        )
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
@@ -717,6 +764,67 @@ class TestGlobalSettings:
             assert settings.auth.api_key == "secret"
             assert settings.mcp.config_path == "/mcp.json"
 
+    def test_load_legacy_zero_ssd_cache_max_size_recovers_to_auto(self):
+        """Startup should recover from old settings.json files with 0GB."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "cache": {
+                            "enabled": True,
+                            "ssd_cache_max_size": "0GB",
+                        },
+                    }
+                )
+            )
+
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cache.ssd_cache_max_size == "auto"
+            assert settings.validate() == []
+
+    def test_load_negative_ssd_cache_max_size_stays_invalid(self):
+        """Startup recovery must not hide non-legacy invalid cache sizes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "cache": {
+                            "enabled": True,
+                            "ssd_cache_max_size": "-1GB",
+                        },
+                    }
+                )
+            )
+
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cache.ssd_cache_max_size == "-1GB"
+            errors = settings.validate()
+            assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+    def test_load_legacy_hot_cache_auto_recovers_to_disabled(self):
+        """Startup should recover from old settings.json files with hot auto."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": "1.0",
+                        "cache": {
+                            "enabled": True,
+                            "hot_cache_max_size": "auto",
+                        },
+                    }
+                )
+            )
+
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cache.hot_cache_max_size == "0"
+            assert settings.validate() == []
+
     def test_load_nonexistent_file_uses_defaults(self):
         """Test loading with no settings file uses defaults."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -940,6 +1048,16 @@ class TestGlobalSettings:
         settings.cache.ssd_cache_max_size = "not-a-size"
         errors = settings.validate()
         assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+        settings = GlobalSettings()
+        settings.cache.ssd_cache_max_size = "0GB"
+        errors = settings.validate()
+        assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+        settings = GlobalSettings()
+        settings.cache.hot_cache_max_size = "auto"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e.lower() for e in errors)
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""

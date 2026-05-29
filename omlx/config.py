@@ -9,6 +9,7 @@ This module provides unified configuration management with:
 - Default values with sensible defaults
 """
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,8 +40,10 @@ def parse_size(size_str: str) -> int:
         if size_str.endswith(unit):
             try:
                 value = float(size_str[: -len(unit)])
+                if not math.isfinite(value):
+                    raise ValueError
                 return int(value * multiplier)
-            except ValueError:
+            except (OverflowError, ValueError):
                 pass
 
     # Try parsing as plain number (bytes)
@@ -113,13 +116,26 @@ class PagedSSDCacheConfig:
 
     @property
     def max_size_bytes(self) -> int:
-        """Get max size in bytes."""
-        return parse_size(self.max_size)
+        """Get max size in bytes using the central settings semantics."""
+        from .settings import (
+            DEFAULT_BASE_PATH,
+            SSD_CACHE_SIZE_AUTO,
+            get_ssd_capacity,
+            normalize_ssd_cache_max_size,
+        )
+
+        normalized = normalize_ssd_cache_max_size(self.max_size)
+        if normalized == SSD_CACHE_SIZE_AUTO:
+            cache_dir = self.cache_dir or (DEFAULT_BASE_PATH / "cache")
+            return int(get_ssd_capacity(cache_dir) * 0.1)
+        return parse_size(normalized)
 
     @property
     def hot_cache_max_size_bytes(self) -> int:
         """Get hot cache max size in bytes. 0 means disabled."""
-        return parse_size(self.hot_cache_max_size)
+        from .settings import normalize_hot_cache_max_size
+
+        return parse_size(normalize_hot_cache_max_size(self.hot_cache_max_size))
 
 
 @dataclass

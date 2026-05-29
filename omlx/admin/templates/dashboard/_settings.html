@@ -425,7 +425,7 @@
                                         </p>
                                     </div>
                                     <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <input type="range" min="0" max="100" step="1"
+                                        <input type="range" min="1" max="100" step="1"
                                                x-model.number="cachePercent"
                                                @input="updateCacheFromSlider()"
                                                class="w-32 h-1.5 bg-neutral-200 rounded-full appearance-none cursor-pointer
@@ -443,7 +443,7 @@
                                                    @keydown.escape="editingCache = false"
                                                    x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
                                                    class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
+                                                   min="1"
                                                    step="1"><span class="text-neutral-400">GB)</span>
                                         </span>
                                     </div>

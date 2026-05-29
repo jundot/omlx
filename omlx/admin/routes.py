@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -33,7 +34,11 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import SubKeyEntry
+from ..settings import (
+    SubKeyEntry,
+    normalize_hot_cache_max_size,
+    normalize_ssd_cache_max_size,
+)
 from ..utils.release_check import select_latest_stable_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -603,6 +608,24 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     )
 
 
+def _validate_model_dirs_for_runtime(model_dirs: list[str]) -> None:
+    """Validate model directories before persisting a runtime change."""
+    for model_dir in model_dirs:
+        model_path = Path(model_dir).expanduser().resolve()
+        if not model_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to change model directories: "
+                f"Model directory does not exist: {model_dir}",
+            )
+        if not model_path.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to change model directories: "
+                f"Path is not a directory: {model_dir}",
+            )
+
+
 async def _reload_models() -> tuple[bool, str]:
     """
     Reload models: re-read model_settings.json, re-scan dirs, re-apply overrides,
@@ -693,6 +716,7 @@ async def _apply_cache_settings_runtime(
     ssd_cache_dir: str | None,
     ssd_cache_max_size: str | None,
     global_settings,
+    hot_cache_only: bool | None = None,
     hot_cache_max_size: str | None = None,
 ) -> tuple[bool, str]:
     """
@@ -712,6 +736,20 @@ async def _apply_cache_settings_runtime(
 
     pool = _server_state.engine_pool
 
+    effective_hot_cache_only = (
+        hot_cache_only
+        if hot_cache_only is not None
+        else global_settings.cache.hot_cache_only
+    )
+    old_hot_cache_only = getattr(pool._scheduler_config, "hot_cache_only", False)
+    pool._scheduler_config.hot_cache_only = effective_hot_cache_only
+    if effective_hot_cache_only != old_hot_cache_only:
+        logger.info(
+            "Hot-cache-only mode changed: %s -> %s",
+            old_hot_cache_only,
+            effective_hot_cache_only,
+        )
+
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
         pool._scheduler_config.paged_ssd_cache_dir = None
@@ -729,6 +767,7 @@ async def _apply_cache_settings_runtime(
             )
 
         if ssd_cache_max_size is not None:
+            ssd_cache_max_size = normalize_ssd_cache_max_size(ssd_cache_max_size)
             # Handle "auto" value
             if ssd_cache_max_size.lower() == "auto":
                 pool._scheduler_config.paged_ssd_cache_max_size = (
@@ -2786,6 +2825,223 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     }
 
 
+def _raise_global_settings_errors(errors: list[str]) -> None:
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail=errors[0] if len(errors) == 1 else errors,
+        )
+
+
+def _restore_global_settings_data(settings, snapshot) -> None:
+    """Restore settings data after a failed transactional update."""
+    for name, value in snapshot.__dict__.items():
+        setattr(settings, name, copy.deepcopy(value))
+
+
+def _clean_server_aliases(server_aliases: list[str]) -> list[str]:
+    from ..utils.network import is_valid_alias
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for alias in server_aliases:
+        if not isinstance(alias, str):
+            raise ValueError("Invalid server alias: each alias must be a string")
+        value = alias.strip()
+        if not value or value in seen:
+            continue
+        if not is_valid_alias(value):
+            raise ValueError(
+                f"Invalid server alias: {value!r} (must be a hostname or IP address)"
+            )
+        seen.add(value)
+        cleaned.append(value)
+    return cleaned
+
+
+def _apply_global_settings_data_patch(
+    settings,
+    request: GlobalSettingsRequest,
+    *,
+    server_aliases: list[str] | None,
+    ssd_cache_max_size: str | None,
+    hot_cache_max_size: str | None,
+) -> None:
+    """Apply the pure data portion of a global-settings patch."""
+    if request.host is not None:
+        settings.server.host = request.host
+    if request.port is not None:
+        settings.server.port = request.port
+    if request.log_level is not None:
+        settings.server.log_level = request.log_level
+    if request.sse_keepalive_mode is not None:
+        settings.server.sse_keepalive_mode = request.sse_keepalive_mode
+    if request.server_aliases is not None:
+        settings.server.server_aliases = server_aliases
+
+    if request.model_dirs is not None:
+        new_dirs = [d for d in request.model_dirs if d.strip()]
+        settings.model.model_dirs = new_dirs
+        settings.model.model_dir = new_dirs[0] if new_dirs else None
+    elif request.model_dir is not None:
+        settings.model.model_dirs = [request.model_dir]
+        settings.model.model_dir = request.model_dir
+    if request.model_fallback is not None:
+        settings.model.model_fallback = request.model_fallback
+
+    if request.memory_guard_tier is not None:
+        settings.memory.memory_guard_tier = request.memory_guard_tier
+    if request.memory_guard_custom_ceiling_gb is not None:
+        settings.memory.memory_guard_custom_ceiling_gb = float(
+            request.memory_guard_custom_ceiling_gb
+        )
+    if request.memory_prefill_memory_guard is not None:
+        settings.memory.prefill_memory_guard = request.memory_prefill_memory_guard
+
+    if request.max_concurrent_requests is not None:
+        settings.scheduler.max_concurrent_requests = request.max_concurrent_requests
+    if request.embedding_batch_size is not None:
+        settings.scheduler.embedding_batch_size = request.embedding_batch_size
+    if request.chunked_prefill is not None:
+        settings.scheduler.chunked_prefill = request.chunked_prefill
+
+    if request.cache_enabled is not None:
+        settings.cache.enabled = request.cache_enabled
+    if request.ssd_cache_dir is not None:
+        settings.cache.ssd_cache_dir = request.ssd_cache_dir
+    if request.ssd_cache_max_size is not None and ssd_cache_max_size is not None:
+        settings.cache.ssd_cache_max_size = ssd_cache_max_size
+    if request.hot_cache_only is not None:
+        settings.cache.hot_cache_only = request.hot_cache_only
+    if request.hot_cache_max_size is not None and hot_cache_max_size is not None:
+        settings.cache.hot_cache_max_size = hot_cache_max_size
+    if request.initial_cache_blocks is not None:
+        settings.cache.initial_cache_blocks = request.initial_cache_blocks
+
+    if request.mcp_config is not None:
+        settings.mcp.config_path = request.mcp_config if request.mcp_config else None
+    if request.hf_endpoint is not None:
+        settings.huggingface.endpoint = request.hf_endpoint
+    if request.ms_endpoint is not None:
+        settings.modelscope.endpoint = request.ms_endpoint
+    if request.network_http_proxy is not None:
+        settings.network.http_proxy = request.network_http_proxy
+    if request.network_https_proxy is not None:
+        settings.network.https_proxy = request.network_https_proxy
+    if request.network_no_proxy is not None:
+        settings.network.no_proxy = request.network_no_proxy
+    if request.network_ca_bundle is not None:
+        settings.network.ca_bundle = request.network_ca_bundle
+
+    if request.sampling_max_context_window is not None:
+        settings.sampling.max_context_window = request.sampling_max_context_window
+    if request.sampling_max_tokens is not None:
+        settings.sampling.max_tokens = request.sampling_max_tokens
+    if request.sampling_temperature is not None:
+        settings.sampling.temperature = request.sampling_temperature
+    if request.sampling_top_p is not None:
+        settings.sampling.top_p = request.sampling_top_p
+    if request.sampling_top_k is not None:
+        settings.sampling.top_k = request.sampling_top_k
+    if request.sampling_repetition_penalty is not None:
+        settings.sampling.repetition_penalty = request.sampling_repetition_penalty
+
+    if request.claude_code_context_scaling_enabled is not None:
+        settings.claude_code.context_scaling_enabled = (
+            request.claude_code_context_scaling_enabled
+        )
+    if request.claude_code_target_context_size is not None:
+        settings.claude_code.target_context_size = (
+            request.claude_code_target_context_size
+        )
+    if request.claude_code_mode is not None:
+        settings.claude_code.mode = request.claude_code_mode
+    if "claude_code_opus_model" in request.model_fields_set:
+        settings.claude_code.opus_model = request.claude_code_opus_model
+    if "claude_code_sonnet_model" in request.model_fields_set:
+        settings.claude_code.sonnet_model = request.claude_code_sonnet_model
+    if "claude_code_haiku_model" in request.model_fields_set:
+        settings.claude_code.haiku_model = request.claude_code_haiku_model
+
+    if "integrations_copilot_model" in request.model_fields_set:
+        settings.integrations.copilot_model = request.integrations_copilot_model
+    if "integrations_codex_model" in request.model_fields_set:
+        settings.integrations.codex_model = request.integrations_codex_model
+    if "integrations_opencode_model" in request.model_fields_set:
+        settings.integrations.opencode_model = request.integrations_opencode_model
+    if "integrations_openclaw_model" in request.model_fields_set:
+        settings.integrations.openclaw_model = request.integrations_openclaw_model
+    if "integrations_hermes_model" in request.model_fields_set:
+        settings.integrations.hermes_model = request.integrations_hermes_model
+    if "integrations_pi_model" in request.model_fields_set:
+        settings.integrations.pi_model = request.integrations_pi_model
+    if "integrations_openclaw_tools_profile" in request.model_fields_set:
+        settings.integrations.openclaw_tools_profile = (
+            request.integrations_openclaw_tools_profile
+        )
+
+    if request.ui_language is not None:
+        settings.ui.language = request.ui_language
+    if "idle_timeout_seconds" in request.model_fields_set:
+        settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
+    if request.skip_api_key_verification is not None:
+        settings.auth.skip_api_key_verification = request.skip_api_key_verification
+    if request.api_key is not None:
+        settings.auth.api_key = request.api_key
+
+
+def _preflight_global_settings_request(
+    global_settings,
+    request: GlobalSettingsRequest,
+) -> tuple[list[str] | None, str | None, str | None]:
+    """Validate a candidate settings object before mutating live state."""
+    errors: list[str] = []
+    cleaned_server_aliases: list[str] | None = None
+    if request.server_aliases is not None:
+        try:
+            cleaned_server_aliases = _clean_server_aliases(request.server_aliases)
+        except ValueError as e:
+            errors.append(str(e))
+
+    normalized_ssd_cache_max_size: str | None = None
+    if request.ssd_cache_max_size is not None:
+        try:
+            normalized_ssd_cache_max_size = normalize_ssd_cache_max_size(
+                request.ssd_cache_max_size
+            )
+        except ValueError as e:
+            errors.append(str(e))
+
+    normalized_hot_cache_max_size: str | None = None
+    if request.hot_cache_max_size is not None:
+        try:
+            normalized_hot_cache_max_size = normalize_hot_cache_max_size(
+                request.hot_cache_max_size
+            )
+        except ValueError as e:
+            errors.append(str(e))
+
+    candidate = copy.deepcopy(global_settings)
+    _apply_global_settings_data_patch(
+        candidate,
+        request,
+        server_aliases=cleaned_server_aliases,
+        ssd_cache_max_size=normalized_ssd_cache_max_size,
+        hot_cache_max_size=normalized_hot_cache_max_size,
+    )
+    errors.extend(candidate.validate())
+    if request.api_key is not None:
+        is_valid, error_msg = validate_api_key(request.api_key)
+        if not is_valid:
+            errors.append(error_msg)
+    _raise_global_settings_errors(errors)
+    return (
+        cleaned_server_aliases,
+        normalized_ssd_cache_max_size,
+        normalized_hot_cache_max_size,
+    )
+
+
 @router.post("/api/global-settings")
 async def update_global_settings(
     request: GlobalSettingsRequest,
@@ -2808,102 +3064,74 @@ async def update_global_settings(
         HTTPException: 401 if not authenticated, 503 if server not initialized,
                       400 if validation fails.
     """
-    from ..config import parse_size
-
     global_settings = _get_global_settings()
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    # Track which settings were applied at runtime
+    (
+        cleaned_server_aliases,
+        normalized_ssd_cache_max_size,
+        normalized_hot_cache_max_size,
+    ) = _preflight_global_settings_request(global_settings, request)
+    settings_snapshot = copy.deepcopy(global_settings)
+
     runtime_applied: list[str] = []
-    pending_embedding_batch_size: int | None = None
-    previous_embedding_batch_size: int | None = None
 
-    # Apply server settings
-    if request.host is not None:
-        global_settings.server.host = request.host
-    if request.port is not None:
-        global_settings.server.port = request.port
-    if request.log_level is not None:
-        global_settings.server.log_level = request.log_level
-        # Apply log level at runtime
-        _apply_log_level_runtime(request.log_level)
-        runtime_applied.append("log_level")
-    if request.sse_keepalive_mode is not None:
-        valid_modes = {"chunk", "comment", "off"}
-        if request.sse_keepalive_mode not in valid_modes:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid sse_keepalive_mode: {request.sse_keepalive_mode} "
-                f"(must be one of {sorted(valid_modes)})",
-            )
-        global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
-        runtime_applied.append("sse_keepalive_mode")
-
-    if request.server_aliases is not None:
-        from ..utils.network import is_valid_alias
-
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for alias in request.server_aliases:
-            if not isinstance(alias, str):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid server alias: each alias must be a string",
-                )
-            value = alias.strip()
-            if not value or value in seen:
-                continue
-            if not is_valid_alias(value):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid server alias: {value!r} (must be a hostname or IP address)",
-                )
-            seen.add(value)
-            cleaned.append(value)
-        global_settings.server.server_aliases = cleaned
-        runtime_applied.append("server_aliases")
-
-    # Apply model settings
     new_dirs = None
     if request.model_dirs is not None:
         new_dirs = [d for d in request.model_dirs if d.strip()]
     elif request.model_dir is not None:
         new_dirs = [request.model_dir]
+    old_dirs = list(global_settings.model.model_dirs)
+    if new_dirs is not None and new_dirs != old_dirs:
+        _validate_model_dirs_for_runtime(new_dirs)
 
-    if new_dirs is not None:
-        old_dirs = global_settings.model.model_dirs
-        if new_dirs != old_dirs:
-            success, msg = await _apply_model_dirs_runtime(new_dirs)
-            if success:
-                global_settings.model.model_dirs = new_dirs
-                global_settings.model.model_dir = new_dirs[0] if new_dirs else None
-                runtime_applied.append("model_dirs")
-                logger.info(msg)
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to change model directories: {msg}"
-                )
+    _apply_global_settings_data_patch(
+        global_settings,
+        request,
+        server_aliases=cleaned_server_aliases,
+        ssd_cache_max_size=normalized_ssd_cache_max_size,
+        hot_cache_max_size=normalized_hot_cache_max_size,
+    )
+
+    # Validate settings
+    errors = global_settings.validate()
+    if errors:
+        _restore_global_settings_data(global_settings, settings_snapshot)
+        raise HTTPException(status_code=400, detail=errors)
+
+    # Persist to file
+    try:
+        global_settings.save()
+    except Exception as e:
+        _restore_global_settings_data(global_settings, settings_snapshot)
+        raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    # Apply runtime effects only after persistence succeeds.
+    if request.log_level is not None:
+        _apply_log_level_runtime(global_settings.server.log_level)
+        runtime_applied.append("log_level")
+    if request.sse_keepalive_mode is not None:
+        runtime_applied.append("sse_keepalive_mode")
+    if request.server_aliases is not None:
+        runtime_applied.append("server_aliases")
+
+    if new_dirs is not None and new_dirs != old_dirs:
+        success, msg = await _apply_model_dirs_runtime(new_dirs)
+        if success:
+            runtime_applied.append("model_dirs")
+            logger.info(msg)
+        else:
+            logger.warning(f"Failed to apply model directories runtime: {msg}")
 
     if request.model_fallback is not None:
-        global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
 
-    # Apply memory guard tier + custom ceiling change (Live)
     if (
         request.memory_guard_tier is not None
         or request.memory_guard_custom_ceiling_gb is not None
     ):
-        if request.memory_guard_tier is not None:
-            global_settings.memory.memory_guard_tier = (
-                request.memory_guard_tier
-            )
-        if request.memory_guard_custom_ceiling_gb is not None:
-            global_settings.memory.memory_guard_custom_ceiling_gb = float(
-                request.memory_guard_custom_ceiling_gb
-            )
         try:
             success, msg = await _apply_memory_guard_tier_runtime(
                 tier=request.memory_guard_tier,
@@ -2917,84 +3145,58 @@ async def update_global_settings(
         except Exception as e:
             logger.warning(f"Error applying memory_guard_tier: {e}")
 
-    # Apply prefill memory guard setting (Live)
     if request.memory_prefill_memory_guard is not None:
-        global_settings.memory.prefill_memory_guard = (
-            request.memory_prefill_memory_guard
-        )
         from ..server import _server_state
 
         if _server_state.process_memory_enforcer is not None:
             _server_state.process_memory_enforcer.prefill_memory_guard = (
-                request.memory_prefill_memory_guard
+                global_settings.memory.prefill_memory_guard
             )
         runtime_applied.append("prefill_memory_guard")
         logger.info(
             f"Prefill memory guard "
-            f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
+            f"{'enabled' if global_settings.memory.prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
-    if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
-            request.max_concurrent_requests
-        )
-
-    # Apply embedding batch size setting (Live for loaded embedding engines)
-    if request.embedding_batch_size is not None:
-        if request.embedding_batch_size <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid embedding_batch_size: must be > 0",
-            )
-        pending_embedding_batch_size = request.embedding_batch_size
-
-    # Apply chunked prefill setting (Live)
     if request.chunked_prefill is not None:
-        global_settings.scheduler.chunked_prefill = request.chunked_prefill
         from ..server import _server_state
 
         pool = _server_state.engine_pool
         if pool is not None:
-            for mid, entry in pool._entries.items():
+            for _mid, entry in pool._entries.items():
                 if entry is None or entry.engine is None:
                     continue
                 async_core = getattr(entry.engine, "_engine", None)
-                core = getattr(async_core, "engine", None) if async_core is not None else None
-                scheduler = getattr(core, "scheduler", None) if core is not None else None
+                core = getattr(async_core, "engine", None) if async_core else None
+                scheduler = getattr(core, "scheduler", None) if core else None
                 if scheduler is not None and hasattr(scheduler, "config"):
-                    scheduler.config.chunked_prefill = request.chunked_prefill
+                    scheduler.config.chunked_prefill = (
+                        global_settings.scheduler.chunked_prefill
+                    )
         runtime_applied.append("chunked_prefill")
         logger.info(
-            f"Chunked prefill {'enabled' if request.chunked_prefill else 'disabled'}"
+            "Chunked prefill %s",
+            "enabled" if global_settings.scheduler.chunked_prefill else "disabled",
         )
 
-    # Apply cache settings
-    cache_changed = False
-    if request.cache_enabled is not None:
-        global_settings.cache.enabled = request.cache_enabled
-        cache_changed = True
-    if request.ssd_cache_dir is not None:
-        global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
-        cache_changed = True
-    if request.ssd_cache_max_size is not None:
-        global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
-        cache_changed = True
-    if request.hot_cache_only is not None:
-        global_settings.cache.hot_cache_only = request.hot_cache_only
-    if request.hot_cache_max_size is not None:
-        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
-        cache_changed = True
-    if request.initial_cache_blocks is not None:
-        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
-
+    cache_changed = any(
+        value is not None
+        for value in (
+            request.cache_enabled,
+            request.ssd_cache_dir,
+            request.ssd_cache_max_size,
+            request.hot_cache_only,
+            request.hot_cache_max_size,
+        )
+    )
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
             request.cache_enabled,
             request.ssd_cache_dir,
-            request.ssd_cache_max_size,
+            normalized_ssd_cache_max_size,
             global_settings,
-            hot_cache_max_size=request.hot_cache_max_size,
+            hot_cache_only=request.hot_cache_only,
+            hot_cache_max_size=normalized_hot_cache_max_size,
         )
         if success:
             runtime_applied.append("cache")
@@ -3002,103 +3204,76 @@ async def update_global_settings(
         else:
             logger.warning(f"Failed to apply cache settings runtime: {msg}")
 
-    # Apply MCP settings (restart required)
-    if request.mcp_config is not None:
-        global_settings.mcp.config_path = request.mcp_config if request.mcp_config else None
-
-    # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
-        global_settings.huggingface.endpoint = request.hf_endpoint
-        if request.hf_endpoint:
-            os.environ["HF_ENDPOINT"] = request.hf_endpoint
-        elif "HF_ENDPOINT" in os.environ:
-            del os.environ["HF_ENDPOINT"]
+        if global_settings.huggingface.endpoint:
+            os.environ["HF_ENDPOINT"] = global_settings.huggingface.endpoint
+        else:
+            os.environ.pop("HF_ENDPOINT", None)
         runtime_applied.append("hf_endpoint")
         logger.info(
-            f"HuggingFace endpoint updated to: "
-            f"{request.hf_endpoint or '(default)'}"
+            "HuggingFace endpoint updated to: %s",
+            global_settings.huggingface.endpoint or "(default)",
         )
 
-    # Apply ModelScope settings (Live - immediately applied via env var)
     if request.ms_endpoint is not None:
-        global_settings.modelscope.endpoint = request.ms_endpoint
-        if request.ms_endpoint:
-            os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
-        elif "MODELSCOPE_DOMAIN" in os.environ:
-            del os.environ["MODELSCOPE_DOMAIN"]
+        if global_settings.modelscope.endpoint:
+            os.environ["MODELSCOPE_DOMAIN"] = global_settings.modelscope.endpoint
+        else:
+            os.environ.pop("MODELSCOPE_DOMAIN", None)
         runtime_applied.append("ms_endpoint")
         logger.info(
-            f"ModelScope endpoint updated to: "
-            f"{request.ms_endpoint or '(default)'}"
+            "ModelScope endpoint updated to: %s",
+            global_settings.modelscope.endpoint or "(default)",
         )
 
-    # Apply network settings (Live - immediately applied via env vars)
-    network_changed = False
-    if request.network_http_proxy is not None:
-        global_settings.network.http_proxy = request.network_http_proxy
-        if request.network_http_proxy:
-            os.environ["HTTP_PROXY"] = request.network_http_proxy
-            os.environ["http_proxy"] = request.network_http_proxy
+    network_changed = any(
+        value is not None
+        for value in (
+            request.network_http_proxy,
+            request.network_https_proxy,
+            request.network_no_proxy,
+            request.network_ca_bundle,
+        )
+    )
+    if network_changed:
+        if global_settings.network.http_proxy:
+            os.environ["HTTP_PROXY"] = global_settings.network.http_proxy
+            os.environ["http_proxy"] = global_settings.network.http_proxy
         else:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("http_proxy", None)
-        network_changed = True
-
-    if request.network_https_proxy is not None:
-        global_settings.network.https_proxy = request.network_https_proxy
-        if request.network_https_proxy:
-            os.environ["HTTPS_PROXY"] = request.network_https_proxy
-            os.environ["https_proxy"] = request.network_https_proxy
+        if global_settings.network.https_proxy:
+            os.environ["HTTPS_PROXY"] = global_settings.network.https_proxy
+            os.environ["https_proxy"] = global_settings.network.https_proxy
         else:
             os.environ.pop("HTTPS_PROXY", None)
             os.environ.pop("https_proxy", None)
-        network_changed = True
-
-    if request.network_no_proxy is not None:
-        global_settings.network.no_proxy = request.network_no_proxy
-        if request.network_no_proxy:
-            os.environ["NO_PROXY"] = request.network_no_proxy
-            os.environ["no_proxy"] = request.network_no_proxy
+        if global_settings.network.no_proxy:
+            os.environ["NO_PROXY"] = global_settings.network.no_proxy
+            os.environ["no_proxy"] = global_settings.network.no_proxy
         else:
             os.environ.pop("NO_PROXY", None)
             os.environ.pop("no_proxy", None)
-        network_changed = True
-
-    if request.network_ca_bundle is not None:
-        global_settings.network.ca_bundle = request.network_ca_bundle
-        if request.network_ca_bundle:
-            os.environ["REQUESTS_CA_BUNDLE"] = request.network_ca_bundle
-            os.environ["SSL_CERT_FILE"] = request.network_ca_bundle
+        if global_settings.network.ca_bundle:
+            os.environ["REQUESTS_CA_BUNDLE"] = global_settings.network.ca_bundle
+            os.environ["SSL_CERT_FILE"] = global_settings.network.ca_bundle
         else:
             os.environ.pop("REQUESTS_CA_BUNDLE", None)
             os.environ.pop("SSL_CERT_FILE", None)
-        network_changed = True
-
-    if network_changed:
         runtime_applied.append("network")
         logger.info("Network settings updated")
 
-    # Apply sampling settings (Live - immediately applied)
-    sampling_changed = False
-    if request.sampling_max_context_window is not None:
-        global_settings.sampling.max_context_window = request.sampling_max_context_window
-        sampling_changed = True
-    if request.sampling_max_tokens is not None:
-        global_settings.sampling.max_tokens = request.sampling_max_tokens
-        sampling_changed = True
-    if request.sampling_temperature is not None:
-        global_settings.sampling.temperature = request.sampling_temperature
-        sampling_changed = True
-    if request.sampling_top_p is not None:
-        global_settings.sampling.top_p = request.sampling_top_p
-        sampling_changed = True
-    if request.sampling_top_k is not None:
-        global_settings.sampling.top_k = request.sampling_top_k
-        sampling_changed = True
-    if request.sampling_repetition_penalty is not None:
-        global_settings.sampling.repetition_penalty = request.sampling_repetition_penalty
-        sampling_changed = True
-
+    sampling_changed = any(
+        value is not None
+        for value in (
+            request.sampling_max_context_window,
+            request.sampling_max_tokens,
+            request.sampling_temperature,
+            request.sampling_top_p,
+            request.sampling_top_k,
+            request.sampling_repetition_penalty,
+        )
+    )
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
             request.sampling_max_context_window,
@@ -3112,35 +3287,17 @@ async def update_global_settings(
             runtime_applied.append("sampling")
             logger.info(msg)
 
-    # Apply Claude Code settings (Live - immediately applied)
-    claude_code_changed = False
-    if request.claude_code_context_scaling_enabled is not None:
-        global_settings.claude_code.context_scaling_enabled = (
-            request.claude_code_context_scaling_enabled
+    claude_code_changed = any(
+        field in request.model_fields_set
+        for field in (
+            "claude_code_context_scaling_enabled",
+            "claude_code_target_context_size",
+            "claude_code_mode",
+            "claude_code_opus_model",
+            "claude_code_sonnet_model",
+            "claude_code_haiku_model",
         )
-        claude_code_changed = True
-    if request.claude_code_target_context_size is not None:
-        global_settings.claude_code.target_context_size = (
-            request.claude_code_target_context_size
-        )
-        claude_code_changed = True
-    # mode: standard is-not-None check is correct — mode must never be null
-    if request.claude_code_mode is not None:
-        global_settings.claude_code.mode = request.claude_code_mode
-        claude_code_changed = True
-    # model fields: use model_fields_set to distinguish "field absent from POST body"
-    # from "field explicitly sent as null" — null must clear the field to None.
-    # DO NOT use `is not None` here: that would prevent clearing a model field to null.
-    if "claude_code_opus_model" in request.model_fields_set:
-        global_settings.claude_code.opus_model = request.claude_code_opus_model
-        claude_code_changed = True
-    if "claude_code_sonnet_model" in request.model_fields_set:
-        global_settings.claude_code.sonnet_model = request.claude_code_sonnet_model
-        claude_code_changed = True
-    if "claude_code_haiku_model" in request.model_fields_set:
-        global_settings.claude_code.haiku_model = request.claude_code_haiku_model
-        claude_code_changed = True
-
+    )
     if claude_code_changed:
         runtime_applied.append("claude_code")
         logger.info(
@@ -3153,36 +3310,18 @@ async def update_global_settings(
             f"haiku={global_settings.claude_code.haiku_model}"
         )
 
-    # Apply integrations settings (Live - immediately applied)
-    integrations_changed = False
-    if "integrations_copilot_model" in request.model_fields_set:
-        global_settings.integrations.copilot_model = request.integrations_copilot_model
-        integrations_changed = True
-    if "integrations_codex_model" in request.model_fields_set:
-        global_settings.integrations.codex_model = request.integrations_codex_model
-        integrations_changed = True
-    if "integrations_opencode_model" in request.model_fields_set:
-        global_settings.integrations.opencode_model = (
-            request.integrations_opencode_model
+    integrations_changed = any(
+        field in request.model_fields_set
+        for field in (
+            "integrations_copilot_model",
+            "integrations_codex_model",
+            "integrations_opencode_model",
+            "integrations_openclaw_model",
+            "integrations_hermes_model",
+            "integrations_pi_model",
+            "integrations_openclaw_tools_profile",
         )
-        integrations_changed = True
-    if "integrations_openclaw_model" in request.model_fields_set:
-        global_settings.integrations.openclaw_model = (
-            request.integrations_openclaw_model
-        )
-        integrations_changed = True
-    if "integrations_hermes_model" in request.model_fields_set:
-        global_settings.integrations.hermes_model = request.integrations_hermes_model
-        integrations_changed = True
-    if "integrations_pi_model" in request.model_fields_set:
-        global_settings.integrations.pi_model = request.integrations_pi_model
-        integrations_changed = True
-    if "integrations_openclaw_tools_profile" in request.model_fields_set:
-        global_settings.integrations.openclaw_tools_profile = (
-            request.integrations_openclaw_tools_profile
-        )
-        integrations_changed = True
-
+    )
     if integrations_changed:
         runtime_applied.append("integrations")
         logger.info(
@@ -3195,68 +3334,44 @@ async def update_global_settings(
             f"pi={global_settings.integrations.pi_model}"
         )
 
-    # Apply UI settings
     if request.ui_language is not None:
-        global_settings.ui.language = request.ui_language
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
-        logger.info(f"UI language changed to: {request.ui_language}")
+        logger.info(f"UI language changed to: {global_settings.ui.language}")
 
-    # Apply idle timeout settings (Live)
-    # Use model_fields_set to distinguish "explicitly sent as null" (disable)
-    # from "not sent" (don't touch).
     if "idle_timeout_seconds" in request.model_fields_set:
-        global_settings.idle_timeout.idle_timeout_seconds = request.idle_timeout_seconds
         runtime_applied.append("idle_timeout_seconds")
-        if request.idle_timeout_seconds:
-            logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
+        if global_settings.idle_timeout.idle_timeout_seconds:
+            logger.info(
+                "Idle timeout set to: %ss",
+                global_settings.idle_timeout.idle_timeout_seconds,
+            )
         else:
             logger.info("Idle timeout disabled")
 
-    # Apply auth settings (API key change)
     if request.api_key is not None:
         from ..server import _server_state
 
-        is_valid, error_msg = validate_api_key(request.api_key)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-
-        global_settings.auth.api_key = request.api_key
-        _server_state.api_key = request.api_key
+        _server_state.api_key = global_settings.auth.api_key
         runtime_applied.append("api_key")
         logger.info("API key updated via admin settings")
 
     if request.skip_api_key_verification is not None:
-        global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
 
-    if pending_embedding_batch_size is not None:
-        previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
-        global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
-
-    # Validate settings
-    errors = global_settings.validate()
-    if errors:
-        if previous_embedding_batch_size is not None:
-            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
-        raise HTTPException(status_code=400, detail=errors)
-
-    # Persist to file
-    try:
-        global_settings.save()
-    except Exception as e:
-        if previous_embedding_batch_size is not None:
-            global_settings.scheduler.embedding_batch_size = previous_embedding_batch_size
-        raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
-
-    if pending_embedding_batch_size is not None:
+    if request.embedding_batch_size is not None:
         from ..server import _server_state
 
         pool = _server_state.engine_pool
         if pool is not None:
-            await pool.apply_embedding_batch_size(pending_embedding_batch_size)
+            await pool.apply_embedding_batch_size(
+                global_settings.scheduler.embedding_batch_size
+            )
         runtime_applied.append("embedding_batch_size")
-        logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
+        logger.info(
+            f"Embedding batch size set to "
+            f"{global_settings.scheduler.embedding_batch_size}"
+        )
 
     # Build response message
     message = "Settings saved successfully."

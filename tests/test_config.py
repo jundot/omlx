@@ -79,6 +79,13 @@ class TestParseSize:
         with pytest.raises(ValueError):
             parse_size("1XB")  # Invalid unit
 
+    def test_parse_non_finite_raises_error(self):
+        """Non-finite values should be rejected as invalid sizes."""
+        with pytest.raises(ValueError):
+            parse_size("infGB")
+        with pytest.raises(ValueError):
+            parse_size("1e309GB")
+
 
 class TestServerConfig:
     """Test cases for ServerConfig dataclass."""
@@ -215,6 +222,25 @@ class TestPagedSSDCacheConfig:
 
         config = PagedSSDCacheConfig(max_size="1TB")
         assert config.max_size_bytes == 1024**4
+
+    def test_max_size_bytes_uses_settings_semantics(self):
+        """SSD cache max size rejects zero and negative sizes."""
+        config = PagedSSDCacheConfig(max_size="0GB")
+        with pytest.raises(ValueError, match="must be positive"):
+            _ = config.max_size_bytes
+
+        config = PagedSSDCacheConfig(max_size="-1GB")
+        with pytest.raises(ValueError, match="must be positive"):
+            _ = config.max_size_bytes
+
+    def test_hot_cache_max_size_bytes_uses_settings_semantics(self):
+        """Hot cache accepts zero as disabled and rejects auto."""
+        config = PagedSSDCacheConfig(hot_cache_max_size="0GB")
+        assert config.hot_cache_max_size_bytes == 0
+
+        config = PagedSSDCacheConfig(hot_cache_max_size="auto")
+        with pytest.raises(ValueError, match="hot_cache_max_size"):
+            _ = config.hot_cache_max_size_bytes
 
 
 class TestMCPConfig:

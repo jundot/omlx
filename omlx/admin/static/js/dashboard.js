@@ -3318,7 +3318,7 @@
             percentToCacheString(percent, totalBytes) {
                 if (!totalBytes || totalBytes === 0) return 'auto';
                 const bytes = Math.floor((percent / 100) * totalBytes);
-                const gb = Math.floor(bytes / (1024 * 1024 * 1024));
+                const gb = Math.max(1, Math.floor(bytes / (1024 * 1024 * 1024)));
                 return `${gb}GB`;
             },
 
@@ -3542,7 +3542,7 @@
 
             // Update cache from manual GB input
             updateCacheFromInput(gbValue) {
-                const gb = parseInt(gbValue) || 0;
+                const gb = Math.max(1, parseInt(gbValue) || 1);
                 this.globalSettings.cache.ssd_cache_max_size = `${gb}GB`;
 
                 // Update percent slider

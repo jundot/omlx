@@ -39,6 +39,63 @@ logger = logging.getLogger(__name__)
 # Settings file version for future migrations
 SETTINGS_VERSION = "1.0"
 
+SSD_CACHE_SIZE_AUTO = "auto"
+
+
+def normalize_ssd_cache_max_size(
+    value: str | None,
+    *,
+    legacy_zero_to_auto: bool = False,
+) -> str:
+    """Normalize and validate the SSD cache size setting.
+
+    ``ssd_cache_max_size`` is a capacity limit. Unlike ``hot_cache_max_size``,
+    zero is not a disable sentinel; disabling SSD spillover is represented by
+    ``cache.enabled=False`` or ``hot_cache_only=True``.
+    """
+    size = SSD_CACHE_SIZE_AUTO if value is None else str(value).strip()
+    if not size:
+        raise ValueError("ssd_cache_max_size must be 'auto' or a positive size")
+    if size.lower() == SSD_CACHE_SIZE_AUTO:
+        return SSD_CACHE_SIZE_AUTO
+
+    try:
+        size_bytes = parse_size(size)
+    except ValueError as e:
+        raise ValueError(f"Invalid ssd_cache_max_size: {e}") from e
+    if size_bytes <= 0:
+        if size_bytes == 0 and legacy_zero_to_auto:
+            return SSD_CACHE_SIZE_AUTO
+        raise ValueError("ssd_cache_max_size must be positive")
+    return size
+
+
+def normalize_hot_cache_max_size(
+    value: str | None,
+    *,
+    legacy_auto_to_disabled: bool = False,
+) -> str:
+    """Normalize and validate the in-memory hot cache size setting.
+
+    Hot cache uses ``0`` as its explicit disabled value. Other values must be
+    positive byte sizes accepted by ``parse_size``.
+    """
+    size = "0" if value is None else str(value).strip()
+    if not size:
+        raise ValueError("hot_cache_max_size must be 0 or a positive size")
+    if size.lower() == SSD_CACHE_SIZE_AUTO and legacy_auto_to_disabled:
+        return "0"
+
+    try:
+        size_bytes = parse_size(size)
+    except ValueError as e:
+        raise ValueError(f"Invalid hot_cache_max_size: {e}") from e
+    if size_bytes < 0:
+        raise ValueError("hot_cache_max_size must be 0 or a positive size")
+    if size_bytes == 0:
+        return "0"
+    return size
+
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
@@ -252,14 +309,15 @@ class CacheSettings:
         Returns:
             Max SSD cache size in bytes (10% of SSD if "auto").
         """
-        if self.ssd_cache_max_size.lower() == "auto":
+        ssd_cache_max_size = normalize_ssd_cache_max_size(self.ssd_cache_max_size)
+        if ssd_cache_max_size == SSD_CACHE_SIZE_AUTO:
             cache_dir = self.get_ssd_cache_dir(base_path)
             return int(get_ssd_capacity(cache_dir) * 0.1)
-        return parse_size(self.ssd_cache_max_size)
+        return parse_size(ssd_cache_max_size)
 
     def get_hot_cache_max_size_bytes(self) -> int:
         """Get hot cache max size in bytes. 0 means disabled."""
-        return parse_size(self.hot_cache_max_size)
+        return parse_size(normalize_hot_cache_max_size(self.hot_cache_max_size))
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -761,6 +819,38 @@ class GlobalSettings:
                 self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
             if "cache" in data:
                 self.cache = CacheSettings.from_dict(data["cache"])
+                try:
+                    normalized_ssd = normalize_ssd_cache_max_size(
+                        self.cache.ssd_cache_max_size,
+                        legacy_zero_to_auto=True,
+                    )
+                except ValueError:
+                    # Keep non-legacy invalid values intact so startup validation
+                    # reports the actual bad setting instead of hiding it.
+                    pass
+                else:
+                    if normalized_ssd != self.cache.ssd_cache_max_size:
+                        logger.warning(
+                            "Recovered invalid persisted ssd_cache_max_size=%r "
+                            "to 'auto'",
+                            self.cache.ssd_cache_max_size,
+                        )
+                        self.cache.ssd_cache_max_size = normalized_ssd
+                try:
+                    normalized_hot = normalize_hot_cache_max_size(
+                        self.cache.hot_cache_max_size,
+                        legacy_auto_to_disabled=True,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    if normalized_hot != self.cache.hot_cache_max_size:
+                        logger.warning(
+                            "Recovered invalid persisted hot_cache_max_size=%r "
+                            "to '0'",
+                            self.cache.hot_cache_max_size,
+                        )
+                        self.cache.hot_cache_max_size = normalized_hot
             if "auth" in data:
                 self.auth = AuthSettings.from_dict(data["auth"])
             if "mcp" in data:
@@ -1093,13 +1183,14 @@ class GlobalSettings:
             )
 
         # Cache validation
-        if self.cache.ssd_cache_max_size.lower() != "auto":
-            try:
-                size = parse_size(self.cache.ssd_cache_max_size)
-                if size <= 0:
-                    errors.append("ssd_cache_max_size must be positive")
-            except ValueError as e:
-                errors.append(f"Invalid ssd_cache_max_size: {e}")
+        try:
+            normalize_ssd_cache_max_size(self.cache.ssd_cache_max_size)
+        except ValueError as e:
+            errors.append(str(e))
+        try:
+            normalize_hot_cache_max_size(self.cache.hot_cache_max_size)
+        except ValueError as e:
+            errors.append(str(e))
 
         if self.cache.initial_cache_blocks <= 0:
             errors.append(
