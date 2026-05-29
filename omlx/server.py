@@ -2352,6 +2352,15 @@ async def create_chat_completion(
                 "Auto-set thinking_budget=%d for grammar-constrained request",
                 default_budget,
             )
+            # Custom reasoning formats (e.g. gemma4 channel) need the close-think
+            # token id passed explicitly so the budget processor can force the
+            # model out of reasoning; the tokenizer does not expose it as
+            # think_end_id and the prompt never ends in a <think> open tag.
+            end_ids = _resolve_custom_think_end_ids(
+                reasoning_parser, getattr(engine, "tokenizer", None)
+            )
+            if end_ids:
+                chat_kwargs["think_end_token_ids"] = end_ids
 
     # Add tools if provided (includes MCP tools)
     if tools_for_template:
@@ -2613,13 +2622,75 @@ def _patch_output_format(tag_dict: dict, user_grammar: dict) -> bool:
     return False
 
 
+# Reasoning formats that xgrammar's ``get_builtin_structural_tag`` does NOT
+# ship a builtin for, keyed by the omlx ``reasoning_parser`` name -> the
+# (open, close) markers that delimit the model's thinking block. Used to keep
+# the grammar permissive during reasoning and only constrain the output that
+# follows, the same contract the builtin tags provide for llama/harmony/etc.
+_CUSTOM_THINKING_MARKERS = {
+    # gemma4 (flyto fork template): emits ``<|channel>thought\n`` ... then the
+    # ``<channel|>`` end-of-channel token before the visible answer. xgrammar
+    # has no gemma builtin, so we compose the tag from primitives below.
+    "gemma_channel": ("<|channel>thought\n", "<channel|>"),
+}
+
+
+def _resolve_custom_think_end_ids(reasoning_parser, tokenizer) -> list[int] | None:
+    """Token id(s) for the close-think marker of a CUSTOM reasoning format.
+
+    Returns ``None`` for builtin parsers (the scheduler resolves those from the
+    tokenizer's ``think_end_id``) or when the marker can't be encoded. For
+    gemma4's channel format this yields ``<channel|>`` so the thinking-budget
+    processor can force the model out of reasoning even though the prompt never
+    ends in a ``<think>`` open tag.
+    """
+    markers = _CUSTOM_THINKING_MARKERS.get(reasoning_parser)
+    if markers is None or tokenizer is None:
+        return None
+    try:
+        ids = tokenizer.encode(markers[1], add_special_tokens=False)
+        return [int(i) for i in ids] if ids else None
+    except Exception:
+        return None
+
+
+def _build_channel_thinking_tag(fmt: dict, open_marker: str,
+                                close_marker: str) -> dict:
+    """Compose a structural tag that lets the model reason freely inside a
+    channel-delimited thinking block, then constrains the following output to
+    ``fmt``.
+
+    Shape: ``sequence[const(open), any_text, const(close), <output slot>]``.
+    The reasoning ``any_text`` excludes the close marker so emitting it
+    transitions to the constrained output; ``_patch_output_format`` swaps the
+    trailing ``any_text`` slot for the user grammar. This is the model-agnostic
+    equivalent of the builtin tags for a format xgrammar does not ship.
+    """
+    tag_dict = {
+        "type": "structural_tag",
+        "format": {
+            "type": "sequence",
+            "elements": [
+                {"type": "const_string", "value": open_marker},
+                {"type": "any_text", "excludes": [close_marker]},
+                {"type": "const_string", "value": close_marker},
+                {"type": "any_text", "excludes": []},  # output slot
+            ],
+        },
+    }
+    _patch_output_format(tag_dict, fmt)
+    return tag_dict
+
+
 def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
                                   chat_template_kwargs: dict | None):
-    """Compile a grammar wrapped in an xgrammar builtin structural tag.
+    """Compile a grammar wrapped in a structural tag so the bitmask stays
+    permissive during the reasoning phase and only constrains the output.
 
-    Uses ``xgrammar.get_builtin_structural_tag`` to obtain the model's
-    protocol structure (thinking tags, channel markers, etc.) and patches
-    the user's grammar into the output slot.
+    Uses ``xgrammar.get_builtin_structural_tag`` for builtin reasoning formats;
+    for formats xgrammar has no builtin for (see ``_CUSTOM_THINKING_MARKERS``)
+    composes the tag from primitives. Patches the user's grammar into the
+    output slot.
     """
     import xgrammar as xgr
 
@@ -2627,6 +2698,16 @@ def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
         chat_template_kwargs
         and chat_template_kwargs.get("enable_thinking") is False
     )
+
+    custom_markers = _CUSTOM_THINKING_MARKERS.get(reasoning_parser)
+    if custom_markers is not None:
+        # No thinking phase requested -> constrain the output directly, same as
+        # the bare path, so we don't force an empty reasoning block.
+        if not reasoning:
+            return _compile_bare_grammar(compiler, fmt)
+        tag_dict = _build_channel_thinking_tag(fmt, *custom_markers)
+        return compiler.compile_structural_tag(tag_dict)
+
     tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
     if not _patch_output_format(tag_dict, fmt):
@@ -4181,6 +4262,15 @@ async def create_response(
                 "Auto-set thinking_budget=%d for grammar-constrained request",
                 default_budget,
             )
+            # Custom reasoning formats (e.g. gemma4 channel) need the close-think
+            # token id passed explicitly so the budget processor can force the
+            # model out of reasoning; the tokenizer does not expose it as
+            # think_end_id and the prompt never ends in a <think> open tag.
+            end_ids = _resolve_custom_think_end_ids(
+                reasoning_parser, getattr(engine, "tokenizer", None)
+            )
+            if end_ids:
+                chat_kwargs["think_end_token_ids"] = end_ids
 
     if tools_for_template:
         chat_kwargs["tools"] = tools_for_template

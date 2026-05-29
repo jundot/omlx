@@ -1703,6 +1703,7 @@ class VLMBatchedEngine(BaseEngine):
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            think_end_token_ids=kwargs.get("think_end_token_ids", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -1773,6 +1774,7 @@ class VLMBatchedEngine(BaseEngine):
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            think_end_token_ids=kwargs.get("think_end_token_ids", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
