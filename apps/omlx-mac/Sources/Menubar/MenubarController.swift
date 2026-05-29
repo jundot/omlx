@@ -291,9 +291,10 @@ final class MenubarController: NSObject {
                 .systemBlue
             )
         case .running(let pid):
+            let port = MenubarController.displayPort(server: server, fallback: config.port)
             return (
                 String(localized: "menubar.header.running",
-                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(config.port))",
+                       defaultValue: "Server: running · pid \(String(pid)) · :\(String(port))",
                        comment: "Menubar status header when the server is running; placeholders are PID and port (rendered as plain integers, no grouping)"),
                 .systemGreen
             )
@@ -478,8 +479,9 @@ final class MenubarController: NSObject {
     private func presentPortConflictAlert(_ conflict: PortConflict) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
         alert.messageText = String(localized: "menubar.alert.port_in_use.title",
-                                   defaultValue: "Port \(String(config.port)) is in use.",
+                                   defaultValue: "Port \(String(port)) is in use.",
                                    comment: "Title of the port-conflict alert; placeholder is the port number (plain integer, no grouping)")
         let pidStr = conflict.pid.map {
             String(localized: "menubar.alert.pid_known",
@@ -493,7 +495,7 @@ final class MenubarController: NSObject {
                      defaultValue: "Another oMLX server is already running on this port (\(pidStr)). Stop it before starting a new instance, or change the port in Settings.",
                      comment: "Port-conflict alert body when the conflicting process is another oMLX instance")
             : String(localized: "menubar.alert.port_in_use.other",
-                     defaultValue: "Another process (\(pidStr)) is listening on port \(String(config.port)). Choose a different port in Settings or terminate that process.",
+                     defaultValue: "Another process (\(pidStr)) is listening on port \(String(port)). Choose a different port in Settings or terminate that process.",
                      comment: "Port-conflict alert body when an unrelated process owns the port")
         alert.addButton(withTitle: String(localized: "menubar.alert.ok",
                                           defaultValue: "OK",
@@ -510,7 +512,9 @@ final class MenubarController: NSObject {
     }
 
     @objc private func openChat() {
-        guard let url = URL(string: "http://\(config.host):\(config.port)/admin/chat") else { return }
+        let host = MenubarController.displayHost(server: server, fallback: config.host)
+        let port = MenubarController.displayPort(server: server, fallback: config.port)
+        guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -557,6 +561,30 @@ final class MenubarController: NSObject {
     private func tps(_ value: Double?) -> String {
         guard let v = value else { return "—" }
         return String(format: "%.1f tok/s", v)
+    }
+}
+
+// MARK: - Live endpoint resolution
+
+extension MenubarController {
+    /// Source-of-truth port for any menubar item that renders the
+    /// current bind port (status header, port-conflict alert, Chat URL).
+    /// The running server is authoritative — `config` here is just the
+    /// snapshot we were constructed with and goes stale after the user
+    /// changes the port via Server screen's Apply, which calls
+    /// `server.reconfigure(port:)` and updates `AppServices.config` but
+    /// not the menubar's local `config` copy.
+    ///
+    /// Internal access (not private) so `MenubarControllerPortTests`
+    /// can exercise it without instantiating the full controller (which
+    /// requires a live `NSStatusBar`).
+    static func displayPort(server: ServerProcess?, fallback: Int) -> Int {
+        server?.port ?? fallback
+    }
+
+    /// Companion to `displayPort(server:fallback:)` — same rationale.
+    static func displayHost(server: ServerProcess?, fallback: String) -> String {
+        server?.host ?? fallback
     }
 }
 
