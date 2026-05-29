@@ -795,8 +795,13 @@ class Scheduler:
 
         # Memory limits for inline prefill checking.
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
-        self._memory_limit_bytes: int = 0  # soft limit
-        self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
+        self._memory_limit_bytes: int = 0  # soft limit (dynamic, jittery)
+        self._memory_hard_limit_bytes: int = 0  # dynamic ceiling (throttle target)
+        # Stable physical cap = min(static_ceiling, metal_cap). Used ONLY to
+        # abort an in-flight prefill, so a transient dynamic-ceiling dip can't
+        # kill a near-complete request that actually fits. 0 => fall back to
+        # _memory_hard_limit_bytes (pre-propagation / old enforcer).
+        self._memory_abort_limit_bytes: int = 0
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -1887,6 +1892,19 @@ class Scheduler:
                 kv_len=base_size + processed_tokens,
             )
 
+            # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
+            # would breach the margined physical cap. The Metal command-buffer
+            # OOM is an async, uncatchable SIGABRT, so it must be prevented
+            # before submission — a post-chunk check is too late. Falls back to
+            # min_chunk after a reclaim; raises gracefully only if even the
+            # floor can't fit (caught by the #1405 path → requeue/clean error).
+            n_to_process = self._guard_prefill_chunk(
+                n_to_process,
+                kv_len=base_size + processed_tokens,
+                progress=processed_tokens,
+                loop_label="external",
+            )
+
             model_kwargs: dict[str, Any] = {}
             if embeds_array is not None and embeds_array.shape[1] > 0:
                 model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
@@ -1955,29 +1973,31 @@ class Scheduler:
                         "OVER_HARD" if _hard > 0 and current > _hard
                         else "OVER_SOFT",
                     )
-                if (
-                    self._memory_hard_limit_bytes > 0
-                    and current > self._memory_hard_limit_bytes
-                ):
+                # Abort decision uses the STABLE physical cap, not the jittery
+                # dynamic ceiling: only kill an in-flight prefill if it would
+                # breach what Metal actually allows. Throttling above still
+                # targets the dynamic ceiling. Falls back to the dynamic hard
+                # limit if the abort limit hasn't been propagated yet.
+                _abort = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
+                if _abort > 0 and current > _abort:
                     # Reclaim the just-computed chunk's Metal transients before
                     # giving up — they are still resident at this pre-clear
-                    # check and are usually what tipped us over the ceiling.
+                    # check and are usually what tipped us over the cap.
                     current = self._reclaim_prefill_headroom()
-                    if current > self._memory_hard_limit_bytes:
+                    if current > _abort:
                         logger.warning(
                             f"Prefill force-stopped at {processed_tokens} "
                             f"tokens: memory {current / 1024**3:.1f}GB "
-                            f"exceeds ceiling "
-                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB "
-                            f"(after reclaim)"
+                            f"exceeds physical cap "
+                            f"{_abort / 1024**3:.1f}GB (after reclaim)"
                         )
                         raise RuntimeError("Memory limit exceeded during prefill")
                     logger.info(
                         "Prefill recovered after reclaim at %d tokens "
-                        "(%.1fGB <= ceiling %.1fGB)",
+                        "(%.1fGB <= cap %.1fGB)",
                         processed_tokens,
                         current / 1024**3,
-                        self._memory_hard_limit_bytes / 1024**3,
+                        _abort / 1024**3,
                     )
                 elif current > self._memory_limit_bytes:
                     logger.warning(
@@ -2041,6 +2061,120 @@ class Scheduler:
     # ``current`` (it is eval'd into residency after the forward pass).
     _PREFILL_HEADROOM_SAFETY: float = 0.90
 
+    # Fraction of the physical abort cap we allow a chunk's predicted PEAK to
+    # reach. The remaining headroom is reserved for Metal command-buffer
+    # overhead: a chunk whose peak lands on the wired limit can make Metal
+    # abort the command buffer asynchronously (kIOGPUCommandBufferCallbackError
+    # OutOfMemory) — an uncatchable SIGABRT — so we keep a hard margin below it.
+    _PREFILL_ABORT_MARGIN: float = 0.90
+
+    # Safety multiplier on the predicted per-chunk transient. The transient
+    # scales with query_len * kv_len, so per-token cost grows with context
+    # length; this covers one chunk's worth of growth + measurement noise.
+    _PREFILL_TRANSIENT_SAFETY: float = 1.3
+
+    def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
+        """Conservative predicted Metal transient (bytes) for one prefill chunk.
+
+        The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
+        the per-token cost GROWS with context length. A long-run EWMA average
+        lags that growth and underestimates the next chunk — the cause of the
+        Metal command-buffer OOM crash at large kv_len. We therefore take the
+        MAX of three signals and apply a safety factor:
+          - the most recently MEASURED per-token transient (last_delta /
+            last_n) — anchored on reality at the current kv_len regime,
+          - the long-run EWMA (model-specific constants the static misses),
+          - the kv_len-aware static SDPA estimate.
+        Returns 0 only when nothing is known (first chunk, no model info).
+        """
+        if n_tokens <= 0:
+            return 0.0
+        per_token = 0.0
+        tracker = self._prefill_transient_tracker
+        if tracker is not None:
+            if tracker.last_n_tokens > 0 and tracker.last_delta_bytes > 0:
+                per_token = max(
+                    per_token, tracker.last_delta_bytes / tracker.last_n_tokens
+                )
+            if tracker.bytes_per_token > 0:
+                per_token = max(per_token, tracker.bytes_per_token)
+        if self.memory_monitor is not None:
+            static = self.memory_monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
+            per_token = max(per_token, float(static))
+        return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
+
+    def _prefill_abort_cap(self) -> int:
+        """Margined physical cap a chunk's predicted peak must stay under.
+
+        Uses the stable abort limit (min(static, metal_cap)) with a margin so
+        we never submit a chunk that could trip the async Metal OOM. Falls back
+        to the dynamic hard limit before the abort limit is propagated.
+        """
+        cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
+        return int(cap * self._PREFILL_ABORT_MARGIN) if cap > 0 else 0
+
+    def _guard_prefill_chunk(
+        self,
+        n_tokens: int,
+        *,
+        kv_len: int,
+        progress: int,
+        loop_label: str,
+    ) -> int:
+        """Clamp/abort a prefill chunk so its predicted peak can never reach
+        the physical Metal cap (the uncatchable async OOM crash).
+
+        Returns a chunk size whose predicted peak fits under the margined cap
+        (possibly shrunk from ``n_tokens``). If even the minimum chunk would
+        not fit after a reclaim, raises a clean RuntimeError — the context is
+        genuinely too large for available memory. That message intentionally
+        does NOT contain "Memory limit exceeded", so ``_requeue_or_fail_prefill``
+        fails it fast with a clear error rather than looping a doomed retry.
+        """
+        cap = self._prefill_abort_cap()
+        if cap <= 0:
+            return n_tokens
+        min_chunk = max(1, self._prefill_min_chunk_tokens)
+        current = max(mx.get_active_memory(), get_phys_footprint())
+        if current + self._predicted_chunk_transient(n_tokens, kv_len) <= cap:
+            return n_tokens
+
+        # Predicted to breach — reclaim transients and re-measure once.
+        current = self._reclaim_prefill_headroom()
+        if current + self._predicted_chunk_transient(min_chunk, kv_len) > cap:
+            logger.warning(
+                "[guard:%s] context too large at progress=%d kv_len=%d: "
+                "%.2fGB + min-chunk transient exceeds physical cap %.2fGB",
+                loop_label,
+                progress,
+                kv_len,
+                current / 1024**3,
+                cap / 1024**3,
+            )
+            raise RuntimeError(
+                "Prefill context too large for available memory "
+                f"(pre-chunk guard at {progress} tokens, kv_len={kv_len}): "
+                f"would exceed physical cap {cap / 1024**3:.1f}GB"
+            )
+
+        # The floor fits — pick the largest chunk that still fits under the cap.
+        per_token = self._predicted_chunk_transient(1, kv_len)
+        safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
+        n_fit = max(min_chunk, min(n_tokens, safe_n))
+        if n_fit < n_tokens:
+            logger.debug(
+                "[guard:%s] shrink %d -> %d at progress=%d kv_len=%d "
+                "(current=%.2fGB cap=%.2fGB)",
+                loop_label,
+                n_tokens,
+                n_fit,
+                progress,
+                kv_len,
+                current / 1024**3,
+                cap / 1024**3,
+            )
+        return n_fit
+
     def _adaptive_chunk_size(
         self,
         requested: int,
@@ -2099,22 +2233,19 @@ class Scheduler:
         current = max(mx.get_active_memory(), get_phys_footprint())
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
-        # Per-token transient estimate: measured EWMA once we have samples,
-        # else the static first-chunk SDPA estimate at the current span.
-        tracker = self._prefill_transient_tracker
-        per_token = 0.0
-        predictor = "none"
-        if tracker is not None and tracker.samples > 0 and tracker.bytes_per_token > 0:
-            per_token = tracker.bytes_per_token * 1.2  # matches predict() safety_factor
-            predictor = "ewma"
-        elif self.memory_monitor is not None:
-            per_token = float(
-                self.memory_monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
-            )
-            predictor = "static"
+        # Conservative per-token transient (measured-last / EWMA / static, ×
+        # safety) — see _predicted_chunk_transient. Anchored on the most recent
+        # measurement so it tracks the transient's growth with kv_len instead
+        # of lagging behind a long-run average.
+        per_token = self._predicted_chunk_transient(1, kv_len)
+        predictor = "measured" if per_token > 0 else "none"
 
-        # The peak we keep each chunk under — a safety margin below the cap.
+        # Keep each chunk's predicted peak under the LOWER of the dynamic
+        # throttle target and the margined physical cap, so the peak can never
+        # reach the Metal wall (the uncatchable async OOM).
         safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
+        abort_cap = self._prefill_abort_cap()
+        target = min(safe_target, abort_cap) if abort_cap > 0 else safe_target
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
 
         if per_token <= 0:
@@ -2126,13 +2257,14 @@ class Scheduler:
             n_fit = requested
         else:
             # Predicted-peak gate: if the FULL requested chunk fits under the
-            # target it runs unchanged (covers all healthy traffic). This must
-            # NOT depend on current crossing the soft watermark — a single big
-            # chunk's transient can blow the ceiling from a low baseline (e.g.
-            # MoE prefill at ~18MB/token), which is the failure this prevents.
-            if current + per_token * requested <= safe_target:
+            # target it runs unchanged (covers all healthy traffic). Gated on
+            # the predicted peak, not on current crossing the soft watermark —
+            # a single big chunk's transient can blow the cap from a low
+            # baseline (MoE prefill at tens of MB/token), the failure this
+            # prevents.
+            if current + per_token * requested <= target:
                 return requested
-            headroom = max(safe_target - current, 0)
+            headroom = max(target - current, 0)
             n_fit = int(headroom / per_token)
 
         n = max(min_chunk, min(requested, n_fit))
@@ -2325,6 +2457,15 @@ class Scheduler:
             kv_len=state.base_size + state.tokens_processed,
         )
 
+        # Pre-chunk safety guard (mirrors the external loop): never submit a
+        # chunk whose predicted peak would trip the uncatchable async Metal OOM.
+        n = self._guard_prefill_chunk(
+            n,
+            kv_len=state.base_size + state.tokens_processed,
+            progress=state.tokens_processed,
+            loop_label="chunked_step",
+        )
+
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
         _throttle_pre = get_phys_footprint()
@@ -2390,28 +2531,27 @@ class Scheduler:
                     "OVER_HARD" if _hard > 0 and current > _hard
                     else "OVER_SOFT",
                 )
-            if (
-                self._memory_hard_limit_bytes > 0
-                and current > self._memory_hard_limit_bytes
-            ):
+            # Abort on the stable physical cap, not the jittery dynamic ceiling
+            # (mirrors the external prefill loop).
+            _abort = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
+            if _abort > 0 and current > _abort:
                 # Reclaim the just-computed chunk's Metal transients before
                 # giving up (mirrors the external prefill loop).
                 current = self._reclaim_prefill_headroom()
-                if current > self._memory_hard_limit_bytes:
+                if current > _abort:
                     raise RuntimeError(
                         f"Memory limit exceeded during chunked prefill at "
                         f"{state.tokens_processed}/{state.total_length - 1} tokens: "
-                        f"{current / 1024**3:.1f}GB exceeds ceiling "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB "
-                        f"(after reclaim)"
+                        f"{current / 1024**3:.1f}GB exceeds physical cap "
+                        f"{_abort / 1024**3:.1f}GB (after reclaim)"
                     )
                 logger.info(
                     "Chunked prefill recovered after reclaim at %d/%d tokens "
-                    "(%.1fGB <= ceiling %.1fGB)",
+                    "(%.1fGB <= cap %.1fGB)",
                     state.tokens_processed,
                     state.total_length - 1,
                     current / 1024**3,
-                    self._memory_hard_limit_bytes / 1024**3,
+                    _abort / 1024**3,
                 )
             elif current > self._memory_limit_bytes:
                 logger.warning(

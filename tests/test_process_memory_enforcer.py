@@ -550,6 +550,70 @@ class TestHardLimitCalculation:
             # → dynamic wins
             assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
 
+
+class TestAbortLimitCalculation:
+    """`_get_abort_limit_bytes` = min(static, metal_cap); ignores the jittery
+    dynamic ceiling so a transient dip can't kill an in-flight prefill."""
+
+    def test_ignores_dynamic_ceiling(self, mock_engine_pool):
+        """Even when the dynamic ceiling is tiny, the abort limit stays at the
+        stable min(static, metal_cap)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=1 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value={  # dynamic would compute to ~10 GB (depressed)
+                "free": 5 * 1024**3,
+                "inactive": 2 * 1024**3,
+                "active": 4 * 1024**3,
+                "wired": 1 * 1024**3,
+            },
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=100 * 1024**3,
+        ):
+            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            # dynamic (~10 GB) is far below, but the abort limit ignores it.
+            assert enforcer._get_abort_limit_bytes() == 40 * 1024**3
+            # Sanity: the (jittery) hard limit DID drop to dynamic.
+            assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
+
+    def test_picks_metal_cap_when_smaller_than_static(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=43 * 1024**3,
+        ):
+            # static = 64 - 8 = 56 GB; metal = 43 GB → min = 43 GB
+            assert enforcer._get_abort_limit_bytes() == 43 * 1024**3
+
+    def test_falls_back_to_static_when_metal_cap_unknown(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="aggressive"
+        )
+        with patch(
+            "omlx.settings.get_system_memory", return_value=48 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            return_value=0,  # unknown
+        ):
+            # aggressive reserve = 6 GB → static = 42 GB
+            assert enforcer._get_abort_limit_bytes() == 42 * 1024**3
+
+    def test_zero_when_guard_disabled(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, prefill_memory_guard=False
+        )
+        assert enforcer._get_abort_limit_bytes() == 0
+
     def test_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
@@ -1240,6 +1304,31 @@ class TestTwoWatermarkPressureLevels:
 
         assert enforcer_2wm._pressure_level == "ok"
         assert scheduler._admission_paused is False
+
+    @pytest.mark.asyncio
+    async def test_propagates_abort_limit_to_scheduler(self, enforcer_2wm, pool):
+        """The stable abort ceiling is pushed to scheduler._memory_abort_limit_bytes
+        every tick, independent of the (jittery) dynamic hard limit."""
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_abort_limit_bytes = 0
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        # Stub the abort ceiling to a known stable value.
+        enforcer_2wm._get_abort_limit_bytes = lambda: 42 * 1024**3
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        assert scheduler._memory_abort_limit_bytes == 42 * 1024**3
 
     @pytest.mark.asyncio
     async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):

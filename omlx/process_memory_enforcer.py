@@ -508,6 +508,29 @@ class ProcessMemoryEnforcer:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
 
+    def _get_abort_limit_bytes(self) -> int:
+        """Stable physical cap used to ABORT an in-flight prefill.
+
+        Deliberately excludes the dynamic ceiling: that value jitters every
+        poll with other-app pressure, and a transient dip must not kill a
+        near-complete prefill whose usage actually fits the physical envelope.
+        We use ``min(static_ceiling, metal_cap)`` — exactly the limit
+        ``start()`` arms via ``mx.set_wired_limit`` — so allocating up to it
+        cannot trigger a Metal clamp/panic. The dynamic ceiling still governs
+        chunk-size throttling and admission elsewhere; this is only the
+        last-resort kill threshold.
+
+        Returns 0 when the guard is disabled (callers treat 0 as "no limit"
+        and fall back to the dynamic hard limit).
+        """
+        if not self._prefill_memory_guard:
+            return 0
+        static_ceiling = self._get_static_ceiling()
+        metal_cap = get_effective_metal_cap_bytes()
+        if metal_cap > 0:
+            return min(static_ceiling, metal_cap)
+        return static_ceiling
+
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
         ceiling = self._get_hard_limit_bytes()
@@ -617,6 +640,7 @@ class ProcessMemoryEnforcer:
                 continue
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = ceiling
+            scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
