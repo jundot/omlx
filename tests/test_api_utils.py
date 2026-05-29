@@ -38,6 +38,7 @@ from omlx.api.anthropic_utils import (
     create_text_delta_event,
     format_sse_event,
     map_finish_reason_to_stop_reason,
+    request_has_cache_control,
 )
 from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
 from omlx.api.anthropic_models import (
@@ -1445,8 +1446,13 @@ class TestConvertInternalToAnthropicResponse:
         # Should have at least one content block
         assert len(result.content) >= 1
 
-    def test_prefix_cache_disabled_legacy_shape(self):
-        """Caching off: usage keeps the legacy shape (input=prompt, cache=0)."""
+    def test_no_cache_control_legacy_shape(self):
+        """No cache_control: usage keeps the legacy shape (input=prompt, cache=0).
+
+        Engine-internal prefix cache hits MUST NOT leak into the Anthropic
+        cache fields when the client did not opt in via cache_control — that
+        would violate the spec contract for input_tokens (#1487).
+        """
         result = convert_internal_to_anthropic_response(
             text="hi",
             model="claude-3",
@@ -1454,15 +1460,31 @@ class TestConvertInternalToAnthropicResponse:
             completion_tokens=5,
             finish_reason="stop",
             cached_tokens=40,
-            prefix_cache_enabled=False,
+            request_uses_cache_control=False,
         )
 
         assert result.usage.input_tokens == 100
         assert result.usage.cache_creation_input_tokens == 0
         assert result.usage.cache_read_input_tokens == 0
 
-    def test_prefix_cache_enabled_splits_prompt(self):
-        """Caching on: prompt splits into input(0) + creation + read."""
+    def test_cache_control_cold_partitions_to_creation(self):
+        """cache_control + cold prefix cache: input=0, cw=prompt, cr=0."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=0,
+            request_uses_cache_control=True,
+        )
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_creation_input_tokens == 100
+        assert result.usage.cache_read_input_tokens == 0
+
+    def test_cache_control_warm_partitions_to_read(self):
+        """cache_control + warm prefix hit: input=0, cw=tail, cr=hit."""
         result = convert_internal_to_anthropic_response(
             text="hi",
             model="claude-3",
@@ -1470,12 +1492,93 @@ class TestConvertInternalToAnthropicResponse:
             completion_tokens=5,
             finish_reason="stop",
             cached_tokens=20,
-            prefix_cache_enabled=True,
+            request_uses_cache_control=True,
         )
 
         assert result.usage.input_tokens == 0
         assert result.usage.cache_creation_input_tokens == 80
         assert result.usage.cache_read_input_tokens == 20
+
+    def test_usage_triple_is_disjoint_partition(self):
+        """input + cw + cr must equal prompt_tokens in every accounting mode (#1487)."""
+        for uses_cc in (True, False):
+            for cached in (0, 25, 100, 200):
+                result = convert_internal_to_anthropic_response(
+                    text="hi",
+                    model="claude-3",
+                    prompt_tokens=100,
+                    completion_tokens=5,
+                    finish_reason="stop",
+                    cached_tokens=cached,
+                    request_uses_cache_control=uses_cc,
+                )
+                u = result.usage
+                assert u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens == 100, (
+                    f"partition broken at uses_cc={uses_cc}, cached={cached}: "
+                    f"{u.input_tokens} + {u.cache_creation_input_tokens} + "
+                    f"{u.cache_read_input_tokens} != 100"
+                )
+                # cached_tokens > prompt_tokens must clamp, never under-report.
+                assert u.cache_read_input_tokens <= 100
+
+
+class TestRequestHasCacheControl:
+    """Tests for request_has_cache_control — the gate for the Anthropic
+    cache-usage partition (#1487)."""
+
+    @staticmethod
+    def _req(**overrides):
+        kwargs = dict(
+            model="claude-3",
+            max_tokens=10,
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        kwargs.update(overrides)
+        return MessagesRequest(**kwargs)
+
+    def test_no_cache_control_anywhere(self):
+        assert request_has_cache_control(self._req()) is False
+
+    def test_plain_string_system_never_signals(self):
+        """system as a plain string can't carry cache_control."""
+        req = self._req(system="You are helpful.")
+        assert request_has_cache_control(req) is False
+
+    def test_system_block_with_cache_control(self):
+        req = self._req(
+            system=[SystemContent(type="text", text="ctx", cache_control={"type": "ephemeral"})]
+        )
+        assert request_has_cache_control(req) is True
+
+    def test_system_block_without_cache_control(self):
+        req = self._req(system=[SystemContent(type="text", text="ctx")])
+        assert request_has_cache_control(req) is False
+
+    def test_tool_with_cache_control(self):
+        req = self._req(
+            tools=[
+                AnthropicTool(
+                    name="get_weather",
+                    input_schema={"type": "object"},
+                    cache_control={"type": "ephemeral"},
+                )
+            ]
+        )
+        assert request_has_cache_control(req) is True
+
+    def test_document_block_with_cache_control(self):
+        doc = ContentBlockDocument(
+            type="document",
+            source={"type": "base64", "media_type": "text/plain", "data": ""},
+            cache_control={"type": "ephemeral"},
+        )
+        req = self._req(messages=[AnthropicMessage(role="user", content=[doc])])
+        assert request_has_cache_control(req) is True
+
+    def test_string_content_message_never_signals(self):
+        """Plain-string message content can't carry cache_control."""
+        req = self._req(messages=[AnthropicMessage(role="user", content="just text")])
+        assert request_has_cache_control(req) is False
 
 
 class TestMapFinishReasonToStopReason:
@@ -1583,19 +1686,34 @@ class TestSSEEventFormatters:
 
         assert '"input_tokens": 100' in result
 
-    def test_create_message_delta_event_prefix_cache_enabled(self):
-        """With caching active, usage splits into disjoint cache fields."""
+    def test_create_message_delta_event_cache_control_splits(self):
+        """With cache_control present, usage splits into disjoint cache fields."""
         result = create_message_delta_event(
             "end_turn",
             10,
             input_tokens=100,
             cached_tokens=30,
-            prefix_cache_enabled=True,
+            request_uses_cache_control=True,
         )
 
         assert '"input_tokens": 0' in result
         assert '"cache_creation_input_tokens": 70' in result
         assert '"cache_read_input_tokens": 30' in result
+
+    def test_create_message_delta_event_no_cache_control_omits_cache_fields(self):
+        """Without cache_control the cache fields stay absent — even if the
+        engine's internal prefix cache hit (#1487)."""
+        result = create_message_delta_event(
+            "end_turn",
+            10,
+            input_tokens=100,
+            cached_tokens=30,
+            request_uses_cache_control=False,
+        )
+
+        assert '"input_tokens": 100' in result
+        assert "cache_creation_input_tokens" not in result
+        assert "cache_read_input_tokens" not in result
 
     def test_create_message_stop_event(self):
         """Test creating message_stop event."""

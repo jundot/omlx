@@ -81,6 +81,7 @@ from .api.anthropic_utils import (
     create_text_delta_event,
     create_thinking_delta_event,
     map_finish_reason_to_stop_reason,
+    request_has_cache_control,
 )
 
 # Import from new modular API
@@ -3174,6 +3175,13 @@ async def stream_anthropic_messages(
             tool_filter = _content_filter
             thinking_filter = _thinking_filter
 
+    # Does the client opt into Anthropic's cache_control accounting?
+    # When yes, message_start.input_tokens reports the post-partition value
+    # (0 here, since we approximate the whole prompt as belonging to the
+    # cache_control region — the final message_delta refines with the real
+    # cache hit count). When no, input_tokens carries the full prompt count.
+    uses_cache_control = request_has_cache_control(request)
+
     # Calculate input tokens before streaming starts
     # This is needed for message_start event
     estimated_input_tokens = 0
@@ -3196,7 +3204,11 @@ async def stream_anthropic_messages(
     yield create_message_start_event(
         message_id=message_id,
         model=request.model,
-        input_tokens=scale_anthropic_tokens(estimated_input_tokens, request.model),
+        input_tokens=(
+            0
+            if uses_cache_control
+            else scale_anthropic_tokens(estimated_input_tokens, request.model)
+        ),
     )
 
     # 3. Stream content with thinking/content separation
@@ -3439,7 +3451,7 @@ async def stream_anthropic_messages(
         output_tokens=actual_output_tokens,
         input_tokens=actual_input_tokens,
         cached_tokens=actual_cached_tokens,
-        prefix_cache_enabled=engine.prefix_cache_enabled,
+        request_uses_cache_control=uses_cache_control,
     )
 
     # Record metrics
@@ -3748,7 +3760,7 @@ async def create_anthropic_message(
             tool_calls=tool_calls,
             thinking=cleaned_thinking if cleaned_thinking else None,
             cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
-            prefix_cache_enabled=engine.prefix_cache_enabled,
+            request_uses_cache_control=request_has_cache_control(request),
         )
 
         return response.model_dump_json()

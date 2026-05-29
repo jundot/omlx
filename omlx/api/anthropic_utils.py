@@ -28,6 +28,38 @@ _PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
 logger = logging.getLogger(__name__)
 
 
+def request_has_cache_control(request: MessagesRequest) -> bool:
+    """True if any system / tool / message block carries ``cache_control``.
+
+    Anthropic's three input-side usage fields (``input_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``) form a
+    *disjoint* partition of the prompt only when the client explicitly
+    marks a region with ``cache_control``. Without that signal the cache
+    fields must stay at 0 and ``input_tokens`` carries the whole prompt
+    count — independent of whether the oMLX engine happens to run
+    automatic prefix caching internally.
+    """
+    sys = request.system
+    if isinstance(sys, list):
+        for blk in sys:
+            if getattr(blk, "cache_control", None):
+                return True
+
+    for tool in request.tools or []:
+        if getattr(tool, "cache_control", None):
+            return True
+
+    for msg in request.messages:
+        content = msg.content
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if getattr(blk, "cache_control", None):
+                return True
+
+    return False
+
+
 def _decode_document_block(block_dict: dict[str, Any]) -> str:
     """Decode an Anthropic document content block to text.
 
@@ -806,16 +838,19 @@ def convert_internal_to_anthropic_response(
     tool_calls: list[ToolCall] | None = None,
     thinking: str | None = None,
     cached_tokens: int = 0,
-    prefix_cache_enabled: bool = False,
+    request_uses_cache_control: bool = False,
 ) -> MessagesResponse:
     """
     Convert internal output to Anthropic MessagesResponse.
 
-    When ``prefix_cache_enabled`` is True the prompt count is split into
-    Anthropic's disjoint usage fields so that
-    input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-    equals prompt_tokens. Otherwise the response keeps the legacy shape
-    (input_tokens = prompt_tokens, cache fields = 0).
+    When the request carries ``cache_control`` breakpoints (signalled by
+    ``request_uses_cache_control``) the prompt count is split into
+    Anthropic's disjoint usage triple so that
+    ``input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    == prompt_tokens``. Otherwise the response keeps the legacy shape
+    (``input_tokens = prompt_tokens``, both cache fields = 0) — even when
+    the engine's automatic prefix cache happened to hit, since Anthropic
+    only surfaces the cache triple when the client opted in.
 
     Args:
         text: Generated text content
@@ -826,7 +861,8 @@ def convert_internal_to_anthropic_response(
         tool_calls: List of internal ToolCall objects
         thinking: Reasoning/thinking content from <think> blocks
         cached_tokens: Prompt tokens served from the prefix cache
-        prefix_cache_enabled: Whether the engine runs automatic prefix caching
+        request_uses_cache_control: Whether the originating request carried
+            ``cache_control`` on any system / tool / message block.
 
     Returns:
         Anthropic MessagesResponse
@@ -877,9 +913,11 @@ def convert_internal_to_anthropic_response(
     # Map finish reason to stop reason
     stop_reason = map_finish_reason_to_stop_reason(finish_reason, bool(tool_calls))
 
-    # When prefix caching is on, split prompt_tokens into the Anthropic
-    # disjoint triple (input + creation + read == prompt_tokens).
-    if prefix_cache_enabled:
+    # Anthropic's three input-side fields are a disjoint partition of the
+    # prompt and only carry non-zero values when the request opted into
+    # caching via cache_control. Without that signal the cache fields stay
+    # at 0 regardless of any internal prefix-cache hits in the engine.
+    if request_uses_cache_control:
         cache_read = max(0, min(cached_tokens, prompt_tokens))
         cache_creation = prompt_tokens - cache_read
         input_display = 0
@@ -1065,17 +1103,20 @@ def create_message_delta_event(
     stop_sequence: str | None = None,
     input_tokens: int | None = None,
     cached_tokens: int = 0,
-    prefix_cache_enabled: bool = False,
+    request_uses_cache_control: bool = False,
 ) -> str:
     """Create message_delta SSE event.
 
-    When ``prefix_cache_enabled`` is True and ``input_tokens`` is given, the
-    count is split into Anthropic's disjoint triple (input stays 0, creation
-    and read carry the remainder). Otherwise the legacy shape is preserved.
+    When ``request_uses_cache_control`` is True and ``input_tokens`` is
+    given, the count is split into Anthropic's disjoint triple (input
+    stays 0, creation and read carry the remainder). Without that signal
+    the cache fields are omitted entirely — Anthropic only surfaces them
+    when the client opted in via a ``cache_control`` breakpoint, even if
+    the engine's automatic prefix cache happened to hit.
     """
     usage: dict[str, int] = {"output_tokens": output_tokens}
 
-    if prefix_cache_enabled and input_tokens is not None:
+    if request_uses_cache_control and input_tokens is not None:
         cache_read = max(0, min(cached_tokens, input_tokens))
         usage["input_tokens"] = 0
         usage["cache_creation_input_tokens"] = input_tokens - cache_read
