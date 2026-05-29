@@ -71,6 +71,14 @@ class ModelSettings:
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
+        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
+        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+            Helps stabilise acceptance rate on long-context prompts.
+        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
+            (None = dflash default 64).
+        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
+            (None = dflash default "adaptive"). "adaptive" can shrink block size when
+            acceptance drops.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, the BatchGenerator uses an MTP draft+verify path for single-request
             decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
@@ -136,6 +144,13 @@ class ModelSettings:
     dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
     dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
     dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
+    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
+    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
+    # agentic workloads where acceptance drops on the default sliding window.
+    dflash_draft_window_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = None
+    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify path for single-request decoding. Compatible model_types:
@@ -374,6 +389,32 @@ class ModelSettingsManager:
 
             self._save()
 
+    def delete_settings(self, model_id: str) -> bool:
+        """Remove all persisted state for a model (settings + profiles).
+
+        Called when a model is deleted so its alias and other settings are
+        released and can be reused by another model.
+
+        Args:
+            model_id: The model identifier.
+
+        Returns:
+            True if any state was removed, False if nothing was stored.
+        """
+        with self._lock:
+            removed = False
+            if model_id in self._settings:
+                del self._settings[model_id]
+                self._save()
+                removed = True
+            if model_id in self._profiles:
+                del self._profiles[model_id]
+                self._save_profiles()
+                removed = True
+            if removed:
+                logger.info(f"Deleted settings for model '{model_id}'")
+            return removed
+
     def get_default_model_id(self) -> Optional[str]:
         """Get the ID of the default model.
 
@@ -609,6 +650,11 @@ class ModelSettingsManager:
     # ==================== Templates ====================
 
     def _load_templates(self) -> None:
+        # Built-in defaults ship inside the package (omlx/default_global_templates.json)
+        # and are merged in at read time — they are NEVER copied to disk and never
+        # appear in `self._templates`. The user file under <base_path> holds
+        # ONLY user-created templates; a missing/empty file is the legitimate
+        # initial state.
         if not self.templates_file.exists():
             self._templates = {}
             return
@@ -643,12 +689,18 @@ class ModelSettingsManager:
             raise
 
     def list_templates(self) -> list[dict]:
+        # Shipped JSON seeds were retired in favor of the client-side preset
+        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # surface is user-created. Callers that distinguish presets from
+        # user templates do so via the preset bundle, not an `is_builtin`
+        # flag on this response.
         with self._lock:
             return [dict(t) for t in self._templates.values()]
 
     def get_template(self, name: str) -> Optional[dict]:
         with self._lock:
-            return dict(self._templates.get(name, {})) or None
+            u = self._templates.get(name)
+            return dict(u) if u is not None else None
 
     def save_template(
         self,

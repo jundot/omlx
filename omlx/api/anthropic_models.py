@@ -102,7 +102,7 @@ class SystemContent(BaseModel):
 class AnthropicMessage(BaseModel):
     """A message in an Anthropic conversation."""
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: str | list[ContentBlock]
 
 

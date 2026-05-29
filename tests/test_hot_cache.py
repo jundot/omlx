@@ -806,3 +806,439 @@ class TestHotCacheWriteBack:
             f"Expected {block_count} SSD files after flush, got {len(ssd_files)}. "
             f"Blocks were likely dropped due to write queue overflow during shutdown."
         )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestPendingWriteBuffer:
+    """Tests for the pending-write buffer that bridges hot cache eviction to SSD write."""
+
+    def _make_cache_data(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
+        return [
+            (
+                mx.zeros((1, heads, seq_len, head_dim)),
+                mx.zeros((1, heads, seq_len, head_dim)),
+            )
+            for _ in range(num_layers)
+        ]
+
+    def _save_block(self, manager, block_hash, model="test-model"):
+        cache_data = self._make_cache_data()
+        return manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name=model,
+            layer_cache_types=["KVCache"] * 2,
+        )
+
+    def test_evicted_block_readable_from_pending_buffer(self, tmp_path):
+        """A block evicted from hot cache is still loadable while SSD write is pending."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "pending_buf_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            # Save 2 blocks (fills hot cache)
+            self._save_block(mgr, b"pending_buf_blk0")
+            self._save_block(mgr, b"pending_buf_blk1")
+
+            # Save 3rd block → evicts block 0
+            self._save_block(mgr, b"pending_buf_blk2")
+
+            # Block 0 should still be loadable (from pending buffer, not SSD)
+            with mgr._hot_cache_lock:
+                assert b"pending_buf_blk0" not in mgr._hot_cache, (
+                    "Block 0 should have been evicted from hot cache"
+                )
+            loaded = mgr.load_block(b"pending_buf_blk0")
+            assert loaded is not None, (
+                "Evicted block should be readable from pending write buffer"
+            )
+            assert len(loaded) == 2
+        finally:
+            mgr.close()
+
+    def test_writer_cleanup_empties_buffer(self, tmp_path):
+        """After background writer completes, pending buffer entry is removed."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "writer_cleanup_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, b"cleanup_test_blk0")
+            self._save_block(mgr, b"cleanup_test_blk1")
+            # Evict block 0
+            self._save_block(mgr, b"cleanup_test_blk2")
+
+            # Block 0 should be in pending buffer
+            with mgr._pending_write_hashes_lock:
+                assert b"cleanup_test_blk0" in mgr._pending_write_buffers
+
+            # Wait for writer to finish
+            time.sleep(1.0)
+
+            # Buffer should be empty after writer cleanup
+            with mgr._pending_write_hashes_lock:
+                assert b"cleanup_test_blk0" not in mgr._pending_write_buffers
+                assert b"cleanup_test_blk0" not in mgr._pending_write_hashes
+        finally:
+            mgr.close()
+
+    def test_has_block_sees_pending_entries(self, tmp_path):
+        """has_block() returns True for blocks in the pending write buffer."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "has_block_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, b"has_block_test_b0")
+            self._save_block(mgr, b"has_block_test_b1")
+            # Evict block 0
+            self._save_block(mgr, b"has_block_test_b2")
+
+            with mgr._hot_cache_lock:
+                assert b"has_block_test_b0" not in mgr._hot_cache
+
+            assert mgr.has_block(b"has_block_test_b0") is True, (
+                "has_block should find blocks in the pending write buffer"
+            )
+        finally:
+            mgr.close()
+
+    def test_delete_block_clears_pending_buffer(self, tmp_path):
+        """delete_block() removes the entry from pending write buffer."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "delete_pending_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, b"del_pending_blk_0")
+            self._save_block(mgr, b"del_pending_blk_1")
+            # Evict block 0
+            self._save_block(mgr, b"del_pending_blk_2")
+
+            # Block 0 is in pending buffer
+            with mgr._pending_write_hashes_lock:
+                assert b"del_pending_blk_0" in mgr._pending_write_buffers
+
+            # Delete it
+            mgr.delete_block(b"del_pending_blk_0")
+
+            # Should no longer be loadable
+            loaded = mgr.load_block(b"del_pending_blk_0")
+            assert loaded is None, (
+                "Deleted block should not be readable from pending buffer"
+            )
+        finally:
+            mgr.close()
+
+    def test_queue_full_cleans_pending_buffer(self, tmp_path):
+        """When write queue is full, dropped block is removed from pending buffer."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "queue_full_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            # Pause the writer by filling the queue with sentinel-free blocks
+            # Use a tiny queue to make overflow easy
+            original_maxsize = mgr._write_queue.maxsize
+            mgr._write_queue = __import__("queue").Queue(maxsize=1)
+
+            # Save blocks to fill queue via eviction
+            self._save_block(mgr, b"qf_test_block_00")
+            self._save_block(mgr, b"qf_test_block_01")
+            # This evicts block 0 → fills queue (size 1)
+            self._save_block(mgr, b"qf_test_block_02")
+            # This evicts block 1 → queue full → should drop AND clean buffer
+            self._save_block(mgr, b"qf_test_block_03")
+
+            # Block 1 was dropped — should NOT be in pending buffer
+            with mgr._pending_write_hashes_lock:
+                assert b"qf_test_block_01" not in mgr._pending_write_buffers, (
+                    "Dropped block should be removed from pending buffer on queue full"
+                )
+                assert b"qf_test_block_01" not in mgr._pending_write_hashes, (
+                    "Dropped block should be removed from pending hashes on queue full"
+                )
+        finally:
+            mgr._write_queue = __import__("queue").Queue(maxsize=original_maxsize)
+            mgr.close()
+
+    def test_evicted_block_loadable_with_metadata(self, tmp_path):
+        """load_block_with_metadata returns data for pending-buffer blocks."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "meta_load_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, b"meta_load_blk_00")
+            self._save_block(mgr, b"meta_load_blk_01")
+            # Evict block 0
+            self._save_block(mgr, b"meta_load_blk_02")
+
+            cache_data, metadata = mgr.load_block_with_metadata(b"meta_load_blk_00")
+            assert cache_data is not None, (
+                "load_block_with_metadata should serve evicted block from pending buffer"
+            )
+            assert metadata is not None
+            assert metadata["num_layers"] == 2
+            assert metadata["token_count"] == 16
+            assert metadata["model_name"] == "test-model"
+        finally:
+            mgr.close()
+
+    def test_end_to_end_lifecycle(self, tmp_path):
+        """Full lifecycle: save → evict → pending hit → writer completes → SSD hit."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "lifecycle_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            self._save_block(mgr, b"lifecycle_blk_00")
+            self._save_block(mgr, b"lifecycle_blk_01")
+            # Evict block 0
+            self._save_block(mgr, b"lifecycle_blk_02")
+
+            # Phase 1: pending buffer hit (before writer completes)
+            loaded = mgr.load_block(b"lifecycle_blk_00")
+            assert loaded is not None, "Should load from pending buffer"
+            assert mgr._stats["hot_cache_hits"] >= 1
+
+            # Phase 2: wait for writer to complete
+            time.sleep(1.0)
+
+            # Buffer should be empty
+            with mgr._pending_write_hashes_lock:
+                assert b"lifecycle_blk_00" not in mgr._pending_write_buffers
+
+            # Phase 3: SSD hit (block now on disk)
+            loaded_ssd = mgr.load_block(b"lifecycle_blk_00")
+            assert loaded_ssd is not None, "Should load from SSD after writer completes"
+            assert len(loaded_ssd) == 2
+        finally:
+            mgr.close()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestSSDWriteDrops:
+    """ssd_write_drops counter increments at queue-saturation drop sites."""
+
+    # Mirrors TestPendingWriteBuffer._make_cache_data — small dimensions
+    # so the per-entry footprint is small and predictable for queue tests.
+    def _make_cache_data(self, num_layers=2, seq_len=16, heads=2, head_dim=16):
+        return [
+            (
+                mx.zeros((1, heads, seq_len, head_dim)),
+                mx.zeros((1, heads, seq_len, head_dim)),
+            )
+            for _ in range(num_layers)
+        ]
+
+    # Mirrors TestPendingWriteBuffer._save_block — uses 2 layers, token_count=16
+    # so the entry_size formula `2 * 2 * 1 * 2 * 16 * 16 * 4` calibrates Test A.
+    def _save_block(self, manager, block_hash, model="test-model"):
+        cache_data = self._make_cache_data()
+        return manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=16,
+            model_name=model,
+            layer_cache_types=["KVCache"] * 2,
+        )
+
+    def test_paged_ssd_cache_stats_default_and_reset(self):
+        """Dataclass: ssd_write_drops defaults to 0 and is zeroed by reset()."""
+        from omlx.cache.stats import PagedSSDCacheStats
+
+        # Default is zero.
+        stats = PagedSSDCacheStats()
+        assert stats.ssd_write_drops == 0
+
+        # reset() returns it to zero from a non-zero state.
+        stats = PagedSSDCacheStats(ssd_write_drops=5, saves=2, loads=3)
+        stats.reset()
+        assert stats.ssd_write_drops == 0
+        # Verify reset() didn't break the existing fields it already handled.
+        assert stats.saves == 0
+        assert stats.loads == 0
+
+    def test_ssd_write_drops_field_round_trips_through_get_stats(self, tmp_path):
+        """The _stats dict value flows through get_stats() AND get_stats_for_model().
+
+        Force a non-zero value into _stats so a missing pass-through in either
+        accessor would leave the dataclass at the default 0 and fail this test.
+        The default-0 case is covered by the dataclass-level test in Task 1;
+        this test exercises the wiring specifically.
+        """
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "wiring_test",
+            max_size_bytes=100 * 1024**2,
+        )
+        try:
+            # Directly poke a non-zero value to test the accessor pass-through
+            # specifically. The real increment sites have their own tests
+            # further down in this class; this test would catch a regression
+            # where a future refactor drops the field from get_stats() or
+            # get_stats_for_model() but leaves the _stats dict key alone.
+            mgr._stats["ssd_write_drops"] = 7
+
+            # Global stats accessor.
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 7, (
+                "get_stats() must pass _stats['ssd_write_drops'] through "
+                "to the dataclass field"
+            )
+
+            # Per-model stats accessor — same wiring, separate code path.
+            # Use any model name; the field is global on the manager.
+            model_stats = mgr.get_stats_for_model("any-model-name")
+            assert model_stats.ssd_write_drops == 7, (
+                "get_stats_for_model() must pass _stats['ssd_write_drops'] "
+                "through to the dataclass field"
+            )
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_hot_eviction_queue_full(self, tmp_path):
+        """Site 1: hot-cache eviction → put_nowait raises queue.Full → drop += 1.
+
+        Patches the real queue's put_nowait to always raise queue.Full,
+        guaranteeing the drop path fires on the first eviction without any
+        dependency on the writer thread's drain rate.
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
+        # entry_size matches the small-dimension helpers above (num_layers=2,
+        # K+V=2 tensors, batch=1, heads=2, seq=16, head_dim=16, float32=4).
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100  # holds exactly 2 entries
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_hot_eviction_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+        try:
+            with patch.object(
+                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+            ):
+                self._save_block(mgr, b"qf_drop_block_00")
+                self._save_block(mgr, b"qf_drop_block_01")
+                # save_02 evicts block 00 → _enqueue_ssd_write → put_nowait
+                # raises queue.Full → drop fires, cleanup runs.
+                self._save_block(mgr, b"qf_drop_block_02")
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            assert stats.errors == 0  # drops are distinct from errors
+
+            # Block 00 was the one being enqueued when put_nowait raised.
+            # Cleanup must have removed it from both pending structures.
+            with mgr._pending_write_hashes_lock:
+                assert b"qf_drop_block_00" not in mgr._pending_write_buffers
+                assert b"qf_drop_block_00" not in mgr._pending_write_hashes
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_cold_store_preflight(self, tmp_path):
+        """Site 2: save_block preflight _write_queue.full() guard.
+
+        Hot cache disabled. Patches the queue's `full()` method to return
+        True so the preflight short-circuits on the first save. No real
+        queue manipulation, no writer-thread race, no risk of crashing the
+        writer with a malformed sentinel.
+        """
+        from unittest.mock import patch
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_cold_preflight_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,  # hot cache disabled → cold-store path
+        )
+        try:
+            with patch.object(mgr._write_queue, "full", return_value=True):
+                cache_data = self._make_cache_data()
+                ok = mgr.save_block(
+                    block_hash=b"cold_preflight_drop_00",
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+                assert ok is False
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            assert stats.errors == 0
+            # Site 2 is a preflight rejection — no index/buffer state was
+            # created, so nothing to assert on cleanup.
+        finally:
+            mgr.close()
+
+    def test_ssd_write_drops_increments_on_cold_store_late_exception(self, tmp_path):
+        """Site 3: save_block put_nowait raises queue.Full after preflight passes.
+
+        Hot cache disabled. put_nowait is patched to raise queue.Full even
+        though _write_queue.full() reports False — forces the late-exception
+        path inside save_block. Cleanup must remove index + pending hashes.
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "drops_cold_late_exception_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+        try:
+            cache_data = self._make_cache_data()
+            block_hash = b"cold_late_drop_00"
+            with patch.object(
+                mgr._write_queue, "put_nowait", side_effect=_queue.Full
+            ):
+                ok = mgr.save_block(
+                    block_hash=block_hash,
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+                assert ok is False
+
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 1
+            # Site 3 cleanup: removed from index and pending hashes.
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_hashes
+        finally:
+            mgr.close()

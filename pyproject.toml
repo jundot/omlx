@@ -75,8 +75,8 @@ dependencies = [
     # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
+    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@1ba671372b289c025b435c1a13aabb4bfb80b183",
 ]
 
 [project.optional-dependencies]
@@ -104,6 +104,37 @@ paroquant = [
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
     "paroquant==0.1.14; python_version >= '3.11'",
 ]
+# Internal extra consumed by packaging/build.py to populate the
+# venvstacks mlx-base layer's requirements list. Listed here as the
+# single source of truth so the layer-template venvstacks.toml stays
+# version-free. End-users don't `pip install omlx[bundle]`; this is for
+# the macOS .app build pipeline.
+#
+# mlx-audio[tts,stt,sts]'s 12 transitive deps appear explicitly because
+# venvstacks 0.7.0's internal `uv pip compile` runs with --no-config and
+# doesn't propagate pyproject.toml's `tool.uv.override-dependencies`,
+# so it can't resolve mlx-audio's `mlx-lm==0.31.1` pin against our
+# git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
+# separately via --no-deps post-resolution.
+bundle = [
+    "mcp>=1.0.0",
+    "modelscope>=1.10.0",
+    # mlx-audio[tts,stt,sts] transitives:
+    "scipy>=1.11.0",
+    "librosa>=0.10.0",
+    "miniaudio>=1.59",
+    "numba>=0.59.0",
+    "pyloudnorm>=0.1.0",
+    "sounddevice>=0.4.6",
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "spacy>=3.8.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
+    "webrtcvad>=2.0.10",
+    # [audio] extra on top of pyproject's plain mistral-common>=1.10
+    "mistral-common[audio]>=1.10",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -111,6 +142,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "venvstacks>=0.7.0",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -123,6 +155,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "venvstacks>=0.7.0",
 ]
 
 [project.urls]

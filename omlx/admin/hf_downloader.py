@@ -8,19 +8,31 @@ with directory-size-based progress polling.
 import asyncio
 import enum
 import logging
+import os
 import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
+import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     EntryNotFoundError,
     GatedRepoError,
     RepositoryNotFoundError,
 )
+from huggingface_hub.utils import tqdm as _hf_tqdm
+
+# Force the xet download path off. hf_xet's Rust ``download_files`` invokes
+# the Python progress callback from a Rust frame and silently swallows any
+# Python exception raised inside it, so our tqdm-based cooperative cancel is
+# a no-op on xet-enabled repos. Falling back to ``http_get`` keeps cancel
+# working at chunk granularity. See issue #1322.
+_hf_constants.HF_HUB_DISABLE_XET = True
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 logger = logging.getLogger(__name__)
 
@@ -31,21 +43,128 @@ _HF_API_TIMEOUT = 10
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
 
+# Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
+# endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
+# 308-redirect to huggingface.co when accessed from IPs outside their region;
+# huggingface_hub does NOT follow those cross-origin 308s during HEAD probes,
+# so downloads fail. We resolve the redirect chain upfront and pin HfApi to
+# the final origin.
+_endpoint_resolution_cache: dict[str, str] = {}
+
+
+def _resolve_endpoint(endpoint: str) -> str:
+    """Follow permanent (301/308) cross-origin redirects on `endpoint`.
+
+    Returns the final origin (scheme://host[:port]) the endpoint resolves to.
+    Used to work around `huggingface_hub`'s inability to follow cross-origin
+    308 redirects during file-download HEAD probes.
+
+    Probes a known-stable HF API path (`/api/models/gpt2`) with HEAD; if the
+    server returns a 301/308 with a Location pointing at a different host,
+    the redirected origin is returned (and cached). Network errors fall back
+    to the original endpoint.
+    """
+    endpoint = endpoint.rstrip("/")
+    if endpoint in _endpoint_resolution_cache:
+        return _endpoint_resolution_cache[endpoint]
+
+    try:
+        import httpx
+    except ImportError:
+        return endpoint
+
+    probe = f"{endpoint}/api/models/gpt2"
+    original_host = urlparse(endpoint).netloc
+    resolved = endpoint
+    try:
+        with httpx.Client(follow_redirects=False, timeout=5.0) as client:
+            r = client.head(probe)
+            # Walk up to 3 permanent hops; stop on first non-permanent status.
+            hops = 0
+            current_url = probe
+            while r.status_code in (301, 308) and "location" in r.headers:
+                hops += 1
+                if hops > 3:
+                    break
+                location = r.headers["location"]
+                if location.startswith("/"):
+                    # Relative redirect — same origin, no rewrite needed.
+                    break
+                target = urlparse(location)
+                if not target.netloc:
+                    break
+                if target.netloc != original_host:
+                    # Cross-origin permanent redirect: rewrite the endpoint.
+                    port = f":{target.port}" if target.port else ""
+                    resolved = f"{target.scheme}://{target.hostname}{port}"
+                    original_host = target.netloc
+                current_url = location
+                r = client.head(current_url)
+    except Exception as e:  # noqa: BLE001 — probe is best-effort
+        logger.debug(f"HF endpoint probe failed for {endpoint}: {e}")
+        return endpoint
+
+    if resolved != endpoint:
+        logger.info(
+            f"HuggingFace endpoint {endpoint} permanently redirects to "
+            f"{resolved}; using resolved origin for downloads."
+        )
+    _endpoint_resolution_cache[endpoint] = resolved
+    return resolved
+
+
+class _DownloadCancelled(Exception):
+    """Raised inside the download thread to interrupt a cancelled download."""
+
+
+def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
+    """Build a tqdm subclass that aborts the download when cancelled.
+
+    huggingface_hub's http_get calls ``progress.update(len(chunk))`` once per
+    downloaded chunk (DOWNLOAD_CHUNK_SIZE, 10MB). A running thread can't be
+    force-stopped and snapshot_download takes no cancel token, so we cooperate
+    from the progress callback: raising here unwinds the download thread
+    cleanly within one chunk, releasing its buffers and connection.
+
+    Note: this relies on the Python http_get path. If HF_HUB_ENABLE_HF_TRANSFER
+    is on, the Rust path ignores tqdm_class and this won't interrupt; oMLX does
+    not enable hf_transfer.
+    """
+
+    class _CancellableTqdm(_hf_tqdm):
+        def update(self, n=1):
+            if should_cancel():
+                raise _DownloadCancelled()
+            return super().update(n)
+
+    return _CancellableTqdm
+
 
 def _get_hf_api() -> tuple[HfApi, str | None]:
     """Create HfApi instance with configured endpoint.
 
+    Only the admin UI's `huggingface.endpoint` setting is honored here.
+    When that's empty, return `HfApi()` with no explicit endpoint so
+    `huggingface_hub` falls back to its own resolution (which already
+    honors the `HF_ENDPOINT` env var). The configured endpoint, when
+    present, is run through `_resolve_endpoint()` to follow permanent
+    cross-origin redirects (e.g. hf-mirror.com → huggingface.co from
+    non-CN IPs) so downstream HF library code sees a stable origin.
+
     Returns:
         Tuple of (HfApi instance, endpoint URL or None).
     """
+    endpoint: str | None = None
     try:
         from ..settings import get_settings
 
-        endpoint = get_settings().huggingface.endpoint
-        if endpoint:
-            return HfApi(endpoint=endpoint), endpoint
+        endpoint = get_settings().huggingface.endpoint or None
     except (RuntimeError, AttributeError):
-        pass
+        endpoint = None
+
+    if endpoint:
+        resolved = _resolve_endpoint(endpoint)
+        return HfApi(endpoint=resolved), resolved
     return HfApi(), None
 
 
@@ -152,6 +271,8 @@ _SORT_MAP = {
     "updated": "lastModified",
     "most_params": "downloads",  # fetch by downloads, re-sort in Python
     "least_params": "downloads",  # fetch by downloads, re-sort in Python
+    "largest": "downloads",  # fetch by downloads, re-sort by size in Python
+    "smallest": "downloads",  # fetch by downloads, re-sort by size in Python
 }
 
 
@@ -245,32 +366,53 @@ class HFDownloader:
         sort: str = "trending",
         limit: int = 100,
         mlx_only: bool = True,
+        # Filtering options
+        min_params: Optional[int] = None,
+        max_params: Optional[int] = None,
+        min_size: Optional[int] = None,
+        max_size: Optional[int] = None,
+        # Sorting options
+        sort_by_size: bool = False,
+        sort_ascending: bool = False,
     ) -> dict:
-        """Search HuggingFace models by query string.
+        """Search HuggingFace models by query string with filtering and sorting.
 
         When mlx_only is True, results are restricted to the MLX library
         (same as https://huggingface.co/models?library=mlx).
 
         Args:
             query: Search query string.
-            sort: Sort order (trending/downloads/created/updated/most_params/least_params).
+            sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
             mlx_only: If True, restrict to MLX library models only.
+            min_params: Minimum parameter count filter.
+            max_params: Maximum parameter count filter.
+            min_size: Minimum model size in bytes filter.
+            max_size: Maximum model size in bytes filter.
+            sort_by_size: Sort results by size instead of default sort.
+            sort_ascending: Sort in ascending order (for size/params sorting).
 
         Returns:
             Dict with 'models' list and 'total' count.
         """
         api, _endpoint = _get_hf_api()
-        sort_key = _SORT_MAP.get(sort, "trendingScore")
+
+        # Determine base sort - for Python-side sorting, we fetch by downloads
+        # which tends to return more results, then sort in Python
+        if sort in ("most_params", "least_params", "largest", "smallest"):
+            base_sort = "downloads"
+        else:
+            base_sort = _SORT_MAP.get(sort, "trendingScore")
 
         kwargs = {
             "search": query,
-            "sort": sort_key,
+            "sort": base_sort,
             "limit": limit,
             "expand": ["safetensors", "downloads", "likes", "trendingScore"],
         }
         if mlx_only:
             kwargs["filter"] = "mlx"
+
         models = await asyncio.wait_for(
             asyncio.to_thread(api.list_models, **kwargs),
             timeout=_HF_API_TIMEOUT,
@@ -281,12 +423,23 @@ class HFDownloader:
             params = None
             params_formatted = None
             size = 0
+
             if m.safetensors and m.safetensors.get("parameters"):
                 params = _get_param_count(m.safetensors)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if params and params <= 0:
                     params = None
+
+            # Apply filters
+            if min_params is not None and (params is None or params < min_params):
+                continue
+            if max_params is not None and (params is None or params > max_params):
+                continue
+            if min_size is not None and size < min_size:
+                continue
+            if max_size is not None and size > max_size:
+                continue
 
             results.append(
                 {
@@ -302,11 +455,18 @@ class HFDownloader:
                 }
             )
 
-        # Re-sort in Python for parameter-based sorting
+        # Apply Python-side sorting
         if sort == "most_params":
             results.sort(key=lambda x: x["params"] or 0, reverse=True)
         elif sort == "least_params":
             results.sort(key=lambda x: x["params"] or 0)
+        elif sort in ("largest", "smallest") or sort_by_size:
+            # Sort by size, putting unknown-size entries at the end
+            results.sort(
+                key=lambda x: x["size"] if x["size"] > 0 else -1,
+                reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),
+            )
+        # Otherwise, keep original HF API ordering (trending, downloads, created, updated)
 
         return {
             "models": results[:limit],
@@ -529,7 +689,7 @@ class HFDownloader:
     ) -> DownloadTask:
         """Retry a failed or cancelled download, resuming from existing files.
 
-        Since partial files are preserved on disk, snapshot_download will
+        Finalized shards are preserved on disk so snapshot_download will
         automatically skip already-completed files.
 
         Args:
@@ -578,8 +738,11 @@ class HFDownloader:
                 progress_task.cancel()
         self._progress_tasks.clear()
 
-        # Cancel all active download tasks
+        # Cancel all active download tasks. Mark cancelled first so an
+        # in-flight snapshot_download thread aborts via its progress callback;
+        # active_task.cancel() only unblocks tasks still waiting on the semaphore.
         for task_id, active_task in list(self._active_tasks.items()):
+            self._cancelled.add(task_id)
             if not active_task.done():
                 active_task.cancel()
                 task = self._tasks.get(task_id)
@@ -673,10 +836,16 @@ class HFDownloader:
                     self._poll_progress(task_id, target_dir)
                 )
 
-                # Run snapshot_download in a thread (blocking call)
+                # Run snapshot_download in a thread (blocking call). The
+                # cancellable tqdm aborts the download from its per-chunk
+                # progress callback so cancel actually stops it (the thread
+                # itself can't be force-killed).
                 await asyncio.to_thread(
                     snapshot_download,
                     **dl_kwargs,
+                    tqdm_class=_make_cancellable_tqdm(
+                        lambda: task_id in self._cancelled
+                    ),
                 )
 
                 # Check if cancelled while downloading
@@ -705,12 +874,18 @@ class HFDownloader:
                             f"Error in download completion callback: {e}"
                         )
 
-        except asyncio.CancelledError:
+        except (_DownloadCancelled, asyncio.CancelledError):
             if task.status not in (
                 DownloadStatus.CANCELLED,
                 DownloadStatus.FAILED,
             ):
                 task.status = DownloadStatus.CANCELLED
+            try:
+                self._cleanup_partial(task)
+            except Exception as e:
+                logger.error(
+                    f"Failed to clean up cancelled download {task.repo_id}: {e}"
+                )
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -839,23 +1014,19 @@ class HFDownloader:
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove partially downloaded model directory."""
+        """Remove in-progress shards while keeping finalized files for resume.
+
+        Hub stages partial downloads inside a hidden ``._____temp`` directory
+        and only renames a shard into the target on completion. Wiping the
+        whole target dir would also nuke shards the user has already paid
+        for; finalized files are visible in the file browser, so users can
+        keep them for auto-resume on retry or remove them themselves.
+        """
         target_dir = self._model_dir / task.repo_id
-        if target_dir.exists():
+        temp_dir = target_dir / "._____temp"
+        if temp_dir.exists():
             try:
-                shutil.rmtree(target_dir)
-                logger.info(f"Cleaned up partial download: {target_dir}")
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
-                logger.error(f"Failed to clean up {target_dir}: {e}")
-        # Drop empty org folder so cancelled downloads do not leave
-        # stub directories behind.
-        parent = target_dir.parent
-        if (
-            parent != self._model_dir
-            and parent.exists()
-            and not any(parent.iterdir())
-        ):
-            try:
-                parent.rmdir()
-            except OSError as e:
-                logger.debug(f"Could not remove empty org folder {parent}: {e}")
+                logger.error(f"Failed to clean up {temp_dir}: {e}")

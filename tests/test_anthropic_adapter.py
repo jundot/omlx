@@ -108,6 +108,66 @@ class TestAnthropicAdapter:
         assert internal.messages[0].content == "You are a helpful assistant."
         assert internal.messages[1].role == "user"
 
+    def test_parse_request_in_messages_system(self, adapter):
+        """role="system" entries inside messages[] are lifted into the
+        canonical system position (claude-code 2.1.154+ behavior)."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hi there"),
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="assistant", content="ok"),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == "Be terse."
+        roles = [m.role for m in internal.messages[1:]]
+        assert roles == ["user", "assistant"]
+
+    def test_parse_request_system_field_and_in_messages_merge(self, adapter):
+        """System field and in-messages system content merge into one block,
+        with the canonical system field first and inlined parts appended."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="user", content="Hi"),
+            ],
+            system="You are a helpful assistant.",
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == (
+            "You are a helpful assistant.\n\nBe terse."
+        )
+        assert internal.messages[1].role == "user"
+
+    def test_parse_request_multiple_in_messages_system(self, adapter):
+        """Multiple inline role="system" entries concatenate in source order."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="First."),
+                AnthropicMessage(role="user", content="Hi"),
+                AnthropicMessage(role="system", content="Second."),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == "First.\nSecond."
+        # The user message survives and no stray system entries remain.
+        assert [m.role for m in internal.messages[1:]] == ["user"]
+
     # =========================================================================
     # parse_request Tests - Generation Parameters
     # =========================================================================

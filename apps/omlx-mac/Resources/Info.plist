@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>oMLX</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<!--
+	  LSUIElement intentionally omitted. We start as Regular activation
+	  policy and switch to Accessory at runtime once the NSStatusItem is
+	  registered with WindowServer. Combining LSUIElement=true with that
+	  runtime switch causes Tahoe ControlCenter to silently block the
+	  status item (see app.py:189-200 + issue #725 from the Python menubar).
+	-->
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 oMLX. All rights reserved.</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<true/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<!--
+	  URL scheme used by AppDelegate.presentAppView() to ask SwiftUI's
+	  Window scene (id "main") to instantiate on first invocation.
+	  The scene's `.handlesExternalEvents(matching: ["main"])` consumes
+	  `omlxapp://main`. Once the NSWindow exists, subsequent shows go
+	  through `makeKeyAndOrderFront` directly.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>app.omlx.url</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>omlxapp</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+		<string>zh-Hant</string>
+		<string>ja</string>
+		<string>ko</string>
+	</array>
+</dict>
+</plist>

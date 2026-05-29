@@ -41,6 +41,11 @@ def extract_thinking(text: str) -> Tuple[str, str]:
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
 
+    Tag-free text is always classified as content. Mirrors
+    ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
+    fallback): when the model emits no thinking markers, surface the body
+    as the answer so the response is never empty.
+
     Args:
         text: Complete model output text.
 
@@ -106,8 +111,8 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self):
-        self._in_thinking: bool = False
+    def __init__(self, start_in_thinking: bool = False):
+        self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
         # Recovery state for malformed thinking: when the prompt prepends
         # ``<think>`` and the model never emits ``</think>`` before EOS,

@@ -210,7 +210,7 @@ brew services info omlx     # 查看状态
 
 ### macOS 菜单栏应用
 
-原生 PyObjC 菜单栏应用（非 Electron）。无需打开终端即可启动、停止和监控服务器。包含持久化服务统计（重启后保留）、崩溃自动重启和应用内自动更新。
+原生 Swift / SwiftUI 菜单栏应用（非 Electron）。无需打开终端即可启动、停止和监控服务器。包含持久化服务统计（重启后保留）、崩溃自动重启和基于 Sparkle 的自动更新。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX 菜单栏统计" width="400">
@@ -338,22 +338,20 @@ pytest -m "not slow"
 
 ### macOS 应用
 
-需要 Python 3.11+ 和 [venvstacks](https://venvstacks.lmstudio.ai)（`pip install venvstacks`）。
+原生 SwiftUI 应用位于 `apps/omlx-mac/`，需要 Xcode 26.5+ 和 Python 3.11+。venvstacks 已声明为 dev 依赖，因此 `pip install -e ".[dev]"`（或 `uv sync --dev`）会引入固定版本。若偏好主机全局工具运行器，也可使用 `uvx venvstacks` 或 `pipx run venvstacks`。
 
 ```bash
-cd packaging
+# 暂存可运行的 oMLX.app（xcodebuild + venvstacks Python 层 + ad-hoc 签名）
+apps/omlx-mac/Scripts/build.sh release
 
-# 完整构建（venvstacks + 应用包 + DMG）
-python build.py
+# 结果在 apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# 跳过 venvstacks（仅代码更改）
-python build.py --skip-venv
-
-# 仅 DMG
-python build.py --dmg-only
+# 强制重建 venvstacks（默认按指纹缓存）
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 ```
 
-应用包结构和层配置的详细说明请参阅 [packaging/README.md](packaging/README.md)。
+首次 cold 构建需要 10–20 分钟（venvstacks Python 层组装）。后续构建复用 `packaging/_export/` 缓存，约 4 分钟完成。层配置请参阅 [packaging/README.md](packaging/README.md)，Swift 源码请参阅 [apps/omlx-mac/](apps/omlx-mac/)。
 
 ## 贡献
 

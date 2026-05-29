@@ -133,6 +133,7 @@ from .api.responses_utils import (
     ResponseStateNotFoundError,
     build_function_call_output_item,
     build_message_output_item,
+    build_reasoning_output_item,
     build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
@@ -332,22 +333,26 @@ async def lifespan(app: FastAPI):
         _server_state.global_settings is not None
         and _server_state.engine_pool is not None
     ):
-        max_bytes = _server_state.global_settings.memory.get_max_process_memory_bytes()
-        if max_bytes is not None:
-            from .process_memory_enforcer import ProcessMemoryEnforcer
+        from .process_memory_enforcer import ProcessMemoryEnforcer
 
-            enforcer = ProcessMemoryEnforcer(
-                engine_pool=_server_state.engine_pool,
-                max_bytes=max_bytes,
-                settings_manager=_server_state.settings_manager,
-                prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
-                global_settings=_server_state.global_settings,
-                soft_threshold=_server_state.global_settings.memory.soft_threshold,
-                hard_threshold=_server_state.global_settings.memory.hard_threshold,
-            )
-            _server_state.process_memory_enforcer = enforcer
-            _server_state.engine_pool._process_memory_enforcer = enforcer
-            enforcer.start()
+        memory_settings = _server_state.global_settings.memory
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=_server_state.engine_pool,
+            memory_guard_tier=memory_settings.memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_settings.memory_guard_custom_ceiling_gb,
+            settings_manager=_server_state.settings_manager,
+            prefill_memory_guard=memory_settings.prefill_memory_guard,
+            global_settings=_server_state.global_settings,
+            soft_threshold=memory_settings.soft_threshold,
+            hard_threshold=memory_settings.hard_threshold,
+            prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
+            prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+        )
+        _server_state.process_memory_enforcer = enforcer
+        _server_state.engine_pool._process_memory_enforcer = enforcer
+        # Engine pool consults the enforcer for the pre-load ceiling.
+        _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        enforcer.start()
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -831,6 +836,8 @@ def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
     model_id: str | None = None,
+    req_top_k: int | None = None,
+    req_repetition_penalty: float | None = None,
     req_min_p: float | None = None,
     req_presence_penalty: float | None = None,
     req_frequency_penalty: float | None = None,
@@ -904,13 +911,19 @@ def get_sampling_params(
         else:
             top_p = global_sampling.top_p
 
-        if model_settings and model_settings.top_k is not None:
+        if req_top_k is not None:
+            top_k = req_top_k
+        elif model_settings and model_settings.top_k is not None:
             top_k = model_settings.top_k
+        elif ocr_defaults and "top_k" in ocr_defaults:
+            top_k = ocr_defaults["top_k"]
         else:
             top_k = global_sampling.top_k
 
-    # Repetition penalty: model settings > ocr_defaults > global default (1.0)
-    if model_settings and model_settings.repetition_penalty is not None:
+    # Repetition penalty: request > model settings > ocr_defaults > global (1.0)
+    if req_repetition_penalty is not None:
+        repetition_penalty = req_repetition_penalty
+    elif model_settings and model_settings.repetition_penalty is not None:
         repetition_penalty = model_settings.repetition_penalty
     elif ocr_defaults and "repetition_penalty" in ocr_defaults:
         repetition_penalty = ocr_defaults["repetition_penalty"]
@@ -1099,7 +1112,6 @@ def validate_context_window(
 
 def init_server(
     model_dirs: str | list[str],
-    max_model_memory: int | None,
     scheduler_config=None,
     api_key: str | None = None,
     global_settings: object | None = None,
@@ -1109,7 +1121,6 @@ def init_server(
 
     Args:
         model_dirs: Path or list of paths to directories containing model subdirectories
-        max_model_memory: Maximum memory for loaded models in bytes, or None for no limit
         scheduler_config: Scheduler config for BatchedEngine
         api_key: API key for authentication (optional)
         global_settings: GlobalSettings instance (optional)
@@ -1201,9 +1212,10 @@ def init_server(
             model_path.mkdir(parents=True, exist_ok=True)
             logger.warning(f"Model directory created (empty): {md}")
 
-    # Create engine pool
+    # Create engine pool. The pool consults enforcer.get_final_ceiling()
+    # for pre-load admission — wired up later in startup once the enforcer
+    # is constructed.
     _server_state.engine_pool = EnginePool(
-        max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
     )
 
@@ -1242,10 +1254,11 @@ def init_server(
         logger.info(f"Default model: {_server_state.default_model}")
     else:
         logger.info("No default model (no models available)")
-    if max_model_memory is None:
-        logger.info("Max model memory: disabled (no limit)")
-    else:
-        logger.info(f"Max model memory: {format_size(max_model_memory)}")
+    if global_settings and getattr(global_settings, "memory", None):
+        logger.info(
+            f"Memory guard tier: {global_settings.memory.memory_guard_tier} "
+            f"(guard {'on' if global_settings.memory.prefill_memory_guard else 'off'})"
+        )
     logger.info(f"Default max tokens: {_server_state.sampling.max_tokens}")
     if api_key:
         logger.info("API key authentication: enabled")
@@ -1352,6 +1365,26 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     if protocol == "openai_responses":
         return None
     return None
+
+
+def _chat_keepalive_chunk(response_id: str) -> str:
+    """Keepalive frame that shares the stream's completion id.
+
+    The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
+    (``chatcmpl-keepalive``) that differs from the real completion chunks.
+    Strict OpenAI stream accumulators (e.g. the official ``openai-go`` SDK)
+    assume every chunk in one streamed completion shares a single ``id``: they
+    latch the first chunk's id and silently drop later chunks whose id differs,
+    discarding the real ``tool_calls``/``finish_reason``/``usage``. Emitting the
+    keepalive with the stream's own ``response_id`` makes it a true no-op for
+    those clients while remaining a parseable data event for clients that can't
+    handle SSE comment lines.
+    """
+    return (
+        'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
+        '"created":0,"model":"keepalive",'
+        '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    )
 
 
 async def _safe_anext(ait):
@@ -1549,10 +1582,12 @@ async def health():
 
     pool_status = None
     if _server_state.engine_pool is not None:
+        enforcer = _server_state.process_memory_enforcer
+        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
-            "max_model_memory": _server_state.engine_pool.max_model_memory,
+            "final_ceiling": ceiling,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
@@ -1587,7 +1622,10 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
-        model_memory_max = pool.max_model_memory
+        enforcer = _server_state.process_memory_enforcer
+        model_memory_max = (
+            enforcer.get_final_ceiling() if enforcer is not None else None
+        )
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -1986,6 +2024,8 @@ async def create_completion(
 
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
             request.temperature, request.top_p, request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
             req_min_p=getattr(request, 'min_p', None),
             req_presence_penalty=getattr(request, 'presence_penalty', None),
             req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2042,8 +2082,10 @@ async def create_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=total_cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_completion()),
@@ -2130,11 +2172,15 @@ async def create_chat_completion(
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
-    elif is_vlm:
-        # VLM: preserve image_url content parts for vision processing
+    elif is_vlm or is_dflash_vlm:
+        # VLM or DFlash with VLM fallback: preserve image_url content parts
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,
@@ -2209,6 +2255,8 @@ async def create_chat_completion(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2298,11 +2346,17 @@ async def create_chat_completion(
         chat_kwargs["stop"] = request.stop
 
     if request.stream:
+        # Pre-mint the completion id so the keepalive frame (emitted before the
+        # generator starts) can share it. See _chat_keepalive_chunk.
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        keepalive = _resolve_keepalive("openai_chat")
+        if keepalive == _KEEPALIVE_CHAT_CHUNK:
+            keepalive = _chat_keepalive_chunk(response_id)
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
                 http_request=http_request,
-                keepalive_chunk=_resolve_keepalive("openai_chat"),
+                keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2399,8 +2453,10 @@ async def create_chat_completion(
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=output.cached_tokens,
                 ),
+                model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
+                total_time=round(elapsed, 2),
             ),
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
@@ -2535,6 +2591,8 @@ def _compile_with_structural_tag(compiler, fmt: dict, reasoning_parser: str,
     protocol structure (thinking tags, channel markers, etc.) and patches
     the user's grammar into the output slot.
     """
+    from omlx._torch_stub import install as _install_torch_stub
+    _install_torch_stub()
     import xgrammar as xgr
 
     reasoning = not (
@@ -2650,6 +2708,8 @@ async def stream_completion(
 
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2752,6 +2812,7 @@ async def stream_chat_completion(
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
+    response_id: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2767,7 +2828,9 @@ async def stream_chat_completion(
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    # Reuse the id pre-minted by the caller (so the keepalive frame can share
+    # it); otherwise mint one for direct/non-streaming callers.
+    response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -3308,9 +3371,9 @@ async def stream_anthropic_messages(
 
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
+        # Only thinking was emitted. Keep block_index on the just-closed
+        # block so following tool_use blocks start at the next contiguous index.
         yield create_content_block_stop_event(index=block_index)
-        block_index += 1
     if text_block_started:
         yield create_content_block_stop_event(index=block_index)
     elif not thinking_block_started and not tool_calls:
@@ -3477,6 +3540,10 @@ async def create_anthropic_message(
     # Convert Anthropic format to internal format
     # Harmony models need special handling to preserve tool format
     is_vlm = isinstance(engine, VLMBatchedEngine)
+    is_dflash_vlm = (
+        not is_vlm
+        and getattr(engine, "supports_multimodal_fallback", False)
+    )
     _entry = get_engine_pool().get_entry(resolved_model)
     native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if engine.model_type == "gpt_oss":
@@ -3486,7 +3553,7 @@ async def create_anthropic_message(
     else:
         messages = convert_anthropic_to_internal(
             request, max_tool_result_tokens, engine.tokenizer,
-            preserve_images=is_vlm,
+            preserve_images=is_vlm or is_dflash_vlm,
             native_reasoning_content=native_reasoning,
         )
 
@@ -3502,6 +3569,8 @@ async def create_anthropic_message(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_max_tokens=request.max_tokens,
     )
 
@@ -3939,7 +4008,14 @@ async def create_response(
 
     # Build sampling kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
-        get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
+        get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
+            req_max_tokens=request.max_output_tokens,
+        )
     )
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -3971,9 +4047,9 @@ async def create_response(
     # for it (Qwen 3.6+). Gated on detection so other templates don't
     # receive an unknown kwarg.
     _entry = get_engine_pool().get_entry(resolved_model)
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
     if (
-        _entry is not None
-        and _entry.preserve_thinking_default is True
+        native_reasoning
         and merged_ct_kwargs.get("enable_thinking") is not False
         and "preserve_thinking" not in merged_ct_kwargs
     ):
@@ -4007,6 +4083,7 @@ async def create_response(
                     model_load_duration=model_load_duration,
                     resolved_model=resolved_model,
                     response_format=response_format,
+                    native_reasoning=native_reasoning,
                     **chat_kwargs,
                 ),
                 http_request=http_request,
@@ -4079,6 +4156,9 @@ async def create_response(
 
         # Build output items
         output_items: list[OutputItem] = []
+        reasoning_text = (thinking_content or "").strip()
+        if native_reasoning and reasoning_text:
+            output_items.append(build_reasoning_output_item(reasoning_text))
         output_items.append(
             build_message_output_item(cleaned_text.strip() if cleaned_text else "")
         )
@@ -4103,8 +4183,15 @@ async def create_response(
                     )
                 )
 
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(reasoning_text))
+            if reasoning_text else 0
+        )
         usage = build_response_usage(
-            output.prompt_tokens, output.completion_tokens, output.cached_tokens
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
+            reasoning_tokens=reasoning_token_count,
+            cached_tokens=output.cached_tokens,
         )
 
         response_obj = ResponseObject(
@@ -4144,6 +4231,7 @@ async def stream_responses_api(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_format=None,
+    native_reasoning: bool = False,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -4153,12 +4241,21 @@ async def stream_responses_api(
     first_token_time = None
     last_output = None
     accumulated_text = ""
+    accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    thinking_parser = ThinkingParser(start_in_thinking=native_reasoning)
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
     msg_id = generate_id(IDPrefix.MESSAGE)
+    reasoning_id = generate_id(IDPrefix.REASONING)
+
+    # Lazy item emission state — items are opened on first token
+    reasoning_opened = False
+    reasoning_closed = False
+    message_opened = False
+    next_output_index = 0
+    reasoning_output_index: Optional[int] = None  # captured when reasoning opens
 
     # Build initial response object (in_progress, empty output)
     initial_response = ResponseObject(
@@ -4191,35 +4288,114 @@ async def stream_responses_api(
         "sequence_number": seq,
     })
 
-    # 3. response.output_item.added (message)
-    msg_item = {
-        "type": "message",
-        "id": msg_id,
-        "status": "in_progress",
-        "role": "assistant",
-        "content": [],
-    }
-    seq += 1
-    yield format_sse_event("response.output_item.added", {
-        "type": "response.output_item.added",
-        "output_index": 0,
-        "item": msg_item,
-        "sequence_number": seq,
-    })
+    # --- helper closures for lazy item emission ----------------------
+    def _open_reasoning():
+        nonlocal seq, reasoning_opened, reasoning_output_index
+        if reasoning_opened:
+            return []
+        reasoning_opened = True
+        reasoning_output_index = next_output_index
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": reasoning_output_index,
+            "item": {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "status": "in_progress",
+                "summary": [],
+            },
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_part.added", {
+            "type": "response.reasoning_summary_part.added",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+            "sequence_number": seq,
+        }))
+        return events
 
-    # 4. response.content_part.added
-    content_part = {"type": "output_text", "text": "", "annotations": []}
-    seq += 1
-    yield format_sse_event("response.content_part.added", {
-        "type": "response.content_part.added",
-        "item_id": msg_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": content_part,
-        "sequence_number": seq,
-    })
+    def _close_reasoning():
+        nonlocal seq, reasoning_closed, next_output_index
+        if reasoning_closed or not reasoning_opened:
+            return []
+        reasoning_closed = True
+        next_output_index += 1
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_text.done", {
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "text": accumulated_reasoning,
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.reasoning_summary_part.done", {
+            "type": "response.reasoning_summary_part.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": accumulated_reasoning},
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": reasoning_output_index,
+            "item": {
+                "type": "reasoning",
+                "id": reasoning_id,
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+            },
+            "sequence_number": seq,
+        }))
+        return events
 
-    # 5. Stream tokens
+    def _open_message():
+        nonlocal seq, message_opened, next_output_index
+        if message_opened:
+            return []
+        message_opened = True
+        msg_output_index = next_output_index
+        events = []
+        seq += 1
+        events.append(format_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": msg_output_index,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+            "sequence_number": seq,
+        }))
+        seq += 1
+        events.append(format_sse_event("response.content_part.added", {
+            "type": "response.content_part.added",
+            "item_id": msg_id,
+            "output_index": msg_output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+            "sequence_number": seq,
+        }))
+        return events
+    # -----------------------------------------------------------------
+
+    # If not native reasoning, open message immediately (legacy behavior)
+    if not native_reasoning:
+        for ev in _open_message():
+            yield ev
+
+    # Stream tokens
     tool_filter = None
     stream_content = True
     if has_tools:
@@ -4228,6 +4404,8 @@ async def stream_responses_api(
             tool_filter = _f
         else:
             stream_content = False
+
+    msg_output_index = None  # will be set when message opens
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -4238,8 +4416,30 @@ async def stream_responses_api(
                 accumulated_text += output.new_text
 
             if stream_content and output.new_text:
-                _thinking, content_delta = thinking_parser.feed(output.new_text)
+                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+
+                if thinking_delta and native_reasoning:
+                    accumulated_reasoning += thinking_delta
+                    for ev in _open_reasoning():
+                        yield ev
+                    seq += 1
+                    yield format_sse_event("response.reasoning_summary_text.delta", {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "delta": thinking_delta,
+                        "sequence_number": seq,
+                    })
+
                 if content_delta:
+                    if native_reasoning and reasoning_opened and not reasoning_closed:
+                        for ev in _close_reasoning():
+                            yield ev
+                    for ev in _open_message():
+                        yield ev
+                    if msg_output_index is None:
+                        msg_output_index = next_output_index
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
@@ -4247,7 +4447,7 @@ async def stream_responses_api(
                         yield format_sse_event("response.output_text.delta", {
                             "type": "response.output_text.delta",
                             "item_id": msg_id,
-                            "output_index": 0,
+                            "output_index": msg_output_index,
                             "content_index": 0,
                             "delta": content_delta,
                             "sequence_number": seq,
@@ -4262,9 +4462,22 @@ async def stream_responses_api(
         })
         return
 
+    # Close reasoning if still open
+    if native_reasoning and reasoning_opened and not reasoning_closed:
+        for ev in _close_reasoning():
+            yield ev
+
+    # Ensure message item is opened (even if no content was streamed)
+    for ev in _open_message():
+        yield ev
+    if msg_output_index is None:
+        msg_output_index = next_output_index
+
     # Flush remaining content from parsers
     if stream_content:
-        _thinking, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish()
+        if thinking_delta and native_reasoning:
+            accumulated_reasoning += thinking_delta
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -4273,7 +4486,7 @@ async def stream_responses_api(
                 yield format_sse_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": msg_id,
-                    "output_index": 0,
+                    "output_index": msg_output_index,
                     "content_index": 0,
                     "delta": content_delta,
                     "sequence_number": seq,
@@ -4285,7 +4498,7 @@ async def stream_responses_api(
                 yield format_sse_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": msg_id,
-                    "output_index": 0,
+                    "output_index": msg_output_index,
                     "content_index": 0,
                     "delta": remaining,
                     "sequence_number": seq,
@@ -4312,13 +4525,13 @@ async def stream_responses_api(
             yield format_sse_event("response.output_text.delta", {
                 "type": "response.output_text.delta",
                 "item_id": msg_id,
-                "output_index": 0,
+                "output_index": msg_output_index,
                 "content_index": 0,
                 "delta": cleaned_text,
                 "sequence_number": seq,
             })
     else:
-        # No tools — use raw accumulated text minus thinking
+        # No tools — use raw accumulated text minus thinking.
         thinking_content, regular_content = extract_thinking(accumulated_text)
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
@@ -4346,33 +4559,33 @@ async def stream_responses_api(
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
-    # 6. response.output_text.done
+    # response.output_text.done
     seq += 1
     yield format_sse_event("response.output_text.done", {
         "type": "response.output_text.done",
         "item_id": msg_id,
-        "output_index": 0,
+        "output_index": msg_output_index,
         "content_index": 0,
         "text": final_text,
         "sequence_number": seq,
     })
 
-    # 7. response.content_part.done
+    # response.content_part.done
     seq += 1
     yield format_sse_event("response.content_part.done", {
         "type": "response.content_part.done",
         "item_id": msg_id,
-        "output_index": 0,
+        "output_index": msg_output_index,
         "content_index": 0,
         "part": {"type": "output_text", "text": final_text, "annotations": []},
         "sequence_number": seq,
     })
 
-    # 8. response.output_item.done (message)
+    # response.output_item.done (message)
     seq += 1
     yield format_sse_event("response.output_item.done", {
         "type": "response.output_item.done",
-        "output_index": 0,
+        "output_index": msg_output_index,
         "item": {
             "type": "message",
             "id": msg_id,
@@ -4384,19 +4597,25 @@ async def stream_responses_api(
     })
 
     # Build output items for final response
-    output_items = [
-        {
-            "type": "message",
-            "id": msg_id,
+    output_items = []
+    if native_reasoning and accumulated_reasoning:
+        output_items.append({
+            "type": "reasoning",
+            "id": reasoning_id,
             "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
-        }
-    ]
+            "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+        })
+    output_items.append({
+        "type": "message",
+        "id": msg_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+    })
 
-    # 9-12. Emit function call items if present
+    # Emit function call items if present
     if tool_calls:
-        output_index = 1
+        output_index = next_output_index + 1
         for tc in tool_calls:
             if hasattr(tc, "function"):
                 call_id = tc.id
@@ -4482,12 +4701,16 @@ async def stream_responses_api(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        reasoning_token_count = (
+            len(engine.tokenizer.encode(accumulated_reasoning))
+            if accumulated_reasoning else 0
+        )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,
             "output_tokens": last_output.completion_tokens,
             "total_tokens": last_output.prompt_tokens + last_output.completion_tokens,
             "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
-            "output_tokens_details": {"reasoning_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
     # 13. response.completed — MUST always be sent
@@ -4580,21 +4803,19 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server (use omlx CLI instead)."""
-    from .config import parse_size
-
     parser = argparse.ArgumentParser(
         description="oMLX multi-model serving for Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Multi-model serving
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB
+    python -m omlx.server --model-dir /path/to/models
 
     # With pinned models
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 48GB --pin llama-3b,qwen-7b
+    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
 
     # With MCP tools
-    python -m omlx.server --model-dir /path/to/models --max-model-memory 32GB --mcp-config mcp.json
+    python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
 Note: Use the omlx CLI for full feature support.
         """,
@@ -4604,12 +4825,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--max-model-memory",
-        type=str,
-        default="32GB",
-        help="Maximum memory for loaded models (e.g., 32GB). KV cache uses additional memory.",
     )
     parser.add_argument(
         "--pin",
@@ -4660,7 +4875,6 @@ Note: Use the omlx CLI for full feature support.
     # Initialize server
     init_server(
         model_dir=args.model_dir,
-        max_model_memory=parse_size(args.max_model_memory),
         pinned_models=pinned_models,
         default_model=args.default_model,
         max_tokens=args.max_tokens,

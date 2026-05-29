@@ -184,6 +184,35 @@ def _extract_multimodal_content_list(content: list) -> list:
 _MERGEABLE_ROLES = {"user", "assistant"}
 _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
 
+# Match `role == "tool"` / `role == 'tool'` in a chat template.
+_TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
+
+
+def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
+    """Check whether the tokenizer's chat template renders tool messages natively.
+
+    mlx-lm / mlx-vlm only set ``has_tool_calling`` when their marker-based
+    ``_infer_tool_parser`` recognises the chat template (qwen3_coder, json_tools,
+    gemma4, etc.). Templates that branch on ``role == "tool"`` and render
+    ``tool_calls`` but don't match any known marker (Qwen3 VL variants, custom
+    fine-tunes) get flattened to ``role: "user"`` — making the model treat tool
+    output as user instructions and breaking multi-turn tool flows (#1290).
+
+    Strict superset of ``has_tool_calling``: if the tokenizer already flags
+    itself, return True immediately. Otherwise probe the chat_template string
+    for both a ``role == "tool"`` equality and the ``tool_calls`` variable —
+    both together keep false positives down (a stray ``"tool"`` literal in a
+    comment isn't enough).
+    """
+    if getattr(tokenizer, "has_tool_calling", False):
+        return True
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(chat_template, str):
+        return False
+    if not _TOOL_ROLE_CHECK_RE.search(chat_template):
+        return False
+    return "tool_calls" in chat_template
+
 
 def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
     """Drop assistant messages that have no content and no tool_calls.
@@ -379,7 +408,7 @@ def extract_text_content(
                 )
             # Preserve structured format for models with native tool calling
             # so the chat template renders tool results in the model's native format
-            if getattr(tokenizer, "has_tool_calling", False):
+            if _chat_template_supports_tool_role(tokenizer):
                 processed_messages.append(
                     {
                         "role": "tool",
@@ -413,7 +442,7 @@ def extract_text_content(
             # so the chat template renders them in the model's native format.
             # Without this, models mimic text-formatted tool calls from history
             # instead of generating their native parseable format.
-            if getattr(tokenizer, "has_tool_calling", False):
+            if _chat_template_supports_tool_role(tokenizer):
                 tool_calls_list = []
                 for tc in msg.tool_calls:
                     if isinstance(tc, dict):
@@ -550,7 +579,7 @@ def extract_multimodal_content(
                 tool_content = truncate_tool_result(
                     tool_content, max_tool_result_tokens, tokenizer
                 )
-            if getattr(tokenizer, "has_tool_calling", False):
+            if _chat_template_supports_tool_role(tokenizer):
                 processed_messages.append(
                     {
                         "role": "tool",
@@ -580,7 +609,7 @@ def extract_multimodal_content(
             if getattr(msg, "partial", False):
                 msg_dict["partial"] = True
 
-            if getattr(tokenizer, "has_tool_calling", False):
+            if _chat_template_supports_tool_role(tokenizer):
                 tool_calls_list = []
                 for tc in msg.tool_calls:
                     if isinstance(tc, dict):

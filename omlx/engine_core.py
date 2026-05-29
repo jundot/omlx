@@ -133,12 +133,22 @@ class EngineCore:
         )
         self._owns_model = True
 
-        # Create scheduler
+        # Per-engine executor with dedicated mx.Stream (#1248).
+        # Each EngineCore gets its own thread + GPU stream so different
+        # models can run scheduler.step() concurrently.
+        self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
+        self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+        )
+
+        # Create scheduler with per-engine stream
         scheduler_config = self.config.scheduler_config or SchedulerConfig()
         self.scheduler = Scheduler(
             model=model,
             tokenizer=tokenizer,
             config=scheduler_config,
+            stream=self._mlx_stream,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -151,11 +161,6 @@ class EngineCore:
         self._task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
-
-        # Global single-thread executor shared across ALL engines.
-        # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
-        # from different engine threads cause segfaults. See issue #85.
-        self._mlx_executor = get_mlx_executor()
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -372,7 +377,15 @@ class EngineCore:
         finally block, NOT here -- calling _cleanup_request() immediately
         after put() would clear the output before the consumer can drain it.
         """
-        result = self.scheduler.abort_request(request_id)
+        scheduler = getattr(self, "scheduler", None)
+        if getattr(self, "_closed", False) or scheduler is None:
+            logger.debug(
+                "Skipping abort for request %s because engine is already closed",
+                request_id,
+            )
+            return False
+
+        result = scheduler.abort_request(request_id)
 
         # Signal consumer with abort error so any waiting
         # stream_outputs() / generate() can exit gracefully.
@@ -400,15 +413,32 @@ class EngineCore:
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate).
         """
+        from .utils.proc_memory import get_phys_footprint
+
         request_ids = list(self._output_collectors.keys())
+        ceiling = 0
+        sched = self.scheduler
+        if sched is not None:
+            ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
+        usage = get_phys_footprint()
+        usage_gb = usage / (1024**3)
+        ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                error_msg = (
-                    "Request aborted: process memory limit exceeded. "
-                    "Increase --max-process-memory or reduce context size."
-                )
+                if ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                        "Reduce context size or lower memory_guard_tier."
+                    )
+                else:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB). "
+                        "Reduce context size or lower memory_guard_tier."
+                    )
                 collector.put(
                     RequestOutput(
                         request_id=rid,
@@ -673,9 +703,9 @@ class EngineCore:
 
         self._closed = True
 
-        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
-        # stream is bound to the MLX executor thread, so dispatch both
+        # stream is bound to the engine's executor thread, so dispatch both
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
@@ -686,6 +716,10 @@ class EngineCore:
                     fn()
                 except RuntimeError:
                     pass
+
+        if self._mlx_executor is not None:
+            self._mlx_executor.shutdown(wait=True)
+            self._mlx_executor = None
 
         # Clear output collectors
         for collector in self._output_collectors.values():
@@ -744,7 +778,7 @@ class AsyncEngineCore:
         return self
 
     async def __aexit__(self, *args) -> None:
-        await self.engine.stop()
+        await self.stop()
 
     def start(self) -> None:
         """Start engine (creates task in current loop)."""
@@ -752,7 +786,10 @@ class AsyncEngineCore:
 
     async def stop(self) -> None:
         """Stop the engine."""
-        await self.engine.stop()
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        await engine.stop()
 
     async def add_request(
         self,
@@ -771,11 +808,21 @@ class AsyncEngineCore:
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
-        return await self.engine.abort_request(request_id)
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            logger.debug(
+                "Skipping abort for request %s because async engine is closed",
+                request_id,
+            )
+            return False
+        return await engine.abort_request(request_id)
 
     async def abort_all_requests(self) -> int:
         """Abort all active requests without stopping the engine."""
-        return await self.engine.abort_all_requests()
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return 0
+        return await engine.abort_all_requests()
 
     async def stream_outputs(
         self,

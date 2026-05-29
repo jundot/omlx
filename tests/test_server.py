@@ -45,13 +45,14 @@ class TestGetSamplingParams:
     def test_request_overrides(self):
         """Test request params override global defaults."""
         temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-            0.5, 0.8, req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
+            0.5, 0.8, req_top_k=40, req_repetition_penalty=1.15,
+            req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
             req_max_tokens=1024,
         )
         assert temp == 0.5
         assert top_p == 0.8
-        assert top_k == 0  # not overridable via request
-        assert rep_penalty == 1.0
+        assert top_k == 40
+        assert rep_penalty == 1.15
         assert min_p == 0.1
         assert presence_penalty == 0.5
         assert frequency_penalty == 0.3
@@ -112,14 +113,21 @@ class TestGetSamplingParams:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
-            settings = ModelSettings(temperature=0.3, min_p=0.05, max_tokens=2048)
+            settings = ModelSettings(
+                temperature=0.3, top_k=50, repetition_penalty=1.2,
+                min_p=0.05, max_tokens=2048,
+            )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
             temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-                0.7, None, "test-model", req_min_p=0.1, req_max_tokens=4096,
+                0.7, None, "test-model",
+                req_top_k=10, req_repetition_penalty=1.05,
+                req_min_p=0.1, req_max_tokens=4096,
             )
             assert temp == 0.7  # request wins
+            assert top_k == 10  # request wins over model
+            assert rep_penalty == 1.05  # request wins over model
             assert min_p == 0.1  # request wins over model
             assert max_tokens == 4096  # request wins over model
 

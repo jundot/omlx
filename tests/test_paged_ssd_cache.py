@@ -801,6 +801,167 @@ class TestPagedSSDCacheManagerWithMLX:
         # Index scan ran in __init__. The legacy file should not appear.
         assert not manager_after_scan.has_block(block_hash)
 
+    def _write_versioned_fixture_block(
+        self,
+        cache_dir: Path,
+        mx,
+        block_hash: bytes,
+        *,
+        num_layers: int,
+        model_name: str,
+    ) -> Path:
+        """Drop a minimally-valid versioned block on disk so we can exercise
+        the startup scan without relying on the background writer."""
+        from omlx.cache.paged_ssd_cache import _CACHE_FORMAT_VERSION
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        block_hash_hex = block_hash.hex()
+        sub_dir = cache_dir / block_hash_hex[0]
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        file_path = sub_dir / f"{block_hash_hex}.safetensors"
+
+        tensors = {}
+        for i in range(num_layers):
+            tensors[f"layer_{i}_keys"] = mx.zeros((1, 8, 32, 64))
+            tensors[f"layer_{i}_values"] = mx.zeros((1, 8, 32, 64))
+
+        mx.save_safetensors(
+            str(file_path),
+            tensors,
+            metadata={
+                "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+                "block_hash": block_hash_hex,
+                "token_count": "32",
+                "num_layers": str(num_layers),
+                "model_name": model_name,
+                "created_at": "0",
+            },
+        )
+        return file_path
+
+    def test_scan_invalidates_layer_count_mismatch(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks with num_layers != expected_num_layers are unlinked at scan.
+
+        Models that change their effective layer count across versions (e.g.,
+        #1404 attaching MTPModule changed 30 → 40) would otherwise leave the
+        old blocks on disk forever, hitting the layer-mismatch reject path on
+        every prefix lookup. See #1413.
+        """
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        stale_hash = b"\x10" + b"\x00" * 31
+        fresh_hash = b"\x20" + b"\x00" * 31
+        stale_path = self._write_versioned_fixture_block(
+            cache_dir, mx, stale_hash, num_layers=30, model_name="qwen3.6"
+        )
+        fresh_path = self._write_versioned_fixture_block(
+            cache_dir, mx, fresh_hash, num_layers=40, model_name="qwen3.6"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+        )
+
+        assert not stale_path.exists()
+        assert fresh_path.exists()
+        assert not manager.has_block(stale_hash)
+        assert manager.has_block(fresh_hash)
+
+    def test_scan_invalidates_model_name_mismatch(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Blocks from a different model are unlinked, even when layer count
+        happens to match."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        other_hash = b"\x30" + b"\x00" * 31
+        match_hash = b"\x40" + b"\x00" * 31
+        other_path = self._write_versioned_fixture_block(
+            cache_dir, mx, other_hash, num_layers=40, model_name="llama"
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir, mx, match_hash, num_layers=40, model_name="qwen3.6"
+        )
+
+        PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="qwen3.6",
+            expected_num_layers=40,
+        )
+
+        assert not other_path.exists()
+        assert match_path.exists()
+
+    def test_scan_keeps_blocks_when_expected_fields_unset(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Backwards compatibility: callers that omit the new init args see
+        no behavior change. All blocks survive scan regardless of metadata."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        h1 = b"\x50" + b"\x00" * 31
+        h2 = b"\x60" + b"\x00" * 31
+        p1 = self._write_versioned_fixture_block(
+            cache_dir, mx, h1, num_layers=30, model_name="a"
+        )
+        p2 = self._write_versioned_fixture_block(
+            cache_dir, mx, h2, num_layers=40, model_name="b"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert p1.exists()
+        assert p2.exists()
+        assert manager.has_block(h1)
+        assert manager.has_block(h2)
+
+    def test_scan_logs_invalidated_count(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """The completion log line surfaces the cleanup count so operators
+        can tell when stale data was purged at boot."""
+        import logging
+
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        for i in range(3):
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x70 + i]) + b"\x00" * 31,
+                num_layers=30,
+                model_name="old",
+            )
+
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=1024**3,
+                expected_model_name="old",
+                expected_num_layers=40,
+            )
+
+        scan_lines = [
+            r.message
+            for r in caplog.records
+            if "SSD cache scan complete" in r.message
+        ]
+        assert scan_lines, "scan completion log not emitted"
+        assert "invalidated_stale=3 blocks" in scan_lines[-1]
+
 
 class TestPagedSSDCacheManagerCacheList:
     """Tests for CacheList support in PagedSSDCacheManager."""
@@ -1706,3 +1867,359 @@ class TestEffectiveMaxSize:
 
         assert "disk pressure" in caplog.text
         assert "disk nearly full" in caplog.text
+
+
+class TestPreloadMatchedBlocks:
+    """Tests for parallel block preloading into hot cache."""
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def manager_with_hot_cache(self, tmp_path, mx):
+        """Create a manager with hot cache enabled."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        yield manager
+        manager.close()
+
+    def _save_test_blocks(self, manager, mx, count=4, layers=2):
+        """Save test blocks and flush them to SSD (not hot cache)."""
+        hashes = []
+        for i in range(count):
+            block_hash = f"preload_test_block_{i:04d}".encode()
+            cache_data = [
+                (
+                    mx.zeros((1, 4, 64, 64)),
+                    mx.zeros((1, 4, 64, 64)),
+                )
+                for _ in range(layers)
+            ]
+            manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=64,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * layers,
+            )
+            hashes.append(block_hash)
+
+        # Flush writer to ensure blocks are on SSD
+        manager.close()
+
+        # Re-open manager (cold start — hot cache is empty)
+        new_manager = PagedSSDCacheManager(
+            cache_dir=manager._cache_dir,
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        return new_manager, hashes
+
+    def test_preload_promotes_to_hot_cache(self, tmp_path, mx):
+        """After preload, blocks are found in hot cache."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        # Verify blocks are NOT in hot cache before preload
+        for h in hashes:
+            assert manager2._hot_cache_get(h) is None
+
+        # Preload
+        loaded = manager2.preload_matched_blocks(hashes)
+        assert loaded == 4
+
+        # Verify blocks ARE in hot cache after preload
+        for h in hashes:
+            assert manager2._hot_cache_get(h) is not None
+
+        manager2.close()
+
+    def test_preload_partial_failure(self, tmp_path, mx):
+        """If one block file is missing, others still load."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=5)
+
+        # Delete one block file from SSD to simulate failure
+        metadata = manager2._index.get(hashes[1])
+        metadata.file_path.unlink()
+
+        loaded = manager2.preload_matched_blocks(hashes)
+
+        # 4 of 5 should succeed (1 deleted)
+        assert loaded == 4
+        assert manager2._hot_cache_get(hashes[0]) is not None
+        assert manager2._hot_cache_get(hashes[1]) is None  # deleted file
+        assert manager2._hot_cache_get(hashes[2]) is not None
+
+        manager2.close()
+
+    def test_preload_skips_hot_cache_blocks(self, tmp_path, mx):
+        """Blocks already in hot cache are not re-loaded."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=5)
+
+        # Load one block into hot cache manually
+        manager2.load_block(hashes[0])
+        assert manager2._hot_cache_get(hashes[0]) is not None
+        promotions_before = manager2._stats["hot_cache_promotions"]
+
+        # Preload all — should only load the 4 cold blocks
+        loaded = manager2.preload_matched_blocks(hashes)
+        assert loaded == 4
+
+        # Promotion count should increase by exactly 4 (not 5)
+        assert manager2._stats["hot_cache_promotions"] == promotions_before + 4
+
+        manager2.close()
+
+    def test_preload_unknown_hashes_ignored(self, tmp_path, mx):
+        """Hashes not in the SSD index are silently skipped."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=5)
+
+        all_hashes = hashes + [b"nonexistent_hash_01", b"nonexistent_hash_02"]
+        loaded = manager2.preload_matched_blocks(all_hashes)
+        assert loaded == 5  # only the real blocks
+
+        manager2.close()
+
+    def test_preload_noop_without_hot_cache(self, tmp_path, mx):
+        """Preload returns 0 when hot cache is disabled."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=0,  # hot cache disabled
+        )
+        block_hash = b"preload_no_hot_test"
+        cache_data = [(mx.zeros((1, 4, 32, 64)), mx.zeros((1, 4, 32, 64)))]
+        manager.save_block(block_hash, cache_data, 32, layer_cache_types=["KVCache"])
+        manager.close()
+
+        manager2 = PagedSSDCacheManager(
+            cache_dir=manager._cache_dir,
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=0,
+        )
+        loaded = manager2.preload_matched_blocks([block_hash])
+        assert loaded == 0
+
+        manager2.close()
+
+    def test_preload_skips_when_hot_cache_full(self, tmp_path, mx):
+        """Preload returns 0 when hot cache has no remaining capacity."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=1024,  # tiny hot cache
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=2)
+
+        # Fill hot cache to capacity
+        manager2._hot_cache_total_bytes = manager2._hot_cache_max_bytes
+
+        loaded = manager2.preload_matched_blocks(hashes)
+        assert loaded == 0
+
+        manager2.close()
+
+    def test_preload_empty_list(self, manager_with_hot_cache):
+        """Empty hash list returns 0 immediately."""
+        loaded = manager_with_hot_cache.preload_matched_blocks([])
+        assert loaded == 0
+
+    def test_preload_skips_below_threshold(self, tmp_path, mx):
+        """Preload skips when fewer than 4 cold blocks need loading."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=3)
+
+        loaded = manager2.preload_matched_blocks(hashes)
+        assert loaded == 0
+        for bh in hashes:
+            assert manager2._hot_cache_get(bh) is None
+
+        manager2.close()
+
+    def test_preload_updates_stats(self, tmp_path, mx):
+        """Preload increments preload-specific stats counters."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        manager2.preload_matched_blocks(hashes)
+
+        assert manager2._stats["preload_blocks_loaded"] == 4
+        assert manager2._stats["preload_calls"] == 1
+        assert manager2._stats["preload_time_ms"] > 0
+
+        manager2.close()
+
+    def test_preloaded_blocks_load_correctly(self, tmp_path, mx):
+        """After preload, load_block returns correct data from hot cache."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=5, layers=3)
+
+        # Preload blocks into hot cache
+        manager2.preload_matched_blocks(hashes)
+
+        # Now load_block should hit hot cache
+        hot_hits_before = manager2._stats["hot_cache_hits"]
+        for h in hashes:
+            data = manager2.load_block(h)
+            assert data is not None
+            assert len(data) == 3  # 3 layers
+            for keys, values in data:
+                assert keys.shape == (1, 4, 64, 64)
+                assert values.shape == (1, 4, 64, 64)
+
+        # All loads should be hot cache hits (not SSD reads)
+        assert manager2._stats["hot_cache_hits"] == hot_hits_before + 5
+
+        manager2.close()
+
+    def test_concurrent_preload_and_load(self, tmp_path, mx):
+        """Preload and load_block don't race on hot cache."""
+        import threading
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=8)
+
+        results = {"preload": None, "loads": []}
+        errors = []
+
+        def do_preload():
+            try:
+                results["preload"] = manager2.preload_matched_blocks(hashes)
+            except Exception as e:
+                errors.append(f"preload: {e}")
+
+        def do_loads():
+            try:
+                for h in hashes:
+                    data = manager2.load_block(h)
+                    results["loads"].append(data is not None)
+            except Exception as e:
+                errors.append(f"load: {e}")
+
+        t1 = threading.Thread(target=do_preload)
+        t2 = threading.Thread(target=do_loads)
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        assert not errors, f"Concurrent errors: {errors}"
+        assert not t1.is_alive(), "Preload thread hung"
+        assert not t2.is_alive(), "Load thread hung"
+
+        manager2.close()
+
+
+class TestPreloadBlocks:
+    """Tests for BlockAwarePrefixCache.preload_blocks()."""
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def test_preload_blocks_calls_ssd_preload(self, tmp_path, mx):
+        """preload_blocks extracts hashes from BlockTable and calls SSD preload."""
+        from unittest.mock import MagicMock
+
+        from omlx.cache.paged_cache import PagedCacheManager
+
+        # Set up real SSD manager with blocks
+        ssd_manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=256 * 1024**2,
+        )
+
+        hashes = []
+        for i in range(5):
+            bh = f"preload_blocks_test_{i:04d}".encode()
+            cache_data = [(mx.zeros((1, 4, 32, 64)), mx.zeros((1, 4, 32, 64)))]
+            ssd_manager.save_block(bh, cache_data, 32, layer_cache_types=["KVCache"])
+            hashes.append(bh)
+        ssd_manager.close()
+
+        # Re-open cold
+        ssd_manager2 = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=256 * 1024**2,
+        )
+
+        # Set up paged cache with allocated blocks
+        paged_cache = PagedCacheManager(block_size=256, max_blocks=100)
+        block_ids = []
+        for bh in hashes:
+            block = paged_cache.allocate_block()
+            block.block_hash = bh
+            block.token_count = 32
+            block_ids.append(block.block_id)
+
+        # Create BlockAwarePrefixCache
+        from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockTable
+
+        model = MagicMock()
+        prefix_cache = BlockAwarePrefixCache(model, paged_cache, ssd_manager2)
+
+        # Create a BlockTable
+        bt = BlockTable(
+            request_id="test-req",
+            block_ids=block_ids,
+            num_tokens=32 * len(block_ids),
+        )
+
+        # Call preload_blocks
+        loaded = prefix_cache.preload_blocks(bt)
+        assert loaded == 5
+
+        # Verify blocks are in hot cache
+        for bh in hashes:
+            assert ssd_manager2._hot_cache_get(bh) is not None
+
+        ssd_manager2.close()

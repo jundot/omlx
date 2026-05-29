@@ -257,36 +257,6 @@
                                         <option value="trace">{{ t('settings.server.log_level_trace') }}</option>
                                     </select>
                                 </div>
-                                <!-- Restart server -->
-                                <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div class="flex flex-col gap-1 min-w-0">
-                                        <label class="text-sm text-neutral-700">{{ t('settings.server.restart_label') }}</label>
-                                        <p class="text-xs text-neutral-500">{{ t('settings.server.restart_desc') }}</p>
-                                        <!-- Status line is always rendered (empty when idle) so the row
-                                             height stays constant across state transitions. Color is
-                                             state-driven; the reserved min-height prevents layout shift
-                                             when restartServer.message goes from "" to text. -->
-                                        <p class="text-xs mt-1 min-h-[1rem]"
-                                           :class="restartServer.status === 'error' ? 'text-red-500'
-                                                 : restartServer.status === 'unsupported' ? 'text-amber-600'
-                                                 : 'text-neutral-500'"
-                                           x-text="restartServer.message"></p>
-                                    </div>
-                                    <button type="button"
-                                            @click="restartServerStart()"
-                                            :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
-                                            class="inline-flex items-center justify-center gap-2 h-10 min-w-[12rem] px-4 text-sm font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
-                                        <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
-                                           data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0"></i>
-                                        <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
-                                           data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
-                                        <span x-text="restartServer.status === 'restarting'
-                                                       ? '{{ t('settings.server.restart_button_restarting') }}'
-                                                       : (restartServer.status === 'waiting'
-                                                           ? '{{ t('settings.server.restart_button_waiting') }}'
-                                                           : '{{ t('settings.server.restart_button') }}')"></span>
-                                    </button>
-                                </div>
                             </div>
                         </div>
 
@@ -353,102 +323,63 @@
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
-                                <!-- Memory Guard -->
+                                <!-- Memory Guard + Tier -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                        </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-1"
+                                           x-show="globalSettings.memory.prefill_memory_guard"
+                                           x-text="memoryGuardTierDescription"></p>
+                                        <template x-if="globalSettings.memory.prefill_memory_guard && memoryGuardShowWiredLimitWarning">
+                                            <div class="mt-1">
+                                                <p class="text-xs font-bold text-red-600"
+                                                   x-html="DOMPurify.sanitize(memoryGuardWiredLimitWarningHTML)"></p>
+                                                <div class="flex items-center justify-between gap-2 mt-1 px-3 py-2 bg-code rounded-md">
+                                                    <code class="text-xs font-mono text-fg break-all" x-text="memoryGuardWiredLimitCommand"></code>
+                                                    <button type="button"
+                                                            @click="copyWiredLimitCommand()"
+                                                            :class="wiredLimitCopied ? 'text-green-500' : 'text-fg-tertiary hover:text-fg'"
+                                                            class="transition-colors flex-shrink-0"
+                                                            :title="wiredLimitCopied ? 'Copied' : 'Copy'">
+                                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </template>
+                                        <p class="text-xs text-neutral-400 mt-1"
+                                           x-show="globalSettings.memory.prefill_memory_guard"
+                                           x-html="DOMPurify.sanitize(memoryGuardBreakdownHTML)"></p>
                                     </div>
-                                    <button type="button"
-                                            @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
-                                            :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
-                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
-                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                    </button>
-                                </div>
-                                <!-- Memory Limit (Total) -->
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_total') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">
-                                            {{ t('settings.resource.memory_limit_total_description') }}
-                                            <br>
-                                            {{ t('settings.resource.memory_limit_total_eviction') }}
-                                            <strong>{{ t('settings.resource.memory_limit_total_auto') }}</strong>{{ t('settings.resource.memory_limit_total_auto_desc') }}
-                                            {{ t('settings.resource.memory_limit_total_disabled') }}
-                                        </p>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
-                                            <input type="checkbox" x-model="processMemoryAuto"
-                                                   @change="if(processMemoryAuto) { globalSettings.memory.max_process_memory = 'auto'; } else { updateProcessMemoryFromSlider(); }"
-                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
-                                        </label>
-                                        <input type="range" min="0" max="99" step="1"
-                                               x-model.number="processMemoryPercent"
-                                               :disabled="processMemoryAuto"
-                                               @input="updateProcessMemoryFromSlider()"
-                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
-                                               :class="processMemoryAuto
-                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
-                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
-                                        <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
-                                              :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="processMemoryAuto ? window.t('settings.resource.auto') : (processMemoryPercent === 0 ? window.t('settings.resource.off') : processMemoryPercent + '%')"></span>
-                                            <template x-if="processMemoryAuto || processMemoryPercent !== 0"><span><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingProcessMemory" @click="if(!processMemoryAuto) { editingProcessMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="processMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="processMemorySizeGB"></span><input x-show="editingProcessMemory"
-                                                   type="number"
-                                                   :value="processMemorySizeGB"
-                                                   @change="updateProcessMemoryFromInput($event.target.value); editingProcessMemory = false"
-                                                   @blur="editingProcessMemory = false"
-                                                   @keydown.enter="updateProcessMemoryFromInput($event.target.value); editingProcessMemory = false"
-                                                   @keydown.escape="editingProcessMemory = false"
-                                                   x-init="if (editingProcessMemory) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
-                                                   step="1"><span :class="processMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
-                                        </span>
-                                    </div>
-                                </div>
-                                <!-- Memory Limit (Models Only) -->
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <div>
-                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.memory_limit_models') }}</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">
-                                            {{ t('settings.resource.memory_limit_models_description') }}
-                                        </p>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
-                                            <input type="checkbox" x-model="modelMemoryAuto"
-                                                   @change="if(modelMemoryAuto) { memoryPercent = 90; updateMemoryFromSlider(); }"
-                                                   class="rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-xs text-neutral-500">{{ t('settings.resource.auto') }}</span>
-                                        </label>
-                                        <input type="range" min="0" max="100" step="1"
-                                               x-model.number="memoryPercent"
-                                               :disabled="modelMemoryAuto"
-                                               @input="updateMemoryFromSlider()"
-                                               class="w-32 h-1.5 rounded-full appearance-none transition-all duration-200"
-                                               :class="modelMemoryAuto
-                                                   ? 'bg-neutral-100 cursor-not-allowed [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-neutral-300 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-not-allowed'
-                                                   : 'bg-neutral-200 cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:shadow-sm'">
-                                        <span class="text-sm w-28 text-right transition-all duration-200 inline-flex items-center justify-end gap-0"
-                                              :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-600'">
-                                            <span x-text="modelMemoryAuto ? window.t('settings.resource.auto') : (memoryPercent === 0 ? window.t('settings.resource.off') : memoryPercent + '%')"></span>
-                                            <template x-if="modelMemoryAuto || memoryPercent !== 0"><span><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'" class="ml-1">(</span><span x-show="!editingModelMemory" @click="if(!modelMemoryAuto) { editingModelMemory = true }" class="cursor-pointer hover:text-neutral-900" :class="modelMemoryAuto ? 'cursor-default text-neutral-300' : ''" x-text="modelMemorySizeGB"></span><input x-show="editingModelMemory"
-                                                   type="number"
-                                                   :value="modelMemorySizeGB"
-                                                   @change="updateModelMemoryFromInput($event.target.value); editingModelMemory = false"
-                                                   @blur="editingModelMemory = false"
-                                                   @keydown.enter="updateModelMemoryFromInput($event.target.value); editingModelMemory = false"
-                                                   @keydown.escape="editingModelMemory = false"
-                                                   x-init="if (editingModelMemory) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
-                                                   min="0"
-                                                   step="1"><span :class="modelMemoryAuto ? 'text-neutral-300' : 'text-neutral-400'">GB)</span></span></template>
-                                        </span>
+                                    <div class="flex items-center gap-3">
+                                        <select x-model="globalSettings.memory.memory_guard_tier"
+                                                x-show="globalSettings.memory.prefill_memory_guard"
+                                                class="px-2.5 py-1.5 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                            <option value="safe">{{ t('settings.resource.guard_tier.safe') }}</option>
+                                            <option value="balanced">{{ t('settings.resource.guard_tier.balanced') }}</option>
+                                            <option value="aggressive">{{ t('settings.resource.guard_tier.aggressive') }}</option>
+                                            <option value="custom">{{ t('settings.resource.guard_tier.custom') }}</option>
+                                        </select>
+                                        <div x-show="globalSettings.memory.prefill_memory_guard && globalSettings.memory.memory_guard_tier === 'custom'"
+                                             class="flex items-center gap-1">
+                                            <input type="number"
+                                                   x-model.number="globalSettings.memory.memory_guard_custom_ceiling_gb"
+                                                   min="1"
+                                                   step="1"
+                                                   placeholder="{{ t('settings.resource.guard_tier.custom_input_placeholder') }}"
+                                                   class="w-20 px-2 py-1 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                                            <span class="text-xs text-neutral-500">GB</span>
+                                        </div>
+                                        <button type="button"
+                                                @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
+                                                :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
                                     </div>
                                 </div>
                                 <!-- Memory Limit (In-Memory Hot Cache) -->
@@ -529,6 +460,16 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.max_concurrent_requests_hint') }}</p>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.scheduler.max_concurrent_requests"
+                                           min="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <!-- Embedding Batch Size -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.embedding_batch_size') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.embedding_batch_size_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.scheduler.embedding_batch_size"
                                            min="1"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
@@ -817,44 +758,80 @@
 
                     </div>
 
-                    <!-- Save Button -->
+                    <!-- Save / Restart Buttons -->
                     <div class="mt-10 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-4">
-                        <div>
-                            <!-- Success Message -->
+                        <div class="flex flex-col gap-1 min-w-0 sm:flex-1">
+                            <!-- Save success -->
                             <div x-show="saveSuccess" x-cloak
                                  x-transition:enter="transition ease-out duration-200"
                                  x-transition:leave="transition ease-in duration-150"
-                                 class="flex items-center gap-2 text-sm text-neutral-700">
-                                <i data-lucide="check-circle" class="w-4 h-4"></i>
-                                <span x-text="saveMessage"></span>
+                                 class="flex items-start gap-2 text-sm text-neutral-700 min-w-0"
+                                 :title="saveMessage">
+                                <i data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="saveMessage"></span>
                             </div>
-                            <!-- Error Message -->
+                            <!-- Save error -->
                             <div x-show="saveError" x-cloak
                                  x-transition:enter="transition ease-out duration-200"
                                  x-transition:leave="transition ease-in duration-150"
-                                 class="flex items-center gap-2 text-sm text-red-600">
-                                <i data-lucide="alert-circle" class="w-4 h-4"></i>
-                                <span x-text="saveError"></span>
+                                 class="flex items-start gap-2 text-sm text-red-600 min-w-0"
+                                 :title="saveError">
+                                <i data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="saveError"></span>
+                            </div>
+                            <!-- Restart status (any non-empty message) -->
+                            <div x-show="restartServer.message" x-cloak
+                                 class="flex items-start gap-2 text-sm min-w-0"
+                                 :class="restartServer.status === 'error' ? 'text-red-600'
+                                       : restartServer.status === 'unsupported' ? 'text-amber-600'
+                                       : 'text-neutral-700'"
+                                 :title="restartServer.message">
+                                <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                   data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0 mt-0.5"></i>
+                                <i x-show="restartServer.status === 'error' || restartServer.status === 'unsupported'"
+                                   data-lucide="alert-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <i x-show="restartServer.status === 'idle'"
+                                   data-lucide="check-circle" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                                <span class="line-clamp-2" x-text="restartServer.message"></span>
                             </div>
                         </div>
-                        <button
-                            @click="saveGlobalSettings"
-                            :disabled="saving"
-                            class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
-                                   rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
-                                   focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
-                                   transform hover:scale-105 active:scale-95
-                                   disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
-                        >
-                            <span x-show="!saving">{{ t('settings.save.button') }}</span>
-                            <span x-show="saving" class="flex items-center">
-                                <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                </svg>
-                                {{ t('settings.save.saving') }}
-                            </span>
-                        </button>
+                        <div class="flex items-center gap-3 shrink-0">
+                            <button type="button"
+                                    @click="restartServerStart()"
+                                    :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                                    class="inline-flex items-center justify-center gap-2 px-6 py-3 bg-white text-neutral-700 text-sm font-semibold
+                                           border border-neutral-300 rounded-full hover:bg-neutral-50 focus:outline-none focus:ring-2
+                                           focus:ring-neutral-300 focus:ring-offset-2 transition-all duration-200
+                                           disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
+                                   data-lucide="loader-2" class="w-4 h-4 animate-spin shrink-0"></i>
+                                <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
+                                   data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
+                                <span x-text="restartServer.status === 'restarting'
+                                               ? '{{ t('settings.server.restart_button_restarting') }}'
+                                               : (restartServer.status === 'waiting'
+                                                   ? '{{ t('settings.server.restart_button_waiting') }}'
+                                                   : '{{ t('settings.server.restart_button') }}')"></span>
+                            </button>
+                            <button
+                                @click="saveGlobalSettings"
+                                :disabled="saving"
+                                class="px-8 py-3 bg-neutral-900 text-white text-sm font-semibold
+                                       rounded-full hover:bg-neutral-800 focus:outline-none focus:ring-2
+                                       focus:ring-neutral-900 focus:ring-offset-2 transition-all duration-200
+                                       transform hover:scale-105 active:scale-95
+                                       disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                            >
+                                <span x-show="!saving">{{ t('settings.save.button') }}</span>
+                                <span x-show="saving" class="flex items-center">
+                                    <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                    {{ t('settings.save.saving') }}
+                                </span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -961,8 +938,8 @@
                                         </div>
 
                                         <!-- Size -->
-                                        <div class="hidden sm:block w-20 text-center flex-shrink-0">
-                                            <span class="text-sm text-neutral-600" x-text="model.estimated_size_formatted || '-'"></span>
+                                        <div class="hidden sm:block w-60 text-center flex-shrink-0">
+                                            <span class="text-sm text-neutral-600" x-text="modelSizeLabel(model)"></span>
                                         </div>
 
                                         <!-- Status -->

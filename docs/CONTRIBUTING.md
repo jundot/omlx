@@ -72,7 +72,8 @@ omlx/
 │   ├── engine_core.py    # Core async inference engine
 │   ├── paged_cache.py    # Block-based KV cache with LRU eviction
 │   └── cli.py            # CLI entry point
-├── packaging/            # macOS menubar app (PyObjC)
+├── apps/omlx-mac/        # Native SwiftUI macOS app (menubar + admin UI)
+├── packaging/            # macOS .app bundle build pipeline (venvstacks)
 ├── tests/                # Test suite
 └── docs/                 # Documentation
 ```

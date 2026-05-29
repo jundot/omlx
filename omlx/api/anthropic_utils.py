@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from .anthropic_models import (
+    AnthropicMessage,
     AnthropicTool,
     AnthropicUsage,
     ContentBlockText,
@@ -151,17 +152,22 @@ def convert_anthropic_to_internal(
     Returns:
         List of {"role": str, "content": str or list}
     """
-    processed_messages: list[dict[str, Any]] = []
-    native_tool_calling = bool(tokenizer and getattr(tokenizer, "has_tool_calling", False))
+    from .utils import _chat_template_supports_tool_role
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    processed_messages: list[dict[str, Any]] = []
+    native_tool_calling = bool(
+        tokenizer and _chat_template_supports_tool_role(tokenizer)
+    )
+
+    # Normalize: extract any role="system" entries from messages[] and merge
+    # with the canonical request.system field (claude-code 2.1.154+ sends
+    # system content inline instead of using the separate field).
+    system_text, normalized_messages = _normalize_in_messages_system(request)
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
 
@@ -371,14 +377,15 @@ def convert_anthropic_to_internal_harmony(
     """
     processed_messages: list[dict[str, Any]] = []
 
-    # Handle system message (Anthropic has separate 'system' field)
-    if request.system:
-        system_text = _extract_system_text(request.system)
-        if system_text:
-            processed_messages.append({"role": "system", "content": system_text})
+    # Normalize: extract any role="system" entries from messages[] and merge
+    # with the canonical request.system field (claude-code 2.1.154+ sends
+    # system content inline instead of using the separate field).
+    system_text, normalized_messages = _normalize_in_messages_system(request)
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
 
     # Process messages
-    for msg in request.messages:
+    for msg in normalized_messages:
         role = msg.role
         content = msg.content
 
@@ -560,6 +567,45 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
             text_parts.append(text)
         return "\n".join(text_parts)
     return ""
+
+
+def _normalize_in_messages_system(
+    request: MessagesRequest,
+) -> tuple[str, list[AnthropicMessage]]:
+    """Extract role="system" entries from messages[] and merge with request.system.
+
+    Claude Code 2.1.154+ began sending system content inline in the messages
+    array instead of (or in addition to) the canonical Anthropic ``system``
+    field. Returns the combined system text and the message list with system
+    entries removed, so downstream conversion sees the canonical shape.
+    """
+    extracted_parts: list[str] = []
+    filtered_messages: list[AnthropicMessage] = []
+    for msg in request.messages:
+        if msg.role != "system":
+            filtered_messages.append(msg)
+            continue
+        content = msg.content
+        if isinstance(content, str):
+            if content:
+                extracted_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                block_dict = _content_block_to_dict(block)
+                if block_dict is None:
+                    continue
+                if block_dict.get("type") == "text":
+                    text = block_dict.get("text", "")
+                    if text:
+                        extracted_parts.append(text)
+
+    base = _extract_system_text(request.system) if request.system else ""
+    if extracted_parts:
+        extra = "\n".join(extracted_parts)
+        system_text = "\n\n".join(p for p in (base, extra) if p)
+    else:
+        system_text = base
+    return system_text, filtered_messages
 
 
 def truncate_tool_result(

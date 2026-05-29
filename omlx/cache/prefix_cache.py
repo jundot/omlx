@@ -344,6 +344,21 @@ class BlockAwarePrefixCache(CacheManager):
         if paged_ssd_cache_manager is not None:
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
+    def _unlink_stale_ssd_block(self, block_hash: bytes | None) -> None:
+        """Permanently remove a stale block from SSD so the mismatch
+        warning does not fire on every subsequent request for the same
+        prefix. Catches cases that bypass the startup scan (e.g., a model
+        swap during a single server lifetime, or partially-written blocks
+        from an interrupted upgrade). Safe no-op when SSD cache is
+        disabled or the block has no hash.
+        """
+        if self.paged_ssd_cache is None or block_hash is None:
+            return
+        try:
+            self.paged_ssd_cache.delete_block(block_hash)
+        except Exception as e:
+            logger.debug(f"Failed to delete stale SSD block: {e}")
+
     def _detect_window_padding_from_blocks(
         self,
         block_ids: list[int],
@@ -1952,6 +1967,36 @@ class BlockAwarePrefixCache(CacheManager):
 
         return forked_table
 
+    def preload_blocks(self, block_table: BlockTable) -> int:
+        """
+        Pre-load matched blocks from SSD into hot cache in parallel.
+
+        Call this between fetch_cache() and reconstruct_cache() to
+        convert cold-SSD reads into hot-cache hits. Warm-start requests
+        (blocks already in hot cache) return 0 with no I/O.
+
+        Args:
+            block_table: BlockTable from fetch_cache() containing matched block IDs.
+
+        Returns:
+            Number of blocks successfully preloaded into hot cache.
+        """
+        if self.paged_ssd_cache is None:
+            return 0
+        if not block_table or not block_table.block_ids:
+            return 0
+
+        block_hashes = []
+        for block_id in block_table.block_ids:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block and block.block_hash is not None:
+                block_hashes.append(block.block_hash)
+
+        if not block_hashes:
+            return 0
+
+        return self.paged_ssd_cache.preload_matched_blocks(block_hashes)
+
     def reconstruct_cache(
         self,
         block_table: BlockTable,
@@ -2056,6 +2101,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Block has no model_name (legacy cache), "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
                         elif block_model_name != current_model_name:
                             # Block is from a different model
@@ -2063,6 +2109,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache model mismatch: block is for '{block_model_name}', "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                     # Validate num_layers to catch cross-model cache issues
@@ -2073,6 +2120,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache layer count mismatch: block has {block_num_layers} layers, "
                                 f"expected {self.expected_num_layers}. Invalidating cache hit."
                             )
+                            self._unlink_stale_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                 # Extract type info from block metadata

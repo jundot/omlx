@@ -56,6 +56,7 @@ class EngineEntry:
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
+    actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -80,37 +81,48 @@ class EnginePool:
 
     def __init__(
         self,
-        max_model_memory: int | None,
         scheduler_config: SchedulerConfig | None = None,
     ):
         """
         Initialize the engine pool.
 
         Args:
-            max_model_memory: Maximum memory for loaded models in bytes,
-                or None for no limit (disabled)
             scheduler_config: Configuration for BatchedEngine schedulers
+
+        Note:
+            Pre-load admission consults `enforcer.get_final_ceiling()` via
+            the `_get_final_ceiling` callback set by `server.init_server()`.
+            Until the callback is wired up the pool admits unconditionally.
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
-        self._max_model_memory = max_model_memory
         self._current_model_memory = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._get_final_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
 
     @property
-    def max_model_memory(self) -> int | None:
-        """Maximum memory for loaded models in bytes, or None if disabled."""
-        return self._max_model_memory
-
-    @property
     def current_model_memory(self) -> int:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
+
+    def _current_ceiling(self) -> int:
+        """Resolve the current memory ceiling via the enforcer callback.
+
+        Returns 0 when no callback is wired up (treated by callers as
+        "no limit").
+        """
+        cb = self._get_final_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
 
     @property
     def model_count(self) -> int:
@@ -121,6 +133,19 @@ class EnginePool:
     def loaded_model_count(self) -> int:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
+
+    async def apply_embedding_batch_size(self, batch_size: int) -> None:
+        """Apply embedding batch size to future and currently loaded embedding engines."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("embedding batch size must be > 0")
+
+        async with self._lock:
+            self._scheduler_config.embedding_batch_size = batch_size
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                if isinstance(engine, EmbeddingEngine):
+                    engine._batch_size = batch_size
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -186,11 +211,7 @@ class EnginePool:
             if model_id not in found_models:
                 logger.warning(f"Pinned model not found: {model_id}")
 
-        mem_display = "disabled" if self._max_model_memory is None else format_size(self._max_model_memory)
-        logger.info(
-            f"Discovered {len(self._entries)} models, "
-            f"max memory: {mem_display}"
-        )
+        logger.info(f"Discovered {len(self._entries)} models")
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
@@ -341,109 +362,56 @@ class EnginePool:
                     entry.last_access = time.time()
                     return entry.engine
 
-            # Check if model is too large for memory limit
-            if (
-                self._max_model_memory is not None
-                and entry.estimated_size > self._max_model_memory
-            ):
-                raise ModelTooLargeError(
-                    model_id, entry.estimated_size, self._max_model_memory
-                )
-
-            # Pre-load eviction: reserve 25% extra for KV cache headroom
-            # so other models get evicted earlier, leaving room for context.
-            # Always try to evict with headroom first. If all evictable models
-            # are gone and the model still fits without headroom, allow it.
-            # Skip entirely when model memory limit is disabled (None).
-            # Audio engines (STT/TTS) don't use KV cache, so headroom is 0.
-            if self._max_model_memory is not None:
-                if entry.engine_type in ("audio_stt", "audio_tts", "audio_sts"):
-                    kv_headroom = 0
-                else:
-                    kv_headroom = int(entry.estimated_size * 0.25)
-                required_with_headroom = entry.estimated_size + kv_headroom
-                try:
-                    await self._ensure_memory_available(required_with_headroom)
-                except InsufficientMemoryError:
-                    # Can't fit with headroom even after evicting everything possible.
-                    # Fall back to weights-only if that fits.
-                    if self._current_model_memory + entry.estimated_size <= self._max_model_memory:
+            # Pre-load admission against the memory ceiling from the
+            # process memory enforcer (min of static and dynamic). Try
+            # evicting LRU non-pinned models first; if the model still
+            # cannot fit after evicting everything available, raise.
+            #
+            # ceiling == 0 means the enforcer is off (guard disabled or
+            # not yet wired up), so we admit unconditionally.
+            ceiling = self._current_ceiling()
+            if ceiling > 0:
+                while True:
+                    current = max(mx.get_active_memory(), get_phys_footprint())
+                    projected = current + entry.estimated_size
+                    if projected <= ceiling:
+                        break
+                    victim = self._find_lru_victim()
+                    if victim is not None:
                         logger.info(
-                            f"Loading {model_id} without KV headroom "
-                            f"(need {format_size(required_with_headroom)}, "
-                            f"available {format_size(self._max_model_memory - self._current_model_memory)})"
+                            f"Evicting '{victim}' to fit '{model_id}' "
+                            f"under memory ceiling "
+                            f"({format_size(projected)} > "
+                            f"{format_size(ceiling)})"
                         )
-                    else:
-                        await self._ensure_memory_available(entry.estimated_size)
-
-            # Check process memory limit before loading.
-            # Try evicting LRU models first to free actual Metal memory.
-            # max_bytes <= 0 means enforcement is disabled (no limit).
-            # max(active, phys_footprint) matches what jetsam sees and what
-            # ProcessMemoryEnforcer uses, so load decisions are consistent.
-            if self._process_memory_enforcer is not None:
-                enforcer = self._process_memory_enforcer
-                if enforcer.max_bytes > 0:
-                    while True:
-                        current = max(mx.get_active_memory(), get_phys_footprint())
-                        projected = current + entry.estimated_size
-                        if projected <= enforcer.max_bytes:
-                            break
-                        # Try to evict an LRU model to free memory
-                        victim = self._find_lru_victim()
-                        if victim is not None:
-                            logger.info(
-                                f"Evicting '{victim}' to fit '{model_id}' "
-                                f"within process memory limit "
-                                f"({format_size(projected)} > "
-                                f"{format_size(enforcer.max_bytes)})"
-                            )
-                            await self._unload_engine(victim)
-                            continue
-                        # No more victims — cannot fit
-                        raise InsufficientMemoryError(
-                            required=entry.estimated_size,
-                            current=current,
-                            message=(
-                                f"Cannot load {model_id}: projected memory "
-                                f"{format_size(projected)} would exceed process "
-                                f"limit {format_size(enforcer.max_bytes)} "
-                                f"(current: {format_size(current)}, "
-                                f"model: {format_size(entry.estimated_size)})"
-                            ),
+                        await self._unload_engine(victim)
+                        continue
+                    # Nothing else to evict — model cannot fit. Use
+                    # ModelTooLargeError when the model alone exceeds the
+                    # ceiling (no chance of fitting), InsufficientMemoryError
+                    # when the model would fit on a clean process but the
+                    # current usage leaves no room.
+                    if entry.estimated_size > ceiling:
+                        raise ModelTooLargeError(
+                            model_id, entry.estimated_size, ceiling
                         )
+                    raise InsufficientMemoryError(
+                        required=entry.estimated_size,
+                        current=current,
+                        message=(
+                            f"Cannot load {model_id}: projected memory "
+                            f"{format_size(projected)} would exceed the memory "
+                            f"ceiling {format_size(ceiling)} "
+                            f"(current: {format_size(current)}, "
+                            f"model: {format_size(entry.estimated_size)}). "
+                            "Free system memory or lower memory_guard_tier."
+                        ),
+                    )
 
             # Now load the model
             await self._load_engine(model_id, force_lm=force_lm)
 
             return self._entries[model_id].engine
-
-    async def _ensure_memory_available(self, required: int) -> None:
-        """
-        Evict LRU models BEFORE loading to ensure we don't exceed memory limit.
-
-        Args:
-            required: Required memory in bytes
-
-        Raises:
-            InsufficientMemoryError: If can't free enough memory
-        """
-        if self._max_model_memory is None:
-            return  # No model memory limit
-        while self._current_model_memory + required > self._max_model_memory:
-            victim = self._find_lru_victim()
-            if not victim:
-                raise InsufficientMemoryError(
-                    required=required,
-                    current=self._current_model_memory,
-                    message=(
-                        f"Cannot free enough memory. "
-                        f"Need {format_size(required)}, "
-                        f"current usage {format_size(self._current_model_memory)}, "
-                        f"all loaded models are pinned."
-                    ),
-                )
-            await self._unload_engine(victim)
 
     def _find_lru_victim(self) -> str | None:
         """
@@ -499,6 +467,7 @@ class EnginePool:
         # Clear engine reference before settle barrier
         entry.engine = None
         entry.last_access = 0.0
+        entry.actual_size = None
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -599,6 +568,7 @@ class EnginePool:
         load_started_at = entry.loading_started_at
         load_completed = False
         entry.abort_loading = False
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -670,6 +640,7 @@ class EnginePool:
                     engine = EmbeddingEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
@@ -737,7 +708,13 @@ class EnginePool:
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"DFlash load failed: {start_error}; "
+                            f"{effective_type} fallback also failed: {fallback_error}"
+                        ) from start_error
                     logger.info(
                         f"Successfully loaded {model_id} as {effective_type} "
                         f"(fallback from DFlash)"
@@ -768,7 +745,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"LM load failed (force_lm=True): {start_error}; "
+                            f"VLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     logger.info(
                         f"Successfully loaded {model_id} as VLM "
@@ -797,7 +780,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                    await engine.start()
+                    try:
+                        await engine.start()
+                    except Exception as fallback_error:
+                        raise RuntimeError(
+                            f"VLM load failed: {start_error}; "
+                            f"LLM fallback also failed: {fallback_error}"
+                        ) from start_error
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
@@ -891,9 +880,14 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
+            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+            observed_delta = max(0, post_load_memory - pre_load_memory)
+            entry.actual_size = observed_delta or entry.estimated_size
+
             logger.info(
                 f"Loaded model: {model_id} "
-                f"(estimated: {format_size(entry.estimated_size)}, "
+                f"(actual: {format_size(entry.actual_size)}, "
+                f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
@@ -956,7 +950,7 @@ class EnginePool:
             Dictionary with pool status information
         """
         return {
-            "max_model_memory": self._max_model_memory,
+            "final_ceiling": self._current_ceiling(),
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
@@ -970,6 +964,7 @@ class EnginePool:
                     "is_loading": e.is_loading,
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
+                    "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,

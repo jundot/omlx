@@ -35,12 +35,7 @@ class CopilotIntegration(Integration):
         max_tokens: int | None = None,
         **kwargs,
     ) -> None:
-        env = os.environ.copy()
-        # Remove omlx-cli Python env vars so Copilot subprocesses don't inherit
-        # our bundled Python runtime.
-        for _key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
-            env.pop(_key, None)
-
+        env = self._scrubbed_env()
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://{host}:{port}/v1"
         env["COPILOT_PROVIDER_TYPE"] = "openai"
 
