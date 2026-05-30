@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import pytest
 
-from omlx.utils.model_loading import _checkpoint_has_mtp_weights
+from omlx.utils.model_loading import (
+    _checkpoint_has_inlined_mtp_weights,
+    _checkpoint_has_mtp_weights,
+    mtp_sidecar_path_for_load,
+)
 
 
 class TestLoadSidecarPatch:
@@ -39,4 +43,6 @@ class TestCheckpointDetectsOptiQLayout:
         except ImportError:
             pytest.skip("mlx not available")
 
+        assert _checkpoint_has_inlined_mtp_weights(tmp_path) is False
         assert _checkpoint_has_mtp_weights(tmp_path) is True
+        assert mtp_sidecar_path_for_load(tmp_path) == tmp_path / "mtp.safetensors"

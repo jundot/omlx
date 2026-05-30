@@ -373,33 +373,15 @@ def _safetensors_has_mtp_keys(path: Path) -> bool:
     return False
 
 
-def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
-    """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
+def _checkpoint_has_inlined_mtp_weights(model_path: str | Path) -> bool:
+    """True iff ``mtp.*`` tensors live in the main checkpoint (index or model shards).
 
-    Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
-    ``config.json`` but strip the MTP weights during conversion (e.g.
-    ``unsloth/Qwen3.6-35B-A3B-UD-MLX-*bit``). Attaching ``MTPModule`` for
-    such a checkpoint causes mlx-vlm's strict ``load_weights`` to fail with
-    "Missing N parameters: language_model.mtp.*", the engine falls back to
-    LLM, and vision is silently dropped (issue #1426).
-
-    Detection order:
-
-    1. ``mtp.safetensors`` sidecar (official HF / OptiQ layout — keys are
-       often absent from ``model.safetensors.index.json``).
-    2. ``model.safetensors.index.json`` weight_map entries.
-    3. Any ``*.safetensors`` shard in the directory (header scan only).
-
-    Returns False when nothing resolves — callers treat that as "no MTP
-    weights" (the conservative choice: skip MTPModule attachment).
+    Does not consult ``mtp.safetensors``. Used to prefer inlined oQ / mlx-lm
+    exports over a leftover HF sidecar in the same directory.
     """
     p = Path(model_path)
     if not p.is_dir():
         return False
-
-    sidecar = _mtp_sidecar_path(p)
-    if sidecar is not None and _safetensors_has_mtp_keys(sidecar):
-        return True
 
     index_path = p / "model.safetensors.index.json"
     if index_path.exists():
@@ -419,6 +401,42 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         if _safetensors_has_mtp_keys(shard):
             return True
     return False
+
+
+def mtp_sidecar_path_for_load(model_path: str | Path) -> Path | None:
+    """Return ``mtp.safetensors`` only when MTP is not already in model shards.
+
+    Load path: inlined weights are picked up by stock ``model*.safetensors``
+    glob; the sidecar is merged only when the main checkpoint omitted them.
+    """
+    p = Path(model_path)
+    if _checkpoint_has_inlined_mtp_weights(p):
+        return None
+    return _mtp_sidecar_path(p)
+
+
+def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
+    """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
+
+    Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
+    ``config.json`` but strip the MTP weights during conversion (e.g.
+    ``unsloth/Qwen3.6-35B-A3B-UD-MLX-*bit``). Attaching ``MTPModule`` for
+    such a checkpoint causes mlx-vlm's strict ``load_weights`` to fail with
+    "Missing N parameters: language_model.mtp.*", the engine falls back to
+    LLM, and vision is silently dropped (issue #1426).
+
+    Detection order:
+
+    1. ``model.safetensors.index.json`` or ``model-*.safetensors`` shards.
+    2. ``mtp.safetensors`` sidecar when step 1 found nothing (HF / OptiQ).
+
+    Returns False when neither resolves — callers treat that as "no MTP
+    weights" (the conservative choice: skip MTPModule attachment).
+    """
+    if _checkpoint_has_inlined_mtp_weights(model_path):
+        return True
+    sidecar = _mtp_sidecar_path(Path(model_path))
+    return sidecar is not None and _safetensors_has_mtp_keys(sidecar)
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:

@@ -7,10 +7,10 @@ references ``model-*.safetensors``. Stock mlx-lm loads ``model*.safetensors``
 only, so the MTP module stays at random init unless the sidecar is merged.
 
 This patch wraps ``mlx_lm.utils.load_model`` and, when ``mtp.safetensors``
-exists, temporarily extends ``glob.glob`` so the sidecar is loaded with the
-main shards *before* ``sanitize`` / ``nn.quantize`` / ``load_weights``. That
-matters for quantized checkpoints: ``class_predicate`` only quantizes layers
-whose ``.scales`` tensors appear in the weight dict at quantize time.
+is needed (no inlined ``mtp.*`` in the main shards/index), temporarily extends
+``glob.glob`` so the sidecar is loaded with the main shards *before*
+``sanitize`` / ``nn.quantize`` / ``load_weights``. Inlined oQ exports are
+left to stock mlx-lm loading even if a leftover sidecar file is present.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from ...utils.model_loading import _mtp_sidecar_path
+from ...utils.model_loading import mtp_sidecar_path_for_load
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ def apply() -> bool:
             kwargs["get_model_classes"] = get_model_classes
 
         model_path = Path(model_path)
-        sidecar = _mtp_sidecar_path(model_path)
+        sidecar = mtp_sidecar_path_for_load(model_path)
         if sidecar is not None:
             with _glob_includes_mtp_sidecar(sidecar):
                 model, config = original(model_path, **kwargs)

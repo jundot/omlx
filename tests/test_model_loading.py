@@ -422,6 +422,25 @@ class TestCheckpointHasMtpWeights:
             pytest.skip("mlx not available")
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
 
+    def test_inlined_mtp_skips_sidecar_for_load(self, tmp_path):
+        """When shards/index already have MTP, do not merge mtp.safetensors."""
+        self._write_index(
+            tmp_path,
+            {"language_model.mtp.fc.weight": "model.safetensors"},
+        )
+        try:
+            import mlx.core as mx
+
+            mx.save_safetensors(
+                str(tmp_path / "mtp.safetensors"),
+                {"mtp.fc.weight": mx.zeros((99, 99))},
+            )
+        except ImportError:
+            pytest.skip("mlx not available")
+        assert model_loading._checkpoint_has_inlined_mtp_weights(str(tmp_path)) is True
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert model_loading.mtp_sidecar_path_for_load(str(tmp_path)) is None
+
     def test_returns_false_for_empty_dir(self, tmp_path):
         # No index, no shards — caller treats as "no MTP weights".
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
