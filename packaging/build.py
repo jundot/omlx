@@ -840,7 +840,7 @@ def _install_xgrammar(export_dir: Path):
     """
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
