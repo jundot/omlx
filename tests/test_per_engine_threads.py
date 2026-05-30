@@ -144,7 +144,15 @@ class TestPerEngineExecutor:
 
             engine.close()
 
-    def test_close_shuts_down_executor(self):
+    def test_close_pins_executor_immortal_not_shut_down(self):
+        """close() must NOT shut down the per-engine executor: exiting its
+        worker thread runs MLX's thread_local CompilerCache destructor, which
+        frees @mx.compile graphs' Python objects unsafely at thread-exit ->
+        DeepSeek-V4 unload SIGSEGV (#1248). The executor is pinned immortal so
+        its worker thread stays alive for the process lifetime; close() only
+        drops EngineCore's own reference."""
+        import omlx.engine_core as ec
+
         mock_model = MagicMock()
         mock_model.model_type = "test"
         mock_tokenizer = MagicMock()
@@ -155,10 +163,14 @@ class TestPerEngineExecutor:
 
             engine = EngineCore(mock_model, mock_tokenizer)
             executor = engine._mlx_executor
+            assert executor in ec._immortal_engine_executors
             engine.close()
 
+            # EngineCore drops its reference, but the executor (and its worker
+            # thread) must stay alive — NOT shut down.
             assert engine._mlx_executor is None
-            assert executor._shutdown
+            assert executor in ec._immortal_engine_executors
+            assert not executor._shutdown
 
 
 class TestImmortalStreamRegistry:
@@ -173,6 +185,8 @@ class TestImmortalStreamRegistry:
 
         assert hasattr(ec, "_immortal_engine_streams")
         assert isinstance(ec._immortal_engine_streams, list)
+        assert hasattr(ec, "_immortal_engine_executors")
+        assert isinstance(ec._immortal_engine_executors, list)
 
     def test_stream_registered_on_init(self):
         import omlx.engine_core as ec
@@ -246,9 +260,10 @@ class TestImmortalStreamRegistry:
             assert len(ec._immortal_engine_streams) == before + 3
 
     def test_close_does_not_shut_down_global_executor(self):
-        """Guardrail: the per-engine executor is shut down at close(), but the
-        process-global executor (get_mlx_executor) must NEVER be shut down by
-        an engine close()."""
+        """Guardrail: an engine close() must NEVER shut down the process-global
+        executor (get_mlx_executor). (The per-engine executor is also no longer
+        shut down — it is pinned immortal — but this test specifically protects
+        the shared global executor.)"""
         import omlx.engine_core as ec
 
         mock_model = MagicMock()
