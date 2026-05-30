@@ -152,6 +152,30 @@ def test_batch_tq_continuous_batching_extend():
     # offset is now mx.array after extend
 
 
+def test_batch_make_mask_matches_fp16_left_padding():
+    """Regression: B>1 make_mask must match mlx-lm's BatchKVCache for left-padded
+    batches. The old hand-rolled causal term compared each request's sequence
+    length against the column index and masked out valid left-padded tokens, so
+    left-padded requests attended to ~nothing and decoded garbage (batch worse
+    than single). It now delegates to create_causal_mask like BatchKVCache.
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    lp = [0, 4, 2]
+    K = mx.random.normal((3, 2, 8, 16))
+    V = mx.random.normal((3, 2, 8, 16))
+    bk = BatchKVCache(lp); bk.update_and_fetch(K, V)
+    bt = BatchTurboQuantKVCache(lp, bits=8.0); bt.update_and_fetch(K, V)
+
+    ref = bk.make_mask(1, return_array=True)        # decode-step mask
+    got = bt.make_mask(1, return_array=True)
+    assert mx.array_equal(ref, got).item(), (
+        "B>1 make_mask diverges from BatchKVCache for left-padding "
+        f"(member masks: BK={ref[:,0,0,:].sum(-1).tolist()} "
+        f"TQ={got[:,0,0,:].sum(-1).tolist()})"
+    )
+
+
 def test_batch_tq_filter():
     batch = BatchTurboQuantKVCache([0, 0, 0], bits=4.0)
     keys = mx.random.normal((3, 2, 8, 32))

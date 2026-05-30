@@ -245,20 +245,15 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return create_attention_mask(N, offset, return_array, window_size)
         if isinstance(offset, mx.array) and offset.size == 1:
             return create_attention_mask(N, offset.item(), return_array, window_size)
-        # B>1: batched causal mask
-        max_offset = offset.max().item()
-        total = max_offset + N
-        rinds = mx.arange(total)[None, None, :]
-        linds = mx.arange(N)[None, None, :, None]
-        off = offset[:, None, None, None]
-        linds = linds + off
-        mask = linds >= rinds
-        if window_size is not None:
-            mask = mask & (linds < rinds + window_size)
-        if self.left_padding is not None:
-            lp = self.left_padding[:, None, None, None]
-            mask = mask & (rinds >= lp)
-        return mask
+        # B>1: delegate to mlx-lm's create_causal_mask with the physical column
+        # count + per-request left_padding, exactly like BatchKVCache. The old
+        # hand-rolled term compared each request's sequence length (offset)
+        # against the column index, which masked out valid left-padded tokens —
+        # so left-padded requests attended to ~nothing and decoded garbage.
+        phys = offset.max().item()
+        return create_causal_mask(
+            N, offset=phys, window_size=window_size, left_padding=self.left_padding
+        )
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
 
