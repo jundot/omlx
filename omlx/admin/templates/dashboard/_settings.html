@@ -887,7 +887,7 @@
                                 {{ t('settings.models.table.type') }}
                                 <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
-                            <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
+                            <div class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
                                 <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
