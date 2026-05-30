@@ -161,6 +161,118 @@ class TestPerEngineExecutor:
             assert executor._shutdown
 
 
+class TestImmortalStreamRegistry:
+    """Per-engine streams must be pinned immortal so the underlying Metal
+    command queue is never recycled at unload (#1248 regression / DeepSeek-V4
+    unload SIGSEGV). The fix restores the good-baseline immortal-queue
+    invariant by holding a process-lifetime strong reference to every
+    per-engine stream in a module-global registry."""
+
+    def test_registry_exists(self):
+        import omlx.engine_core as ec
+
+        assert hasattr(ec, "_immortal_engine_streams")
+        assert isinstance(ec._immortal_engine_streams, list)
+
+    def test_stream_registered_on_init(self):
+        import omlx.engine_core as ec
+
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+
+        before = len(ec._immortal_engine_streams)
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(mock_model, mock_tokenizer)
+            # The engine's stream must be held by the registry immediately.
+            assert engine._mlx_stream in ec._immortal_engine_streams
+            assert len(ec._immortal_engine_streams) == before + 1
+
+            engine.close()
+
+    def test_stream_retained_after_close(self):
+        """close() must NOT drop the registry's strong reference: the stream
+        (and its Metal queue) stays alive for the process lifetime even after
+        the engine is closed and dereferenced."""
+        import gc
+        import omlx.engine_core as ec
+
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(mock_model, mock_tokenizer)
+            stream = engine._mlx_stream
+            engine.close()
+
+            # Drop the only other strong references and force collection.
+            del engine
+            gc.collect()
+
+            # Registry must still hold the stream -> Metal queue immortal.
+            assert stream in ec._immortal_engine_streams
+
+    def test_registry_growth_bounded_by_engine_count(self):
+        """Growth is O(engines created), one entry per engine, regardless of
+        whether close() was called."""
+        import omlx.engine_core as ec
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            before = len(ec._immortal_engine_streams)
+            engines = []
+            for _ in range(3):
+                m = MagicMock()
+                m.model_type = "test"
+                engines.append(EngineCore(m, mock_tokenizer))
+
+            assert len(ec._immortal_engine_streams) == before + 3
+
+            for e in engines:
+                e.close()
+
+            # close() does not remove entries; count is unchanged.
+            assert len(ec._immortal_engine_streams) == before + 3
+
+    def test_close_does_not_shut_down_global_executor(self):
+        """Guardrail: the per-engine executor is shut down at close(), but the
+        process-global executor (get_mlx_executor) must NEVER be shut down by
+        an engine close()."""
+        import omlx.engine_core as ec
+
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+
+        # Materialize the global executor and confirm it is distinct from the
+        # per-engine one and survives close().
+        global_exec = ec.get_mlx_executor()
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(mock_model, mock_tokenizer)
+            assert engine._mlx_executor is not global_exec
+            engine.close()
+
+            assert not global_exec._shutdown
+            # Same singleton is still returned and usable.
+            assert ec.get_mlx_executor() is global_exec
+            assert not global_exec._shutdown
+
+
 class TestConcurrentStreamIsolation:
     """Verify that per-engine streams don't leak across engines during
     concurrent execution."""

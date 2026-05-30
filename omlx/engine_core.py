@@ -31,6 +31,38 @@ logger = logging.getLogger(__name__)
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+# Module-global keep-alive registry for per-engine MLX streams (#1248).
+#
+# Background: prior to the per-engine executor/stream split (#1248), every
+# engine shared ONE process-global executor whose thread-local generation
+# stream was created once and lived for the entire process lifetime — an
+# IMMORTAL Metal command queue that was never destroyed or recycled.
+#
+# The #1248 split gave each EngineCore its own mx.Stream created at __init__.
+# That stream (and its underlying Metal command queue) is reaped when the
+# EngineCore is garbage-collected at unload, so the queue became MORTAL and
+# is RECYCLED on the next allocation. For DeepSeek-V4-Flash (the only model
+# with module-scope mx.fast.metal_kernel + persistent @mx.compile graphs)
+# this recycling deterministically triggers an asynchronous native Metal
+# SIGSEGV at unload (use-after-free on the recycled queue). The crash is
+# sync-immune: draining/flushing the stream before teardown only relocates
+# it. See deepseek-v4-benchmark-shutdown notes.
+#
+# Fix: keep a strong reference to every per-engine stream here so it is never
+# garbage-collected. This restores the proven-good IMMORTAL-queue invariant
+# (the Metal command queue lives for the process lifetime and is never
+# recycled) WITHOUT any synchronization, while preserving the #1248
+# per-engine executor concurrency for all models. Growth is bounded by the
+# number of engines ever created (O(engines), not O(load/unload cycles));
+# each entry is a tiny handle to a process-global device queue.
+#
+# Honest scope: this directly neutralizes the recycled-queue mechanism. If a
+# V4-internal Metal buffer double-free exists that is independent of queue
+# lifecycle, this MASKS it exactly as the good baseline did (by keeping the
+# queue alive so the corrupting timing never occurs) rather than root-causing
+# it. Do NOT remove entries from this list and do NOT add synchronization.
+_immortal_engine_streams: list = []
+
 
 def _init_mlx_thread() -> None:
     """Replace generation_stream with a thread-local stream on the executor thread.
@@ -137,6 +169,11 @@ class EngineCore:
         # Each EngineCore gets its own thread + GPU stream so different
         # models can run scheduler.step() concurrently.
         self._mlx_stream = mx.new_thread_local_stream(mx.default_device())
+        # Pin the stream immortal: hold a process-lifetime strong reference so
+        # GC never destroys it at unload and its Metal command queue is never
+        # recycled. Restores the proven-good immortal-queue invariant that the
+        # #1248 split removed (DeepSeek-V4 unload SIGSEGV). See registry note.
+        _immortal_engine_streams.append(self._mlx_stream)
         self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
