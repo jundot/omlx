@@ -142,6 +142,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "python-semantic-release>=10.0.0",
     "venvstacks>=0.7.0",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
@@ -155,6 +156,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "python-semantic-release>=10.0.0",
     "venvstacks>=0.7.0",
 ]
 
@@ -204,3 +206,16 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
+
+[tool.semantic_release]
+version_variable = ["omlx/_version.py:__version__"]
+version_source = "variable"
+commit_parser = "conventional"
+parsers = [
+    "feat:minor",
+    "fix:patch",
+    "perf:patch",
+]
+upload_to_pypi = false
+upload_to_release = true
+build_command = false
