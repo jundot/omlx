@@ -32,6 +32,11 @@ def _fix_decode_single_token_quantize() -> None:
     through the correct non-fused path. Cost: one extra Metal dispatch per
     decode step (separate K and V quantize) — negligible. Forward-compatible:
     if upstream fixes the kernel this only loses the fused micro-optimization.
+
+    NOTE: fixed on mlx-vlm main (fea81522) but not in our pinned f96138e nor
+    the v0.5.0 release tag — drop this workaround once the pin bumps past the
+    fix. Bug #2 (the masked decode path) is still broken on main; see the B>1
+    dequantize+SDPA route in apply_turboquant_attention_patch().
     """
     global _DECODE_QUANT_FIXED
     if _DECODE_QUANT_FIXED:
