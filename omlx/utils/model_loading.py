@@ -71,6 +71,24 @@ def _patch_mlx_lm_load_config() -> None:
     _MLX_LM_LOAD_CONFIG_PATCHED = True
 
 
+_MLX_LM_LOAD_MTP_SIDECAR_PATCHED = False
+
+
+def _patch_mlx_lm_load_mtp_sidecar() -> None:
+    """Wrap ``mlx_lm.utils.load_model`` to merge ``mtp.safetensors`` sidecars."""
+    global _MLX_LM_LOAD_MTP_SIDECAR_PATCHED
+    if _MLX_LM_LOAD_MTP_SIDECAR_PATCHED:
+        return
+
+    try:
+        from ..patches.mlx_lm_mtp import load_sidecar
+    except ImportError:
+        return
+
+    if load_sidecar.apply():
+        _MLX_LM_LOAD_MTP_SIDECAR_PATCHED = True
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -112,6 +130,7 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+    _patch_mlx_lm_load_mtp_sidecar()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
@@ -325,6 +344,34 @@ _MTP_WEIGHT_PREFIXES = (
     "model.language_model.mtp.",
 )
 
+_MTP_SIDECAR_FILENAME = "mtp.safetensors"
+
+
+def _is_mtp_weight_key(key: str) -> bool:
+    return key.startswith(_MTP_WEIGHT_PREFIXES)
+
+
+def _mtp_sidecar_path(model_path: Path) -> Path | None:
+    """Return ``mtp.safetensors`` when the HF-style sidecar is present."""
+    sidecar = model_path / _MTP_SIDECAR_FILENAME
+    return sidecar if sidecar.is_file() else None
+
+
+def _safetensors_has_mtp_keys(path: Path) -> bool:
+    """True iff *path*'s safetensors header lists any MTP-prefixed tensor."""
+    try:
+        import safetensors
+    except ImportError:
+        return False
+    try:
+        with safetensors.safe_open(str(path), framework="numpy") as f:
+            for key in f.keys():
+                if _is_mtp_weight_key(key):
+                    return True
+    except Exception as e:
+        logger.debug("Failed to read %s for mtp weight scan: %s", path, e)
+    return False
+
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
@@ -336,42 +383,41 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     "Missing N parameters: language_model.mtp.*", the engine falls back to
     LLM, and vision is silently dropped (issue #1426).
 
-    Reads ``model.safetensors.index.json`` when present (no shard I/O).
-    Falls back to the first safetensors shard's metadata header. Returns
-    False when neither resolves — callers treat that as "no MTP weights"
-    (the conservative choice: skip MTPModule attachment).
+    Detection order:
+
+    1. ``mtp.safetensors`` sidecar (official HF / OptiQ layout — keys are
+       often absent from ``model.safetensors.index.json``).
+    2. ``model.safetensors.index.json`` weight_map entries.
+    3. Any ``*.safetensors`` shard in the directory (header scan only).
+
+    Returns False when nothing resolves — callers treat that as "no MTP
+    weights" (the conservative choice: skip MTPModule attachment).
     """
     p = Path(model_path)
     if not p.is_dir():
         return False
+
+    sidecar = _mtp_sidecar_path(p)
+    if sidecar is not None and _safetensors_has_mtp_keys(sidecar):
+        return True
 
     index_path = p / "model.safetensors.index.json"
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(
-                k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map
-            )
+            if any(_is_mtp_weight_key(k) for k in weight_map):
+                return True
         except Exception as e:
             logger.debug(
                 "Failed to read %s for mtp weight scan: %s", index_path, e
             )
 
-    shards = sorted(p.glob("*.safetensors"))
-    if not shards:
-        return False
-    try:
-        import safetensors
-
-        with safetensors.safe_open(str(shards[0]), framework="numpy") as f:
-            for k in f.keys():
-                if k.startswith(_MTP_WEIGHT_PREFIXES):
-                    return True
-    except Exception as e:
-        logger.debug(
-            "Failed to read %s header for mtp weight scan: %s", shards[0], e
-        )
+    for shard in sorted(p.glob("*.safetensors")):
+        if shard.name == _MTP_SIDECAR_FILENAME:
+            continue
+        if _safetensors_has_mtp_keys(shard):
+            return True
     return False
 
 

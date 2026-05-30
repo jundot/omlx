@@ -74,7 +74,15 @@ def apply_mlx_lm_mtp_patch() -> bool:
         True if the patch is now active. False if a sub-step refused
         to apply (mlx-lm not importable, missing prerequisite patch).
     """
-    from . import batch_generator, cache_rollback, deepseek_v4_model, qwen35_model
+    from . import (
+        batch_generator,
+        cache_rollback,
+        deepseek_v4_model,
+        load_sidecar,
+        qwen35_model,
+    )
+
+    load_sidecar.apply()
 
     if not cache_rollback.apply():
         return False

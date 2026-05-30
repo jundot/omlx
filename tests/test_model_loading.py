@@ -402,6 +402,26 @@ class TestCheckpointHasMtpWeights:
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
+    def test_returns_true_when_sidecar_present_but_index_lacks_mtp(self, tmp_path):
+        """HF / OptiQ layout: MTP lives only in mtp.safetensors."""
+        self._write_index(
+            tmp_path,
+            {
+                "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+            },
+        )
+        sidecar = tmp_path / "mtp.safetensors"
+        try:
+            import mlx.core as mx
+
+            mx.save_safetensors(
+                str(sidecar),
+                {"mtp.fc.weight": mx.zeros((8, 16))},
+            )
+        except ImportError:
+            pytest.skip("mlx not available")
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
     def test_returns_false_for_empty_dir(self, tmp_path):
         # No index, no shards — caller treats as "no MTP weights".
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
