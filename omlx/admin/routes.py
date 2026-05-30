@@ -4476,6 +4476,12 @@ def _build_active_models_data() -> dict:
                 snapshot = entry.engine.get_activity_snapshot()
                 active_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
+            elif hasattr(entry.engine, "has_active_requests"):
+                # DFlash bypasses the scheduler and exposes neither an
+                # AsyncEngineCore (_engine) nor get_activity_snapshot, so the
+                # dashboard previously read it as permanently idle (#1477).
+                # Fall back to its boolean in-flight signal.
+                active_requests = 1 if entry.engine.has_active_requests() else 0
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}

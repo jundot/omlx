@@ -220,6 +220,72 @@ def test_active_models_includes_non_streaming_activity_rows():
     ]
 
 
+# ── DFlash boolean activity fallback (#1477) ──────────────────────────────
+
+
+class FakeDFlashEngine:
+    """DFlash exposes a boolean in-flight signal but neither an
+    AsyncEngineCore (_engine) nor get_activity_snapshot."""
+
+    def __init__(self, active):
+        self._active = active
+
+    def has_active_requests(self):
+        return self._active
+
+
+class FakeDFlashPool:
+    def __init__(self, active):
+        self._entries = {
+            "dflash-model": SimpleNamespace(engine=FakeDFlashEngine(active))
+        }
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "dflash-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def _build_dflash_data(active):
+    class EmptyPrefillTracker:
+        def get_model_progress(self, model_id):
+            return []
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=FakeDFlashPool(active)),
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=EmptyPrefillTracker()),
+        patch("time.monotonic", return_value=110.0),
+    ):
+        return admin_routes._build_active_models_data()
+
+
+def test_dflash_reports_active_via_boolean_signal():
+    data = _build_dflash_data(active=True)
+    model = data["models"][0]
+    assert model["active_requests"] == 1
+    assert data["total_active_requests"] == 1
+
+
+def test_dflash_reports_idle_when_no_active_request():
+    data = _build_dflash_data(active=False)
+    model = data["models"][0]
+    assert model["active_requests"] == 0
+    assert data["total_active_requests"] == 0
+
+
 # ── idle / TTL countdown (#1307) ──────────────────────────────────────────
 
 

@@ -2192,15 +2192,22 @@ async def server_status(_: bool = Depends(verify_api_key)):
             if engine is None:
                 continue
             async_core = getattr(engine, "_engine", None)
-            if async_core is None:
-                continue
-            core = getattr(async_core, "engine", None)
-            if core is None:
-                continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
-            sched = getattr(core, "scheduler", None)
-            if sched is not None:
-                waiting_requests += len(getattr(sched, "waiting", []))
+            if async_core is not None:
+                core = getattr(async_core, "engine", None)
+                if core is None:
+                    continue
+                active_requests += len(getattr(core, "_output_collectors", {}))
+                sched = getattr(core, "scheduler", None)
+                if sched is not None:
+                    waiting_requests += len(getattr(sched, "waiting", []))
+            elif hasattr(engine, "get_activity_snapshot"):
+                active_requests += engine.get_activity_snapshot().get(
+                    "active_requests", 0
+                )
+            elif hasattr(engine, "has_active_requests"):
+                # DFlash exposes neither _engine nor get_activity_snapshot;
+                # use its boolean in-flight signal so it is not missed (#1477).
+                active_requests += 1 if engine.has_active_requests() else 0
 
     return {
         "status": "ok",
