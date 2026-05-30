@@ -31,12 +31,15 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    # Published metadata uses a PyPI spec (PyPI rejects direct git URLs in
+    # Requires-Dist). Local dev is pinned to commit ed1fca4 (v0.31.3 +
+    # thread-local generation stream + ArraysCache batch dim + think-token None
+    # fixes) via [tool.uv].override-dependencies below.
+    "mlx-lm==0.31.3",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
-    # mlx-embeddings from latest commit (32981fa)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
+    # PyPI spec for publish; dev pinned to commit 32981fa via override below.
+    "mlx-embeddings==0.1.0",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     "transformers>=5.0.0",
     # transformers 5.x's tokenization_mistral_common module imports
@@ -74,11 +77,15 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    # PyPI spec for publish; dev pinned to commit f96138e (Gemma4 MTP server
+    # batching #1166, speculative utils refactor #1169, Qwen native MTP drafter,
+    # MiniCPM-V 4.6) via override below.
+    "mlx-vlm>=0.5.0",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.5.1 (20d68db) — original bstnxbt repo. Gemma4 support, runtime package refactor, stable prefix snapshot reuse
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
+    # PyPI spec for publish; dev pinned to commit 20d68db (bstnxbt repo: Gemma4
+    # support, runtime package refactor, stable prefix snapshot reuse) via
+    # override below.
+    "dflash-mlx>=0.1.6",
     # Grammar-constrained decoding for structured-output enforcement
     # (response_format json_schema). Core dependency since 2026-05-18:
     # xgrammar 0.2.x dropped torch (~24MB total: xgrammar + apache-tvm-ffi),
@@ -98,11 +105,9 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
-    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: tiktoken, mistral-common[audio]
-    # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    # PyPI spec for publish (extras: tts/stt/sts); dev pinned to commit 5175326
+    # via override below.
+    "mlx-audio[tts,stt,sts]>=0.4.3",
 ]
 paroquant = [
     # ParoQuant runtime loader for paroquant-quantized models. Installed
@@ -187,13 +192,24 @@ include = ["omlx*"]
 [tool.setuptools.package-data]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
-"omlx.eval" = ["data/*.jsonl"]
+# omlx.eval benchmark datasets (omlx/eval/data/*.jsonl, ~62 MB) are intentionally
+# NOT bundled: they bloat the wheel and the inference server never reads them.
+# `omlx eval` users fetch the datasets separately.
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# The mlx-* / dflash-mlx deps in [project.dependencies] are declared with PyPI
+# version specs so the PUBLISHED wheel metadata is valid (PyPI rejects direct
+# git URLs in Requires-Dist). For LOCAL dev / source installs we still want the
+# exact pinned commits (which carry fixes not yet in the PyPI releases), so we
+# force them here. override-dependencies replaces the requirement entirely, so
+# it both pins the commit and overrides transitive pins
+# (e.g. mlx-audio → mlx-lm==0.31.1) that would otherwise conflict.
 override-dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
 ]
 
 [tool.black]
