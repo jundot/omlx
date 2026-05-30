@@ -419,6 +419,22 @@ class TestServeCommandFunctions:
         assert "embedding_batch_size" in result.stdout
         assert not (tmp_path / "settings.json").exists()
 
+    def test_cli_ssd_cache_size_uses_settings_validator(self):
+        """One-shot CLI cache flags should share settings.py size semantics."""
+        from omlx.cli import _resolve_ssd_cache_max_size_bytes
+
+        with pytest.raises(ValueError, match="must be positive"):
+            _resolve_ssd_cache_max_size_bytes("0GB", "/tmp/omlx-cache")
+
+    def test_cli_hot_cache_size_uses_settings_validator(self):
+        """Hot-cache CLI values use 0 as disabled and reject auto."""
+        from omlx.cli import _resolve_hot_cache_max_size_bytes
+
+        assert _resolve_hot_cache_max_size_bytes("0GB") == 0
+        assert _resolve_hot_cache_max_size_bytes("0") == 0
+        with pytest.raises(ValueError, match="hot_cache_max_size"):
+            _resolve_hot_cache_max_size_bytes("auto")
+
 
 
 class TestHasCliOverrides:

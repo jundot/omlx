@@ -3505,7 +3505,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "RAM ceiling for hot cache. \"0\" disables, \"8GB\" or \"auto\" accepted."
+            "value" : "RAM ceiling for hot cache. \"0\" disables; positive sizes like \"8GB\" enable it."
           }
         }
       }

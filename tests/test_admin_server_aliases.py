@@ -4,6 +4,7 @@
 
 import asyncio
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,7 @@ from fastapi import HTTPException
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.admin.routes as admin_routes
 from omlx.admin.routes import GlobalSettingsRequest
+from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
     is_valid_alias,
@@ -160,6 +162,77 @@ class TestServerInfoEndpoint:
         assert exc_info.value.status_code == 503
 
 
+class TestGetGlobalSettingsCache:
+    """get_global_settings: cache settings should expose raw save values."""
+
+    def _memory_info(self):
+        return {
+            "total_bytes": 64 * 1024**3,
+            "total_formatted": "64GB",
+            "auto_limit_formatted": "51GB",
+            "available_bytes": 32 * 1024**3,
+            "omlx_phys_footprint_bytes": 0,
+            "free_memory_bytes": 16 * 1024**3,
+            "inactive_memory_bytes": 8 * 1024**3,
+            "active_memory_bytes": 40 * 1024**3,
+            "iogpu_wired_limit_bytes": 0,
+            "omlx_wired_limit_request_bytes": 0,
+        }
+
+    def _disk_info(self):
+        return {
+            "total_bytes": 100 * 1024**3,
+            "total_formatted": "100GB",
+        }
+
+    def test_preserves_raw_auto_ssd_cache_size_in_settings_response(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.cache.ssd_cache_dir = "/tmp/omlx/cache"
+        gs.cache.ssd_cache_max_size = "auto"
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                admin_routes,
+                "get_system_memory_info",
+                return_value=self._memory_info(),
+            ),
+            patch.object(
+                admin_routes,
+                "get_ssd_disk_info",
+                return_value=self._disk_info(),
+            ),
+            patch("omlx.settings.get_ssd_capacity", return_value=100 * 1024**3),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["ssd_cache_max_size"] == "auto"
+        assert result["cache"]["ssd_cache_max_size_resolved"] == "10GB"
+
+    def test_returns_explicit_ssd_cache_size_in_settings_response(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.cache.ssd_cache_dir = "/tmp/omlx/cache"
+        gs.cache.ssd_cache_max_size = "25GB"
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                admin_routes,
+                "get_system_memory_info",
+                return_value=self._memory_info(),
+            ),
+            patch.object(
+                admin_routes,
+                "get_ssd_disk_info",
+                return_value=self._disk_info(),
+            ),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["ssd_cache_max_size"] == "25GB"
+        assert result["cache"]["ssd_cache_max_size_resolved"] == "25GB"
+
+
 # =============================================================================
 # /admin/api/global-settings save path for server_aliases
 # =============================================================================
@@ -264,18 +337,13 @@ class TestUpdateGlobalSettingsAliases:
 class TestUpdateGlobalSettingsEmbeddingBatchSize:
     """update_global_settings: saving and hot-applying embedding batch size."""
 
-    def _make_scheduler_settings(self):
-        return SimpleNamespace(
-            max_concurrent_requests=8,
-            embedding_batch_size=32,
-            chunked_prefill=False,
-        )
+    def _make_settings(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.save = MagicMock(return_value=None)
+        return gs
 
     def test_saves_and_hot_applies_embedding_batch_size(self):
-        gs = MagicMock()
-        gs.scheduler = self._make_scheduler_settings()
-        gs.validate.return_value = []
-        gs.save.return_value = None
+        gs = self._make_settings()
 
         pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
         server_state = SimpleNamespace(engine_pool=pool)
@@ -297,10 +365,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         gs.save.assert_called_once()
 
     def test_rejects_invalid_embedding_batch_size(self):
-        gs = MagicMock()
-        gs.scheduler = self._make_scheduler_settings()
-        gs.validate.return_value = []
-        gs.save.return_value = None
+        gs = self._make_settings()
         request = GlobalSettingsRequest(embedding_batch_size=0)
 
         with _patched_global_settings(gs):
@@ -314,10 +379,8 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         gs.save.assert_not_called()
 
     def test_does_not_hot_apply_embedding_batch_size_when_validation_fails(self):
-        gs = MagicMock()
-        gs.scheduler = self._make_scheduler_settings()
-        gs.validate.return_value = ["invalid unrelated setting"]
-        gs.save.return_value = None
+        gs = self._make_settings()
+        gs.server.port = 0
         pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5)
@@ -338,10 +401,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         gs.save.assert_not_called()
 
     def test_does_not_mutate_embedding_batch_size_when_api_key_is_invalid(self):
-        gs = MagicMock()
-        gs.scheduler = self._make_scheduler_settings()
-        gs.validate.return_value = []
-        gs.save.return_value = None
+        gs = self._make_settings()
         pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5, api_key="abc")
@@ -362,9 +422,7 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         gs.save.assert_not_called()
 
     def test_does_not_hot_apply_embedding_batch_size_when_save_fails(self):
-        gs = MagicMock()
-        gs.scheduler = self._make_scheduler_settings()
-        gs.validate.return_value = []
+        gs = self._make_settings()
         gs.save.side_effect = OSError("disk full")
         pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
         server_state = SimpleNamespace(engine_pool=pool)
@@ -383,3 +441,178 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         assert exc_info.value.status_code == 500
         pool.apply_embedding_batch_size.assert_not_awaited()
         assert gs.scheduler.embedding_batch_size == 32
+
+    def test_does_not_update_server_api_key_when_save_fails(self):
+        gs = self._make_settings()
+        gs.auth.api_key = "old-key"
+        gs.save.side_effect = OSError("disk full")
+        server_state = SimpleNamespace(api_key="old-key")
+        request = GlobalSettingsRequest(api_key="new-key")
+
+        with _patched_global_settings(gs), patch("omlx.server._server_state", server_state):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 500
+        assert server_state.api_key == "old-key"
+        assert gs.auth.api_key == "old-key"
+
+    def test_does_not_apply_model_dirs_runtime_when_save_fails(self, tmp_path):
+        gs = self._make_settings()
+        gs.model.model_dirs = ["/old/models"]
+        gs.model.model_dir = "/old/models"
+        gs.save.side_effect = OSError("disk full")
+        apply_model_dirs = AsyncMock(return_value=(True, "models updated"))
+        request = GlobalSettingsRequest(model_dirs=[str(tmp_path)])
+
+        with _patched_global_settings(gs), patch.object(
+            admin_routes,
+            "_apply_model_dirs_runtime",
+            apply_model_dirs,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 500
+        apply_model_dirs.assert_not_awaited()
+        assert gs.model.model_dirs == ["/old/models"]
+        assert gs.model.model_dir == "/old/models"
+
+
+class TestUpdateGlobalSettingsCacheSize:
+    """update_global_settings: SSD cache size validation and normalization."""
+
+    def _make_settings(self):
+        gs = GlobalSettings(base_path=Path("/tmp/omlx"))
+        gs.cache.ssd_cache_dir = "/tmp/omlx/cache"
+        gs.cache.ssd_cache_max_size = "50GB"
+        gs.save = MagicMock(return_value=None)
+        return gs
+
+    def test_rejects_zero_ssd_cache_size_without_mutating_settings(self):
+        gs = self._make_settings()
+        request = GlobalSettingsRequest(ssd_cache_max_size="0GB")
+        apply_cache = AsyncMock(return_value=(True, "cache updated"))
+
+        with _patched_global_settings(gs), patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            apply_cache,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "ssd_cache_max_size must be positive" in exc_info.value.detail
+        assert gs.cache.ssd_cache_max_size == "50GB"
+        apply_cache.assert_not_awaited()
+        gs.save.assert_not_called()
+
+    def test_trims_valid_ssd_cache_size_before_persisting(self):
+        gs = self._make_settings()
+        request = GlobalSettingsRequest(ssd_cache_max_size=" 20GB ")
+        apply_cache = AsyncMock(return_value=(True, "cache updated"))
+
+        with _patched_global_settings(gs), patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            apply_cache,
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.ssd_cache_max_size == "20GB"
+        apply_cache.assert_awaited_once()
+        gs.save.assert_called_once()
+
+    def test_hot_cache_only_updates_scheduler_runtime_config(self):
+        gs = self._make_settings()
+        request = GlobalSettingsRequest(hot_cache_only=True)
+        scheduler_config = SimpleNamespace(
+            paged_ssd_cache_dir=None,
+            paged_ssd_cache_max_size=0,
+            hot_cache_max_size=0,
+            hot_cache_only=False,
+        )
+        pool = SimpleNamespace(
+            _scheduler_config=scheduler_config,
+            get_loaded_model_ids=MagicMock(return_value=["model-a"]),
+            _unload_engine=AsyncMock(),
+        )
+        server_state = SimpleNamespace(engine_pool=pool)
+
+        with _patched_global_settings(gs), patch("omlx.server._server_state", server_state):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "cache" in result["runtime_applied"]
+        assert gs.cache.hot_cache_only is True
+        assert scheduler_config.hot_cache_only is True
+        pool._unload_engine.assert_awaited_once_with("model-a")
+        gs.save.assert_called_once()
+
+    def test_does_not_apply_cache_runtime_when_save_fails(self):
+        gs = self._make_settings()
+        gs.save.side_effect = OSError("disk full")
+        request = GlobalSettingsRequest(ssd_cache_max_size="20GB")
+        apply_cache = AsyncMock(return_value=(True, "cache updated"))
+
+        with _patched_global_settings(gs), patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            apply_cache,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 500
+        apply_cache.assert_not_awaited()
+        assert gs.cache.ssd_cache_max_size == "50GB"
+
+    def test_rejects_invalid_hot_cache_size_without_mutating_settings(self):
+        gs = self._make_settings()
+        request = GlobalSettingsRequest(hot_cache_max_size="auto")
+        apply_cache = AsyncMock(return_value=(True, "cache updated"))
+
+        with _patched_global_settings(gs), patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            apply_cache,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "hot_cache_max_size" in exc_info.value.detail
+        assert gs.cache.hot_cache_max_size == "0"
+        apply_cache.assert_not_awaited()
+        gs.save.assert_not_called()
+
+    def test_rejects_invalid_port_without_mutating_settings(self):
+        gs = self._make_settings()
+        request = GlobalSettingsRequest(port=0)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "port" in exc_info.value.detail
+        assert gs.server.port == 8000
+        gs.save.assert_not_called()
