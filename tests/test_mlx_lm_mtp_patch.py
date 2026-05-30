@@ -388,7 +388,7 @@ class TestQwen35MoeSanitize:
         (model quantized without preserve_mtp). Must not crash."""
         import logging
 
-        with caplog.at_level(logging.DEBUG):
+        with caplog.at_level(logging.DEBUG, logger="omlx"):
             result = moe_model.sanitize(self._backbone_weights())
         assert not any("mtp" in k for k in result)
         assert any("no MTP weights found" in r.getMessage() for r in caplog.records)
