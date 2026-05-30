@@ -11,6 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+import re
 from typing import Any
 
 import mlx.core as mx
@@ -108,6 +109,11 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     raise RuntimeError(_missing_processor_hint(model_name))
 
 
+def _is_word(text: str) -> bool:
+    """True if *text* contains at least one alphanumeric character."""
+    return bool(re.search(r"[A-Za-z0-9]", text or ""))
+
+
 class STTEngine(BaseNonStreamingEngine):
     """
     Engine for audio transcription (Speech-to-Text).
@@ -203,22 +209,33 @@ class STTEngine(BaseNonStreamingEngine):
         self,
         audio_path: str,
         language: str | None = None,
+        text: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Transcribe an audio file.
+        Transcribe or align an audio file.
 
         Args:
             audio_path: Path to the audio file to transcribe
             language: Optional language code (e.g. 'en', 'fr')
+            text: Optional reference transcript for forced alignment.
+                When provided, performs forced alignment instead of
+                transcription and returns word-level items.
             **kwargs: Additional model-specific parameters
 
         Returns:
-            Dictionary with keys:
+            Transcription mode (text=None):
                 text: Transcribed text
                 language: Detected or specified language
                 segments: List of timed segments (may be empty)
                 duration: Audio duration in seconds
+
+            Forced alignment mode (text= provided):
+                model: Model name used
+                language: Language used
+                items: List of word-level {text, start, end, duration}
+                weak_word_count: Number of weakly-aligned words
+                weak_ratio: weak_word_count / total_items
         """
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
@@ -231,6 +248,10 @@ class STTEngine(BaseNonStreamingEngine):
             "STT transcribe: model=%s, file=%s (%d bytes), language=%s",
             self._model_name, os.path.basename(audio_path), file_size, language,
         )
+        if text is not None:
+            logger.info(
+                "STT align mode: text_len=%d", len(text),
+            )
 
         model = self._model
         t0 = time.monotonic()
@@ -260,14 +281,45 @@ class STTEngine(BaseNonStreamingEngine):
             # Call model.generate() directly instead of
             # generate_transcription() which writes files to disk.
             gen_kwargs = dict(kwargs)
+            if text is not None:
+                gen_kwargs["text"] = text
             generate_language = _normalize_stt_generate_language(language)
             if generate_language is not None:
                 gen_kwargs["language"] = generate_language
 
             result = model.generate(audio_path, **gen_kwargs)
 
-            # result is typically an STTOutput dataclass with:
-            # text, segments, language, total_time, etc.
+            # Forced alignment path (text= provided): parse word-level items
+            if text is not None:
+                items = []
+                weak_count = 0
+                for item in getattr(result, "items", []) or []:
+                    start = getattr(item, "start_time", None)
+                    end = getattr(item, "end_time", None)
+                    duration = (
+                        max(0.0, float(end) - float(start))
+                        if start is not None and end is not None
+                        else None
+                    )
+                    token = getattr(item, "text", "")
+                    if _is_word(token) and (duration or 0.0) < 0.06:
+                        weak_count += 1
+                    items.append({
+                        "text": token,
+                        "start": start,
+                        "end": end,
+                        "duration": duration,
+                    })
+
+                return {
+                    "model": self._model_name,
+                    "language": language or "",
+                    "items": items,
+                    "weak_word_count": weak_count,
+                    "weak_ratio": round(weak_count / max(1, len(items)), 3),
+                }
+
+            # Normal transcription path: parse sentence-level segments
             if hasattr(result, "text"):
                 raw_lang = _normalize_language(
                     getattr(result, "language", None)
@@ -308,11 +360,17 @@ class STTEngine(BaseNonStreamingEngine):
             )
 
             elapsed = time.monotonic() - t0
-            text_len = len(result.get("text", ""))
-            logger.info(
-                "STT transcribe done: model=%s, %.2fs, %d chars output",
-                self._model_name, elapsed, text_len,
-            )
+            if text is not None:
+                logger.info(
+                    "STT align done: model=%s, %.2fs, %d items",
+                    self._model_name, elapsed, len(result.get("items", [])),
+                )
+            else:
+                text_len = len(result.get("text", ""))
+                logger.info(
+                    "STT transcribe done: model=%s, %.2fs, %d chars output",
+                    self._model_name, elapsed, text_len,
+                )
             return result
         finally:
             await self._finish_activity(activity_id)

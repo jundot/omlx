@@ -21,7 +21,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from ..server_metrics import get_server_metrics
-from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
+from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse, AudioAlignmentResponse
 
 logger = logging.getLogger(__name__)
 
@@ -631,3 +631,70 @@ async def process_audio(
     _record_audio_request(resolved_model)
 
     return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@router.post("/v1/audio/alignments", response_model=AudioAlignmentResponse)
+async def create_alignment(
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    model: str = Form(...),
+    language: str = Form("English"),
+):
+    """Forced audio-text alignment endpoint.
+
+    Accepts an audio file and a reference transcript, aligns each word
+    in the transcript to the audio, and returns word-level timestamps.
+
+    Uses an STT model with forced alignment capability
+    (e.g. ``mlx-community/Qwen3-ForcedAligner-0.6B-8bit``).
+    """
+    from omlx.engine.stt import STTEngine
+    from omlx.exceptions import ModelNotFoundError
+
+    pool = _get_engine_pool()
+    resolved_model = _resolve_model(model)
+
+    try:
+        engine = await pool.get_engine(resolved_model)
+    except ModelNotFoundError as exc:
+        avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not isinstance(engine, STTEngine):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{resolved_model}' is not a speech-to-text model",
+        )
+
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    try:
+        content = await _read_upload(file)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            tmp.write(content)
+
+        result = await engine.transcribe(
+            tmp_path,
+            text=text,
+            language=language,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    _record_audio_request(resolved_model)
+
+    return AudioAlignmentResponse(**result)

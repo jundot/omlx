@@ -29,6 +29,21 @@ class AudioTranscriptionResponse(BaseModel):
     segments: Optional[List[dict]] = None
 
 
+class ForceAlignedItem(BaseModel):
+    text: str
+    start: float | None = None
+    end: float | None = None
+    duration: float | None = None
+
+
+class AudioAlignmentResponse(BaseModel):
+    model: str
+    language: str
+    items: list[ForceAlignedItem]
+    weak_word_count: int
+    weak_ratio: float
+
+
 class AudioSpeechRequest(BaseModel):
     model: str
     input: str
