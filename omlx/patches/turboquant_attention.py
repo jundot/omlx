@@ -15,6 +15,41 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+_DECODE_QUANT_FIXED = False
+
+
+def _fix_decode_single_token_quantize() -> None:
+    """Disable mlx-vlm's broken fused single-token KV-quantize kernel.
+
+    mlx-vlm's TurboQuantKVCache._try_fused_kv_quantize takes a fused Metal
+    kernel path ONLY when keys.shape[-2] == 1 — i.e. exactly the decode step.
+    In the pinned mlx-vlm (f96138e) that kernel is broken: it produces ~140%
+    reconstruction error on the appended token at every bit depth, while the
+    non-fused codec.quantize() path used for T>=2 (prefill) is correct. The
+    result is garbage generation once TurboQuant decode is actually engaged.
+
+    Forcing _try_fused_kv_quantize to decline (return (None, None)) routes T=1
+    through the correct non-fused path. Cost: one extra Metal dispatch per
+    decode step (separate K and V quantize) — negligible. Forward-compatible:
+    if upstream fixes the kernel this only loses the fused micro-optimization.
+    """
+    global _DECODE_QUANT_FIXED
+    if _DECODE_QUANT_FIXED:
+        return
+    try:
+        from mlx_vlm.turboquant import TurboQuantKVCache
+    except ImportError:
+        return
+
+    def _decline_fused_kv_quantize(self, keys, values):
+        return None, None
+
+    TurboQuantKVCache._try_fused_kv_quantize = _decline_fused_kv_quantize
+    _DECODE_QUANT_FIXED = True
+    logger.info(
+        "TurboQuant decode fix applied: disabled broken fused single-token "
+        "quantize kernel (mlx-vlm f96138e)"
+    )
 
 
 def apply_turboquant_attention_patch() -> bool:
@@ -51,6 +86,21 @@ def apply_turboquant_attention_patch() -> bool:
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
             if queries.shape[-2] == 1:
+                # Continuous-batching decode (B>1) passes an array mask for
+                # per-request left-padding. mlx-vlm f96138e's masked
+                # decode_attention path is broken (~140% error), so route the
+                # array-mask case through dequantize + standard SDPA — the same
+                # approach mlx-vlm uses for its own BatchTurboQuantKVCache.
+                # B=1 keeps mask=None/"causal" and the correct fused kernel.
+                if isinstance(mask, mx.array):
+                    dq_keys, dq_values = real_cache.dequantize(keys, values)
+                    return mx.fast.scaled_dot_product_attention(
+                        queries,
+                        dq_keys.astype(queries.dtype),
+                        dq_values.astype(queries.dtype),
+                        scale=scale,
+                        mask=mask,
+                    )
                 return real_cache.decode_attention(
                     queries,
                     keys_state=keys,
@@ -98,6 +148,10 @@ def apply_turboquant_attention_patch() -> bool:
             vlm_base.scaled_dot_product_attention = patched_sdpa
     except ImportError:
         pass
+
+    # Without this, decode-step KV quantization is corrupt and TurboQuant
+    # produces garbage even at 8-bit (see _fix_decode_single_token_quantize).
+    _fix_decode_single_token_quantize()
 
     _PATCHED = True
     logger.info("TurboQuant attention patch applied")

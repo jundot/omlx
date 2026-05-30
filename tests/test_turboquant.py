@@ -398,3 +398,78 @@ def test_from_cache_merge_builds_working_batch():
     )
     mx.eval(out)
     assert out.shape == (2, 2, 1, 32)              # (B, n_q_heads, 1, D)
+
+
+def test_decode_single_token_quantize_is_accurate():
+    """Regression: the decode step appends ONE token via update_and_fetch.
+
+    mlx-vlm f96138e's fused single-token quantize kernel (used only for
+    keys.shape[-2] == 1) is broken — ~140% reconstruction error at every bit
+    depth — which garbles generation once TurboQuant decode engages. The
+    attention patch installs a workaround that forces the correct non-fused
+    path. This test fails loudly if the workaround stops being applied or an
+    upstream regression reappears.
+    """
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()  # installs the decode-quantize fix
+
+    ctx_k = mx.random.normal((1, 8, 40, 64)) * 0.1
+    ctx_v = mx.random.normal((1, 8, 40, 64)) * 0.1
+    new_k = mx.random.normal((1, 8, 1, 64)) * 0.1
+    new_v = mx.random.normal((1, 8, 1, 64)) * 0.1
+
+    tq = TurboQuantKVCache(bits=8.0)
+    tq.update_and_fetch(ctx_k, ctx_v)
+    tq.update_and_fetch(new_k, new_v)  # the decode-step append (T=1)
+    dk, _ = tq.dequantize()
+
+    rel_err = (
+        mx.mean(mx.abs(dk[:, :, 40:41, :] - new_k)).item()
+        / mx.mean(mx.abs(new_k)).item()
+    )
+    # 8-bit TurboQuant is near-lossless; broken kernel gives >100%.
+    assert rel_err < 0.05, f"decode-token quantize error {rel_err:.1%} (kernel bug?)"
+
+
+def test_batch_decode_routes_around_broken_masked_kernel():
+    """Regression: B>1 continuous-batching decode passes an array mask.
+
+    mlx-vlm f96138e's masked decode_attention path is broken (~140% error),
+    so the attention patch routes array-mask decode through dequantize + SDPA.
+    This verifies the patched scaled_dot_product_attention produces the
+    dequantize+SDPA result (NOT the broken kernel) for a B>1 array mask.
+    """
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()
+
+    # B=2 ragged batch (different prefill lengths) -> needs an array mask.
+    singles = []
+    for length in (12, 8):
+        fp = KVCache()
+        fp.update_and_fetch(
+            mx.random.normal((1, 4, length, 32)) * 0.1,
+            mx.random.normal((1, 4, length, 32)) * 0.1,
+        )
+        singles.append(TurboQuantKVCache.from_cache(fp, bits=8.0))
+    batch = BatchTurboQuantKVCache.merge(singles)
+
+    q = mx.random.normal((2, 16, 1, 32)) * 0.1  # B=2, 16 q-heads / 4 kv-heads
+    ks, vs = batch.update_and_fetch(
+        mx.random.normal((2, 4, 1, 32)) * 0.1,
+        mx.random.normal((2, 4, 1, 32)) * 0.1,
+    )
+    dk, dv = batch.dequantize(ks, vs)
+    T = dk.shape[2]
+    mask = mx.ones((2, 1, 1, T), dtype=mx.bool_)
+
+    out = mlx_base.scaled_dot_product_attention(q, ks, vs, batch, scale=32**-0.5, mask=mask)
+    ref = mx.fast.scaled_dot_product_attention(
+        q, dk.astype(q.dtype), dv.astype(q.dtype), scale=32**-0.5, mask=mask
+    )
+    mx.eval(out, ref)
+    rel = mx.mean(mx.abs(out - ref)).item() / mx.mean(mx.abs(ref)).item()
+    assert rel < 0.01, f"B>1 array-mask decode not routed to dequant+SDPA (err {rel:.1%})"
