@@ -28,7 +28,11 @@ def _model_path():
         return None
 
 
-pytestmark = pytest.mark.skipif(_model_path() is None, reason=f"{MODEL_REPO} not cached")
+pytestmark = [
+    pytest.mark.turboquant,
+    pytest.mark.slow,
+    pytest.mark.skipif(_model_path() is None, reason=f"{MODEL_REPO} not cached"),
+]
 
 
 def _helpers():

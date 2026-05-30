@@ -14,6 +14,8 @@ from mlx_vlm.turboquant import (
 
 from omlx.turboquant_kv import BatchTurboQuantKVCache, _rebuild_codecs, _infer_head_dim
 
+pytestmark = pytest.mark.turboquant
+
 
 def _sample_unit_vectors(count: int, dim: int) -> mx.array:
     vectors = mx.random.normal((count, dim))
