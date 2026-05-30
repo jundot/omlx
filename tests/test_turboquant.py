@@ -166,8 +166,10 @@ def test_batch_make_mask_matches_fp16_left_padding():
     lp = [0, 4, 2]
     K = mx.random.normal((3, 2, 8, 16))
     V = mx.random.normal((3, 2, 8, 16))
-    bk = BatchKVCache(lp); bk.update_and_fetch(K, V)
-    bt = BatchTurboQuantKVCache(lp, bits=8.0); bt.update_and_fetch(K, V)
+    bk = BatchKVCache(lp)
+    bk.update_and_fetch(K, V)
+    bt = BatchTurboQuantKVCache(lp, bits=8.0)
+    bt.update_and_fetch(K, V)
 
     ref = bk.make_mask(1, return_array=True)        # decode-step mask
     got = bt.make_mask(1, return_array=True)
