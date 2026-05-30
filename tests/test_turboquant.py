@@ -403,16 +403,14 @@ def test_from_cache_merge_builds_working_batch():
 def test_decode_single_token_quantize_is_accurate():
     """Regression: the decode step appends ONE token via update_and_fetch.
 
-    mlx-vlm f96138e's fused single-token quantize kernel (used only for
-    keys.shape[-2] == 1) is broken — ~140% reconstruction error at every bit
-    depth — which garbles generation once TurboQuant decode engages. The
-    attention patch installs a workaround that forces the correct non-fused
-    path. This test fails loudly if the workaround stops being applied or an
-    upstream regression reappears.
+    An earlier mlx-vlm fused single-token quantize kernel (used only for
+    keys.shape[-2] == 1) was broken — ~140% reconstruction error at every bit
+    depth — which garbled generation once TurboQuant decode engaged. It is fixed
+    on the pinned mlx-vlm (main). This test fails loudly if that regresses.
     """
     from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
 
-    apply_turboquant_attention_patch()  # installs the decode-quantize fix
+    apply_turboquant_attention_patch()
 
     ctx_k = mx.random.normal((1, 8, 40, 64)) * 0.1
     ctx_v = mx.random.normal((1, 8, 40, 64)) * 0.1
@@ -432,19 +430,20 @@ def test_decode_single_token_quantize_is_accurate():
     assert rel_err < 0.05, f"decode-token quantize error {rel_err:.1%} (kernel bug?)"
 
 
-def test_batch_decode_routes_around_broken_masked_kernel():
+def test_batch_masked_decode_is_accurate():
     """Regression: B>1 continuous-batching decode passes an array mask.
 
-    mlx-vlm f96138e's masked decode_attention path is broken (~140% error),
-    so the attention patch routes array-mask decode through dequantize + SDPA.
-    This verifies the patched scaled_dot_product_attention produces the
-    dequantize+SDPA result (NOT the broken kernel) for a B>1 array mask.
+    mlx-vlm's L=1 value kernels ignore RHT and corrupt the masked decode_attention
+    path (~140% error). _fix_masked_decode_rht() disables them so the codec uses
+    the correct einsum/_rotate_inverse fallback. This verifies the patched
+    scaled_dot_product_attention produces correct masked decode output for a B>1
+    array mask — matching the dequantize+SDPA reference over the same states.
     """
     from mlx_lm.models import base as mlx_base
 
     from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
 
-    apply_turboquant_attention_patch()
+    apply_turboquant_attention_patch()  # installs the RHT masked-decode fix
 
     # B=2 ragged batch (different prefill lengths) -> needs an array mask.
     singles = []
@@ -463,8 +462,8 @@ def test_batch_decode_routes_around_broken_masked_kernel():
         mx.random.normal((2, 4, 1, 32)) * 0.1,
     )
     dk, dv = batch.dequantize(ks, vs)
-    T = dk.shape[2]
-    mask = mx.ones((2, 1, 1, T), dtype=mx.bool_)
+    t_len = dk.shape[2]
+    mask = mx.ones((2, 1, 1, t_len), dtype=mx.bool_)
 
     out = mlx_base.scaled_dot_product_attention(q, ks, vs, batch, scale=32**-0.5, mask=mask)
     ref = mx.fast.scaled_dot_product_attention(
@@ -472,4 +471,6 @@ def test_batch_decode_routes_around_broken_masked_kernel():
     )
     mx.eval(out, ref)
     rel = mx.mean(mx.abs(out - ref)).item() / mx.mean(mx.abs(ref)).item()
-    assert rel < 0.01, f"B>1 array-mask decode not routed to dequant+SDPA (err {rel:.1%})"
+    # 8-bit quantized masked decode vs dequantize+SDPA over the same states.
+    # Broken RHT kernels give ~140%; the fix brings it into quantization noise.
+    assert rel < 0.05, f"B>1 masked decode inaccurate (err {rel:.1%}) — RHT fix not applied?"
