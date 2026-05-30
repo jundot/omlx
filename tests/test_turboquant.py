@@ -314,3 +314,87 @@ def test_ssd_type_map_completeness():
         "TurboQuantSplitState": TurboQuantSplitState,
     }
     assert set(_type_map.keys()) == expected_types
+
+
+# ---------------------------------------------------------------------------
+# Batched TurboQuant wiring (Phase 1): eligibility gate + post-prefill
+# conversion path (from_cache -> merge -> BatchTurboQuantKVCache)
+# ---------------------------------------------------------------------------
+
+
+def test_turboquant_eligible_gate():
+    """Only dense KVCache (and CacheList of KVCache) is batch-convertible.
+
+    Chunked/rotating/quantized caches must gate OFF so chunked-attention
+    models (Llama-4) and sliding-window models stay fp16 instead of crashing
+    in _merge_caches() — the #771 SIGABRT class.
+    """
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import (
+        CacheList,
+        ChunkedKVCache,
+        KVCache,
+        QuantizedKVCache,
+        RotatingKVCache,
+    )
+
+    from omlx.scheduler import Scheduler
+
+    # _turboquant_eligible is pure (ignores self); call the unbound method
+    # with a throwaway self so we don't construct a full Scheduler.
+    def elig(cache):
+        return Scheduler._turboquant_eligible(SimpleNamespace(), cache)
+
+    assert elig([KVCache(), KVCache()]) is True
+    assert elig([]) is False
+    assert elig([KVCache(), ChunkedKVCache(8192)]) is False
+    assert elig([KVCache(), RotatingKVCache(32)]) is False
+    assert elig([QuantizedKVCache()]) is False
+    assert elig([CacheList(KVCache(), KVCache())]) is True
+    assert elig([CacheList(KVCache(), RotatingKVCache(32))]) is False
+
+
+def test_from_cache_merge_builds_working_batch():
+    """Mirror the scheduler path: fp16 prefill -> from_cache (post-prefill
+    quantize) -> _merge_caches builds a BatchTurboQuantKVCache that decodes.
+
+    Importing omlx.scheduler installs the TurboQuantKVCache.merge monkey-patch
+    that _merge_caches() relies on, so caches[0].merge([...]) is what the
+    BatchGenerator actually calls at insert() time.
+    """
+    import omlx.scheduler  # noqa: F401  (applies the merge monkey-patch)
+
+    per_request = []
+    for length in (8, 4):  # two requests of different prefill lengths
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal((1, 2, length, 32)),
+            mx.random.normal((1, 2, length, 32)),
+        )
+        per_request.append(TurboQuantKVCache.from_cache(kv, bits=4.0))
+    mx.eval(*[c.keys for c in per_request])
+
+    # Exactly what mlx-lm _merge_caches() does for one layer.
+    batch = per_request[0].merge(per_request)
+    assert isinstance(batch, BatchTurboQuantKVCache)
+    assert batch.left_padding.tolist() == [0, 4]   # request 1 left-padded
+    assert batch.offset.tolist() == [8, 4]         # per-request valid lengths
+
+    # A decode step + the real attention path the model uses: update_and_fetch
+    # returns correctly-sliced state proxies (NOT the full reserved buffer),
+    # and decode_attention runs over the batched left-padding mask.
+    ks, vs = batch.update_and_fetch(
+        mx.random.normal((2, 2, 1, 32)),
+        mx.random.normal((2, 2, 1, 32)),
+    )
+    assert batch.offset.tolist() == [9, 5]         # both requests advanced by 1
+    out = batch.decode_attention(
+        mx.random.normal((2, 2, 1, 32)),
+        keys_state=ks,
+        values_state=vs,
+        scale=32**-0.5,
+        mask=batch.make_mask(1, return_array=True),
+    )
+    mx.eval(out)
+    assert out.shape == (2, 2, 1, 32)              # (B, n_q_heads, 1, D)
