@@ -1,0 +1,61 @@
+From: oMLX maintainers
+Subject: [PATCH] turboquant: guard L=1 value Metal kernels behind `not use_rht`
+
+The L=1 value-reconstruction Metal kernels (`_metal_mse_weighted_sum`,
+`_metal_mse_weighted_sum_sum_from_scores`) apply `matmul(weighted_rot, rotation)`
+to undo the codec rotation. That is only correct when the codec uses a plain
+rotation matrix. When `use_rht=True` (a randomized Hadamard transform, the
+default for `_TurboQuantMSECodec`), the inverse is `_rht_inverse(.; signs)`, not
+`matmul(.; rotation)`, so these kernels return garbage (~140% reconstruction
+error at every bit depth).
+
+`weighted_sum_from_scores` already guards its kernel with `if not self.use_rht`.
+`weighted_sum` and `weighted_sum_stats_from_scores` do not — so the
+single-query decode path (and any continuous-batching decode that takes the
+masked branch) is corrupt under RHT. This was latent because the fused decode
+fast path (`_fused_mse_decode_kernel`) is used for the common mask=None/causal
+case; the bug only surfaces when an array mask forces the slow path.
+
+Fix: add the same `not self.use_rht` guard to both methods, mirroring
+`weighted_sum_from_scores`. Under RHT this falls back to the correct einsum +
+`_rotate_inverse` path. Verified 140% -> ~1% reconstruction error.
+
+--- a/mlx_vlm/turboquant.py
++++ b/mlx_vlm/turboquant.py
+@@ class _TurboQuantMSECodec:
+     def weighted_sum(self, weights: mx.array, state: TurboQuantMSEState) -> mx.array:
+-        if weights.shape[-2] == 1:
++        if not self.use_rht and weights.shape[-2] == 1:
+             fast_output = _metal_mse_weighted_sum(
+                 weights,
+                 state,
+                 self.bits,
+                 self.codebook,
+                 self.rotation,
+             )
+             if fast_output is not None:
+                 return fast_output
+@@ class _TurboQuantMSECodec:
+     def weighted_sum_stats_from_scores(
+         self, scores: mx.array, state: TurboQuantMSEState
+     ) -> tuple[mx.array, mx.array, mx.array]:
+         max_scores = mx.max(scores, axis=-1)
+         # Metal kernel fast path: only for single-query decode (L=1)
+-        if scores.ndim == 5 and scores.shape[-2] == 1:
++        if not self.use_rht and scores.ndim == 5 and scores.shape[-2] == 1:
+             max_scores_2d = max_scores.reshape(
+                 max_scores.shape[0],
+                 max_scores.shape[1],
+                 max_scores.shape[2],
+             )
+             fast_output = _metal_mse_weighted_sum_sum_from_scores(
+                 scores,
+                 state,
+                 self.bits,
+                 self.codebook,
+                 self.rotation,
+                 max_scores_2d,
+             )
+             if fast_output is not None:
+                 denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
+                 return fast_output, denom, max_scores
