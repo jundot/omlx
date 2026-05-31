@@ -1,0 +1,28 @@
+{
+  "_comment": "weight = relative compute capacity per backend; load is normalized by it so a faster machine takes proportionally more traffic. mem_soft_floor/mem_penalty are the soft memory gate (deprioritize a backend near its Metal ceiling, never hard-exclude). affinity_hysteresis is in weight-normalized load units.",
+  "listen": "0.0.0.0:9000",
+  "router_api_key": "CHANGE-ME-clients-present-this-key",
+  "poll_interval": 1.5,
+  "affinity_hysteresis": 1.0,
+  "poll_timeout": 3.0,
+  "mem_soft_floor": 0.05,
+  "mem_penalty": 10.0,
+  "backends": [
+    {
+      "name": "m2max",
+      "base_url": "http://m2max:8000",
+      "api_key": "M2MAX-REAL-X-API-KEY",
+      "weight": 1.0
+    },
+    {
+      "name": "m5max",
+      "base_url": "http://m5max:8000",
+      "api_key": "M5MAX-REAL-X-API-KEY",
+      "weight": 1.3
+    }
+  ],
+  "aliases": {
+    "_comment": "optional: map a client-facing display alias to the real model id from /v1/models/status",
+    "gpt-4o": "gemma4-moe-26b-a4b-q6"
+  }
+}
