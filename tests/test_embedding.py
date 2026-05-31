@@ -721,7 +721,8 @@ class TestEmbeddingEngine:
 
         engine = EmbeddingEngine("test-model")
 
-        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel:
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx"):
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
@@ -730,12 +731,15 @@ class TestEmbeddingEngine:
             )
             MockModel.return_value = mock_model
 
-            asyncio.run(engine.start())
-            result = asyncio.run(engine.embed(["Hello", "World"]))
+            async def run():
+                await engine.start()
+                return await engine.embed(["Hello", "World"])
 
-            assert len(result.embeddings) == 2
-            assert result.total_tokens == 10
-            assert result.dimensions == 3
+            result = asyncio.run(run())
+
+        assert len(result.embeddings) == 2
+        assert result.total_tokens == 10
+        assert result.dimensions == 3
 
     def test_engine_not_started_raises_error(self):
         """Test that embed raises error if engine not started."""
@@ -849,18 +853,25 @@ class TestEmbeddingEngine:
             )
             MockModel.return_value = mock_model
 
-            asyncio.run(engine.start())
-            asyncio.run(engine.embed(["Hello"]))
+            async def run():
+                await engine.start()
+                await engine.embed(["Hello"])
 
+            asyncio.run(run())
+
+            # _run_sync calls mx.clear_cache() once per batch inside the loop
+            # and once more in the finally block → 2 calls for a single batch.
             mock_mx.synchronize.assert_called_once()
-            mock_mx.clear_cache.assert_called_once()
+            assert mock_mx.clear_cache.call_count == 2
 
     def test_engine_clears_metal_cache_per_concurrent_request(self):
-        """Cache clear must fire per request even under concurrency (#684 regression).
+        """Cache clear must fire for every coalesced dispatch cycle (#684 regression).
 
-        The earlier fix gated the clear on `_active_count == 0`, which never
-        triggered under steady concurrent RAG indexing loads. This asserts
-        every request clears, not just the last one.
+        The coalescing dispatch loop drains all concurrently-pending requests into
+        a single _run_sync() call.  For N concurrent single-text requests coalesced
+        into one batch (batch_size=64 >> 4):
+          - mx.clear_cache() is called once inside the batch loop + once in finally = 2
+          - mx.synchronize() is called once in finally = 1
         """
         engine = EmbeddingEngine("test-model")
         concurrency = 4
@@ -868,8 +879,11 @@ class TestEmbeddingEngine:
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
              patch("omlx.engine.embedding.mx") as mock_mx:
             mock_model = MagicMock()
-            mock_model.embed.return_value = EmbeddingOutput(
-                embeddings=[[0.1, 0.2]],
+            # Return one embedding per input so every coalesced request gets
+            # its future resolved (returning a fixed 1-embedding output causes
+            # the 3 remaining futures to never resolve and asyncio.gather hangs).
+            mock_model.embed.side_effect = lambda inputs=None, **kw: EmbeddingOutput(
+                embeddings=[[0.1, 0.2]] * len(inputs),
                 total_tokens=5,
                 dimensions=2,
             )
@@ -883,8 +897,11 @@ class TestEmbeddingEngine:
 
             asyncio.run(run_concurrent())
 
-            assert mock_mx.synchronize.call_count == concurrency
-            assert mock_mx.clear_cache.call_count == concurrency
+            # All 4 requests are coalesced into one _run_sync call (1 batch).
+            # synchronize: once in finally block.
+            mock_mx.synchronize.assert_called_once()
+            # clear_cache: once per batch in the loop + once in finally = 2.
+            assert mock_mx.clear_cache.call_count == 2
 
     def test_engine_chunks_large_embedding_requests_and_clears_each_chunk(self):
         """Large embedding requests should not hold the whole batch in MLX memory."""
@@ -903,10 +920,14 @@ class TestEmbeddingEngine:
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
 
-            asyncio.run(engine.start())
-            result = asyncio.run(
-                engine.embed([f"text-{i}" for i in range(5)])
-            )
+            # start() and embed() must share the same event loop so the
+            # dispatch task created by start() is still alive when embed()
+            # puts work on the queue.
+            async def run():
+                await engine.start()
+                return await engine.embed([f"text-{i}" for i in range(5)])
+
+            result = asyncio.run(run())
 
             assert result.embeddings == [[0.0], [1.0], [2.0], [3.0], [4.0]]
             assert result.total_tokens == 5
@@ -918,8 +939,11 @@ class TestEmbeddingEngine:
                 ["text-2", "text-3"],
                 ["text-4"],
             ]
-            assert mock_mx.synchronize.call_count == 3
-            assert mock_mx.clear_cache.call_count == 3
+            # _run_sync calls mx.clear_cache() once per batch (3 batches)
+            # plus once in the finally block → 4 total.
+            # mx.synchronize() is called once, in the finally block.
+            assert mock_mx.synchronize.call_count == 1
+            assert mock_mx.clear_cache.call_count == 4
 
     def test_engine_snapshots_batch_size_per_request(self):
         """Live batch-size updates must not skip or duplicate active request inputs."""
@@ -942,10 +966,14 @@ class TestEmbeddingEngine:
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
 
-            asyncio.run(engine.start())
-            result = asyncio.run(
-                engine.embed([f"text-{i}" for i in range(5)])
-            )
+            # start() and embed() must share the same event loop so the
+            # dispatch task created by start() is still alive when embed()
+            # puts work on the queue.
+            async def run():
+                await engine.start()
+                return await engine.embed([f"text-{i}" for i in range(5)])
+
+            result = asyncio.run(run())
 
             assert result.embeddings == [[0.0], [1.0], [2.0], [3.0], [4.0]]
             assert observed_batches == [
@@ -955,7 +983,17 @@ class TestEmbeddingEngine:
             ]
 
     def test_concurrent_large_embedding_requests_interleave_between_chunks(self):
-        """One large embedding request should not monopolize the MLX executor."""
+        """Concurrent requests coalesced into one dispatch cycle share batches.
+
+        When two requests arrive simultaneously via asyncio.gather they are
+        coalesced into a single _run_coalesced call.  All texts are flattened,
+        sorted by approximate length, then batched.  Because all 8 texts here
+        have the same character length the stable sort preserves arrival order
+        (a-0…a-3 first, b-0…b-3 second), yielding batches:
+          [a-0, a-1], [a-2, a-3], [b-0, b-1], [b-2, b-3]
+        Both requests' futures are resolved correctly despite the interleaved
+        batching.
+        """
         engine = EmbeddingEngine("test-model", batch_size=2)
         observed_chunks = []
         observed_lock = threading.Lock()
@@ -987,10 +1025,12 @@ class TestEmbeddingEngine:
 
             assert [row[0] for row in first.embeddings] == [0.0, 1.0, 2.0, 3.0]
             assert [row[0] for row in second.embeddings] == [0.0, 1.0, 2.0, 3.0]
+            # All 8 texts have equal length so stable sort preserves arrival order.
+            # Both requests are coalesced into one _run_sync call; batches are:
             assert observed_chunks == [
                 ("a-0", "a-1"),
-                ("b-0", "b-1"),
                 ("a-2", "a-3"),
+                ("b-0", "b-1"),
                 ("b-2", "b-3"),
             ]
 
