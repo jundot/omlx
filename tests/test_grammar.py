@@ -367,10 +367,24 @@ class TestCompileGrammarForRequest:
         assert "xgrammar" in exc_info.value.detail
 
     def test_returns_none_when_no_compiler_and_response_format(self):
-        """response_format gracefully falls back to None when no compiler."""
+        """json_object (no concrete schema) still falls back to None when no
+        compiler — only a requested json_schema must fail loud."""
         engine = _make_engine(grammar_compiler=None)
         result = self._call(engine, response_format={"type": "json_object"})
         assert result is None
+
+    def test_raises_when_no_compiler_and_response_format_json_schema(self):
+        """A requested json_schema must not be silently ignored when xgrammar
+        is unavailable — fail loud instead of unconstrained generation."""
+        from fastapi import HTTPException
+        engine = _make_engine(grammar_compiler=None)
+        with pytest.raises(HTTPException) as exc_info:
+            self._call(engine, response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "t", "schema": {"type": "object"}},
+            })
+        assert exc_info.value.status_code == 400
+        assert "xgrammar" in exc_info.value.detail
 
     def test_bare_json_schema(self):
         """No reasoning_parser: compile_json_schema called directly."""
@@ -487,17 +501,21 @@ class TestCompileGrammarForRequest:
         assert exc_info.value.status_code == 400
         assert "bad schema" in exc_info.value.detail
 
-    def test_compilation_error_returns_none_for_response_format(self):
-        """response_format compilation errors → graceful fallback to None."""
+    def test_compilation_error_raises_for_response_format(self):
+        """response_format compile errors fail loud (HTTP 400), not a silent
+        fallback to unconstrained generation that emits wrong-shaped output."""
+        from fastapi import HTTPException
         compiler = MagicMock()
         compiler.compile_json_schema.side_effect = RuntimeError("bad")
         engine = _make_engine(grammar_compiler=compiler)
 
-        result = self._call(engine, response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "t", "schema": {"type": "object"}},
-        })
-        assert result is None
+        with pytest.raises(HTTPException) as exc_info:
+            self._call(engine, response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "t", "schema": {"type": "object"}},
+            })
+        assert exc_info.value.status_code == 400
+        assert "bad" in exc_info.value.detail
 
 
 # =========================================================================

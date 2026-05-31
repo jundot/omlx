@@ -2689,6 +2689,18 @@ def _compile_grammar_for_request(
                     "Install with: pip install 'omlx[grammar]'"
                 )
             raise HTTPException(status_code=400, detail=detail)
+        # response_format path: if a non-empty schema was actually
+        # requested, fail loud rather than silently ignoring it.
+        # json_object (empty schema {}) and the no-schema case return None.
+        if fmt.get("json_schema"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Structured output requires xgrammar, but it is not "
+                    "available; cannot honor the requested response_format "
+                    "json_schema. Install with: pip install 'omlx[grammar]'"
+                ),
+            )
         return None
 
     try:
@@ -2698,14 +2710,17 @@ def _compile_grammar_for_request(
             )
         return _compile_bare_grammar(compiler, fmt)
     except Exception as e:
-        if structured_outputs is not None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Grammar compilation error: {e}",
-            )
-        logger.warning("Grammar compilation from response_format failed, "
-                       "falling back to prompt injection: %s", e)
-    return None
+        # Fail loud. Reaching here means _build_format_element returned a
+        # non-None fmt (json_schema / grammar / regex / json_object), so a
+        # compiled grammar is genuinely required. Silently returning None on
+        # the response_format path degraded to UNCONSTRAINED generation, which
+        # emits wrong-shaped output the caller cannot detect — forbidden by the
+        # fail-fast policy. Surface the original xgrammar error (chained via
+        # `from e`) for both the structured_outputs and response_format paths.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Grammar compilation error: {e}",
+        ) from e
 
 
 # =============================================================================
