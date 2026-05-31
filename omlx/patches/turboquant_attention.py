@@ -15,49 +15,6 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
-_RHT_DECODE_FIXED = False
-
-
-def _fix_masked_decode_rht() -> None:
-    """Work around mlx-vlm's L=1 value Metal kernels that ignore RHT (Bug 2).
-
-    `_TurboQuantMSECodec.weighted_sum` and `weighted_sum_stats_from_scores` call
-    the single-query (L=1) value kernels (`_metal_mse_weighted_sum`,
-    `_metal_mse_weighted_sum_sum_from_scores`) WITHOUT the `if not self.use_rht`
-    guard that the sibling `weighted_sum_from_scores` has. Those kernels undo the
-    codec rotation with `matmul(., rotation)`, but TurboQuant KV codecs use
-    `use_rht=True` (randomized Hadamard transform) whose inverse is
-    `_rht_inverse` — so they corrupt the masked decode path (~140% error). That
-    is what makes B>1 continuous-batching decode (which passes a per-request
-    left-padding array mask) produce garbage.
-
-    We disable those two kernels so the codec falls back to the correct einsum +
-    `_rotate_inverse` path. Since our KV codecs are always `use_rht=True`, this is
-    equivalent to the upstream `not self.use_rht` guard, at the cost of one matmul
-    instead of a fused kernel on the slow decode path — negligible.
-
-    Temporary until the upstream fix lands; see
-    docs/upstream/mlx-vlm-turboquant-rht-decode-PR.md. (Bug 1, the fused
-    single-token quantize kernel, is already fixed on the pinned mlx-vlm main.)
-    """
-    global _RHT_DECODE_FIXED
-    if _RHT_DECODE_FIXED:
-        return
-    try:
-        import mlx_vlm.turboquant as _tq
-    except ImportError:
-        return
-
-    def _decline(*args, **kwargs):
-        return None
-
-    _tq._metal_mse_weighted_sum = _decline
-    _tq._metal_mse_weighted_sum_sum_from_scores = _decline
-    _RHT_DECODE_FIXED = True
-    logger.info(
-        "TurboQuant decode fix applied: disabled RHT-incompatible L=1 value "
-        "kernels (mlx-vlm Bug 2 workaround)"
-    )
 
 
 def apply_turboquant_attention_patch() -> bool:
@@ -94,10 +51,11 @@ def apply_turboquant_attention_patch() -> bool:
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
             if queries.shape[-2] == 1:
-                # Decode (B=1 and B>1). With the masked decode path corrected by
-                # _fix_masked_decode_rht(), continuous-batching decode using a
-                # per-request left-padding array mask runs the quantized kernels
-                # directly — no full-batch dequantize per step.
+                # Decode (B=1 and B>1). Continuous-batching decode passes a
+                # per-request left-padding array mask; the masked decode_attention
+                # path runs the quantized kernels directly (no full-batch
+                # dequantize per step). The RHT masked-decode fix landed upstream
+                # in mlx-vlm (Blaizzy/mlx-vlm#1244, in the pinned commit).
                 return real_cache.decode_attention(
                     queries,
                     keys_state=keys,
@@ -145,10 +103,6 @@ def apply_turboquant_attention_patch() -> bool:
             vlm_base.scaled_dot_product_attention = patched_sdpa
     except ImportError:
         pass
-
-    # Without this, B>1 (masked) decode is corrupt and TurboQuant batching
-    # produces garbage (see _fix_masked_decode_rht).
-    _fix_masked_decode_rht()
 
     _PATCHED = True
     logger.info("TurboQuant attention patch applied")
