@@ -2229,8 +2229,11 @@ async def create_chat_completion(
         chat_template_kwargs=merged_ct_kwargs or None,
         reasoning_parser=reasoning_parser,
     )
-    # Fall back to prompt injection when grammar is not compiled
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    response_format_warning = None
     if compiled_grammar is None and response_format:
+        response_format_warning = _response_format_warning_header(response_format)
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
@@ -2369,6 +2372,9 @@ async def create_chat_completion(
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
             keepalive = _chat_keepalive_chunk(response_id)
+        sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+        if response_format_warning:
+            sse_headers["Warning"] = response_format_warning
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
@@ -2376,7 +2382,7 @@ async def create_chat_completion(
                 keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            headers=sse_headers,
         )
 
     # Non-streaming response with keepalive during prefill
@@ -2475,9 +2481,13 @@ async def create_chat_completion(
             ),
         ).model_dump_json(exclude_none=True)
 
+    json_headers = (
+        {"Warning": response_format_warning} if response_format_warning else None
+    )
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),
         media_type="application/json",
+        headers=json_headers,
     )
 
 
@@ -2757,6 +2767,30 @@ def _warn_response_format_not_enforced(response_format, error=None):
             "unavailable; output will not be schema-enforced (falling back to "
             "prompt injection)%s.", reason,
         )
+
+
+def _response_format_warning_header(response_format) -> str:
+    """Build an RFC 7234 ``Warning`` header for an unenforced response_format.
+
+    The server already logs the downgrade (see
+    :func:`_warn_response_format_not_enforced`), but that signal is only
+    visible to the operator.  This header surfaces the same fact to the API
+    caller so a client can tell that ``response_format`` fell back to
+    best-effort prompt injection rather than schema-enforced output (#1241).
+    Header values must be single-line ASCII, so the text is terse.
+    """
+    if _response_format_requests_strict(response_format):
+        text = (
+            "response_format strict json_schema not enforced; "
+            "grammar-constrained decoding unavailable, output is "
+            "best-effort and NOT schema-enforced"
+        )
+    else:
+        text = (
+            "response_format not enforced; grammar-constrained decoding "
+            "unavailable, output is best-effort"
+        )
+    return f'199 omlx "{text}"'
 
 
 # =============================================================================

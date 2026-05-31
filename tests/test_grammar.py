@@ -591,6 +591,48 @@ class TestResponseFormatRequestsStrict:
         assert self._call(rf) is True
 
 
+class TestResponseFormatWarningHeader:
+    """The unenforced-response_format degrade is surfaced to the caller as an
+    RFC 7234 Warning response header, not just a server-side log (#1241)."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_warning_header
+        return _response_format_warning_header(response_format)
+
+    @staticmethod
+    def _strict_rf(strict):
+        return {
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": strict, "schema": {}},
+        }
+
+    def test_strict_header_names_strict_intent(self):
+        header = self._call(self._strict_rf(True))
+        assert header.startswith('199 omlx "')
+        assert header.endswith('"')
+        assert "strict" in header
+        assert "NOT schema-enforced" in header
+
+    def test_non_strict_header_is_generic(self):
+        header = self._call(self._strict_rf(False))
+        assert header.startswith('199 omlx "')
+        assert "not enforced" in header
+        assert "strict" not in header
+
+    def test_json_object_header_is_generic(self):
+        header = self._call({"type": "json_object"})
+        assert header.startswith('199 omlx "')
+        assert "strict" not in header
+
+    def test_header_value_is_single_line_ascii(self):
+        # HTTP header values cannot contain CR/LF or non-ASCII bytes.
+        for rf in (self._strict_rf(True), {"type": "json_object"}):
+            header = self._call(rf)
+            header.encode("ascii")  # raises if non-ASCII
+            assert "\n" not in header and "\r" not in header
+
+
 # =========================================================================
 # GrammarConstraintProcessor
 # =========================================================================
