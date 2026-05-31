@@ -323,7 +323,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"
     try:
-        resp = requests.get(f"{base_url}/health", timeout=3)
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
     except Exception:
         print(f"oMLX server is not running at {base_url}")
