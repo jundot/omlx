@@ -325,6 +325,24 @@ FastAPI Server (OpenAI / Anthropic API)
 
 </details>
 
+## 多机集群路由
+
+有多台 Mac 时，集群路由器（`omlx/cluster/`）把请求按模型和负载自动分发到多台 `omlx serve`。它不是 GPU/显存级集群，也不是共享 KV 缓存——每台仍是独立 server，路由器只决定每个请求由哪台处理。
+
+- 模型感知：请求只发给装有目标模型的机器，不用手动记哪台有哪个模型。
+- 加权均衡：更快的机器配更高 `weight`，自动多分流量（1.0 / 1.3 大约多分 30%）。
+- 已加载优先 + 显存软门槛：优先发给已加载该模型的机器，显存吃紧的机器被降权避开冷加载。
+- 流式透传与故障转移：SSE 字节透传、客户端断开取消上游；连接失败在流开始前转移到另一台。
+
+路由器监听独立端口（默认 `:9000`，因为它和 server 同机不能共用 `:8000`）。客户端把地址从某台的 `:8000` 换成路由器的 `:9000` 即可，单机直连不受影响。
+
+```bash
+OMLX_CLUSTER_CONFIG=~/.omlx/cluster.json python -m omlx.cluster.router
+# 客户端指向 http://<router-host>:9000/v1
+```
+
+跨机访问要求被访问机的 `server.host` 绑 `0.0.0.0`（默认只绑回环），且建议只在内网/tailscale 暴露，靠 `X-API-Key` 保护。配置模板见 `omlx/cluster/cluster.example.json`，完整说明见 [docs/cluster.md](docs/cluster.md)。
+
 ## 开发
 
 ### CLI 服务器

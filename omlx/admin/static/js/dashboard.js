@@ -5,7 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
-    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
+    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench', 'cluster']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
@@ -179,6 +179,19 @@
             restartServer: {
                 status: 'idle',
                 message: '',
+            },
+
+            // Cluster-router management (Cluster tab). Talks to /admin/api/cluster/*.
+            cluster: {
+                config: null,        // masked config being edited (secrets are __SAVED__)
+                exists: false,
+                path: '',
+                status: null,        // {agent, listen, health, error}
+                loading: false,
+                saving: false,
+                saveError: '',
+                saveSuccess: false,
+                controlBusy: '',     // launchctl action currently in flight
             },
 
             statsScope: 'session',
@@ -587,6 +600,10 @@
                 if (!DASHBOARD_MAIN_TABS.has(tab)) return;
                 this.mainTab = tab;
                 this.syncTabStateToUrl();
+                if (tab === 'cluster') {
+                    this.loadClusterConfig();
+                    this.loadClusterStatus();
+                }
             },
 
             setSettingsTab(tab) {
@@ -608,6 +625,109 @@
                     if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
                     this.loadUploadTasks();
                 }
+            },
+
+            // ---- Cluster router management ----
+            defaultClusterConfig() {
+                return {
+                    listen: '0.0.0.0:9000',
+                    router_api_key: '',
+                    poll_interval: 1.5,
+                    affinity_hysteresis: 1.0,
+                    mem_soft_floor: 0.05,
+                    mem_penalty: 10.0,
+                    backends: [],
+                };
+            },
+
+            async loadClusterConfig() {
+                try {
+                    const r = await fetch('/admin/api/cluster/config');
+                    if (r.status === 401) { window.location.href = '/admin'; return; }
+                    const d = await r.json();
+                    this.cluster.exists = !!d.exists;
+                    this.cluster.path = d.path || '';
+                    this.cluster.config = (d.config && Object.keys(d.config).length)
+                        ? d.config
+                        : this.defaultClusterConfig();
+                    if (!Array.isArray(this.cluster.config.backends)) {
+                        this.cluster.config.backends = [];
+                    }
+                } catch (e) {
+                    this.cluster.config = this.defaultClusterConfig();
+                }
+            },
+
+            addClusterBackend() {
+                if (!this.cluster.config) this.cluster.config = this.defaultClusterConfig();
+                this.cluster.config.backends.push({ name: '', base_url: 'http://', api_key: '', weight: 1.0 });
+            },
+
+            removeClusterBackend(i) {
+                if (this.cluster.config && this.cluster.config.backends) {
+                    this.cluster.config.backends.splice(i, 1);
+                }
+            },
+
+            async saveClusterConfig() {
+                this.cluster.saving = true;
+                this.cluster.saveError = '';
+                this.cluster.saveSuccess = false;
+                try {
+                    const r = await fetch('/admin/api/cluster/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ config: this.cluster.config }),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        this.cluster.saveSuccess = true;
+                        setTimeout(() => { this.cluster.saveSuccess = false; }, 3000);
+                        this.loadClusterStatus();
+                    } else {
+                        this.cluster.saveError = d.detail || 'Save failed';
+                    }
+                } catch (e) {
+                    this.cluster.saveError = 'Save failed';
+                } finally {
+                    this.cluster.saving = false;
+                }
+            },
+
+            async loadClusterStatus() {
+                this.cluster.loading = true;
+                try {
+                    const r = await fetch('/admin/api/cluster/status');
+                    if (r.ok) this.cluster.status = await r.json();
+                } catch (e) {
+                    this.cluster.status = null;
+                } finally {
+                    this.cluster.loading = false;
+                }
+            },
+
+            async controlCluster(action) {
+                this.cluster.controlBusy = action;
+                try {
+                    await fetch('/admin/api/cluster/control', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action }),
+                    });
+                } catch (e) {
+                    // status refresh below reflects reality regardless
+                } finally {
+                    setTimeout(() => {
+                        this.cluster.controlBusy = '';
+                        this.loadClusterStatus();
+                    }, 1500);
+                }
+            },
+
+            clusterBackendRows() {
+                const s = this.cluster.status;
+                if (!s || !s.health || !s.health.backends) return [];
+                return Object.entries(s.health.backends).map(([name, v]) => ({ name, ...v }));
             },
 
             async checkForUpdate() {
