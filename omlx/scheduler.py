@@ -1140,24 +1140,30 @@ class Scheduler:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
-        - mx.async_eval() was called on the inference thread for all
-          KV cache arrays, dispatching materialization asynchronously
-          without blocking the inference thread. async_eval completes
-          Metal command enqueueing before returning, so all commands
-          are submitted by the time executor.submit() runs.
-        - This worker calls mx.synchronize(self._stream) via the
-          _safe_sync_stream helper to wait on the same stream where
-          mx.async_eval dispatched the arrays. A bare mx.synchronize()
-          with no args only blocks on the default stream (gpu:0) and
-          would leave the dispatched per-engine stream's work
-          unsynchronized, racing the buffer-protocol access below
-          (#1437). Stream objects are not thread-local in MLX (Metal
-          device is a global singleton), so mx.synchronize(stream) is
-          safe cross-thread; it just calls waitUntilCompleted on the
-          command buffer.
-        - bfloat16 view+eval inside _extract_tensor_bytes runs on this
-          worker's default mx stream, isolated from self._stream;
-          the underlying buffer is read-only at this point.
+        - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
+          the inference thread for all KV cache arrays in cache_to_store, so
+          they are fully materialized concrete buffers before this worker
+          runs. This is the load-bearing invariant: MLX streams ARE
+          thread-local (each engine's generation stream is created via
+          mx.new_thread_local_stream on the inference thread). A KV array
+          left lazy and bound to self._stream cannot be materialized on this
+          worker thread — _extract_block_tensor_slice (slices) and
+          _extract_tensor_bytes (bf16 -> uint16 view) would re-dispatch the
+          source op to self._stream's index, which does NOT exist on this
+          thread, aborting the process ("There is no Stream(gpu, N) in
+          current thread"). Boundary snapshots get the same treatment via
+          _eval_snapshot_cache at capture time.
+        - Because the sources are concrete, the worker's own slice/view ops
+          consume materialized buffers and bind their new ops to the
+          always-present default stream (gpu,0). The _safe_sync_stream call
+          below is now belt-and-suspenders (the owner already drained the
+          work); correctness no longer depends on its cross-thread
+          mx.synchronize, whose "no Stream" RuntimeError it tolerantly
+          swallows.
+        - All mx-buffer access here is held under _mx_buffer_access_lock,
+          serializing the bf16 view+eval and the buffer-protocol reads
+          against inference-thread _sync_and_clear_cache (which also takes
+          that lock), so mx.clear_cache cannot reclaim a buffer mid-read.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
 
@@ -3159,6 +3165,26 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
+        """Force the leaf KV tensors of an in-memory boundary snapshot concrete.
+
+        Runs on the capturing (owner/inference) thread. The store-cache worker
+        later re-extracts and slices these via _BoundarySnapshotProvider; MLX
+        streams are thread-local, so any leaf op still lazy at that point would
+        re-dispatch to this thread's stream index, which does not exist on the
+        worker -> SIGABRT. Extracting + eval'ing the leaves here (under this
+        thread's stream, where that stream lives) makes the worker's slicing
+        operate exclusively on already-materialized buffers, which bind their
+        new ops to the always-present default stream (gpu,0).
+        """
+        if not snapshot_cache:
+            return
+        extracted, _ = self._extract_cache_states(snapshot_cache)
+        leaves = self._collect_arrays_from_extracted_cache(extracted)
+        if leaves:
+            with mx.stream(self._stream):
+                mx.eval(*leaves)
+
     def _on_prefill_boundary_snapshot(
         self,
         request_id: str,
@@ -3203,8 +3229,16 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
+                # In-memory fallback: this snapshot will be sliced later on the
+                # store-cache worker thread (via _BoundarySnapshotProvider ->
+                # _extract_cache_states). MLX streams are thread-local, so the
+                # worker cannot materialize a lazy op bound to THIS (owner) thread's
+                # stream. Force it concrete now, on the capturing thread, so the
+                # worker only ever slices already-evaluated buffers.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
 
         self._boundary_snapshot_required = True
@@ -3327,10 +3361,18 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
             else:
+                # In-memory fallback: the store-cache worker slices this snapshot
+                # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
+                # MLX streams are thread-local, so force the leaves concrete now on
+                # the capturing thread; otherwise the worker re-dispatches a lazy op
+                # to this thread's stream index -> "no Stream(gpu, N)" -> SIGABRT.
+                # Mirrors _on_prefill_boundary_snapshot's in-memory fallback.
+                self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request.request_id][
                     total_tokens
                 ] = snapshot_cache
         else:
+            self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request.request_id][
                 total_tokens
             ] = snapshot_cache
@@ -5879,10 +5921,13 @@ class Scheduler:
                             # Inference-thread store_cache prep, timed as
                             # three sub-phases (boundary / collect / dispatch)
                             # mirroring boundary_capture_* granularity.
-                            # async_eval dispatches KV array materialization
-                            # without blocking; the worker calls
-                            # mx.synchronize() to wait before extracting
-                            # bytes.
+                            # The dispatch phase does a FULL mx.eval (not
+                            # async_eval) so the KV arrays are concrete on THIS
+                            # thread before the store-cache worker slices/views
+                            # them. MLX streams are thread-local; a lazy op left
+                            # for the worker to materialize re-dispatches to this
+                            # thread's stream index, which is absent on the worker
+                            # -> SIGABRT. See the dispatch-phase comment below.
                             with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
                                     boundary_override = self._get_boundary_store_override(
@@ -5919,7 +5964,28 @@ class Scheduler:
                                     )
                                 with self._phase_timer("store_cache_main_dispatch"):
                                     if pre_eval_arrays:
-                                        mx.async_eval(*pre_eval_arrays)
+                                        # FULL eval (not async_eval) on the owner
+                                        # thread. MLX streams are thread-local:
+                                        # these KV arrays carry self._stream
+                                        # (a per-engine ThreadLocalStream created
+                                        # on THIS thread). The store-cache worker
+                                        # later slices them (_extract_block_tensor_slice)
+                                        # and views bf16->uint16 (_extract_tensor_bytes);
+                                        # if the source op is still LAZY at that
+                                        # point, materializing it on the worker
+                                        # re-dispatches to self._stream's index,
+                                        # which does not exist on the worker thread
+                                        # -> "There is no Stream(gpu, N) in current
+                                        # thread" -> std::terminate -> SIGABRT.
+                                        # Forcing concrete materialization here
+                                        # means every downstream worker op consumes
+                                        # an already-evaluated buffer and binds its
+                                        # own new ops to the always-present default
+                                        # stream (gpu,0). The big host memcpy
+                                        # (bytes(memoryview(...))) and the disk
+                                        # write stay on the worker — only the GPU
+                                        # completion fence moves onto this thread.
+                                        mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
                                 # Hand the store-cache write to the background

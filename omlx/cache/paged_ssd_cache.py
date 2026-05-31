@@ -212,12 +212,23 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     when the source array was evaluated on the inference thread.
 
     For bfloat16 arrays, uses view(uint16) since the buffer protocol does
-    not support bfloat16 directly. The view shares the source buffer; no
-    Metal command is issued by view() alone, and bytes(memoryview(view))
-    on an already-materialized source returns the raw bf16 bits unchanged.
+    not support bfloat16 directly. CAUTION: ``arr.view(mx.uint16)`` is a LAZY
+    MLX op, and MLX streams are thread-local. If ``arr`` is a still-lazy op
+    bound to a stream created on another thread, materializing the view here
+    re-dispatches that op to a stream index that does not exist on the calling
+    thread -> "There is no Stream(gpu, N) in current thread" -> SIGABRT. The
+    contract for cross-thread safety is therefore: every source array reaching
+    this function must already be fully ``mx.eval``'d on the thread that owns
+    its stream (the inference/executor thread). The owner-side full eval is
+    enforced in scheduler._cleanup_finished (mx.eval(*pre_eval_arrays)) and in
+    scheduler._eval_snapshot_cache for boundary snapshots. With a concrete
+    source, the ``view`` op below consumes a materialized buffer and binds to
+    the always-present default stream (gpu,0); we mx.eval it explicitly so the
+    materialization is deterministic and happens inside the caller's held
+    _mx_buffer_access_lock rather than being deferred to the memoryview read.
 
     Args:
-        arr: Evaluated MLX array (caller's responsibility).
+        arr: Evaluated MLX array (caller's responsibility — see above).
 
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
@@ -225,7 +236,13 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
     if arr.dtype == mx.bfloat16:
-        raw = bytes(memoryview(arr.view(mx.uint16)))
+        u16 = arr.view(mx.uint16)
+        # Explicit eval: with a concrete source this binds to the default
+        # stream (gpu,0) and completes the host-visible buffer before the
+        # memoryview read, keeping all materialization inside the worker's
+        # _mx_buffer_access_lock window (closes the mx.clear_cache race).
+        mx.eval(u16)
+        raw = bytes(memoryview(u16))
     else:
         raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
@@ -1362,20 +1379,20 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Caller (scheduler._cleanup_finished, async store-cache path)
-            # dispatches real KV arrays via mx.async_eval on the inference
-            # thread's generation_stream before submitting to the
-            # omlx-store-cache executor. The worker then waits on that same
-            # stream via mx.synchronize(generation_stream) (see
-            # _async_store_cache_worker) before reaching this code path,
-            # so the arrays are fully materialized by the time
-            # _extract_tensor_bytes hits the buffer protocol. The tiny
-            # mx.zeros((1,)) placeholders allocated above are lazy nodes
-            # whose buffer materialization happens implicitly via the buffer
-            # protocol. Skipping any explicit mx.eval here keeps save_block
-            # off the Metal command-submission path when invoked from a
-            # non-inference thread, which is the source of the cross-thread
-            # race tracked in #978/#1040/#1106/#1437.
+            # Cross-thread contract: caller (scheduler._cleanup_finished) does
+            # a FULL mx.eval on the inference thread for every real KV array
+            # that feeds this path (and _eval_snapshot_cache for boundary
+            # snapshots), so the block tensors sliced into ``arrays`` above
+            # consume already-concrete buffers. MLX streams are thread-local,
+            # so this is mandatory: a lazy op bound to the inference thread's
+            # generation_stream cannot be materialized on the omlx-store-cache
+            # worker thread (its stream index is absent there -> SIGABRT). The
+            # slice ops created on this worker, and the mx.zeros((1,))
+            # placeholders allocated above, have concrete inputs (or none) and
+            # therefore bind to the always-present default stream (gpu,0).
+            # _extract_tensor_bytes below mx.eval's the bf16 uint16 view
+            # explicitly under that default stream, inside the worker's held
+            # _mx_buffer_access_lock. Race history: #978/#1040/#1106/#1437.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
