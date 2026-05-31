@@ -1,0 +1,201 @@
+<!-- Cluster router management tab. Backed by /admin/api/cluster/* and the
+     cluster() state in dashboard.js. Labels are English (this admin/technical
+     page intentionally does not use the i18n t() system). -->
+<div x-show="mainTab === 'cluster'" x-cloak class="space-y-6">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between">
+        <div>
+            <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">Cluster Router</h2>
+            <p class="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">
+                Spread OpenAI-compatible requests across multiple omlx backends. The router is a
+                separate process managed by launchd; this page edits its config and controls it.
+            </p>
+        </div>
+        <button @click="loadClusterStatus()"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition-all">
+            <i data-lucide="refresh-cw" class="w-4 h-4" :class="cluster.loading ? 'animate-spin' : ''"></i>
+            Refresh
+        </button>
+    </div>
+
+    <!-- Status card -->
+    <div class="rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 overflow-hidden">
+        <div class="px-5 py-4 border-b border-neutral-100 dark:border-neutral-800 flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Status</h3>
+            <div class="flex items-center gap-2">
+                <button @click="controlCluster('start')" :disabled="cluster.controlBusy"
+                        class="px-3 py-1.5 text-xs font-medium rounded-lg bg-green-50 text-green-700 hover:bg-green-100 disabled:opacity-50 transition-all">
+                    <span x-show="cluster.controlBusy !== 'start'">Start</span>
+                    <span x-show="cluster.controlBusy === 'start'">Starting...</span>
+                </button>
+                <button @click="controlCluster('restart')" :disabled="cluster.controlBusy"
+                        class="px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-50 transition-all">
+                    <span x-show="cluster.controlBusy !== 'restart'">Restart</span>
+                    <span x-show="cluster.controlBusy === 'restart'">Restarting...</span>
+                </button>
+                <button @click="controlCluster('stop')" :disabled="cluster.controlBusy"
+                        class="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50 transition-all">
+                    <span x-show="cluster.controlBusy !== 'stop'">Stop</span>
+                    <span x-show="cluster.controlBusy === 'stop'">Stopping...</span>
+                </button>
+            </div>
+        </div>
+
+        <div class="px-5 py-4">
+            <!-- Agent + router state -->
+            <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm" x-show="cluster.status">
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full"
+                          :class="cluster.status && cluster.status.agent && cluster.status.agent.running ? 'bg-green-500' : 'bg-neutral-300'"></span>
+                    <span class="text-neutral-700 dark:text-neutral-300">
+                        Router:
+                        <span class="font-medium"
+                              x-text="cluster.status && cluster.status.agent
+                                  ? (cluster.status.agent.running ? 'running (pid ' + cluster.status.agent.pid + ')'
+                                     : cluster.status.agent.loaded ? 'loaded, not running'
+                                     : cluster.status.agent.installed ? 'installed, not loaded' : 'not installed')
+                                  : 'unknown'"></span>
+                    </span>
+                </div>
+                <div class="text-neutral-500 dark:text-neutral-400">
+                    Listen: <span class="font-mono text-xs" x-text="cluster.status ? cluster.status.listen : ''"></span>
+                </div>
+                <div x-show="cluster.status && cluster.status.error" class="text-red-500 text-xs">
+                    <span x-text="cluster.status ? cluster.status.error : ''"></span>
+                </div>
+            </div>
+
+            <!-- Backend health table -->
+            <div class="mt-4 overflow-x-auto" x-show="clusterBackendRows().length">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-xs text-neutral-400 border-b border-neutral-100 dark:border-neutral-800">
+                            <th class="py-2 pr-4 font-medium">Backend</th>
+                            <th class="py-2 pr-4 font-medium">Healthy</th>
+                            <th class="py-2 pr-4 font-medium">Weight</th>
+                            <th class="py-2 pr-4 font-medium">Load</th>
+                            <th class="py-2 pr-4 font-medium">Depth</th>
+                            <th class="py-2 pr-4 font-medium">Mem headroom</th>
+                            <th class="py-2 pr-4 font-medium">Resident models</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="b in clusterBackendRows()" :key="b.name">
+                            <tr class="border-b border-neutral-50 dark:border-neutral-800/50">
+                                <td class="py-2 pr-4 font-medium text-neutral-800 dark:text-neutral-200" x-text="b.name"></td>
+                                <td class="py-2 pr-4">
+                                    <span class="inline-flex items-center gap-1">
+                                        <span class="w-1.5 h-1.5 rounded-full" :class="b.healthy ? 'bg-green-500' : 'bg-red-500'"></span>
+                                        <span x-text="b.healthy ? 'yes' : 'no'"></span>
+                                    </span>
+                                </td>
+                                <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-400" x-text="b.weight"></td>
+                                <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-400" x-text="b.load"></td>
+                                <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-400" x-text="b.depth"></td>
+                                <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-400"
+                                    x-text="(b.mem_headroom != null ? (b.mem_headroom * 100).toFixed(0) + '%' : '-')"></td>
+                                <td class="py-2 pr-4 text-neutral-500 dark:text-neutral-500"
+                                    x-text="(b.resident && b.resident.length) ? b.resident.length : 0"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+
+            <div x-show="!cluster.status" class="text-sm text-neutral-400">Loading status...</div>
+        </div>
+    </div>
+
+    <!-- Config editor -->
+    <div class="rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 overflow-hidden"
+         x-show="cluster.config">
+        <div class="px-5 py-4 border-b border-neutral-100 dark:border-neutral-800">
+            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Configuration</h3>
+            <p class="text-xs text-neutral-400 mt-0.5">
+                Saved to <span class="font-mono" x-text="cluster.path"></span>.
+                Stored API keys show as a placeholder; leave them to keep, type to replace.
+                Changes take effect after a router restart.
+            </p>
+        </div>
+
+        <div class="px-5 py-4 space-y-5" x-show="cluster.config">
+            <!-- Top-level fields -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Listen (host:port)</label>
+                    <input type="text" x-model="cluster.config.listen" placeholder="0.0.0.0:9000"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg font-mono text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Router API key (clients present this)</label>
+                    <input type="password" x-model="cluster.config.router_api_key" autocomplete="new-password"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg font-mono text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Poll interval (s)</label>
+                    <input type="number" step="0.1" min="0" x-model.number="cluster.config.poll_interval"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Affinity hysteresis</label>
+                    <input type="number" step="0.1" min="0" x-model.number="cluster.config.affinity_hysteresis"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Memory soft floor (0-1)</label>
+                    <input type="number" step="0.01" min="0" max="1" x-model.number="cluster.config.mem_soft_floor"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Memory penalty (load units)</label>
+                    <input type="number" step="1" min="0" x-model.number="cluster.config.mem_penalty"
+                           class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                </div>
+            </div>
+
+            <!-- Backends -->
+            <div>
+                <div class="flex items-center justify-between mb-2">
+                    <label class="text-xs font-semibold text-neutral-700 dark:text-neutral-300 uppercase tracking-wide">Backends</label>
+                    <button @click="addClusterBackend()"
+                            class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition-all">
+                        <i data-lucide="plus" class="w-3.5 h-3.5"></i> Add backend
+                    </button>
+                </div>
+                <div class="space-y-2">
+                    <template x-for="(b, i) in cluster.config.backends" :key="i">
+                        <div class="grid grid-cols-12 gap-2 items-center">
+                            <input type="text" x-model="b.name" placeholder="name"
+                                   class="col-span-2 px-2 py-1.5 text-xs border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
+                            <input type="text" x-model="b.base_url" placeholder="http://10.0.0.1:8000"
+                                   class="col-span-5 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
+                            <input type="password" x-model="b.api_key" placeholder="api key" autocomplete="new-password"
+                                   class="col-span-3 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
+                            <input type="number" step="0.1" min="0.1" x-model.number="b.weight" placeholder="weight"
+                                   class="col-span-1 px-2 py-1.5 text-xs border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
+                            <button @click="removeClusterBackend(i)"
+                                    class="col-span-1 flex items-center justify-center p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all">
+                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </template>
+                    <p x-show="!cluster.config.backends.length" class="text-xs text-neutral-400 py-2">
+                        No backends yet. Add one per omlx server you want to route to.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Save row -->
+            <div class="flex items-center gap-3 pt-2 border-t border-neutral-100 dark:border-neutral-800">
+                <button @click="saveClusterConfig()" :disabled="cluster.saving"
+                        class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 dark:bg-neutral-100 dark:text-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
+                    <span x-show="!cluster.saving">Save config</span>
+                    <span x-show="cluster.saving">Saving...</span>
+                </button>
+                <span x-show="cluster.saveSuccess" x-cloak class="text-sm text-green-600">Saved. Restart the router to apply.</span>
+                <span x-show="cluster.saveError" x-cloak class="text-sm text-red-500" x-text="cluster.saveError"></span>
+            </div>
+        </div>
+    </div>
+</div>

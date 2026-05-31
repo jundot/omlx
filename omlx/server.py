@@ -457,6 +457,12 @@ set_admin_getters(
 )
 app.include_router(admin_router)
 
+# Cluster-router management API (omlx/admin/cluster_routes.py). Each endpoint
+# enforces auth via Depends(require_admin), so no router-level dependency here.
+from .admin.cluster_routes import cluster_router  # noqa: E402
+
+app.include_router(cluster_router)
+
 
 @app.exception_handler(_RedirectToLogin)
 async def redirect_to_login_handler(request, exc):

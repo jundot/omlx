@@ -74,6 +74,15 @@ resp = requests.post(
 print(resp.json()["choices"][0]["message"]["content"])
 ```
 
+## 多机集群路由
+
+如果有多台 Mac，集群路由器可以把请求按模型和负载自动分发到多台 `omlx serve`。它不是 GPU/显存级集群，也不是共享 KV 缓存——每台仍是独立 server，路由器只决定每个请求由哪台处理。请求只会发给装有目标模型的机器；更快的机器配更高 `weight`，自动多分流量；显存吃紧的机器会被降权避开冷加载。客户端把地址从某台的 `:8000` 换成路由器的 `:9000` 即可，单机直连不受影响。配置见 `omlx/cluster/cluster.example.json`，完整说明见 [docs/cluster.md](docs/cluster.md)。
+
+```
+OMLX_CLUSTER_CONFIG=~/.omlx/cluster.json python -m omlx.cluster.router
+# 客户端指向 http://<router-host>:9000/v1
+```
+
 ## 跟上游 oMLX 的关系
 
 Flyto MLX 是 oMLX 的下游派生，遵循 Apache 2.0。我们定期从上游回挑 bug 修复和新模型支持，但不再把自己的功能反向 PR 给上游。如果只想要纯净的上游体验，请直接用 [@jundot/oMLX](https://github.com/jundot/omlx)。完整版权与署名见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
@@ -111,6 +120,23 @@ pip install git+https://github.com/panwudi/flyto-mlx@v0.4.1
 ```
 
 Plain `pip install flyto-mlx` is not currently available. Flyto MLX, like oMLX itself, depends on unreleased mlx-vlm commits that PEP 508 §6 prevents from being declared in PyPI packages. Once `mlx-vlm 0.6.x` ships with those commits we will enable the PyPI channel.
+
+### Multi-machine cluster routing
+
+With more than one Mac, the cluster router spreads requests across several
+`omlx serve` backends by model and load. It is not GPU/memory-level clustering
+and not a shared KV cache -- each backend stays standalone; the router only
+picks which one handles each request. A request only goes to a machine that
+hosts the model; a faster machine gets a higher `weight` and proportionally
+more traffic; a memory-pressured machine is deprioritized to avoid cold loads.
+Clients just swap a backend's `:8000` for the router's `:9000`; direct
+single-backend access still works. See `omlx/cluster/cluster.example.json` and
+[docs/cluster.md](docs/cluster.md).
+
+```
+OMLX_CLUSTER_CONFIG=~/.omlx/cluster.json python -m omlx.cluster.router
+# point clients at http://<router-host>:9000/v1
+```
 
 ### Relationship to upstream
 
