@@ -391,6 +391,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     context_window = model_info.get("max_context_window")
     max_tokens = model_info.get("max_tokens")
     model_type = model_info.get("model_type")
+    reasoning = model_info.get("enable_thinking")  # may be None
 
     # Launch
     print(f"Launching {integration.display_name} with model {model}...")
@@ -404,6 +405,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         context_window=context_window,
         max_tokens=max_tokens,
         model_type=model_type,
+        reasoning=reasoning,
         extra_args=extra_args,
     )
 

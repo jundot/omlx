@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -50,6 +51,16 @@ class Integration:
         for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
             env.pop(key, None)
         return env
+
+    def _guess_reasoning(self, model: str) -> bool:
+        """Guess whether a model slug refers to a reasoning model.
+
+        Used as a fallback when the server's ``enable_thinking`` field
+        is absent. Does not detect most reasoning-capable models;
+        this heuristic is chosen for backwards compatibility with
+        previous versions of oMLX.
+        """
+        return bool(re.search(r'\b(thinking|o1|o3|r1)\b', model.lower()))
 
     def select_model(
         self, models_info: list[dict], tool_name: str | None = None

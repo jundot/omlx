@@ -34,7 +34,14 @@ class CodexIntegration(Integration):
             f"launch codex --model {model or 'select-a-model'}"
         )
 
-    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
+    def configure(
+        self,
+        port: int,
+        api_key: str,
+        model: str,
+        host: str = "127.0.0.1",
+        reasoning: bool | None = None,
+    ) -> None:
         config_path = self.CONFIG_PATH
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -62,8 +69,13 @@ class CodexIntegration(Integration):
             "model_provider": '"omlx"'
         }
         
-        # If it is a reasoning model, add reasoning effort
-        is_reasoning = bool(re.search(r'\b(thinking|o1|o3|r1)\b', (model or "").lower()))
+        
+        # If it is a reasoning model, add reasoning effort. 
+        is_reasoning = (
+            bool(reasoning)
+            if reasoning is not None
+            else self._guess_reasoning(model)
+        )
         if is_reasoning:
             top_level_overrides["model_reasoning_effort"] = '"high"'
 
@@ -117,7 +129,9 @@ class CodexIntegration(Integration):
         extra_args: list[str] | None = None,
         **kwargs,
     ) -> None:
-        self.configure(port, api_key, model, host=host)
+        self.configure(
+            port, api_key, model, host=host, reasoning=kwargs.pop("reasoning", None)
+        )
 
         env = self._scrubbed_env()
         env["OMLX_API_KEY"] = api_key or "omlx"

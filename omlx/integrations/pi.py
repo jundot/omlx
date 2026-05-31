@@ -41,10 +41,6 @@ class PiIntegration(Integration):
             f"launch pi --model {model or 'select-a-model'}"
         )
 
-    @staticmethod
-    def _is_reasoning_model(model: str | None) -> bool:
-        return bool(re.search(r"\b(thinking|o1|o3|r1)\b", (model or "").lower()))
-
     def configure(
         self,
         port: int,
@@ -54,6 +50,7 @@ class PiIntegration(Integration):
         context_window: int | None = None,
         max_tokens: int | None = None,
         model_type: str | None = None,
+        reasoning: bool | None = None,
     ) -> None:
         def update_models(config: dict) -> None:
             config.setdefault("providers", {})
@@ -67,7 +64,11 @@ class PiIntegration(Integration):
                 model_entry: dict = {
                     "id": model,
                     "name": model,
-                    "reasoning": self._is_reasoning_model(model),
+                    "reasoning": (
+                        bool(reasoning)
+                        if reasoning is not None
+                        else self._guess_reasoning(model)
+                    ),
                     "input": ["text", "image"] if model_type == "vlm" else ["text"],
                     "cost": {
                         "input": 0,
@@ -95,6 +96,7 @@ class PiIntegration(Integration):
         context_window = kwargs.pop("context_window", None)
         max_tokens = kwargs.pop("max_tokens", None)
         model_type = kwargs.pop("model_type", None)
+        reasoning = kwargs.pop("reasoning", None)
         self.configure(
             port,
             api_key,
@@ -103,6 +105,7 @@ class PiIntegration(Integration):
             context_window=context_window,
             max_tokens=max_tokens,
             model_type=model_type,
+            reasoning=reasoning,
         )
 
         env = self._scrubbed_env()

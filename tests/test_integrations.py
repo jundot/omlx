@@ -159,6 +159,26 @@ name = "old-omlx"
         assert 'model = "llama-3.1-8b"' in content
         assert "model_reasoning_effort" not in content
 
+    def test_configure_reasoning_flag_true_overrides_slug(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(port=8000, api_key="", model="qwen3.6", reasoning=True)
+
+        content = config_path.read_text()
+        assert 'model_reasoning_effort = "high"' in content
+
+    def test_configure_reasoning_flag_false_overrides_slug(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(
+                port=8000, api_key="", model="deepseek-r1-distill", reasoning=False
+            )
+
+        content = config_path.read_text()
+        assert "model_reasoning_effort" not in content
+
     def test_launch_forwards_extra_args(self, tmp_path):
         codex = CodexIntegration()
         config_path = tmp_path / "codex" / "config.toml"
@@ -800,6 +820,55 @@ class TestPiIntegration:
 
         provider = json.loads(models_path.read_text())["providers"]["omlx"]
         assert provider["baseUrl"] == "http://192.168.1.100:9000/v1"
+
+    def test_configure_reasoning_flag_true(self, tmp_path):
+        # The reported bug: a thinking-configured model (Qwen 3.6) whose slug
+        # does not match the legacy heuristic must still be advertised to Pi as
+        # a reasoning model when the server resolves it as one.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=8000, api_key="key", model="qwen3.6", reasoning=True)
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is True
+
+    def test_configure_reasoning_flag_false_overrides_slug(self, tmp_path):
+        # Server says not-a-reasoning-model; trust it over the slug heuristic.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(
+                port=8000, api_key="key", model="some-thinking-model", reasoning=False
+            )
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is False
+
+    def test_configure_reasoning_falls_back_to_heuristic(self, tmp_path):
+        # No server-resolved value (older server): fall back to the slug heuristic.
+        models_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+
+        pi = PiIntegration()
+        with (
+            patch.object(PiIntegration, "MODELS_PATH", models_path),
+            patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
+        ):
+            pi.configure(port=8000, api_key="key", model="qwen3-thinking")
+
+        model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
+        assert model_config["reasoning"] is True
 
     def test_configure_creates_backup(self, tmp_path):
         models_path = tmp_path / "models.json"

@@ -314,6 +314,7 @@ class TestLaunchCommandFunction:
             context_window=32768,
             max_tokens=8192,
             model_type="vlm",
+            reasoning=None,
             extra_args=None,
         )
 
