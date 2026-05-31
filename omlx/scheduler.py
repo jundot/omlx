@@ -910,11 +910,18 @@ class Scheduler:
                 self.block_aware_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
                 )
-                logger.info(
-                    f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
-                    f"block_size={self.config.paged_cache_block_size}, "
-                    f"max_blocks={max_blocks}"
-                )
+                if self.config.hot_cache_only:
+                    logger.info(
+                        f"hot-cache-only mode enabled: "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
+                else:
+                    logger.info(
+                        f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
 
             # Async store_cache executor: single worker so submissions are
             # serialized (matches the original synchronous order) and we
@@ -6818,12 +6825,19 @@ class Scheduler:
                         "Failed to initialize boundary snapshot SSD store: %s", e
                     )
 
-            logger.info(
-                f"paged SSD cache enabled: "
-                f"cache_dir={self.config.paged_ssd_cache_dir}, "
-                f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
-                f"block_size={self.config.paged_cache_block_size} tokens"
-            )
+            if self.config.hot_cache_only:
+                logger.info(
+                    f"hot-cache-only mode enabled: "
+                    f"hot_cache_max={self._format_bytes(self.config.hot_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
+            else:
+                logger.info(
+                    f"paged SSD cache enabled: "
+                    f"cache_dir={self.config.paged_ssd_cache_dir}, "
+                    f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
 
         except Exception as e:
             logger.error(f"Failed to initialize paged SSD cache: {e}")
