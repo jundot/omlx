@@ -2643,6 +2643,28 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _response_format_requests_strict(response_format) -> bool:
+    """True when an OpenAI ``response_format`` demands strict json_schema output.
+
+    A ``json_schema`` response_format with ``strict: true`` signals that the
+    caller expects schema-conformant output, not best-effort.  When
+    grammar-constrained decoding is unavailable the request still falls back to
+    prompt injection, but the downgrade is logged at a level that names the
+    unhonored ``strict`` intent so it is not silent (issue #1241).
+    """
+    if response_format is None:
+        return False
+    rf = response_format
+    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
+    if rf_type != "json_schema":
+        return False
+    js = rf.get("json_schema") if isinstance(rf, dict) else getattr(rf, "json_schema", None)
+    if js is None:
+        return False
+    strict = js.get("strict") if isinstance(js, dict) else getattr(js, "strict", None)
+    return bool(strict)
+
+
 def _compile_grammar_for_request(
     engine: BaseEngine,
     structured_outputs=None,
@@ -2657,9 +2679,12 @@ def _compile_grammar_for_request(
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
 
-    Returns a compiled grammar object or ``None``.  Raises
-    :class:`HTTPException` on compilation errors or when xgrammar is
-    required but not installed.
+    Returns a compiled grammar object or ``None``.  ``structured_outputs``
+    raises :class:`HTTPException` when grammar is unavailable or fails to
+    compile.  A ``response_format`` degrades to ``None`` so the caller can fall
+    back to prompt injection; the downgrade is logged (and named as an
+    unhonored strict request when ``strict: true`` was set) rather than being
+    silent (#1241).
     """
     compiler = getattr(engine, 'grammar_compiler', None)
 
@@ -2689,6 +2714,8 @@ def _compile_grammar_for_request(
                     "Install with: pip install 'omlx[grammar]'"
                 )
             raise HTTPException(status_code=400, detail=detail)
+        if response_format is not None:
+            _warn_response_format_not_enforced(response_format)
         return None
 
     try:
@@ -2703,9 +2730,33 @@ def _compile_grammar_for_request(
                 status_code=400,
                 detail=f"Grammar compilation error: {e}",
             )
-        logger.warning("Grammar compilation from response_format failed, "
-                       "falling back to prompt injection: %s", e)
+        _warn_response_format_not_enforced(response_format, error=e)
     return None
+
+
+def _warn_response_format_not_enforced(response_format, error=None):
+    """Log that a ``response_format`` request fell back to prompt injection.
+
+    Previously a ``response_format`` that could not be grammar-constrained
+    (no compiler available, or a compilation error) degraded to best-effort
+    prompt injection silently, giving the client no signal that the schema was
+    not enforced (#1241).  A ``strict: true`` request gets a message that names
+    the unhonored strict intent.
+    """
+    reason = f" ({error})" if error is not None else ""
+    if _response_format_requests_strict(response_format):
+        logger.warning(
+            "response_format requested strict json_schema output but "
+            "grammar-constrained decoding is unavailable; strict enforcement "
+            "cannot be honored, falling back to best-effort prompt injection "
+            "(output is NOT schema-enforced)%s.", reason,
+        )
+    else:
+        logger.warning(
+            "response_format requested but grammar-constrained decoding is "
+            "unavailable; output will not be schema-enforced (falling back to "
+            "prompt injection)%s.", reason,
+        )
 
 
 # =============================================================================

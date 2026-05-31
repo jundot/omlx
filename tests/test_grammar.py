@@ -499,6 +499,97 @@ class TestCompileGrammarForRequest:
         })
         assert result is None
 
+    # ---- #1241: strict json_schema response_format is a hard constraint ----
+
+    @staticmethod
+    def _strict_rf(strict):
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "t",
+                "strict": strict,
+                "schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+            },
+        }
+
+    def test_strict_response_format_no_compiler_degrades_not_raises(self):
+        """strict:true response_format degrades to None (warn) rather than 400.
+
+        Reporter on #1241 listed explicit rejection as acceptable, but to avoid
+        a breaking behavior change we warn-and-fall-back instead of rejecting.
+        """
+        engine = _make_engine(grammar_compiler=None)
+        assert self._call(engine, response_format=self._strict_rf(True)) is None
+
+    def test_returns_none_when_no_compiler_and_nonstrict_response_format(self):
+        """strict:false response_format also degrades gracefully to None."""
+        engine = _make_engine(grammar_compiler=None)
+        assert self._call(engine, response_format=self._strict_rf(False)) is None
+
+    def test_returns_none_when_no_compiler_and_response_format_strict_absent(self):
+        """response_format without a strict flag defaults to best-effort (None)."""
+        engine = _make_engine(grammar_compiler=None)
+        result = self._call(engine, response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {"type": "object"}},
+        })
+        assert result is None
+
+    def test_compilation_error_strict_response_format_degrades_not_raises(self):
+        """A compile failure under strict:true degrades to None, not 400.
+
+        Mirrors the no-compiler path: response_format never hard-fails, even
+        when strict was requested (structured_outputs is the one that 400s).
+        """
+        compiler = MagicMock()
+        compiler.compile_json_schema.side_effect = RuntimeError("bad schema")
+        engine = _make_engine(grammar_compiler=compiler)
+        assert self._call(engine, response_format=self._strict_rf(True)) is None
+
+
+class TestResponseFormatRequestsStrict:
+    """Tests for _response_format_requests_strict."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_requests_strict
+        return _response_format_requests_strict(response_format)
+
+    def test_none(self):
+        assert self._call(None) is False
+
+    def test_json_object_not_strict(self):
+        assert self._call({"type": "json_object"}) is False
+
+    def test_text_not_strict(self):
+        assert self._call({"type": "text"}) is False
+
+    def test_json_schema_strict_true(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": True, "schema": {}},
+        }) is True
+
+    def test_json_schema_strict_false(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": False, "schema": {}},
+        }) is False
+
+    def test_json_schema_strict_absent(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {}},
+        }) is False
+
+    def test_pydantic_model_strict_true(self):
+        from omlx.api.openai_models import ResponseFormat, ResponseFormatJsonSchema
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema=ResponseFormatJsonSchema(name="t", strict=True, schema={}),
+        )
+        assert self._call(rf) is True
+
 
 # =========================================================================
 # GrammarConstraintProcessor
