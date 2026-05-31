@@ -51,6 +51,11 @@ def apply_turboquant_attention_patch() -> bool:
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
             if queries.shape[-2] == 1:
+                # Decode (B=1 and B>1). Continuous-batching decode passes a
+                # per-request left-padding array mask; the masked decode_attention
+                # path runs the quantized kernels directly (no full-batch
+                # dequantize per step). The RHT masked-decode fix landed upstream
+                # in mlx-vlm (Blaizzy/mlx-vlm#1244, in the pinned commit).
                 return real_cache.decode_attention(
                     queries,
                     keys_state=keys,

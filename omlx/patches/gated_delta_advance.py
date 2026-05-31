@@ -14,8 +14,9 @@ the body mid-function:
   same shape for state and mask) that mask real bugs in favor of mlx-lm
   semantics.
 
-The mlx-vlm-specific ``gdn_sink`` parameter is preserved: when given, append
-the same tuple the rollback path consumes.
+The mlx-vlm-specific ``gdn_sink`` parameter is preserved for the normal path.
+Newer upstream ``target_verify`` calls are delegated to mlx-vlm's original
+method so speculative verification keeps its upstream state contract.
 
 Patch target (current upstream):
 - mlx_vlm.models.qwen3_5.language.Qwen3_5GatedDeltaNet (commit 191d7c8)
@@ -43,9 +44,9 @@ logger = logging.getLogger(__name__)
 _patched_classes: set[int] = set()
 
 
-def _build_replacement_call():
+def _build_replacement_call(original_call: Optional[Any] = None):
     """Construct the new __call__ matching mlx-lm semantics with mlx-vlm
-    signature (gdn_sink) preserved."""
+    signature (gdn_sink, target_verify) preserved."""
 
     def __call__(
         self,
@@ -53,7 +54,18 @@ def _build_replacement_call():
         mask: Optional["mx.array"] = None,
         cache: Optional[Any] = None,
         gdn_sink: Optional[list] = None,
+        target_verify: bool = False,
     ) -> "mx.array":
+        if original_call is not None and (target_verify or gdn_sink is not None):
+            return original_call(
+                self,
+                inputs,
+                mask=mask,
+                cache=cache,
+                gdn_sink=gdn_sink,
+                target_verify=target_verify,
+            )
+
         B, S, _ = inputs.shape
 
         # Optional sharding group (mlx-lm only — mlx-vlm class has no such
@@ -160,7 +172,7 @@ def _patch_class(cls: Any, label: str) -> bool:
     """Replace cls.__call__ with the mlx-lm-equivalent body once."""
     if id(cls) in _patched_classes:
         return True
-    cls.__call__ = _build_replacement_call()
+    cls.__call__ = _build_replacement_call(cls.__call__)
     _patched_classes.add(id(cls))
     logger.info(f"GatedDeltaNet patch applied (body replacement): {label}")
     return True

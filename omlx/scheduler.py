@@ -910,11 +910,18 @@ class Scheduler:
                 self.block_aware_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
                 )
-                logger.info(
-                    f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
-                    f"block_size={self.config.paged_cache_block_size}, "
-                    f"max_blocks={max_blocks}"
-                )
+                if self.config.hot_cache_only:
+                    logger.info(
+                        f"hot-cache-only mode enabled: "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
+                else:
+                    logger.info(
+                        f"paged SSD cache enabled: {self.config.paged_ssd_cache_dir}, "
+                        f"block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={max_blocks}"
+                    )
 
             # Async store_cache executor: single worker so submissions are
             # serialized (matches the original synchronous order) and we
@@ -1659,15 +1666,36 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
-        """Replace KVCache with empty TurboQuantKVCache before prefill.
+    def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
+        """True if every cache layer can be safely TurboQuant-converted for
+        continuous batching.
 
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
+        Only plain KVCache (and CacheList of KVCache, for VLM) implement the
+        merge/filter/extract/extend batch protocol that the monkey-patched
+        TurboQuantKVCache.merge relies on inside BatchGenerator. Chunked- and
+        rotating-attention caches (Llama-4, sliding-window) need
+        maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
+        not provide, so those models stay fp16 — no crash, no TurboQuant.
+        """
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        def _ok(c: Any) -> bool:
+            if isinstance(c, KVCache):
+                return True
+            if isinstance(c, CacheList):
+                return all(_ok(inner) for inner in c.caches)
+            return False
+
+        return bool(prompt_cache) and all(_ok(c) for c in prompt_cache)
+
+    def _apply_turboquant_kv_empty(self, prompt_cache: list[Any]) -> None:
+        """Replace empty KVCache layers with empty TurboQuantKVCache.
 
         Tokens are quantized on the fly during update_and_fetch, avoiding
         the peak memory spike from storing full-precision KV then converting.
-        Skips the last KVCache layer if turboquant_skip_last is set.
+        Used only when there is no prefill history to preserve (the single
+        last token is quantized during insert()'s prompt step). Skips the
+        last KVCache layer if turboquant_skip_last is set.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -1701,13 +1729,13 @@ class Scheduler:
             )
 
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert existing KVCache data to TurboQuantKVCache via from_cache().
+        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
 
-        NOTE: Not currently called -- see #771. Kept for future use when
-        TurboQuantKVCache implements merge()/maybe_trim_front().
-
-        Used when an existing cache is provided (e.g. from SSD prefix cache).
-        Uses from_cache() to quantize the existing KV data.
+        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
+        cache): the completed full-precision KV is quantized once, so prefill
+        hidden states stay exact and quantization error only enters at
+        decode-time reads. This is the key difference from #717/#771, which
+        quantized on the fly during prefill and corrupted hidden states.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -1770,13 +1798,17 @@ class Scheduler:
         """
         n_tokens = len(tokens)
         if n_tokens <= 1:
-            # Nothing to prefill, return cache + tokens as-is
+            # Nothing to prefill, return cache + tokens as-is.
             cache = existing_cache or make_prompt_cache(self.model)
-            # NOTE: Do NOT apply TurboQuant here. TurboQuantKVCache does not
-            # support merge(), which is called by _merge_caches() inside
-            # BatchGenerator when insert() creates a PromptProcessingBatch.
-            # TurboQuant conversion must happen inside BatchGenerator after
-            # the batch cache is created, not on individual per-request caches.
+            # TurboQuant: a TQ cache here makes _merge_caches() build a
+            # BatchTurboQuantKVCache (via the monkey-patched merge), so the
+            # one decode token quantizes against TQ history. An empty fresh
+            # cache gets empty TQ layers; a restored cache preserves its data.
+            if self._turboquant_kv_bits is not None and self._turboquant_eligible(cache):
+                if existing_cache is None:
+                    self._apply_turboquant_kv_empty(cache)
+                else:
+                    self._apply_turboquant_kv_convert(cache)
             return cache, tokens
 
         # Create or reuse cache
@@ -1785,14 +1817,10 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # NOTE: TurboQuant conversion is NOT applied during external prefill.
-        # TurboQuantKVCache does not support merge() or maybe_trim_front(),
-        # so passing it to insert() would fail in _merge_caches() or cause
-        # AttributeError in chunked-attention models (e.g. Llama-4-Scout).
-        # Additionally, on-the-fly quantization during prefill causes
-        # precision loss that corrupts hidden states across layers (#771).
-        # Prefill runs with standard KVCache; TurboQuant quantization
-        # happens inside BatchGenerator during the decode phase.
+        # TurboQuant runs in fp16 during the prefill loop below and is
+        # quantized once at the end (see the _apply_turboquant_kv_convert call
+        # before the return). Chunked/rotating models are gated out by
+        # _turboquant_eligible and stay fp16.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -2042,6 +2070,15 @@ class Scheduler:
         if vlm_embeds is not None and _saved_rope_deltas is not None:
             self.model._language_model._rope_deltas = _saved_rope_deltas
         request._prefill_saved_rope_deltas = None
+
+        # Quantize the completed fp16 KV cache to TurboQuant for decode.
+        # Done here (after the prefill loop, after boundary snapshots are
+        # captured fp16) so prefill hidden states stay exact and the paged-SSD
+        # format is unchanged. _merge_caches() then builds a
+        # BatchTurboQuantKVCache when this request is inserted. Gated to dense
+        # KVCache models — chunked/rotating caches stay fp16.
+        if self._turboquant_kv_bits is not None and self._turboquant_eligible(prompt_cache):
+            self._apply_turboquant_kv_convert(prompt_cache)
 
         return prompt_cache, last_token
 
@@ -5454,8 +5491,9 @@ class Scheduler:
             if request.sampling_params.seed is not None:
                 mx.random.seed(request.sampling_params.seed)
 
-            # NOTE: TurboQuant KV conversion is not applied during prefill.
-            # See _do_external_prefill() comment for rationale (#771).
+            # TurboQuant KV is quantized at the end of _do_external_prefill
+            # (fp16 prefill → quantize once); _merge_caches() turns the per
+            # request TQ cache into a BatchTurboQuantKVCache on insert.
 
             # VLM MTP routing: if a gemma4_assistant drafter is attached, run
             # an extra last-token forward to capture hidden + shared_kv_states,
@@ -6818,12 +6856,19 @@ class Scheduler:
                         "Failed to initialize boundary snapshot SSD store: %s", e
                     )
 
-            logger.info(
-                f"paged SSD cache enabled: "
-                f"cache_dir={self.config.paged_ssd_cache_dir}, "
-                f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
-                f"block_size={self.config.paged_cache_block_size} tokens"
-            )
+            if self.config.hot_cache_only:
+                logger.info(
+                    f"hot-cache-only mode enabled: "
+                    f"hot_cache_max={self._format_bytes(self.config.hot_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
+            else:
+                logger.info(
+                    f"paged SSD cache enabled: "
+                    f"cache_dir={self.config.paged_ssd_cache_dir}, "
+                    f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
+                    f"block_size={self.config.paged_cache_block_size} tokens"
+                )
 
         except Exception as e:
             logger.error(f"Failed to initialize paged SSD cache: {e}")

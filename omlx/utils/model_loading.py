@@ -150,7 +150,10 @@ def maybe_apply_pre_load_patches(
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
-        from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+        )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)

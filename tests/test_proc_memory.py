@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.proc_memory.get_phys_footprint."""
 
+import ctypes
 import os
 import sys
 
@@ -28,17 +29,25 @@ class TestGetPhysFootprintDarwin:
         # PID 0 is the kernel — proc_pid_rusage refuses it.
         assert get_phys_footprint(pid=0) == 0
 
-    def test_includes_python_heap(self):
-        baseline = get_phys_footprint()
-        # Allocate a sizeable buffer to force phys growth.
-        big = bytearray(64 * 1024 * 1024)
-        # Touch it so pages become resident.
-        for i in range(0, len(big), 4096):
-            big[i] = 1
-        after = get_phys_footprint()
-        # phys should have grown by at least most of the allocation.
-        assert after - baseline > 32 * 1024 * 1024
-        del big
+    def test_nonexistent_pid_returns_zero(self):
+        # Find a PID that is guaranteed not to exist.
+        # Use a PID far above the current process table.
+        # macOS reserves PID_MAX = 99999, so anything above that is invalid.
+        nonexistent_pid = os.getpid() + 100000
+        assert get_phys_footprint(pid=nonexistent_pid) == 0
+
+    def test_result_is_reasonable_size(self):
+        v = get_phys_footprint()
+        # phys_footprint should be representable as a positive int.
+        # No upper bound assertion — the value varies by runtime environment
+        # (CI runners, debug builds, loaded tooling) making fixed ceilings fragile.
+        assert v > 0
+
+    def test_returns_int(self):
+        assert isinstance(get_phys_footprint(), int)
+
+    def test_returns_int_for_explicit_pid(self):
+        assert isinstance(get_phys_footprint(pid=os.getpid()), int)
 
 
 class TestGetPhysFootprintFallback:

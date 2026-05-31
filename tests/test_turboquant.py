@@ -14,6 +14,8 @@ from mlx_vlm.turboquant import (
 
 from omlx.turboquant_kv import BatchTurboQuantKVCache, _rebuild_codecs, _infer_head_dim
 
+pytestmark = pytest.mark.turboquant
+
 
 def _sample_unit_vectors(count: int, dim: int) -> mx.array:
     vectors = mx.random.normal((count, dim))
@@ -135,6 +137,62 @@ def test_batch_tq_merge_extract():
     assert e2.offset == 4
 
 
+def test_batch_tq_merge_preserves_empty_rows():
+    """Regression: mixed empty/non-empty rows must keep the batch dimension."""
+    full = TurboQuantKVCache(bits=4.0)
+    full.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    mx.eval(full.keys, full.values)
+
+    for caches, expected_padding, expected_offsets in (
+        ([TurboQuantKVCache(bits=4.0), full], [4, 0], [0, 4]),
+        ([full, TurboQuantKVCache(bits=4.0)], [0, 4], [4, 0]),
+    ):
+        batch = BatchTurboQuantKVCache.merge(caches)
+        assert batch.left_padding.tolist() == expected_padding
+        assert batch.offset.tolist() == expected_offsets
+        assert batch.keys.norms.shape[0] == 2
+
+        batch.update_and_fetch(
+            mx.random.normal((2, 2, 1, 32)), mx.random.normal((2, 2, 1, 32))
+        )
+
+
+def test_batch_tq_extend_preserves_empty_rows():
+    """Regression: extend() can mix initialized and empty batch rows."""
+    def full_batch():
+        full = BatchTurboQuantKVCache.merge([TurboQuantKVCache(bits=4.0)])
+        full.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+        )
+        mx.eval(full.keys, full.values)
+        return full
+
+    for left, right, expected_padding, expected_offsets in (
+        (
+            BatchTurboQuantKVCache([0], bits=4.0),
+            full_batch(),
+            [4, 0],
+            [0, 4],
+        ),
+        (
+            full_batch(),
+            BatchTurboQuantKVCache([0], bits=4.0),
+            [0, 4],
+            [4, 0],
+        ),
+    ):
+        left.extend(right)
+        assert left.left_padding.tolist() == expected_padding
+        assert left.offset.tolist() == expected_offsets
+        assert left.keys.norms.shape[0] == 2
+
+        left.update_and_fetch(
+            mx.random.normal((2, 2, 1, 32)), mx.random.normal((2, 2, 1, 32))
+        )
+
+
 def test_batch_tq_continuous_batching_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
     b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
@@ -150,6 +208,32 @@ def test_batch_tq_continuous_batching_extend():
     dv = mx.random.normal((2, 2, 1, 32))
     b1.update_and_fetch(dk, dv)
     # offset is now mx.array after extend
+
+
+def test_batch_make_mask_matches_fp16_left_padding():
+    """Regression: B>1 make_mask must match mlx-lm's BatchKVCache for left-padded
+    batches. The old hand-rolled causal term compared each request's sequence
+    length against the column index and masked out valid left-padded tokens, so
+    left-padded requests attended to ~nothing and decoded garbage (batch worse
+    than single). It now delegates to create_causal_mask like BatchKVCache.
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    lp = [0, 4, 2]
+    K = mx.random.normal((3, 2, 8, 16))
+    V = mx.random.normal((3, 2, 8, 16))
+    bk = BatchKVCache(lp)
+    bk.update_and_fetch(K, V)
+    bt = BatchTurboQuantKVCache(lp, bits=8.0)
+    bt.update_and_fetch(K, V)
+
+    ref = bk.make_mask(1, return_array=True)        # decode-step mask
+    got = bt.make_mask(1, return_array=True)
+    assert mx.array_equal(ref, got).item(), (
+        "B>1 make_mask diverges from BatchKVCache for left-padding "
+        f"(member masks: BK={ref[:,0,0,:].sum(-1).tolist()} "
+        f"TQ={got[:,0,0,:].sum(-1).tolist()})"
+    )
 
 
 def test_batch_tq_filter():
@@ -314,3 +398,163 @@ def test_ssd_type_map_completeness():
         "TurboQuantSplitState": TurboQuantSplitState,
     }
     assert set(_type_map.keys()) == expected_types
+
+
+# ---------------------------------------------------------------------------
+# Batched TurboQuant wiring (Phase 1): eligibility gate + post-prefill
+# conversion path (from_cache -> merge -> BatchTurboQuantKVCache)
+# ---------------------------------------------------------------------------
+
+
+def test_turboquant_eligible_gate():
+    """Only dense KVCache (and CacheList of KVCache) is batch-convertible.
+
+    Chunked/rotating/quantized caches must gate OFF so chunked-attention
+    models (Llama-4) and sliding-window models stay fp16 instead of crashing
+    in _merge_caches() — the #771 SIGABRT class.
+    """
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import (
+        CacheList,
+        ChunkedKVCache,
+        KVCache,
+        QuantizedKVCache,
+        RotatingKVCache,
+    )
+
+    from omlx.scheduler import Scheduler
+
+    # _turboquant_eligible is pure (ignores self); call the unbound method
+    # with a throwaway self so we don't construct a full Scheduler.
+    def elig(cache):
+        return Scheduler._turboquant_eligible(SimpleNamespace(), cache)
+
+    assert elig([KVCache(), KVCache()]) is True
+    assert elig([]) is False
+    assert elig([KVCache(), ChunkedKVCache(8192)]) is False
+    assert elig([KVCache(), RotatingKVCache(32)]) is False
+    assert elig([QuantizedKVCache()]) is False
+    assert elig([CacheList(KVCache(), KVCache())]) is True
+    assert elig([CacheList(KVCache(), RotatingKVCache(32))]) is False
+
+
+def test_from_cache_merge_builds_working_batch():
+    """Mirror the scheduler path: fp16 prefill -> from_cache (post-prefill
+    quantize) -> _merge_caches builds a BatchTurboQuantKVCache that decodes.
+
+    Importing omlx.scheduler installs the TurboQuantKVCache.merge monkey-patch
+    that _merge_caches() relies on, so caches[0].merge([...]) is what the
+    BatchGenerator actually calls at insert() time.
+    """
+    import omlx.scheduler  # noqa: F401  (applies the merge monkey-patch)
+
+    per_request = []
+    for length in (8, 4):  # two requests of different prefill lengths
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal((1, 2, length, 32)),
+            mx.random.normal((1, 2, length, 32)),
+        )
+        per_request.append(TurboQuantKVCache.from_cache(kv, bits=4.0))
+    mx.eval(*[c.keys for c in per_request])
+
+    # Exactly what mlx-lm _merge_caches() does for one layer.
+    batch = per_request[0].merge(per_request)
+    assert isinstance(batch, BatchTurboQuantKVCache)
+    assert batch.left_padding.tolist() == [0, 4]   # request 1 left-padded
+    assert batch.offset.tolist() == [8, 4]         # per-request valid lengths
+
+    # A decode step + the real attention path the model uses: update_and_fetch
+    # returns correctly-sliced state proxies (NOT the full reserved buffer),
+    # and decode_attention runs over the batched left-padding mask.
+    ks, vs = batch.update_and_fetch(
+        mx.random.normal((2, 2, 1, 32)),
+        mx.random.normal((2, 2, 1, 32)),
+    )
+    assert batch.offset.tolist() == [9, 5]         # both requests advanced by 1
+    out = batch.decode_attention(
+        mx.random.normal((2, 2, 1, 32)),
+        keys_state=ks,
+        values_state=vs,
+        scale=32**-0.5,
+        mask=batch.make_mask(1, return_array=True),
+    )
+    mx.eval(out)
+    assert out.shape == (2, 2, 1, 32)              # (B, n_q_heads, 1, D)
+
+
+def test_decode_single_token_quantize_is_accurate():
+    """Regression: the decode step appends ONE token via update_and_fetch.
+
+    An earlier mlx-vlm fused single-token quantize kernel (used only for
+    keys.shape[-2] == 1) was broken — ~140% reconstruction error at every bit
+    depth — which garbled generation once TurboQuant decode engaged. It is fixed
+    on the pinned mlx-vlm (main). This test fails loudly if that regresses.
+    """
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()
+
+    ctx_k = mx.random.normal((1, 8, 40, 64)) * 0.1
+    ctx_v = mx.random.normal((1, 8, 40, 64)) * 0.1
+    new_k = mx.random.normal((1, 8, 1, 64)) * 0.1
+    new_v = mx.random.normal((1, 8, 1, 64)) * 0.1
+
+    tq = TurboQuantKVCache(bits=8.0)
+    tq.update_and_fetch(ctx_k, ctx_v)
+    tq.update_and_fetch(new_k, new_v)  # the decode-step append (T=1)
+    dk, _ = tq.dequantize()
+
+    rel_err = (
+        mx.mean(mx.abs(dk[:, :, 40:41, :] - new_k)).item()
+        / mx.mean(mx.abs(new_k)).item()
+    )
+    # 8-bit TurboQuant is near-lossless; broken kernel gives >100%.
+    assert rel_err < 0.05, f"decode-token quantize error {rel_err:.1%} (kernel bug?)"
+
+
+def test_batch_masked_decode_is_accurate():
+    """Regression: B>1 continuous-batching decode passes an array mask.
+
+    The L=1 value kernels formerly corrupted the masked decode_attention path
+    under RHT (~140% error); the `not use_rht` guard is now fixed upstream in the
+    pinned mlx-vlm (Blaizzy/mlx-vlm#1244). This verifies the patched
+    scaled_dot_product_attention produces correct masked decode output for a B>1
+    array mask — matching the dequantize+SDPA reference over the same states.
+    """
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()
+
+    # B=2 ragged batch (different prefill lengths) -> needs an array mask.
+    singles = []
+    for length in (12, 8):
+        fp = KVCache()
+        fp.update_and_fetch(
+            mx.random.normal((1, 4, length, 32)) * 0.1,
+            mx.random.normal((1, 4, length, 32)) * 0.1,
+        )
+        singles.append(TurboQuantKVCache.from_cache(fp, bits=8.0))
+    batch = BatchTurboQuantKVCache.merge(singles)
+
+    q = mx.random.normal((2, 16, 1, 32)) * 0.1  # B=2, 16 q-heads / 4 kv-heads
+    ks, vs = batch.update_and_fetch(
+        mx.random.normal((2, 4, 1, 32)) * 0.1,
+        mx.random.normal((2, 4, 1, 32)) * 0.1,
+    )
+    dk, dv = batch.dequantize(ks, vs)
+    t_len = dk.shape[2]
+    mask = mx.ones((2, 1, 1, t_len), dtype=mx.bool_)
+
+    out = mlx_base.scaled_dot_product_attention(q, ks, vs, batch, scale=32**-0.5, mask=mask)
+    ref = mx.fast.scaled_dot_product_attention(
+        q, dk.astype(q.dtype), dv.astype(q.dtype), scale=32**-0.5, mask=mask
+    )
+    mx.eval(out, ref)
+    rel = mx.mean(mx.abs(out - ref)).item() / mx.mean(mx.abs(ref)).item()
+    # 8-bit quantized masked decode vs dequantize+SDPA over the same states.
+    # Broken RHT kernels give ~140%; the fix brings it into quantization noise.
+    assert rel < 0.05, f"B>1 masked decode inaccurate (err {rel:.1%}) — RHT fix missing from pinned mlx-vlm?"

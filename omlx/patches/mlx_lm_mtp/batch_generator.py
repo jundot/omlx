@@ -73,7 +73,8 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,9 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def apply() -> bool:
-    """Wrap ``GenerationBatch.__init__`` + ``GenerationBatch.next``.
+    """Wrap ``GenerationBatch`` and ``BatchGenerator`` MTP hooks.
 
     One-shot by design: the wraps capture ``original_*`` in closures so
     re-applying would chain wraps and double-init. ``GenerationBatch`` is
@@ -90,71 +92,106 @@ def apply() -> bool:
     self-healing elsewhere doesn't apply here.
     """
     try:
-        from mlx_lm.generate import GenerationBatch
+        from mlx_lm.generate import BatchGenerator, GenerationBatch
     except ImportError:
-        logger.debug("mlx_lm.generate.GenerationBatch not importable")
+        logger.debug("mlx_lm.generate GenerationBatch/BatchGenerator not importable")
         return False
 
-    if hasattr(GenerationBatch, "_omlx_mtp_patched"):
-        return True
+    if not hasattr(GenerationBatch, "_omlx_mtp_patched"):
+        original_init = GenerationBatch.__init__
+        original_next = GenerationBatch.next
+        original_filter = GenerationBatch.filter
+        original_extend = GenerationBatch.extend
 
-    original_init = GenerationBatch.__init__
-    original_next = GenerationBatch.next
-    original_filter = GenerationBatch.filter
-    original_extend = GenerationBatch.extend
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            # Do not activate MTP here. Fresh singleton batches created by
+            # PromptProcessingBatch.generate() may still be merged into a larger
+            # continuous batch; mutating their cache in __init__ can corrupt the
+            # later standard batched path. Activation is lazy in patched_next().
+            uids = getattr(self, "uids", None)
+            if uids:
+                reason = _ineligibility_reason(self)
+                if reason:
+                    logger.debug("MTP path not active: %s", reason)
 
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        # Do not activate MTP here. Fresh singleton batches created by
-        # PromptProcessingBatch.generate() may still be merged into a larger
-        # continuous batch; mutating their cache in __init__ can corrupt the
-        # later standard batched path. Activation is lazy in patched_next().
-        uids = getattr(self, "uids", None)
-        if uids:
-            reason = _ineligibility_reason(self)
-            if reason:
-                logger.debug("MTP path not active: %s", reason)
+        def patched_next(self, *args, **kwargs):
+            if _is_mtp_batch_eligible(self):
+                try:
+                    batch_state = _prepare_mtp_batch_state_for_next(self)
+                    if batch_state is not None:
+                        return _mtp_batch_next(self, batch_state)
+                except _MtpStepFallback as exc:
+                    logger.debug("MTP batch next() fallback to standard step: %s", exc)
+                    _reconcile_mtp_batch_to_standard(self)
+                    _drop_mtp_batch_state(self, "batch-step-fallback")
+            elif getattr(self, "_omlx_mtp_batch_state", None) is not None:
+                _reconcile_mtp_batch_to_standard(self)
+                _drop_mtp_batch_state(self, "batch-ineligible")
 
-    def patched_next(self, *args, **kwargs):
-        if _is_mtp_eligible(self):
-            try:
-                state = _prepare_mtp_state_for_next(self)
-                if state is not None:
-                    return _mtp_next(self, state)
-            except _MtpStepFallback as exc:
-                logger.debug("MTP next() fallback to standard step: %s", exc)
-                _drop_mtp_state(self, "step-fallback")
-        else:
-            _drop_mtp_state(self, "non-singleton-or-ineligible")
-        return original_next(self, *args, **kwargs)
+            if _is_mtp_eligible(self):
+                try:
+                    state = _prepare_mtp_state_for_next(self)
+                    if state is not None:
+                        return _mtp_next(self, state)
+                except _MtpStepFallback as exc:
+                    logger.debug("MTP next() fallback to standard step: %s", exc)
+                    _drop_mtp_state(self, "step-fallback")
+            else:
+                _drop_mtp_state(self, "non-singleton-or-ineligible")
+            return original_next(self, *args, **kwargs)
 
-    def patched_extend(self, batch, *args, **kwargs):
-        # The host (self) may be a singleton with active MTP about to gain a
-        # co-runner. The MTP path never maintains mlx-lm's _next_tokens, so a
-        # plain drop here would leave standard batched decode resuming from a
-        # stale _next_tokens against an MTP-advanced cache, corrupting one
-        # token. Reconcile the host to a standard-resumable state BEFORE the
-        # merge, while it is still single-sequence. Drop state either way:
-        # after the merge self is multi-seq and MTP is off by design.
-        host_state = getattr(self, "_omlx_mtp_state", None)
-        if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
-            _reconcile_mtp_to_standard(self, host_state)
-            _drop_mtp_state(self, "extend-reconciled")
-        result = original_extend(self, batch, *args, **kwargs)
-        _drop_mtp_state(batch, "donor-extended")
-        _drop_invalid_mtp_state(self, "extend")
-        return result
+        def patched_extend(self, batch, *args, **kwargs):
+            # The host (self) may have active MTP about to gain a co-runner.
+            # The MTP path never maintains mlx-lm's _next_tokens, so a plain
+            # drop here would leave standard batched decode resuming from a
+            # stale _next_tokens against an MTP-advanced cache. Reconcile
+            # before merge while ownership is still well defined.
+            _reconcile_mtp_batch_to_standard(self)
+            _drop_mtp_batch_state(self, "extend-reconciled")
+            _drop_mtp_batch_state(batch, "donor-extended")
 
-    def patched_filter(self, keep, *args, **kwargs):
-        result = original_filter(self, keep, *args, **kwargs)
-        _drop_invalid_mtp_state(self, "filter", log_empty=True)
-        return result
+            host_state = getattr(self, "_omlx_mtp_state", None)
+            if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
+                _reconcile_mtp_to_standard(self, host_state)
+                _drop_mtp_state(self, "extend-reconciled")
+            result = original_extend(self, batch, *args, **kwargs)
+            _drop_mtp_state(batch, "donor-extended")
+            _drop_invalid_mtp_state(self, "extend")
+            _drop_invalid_mtp_batch_state(self, "extend")
+            return result
 
-    GenerationBatch.__init__ = patched_init
-    GenerationBatch.next = patched_next
-    GenerationBatch.filter = patched_filter
-    GenerationBatch.extend = patched_extend
-    GenerationBatch._omlx_mtp_patched = True
+        def patched_filter(self, keep, *args, **kwargs):
+            old_uids = list(getattr(self, "uids", []) or [])
+            result = original_filter(self, keep, *args, **kwargs)
+            _drop_invalid_mtp_state(self, "filter", log_empty=True)
+            _drop_invalid_mtp_batch_state(
+                self,
+                "filter",
+                old_uids=old_uids,
+                log_empty=True,
+            )
+            return result
+
+        GenerationBatch.__init__ = patched_init
+        GenerationBatch.next = patched_next
+        GenerationBatch.filter = patched_filter
+        GenerationBatch.extend = patched_extend
+        GenerationBatch._omlx_mtp_patched = True
+
+    if not hasattr(BatchGenerator, "_omlx_mtp_patched"):
+        original_bg_next = BatchGenerator._next
+
+        def patched_bg_next(self, *args, **kwargs):
+            gen_batch = getattr(self, "_generation_batch", None)
+            if gen_batch is not None:
+                gen_batch._omlx_mtp_activation_safe = (
+                    _batch_generator_allows_mtp_activation(self)
+                )
+            return original_bg_next(self, *args, **kwargs)
+
+        BatchGenerator._next = patched_bg_next
+        BatchGenerator._omlx_mtp_patched = True
     return True
 
 
@@ -172,6 +209,63 @@ def _model_has_mtp_module(model: Any) -> bool:
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
 
 
+def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
+    """True when lazy MTP activation cannot race with a pending batch merge."""
+    try:
+        return (
+            len(getattr(batch_gen, "_unprocessed_sequences", [])) == 0
+            and len(getattr(batch_gen, "_prompt_batch", [])) == 0
+            and len(getattr(batch_gen, "_currently_processing", [])) == 0
+        )
+    except Exception:
+        return False
+
+
+def _mtp_common_eligible(gen_batch: Any) -> bool:
+    if not hasattr(gen_batch, "model"):
+        return False
+    if not hasattr(gen_batch.model, "mtp_forward"):
+        return False
+    if not _model_has_mtp_module(gen_batch.model):
+        return False
+    try:
+        from . import is_mtp_active
+
+        if not is_mtp_active():
+            return False
+    except Exception:
+        return False
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) == 0:
+        return False
+    if _has_grammar_processors(gen_batch):
+        return False
+    return True
+
+
+def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
+    if getattr(gen_batch, state_attr, None) is not None:
+        return True
+    return bool(getattr(gen_batch, "_omlx_mtp_activation_safe", True))
+
+
+def _batch_rows_aligned_for_mtp(gen_batch: Any) -> bool:
+    """True when all batch rows share the same target-cache decode position."""
+    prompt_cache = getattr(gen_batch, "prompt_cache", None) or []
+    for cache in prompt_cache:
+        offset = getattr(cache, "offset", None)
+        if offset is None:
+            continue
+        try:
+            if hasattr(offset, "tolist"):
+                values = [int(v) for v in offset.tolist()]
+                return len(set(values)) <= 1
+            return True
+        except Exception:
+            return False
+    return True
+
+
 def _is_mtp_eligible(gen_batch: Any) -> bool:
     """``__init__`` and ``next`` only engage MTP for single-sequence batches
     when the model exposes ``mtp_forward``, has an attached MTP head, and
@@ -183,22 +277,28 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
     to decide whether to run the draft/verify cycle. ``is_mtp_active``
     reflects the per-load ``model_settings.mtp_enabled`` choice.
     """
-    if not hasattr(gen_batch, "model"):
-        return False
-    if not hasattr(gen_batch.model, "mtp_forward"):
-        return False
-    if not _model_has_mtp_module(gen_batch.model):
-        return False
-    try:
-        from . import is_mtp_active
-        if not is_mtp_active():
-            return False
-    except Exception:
+    if not _mtp_common_eligible(gen_batch):
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) != 1:
         return False
-    if _has_grammar_processors(gen_batch):
+    if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
+        return False
+    return True
+
+
+def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
+    if not _mtp_common_eligible(gen_batch):
+        return False
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) <= 1:
+        return False
+    if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
+        return False
+    if (
+        getattr(gen_batch, "_omlx_mtp_batch_state", None) is None
+        and not _batch_rows_aligned_for_mtp(gen_batch)
+    ):
         return False
     return True
 
@@ -220,6 +320,7 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         return "model has no attached mtp head"
     try:
         from . import is_mtp_active
+
         if not is_mtp_active():
             return "mtp_active flag is off (model_settings.mtp_enabled was False at load time)"
     except Exception:
@@ -228,7 +329,11 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if uids is None:
         return "GenerationBatch has no uids"
     if len(uids) != 1:
-        return f"batch size {len(uids)} != 1 (continuous batching, MTP off by design)"
+        if not _batch_rows_aligned_for_mtp(gen_batch):
+            return "row-wise MTP requires aligned target-cache positions"
+        return ""
+    if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
+        return "pending prompt work may still merge into this singleton batch"
     if _has_grammar_processors(gen_batch):
         return "grammar-constrained decoding uses GenerationBatch._step hooks"
     return ""
@@ -241,6 +346,7 @@ class _MtpStepFallback(RuntimeError):
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _MtpStats:
@@ -304,9 +410,17 @@ class _MtpState:
     stats: _MtpStats = field(default_factory=_MtpStats)
 
 
+@dataclass
+class _MtpBatchState:
+    """Experimental row-wise MTP state for a multi-sequence GenerationBatch."""
+
+    states: Dict[Any, _MtpState] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _resolve_sampler(gen_batch: Any):
     """Match ``GenerationBatch._step``'s per-sequence sampler resolution (batch=1)."""
@@ -397,6 +511,244 @@ def _drop_invalid_mtp_state(
         reason,
         log_stats=bool(log_empty and not uids),
     )
+
+
+def _mtp_batch_state_valid_for_batch(
+    gen_batch: Any, batch_state: Optional[_MtpBatchState]
+) -> bool:
+    if batch_state is None:
+        return False
+    uids = getattr(gen_batch, "uids", None)
+    if not uids:
+        return False
+    return all(uid in batch_state.states for uid in uids)
+
+
+def _drop_mtp_batch_state(
+    gen_batch: Any,
+    reason: str,
+    *,
+    log_stats: bool = False,
+) -> Optional[_MtpBatchState]:
+    batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
+    if batch_state is None:
+        return None
+    if log_stats:
+        for state in list(batch_state.states.values()):
+            try:
+                _log_mtp_stats(
+                    getattr(state, "uid", "?"),
+                    state.stats,
+                    getattr(state, "_finish_reason", reason),
+                )
+            except Exception:
+                pass
+    try:
+        delattr(gen_batch, "_omlx_mtp_batch_state")
+    except AttributeError:
+        pass
+    logger.debug("MTP batch state dropped: %s", reason)
+    return batch_state
+
+
+def _drop_invalid_mtp_batch_state(
+    gen_batch: Any,
+    reason: str,
+    *,
+    old_uids: Optional[List[Any]] = None,
+    log_empty: bool = False,
+) -> Optional[_MtpBatchState]:
+    batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
+    if batch_state is None:
+        return None
+    uids = list(getattr(gen_batch, "uids", []) or [])
+    if not uids:
+        return _drop_mtp_batch_state(
+            gen_batch,
+            reason,
+            log_stats=bool(log_empty),
+        )
+
+    keep = set(uids)
+    removed = set(old_uids or []) - keep
+    for uid in removed:
+        state = batch_state.states.pop(uid, None)
+        if state is not None and log_empty:
+            try:
+                _log_mtp_stats(uid, state.stats, reason)
+            except Exception:
+                pass
+    batch_state.states = {
+        uid: state for uid, state in batch_state.states.items() if uid in keep
+    }
+    if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
+        if len(uids) == 1:
+            gen_batch._omlx_mtp_state = batch_state.states[uids[0]]
+            _drop_mtp_batch_state(gen_batch, "filter-to-singleton")
+            return None
+        return batch_state
+    return _drop_mtp_batch_state(gen_batch, reason)
+
+
+def _row_value(values: Optional[List[Any]], idx: int, default: Any = None) -> Any:
+    if values is None:
+        return default
+    try:
+        if len(values) == 0:
+            return default
+        return values[idx]
+    except Exception:
+        return default
+
+
+def _make_row_batch(
+    gen_batch: Any,
+    idx: int,
+    *,
+    prompt_cache: Optional[List[Any]] = None,
+    state: Optional[_MtpState] = None,
+) -> Any:
+    if prompt_cache is None:
+        prompt_cache = gen_batch.extract_cache(idx)
+
+    next_tokens = getattr(gen_batch, "_next_tokens", None)
+    next_logprobs = getattr(gen_batch, "_next_logprobs", None)
+    row = SimpleNamespace(
+        model=gen_batch.model,
+        uids=[gen_batch.uids[idx]],
+        prompt_cache=prompt_cache,
+        tokens=[gen_batch.tokens[idx]],
+        samplers=[_row_value(getattr(gen_batch, "samplers", None), idx)],
+        fallback_sampler=gen_batch.fallback_sampler,
+        logits_processors=[
+            _row_value(getattr(gen_batch, "logits_processors", None), idx, [])
+        ],
+        state_machines=[_row_value(getattr(gen_batch, "state_machines", None), idx)],
+        max_tokens=[_row_value(getattr(gen_batch, "max_tokens", None), idx)],
+        _next_tokens=next_tokens[idx : idx + 1] if next_tokens is not None else None,
+        _next_logprobs=(
+            [next_logprobs[idx]]
+            if next_logprobs is not None and len(next_logprobs) > idx
+            else []
+        ),
+        _token_context=[gen_batch._token_context[idx]],
+        _num_tokens=[gen_batch._num_tokens[idx]],
+        _matcher_states=[gen_batch._matcher_states[idx]],
+    )
+    if state is not None:
+        row._omlx_mtp_state = state
+    return row
+
+
+def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
+    if not row_caches:
+        return []
+    merged = []
+    for layer_idx in range(len(row_caches[0])):
+        per_row = [cache[layer_idx] for cache in row_caches]
+        merge = getattr(per_row[0], "merge", None)
+        if not callable(merge):
+            raise _MtpStepFallback(
+                f"cache {type(per_row[0]).__name__} cannot merge row caches"
+            )
+        merged.append(merge(per_row))
+    return merged
+
+
+def _replace_cache_rows(
+    gen_batch: Any,
+    replacements: Dict[int, List[Any]],
+) -> None:
+    if not replacements:
+        return
+    row_caches = [
+        replacements.get(idx) or gen_batch.extract_cache(idx)
+        for idx in range(len(gen_batch.uids))
+    ]
+    gen_batch.prompt_cache = _merge_row_caches(row_caches)
+
+
+def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState]:
+    """Return a valid row-wise MTP state, lazily initializing every row."""
+    batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
+    if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
+        return batch_state
+    if batch_state is not None:
+        _drop_mtp_batch_state(gen_batch, "stale-batch-owner")
+
+    replacements: Dict[int, List[Any]] = {}
+    token_context_updates: Dict[int, Any] = {}
+    states: Dict[Any, _MtpState] = {}
+
+    for idx, uid in enumerate(gen_batch.uids):
+        row = _make_row_batch(gen_batch, idx)
+        _set_singleton_mrope_delta(row)
+        _post_init_mtp(row)
+        state = getattr(row, "_omlx_mtp_state", None)
+        if not _mtp_state_valid_for_batch(row, state):
+            _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
+            return None
+        states[uid] = state
+        replacements[idx] = row.prompt_cache
+        token_context_updates[idx] = row._token_context[0]
+
+    _replace_cache_rows(gen_batch, replacements)
+    for idx, token_context in token_context_updates.items():
+        gen_batch._token_context[idx] = token_context
+
+    batch_state = _MtpBatchState(states=states)
+    gen_batch._omlx_mtp_batch_state = batch_state
+    logger.info(
+        "MTP row-wise batch path activated for %d sequences",
+        len(gen_batch.uids),
+    )
+    return batch_state
+
+
+def _reconcile_mtp_batch_to_standard(gen_batch: Any) -> bool:
+    batch_state = getattr(gen_batch, "_omlx_mtp_batch_state", None)
+    if batch_state is None:
+        return True
+    if not getattr(gen_batch, "uids", None):
+        return True
+
+    import mlx.core as mx
+
+    row_caches: Dict[int, List[Any]] = {}
+    next_tokens = []
+    next_logprobs = []
+    token_context_updates: Dict[int, Any] = {}
+
+    try:
+        for idx, uid in enumerate(gen_batch.uids):
+            state = batch_state.states.get(uid)
+            if state is None:
+                row_caches[idx] = gen_batch.extract_cache(idx)
+                if getattr(gen_batch, "_next_tokens", None) is not None:
+                    next_tokens.append(gen_batch._next_tokens[idx : idx + 1])
+                if len(getattr(gen_batch, "_next_logprobs", [])) > idx:
+                    next_logprobs.append(gen_batch._next_logprobs[idx])
+                continue
+
+            row = _make_row_batch(gen_batch, idx, state=state)
+            if not _reconcile_mtp_to_standard(row, state):
+                return False
+            row_caches[idx] = row.prompt_cache
+            next_tokens.append(row._next_tokens)
+            next_logprobs.extend(row._next_logprobs)
+            token_context_updates[idx] = row._token_context[0]
+
+        if row_caches:
+            _replace_cache_rows(gen_batch, row_caches)
+        if next_tokens:
+            gen_batch._next_tokens = mx.concatenate(next_tokens)
+            gen_batch._next_logprobs = next_logprobs
+        for idx, token_context in token_context_updates.items():
+            gen_batch._token_context[idx] = token_context
+        return True
+    except Exception as exc:
+        logger.warning("MTP batch reconcile failed: %s", exc)
+        return False
 
 
 def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
@@ -498,9 +850,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_tok = mx.array([int(next_id)], dtype=mx.uint32)
             next_lp = next_lp_1d
         else:
-            prev_buf = (
-                gen_batch._token_context[0].tokens if procs is not None else None
-            )
+            prev_buf = gen_batch._token_context[0].tokens if procs is not None else None
             ll = _apply_processors(procs, prev_buf, last_logits)
             next_lp_2d = _logprobs(ll)
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
@@ -641,9 +991,7 @@ def _rollback_after_reject(
     non-MTP step.
     """
     if gdn_states is not None and hasattr(model, "rollback_speculative_cache"):
-        model.rollback_speculative_cache(
-            prompt_cache, gdn_states, accepted, block_size
-        )
+        model.rollback_speculative_cache(prompt_cache, gdn_states, accepted, block_size)
         return True
     return _restore_or_trim_caches(prompt_cache)
 
@@ -677,9 +1025,7 @@ def _call_backbone(
             return result
         if len(result) == 2:
             return result[0], result[1], None
-    raise TypeError(
-        f"backbone returned unexpected shape: {type(result).__name__}"
-    )
+    raise TypeError(f"backbone returned unexpected shape: {type(result).__name__}")
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
@@ -702,6 +1048,7 @@ def _ensure_uint32(arr):
 # Post-init: run one extra backbone forward + MTP forward; queue the two
 # emitted tokens; stash a draft for the first verify cycle.
 # ---------------------------------------------------------------------------
+
 
 def _post_init_mtp(gen_batch: Any) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
@@ -763,9 +1110,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
         prev_with_main_and_next = mx.concatenate(
             [prev_buf, _ensure_uint32(next_main_tok)]
         )
-        mtp_logits_2d = _apply_processors(
-            procs, prev_with_main_and_next, mtp_logits_2d
-        )
+        mtp_logits_2d = _apply_processors(procs, prev_with_main_and_next, mtp_logits_2d)
     draft_lp_2d = _logprobs(mtp_logits_2d)
     draft_tok = sampler(draft_lp_2d)
     # Filtered draft lp — what the sampler actually drew from. The next
@@ -796,6 +1141,119 @@ def _post_init_mtp(gen_batch: Any) -> None:
 # ---------------------------------------------------------------------------
 # next() dispatch
 # ---------------------------------------------------------------------------
+
+
+def _mtp_batch_next(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
+    """Emit one token per row using independent MTP state per active uid.
+
+    This is intentionally conservative: rows whose queues are empty are
+    advanced through the proven singleton MTP cycle against extracted row
+    caches, then the modified rows are merged back into the batched cache.
+    That keeps continuous-batching ownership correct while enabling MTP in
+    multi-request decode without sharing singleton state across rows.
+    """
+    if not getattr(gen_batch, "uids", None):
+        return []
+
+    replacements: Dict[int, List[Any]] = {}
+    token_context_updates: Dict[int, Any] = {}
+
+    for idx, uid in enumerate(list(gen_batch.uids)):
+        state = batch_state.states.get(uid)
+        if state is None:
+            raise _MtpStepFallback(f"missing row state for uid={uid}")
+        if state.queue:
+            continue
+
+        row = _make_row_batch(
+            gen_batch,
+            idx,
+            prompt_cache=gen_batch.extract_cache(idx),
+            state=state,
+        )
+        _set_singleton_mrope_delta(row)
+        _run_verify_cycle(row, state)
+        if not state.queue:
+            raise _MtpStepFallback(f"row uid={uid} verify produced no tokens")
+        replacements[idx] = row.prompt_cache
+        token_context_updates[idx] = row._token_context[0]
+
+    _replace_cache_rows(gen_batch, replacements)
+    for idx, token_context in token_context_updates.items():
+        gen_batch._token_context[idx] = token_context
+
+    return _emit_batch_responses(gen_batch, batch_state)
+
+
+def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[Any]:
+    Response = type(gen_batch).Response
+
+    keep = []
+    responses = []
+    finished_uids = []
+
+    for idx, uid in enumerate(list(gen_batch.uids)):
+        state = batch_state.states.get(uid)
+        if state is None or not state.queue:
+            raise _MtpStepFallback(f"row uid={uid} has no queued token")
+
+        token_id, logprobs_1d, source = state.queue.popleft()
+        _bump_emit_stat(state, source)
+
+        finish_reason: Optional[str] = None
+        match_sequence = None
+
+        gen_batch.tokens[idx].append(token_id)
+        gen_batch._num_tokens[idx] += 1
+        if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
+            finish_reason = "length"
+
+        new_state, match_sequence, current_state = gen_batch.state_machines[idx].match(
+            gen_batch._matcher_states[idx],
+            token_id,
+        )
+        gen_batch._matcher_states[idx] = new_state
+        if match_sequence is not None and current_state is None:
+            finish_reason = "stop"
+
+        if finish_reason is not None:
+            responses.append(
+                Response(
+                    uid=uid,
+                    token=token_id,
+                    logprobs=logprobs_1d,
+                    finish_reason=finish_reason,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    prompt_cache=gen_batch.extract_cache(idx),
+                    all_tokens=gen_batch.tokens[idx],
+                )
+            )
+            _log_mtp_stats(uid, state.stats, finish_reason)
+            finished_uids.append(uid)
+        else:
+            keep.append(idx)
+            responses.append(
+                Response(
+                    uid=uid,
+                    token=token_id,
+                    logprobs=logprobs_1d,
+                    finish_reason=None,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    prompt_cache=None,
+                    all_tokens=None,
+                )
+            )
+
+    for uid in finished_uids:
+        batch_state.states.pop(uid, None)
+
+    if len(keep) < len(gen_batch.uids):
+        gen_batch.filter(keep)
+
+    return responses
+
 
 def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     """Emit one token; run a verify cycle if the queue is empty."""
@@ -868,6 +1326,7 @@ def _bump_emit_stat(state: _MtpState, source: str) -> None:
 # ---------------------------------------------------------------------------
 # Verify cycle: 2-token forward + accept/reject + MTP forward for next draft.
 # ---------------------------------------------------------------------------
+
 
 def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     """Run one verify cycle. Populates ``state.queue`` with 1 (reject) or 2
@@ -954,8 +1413,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         accept = verify_id == draft_id
     else:
         log_accept = (
-            verify_accept_lp[0, draft_id].item()
-            - draft_accept_lp[draft_id].item()
+            verify_accept_lp[0, draft_id].item() - draft_accept_lp[draft_id].item()
         )
         # Draw the acceptance roll from mx.random so it follows the same
         # mx.random.seed the rest of the sampler uses (line ~962 residual
@@ -1001,8 +1459,11 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
     # accepted=0 means only the confirmed token (verify position) is kept;
     # block_size=2 covers both the confirmed and the rejected draft.
     if not _rollback_after_reject(
-        gen_batch.model, gen_batch.prompt_cache, gdn_states,
-        accepted=0, block_size=2,
+        gen_batch.model,
+        gen_batch.prompt_cache,
+        gdn_states,
+        accepted=0,
+        block_size=2,
     ):
         if procs is not None:
             _trim_token_buffer(gen_batch, 1)
@@ -1043,6 +1504,7 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
 # Helpers used by the verify cycle.
 # ---------------------------------------------------------------------------
 
+
 def _step_mtp(
     gen_batch: Any,
     hidden_at_position: Any,
@@ -1071,9 +1533,7 @@ def _step_mtp(
     )
     mtp_logits_2d = mtp_logits[:, -1, :]
     if procs is not None and prev_buf is not None:
-        prev_with_next = mx.concatenate(
-            [prev_buf, _ensure_uint32(next_main_tok)]
-        )
+        prev_with_next = mx.concatenate([prev_buf, _ensure_uint32(next_main_tok)])
         mtp_logits_2d = _apply_processors(procs, prev_with_next, mtp_logits_2d)
     new_lp = _logprobs(mtp_logits_2d)
     new_tok = sampler(new_lp)
@@ -1118,6 +1578,7 @@ def _residual_sample(verify_lp_2d: Any, draft_lp_1d: Any) -> Tuple[int, Any]:
 # ---------------------------------------------------------------------------
 # Response builder — mirrors GenerationBatch.next()'s per-sequence epilogue.
 # ---------------------------------------------------------------------------
+
 
 def _emit_response(
     gen_batch: Any,

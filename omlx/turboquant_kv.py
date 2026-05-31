@@ -173,6 +173,16 @@ def _pad_state_left(state, pad_length: int):
     return _concat_state(pad, state)
 
 
+def _empty_state_batch_like(state, batch_size: int):
+    """Allocate an empty token state with the requested batch size."""
+    if state is None:
+        return None
+    row = _filter_state(_allocate_state_like(state, 0), slice(0, 1))
+    if batch_size == 1:
+        return row
+    return _concat_state_batch([row] * batch_size)
+
+
 # ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
@@ -245,20 +255,15 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return create_attention_mask(N, offset, return_array, window_size)
         if isinstance(offset, mx.array) and offset.size == 1:
             return create_attention_mask(N, offset.item(), return_array, window_size)
-        # B>1: batched causal mask
-        max_offset = offset.max().item()
-        total = max_offset + N
-        rinds = mx.arange(total)[None, None, :]
-        linds = mx.arange(N)[None, None, :, None]
-        off = offset[:, None, None, None]
-        linds = linds + off
-        mask = linds >= rinds
-        if window_size is not None:
-            mask = mask & (linds < rinds + window_size)
-        if self.left_padding is not None:
-            lp = self.left_padding[:, None, None, None]
-            mask = mask & (rinds >= lp)
-        return mask
+        # B>1: delegate to mlx-lm's create_causal_mask with the physical column
+        # count + per-request left_padding, exactly like BatchKVCache. The old
+        # hand-rolled term compared each request's sequence length (offset)
+        # against the column index, which masked out valid left-padded tokens —
+        # so left-padded requests attended to ~nothing and decoded garbage.
+        phys = offset.max().item()
+        return create_causal_mask(
+            N, offset=phys, window_size=window_size, left_padding=self.left_padding
+        )
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
 
@@ -313,10 +318,21 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         s_idx = _state_length(self.keys) if self.keys is not None else 0
         o_idx = _state_length(other.keys) if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
+        ref_keys = self.keys if self.keys is not None else other.keys
+        ref_values = self.values if self.values is not None else other.values
 
         def _pad_and_trim(c, idx):
-            ks = _slice_state(c.keys, idx) if c.keys is not None else None
-            vs = _slice_state(c.values, idx) if c.values is not None else None
+            batch_size = int(c.offset.shape[0])
+            if c.keys is None:
+                if max_idx > 0 and ref_keys is not None:
+                    ks = _empty_state_batch_like(ref_keys, batch_size)
+                    vs = _empty_state_batch_like(ref_values, batch_size)
+                else:
+                    ks = None
+                    vs = None
+            else:
+                ks = _slice_state(c.keys, idx)
+                vs = _slice_state(c.values, idx)
             left = max_idx - idx
             if left > 0 and ks is not None:
                 ks = _pad_state_left(ks, left)
@@ -378,9 +394,27 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
         key_states = []
         value_states = []
+        reference_key_state = None
+        reference_value_state = None
+        for c in caches:
+            ks, vs = c.state
+            if ks is not None:
+                reference_key_state = (
+                    ks._state if isinstance(ks, _QuantizedStateProxy) else ks
+                )
+                reference_value_state = (
+                    vs._state if isinstance(vs, _QuantizedStateProxy) else vs
+                )
+                break
+
         for p, c in zip(padding, caches):
             ks, vs = c.state
             if ks is None:
+                if max_length > 0 and reference_key_state is not None:
+                    key_states.append(_allocate_state_like(reference_key_state, max_length))
+                    value_states.append(
+                        _allocate_state_like(reference_value_state, max_length)
+                    )
                 continue
             ks = ks._state if isinstance(ks, _QuantizedStateProxy) else ks
             vs = vs._state if isinstance(vs, _QuantizedStateProxy) else vs

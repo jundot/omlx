@@ -51,12 +51,38 @@ def test_mlx_vlm_qwen3_5_class_is_patched():
 
 def test_patched_call_signature_matches_mlx_vlm():
     """The replacement __call__ must accept the mlx-vlm signature
-    ``(inputs, mask=None, cache=None, gdn_sink=None)``. Any callsite that
-    passes ``gdn_sink`` (speculative-cache rollback) must still work.
+    ``(inputs, mask=None, cache=None, gdn_sink=None, target_verify=False)``.
+    Any callsite that passes mlx-vlm's speculative-cache arguments must
+    still work.
     """
     import inspect
     from omlx.patches.gated_delta_advance import _build_replacement_call
 
     sig = inspect.signature(_build_replacement_call())
     params = list(sig.parameters.keys())
-    assert params == ["self", "inputs", "mask", "cache", "gdn_sink"]
+    assert params == ["self", "inputs", "mask", "cache", "gdn_sink", "target_verify"]
+
+
+def test_patched_call_delegates_target_verify_to_upstream():
+    from omlx.patches.gated_delta_advance import _build_replacement_call
+
+    calls = []
+
+    def original(self, inputs, mask=None, cache=None, gdn_sink=None, target_verify=False):
+        calls.append((self, inputs, mask, cache, gdn_sink, target_verify))
+        return "upstream"
+
+    replacement = _build_replacement_call(original)
+    owner = object()
+    sink = []
+    result = replacement(
+        owner,
+        "inputs",
+        mask="mask",
+        cache="cache",
+        gdn_sink=sink,
+        target_verify=True,
+    )
+
+    assert result == "upstream"
+    assert calls == [(owner, "inputs", "mask", "cache", sink, True)]

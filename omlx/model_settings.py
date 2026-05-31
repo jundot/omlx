@@ -80,10 +80,11 @@ class ModelSettings:
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
-            When True, the BatchGenerator uses an MTP draft+verify path for single-request
-            decoding. Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually
-            exclusive with dflash_enabled and turboquant_kv_enabled. Concurrent requests on
-            the same model fall back to standard continuous batching automatically.
+            When True, BatchGenerator uses MTP draft+verify for singleton decode and
+            for multi-row decode batches whose cache positions are aligned. Unaligned
+            continuous batches fall back to standard decoding automatically. Compatible
+            model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
+            dflash_enabled and turboquant_kv_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -153,8 +154,9 @@ class ModelSettings:
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
-    # uses MTP draft+verify path for single-request decoding. Compatible model_types:
-    # qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with dflash and turboquant.
+    # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
+    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
+    # with dflash and turboquant.
     mtp_enabled: bool = False
 
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
