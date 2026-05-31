@@ -74,6 +74,59 @@ class HermesIntegration(Integration):
         except OSError as e:
             print(f"Warning: could not create backup: {e}")
 
+    @staticmethod
+    def _should_manage_vision_config(vision_config: object, base_url: str) -> bool:
+        """Return True when the Hermes vision block is absent or oMLX-owned."""
+        if not isinstance(vision_config, dict):
+            return True
+
+        provider = vision_config.get("provider")
+        existing_base_url = vision_config.get("base_url")
+        if provider in (None, "custom", "omlx"):
+            return existing_base_url in (None, base_url) or provider == "omlx"
+        return False
+
+    def _configure_vision_if_vlm(
+        self,
+        config: dict,
+        model: str,
+        base_url: str,
+        api_key: str,
+        model_type: str | None,
+    ) -> None:
+        """Configure Hermes auxiliary vision routing for oMLX VLM models."""
+        if model_type != "vlm" or not model:
+            return
+
+        agent_config = config.get("agent", {})
+        if not isinstance(agent_config, dict):
+            agent_config = {}
+        agent_config.setdefault("image_input_mode", "auto")
+        config["agent"] = agent_config
+
+        auxiliary = config.get("auxiliary", {})
+        if not isinstance(auxiliary, dict):
+            auxiliary = {}
+
+        existing_vision = auxiliary.get("vision")
+        if not self._should_manage_vision_config(existing_vision, base_url):
+            config["auxiliary"] = auxiliary
+            return
+
+        vision_config = (
+            dict(existing_vision) if isinstance(existing_vision, dict) else {}
+        )
+        vision_config.update(
+            {
+                "provider": "custom",
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key or "omlx",
+            }
+        )
+        auxiliary["vision"] = vision_config
+        config["auxiliary"] = auxiliary
+
     def configure(
         self,
         port: int,
@@ -82,10 +135,12 @@ class HermesIntegration(Integration):
         host: str = "127.0.0.1",
         context_window: int | None = None,
         max_tokens: int | None = None,
+        model_type: str | None = None,
     ) -> None:
         config_path = self.CONFIG_PATH
         config = self._read_config(config_path)
         self._create_backup(config_path)
+        base_url = f"http://{host}:{port}/v1"
 
         providers = config.setdefault("providers", {})
         if not isinstance(providers, dict):
@@ -98,7 +153,7 @@ class HermesIntegration(Integration):
         provider_config.update(
             {
                 "name": "oMLX",
-                "base_url": f"http://{host}:{port}/v1",
+                "base_url": base_url,
                 "api_key": api_key or "omlx",
                 "api_mode": "chat_completions",
             }
@@ -136,6 +191,14 @@ class HermesIntegration(Integration):
             model_config.pop("max_tokens", None)
         config["model"] = model_config
 
+        self._configure_vision_if_vlm(
+            config,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            model_type=model_type,
+        )
+
         config_path.parent.mkdir(parents=True, exist_ok=True)
         yaml_content = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
         config_path.write_text(
@@ -154,6 +217,7 @@ class HermesIntegration(Integration):
     ) -> None:
         context_window = kwargs.pop("context_window", None)
         max_tokens = kwargs.pop("max_tokens", None)
+        model_type = kwargs.pop("model_type", None)
         self.configure(
             port,
             api_key,
@@ -161,6 +225,7 @@ class HermesIntegration(Integration):
             host=host,
             context_window=context_window,
             max_tokens=max_tokens,
+            model_type=model_type,
         )
 
         env = self._scrubbed_env()

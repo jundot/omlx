@@ -1,11 +1,9 @@
 """Tests for the integrations module."""
 
 import json
-import os
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import yaml
 
 from omlx.integrations import get_integration, list_integrations
@@ -13,8 +11,8 @@ from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
-from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
+from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
 
 
@@ -564,6 +562,117 @@ class TestHermesIntegration:
         assert config["model"]["default"] == "qwen3.5"
         assert config["model"]["context_length"] == 131072
         assert config["model"]["max_tokens"] == 8192
+
+    def test_configure_vlm_adds_auxiliary_vision(self, tmp_path):
+        config_path = tmp_path / "hermes" / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="test-key",
+                model="qwen-vl",
+                context_window=131072,
+                model_type="vlm",
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["image_input_mode"] == "auto"
+        assert config["auxiliary"]["vision"] == {
+            "provider": "custom",
+            "model": "qwen-vl",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "test-key",
+        }
+
+    def test_configure_llm_does_not_add_auxiliary_vision(self, tmp_path):
+        config_path = tmp_path / "hermes" / "config.yaml"
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="test-key",
+                model="qwen-text",
+                model_type="llm",
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert "agent" not in config
+        assert "auxiliary" not in config
+
+    def test_configure_vlm_preserves_external_vision_provider(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "auxiliary": {
+                        "vision": {
+                            "provider": "custom",
+                            "model": "external-vision-model",
+                            "base_url": "https://vision.example.test/v1",
+                            "api_key": "external-key",
+                        }
+                    }
+                },
+                sort_keys=False,
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="test-key",
+                model="qwen-vl",
+                model_type="vlm",
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["image_input_mode"] == "auto"
+        assert config["auxiliary"]["vision"] == {
+            "provider": "custom",
+            "model": "external-vision-model",
+            "base_url": "https://vision.example.test/v1",
+            "api_key": "external-key",
+        }
+
+    def test_configure_vlm_updates_existing_omlx_vision(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "auxiliary": {
+                        "vision": {
+                            "provider": "custom",
+                            "model": "old-vlm",
+                            "base_url": "http://127.0.0.1:8000/v1",
+                            "api_key": "old-key",
+                            "timeout": 240,
+                        }
+                    }
+                },
+                sort_keys=False,
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                port=8000,
+                api_key="new-key",
+                model="qwen-vl",
+                model_type="vlm",
+            )
+
+        vision = yaml.safe_load(config_path.read_text())["auxiliary"]["vision"]
+        assert vision == {
+            "provider": "custom",
+            "model": "qwen-vl",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "new-key",
+            "timeout": 240,
+        }
 
     def test_configure_custom_host(self, tmp_path):
         config_path = tmp_path / "config.yaml"
