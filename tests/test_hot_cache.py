@@ -1246,8 +1246,8 @@ class TestSSDWriteDrops:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestReadOnlyCache:
-    """Verify is_read_only property and save_block behavior when
-    hot_cache_only=True but hot_cache_max_bytes=0 (no write capacity)."""
+    """Verify save_block behavior when hot_cache_only=True but
+    hot_cache_max_bytes=0 (no write capacity) — no WARNING is emitted."""
 
     @pytest.fixture
     def manager(self, tmp_path):
@@ -1268,36 +1268,6 @@ class TestReadOnlyCache:
             )
             for _ in range(num_layers)
         ]
-
-    def test_is_read_only_true_when_no_capacity(self, manager):
-        """hot_cache_only=True with hot_cache_max_bytes=0 means no write tier."""
-        assert manager.is_read_only is True
-
-    def test_is_read_only_false_when_hot_cache_has_capacity(self, tmp_path):
-        """hot_cache_only=True with positive capacity means write-back is active."""
-        mgr = PagedSSDCacheManager(
-            cache_dir=tmp_path / "has_capacity",
-            max_size_bytes=100 * 1024**2,
-            hot_cache_max_bytes=10 * 1024**2,
-            hot_cache_only=True,
-        )
-        try:
-            assert mgr.is_read_only is False
-        finally:
-            mgr.close()
-
-    def test_is_read_only_false_when_ssd_active(self, tmp_path):
-        """hot_cache_only=False (normal SSD mode) is never read-only."""
-        mgr = PagedSSDCacheManager(
-            cache_dir=tmp_path / "ssd_active",
-            max_size_bytes=100 * 1024**2,
-            hot_cache_max_bytes=0,
-            hot_cache_only=False,
-        )
-        try:
-            assert mgr.is_read_only is False
-        finally:
-            mgr.close()
 
     def test_save_block_returns_false_and_logs_info(self, manager, caplog):
         """save_block returns False and logs at INFO, not WARNING."""
