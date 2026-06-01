@@ -581,14 +581,18 @@
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
+                                            <p x-show="modelSettings.is_paroquant" class="text-xs text-amber-600 font-medium mt-1.5 flex items-center gap-1.5 bg-amber-50 p-2 rounded-lg border border-amber-200/50">
+                                                <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>
+                                                <span class="leading-normal">{{ t('modal.model_settings.paroquant_warning') }}</span>
+                                            </p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :disabled="modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : '')"
+                                                @click="if (!modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
+                                                :disabled="modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : ''"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    (modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
