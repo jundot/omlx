@@ -1242,3 +1242,98 @@ class TestSSDWriteDrops:
                 assert block_hash not in mgr._pending_write_hashes
         finally:
             mgr.close()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestReadOnlyCache:
+    """Verify is_read_only property and save_block behavior when
+    hot_cache_only=True but hot_cache_max_bytes=0 (no write capacity)."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "read_only",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+            hot_cache_only=True,
+        )
+        yield mgr
+        mgr.close()
+
+    def _make_cache_data(self, num_layers=2):
+        return [
+            (
+                mx.zeros((1, 8, 32, 64)),
+                mx.zeros((1, 8, 32, 64)),
+            )
+            for _ in range(num_layers)
+        ]
+
+    def test_is_read_only_true_when_no_capacity(self, manager):
+        """hot_cache_only=True with hot_cache_max_bytes=0 means no write tier."""
+        assert manager.is_read_only is True
+
+    def test_is_read_only_false_when_hot_cache_has_capacity(self, tmp_path):
+        """hot_cache_only=True with positive capacity means write-back is active."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "has_capacity",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+            hot_cache_only=True,
+        )
+        try:
+            assert mgr.is_read_only is False
+        finally:
+            mgr.close()
+
+    def test_is_read_only_false_when_ssd_active(self, tmp_path):
+        """hot_cache_only=False (normal SSD mode) is never read-only."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_active",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+            hot_cache_only=False,
+        )
+        try:
+            assert mgr.is_read_only is False
+        finally:
+            mgr.close()
+
+    def test_save_block_returns_false_and_logs_info(self, manager, caplog):
+        """save_block returns False and logs at INFO, not WARNING."""
+        import logging
+
+        block_hash = b"read_only_save_test"
+        cache_data = self._make_cache_data()
+
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            result = manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=32,
+                model_name="test-model",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+        assert result is False
+        assert not manager.has_block(block_hash)
+
+        # Must have an INFO log about the skip
+        info_lines = [
+            r.message
+            for r in caplog.records
+            if "skipping block" in r.message
+        ]
+        assert info_lines, "expected INFO log about skipping block"
+
+        # No WARNING about block persistence failure should be emitted
+        persist_warnings = [
+            r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "tiered cache" in r.message
+        ]
+        assert not persist_warnings, (
+            f"expected no WARNING about tiered cache persistence, "
+            f"got: {persist_warnings}"
+        )
