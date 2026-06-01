@@ -447,6 +447,54 @@ class TestEstimateModelSize:
         # Should use safetensors size only
         assert size == int(1000 * 1.05)
 
+    def test_prefers_index_total_size(self, tmp_path):
+        """When model.safetensors.index.json declares total_size, use it
+        instead of summing on-disk shard bytes."""
+        import json
+
+        (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"0" * 2000)
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": 999999}})
+        )
+
+        size = estimate_model_size(tmp_path)
+        # Declared total_size wins over the 3000-byte on-disk sum.
+        assert size == int(999999 * 1.05)
+
+    def test_index_total_size_correct_mid_download(self, tmp_path):
+        """Regression: a model still downloading has finished shards as
+        *.safetensors and the rest as *.incomplete (no .safetensors suffix).
+        Summing on-disk files would undercount; the index's total_size must
+        still yield the model's true full size."""
+        import json
+
+        # Only shard 2 finished; shard 1 is still an .incomplete temp file.
+        (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"0" * 2000)
+        (tmp_path / "model-00001-of-00002.safetensors.incomplete").write_bytes(b"0" * 500)
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": 62_000_000_000}})
+        )
+
+        size = estimate_model_size(tmp_path)
+        # Full declared size, NOT the 2000 bytes of the one finished shard.
+        assert size == int(62_000_000_000 * 1.05)
+
+    def test_falls_back_when_index_has_no_total_size(self, tmp_path):
+        """A malformed/old index without metadata.total_size falls back to
+        summing the actual safetensors files."""
+        import json
+
+        (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"0" * 2000)
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"x": "model-00001-of-00002.safetensors"}})
+        )
+
+        size = estimate_model_size(tmp_path)
+        # No usable total_size -> sum the 3000 on-disk bytes.
+        assert size == int(3000 * 1.05)
+
 
 class TestDiscoverModels:
     """Tests for discover_models function."""

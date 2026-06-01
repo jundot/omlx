@@ -643,6 +643,24 @@ def estimate_model_size(model_path: Path) -> int:
     """
     total_size = 0
 
+    # Preferred: the sharded-safetensors index records the model's TRUE total
+    # weight size in metadata.total_size. Reading it makes the estimate correct
+    # even while the model is still downloading (a half-fetched shard is a
+    # *.incomplete file with no .safetensors suffix, so the glob below would
+    # otherwise undercount to just the finished shards -- the cause of a model
+    # showing e.g. 12GB instead of its real 62GB mid-download).
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            import json
+
+            with open(index_path) as fh:
+                declared = json.load(fh).get("metadata", {}).get("total_size")
+            if isinstance(declared, int) and declared > 0:
+                return int(declared * 1.05)
+        except (OSError, ValueError, TypeError):
+            pass  # fall through to summing actual files
+
     # Primary: safetensors files
     safetensors_files = list(model_path.glob("*.safetensors"))
     for f in safetensors_files:
