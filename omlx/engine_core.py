@@ -61,6 +61,48 @@ def _init_mlx_thread() -> None:
     logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
 
 
+def _init_engine_mlx_thread(stream) -> None:
+    """Initializer for a PER-ENGINE executor thread (EngineCore._mlx_executor).
+
+    Unlike the global executor (which creates its own stream via
+    ``_init_mlx_thread``), a per-engine executor is handed the engine's existing
+    ``self._mlx_stream`` so the scheduler's explicit ``with mx.stream(self._stream)``
+    blocks and this thread's implicit default stream are the SAME object -- no
+    cross-stream "created on A, synced on B" hazard.
+
+    Two things are set on the worker thread:
+
+    1. The thread's DEFAULT stream, so a bare ``mx.async_eval()`` / ``.item()``
+       with no active ``with mx.stream(...)`` context (mlx_vlm's _mtp_rounds does
+       exactly this) targets the engine stream instead of crashing with
+       "There is no Stream(gpu, N) in current thread".
+    2. The module-global ``generation_stream`` on mlx_lm.generate, omlx.scheduler,
+       and mlx_vlm's two speculative/generate modules, so any code that reads the
+       module global at call time also uses the engine stream. mlx_vlm modules
+       are only present in VLM setups -> guard each lookup.
+    """
+    import sys
+    import mlx.core as mx
+
+    # Make bare (context-less) MLX ops on this thread use the engine stream.
+    try:
+        mx.set_default_stream(stream)
+    except Exception:  # noqa: BLE001 - older mlx may lack this; module patch below still helps
+        logger.warning("set_default_stream unavailable; relying on module-global patch only")
+
+    for modname in (
+        "mlx_lm.generate",
+        "omlx.scheduler",
+        "mlx_vlm.speculative.utils",
+        "mlx_vlm.generate",
+    ):
+        mod = sys.modules.get(modname)
+        if mod is not None and hasattr(mod, "generation_stream"):
+            mod.generation_stream = stream
+
+    logger.info(f"Per-engine MLX thread initialized: stream = {stream}")
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -140,6 +182,14 @@ class EngineCore:
         self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"mlx-engine-{self._engine_id[:8]}",
+            # Initialize the worker thread's MLX stream state. Without this the
+            # vlm_mtp speculative path crashes: mlx_vlm's _mtp_rounds calls a
+            # bare mx.async_eval(draft_tokens) (no `with mx.stream(...)`), which
+            # uses the thread's DEFAULT stream -- never set on this worker -> the
+            # "There is no Stream(gpu, 1) in current thread" RuntimeError. We
+            # align everything on this engine's own stream.
+            initializer=_init_engine_mlx_thread,
+            initargs=(self._mlx_stream,),
         )
 
         # Create scheduler with per-engine stream

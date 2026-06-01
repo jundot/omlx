@@ -1,5 +1,7 @@
 """Tests for per-engine thread isolation (issue #1248)."""
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -215,3 +217,102 @@ class TestConcurrentStreamIsolation:
 
         from omlx.scheduler import _default_generation_stream as current
         assert id(current) == original_id
+
+
+class TestPerEngineStreamInitializer:
+    """_init_engine_mlx_thread is the initializer for the per-engine executor.
+
+    Regression for "There is no Stream(gpu, 1) in current thread": the
+    per-engine executor previously had NO initializer, so the worker thread
+    running scheduler.step() -> _step_vlm_mtp() -> mlx_vlm _mtp_rounds had no
+    default MLX stream. mlx_vlm's _mtp_rounds issues a bare
+    mx.async_eval(draft_tokens) outside any `with mx.stream(...)` block, which
+    then crashed on that worker thread.
+    """
+
+    def test_aligns_all_modules_on_engine_stream(self):
+        import omlx.engine_core as ec
+
+        engine_stream = MagicMock(name="engine_stream")
+        fake_gen = types.ModuleType("mlx_lm.generate")
+        fake_gen.generation_stream = "ORIGINAL"
+        fake_sched = types.ModuleType("omlx.scheduler")
+        fake_sched.generation_stream = "ORIGINAL"
+        fake_vlm_spec = types.ModuleType("mlx_vlm.speculative.utils")
+        fake_vlm_spec.generation_stream = "ORIGINAL"
+        fake_vlm_gen = types.ModuleType("mlx_vlm.generate")
+        fake_vlm_gen.generation_stream = "ORIGINAL"
+
+        with patch.object(ec.mx, "set_default_stream") as mock_set:
+            with patch.dict(sys.modules, {
+                "mlx_lm.generate": fake_gen,
+                "omlx.scheduler": fake_sched,
+                "mlx_vlm.speculative.utils": fake_vlm_spec,
+                "mlx_vlm.generate": fake_vlm_gen,
+            }):
+                ec._init_engine_mlx_thread(engine_stream)
+
+        mock_set.assert_called_once_with(engine_stream)
+        assert fake_gen.generation_stream is engine_stream
+        assert fake_sched.generation_stream is engine_stream
+        assert fake_vlm_spec.generation_stream is engine_stream
+        assert fake_vlm_gen.generation_stream is engine_stream
+
+    def test_skips_absent_vlm_modules(self):
+        import omlx.engine_core as ec
+
+        engine_stream = MagicMock(name="engine_stream")
+        fake_gen = types.ModuleType("mlx_lm.generate")
+        fake_gen.generation_stream = "ORIGINAL"
+
+        with patch.object(ec.mx, "set_default_stream") as mock_set:
+            with patch.dict(sys.modules, {"mlx_lm.generate": fake_gen}):
+                sys.modules.pop("mlx_vlm.speculative.utils", None)
+                sys.modules.pop("mlx_vlm.generate", None)
+                ec._init_engine_mlx_thread(engine_stream)  # must not raise
+
+        mock_set.assert_called_once_with(engine_stream)
+        assert fake_gen.generation_stream is engine_stream
+
+    def test_tolerates_set_default_stream_failure(self):
+        import omlx.engine_core as ec
+
+        engine_stream = MagicMock(name="engine_stream")
+        fake_sched = types.ModuleType("omlx.scheduler")
+        fake_sched.generation_stream = "ORIGINAL"
+
+        with patch.object(ec.mx, "set_default_stream",
+                          side_effect=AttributeError("no set_default_stream")):
+            with patch.dict(sys.modules, {"omlx.scheduler": fake_sched}):
+                ec._init_engine_mlx_thread(engine_stream)  # must not raise
+
+        assert fake_sched.generation_stream is engine_stream
+
+    def test_per_engine_executor_wires_the_initializer(self):
+        """Load-bearing wiring: the per-engine ThreadPoolExecutor must be built
+        with initializer=_init_engine_mlx_thread and initargs=(self._mlx_stream,).
+        Without this the fix never runs on the worker thread."""
+        import omlx.engine_core as ec
+
+        captured = {}
+        real_tpe = ec.concurrent.futures.ThreadPoolExecutor
+
+        def _spy(*args, **kwargs):
+            if str(kwargs.get("thread_name_prefix", "")).startswith("mlx-engine-"):
+                captured.update(kwargs)
+            return real_tpe(*args, **kwargs)
+
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            with patch("omlx.engine_core.concurrent.futures.ThreadPoolExecutor",
+                       side_effect=_spy):
+                engine = EngineCore(mock_model, mock_tokenizer)
+
+        assert captured.get("initializer") is ec._init_engine_mlx_thread
+        assert captured.get("initargs") == (engine._mlx_stream,)
+        engine.close()
