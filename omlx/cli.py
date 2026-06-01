@@ -277,7 +277,10 @@ def serve_command(args):
         )
 
         print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
-        uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        try:
+            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        except KeyboardInterrupt:
+            pass
     finally:
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
