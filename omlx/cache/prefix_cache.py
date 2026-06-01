@@ -645,14 +645,10 @@ class BlockAwarePrefixCache(CacheManager):
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
-                        if not (
-                            self.paged_ssd_cache._hot_cache_only
-                            and not self.paged_ssd_cache._hot_cache_enabled
-                        ):
-                            logger.warning(
-                                f"Block {block.block_id} was not persisted "
-                                f"to tiered cache"
-                            )
+                        logger.info(
+                            f"Block {block.block_id} was not persisted "
+                            f"to tiered cache"
+                        )
                         # Persistence failed: roll back metadata so we don't
                         # retain a block that cannot be reconstructed later.
                         self.paged_cache.free_block(block.block_id)
