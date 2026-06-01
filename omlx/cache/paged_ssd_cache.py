@@ -1419,6 +1419,10 @@ class PagedSSDCacheManager(CacheManager):
 
             if self._hot_cache_only:
                 # Hot cache disabled but hot_cache_only set: block is not retained.
+                logger.info(
+                    f"Hot cache only with no capacity, "
+                    f"skipping block {block_hash.hex()[:16]}"
+                )
                 return False
 
             # SSD path: add to index for SSD file tracking

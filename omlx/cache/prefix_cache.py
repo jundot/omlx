@@ -645,7 +645,7 @@ class BlockAwarePrefixCache(CacheManager):
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
-                        logger.warning(
+                        logger.info(
                             f"Failed to save block {block.block_id} to tiered cache"
                         )
                         # Persistence failed: roll back metadata so we don't
