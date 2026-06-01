@@ -645,12 +645,7 @@ class BlockAwarePrefixCache(CacheManager):
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
-                        if self.paged_ssd_cache.is_read_only:
-                            logger.debug(
-                                f"Block {block.block_id} not saved: "
-                                f"cache is read-only"
-                            )
-                        else:
+                        if not self.paged_ssd_cache.is_read_only:
                             logger.warning(
                                 f"Block {block.block_id} was not persisted "
                                 f"to tiered cache"
