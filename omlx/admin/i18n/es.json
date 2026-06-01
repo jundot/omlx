@@ -456,6 +456,7 @@
   "modal.model_settings.turboquant_kv": "Caché KV TurboQuant",
   "modal.model_settings.turboquant_kv_hint": "Comprimir caché KV usando cuantización vectorial. Bits más bajos = más compresión, bits más altos = mejor calidad. Soporta de 2 a 8 bits.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits por canal",
+  "modal.model_settings.paroquant_warning": "Advertencia: la compatibilidad con los modelos ParoQuant no está completamente verificada; utilícelo con precaución.",
   "modal.model_settings.mtp": "Native MTP",
   "modal.model_settings.mtp_hint": "Usa el módulo MTP integrado del modelo para una decodificación de solicitud única ~1.5× más rápida. (Solo Qwen 3.5/3.6 y Deepseek-v4)<br><strong>Solo flujo único: las solicitudes se procesan una a la vez.</strong><br>* mlx-lm PR <a href=\"https://github.com/ml-explore/mlx-lm/pull/990\" target=\"_blank\" rel=\"noopener\" class=\"text-blue-500 hover:text-blue-700 underline\">#990</a> by AirRunner, PR <a href=\"https://github.com/Blaizzy/mlx-lm/pull/15\" target=\"_blank\" rel=\"noopener\" class=\"text-blue-500 hover:text-blue-700 underline\">#15</a> by 0xClandestine",
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",
