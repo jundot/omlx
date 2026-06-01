@@ -2605,5 +2605,3 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-
-
