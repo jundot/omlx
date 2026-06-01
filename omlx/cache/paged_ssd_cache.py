@@ -2605,3 +2605,15 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
+
+    @property
+    def is_read_only(self) -> bool:
+        """
+        True when the cache is configured with no write capacity
+        (hot-cache-only mode with no hot cache capacity).
+
+        In this state, ``save_block()`` intentionally skips persistence
+        and returns ``False``. Callers should treat the "failure" as
+        expected rather than a real error.
+        """
+        return self._hot_cache_only and not self._hot_cache_enabled
