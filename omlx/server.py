@@ -2679,19 +2679,21 @@ def _response_format_requests_strict(response_format) -> bool:
 
 
 def _response_format_requests_grammar(response_format) -> bool:
-    """True when an OpenAI ``response_format`` asks for grammar-constrained JSON.
+    """True when an OpenAI ``response_format`` maps to grammar-constrained JSON.
 
-    Only ``json_object`` and ``json_schema`` map to grammar-constrained
-    decoding, so only those can be silently *unenforced* when no grammar
-    compiler is available.  A plain ``{"type": "text"}`` (or absent) format
-    never requested enforcement and must not trigger the downgrade Warning
-    header or prompt-injection fallback (#1241 review).
+    Delegates to :func:`_build_format_element` so the unenforced-degrade signal
+    stays in sync with what actually gets compiled: a format earns the
+    Warning header / prompt-injection fallback only when a grammar element would
+    have been built for it.  That is non-``None`` exactly for ``json_object``
+    and a ``json_schema`` carrying a schema; a plain ``{"type": "text"}`` (or a
+    json_schema with no schema) maps to nothing and must not warn.  Sharing the
+    one source of truth keeps the header consistent with the server-side warn
+    log and avoids claiming "grammar-constrained decoding unavailable" for a
+    request that never described an enforceable grammar (#1241 review).
     """
     if response_format is None:
         return False
-    rf = response_format
-    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
-    return rf_type in ("json_object", "json_schema")
+    return _build_format_element(response_format=response_format) is not None
 
 
 def _compile_grammar_for_request(

@@ -619,6 +619,16 @@ class TestResponseFormatRequestsGrammar:
             "json_schema": {"name": "t", "schema": {}},
         }) is True
 
+    def test_json_schema_without_schema_maps_to_nothing(self):
+        # A json_schema that carries no schema compiles to no grammar, so it
+        # must not earn a Warning header claiming decoding was unavailable.
+        # Keeps the header in sync with what _build_format_element builds.
+        assert self._call({"type": "json_schema", "json_schema": {"name": "t"}}) is False
+        assert self._call({"type": "json_schema"}) is False
+
+    def test_unknown_type_does_not_request_grammar(self):
+        assert self._call({"type": "json"}) is False
+
     def test_pydantic_text_model(self):
         from omlx.api.openai_models import ResponseFormat
         assert self._call(ResponseFormat(type="text")) is False
