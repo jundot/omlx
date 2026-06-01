@@ -591,6 +591,47 @@ class TestResponseFormatRequestsStrict:
         assert self._call(rf) is True
 
 
+class TestResponseFormatRequestsGrammar:
+    """Tests for _response_format_requests_grammar — the gate that decides
+    whether an unenforced response_format earns a Warning header / fallback.
+    Only json_object and json_schema request grammar-constrained output; a
+    plain text format never asked for enforcement, so it must not warn
+    (#1241 review)."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_requests_grammar
+        return _response_format_requests_grammar(response_format)
+
+    def test_none(self):
+        assert self._call(None) is False
+
+    def test_text_does_not_request_grammar(self):
+        # The reviewer's case: type "text" must NOT emit a Warning header.
+        assert self._call({"type": "text"}) is False
+
+    def test_json_object(self):
+        assert self._call({"type": "json_object"}) is True
+
+    def test_json_schema(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {}},
+        }) is True
+
+    def test_pydantic_text_model(self):
+        from omlx.api.openai_models import ResponseFormat
+        assert self._call(ResponseFormat(type="text")) is False
+
+    def test_pydantic_json_schema_model(self):
+        from omlx.api.openai_models import ResponseFormat, ResponseFormatJsonSchema
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema=ResponseFormatJsonSchema(name="t", schema={}),
+        )
+        assert self._call(rf) is True
+
+
 class TestResponseFormatWarningHeader:
     """The unenforced-response_format degrade is surfaced to the caller as an
     RFC 7234 Warning response header, not just a server-side log (#1241)."""

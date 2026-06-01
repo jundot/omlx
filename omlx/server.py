@@ -2231,8 +2231,11 @@ async def create_chat_completion(
     )
     # Fall back to prompt injection when grammar is not compiled. The degrade
     # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
     response_format_warning = None
-    if compiled_grammar is None and response_format:
+    if compiled_grammar is None and _response_format_requests_grammar(response_format):
         response_format_warning = _response_format_warning_header(response_format)
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
@@ -2673,6 +2676,22 @@ def _response_format_requests_strict(response_format) -> bool:
         return False
     strict = js.get("strict") if isinstance(js, dict) else getattr(js, "strict", None)
     return bool(strict)
+
+
+def _response_format_requests_grammar(response_format) -> bool:
+    """True when an OpenAI ``response_format`` asks for grammar-constrained JSON.
+
+    Only ``json_object`` and ``json_schema`` map to grammar-constrained
+    decoding, so only those can be silently *unenforced* when no grammar
+    compiler is available.  A plain ``{"type": "text"}`` (or absent) format
+    never requested enforcement and must not trigger the downgrade Warning
+    header or prompt-injection fallback (#1241 review).
+    """
+    if response_format is None:
+        return False
+    rf = response_format
+    rf_type = rf.get("type") if isinstance(rf, dict) else getattr(rf, "type", None)
+    return rf_type in ("json_object", "json_schema")
 
 
 def _compile_grammar_for_request(
