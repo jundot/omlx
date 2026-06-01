@@ -581,14 +581,16 @@
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
                                             <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
+                                            <p x-show="modelSettings.is_paroquant"
+                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.paroquant_warning') }}</p>
                                         </div>
                                         <button type="button"
-                                                @click="if (!modelSettings.is_paroquant && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
-                                                :disabled="modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
-                                                :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : '')"
+                                                @click="if (!modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
+                                                :disabled="modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled"
+                                                :title="modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.mtp_conflict_turboquant') }}' : ''"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
-                                                    (modelSettings.is_paroquant || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
+                                                    (modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
                                                 ]"
                                                 class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="modelSettings.turboquant_kv_enabled ? 'translate-x-5' : 'translate-x-0'"
