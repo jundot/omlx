@@ -739,6 +739,13 @@ class TestRuntimeCacheObservability:
                 "indexed_blocks": 12,
                 "indexed_blocks_display": "12",
                 "has_sub_block_cache": False,
+                "max_blocks": 0,
+                "allocated_blocks": 0,
+                "free_blocks": 0,
+                "shared_blocks": 0,
+                "total_tokens_cached": 0,
+                "utilization": 0.0,
+                "cache_hit_rate": 0.0,
                 "partial_block_skips": 0,
                 "partial_tokens_skipped": 0,
                 "last_partial_tokens_skipped": 0,
@@ -756,6 +763,13 @@ class TestRuntimeCacheObservability:
                 "indexed_blocks": 4,
                 "indexed_blocks_display": "4",
                 "has_sub_block_cache": False,
+                "max_blocks": 0,
+                "allocated_blocks": 0,
+                "free_blocks": 0,
+                "shared_blocks": 0,
+                "total_tokens_cached": 0,
+                "utilization": 0.0,
+                "cache_hit_rate": 0.0,
                 "partial_block_skips": 0,
                 "partial_tokens_skipped": 0,
                 "last_partial_tokens_skipped": 0,
@@ -770,6 +784,72 @@ class TestRuntimeCacheObservability:
         ]
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
+
+    def test_runtime_cache_exposes_paged_kv_occupancy(self):
+        """Per-model rows should expose paged-KV occupancy from prefix cache."""
+        cache_dir = Path("/tmp/omlx-cache")
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+
+        scheduler = MagicMock()
+        scheduler.get_ssd_cache_stats.return_value = {
+            "block_size": 1024,
+            "indexed_blocks": 12,
+            "ssd_cache": {
+                "num_files": 3,
+                "total_size_bytes": 4096,
+                "hot_cache_max_bytes": 0,
+                "hot_cache_size_bytes": 0,
+                "hot_cache_entries": 0,
+            },
+            "prefix_cache": {
+                "max_blocks": 1024,
+                "allocated_blocks": 640,
+                "free_blocks": 384,
+                "shared_blocks": 8,
+                "total_tokens_cached": 131072,
+                "utilization": 0.625,
+                "cache_hit_rate": 0.75,
+            },
+        }
+
+        entry = SimpleNamespace(
+            engine=SimpleNamespace(
+                _engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
+            )
+        )
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [{"id": "qwen-a3b", "loaded": True}]
+        }
+        engine_pool._entries = {"qwen-a3b": entry}
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        model_payload = payload["models"][0]
+        assert {
+            key: model_payload[key]
+            for key in (
+                "max_blocks",
+                "allocated_blocks",
+                "free_blocks",
+                "shared_blocks",
+                "total_tokens_cached",
+                "utilization",
+                "cache_hit_rate",
+            )
+        } == {
+            "max_blocks": 1024,
+            "allocated_blocks": 640,
+            "free_blocks": 384,
+            "shared_blocks": 8,
+            "total_tokens_cached": 131072,
+            "utilization": 0.625,
+            "cache_hit_rate": 0.75,
+        }
 
     def test_runtime_cache_ignores_single_model_stats_failure(self):
         """One model failing stats collection should not break the whole payload."""
