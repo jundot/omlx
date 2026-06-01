@@ -167,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let runtime = try PythonRuntime.resolve()
             let server = ServerProcess(
                 runtime: runtime,
-                host: config.host,
+                bindAddress: config.bindAddress,
                 port: config.port,
                 basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
             )

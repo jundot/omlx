@@ -703,7 +703,8 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
-            self.effectiveHost = dto.server.host
+            // effectiveHost is used for endpoint URLs — normalise 0.0.0.0 → 127.0.0.1
+            self.effectiveHost = dto.server.host == "0.0.0.0" ? "127.0.0.1" : dto.server.host
             self.effectivePort = dto.server.port
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
@@ -947,7 +948,7 @@ final class ServerScreenVM: ObservableObject {
             await commit(GlobalSettingsPatch(host: next))
             do {
                 try await services.applyServerEndpoint(host: next)
-                self.effectiveHost = next
+                self.effectiveHost = next == "0.0.0.0" ? "127.0.0.1" : next
             } catch {
                 self.lastError = error.omlxDescription
             }
@@ -1030,7 +1031,7 @@ final class ServerScreenVM: ObservableObject {
                         port: portChanged ? parsedPort : nil
                     )
                     if let p = parsedPort, portChanged { self.effectivePort = p }
-                    if hostChanged { self.effectiveHost = host }
+                    if hostChanged { self.effectiveHost = host == "0.0.0.0" ? "127.0.0.1" : host }
                 } else {
                     try await services.restartServer()
                 }

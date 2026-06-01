@@ -359,24 +359,23 @@ final class AppServices: NSObject, ObservableObject {
     /// double-write here. When the server is offline (wizard dropouts,
     /// dev), we DO write so the next spawn reads the right values.
     func applyServerEndpoint(host: String? = nil, port: Int? = nil) async throws {
-        let resolvedHost = host ?? config.host
+        let resolvedBindAddress = host ?? config.bindAddress
         let resolvedPort = port ?? config.port
 
         var updated = config
-        updated.host = resolvedHost
+        updated.bindAddress = resolvedBindAddress
         updated.port = resolvedPort
         if server == nil {
             try updated.save()
         }
         self.config = updated
 
-        // The HTTP client also needs to know about the new endpoint so future
-        // admin calls land on the new bind address.
-        client.configure(host: resolvedHost, port: resolvedPort, apiKey: updated.apiKey)
+        // The HTTP client uses the connectable host (normalises 0.0.0.0 → 127.0.0.1).
+        client.configure(host: updated.host, port: resolvedPort, apiKey: updated.apiKey)
 
         if let server {
             await server.stop()
-            try server.reconfigure(host: resolvedHost, port: resolvedPort)
+            try server.reconfigure(bindAddress: resolvedBindAddress, port: resolvedPort)
             _ = try server.start()
         }
     }

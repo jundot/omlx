@@ -416,7 +416,7 @@ final class MenubarController: NSObject {
     // MARK: - Pollers
 
     /// Bind endpoint the stats poller should hit. Sourced from the live
-    /// `ServerProcess` (which `reconfigure(host:port:)` keeps current) so a
+    /// `ServerProcess` (which `reconfigure(bindAddress:port:)` keeps current) so a
     /// runtime port/host change re-points the poller, falling back to the
     /// config snapshot only when there is no server. Mirrors the
     /// `displayPort`/`displayHost` resolution used for the visible items.
