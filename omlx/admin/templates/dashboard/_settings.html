@@ -929,22 +929,33 @@
                                     <!-- Main Row -->
                                     <div class="flex items-center gap-4 px-6 py-4">
                                         <!-- Model Name -->
-                                        <div class="flex-1 min-w-0 flex items-center gap-3">
-                                            <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
-                                                <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                        <div class="flex-1 min-w-0 flex items-start gap-3">
+                                            <!-- Icon column: box icon + optional chevron below, always same width -->
+                                            <div class="flex flex-col items-center flex-shrink-0 gap-0.5">
+                                                <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center">
+                                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                                </div>
+                                                <button @click.stop="toggleModelExpand(model.id)" x-show="model.hasProfiles" x-cloak
+                                                        class="w-8 h-3.5 flex items-center justify-center rounded hover:bg-neutral-200 transition-all">
+                                                    <i data-lucide="chevron-down" class="w-3 h-3 text-neutral-400" x-show="expandedModels[model.id]" x-cloak></i>
+                                                    <i data-lucide="chevron-right" class="w-3 h-3 text-neutral-400" x-show="!expandedModels[model.id]"></i>
+                                                </button>
                                             </div>
-                                            <p class="text-sm font-medium text-neutral-900 break-all sm:truncate" x-text="model.id"></p>
-                                            <span x-show="model.settings?.model_alias" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
-                                                  x-text="model.settings?.model_alias"></span>
-                                            <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="p-1 rounded-md transition-all flex-shrink-0"
-                                                    :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
+                                            <!-- Text row aligned with the box icon -->
+                                            <div class="flex items-center gap-2 min-w-0 h-8">
+                                                <p class="text-sm font-medium text-neutral-900 break-all sm:truncate" x-text="model.id"></p>
+                                                <span x-show="model.settings?.model_alias" x-cloak
+                                                      class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px] flex-shrink-0"
+                                                      x-text="model.settings?.model_alias"></span>
+                                                <button x-data="{ copied: false }"
+                                                        @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
+                                                        class="p-1 rounded-md transition-all flex-shrink-0"
+                                                        :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                        :title="window.t('settings.models.table.copy_model_name_tooltip')">
+                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                    <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                </button>
+                                            </div>
                                         </div>
 
                                         <!-- Type -->
@@ -1040,8 +1051,53 @@
                                         </div>
                                     </div>
 
+                                    <!-- Profile sub-rows (expanded view) -->
+                                    <div x-show="expandedModels[model.id]" x-collapse x-cloak>
+                                        <!-- Loading state -->
+                                        <div x-show="model.profilesLoading"
+                                             class="flex items-center justify-center px-6 py-3 bg-neutral-50/30 border-t border-neutral-100">
+                                            <svg class="animate-spin w-4 h-4 text-neutral-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                                            </svg>
+                                        </div>
+
+                                        <!-- Profile rows -->
+                                        <template x-if="model.expandedProfiles?.length > 0">
+                                            <div>
+                                                <template x-for="profile in model.expandedProfiles" :key="profile.name">
+                                                    <div class="flex items-center gap-4 px-6 py-2.5 bg-neutral-50/50 border-t border-neutral-100 pl-16">
+                                                        <div class="flex-1 min-w-0 flex items-center gap-2">
+                                                            <i data-lucide="user" class="w-3.5 h-3.5 text-emerald-500 flex-shrink-0"></i>
+                                                            <span class="text-sm font-medium text-emerald-700 truncate"
+                                                                  x-text="profile.display_name || profile.name"></span>
+                                                            <span x-show="model.settings?.active_profile_name === profile.name"
+                                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-emerald-100 text-emerald-700 flex-shrink-0">
+                                                                Active
+                                                            </span>
+                                                        </div>
+                                                        <div class="flex items-center gap-2 text-xs text-neutral-400">
+                                                            <span x-show="profile.scope" x-text="profile.scope"></span>
+                                                            <span x-show="profile.description" class="truncate max-w-xs" x-text="profile.description"></span>
+                                                        </div>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
+
+                                        <!-- No profiles message -->
+                                        <div x-show="model.expandedProfiles?.length === 0 && !model.profilesLoading"
+                                             class="flex items-center justify-between px-6 py-3 bg-neutral-50/30 border-t border-neutral-100 pl-16">
+                                            <span class="text-xs text-neutral-400">No profiles configured</span>
+                                            <button @click.stop="openModelSettings(model)"
+                                                    class="text-xs text-emerald-600 hover:text-emerald-700">
+                                                Create one →
+                                            </button>
+                                        </div>
+                                    </div>
+
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
+                                    <div x-show="!expandedModels[model.id] && (!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <!-- 1. Profile pill (emerald) if active_profile_name -->

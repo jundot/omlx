@@ -64,6 +64,7 @@
             reloading: false,
             sortBy: 'id',
             sortOrder: 'asc',
+            expandedModels: {},
 
             // Auth UI state
             showApiKey: false,
@@ -895,6 +896,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
+                        this.prefetchAllModelProfiles();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -903,6 +905,23 @@
                 } finally {
                     this.loadingModels = false;
                 }
+            },
+
+            async prefetchAllModelProfiles() {
+                const llmModels = this.models.filter(m => !m.model_type || m.model_type === 'llm' || m.model_type === 'vlm');
+                await Promise.all(llmModels.map(async (model) => {
+                    try {
+                        const r = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/profiles`);
+                        if (r.ok) {
+                            const data = await r.json();
+                            const profiles = data.profiles || [];
+                            model.expandedProfiles = profiles;
+                            model.hasProfiles = profiles.length > 0;
+                        }
+                    } catch (e) {
+                        // ignore — chevron stays hidden if fetch fails
+                    }
+                }));
             },
 
             async reloadModels() {
@@ -1120,6 +1139,10 @@
                 } catch (e) {
                     console.error('Failed to load profiles:', e);
                 }
+            },
+            toggleModelExpand(modelId) {
+                const shouldExpand = !this.expandedModels[modelId];
+                this.expandedModels[modelId] = shouldExpand;
             },
             async loadTemplates() {
                 try {
@@ -1390,7 +1413,7 @@
                         settings: template.settings,
                         source_template: template.name,
                     };
-                    
+
                     try {
                         const r = await fetch(
                             `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
