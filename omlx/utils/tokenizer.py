@@ -39,10 +39,23 @@ def unwrap_tokenizer(tokenizer):
 
 
 def resolve_vocab_size(model: Any) -> int | None:
-    """Extract vocab_size from a model's config/args, handling nested configs.
+    """Extract vocab_size from a model, preferring the authoritative source.
 
-    Tries ``model.config.vocab_size``, then ``model.args.vocab_size``,
-    then ``text_config.vocab_size`` for VLM composite models (e.g. Qwen3.5).
+    Resolution order:
+    1. The ``lm_head`` weight's first dimension (authoritative — this is the
+       exact vocabulary the model emits logits over).
+    2. ``text_config.vocab_size`` when present (the inner language model's
+       vocab on VLM composite configs).
+    3. ``model.config.vocab_size`` / ``model.args.vocab_size`` (top-level).
+
+    Why lm_head and text_config come first for VLMs: several mlx-vlm
+    ``ModelConfig`` dataclasses (e.g. glm4v, glm4v_moe, gemma3) hard-code a
+    top-level ``vocab_size`` default that does not match the inner LM vocab
+    when ``config.json`` omits the top-level key.  For example, GLM-4.6V has
+    ``text_config.vocab_size=151552`` but ``ModelConfig.vocab_size=257152``
+    as a dataclass default.  Code that sizes logits-aligned buffers (e.g.
+    grammar bitmasks) from the top-level value produces a shape mismatch
+    against the real (151552) logits.
 
     Args:
         model: An MLX model object (LLM, VLM, or any object with config/args).
@@ -52,18 +65,45 @@ def resolve_vocab_size(model: Any) -> int | None:
     """
     if model is None:
         return None
+
+    # 1. lm_head weight — authoritative for any model that exposes one.
+    #    VLM adapters wrap the language model under ``_language_model``;
+    #    raw mlx-lm/mlx-vlm models expose ``lm_head`` directly or under
+    #    ``language_model``.
+    for path in (
+        ("_language_model", "lm_head"),
+        ("language_model", "lm_head"),
+        ("lm_head",),
+    ):
+        obj: Any = model
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        weight = getattr(obj, "weight", None) if obj is not None else None
+        shape = getattr(weight, "shape", None)
+        try:
+            first_dim = shape[0] if shape is not None else None
+        except (TypeError, IndexError):
+            first_dim = None
+        if isinstance(first_dim, int):
+            return int(first_dim)
+
+    # 2 & 3. Config-based fallbacks.
     for attr in ('config', 'args'):
         config = getattr(model, attr, None)
         if config is None:
             continue
-        vs = getattr(config, 'vocab_size', None)
-        if isinstance(vs, int):
-            return vs
         text_cfg = getattr(config, 'text_config', None)
         if isinstance(text_cfg, dict):
             vs = text_cfg.get('vocab_size')
         elif text_cfg is not None:
             vs = getattr(text_cfg, 'vocab_size', None)
+        else:
+            vs = None
+        if isinstance(vs, int):
+            return vs
+        vs = getattr(config, 'vocab_size', None)
         if isinstance(vs, int):
             return vs
     return None
