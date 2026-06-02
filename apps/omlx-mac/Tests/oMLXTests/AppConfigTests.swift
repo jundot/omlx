@@ -46,7 +46,7 @@ final class AppConfigTests: XCTestCase {
 
     func testSaveProducesExpectedTopLevelKeys() throws {
         let cfg = AppConfig(
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: 9000,
             apiKey: "secret",
             basePath: tempBase,
@@ -61,9 +61,12 @@ final class AppConfigTests: XCTestCase {
         let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
 
         XCTAssertEqual((json["server"] as! [String: Any])["host"] as! String, "127.0.0.1")
+        XCTAssertNil((json["server"] as! [String: Any])["bind_address"])
         XCTAssertEqual((json["server"] as! [String: Any])["port"] as! Int, 9000)
         XCTAssertEqual((json["auth"] as! [String: Any])["api_key"] as! String, "secret")
-        XCTAssertEqual((json["model"] as! [String: Any])["model_dir"] as! String, "\(tempBase!)/models")
+        let model = json["model"] as! [String: Any]
+        XCTAssertEqual(model["model_dirs"] as! [String], ["\(tempBase!)/models"])
+        XCTAssertEqual(model["model_dir"] as! String, "\(tempBase!)/models")
         XCTAssertEqual((json["huggingface"] as! [String: Any])["endpoint"] as! String,
                        "https://hf-mirror.example")
         XCTAssertEqual(json["version"] as! String, "1.0")
@@ -79,9 +82,9 @@ final class AppConfigTests: XCTestCase {
             "claude_code": ["enabled": true, "model": "claude-opus-4-5"],
             "integrations": ["github": ["token": "abc"]],
             "ui": ["theme": "dark"],
-            "server": ["host": "0.0.0.0", "port": 1234],
+            "server": ["host": "0.0.0.0", "bind_address": "0.0.0.0", "port": 1234],
             "model": [
-                "model_dirs": ["/some/where/else"],   // not owned by AppConfig
+                "model_dirs": ["/some/where/else"],
                 "model_dir": "/will-be-overwritten",
                 "max_model_memory": "auto"             // also unknown
             ],
@@ -91,7 +94,7 @@ final class AppConfigTests: XCTestCase {
             .write(to: url)
 
         let cfg = AppConfig(
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: 8080,
             apiKey: nil,
             basePath: tempBase,
@@ -109,9 +112,13 @@ final class AppConfigTests: XCTestCase {
 
         // Unknown sub-keys under owned sections survive too — only the fields
         // AppConfig owns get rewritten.
+        let server = after["server"] as! [String: Any]
+        XCTAssertEqual(server["host"] as! String, "127.0.0.1")
+        XCTAssertNil(server["bind_address"])
+
         let model = after["model"] as! [String: Any]
-        XCTAssertEqual(model["model_dirs"] as! [String], ["/some/where/else"],
-                       "model_dirs is Python-owned and must be preserved")
+        XCTAssertEqual(model["model_dirs"] as! [String], ["/new/models"],
+                       "model_dirs is AppConfig-owned and must stay in sync with model_dir")
         XCTAssertEqual(model["max_model_memory"] as! String, "auto")
         XCTAssertEqual(model["model_dir"] as! String, "/new/models",
                        "model_dir is AppConfig-owned and gets the new value")
@@ -121,6 +128,60 @@ final class AppConfigTests: XCTestCase {
                        "cache.ssd_cache_dir is not in AppConfig's slice")
     }
 
+    func testWildcardBindAddressUsesHostKeyButConnectsViaLoopback() throws {
+        let cfg = AppConfig(
+            bindAddress: "0.0.0.0",
+            port: 9000,
+            apiKey: nil,
+            basePath: tempBase,
+            modelDir: "\(tempBase!)/models",
+            hfEndpoint: ""
+        )
+
+        XCTAssertEqual(cfg.host, "127.0.0.1")
+
+        try cfg.save()
+
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        let server = json["server"] as! [String: Any]
+        XCTAssertEqual(server["host"] as! String, "0.0.0.0")
+        XCTAssertNil(server["bind_address"])
+    }
+
+    func testLoadAcceptsBindAddressFallback() throws {
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let original: [String: Any] = [
+            "server": ["bind_address": "0.0.0.0", "port": 9000],
+            "model": ["model_dir": "\(tempBase!)/models"]
+        ]
+        try JSONSerialization.data(withJSONObject: original, options: [.prettyPrinted])
+            .write(to: url)
+
+        let slice = try AppConfig.readSettingsForTests(basePath: tempBase)
+
+        XCTAssertEqual(slice.bindAddress, "0.0.0.0")
+        XCTAssertEqual(slice.port, 9000)
+    }
+
+    func testLoadReadsModelDirsAndPrimaryModelDir() throws {
+        let url = AppConfig.settingsURL(basePath: tempBase)
+        let original: [String: Any] = [
+            "server": ["host": "127.0.0.1", "port": 9000],
+            "model": [
+                "model_dirs": ["/models/a", "/models/b"],
+                "model_dir": "/models/a"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: original, options: [.prettyPrinted])
+            .write(to: url)
+
+        let slice = try AppConfig.readSettingsForTests(basePath: tempBase)
+
+        XCTAssertEqual(slice.modelDirs ?? [], ["/models/a", "/models/b"])
+        XCTAssertEqual(slice.modelDir, "/models/a")
+    }
+
     // MARK: modelDir invariant
 
     func testDefaultConfigHasNonEmptyModelDir() {
@@ -128,6 +189,7 @@ final class AppConfigTests: XCTestCase {
         // must hand back a usable modelDir. Otherwise the UI shows a blank
         // field and the server falls through to its own default — diverging.
         XCTAssertFalse(AppConfig.default.modelDir.isEmpty)
+        XCTAssertFalse(AppConfig.default.effectiveModelDirs.isEmpty)
         XCTAssertTrue(AppConfig.default.modelDir.hasSuffix("/models"))
     }
 

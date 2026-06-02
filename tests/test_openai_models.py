@@ -155,6 +155,19 @@ class TestFunctionCallAndToolCall:
         assert fc.name == "no_args"
         assert fc.arguments == "{}"
 
+    def test_function_call_strips_name_whitespace(self):
+        """Model-emitted function names must not include incidental whitespace."""
+        fc = FunctionCall(name="Bash\n\n", arguments={})
+
+        assert fc.name == "Bash"
+        assert fc.arguments == "{}"
+
+    def test_function_call_rejects_non_string_name(self):
+        """Name normalization must not widen FunctionCall.name beyond str."""
+        for name in (None, 123, {"name": "Bash"}, ["Bash"]):
+            with pytest.raises(ValidationError):
+                FunctionCall(name=name, arguments={})
+
     def test_tool_call(self):
         """Test creating tool call."""
         tc = ToolCall(

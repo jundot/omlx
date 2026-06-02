@@ -13,16 +13,21 @@ import XCTest
 @MainActor
 final class ServerScreenVMStorageDiffTests: XCTestCase {
 
-    private func makeServices(basePath: String, modelDir: String) -> AppServices {
+    private func makeServices(basePath: String, modelDirs: [String]) -> AppServices {
         let cfg = AppConfig(
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: 8080,
             apiKey: nil,
             basePath: basePath,
-            modelDir: modelDir,
+            modelDir: modelDirs[0],
+            modelDirs: modelDirs,
             hfEndpoint: ""
         )
         return AppServices(config: cfg, server: nil)
+    }
+
+    private func makeServices(basePath: String, modelDir: String) -> AppServices {
+        makeServices(basePath: basePath, modelDirs: [modelDir])
     }
 
     func testNoChanges() {
@@ -30,11 +35,11 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "/Users/Fido/.omlx"
-        vm.modelDirText = "/Users/Fido/.omlx/models"
+        vm.modelDirTexts = ["/Users/Fido/.omlx/models"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertFalse(diff.modelDirsChanged)
         XCTAssertFalse(diff.hasChanges)
     }
 
@@ -43,11 +48,11 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "/Users/Fido/.omlx-other"
-        vm.modelDirText = "/Users/Fido/.omlx/models"
+        vm.modelDirTexts = ["/Users/Fido/.omlx/models"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertTrue(diff.baseChanged)
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertFalse(diff.modelDirsChanged)
         XCTAssertEqual(diff.normalizedBase, "/Users/Fido/.omlx-other")
     }
 
@@ -56,12 +61,13 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "/Users/Fido/.omlx"
-        vm.modelDirText = "/Volumes/SSD/models"
+        vm.modelDirTexts = ["/Volumes/SSD/models"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
-        XCTAssertTrue(diff.dirChanged)
+        XCTAssertTrue(diff.modelDirsChanged)
         XCTAssertEqual(diff.normalizedModelDir, "/Volumes/SSD/models")
+        XCTAssertEqual(diff.normalizedModelDirs, ["/Volumes/SSD/models"])
     }
 
     func testBothChanged() {
@@ -69,7 +75,7 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "/Users/Fido/.omlx-other"
-        vm.modelDirText = "/Volumes/SSD/models"
+        vm.modelDirTexts = ["/Volumes/SSD/models"]
 
         XCTAssertTrue(vm.storageDiff(services: services).hasChanges)
     }
@@ -81,11 +87,11 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "/Users/Fido/.omlx/"
-        vm.modelDirText = "/Users/Fido/.omlx/models/"
+        vm.modelDirTexts = ["/Users/Fido/.omlx/models/"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertFalse(diff.modelDirsChanged)
     }
 
     func testWhitespaceNormalizesToNoDiff() {
@@ -93,11 +99,11 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "  /Users/Fido/.omlx  "
-        vm.modelDirText = "\n/Users/Fido/.omlx/models\t"
+        vm.modelDirTexts = ["\n/Users/Fido/.omlx/models\t"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertFalse(diff.modelDirsChanged)
     }
 
     func testTildeExpansion() {
@@ -106,26 +112,81 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
                                     modelDir: "\(home)/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = "~/.omlx"
-        vm.modelDirText = "~/.omlx/models"
+        vm.modelDirTexts = ["~/.omlx/models"]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged,
                        "tilde must expand before comparing to the home-absolute config value")
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertFalse(diff.modelDirsChanged)
     }
 
-    func testEmptyTextDoesNotTriggerChange() {
-        // If the user clears the field, we currently treat that as "no
-        // change" rather than "set to empty". applyStorage() separately
-        // refuses to submit empty values. Belt-and-suspenders.
+    func testEmptyModelDirsTriggersInvalidChange() {
+        // Clearing every row is a real edit, but applyServerSettings rejects
+        // it before sending a patch because the server requires at least one
+        // model root.
         let services = makeServices(basePath: "/Users/Fido/.omlx",
                                     modelDir: "/Users/Fido/.omlx/models")
         let vm = ServerScreenVM()
         vm.basePathText = ""
-        vm.modelDirText = ""
+        vm.modelDirTexts = [""]
 
         let diff = vm.storageDiff(services: services)
         XCTAssertFalse(diff.baseChanged)
-        XCTAssertFalse(diff.dirChanged)
+        XCTAssertTrue(diff.modelDirsChanged)
+        XCTAssertEqual(diff.normalizedModelDirs, [])
+    }
+
+    func testMultipleModelDirsNormalizeToNoDiff() {
+        let services = makeServices(
+            basePath: "/Users/Fido/.omlx",
+            modelDirs: ["/Users/Fido/.omlx/models", "/Volumes/SSD/models"]
+        )
+        let vm = ServerScreenVM()
+        vm.basePathText = "/Users/Fido/.omlx"
+        vm.modelDirTexts = [
+            " /Users/Fido/.omlx/models/ ",
+            "/Volumes/SSD/models",
+            "/Volumes/SSD/models/"
+        ]
+
+        let diff = vm.storageDiff(services: services)
+        XCTAssertFalse(diff.modelDirsChanged)
+        XCTAssertEqual(diff.normalizedModelDirs, [
+            "/Users/Fido/.omlx/models",
+            "/Volumes/SSD/models"
+        ])
+    }
+
+    func testModelDirReorderTriggersChange() {
+        let services = makeServices(
+            basePath: "/Users/Fido/.omlx",
+            modelDirs: ["/Users/Fido/.omlx/models", "/Volumes/SSD/models"]
+        )
+        let vm = ServerScreenVM()
+        vm.basePathText = "/Users/Fido/.omlx"
+        vm.modelDirTexts = ["/Volumes/SSD/models", "/Users/Fido/.omlx/models"]
+
+        let diff = vm.storageDiff(services: services)
+        XCTAssertTrue(diff.modelDirsChanged)
+        XCTAssertEqual(diff.normalizedModelDir, "/Volumes/SSD/models")
+    }
+
+    func testApplyConfigKeepsWildcardBindButUsesLoopbackEndpoint() {
+        let cfg = AppConfig(
+            bindAddress: "0.0.0.0",
+            port: 8080,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            modelDirs: ["/Users/Fido/.omlx/models"],
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertEqual(vm.host, "0.0.0.0")
+        XCTAssertEqual(vm.appliedBindAddress, "0.0.0.0")
+        XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
     }
 }

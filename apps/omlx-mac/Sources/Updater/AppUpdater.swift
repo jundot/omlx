@@ -169,48 +169,116 @@ final class AppUpdater {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 3600
-        let session = URLSession(configuration: config)
-        self.session = session
-        defer { session.invalidateAndCancel(); self.session = nil }
-
-        let (bytes, response) = try await session.bytes(from: dmgURL)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw UpdateError.downloadFailed("HTTP \(code)")
-        }
-
-        let total = response.expectedContentLength
-        var received: Int64 = 0
-        var lastReportedPct = -1
-
-        FileManager.default.createFile(atPath: dest.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: dest) else {
-            throw UpdateError.downloadFailed("Could not open \(dest.lastPathComponent) for writing")
-        }
-        defer { try? handle.close() }
-
-        var chunk = Data()
-        chunk.reserveCapacity(256 * 1024)
-        for try await byte in bytes {
-            if cancelled { throw UpdateError.cancelled }
-            chunk.append(byte)
-            received += 1
-            if chunk.count >= 256 * 1024 {
-                try handle.write(contentsOf: chunk)
-                chunk.removeAll(keepingCapacity: true)
-                if total > 0 {
-                    let pct = Int(received * 100 / total)
-                    if pct != lastReportedPct {
-                        lastReportedPct = pct
-                        await MainActor.run {
-                            self.onProgress(.downloading(percent: pct, receivedBytes: received, totalBytes: total))
-                        }
-                    }
-                }
+        let delegate = DMGDownloadDelegate(destination: dest) { [weak self] pct, received, total in
+            Task { @MainActor [weak self] in
+                guard let self, !self.cancelled else { return }
+                self.onProgress(.downloading(percent: pct, receivedBytes: received, totalBytes: total))
             }
         }
-        if !chunk.isEmpty {
-            try handle.write(contentsOf: chunk)
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        self.session = session
+        defer {
+            session.invalidateAndCancel()
+            self.session = nil
+            self.downloadTask = nil
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            delegate.continuation = continuation
+            let task = session.downloadTask(with: dmgURL)
+            self.downloadTask = task
+            task.resume()
+        }
+        if cancelled {
+            throw UpdateError.cancelled
+        }
+    }
+
+    private final class DMGDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+        let destination: URL
+        let onProgress: @Sendable (Int, Int64, Int64) -> Void
+        var continuation: CheckedContinuation<Void, Error>?
+
+        private let lock = NSLock()
+        private var completed = false
+        private var lastReportedPct = -1
+
+        init(
+            destination: URL,
+            onProgress: @escaping @Sendable (Int, Int64, Int64) -> Void
+        ) {
+            self.destination = destination
+            self.onProgress = onProgress
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard totalBytesExpectedToWrite > 0 else { return }
+            let pct = Int(totalBytesWritten * 100 / totalBytesExpectedToWrite)
+            lock.lock()
+            let shouldReport = pct != lastReportedPct
+            if shouldReport { lastReportedPct = pct }
+            lock.unlock()
+            if shouldReport {
+                onProgress(pct, totalBytesWritten, totalBytesExpectedToWrite)
+            }
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {
+            guard let http = downloadTask.response as? HTTPURLResponse,
+                  http.statusCode == 200
+            else {
+                let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? -1
+                finish(.failure(UpdateError.downloadFailed("HTTP \(code)")))
+                return
+            }
+            do {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try FileManager.default.moveItem(at: location, to: destination)
+                finish(.success(()))
+            } catch {
+                finish(.failure(UpdateError.downloadFailed(error.localizedDescription)))
+            }
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            didCompleteWithError error: Error?
+        ) {
+            if let error {
+                finish(.failure(error))
+            }
+        }
+
+        private func finish(_ result: Result<Void, Error>) {
+            lock.lock()
+            guard !completed else {
+                lock.unlock()
+                return
+            }
+            completed = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+
+            switch result {
+            case .success:
+                continuation?.resume()
+            case .failure(let error):
+                continuation?.resume(throwing: error)
+            }
         }
     }
 

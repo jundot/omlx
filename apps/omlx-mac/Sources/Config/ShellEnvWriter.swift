@@ -18,6 +18,22 @@ import Foundation
 
 enum ShellEnvWriter {
     static let variableName = "OMLX_BASE_PATH"
+    nonisolated(unsafe) static var homeOverrideForTests: URL?
+    nonisolated(unsafe) static var shellOverrideForTests: String?
+
+    private enum WriterError: LocalizedError {
+        case cliWrapperNotExecutable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .cliWrapperNotExecutable(let path):
+                return "App-bundle CLI wrapper is not executable: \(path)"
+            }
+        }
+    }
+
+    private static let cliShimBeginMarker = "# oMLX: CLI shim path begin"
+    private static let cliShimEndMarker = "# oMLX: CLI shim path end"
 
     /// Set or clear the variable across the user's shell rc files.
     /// - When `value` is non-nil, removes any existing line and appends
@@ -38,10 +54,43 @@ enum ShellEnvWriter {
         try? appendExport(to: target, name: variableName, value: value)
     }
 
+    /// Install/update `~/.omlx/bin/omlx` so app-only installs still expose
+    /// the same terminal command as pip/Homebrew installs.
+    static func ensureCLIShim(appBundleURL: URL = Bundle.main.bundleURL) throws {
+        let shimDir = home()
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shimDir,
+            withIntermediateDirectories: true
+        )
+
+        let bundleCLI = appBundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("omlx-cli")
+        guard FileManager.default.isExecutableFile(atPath: bundleCLI.path) else {
+            throw WriterError.cliWrapperNotExecutable(bundleCLI.path)
+        }
+        let shimURL = shimDir.appendingPathComponent("omlx")
+        let script = """
+        #!/bin/sh
+        exec \(shellQuote(bundleCLI.path)) "$@"
+        """
+        try script.write(to: shimURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: shimURL.path
+        )
+
+        ensureCurrentProcessPathContains(shimDir.path)
+        try ensureCLIPathExport()
+    }
+
     // MARK: - File targets
 
     private static func home() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        homeOverrideForTests ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
     private static func candidateFiles() -> [URL] {
@@ -55,7 +104,7 @@ enum ShellEnvWriter {
     /// Prefer the rc file matching the user's `$SHELL`. zsh users get
     /// `.zshrc`, bash users get `.bashrc`, anyone else falls back below.
     private static func primaryFile() -> URL? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? ""
+        let shell = shellOverrideForTests ?? ProcessInfo.processInfo.environment["SHELL"] ?? ""
         if shell.contains("zsh") {
             return home().appendingPathComponent(".zshrc")
         }
@@ -113,5 +162,58 @@ enum ShellEnvWriter {
         existing.append("export \(name)=\"\(escaped)\"\n")
 
         try existing.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func ensureCLIPathExport() throws {
+        let files = candidateFiles()
+        for url in files where FileManager.default.fileExists(atPath: url.path) {
+            let raw = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            if raw.contains(cliShimBeginMarker) {
+                return
+            }
+        }
+
+        let target = primaryFile() ?? files.first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }) ?? files.first!
+        let block = """
+        \(cliShimBeginMarker)
+        case ":$PATH:" in
+          *":$HOME/.omlx/bin:"*) ;;
+          *) export PATH="$HOME/.omlx/bin:$PATH" ;;
+        esac
+        \(cliShimEndMarker)
+        """
+        try appendRawBlock(to: target, block: block)
+    }
+
+    private static func appendRawBlock(to url: URL, block: String) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        var existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        if !existing.hasSuffix("\n"), !existing.isEmpty {
+            existing.append("\n")
+        }
+        existing.append(block)
+        if !existing.hasSuffix("\n") {
+            existing.append("\n")
+        }
+        try existing.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func ensureCurrentProcessPathContains(_ dir: String) {
+        let current = getenv("PATH").map { String(cString: $0) } ?? ""
+        let parts = current.split(separator: ":").map(String.init)
+        guard !parts.contains(dir) else { return }
+        let next = current.isEmpty ? dir : "\(dir):\(current)"
+        setenv("PATH", next, 1)
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        if value.isEmpty { return "''" }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }

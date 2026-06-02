@@ -117,7 +117,7 @@ class ServerSettings:
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=data.get("host", data.get("bind_address", "127.0.0.1")),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),

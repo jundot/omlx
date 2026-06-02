@@ -298,6 +298,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     from .integrations import IntegrationContext, get_integration, list_integrations
     from .settings import GlobalSettings
 
+    def _optional_str(value) -> str | None:
+        return value if isinstance(value, str) and value else None
+
     tool_name = args.tool
 
     if tool_name == "list":
@@ -336,6 +339,22 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
 
+    claude_settings = getattr(settings, "claude_code", None)
+    cli_opus_model = _optional_str(getattr(args, "opus_model", None))
+    cli_sonnet_model = _optional_str(getattr(args, "sonnet_model", None))
+    cli_haiku_model = _optional_str(getattr(args, "haiku_model", None))
+    settings_opus_model = _optional_str(getattr(claude_settings, "opus_model", None))
+    settings_sonnet_model = _optional_str(
+        getattr(claude_settings, "sonnet_model", None)
+    )
+    settings_haiku_model = _optional_str(getattr(claude_settings, "haiku_model", None))
+    opus_model = cli_opus_model or settings_opus_model
+    sonnet_model = cli_sonnet_model or settings_sonnet_model
+    haiku_model = cli_haiku_model or settings_haiku_model
+    claude_has_tier_models = (
+        tool_name == "claude" and any((opus_model, sonnet_model, haiku_model))
+    )
+
     # Build headers for authenticated requests
     headers = {}
     if api_key:
@@ -354,8 +373,12 @@ def launch_command(args, extra_args: list[str] | None = None):
     except Exception:
         pass
 
-    # Determine model
+    # Determine model. Claude Code can use separate Opus/Sonnet/Haiku defaults
+    # from settings, so bare `omlx launch claude` should not force a second
+    # interactive model choice when those tiers are configured.
     model = args.model
+    if not model and claude_has_tier_models:
+        model = sonnet_model or opus_model or haiku_model or ""
     if not model:
         # Fetch available models from server
         try:
@@ -399,6 +422,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         port=port,
         api_key=api_key,
         model=model,
+        opus_model=opus_model if tool_name == "claude" else None,
+        sonnet_model=sonnet_model if tool_name == "claude" else None,
+        haiku_model=haiku_model if tool_name == "claude" else None,
         context_window=model_info.get("max_context_window"),
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
@@ -725,6 +751,27 @@ Example directory structure:
         default="coding",
         choices=["minimal", "coding", "messaging", "full"],
         help="OpenClaw tools profile (default: coding)",
+    )
+    launch_parser.add_argument(
+        "--opus",
+        dest="opus_model",
+        type=str,
+        default=None,
+        help="Claude Code Opus tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--sonnet",
+        dest="sonnet_model",
+        type=str,
+        default=None,
+        help="Claude Code Sonnet tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--haiku",
+        dest="haiku_model",
+        type=str,
+        default=None,
+        help="Claude Code Haiku tier model (Claude integration only)",
     )
 
     # Diagnose command

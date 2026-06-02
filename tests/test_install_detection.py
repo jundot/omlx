@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from omlx.utils.install import (
+    get_app_bundle_cli_path,
     get_cli_prefix,
     get_install_method,
     is_app_bundle,
@@ -16,18 +17,45 @@ class TestInstallDetection:
         assert not is_app_bundle()
         assert get_cli_prefix() == "omlx"
 
-    def test_app_bundle_detected(self):
+    def test_app_bundle_detected(self, tmp_path):
         """Simulate running inside .app bundle."""
         fake = "/Applications/oMLX.app/Contents/Resources/omlx/utils/install.py"
-        with patch("omlx.utils.install.__file__", fake):
+        with (
+            patch("omlx.utils.install.__file__", fake),
+            patch("omlx.utils.install.Path.home", return_value=tmp_path),
+        ):
             assert is_app_bundle()
             assert get_cli_prefix() == "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
+            assert (
+                str(get_app_bundle_cli_path())
+                == "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
+            )
 
-    def test_custom_app_location(self):
+    def test_custom_app_location(self, tmp_path):
         """App bundle installed in non-standard location."""
         fake = "/Users/me/Apps/oMLX.app/Contents/Resources/omlx/utils/install.py"
-        with patch("omlx.utils.install.__file__", fake):
+        with (
+            patch("omlx.utils.install.__file__", fake),
+            patch("omlx.utils.install.Path.home", return_value=tmp_path),
+        ):
             assert is_app_bundle()
+            assert (
+                get_cli_prefix()
+                == "/Users/me/Apps/oMLX.app/Contents/MacOS/omlx-cli"
+            )
+
+    def test_app_bundle_uses_bare_omlx_when_user_shim_exists(self, tmp_path):
+        """Installed app should render the short command once its shim exists."""
+        fake = "/Applications/oMLX.app/Contents/Resources/omlx/utils/install.py"
+        shim = tmp_path / ".omlx" / "bin" / "omlx"
+        shim.parent.mkdir(parents=True)
+        shim.write_text("#!/bin/sh\n")
+        shim.chmod(0o755)
+        with (
+            patch("omlx.utils.install.__file__", fake),
+            patch("omlx.utils.install.Path.home", return_value=tmp_path),
+        ):
+            assert get_cli_prefix() == "omlx"
 
 
 class TestIsHomebrew:

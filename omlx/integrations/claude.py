@@ -47,11 +47,20 @@ class ClaudeCodeIntegration(Integration):
         # Disable telemetry and non-essential background traffic.
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
-        if ctx.model:
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = ctx.model
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = ctx.model
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = ctx.model
-            env["CLAUDE_CODE_SUBAGENT_MODEL"] = ctx.model
+        opus_model = ctx.opus_model or ctx.model
+        sonnet_model = ctx.sonnet_model or ctx.model
+        haiku_model = ctx.haiku_model or ctx.model
+
+        if opus_model:
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus_model
+        if sonnet_model:
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet_model
+        if haiku_model:
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
+
+        subagent_model = haiku_model or sonnet_model or opus_model
+        if subagent_model:
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
 
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)

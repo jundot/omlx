@@ -19,6 +19,9 @@ class IntegrationContext:
     port: int
     api_key: str = ""
     model: str = ""
+    opus_model: str | None = None
+    sonnet_model: str | None = None
+    haiku_model: str | None = None
     context_window: int | None = None
     max_tokens: int | None = None
     model_type: str | None = None

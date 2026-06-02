@@ -126,6 +126,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installWindowObservers()
+        services.updates.setTerminateForUpdate { [weak self] in
+            if let self {
+                self.requestQuit()
+            } else {
+                NSApp.terminate(nil)
+            }
+        }
+        if !isRunningUnitTests {
+            do {
+                try ShellEnvWriter.ensureCLIShim()
+            } catch {
+                NSLog("oMLX: CLI shim setup failed — \(error)")
+            }
+        }
 
         let config = AppConfig.load()
         services.updateConfig(config)
@@ -145,6 +159,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
     /// All three MenubarController construction sites (first-run, returning
     /// user success, returning user failure) capture the same `openAppView`
     /// closure and differ only in `server`/`lastError`.
@@ -156,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MenubarController(
             server: server,
             config: config,
+            updates: services.updates,
             lastError: lastError,
             openAppView: { [weak self] in self?.presentAppView() },
             requestQuit:  { [weak self] in self?.requestQuit() }
@@ -167,7 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let runtime = try PythonRuntime.resolve()
             let server = ServerProcess(
                 runtime: runtime,
-                host: config.host,
+                bindAddress: config.bindAddress,
                 port: config.port,
                 basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
             )
@@ -340,6 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.menubar = MenubarController(
                 server: server,
                 config: services.config,
+                updates: services.updates,
                 openAppView: { [weak self] in self?.presentAppView() },
                 requestQuit:  { [weak self] in self?.requestQuit() }
             )

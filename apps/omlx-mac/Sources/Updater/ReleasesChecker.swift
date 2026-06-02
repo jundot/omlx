@@ -6,10 +6,10 @@
 // latest stable PEP 440 tag, and selects the DMG asset whose filename
 // embeds the current macOS major version (e.g. `-macos15-` or `-macos26-`).
 //
-// Channel handling: GitHub Releases marks pre-1.0 / rc / beta tags via
-// the `prerelease` flag on each release. `UpdateChannel.beta` opens up
-// pre-releases; `.nightly` opens up everything including drafts.
-// Filtering happens client-side via PEP 440 version parsing.
+// Channel handling: Stable accepts final tags only, Release Candidate also
+// accepts rc tags, and Dev accepts dev/pre-release tags. GitHub's
+// `prerelease` flag is treated as advisory because it can be set
+// incorrectly; tag strings are checked client-side too.
 
 import Foundation
 
@@ -26,6 +26,12 @@ struct GitHubRelease: Decodable, Sendable {
         let name: String
         let browserDownloadURL: URL
         let size: Int64
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
+            case size
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -38,11 +44,6 @@ struct GitHubRelease: Decodable, Sendable {
         case assets
     }
 
-    enum AssetKeys: String, CodingKey {
-        case name
-        case browserDownloadURL = "browser_download_url"
-        case size
-    }
 }
 
 struct AvailableRelease: Sendable, Equatable {
@@ -112,16 +113,23 @@ enum ReleasesChecker {
     }
 
     /// Pick the latest release allowed by the channel. Stable excludes
-    /// drafts + prereleases; beta accepts prereleases; nightly accepts
-    /// drafts too. Ties broken by PEP 440 version order.
+    /// drafts and prerelease tags, Release Candidate accepts rc tags, and
+    /// Dev accepts all non-draft tags. Ties are broken by version order.
     static func selectLatest(
         _ releases: [GitHubRelease],
         channel: UpdateChannel
     ) -> GitHubRelease? {
         let allowed = releases.filter { r in
-            if r.draft { return channel == .nightly }
-            if r.prerelease { return channel != .stable }
-            return true
+            let version = String(r.tagName.trimmingPrefix("v").trimmingPrefix("V"))
+            if r.draft { return false }
+            switch channel {
+            case .stable:
+                return !r.prerelease && !isPrereleaseVersion(version)
+            case .releaseCandidate:
+                return !isDevVersion(version) && !isAlphaBetaVersion(version)
+            case .dev:
+                return true
+            }
         }
         return allowed.max { lhs, rhs in
             let l = String(lhs.tagName.trimmingPrefix("v").trimmingPrefix("V"))
@@ -157,6 +165,29 @@ enum ReleasesChecker {
         let trimmed = version.split(whereSeparator: { !$0.isNumber && $0 != "." })
             .first.map(String.init) ?? version
         return trimmed.split(separator: ".").compactMap { Int($0) }
+    }
+
+    /// GitHub's `prerelease` flag is release metadata and can be set
+    /// incorrectly. Stable channel should still ignore PEP 440 prerelease
+    /// tags such as `0.4.0rc1`, `0.4.0.dev1`, `0.4.0b1`, and `0.4.0a1`.
+    private static func isPrereleaseVersion(_ version: String) -> Bool {
+        isDevVersion(version) || isRCVersion(version) || isAlphaBetaVersion(version)
+    }
+
+    private static func isDevVersion(_ version: String) -> Bool {
+        version.lowercased().contains("dev")
+    }
+
+    private static func isRCVersion(_ version: String) -> Bool {
+        version.lowercased().contains("rc")
+    }
+
+    private static func isAlphaBetaVersion(_ version: String) -> Bool {
+        let normalized = version.lowercased()
+        return normalized.range(of: #"(?:^|[.\-])a\d+"#, options: .regularExpression) != nil
+            || normalized.range(of: #"(?:^|[.\-])b\d+"#, options: .regularExpression) != nil
+            || normalized.contains("alpha")
+            || normalized.contains("beta")
     }
 
     /// Pick the DMG asset whose filename embeds the current macOS major

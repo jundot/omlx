@@ -42,6 +42,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct ModelSettings: Codable, Equatable, Sendable {
         let modelDirs: [String]?
+        let modelDir: String?
         let modelFallback: Bool?
     }
 
@@ -245,6 +246,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// When the requested model isn't loaded, fall back to any loaded
     /// model rather than 404.
     var modelFallback: Bool? = nil
+    /// Ordered model roots. The first directory is the primary download
+    /// target; all entries are scanned for local models.
+    var modelDirs: [String]? = nil
 
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil

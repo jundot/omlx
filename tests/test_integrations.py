@@ -1164,6 +1164,37 @@ class TestClaudeCodeIntegration:
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
 
+    def test_launch_sets_distinct_claude_tier_models(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="fallback",
+                    opus_model="opus-local",
+                    sonnet_model="sonnet-local",
+                    haiku_model="haiku-local",
+                )
+            )
+
+        env = captured["env"]
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-local"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-local"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-local"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-local"
+
     def test_launch_open_server_uses_omlx_token(self):
         cc = ClaudeCodeIntegration()
         captured = {}

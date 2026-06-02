@@ -75,7 +75,7 @@ final class ServerProcessIntegrationTests: XCTestCase {
 
         let proc = ServerProcess(
             runtime: runtime,
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: port,
             basePath: tempBase
         )

@@ -80,20 +80,29 @@ final class MenubarControllerPortTests: XCTestCase {
     }
 
     func testDisplayHostPrefersLiveServer() {
-        let server = ServerProcess(runtime: makeRuntime(), host: "0.0.0.0", port: 8080)
+        let server = ServerProcess(runtime: makeRuntime(), bindAddress: "127.0.0.1", port: 8080)
         XCTAssertEqual(
             MenubarController.displayHost(server: server, fallback: "127.0.0.1"),
-            "0.0.0.0"
+            "127.0.0.1"
+        )
+    }
+
+    func testDisplayHostUsesServerConnectableHost() {
+        let server = ServerProcess(runtime: makeRuntime(), bindAddress: "0.0.0.0", port: 8080)
+        XCTAssertEqual(
+            MenubarController.displayHost(server: server, fallback: "127.0.0.1"),
+            "127.0.0.1",
+            "ServerProcess.host returns the connectable host (0.0.0.0 → 127.0.0.1)."
         )
     }
 
     func testDisplayHostFollowsReconfigure() throws {
-        let server = ServerProcess(runtime: makeRuntime(), host: "127.0.0.1", port: 8080)
-        try server.reconfigure(host: "0.0.0.0")
+        let server = ServerProcess(runtime: makeRuntime(), bindAddress: "127.0.0.1", port: 8080)
+        try server.reconfigure(bindAddress: "localhost")
         XCTAssertEqual(
             MenubarController.displayHost(server: server, fallback: "127.0.0.1"),
-            "0.0.0.0",
-            "Listen Address changes propagate to the server via saveHost → applyServerEndpoint → server.reconfigure(host:); the menubar must reflect that."
+            "localhost",
+            "Listen Address changes propagate to the server via saveHost → applyServerEndpoint → server.reconfigure(bindAddress:); the menubar must reflect that."
         )
     }
 

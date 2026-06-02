@@ -247,6 +247,18 @@ class TestLaunchCommandOptions:
         )
         assert "--model" in result.stdout
 
+    def test_launch_has_claude_tier_options(self):
+        """Claude tier options should remain accepted for copied app commands."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "--opus" in result.stdout
+        assert "--sonnet" in result.stdout
+        assert "--haiku" in result.stdout
+
     def test_launch_lists_hermes(self):
         """Test that launch help lists Hermes as an available integration."""
         result = subprocess.run(
@@ -418,6 +430,118 @@ class TestLaunchCommandFunction:
 
         ctx = integration.launch.call_args.args[0]
         assert ctx.extra_args == ("--resume", "abc123")
+
+    def test_launch_command_uses_saved_claude_tiers_without_model_prompt(self):
+        """Bare `omlx launch claude` should use saved tier models."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "sonnet-local",
+                    "model_type": "llm",
+                    "max_context_window": 65536,
+                    "max_tokens": 8192,
+                }
+            ]
+        }
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model="opus-local",
+                sonnet_model="sonnet-local",
+                haiku_model="haiku-local",
+            ),
+        )
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+            opus_model=None,
+            sonnet_model=None,
+            haiku_model=None,
+        )
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        integration.select_model.assert_not_called()
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.model == "sonnet-local"
+        assert ctx.opus_model == "opus-local"
+        assert ctx.sonnet_model == "sonnet-local"
+        assert ctx.haiku_model == "haiku-local"
+        assert ctx.api_key == "saved-key"
+        assert ctx.context_window == 65536
+
+    def test_launch_command_claude_cli_tiers_override_saved_settings(self):
+        """Explicit --opus/--sonnet/--haiku should win over saved settings."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Claude Code"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {"models": []}
+
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            claude_code=SimpleNamespace(
+                opus_model="saved-opus",
+                sonnet_model="saved-sonnet",
+                haiku_model="saved-haiku",
+            ),
+        )
+
+        args = argparse.Namespace(
+            tool="claude",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+            opus_model="cli-opus",
+            sonnet_model="cli-sonnet",
+            haiku_model="cli-haiku",
+        )
+
+        with (
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.model == "cli-sonnet"
+        assert ctx.opus_model == "cli-opus"
+        assert ctx.sonnet_model == "cli-sonnet"
+        assert ctx.haiku_model == "cli-haiku"
 
 
 class TestLaunchArgvParsing:

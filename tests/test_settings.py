@@ -86,6 +86,18 @@ class TestServerSettings:
         assert settings.log_level == "debug"
         assert settings.cors_origins == ["*"]  # default
 
+    def test_from_dict_reads_bind_address_fallback(self):
+        """bind_address is accepted only as a compatibility fallback."""
+        settings = ServerSettings.from_dict({"bind_address": "0.0.0.0"})
+        assert settings.host == "0.0.0.0"
+
+    def test_from_dict_host_wins_over_bind_address(self):
+        """host remains the canonical persisted/admin API key."""
+        settings = ServerSettings.from_dict(
+            {"host": "127.0.0.1", "bind_address": "0.0.0.0"}
+        )
+        assert settings.host == "127.0.0.1"
+
     def test_from_dict_with_cors_origins(self):
         """Test creation from dictionary with cors_origins."""
         data = {

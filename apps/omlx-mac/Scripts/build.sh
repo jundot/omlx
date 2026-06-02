@@ -362,6 +362,34 @@ rsync -a \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
 
+# --- Embed CLI wrapper ----------------------------------------------------
+
+log "Writing app-bundle CLI wrapper..."
+CLI_WRAPPER="$STAGED_APP/Contents/MacOS/omlx-cli"
+cat > "$CLI_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+PYROOT="$RESOURCES/Python"
+CPYTHON="$PYROOT/cpython-3.11"
+PYTHON="$CPYTHON/bin/python3"
+MLX_SITE="$PYROOT/framework-mlx-base/lib/python3.11/site-packages"
+
+export PYTHONHOME="$CPYTHON"
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$MLX_SITE:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES:$MLX_SITE"
+fi
+
+exec "$PYTHON" -m omlx.cli "$@"
+EOF
+chmod 755 "$CLI_WRAPPER"
+ok "  + omlx-cli"
+
 # --- Compile AppIcon.icon (Tahoe Liquid Glass) ----------------------------
 #
 # Xcode 26.5's project build system does NOT route a standalone
@@ -428,6 +456,8 @@ if [ "$SKIP_EMBEDDED_SIGN" -eq 1 ]; then
 else
     log "Ad-hoc signing embedded native code…"
     _sign_embedded_mach_o_files "$PYTHON_DIR"
+    codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
+    ok "  + signed omlx-cli wrapper"
 fi
 
 log "Ad-hoc resigning app bundle…"
