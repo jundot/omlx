@@ -1,43 +1,43 @@
 <!-- Cluster router management tab. Backed by /admin/api/cluster/* and the
-     cluster() state in dashboard.js. Labels are English (this admin/technical
-     page intentionally does not use the i18n t() system). -->
+     cluster() state in dashboard.js. Strings go through the i18n system:
+     static labels via Jinja {{ t('cluster.*') }}, JS expressions via
+     window.t('cluster.*'). -->
 <div x-show="mainTab === 'cluster'" x-cloak class="space-y-6">
 
     <!-- Header -->
     <div class="flex items-center justify-between">
         <div>
-            <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">Cluster Router</h2>
+            <h2 class="text-xl font-semibold text-neutral-900 dark:text-neutral-100">{{ t('cluster.title') }}</h2>
             <p class="text-sm text-neutral-500 dark:text-neutral-400 mt-0.5">
-                Spread OpenAI-compatible requests across multiple omlx backends. The router is a
-                separate process managed by launchd; this page edits its config and controls it.
+                {{ t('cluster.subtitle') }}
             </p>
         </div>
         <button @click="loadClusterStatus()"
                 class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition-all">
             <i data-lucide="refresh-cw" class="w-4 h-4" :class="cluster.loading ? 'animate-spin' : ''"></i>
-            Refresh
+            {{ t('cluster.btn.refresh') }}
         </button>
     </div>
 
     <!-- Status card -->
     <div class="rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 overflow-hidden">
         <div class="px-5 py-4 border-b border-neutral-100 dark:border-neutral-800 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Status</h3>
+            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{{ t('cluster.status.heading') }}</h3>
             <div class="flex items-center gap-2">
                 <button @click="controlCluster('start')" :disabled="cluster.controlBusy"
                         class="px-3 py-1.5 text-xs font-medium rounded-lg bg-green-50 text-green-700 hover:bg-green-100 disabled:opacity-50 transition-all">
-                    <span x-show="cluster.controlBusy !== 'start'">Start</span>
-                    <span x-show="cluster.controlBusy === 'start'">Starting...</span>
+                    <span x-show="cluster.controlBusy !== 'start'">{{ t('cluster.btn.start') }}</span>
+                    <span x-show="cluster.controlBusy === 'start'">{{ t('cluster.btn.starting') }}</span>
                 </button>
                 <button @click="controlCluster('restart')" :disabled="cluster.controlBusy"
                         class="px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-50 transition-all">
-                    <span x-show="cluster.controlBusy !== 'restart'">Restart</span>
-                    <span x-show="cluster.controlBusy === 'restart'">Restarting...</span>
+                    <span x-show="cluster.controlBusy !== 'restart'">{{ t('cluster.btn.restart') }}</span>
+                    <span x-show="cluster.controlBusy === 'restart'">{{ t('cluster.btn.restarting') }}</span>
                 </button>
                 <button @click="controlCluster('stop')" :disabled="cluster.controlBusy"
                         class="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50 transition-all">
-                    <span x-show="cluster.controlBusy !== 'stop'">Stop</span>
-                    <span x-show="cluster.controlBusy === 'stop'">Stopping...</span>
+                    <span x-show="cluster.controlBusy !== 'stop'">{{ t('cluster.btn.stop') }}</span>
+                    <span x-show="cluster.controlBusy === 'stop'">{{ t('cluster.btn.stopping') }}</span>
                 </button>
             </div>
         </div>
@@ -49,17 +49,17 @@
                     <span class="w-2 h-2 rounded-full"
                           :class="cluster.status && cluster.status.agent && cluster.status.agent.running ? 'bg-green-500' : 'bg-neutral-300'"></span>
                     <span class="text-neutral-700 dark:text-neutral-300">
-                        Router:
+                        {{ t('cluster.status.router_label') }}
                         <span class="font-medium"
                               x-text="cluster.status && cluster.status.agent
-                                  ? (cluster.status.agent.running ? 'running (pid ' + cluster.status.agent.pid + ')'
-                                     : cluster.status.agent.loaded ? 'loaded, not running'
-                                     : cluster.status.agent.installed ? 'installed, not loaded' : 'not installed')
-                                  : 'unknown'"></span>
+                                  ? (cluster.status.agent.running ? window.t('cluster.router.running').replace('{pid}', cluster.status.agent.pid)
+                                     : cluster.status.agent.loaded ? window.t('cluster.router.loaded_not_running')
+                                     : cluster.status.agent.installed ? window.t('cluster.router.installed_not_loaded') : window.t('cluster.router.not_installed'))
+                                  : window.t('cluster.router.unknown')"></span>
                     </span>
                 </div>
                 <div class="text-neutral-500 dark:text-neutral-400">
-                    Listen: <span class="font-mono text-xs" x-text="cluster.status ? cluster.status.listen : ''"></span>
+                    {{ t('cluster.status.listen_label') }} <span class="font-mono text-xs" x-text="cluster.status ? cluster.status.listen : ''"></span>
                 </div>
                 <div x-show="cluster.status && cluster.status.error" class="text-red-500 text-xs">
                     <span x-text="cluster.status ? cluster.status.error : ''"></span>
@@ -71,13 +71,13 @@
                 <table class="w-full text-sm">
                     <thead>
                         <tr class="text-left text-xs text-neutral-400 border-b border-neutral-100 dark:border-neutral-800">
-                            <th class="py-2 pr-4 font-medium">Backend</th>
-                            <th class="py-2 pr-4 font-medium">Healthy</th>
-                            <th class="py-2 pr-4 font-medium">Weight</th>
-                            <th class="py-2 pr-4 font-medium">Load</th>
-                            <th class="py-2 pr-4 font-medium">Depth</th>
-                            <th class="py-2 pr-4 font-medium">Mem headroom</th>
-                            <th class="py-2 pr-4 font-medium">Resident models</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.backend') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.healthy') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.weight') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.load') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.depth') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.mem_headroom') }}</th>
+                            <th class="py-2 pr-4 font-medium">{{ t('cluster.col.resident') }}</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -87,7 +87,7 @@
                                 <td class="py-2 pr-4">
                                     <span class="inline-flex items-center gap-1">
                                         <span class="w-1.5 h-1.5 rounded-full" :class="b.healthy ? 'bg-green-500' : 'bg-red-500'"></span>
-                                        <span x-text="b.healthy ? 'yes' : 'no'"></span>
+                                        <span x-text="b.healthy ? window.t('cluster.healthy.yes') : window.t('cluster.healthy.no')"></span>
                                     </span>
                                 </td>
                                 <td class="py-2 pr-4 text-neutral-600 dark:text-neutral-400" x-text="b.weight"></td>
@@ -103,7 +103,7 @@
                 </table>
             </div>
 
-            <div x-show="!cluster.status" class="text-sm text-neutral-400">Loading status...</div>
+            <div x-show="!cluster.status" class="text-sm text-neutral-400">{{ t('cluster.status.loading') }}</div>
         </div>
     </div>
 
@@ -111,11 +111,10 @@
     <div class="rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 overflow-hidden"
          x-show="cluster.config">
         <div class="px-5 py-4 border-b border-neutral-100 dark:border-neutral-800">
-            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Configuration</h3>
+            <h3 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">{{ t('cluster.config.heading') }}</h3>
             <p class="text-xs text-neutral-400 mt-0.5">
-                Saved to <span class="font-mono" x-text="cluster.path"></span>.
-                Stored API keys show as a placeholder; leave them to keep, type to replace.
-                Changes take effect after a router restart.
+                {{ t('cluster.config.saved_to') }} <span class="font-mono" x-text="cluster.path"></span>.
+                {{ t('cluster.config.hint_suffix') }}
             </p>
         </div>
 
@@ -123,32 +122,32 @@
             <!-- Top-level fields -->
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Listen (host:port)</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.listen') }}</label>
                     <input type="text" x-model="cluster.config.listen" placeholder="0.0.0.0:9000"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg font-mono text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Router API key (clients present this)</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.router_api_key') }}</label>
                     <input type="password" x-model="cluster.config.router_api_key" autocomplete="new-password"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg font-mono text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Poll interval (s)</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.poll_interval') }}</label>
                     <input type="number" step="0.1" min="0" x-model.number="cluster.config.poll_interval"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Affinity hysteresis</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.affinity_hysteresis') }}</label>
                     <input type="number" step="0.1" min="0" x-model.number="cluster.config.affinity_hysteresis"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Memory soft floor (0-1)</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.mem_soft_floor') }}</label>
                     <input type="number" step="0.01" min="0" max="1" x-model.number="cluster.config.mem_soft_floor"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">Memory penalty (load units)</label>
+                    <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.mem_penalty') }}</label>
                     <input type="number" step="1" min="0" x-model.number="cluster.config.mem_penalty"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
@@ -157,22 +156,22 @@
             <!-- Backends -->
             <div>
                 <div class="flex items-center justify-between mb-2">
-                    <label class="text-xs font-semibold text-neutral-700 dark:text-neutral-300 uppercase tracking-wide">Backends</label>
+                    <label class="text-xs font-semibold text-neutral-700 dark:text-neutral-300 uppercase tracking-wide">{{ t('cluster.backends.heading') }}</label>
                     <button @click="addClusterBackend()"
                             class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition-all">
-                        <i data-lucide="plus" class="w-3.5 h-3.5"></i> Add backend
+                        <i data-lucide="plus" class="w-3.5 h-3.5"></i> {{ t('cluster.backends.add') }}
                     </button>
                 </div>
                 <div class="space-y-2">
                     <template x-for="(b, i) in cluster.config.backends" :key="i">
                         <div class="grid grid-cols-12 gap-2 items-center">
-                            <input type="text" x-model="b.name" placeholder="name"
+                            <input type="text" x-model="b.name" :placeholder="window.t('cluster.backend.ph_name')"
                                    class="col-span-2 px-2 py-1.5 text-xs border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
                             <input type="text" x-model="b.base_url" placeholder="http://10.0.0.1:8000"
                                    class="col-span-5 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
-                            <input type="password" x-model="b.api_key" placeholder="api key" autocomplete="new-password"
+                            <input type="password" x-model="b.api_key" :placeholder="window.t('cluster.backend.ph_api_key')" autocomplete="new-password"
                                    class="col-span-3 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
-                            <input type="number" step="0.1" min="0.1" x-model.number="b.weight" placeholder="weight"
+                            <input type="number" step="0.1" min="0.1" x-model.number="b.weight" :placeholder="window.t('cluster.backend.ph_weight')"
                                    class="col-span-1 px-2 py-1.5 text-xs border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
                             <button @click="removeClusterBackend(i)"
                                     class="col-span-1 flex items-center justify-center p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all">
@@ -181,7 +180,7 @@
                         </div>
                     </template>
                     <p x-show="!cluster.config.backends.length" class="text-xs text-neutral-400 py-2">
-                        No backends yet. Add one per omlx server you want to route to.
+                        {{ t('cluster.backends.empty') }}
                     </p>
                 </div>
             </div>
@@ -190,10 +189,10 @@
             <div class="flex items-center gap-3 pt-2 border-t border-neutral-100 dark:border-neutral-800">
                 <button @click="saveClusterConfig()" :disabled="cluster.saving"
                         class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 dark:bg-neutral-100 dark:text-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
-                    <span x-show="!cluster.saving">Save config</span>
-                    <span x-show="cluster.saving">Saving...</span>
+                    <span x-show="!cluster.saving">{{ t('cluster.btn.save') }}</span>
+                    <span x-show="cluster.saving">{{ t('cluster.btn.saving') }}</span>
                 </button>
-                <span x-show="cluster.saveSuccess" x-cloak class="text-sm text-green-600">Saved. Restart the router to apply.</span>
+                <span x-show="cluster.saveSuccess" x-cloak class="text-sm text-green-600">{{ t('cluster.save.success') }}</span>
                 <span x-show="cluster.saveError" x-cloak class="text-sm text-red-500" x-text="cluster.saveError"></span>
             </div>
         </div>
