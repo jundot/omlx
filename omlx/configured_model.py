@@ -16,7 +16,7 @@ function interfaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar
 
 from .engine_pool import EngineEntry
 from .model_settings import ModelSettings
@@ -25,7 +25,9 @@ if TYPE_CHECKING:
     # SamplingDefaults lives in server.py, which imports this module.
     from .server import SamplingDefaults
 
-def first_present[T](*args: Optional[T]) -> Optional[T]:
+T = TypeVar('T')
+
+def first_present(*args: Optional[T]) -> Optional[T]:
     """The first non-None value passed, or None if all are None."""
     for x in args:
         if x is not None:
