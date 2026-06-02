@@ -351,16 +351,26 @@ class ModelSettingsManager:
             logger.error(f"Failed to save settings file: {e}")
             raise
 
-    def get_settings(self, model_id: str) -> ModelSettings:
+    def get_settings(self, model_id: str, profile_name: Optional[str] = None) -> ModelSettings:
         """Get settings for a specific model.
 
         Args:
             model_id: The model identifier.
+            profile_name: Optional profile name to use for settings.
 
         Returns:
             ModelSettings for the model, or default settings if not found.
         """
         with self._lock:
+            if profile_name is not None:
+                logger.info(profile_name)
+                profile_settings = self.get_profile_by_display_name(model_id, profile_name)
+                logger.info(profile_settings)
+                if profile_settings is not None:
+                    return ModelSettings.from_dict(profile_settings)
+                else:
+                    pass
+
             if model_id in self._settings:
                 # Return a copy to prevent external modification
                 settings = self._settings[model_id]
@@ -506,6 +516,13 @@ class ModelSettingsManager:
     def get_profile(self, model_id: str, name: str) -> Optional[dict]:
         with self._lock:
             return dict(self._profiles.get(model_id, {}).get(name, {})) or None
+
+    def get_profile_by_display_name(self, model_id: str, display_name: str) -> Optional[dict]:
+        model_profiles = self._profiles.get(model_id, {})
+        profile = next((p for p in model_profiles.values() if p.get('display_name') == display_name), None)
+        profile_settings = profile.get('settings') if profile else None
+
+        return profile_settings
 
     def save_profile(
         self,

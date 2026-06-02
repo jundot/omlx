@@ -667,6 +667,10 @@ async def get_engine(
 
     This is the unified engine getter that handles LLM, embedding, and reranker models.
 
+    Profile suffix support: The profile suffix is stripped from the model ID
+    before resolving and loading the engine. The profile settings are applied
+    separately in the sampling parameters and context window functions.
+
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
         engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
@@ -694,8 +698,10 @@ async def get_engine(
             detail="No model specified and no default model set"
         )
 
+    # Strip profile suffix to get base model ID for engine loading
+    base_model_id, _ = extract_model_name_and_profile_name(model_id)
     # Resolve alias to real model_id
-    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    model_id = pool.resolve_model_id(base_model_id, _server_state.settings_manager)
 
     try:
         engine = await pool.get_engine(model_id)
@@ -869,13 +875,14 @@ def get_sampling_params(
     ocr_defaults: dict | None = None,
     req_xtc_probability: float | None = None,
     req_xtc_threshold: float | None = None,
+    profile_name: str | None = None,
 ) -> tuple[float, float, int, float, float, float, float, int, float, float]:
     """
-    Get effective sampling parameters with per-model settings support.
+    Get effective sampling parameters with per-model settings and profile support.
 
     Priority:
     - If force_sampling is True (global or model level): use forced values
-    - Otherwise: request > model settings > ocr_defaults > global defaults
+    - Otherwise: request > profile settings > model settings > ocr_defaults > global defaults
 
     Returns:
         tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
@@ -888,7 +895,7 @@ def get_sampling_params(
     # Get per-model settings if available
     model_settings = None
     if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
+        model_settings = _server_state.settings_manager.get_settings(model_id, profile_name)
 
     # Resolve OCR defaults if not provided by caller
     if ocr_defaults is None and model_id:
@@ -1044,6 +1051,38 @@ def resolve_model_id(model_id: str | None) -> str | None:
     return pool.resolve_model_id(model_id, _server_state.settings_manager)
 
 
+def extract_model_name_and_profile_name(model_id: str | None) -> tuple[str | None, str | None]:
+    """Parse a model ID that may include a profile suffix.
+
+    Model IDs with profile suffixes follow the pattern:
+    <model_id>:<profile_name>
+
+    For example:
+        - "llama3_1" -> ("llama3", "1")
+        - "llama3" -> ("llama3", None)
+        - "llama3_1_fast" -> ("llama3", "1_fast")
+
+    Args:
+        model_id: The model ID to parse
+
+    Returns:
+        Tuple of (base_model_id, profile_name)
+        - base_model_id: The base model ID without the profile suffix
+        - profile_name: The profile name if present, otherwise None
+    """
+    if model_id is None:
+        return None, None
+
+    if ":" not in model_id:
+        return model_id, None
+
+    parts = model_id.split(":", 1)
+    base_model_id = parts[0]
+    profile_name = parts[1] if len(parts) > 1 else None
+
+    return base_model_id, profile_name
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -1061,7 +1100,7 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
     return None
 
 
-def get_max_context_window(model_id: str | None = None) -> int | None:
+def get_max_context_window(model_id: str | None = None, profile_name: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
@@ -1074,6 +1113,9 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         3. Global default from ``SamplingConfig`` — last-resort fallback
            for models whose config files don't expose a context length.
 
+    Profile settings are checked before model settings for the context window
+    parameter. Priority: request > profile > model > config > global default.
+
     Returns:
         Max context window token count, or ``None`` if no tier resolves
         (only possible when neither the model nor the global default
@@ -1084,7 +1126,7 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 
     model_settings = None
     if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
+        model_settings = _server_state.settings_manager.get_settings(model_id, profile_name)
 
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
@@ -1131,14 +1173,14 @@ def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int
 
 
 def validate_context_window(
-    num_prompt_tokens: int, model_id: str | None = None
+    num_prompt_tokens: int, model_id: str | None = None, profile_name: str | None = None
 ) -> None:
     """
     Validate that prompt token count does not exceed max context window.
 
     Raises HTTPException 400 if the prompt is too long.
     """
-    max_ctx = get_max_context_window(model_id)
+    max_ctx = get_max_context_window(model_id, profile_name)
     if max_ctx and num_prompt_tokens > max_ctx:
         raise HTTPException(
             status_code=400,
@@ -2042,10 +2084,13 @@ async def create_completion(
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
-    # Validate context window for each prompt
+    # Parse model suffix to get profile name
+    base_model_id, profile_name = extract_model_name_and_profile_name(request.model)
+
+    # Validate context window for each prompt (using base model ID)
     for prompt in prompts:
         num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        validate_context_window(num_tokens, base_model_id, profile_name)
 
     if request.stream:
         return StreamingResponse(
@@ -2067,7 +2112,7 @@ async def create_completion(
         total_cached_tokens = 0
 
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-            request.temperature, request.top_p, request.model,
+            request.temperature, request.top_p, base_model_id,
             req_top_k=getattr(request, 'top_k', None),
             req_repetition_penalty=getattr(request, 'repetition_penalty', None),
             req_min_p=getattr(request, 'min_p', None),
@@ -2076,6 +2121,7 @@ async def create_completion(
             req_max_tokens=request.max_tokens,
             req_xtc_probability=getattr(request, 'xtc_probability', None),
             req_xtc_threshold=getattr(request, 'xtc_threshold', None),
+            profile_name=profile_name,
         )
 
         for i, prompt in enumerate(prompts):
@@ -2178,12 +2224,15 @@ async def create_chat_completion(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
+    # Parse model suffix to get base model ID and profile name
+    base_model_id, profile_name = extract_model_name_and_profile_name(request.model)
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
     # Resolve alias to real model ID for settings lookups
-    resolved_model = resolve_model_id(request.model) or request.model
+    resolved_model = resolve_model_id(base_model_id) or base_model_id
 
     # Get per-model settings
     max_tool_result_tokens = None
@@ -2308,11 +2357,11 @@ async def create_chat_completion(
                 status_code=400, detail=f"Chat template error: {e}"
             )
         raise
-    validate_context_window(num_prompt_tokens, request.model)
+    validate_context_window(num_prompt_tokens, base_model_id, profile_name)
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-        request.temperature, request.top_p, request.model,
+        request.temperature, request.top_p, base_model_id,
         req_top_k=getattr(request, 'top_k', None),
         req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
@@ -2321,6 +2370,7 @@ async def create_chat_completion(
         req_max_tokens=request.max_tokens,
         req_xtc_probability=getattr(request, 'xtc_probability', None),
         req_xtc_threshold=getattr(request, 'xtc_threshold', None),
+        profile_name=profile_name,
     )
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -3601,10 +3651,13 @@ async def create_anthropic_message(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
+    # Parse model suffix to get base model ID and profile name
+    base_model_id, profile_name = extract_model_name_and_profile_name(request.model)
+
     engine = await get_engine_for_model(request.model)
 
     # Resolve alias to real model ID for settings lookups
-    resolved_model = resolve_model_id(request.model) or request.model
+    resolved_model = resolve_model_id(base_model_id) or base_model_id
 
     # Get per-model settings
     max_tool_result_tokens = None
@@ -3673,10 +3726,11 @@ async def create_anthropic_message(
 
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-        request.temperature, request.top_p, request.model,
+        request.temperature, request.top_p, resolved_model,
         req_top_k=getattr(request, 'top_k', None),
         req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_max_tokens=request.max_tokens,
+        profile_name=profile_name,
     )
 
     chat_kwargs = {
@@ -3996,12 +4050,13 @@ async def create_response(
     logger.debug(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
+    base_model_id, profile_name = extract_model_name_and_profile_name(request.model)
 
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
-    resolved_model = resolve_model_id(request.model) or request.model
+    resolved_model = resolve_model_id(base_model_id) or base_model_id
 
     current_input_messages = convert_responses_input_to_messages(request.input)
 
@@ -4109,17 +4164,18 @@ async def create_response(
                 status_code=400, detail=f"Chat template error: {e}"
             )
         raise
-    validate_context_window(num_prompt_tokens, request.model)
+    validate_context_window(num_prompt_tokens, base_model_id, profile_name)
 
     # Build sampling kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
         get_sampling_params(
             request.temperature,
             request.top_p,
-            request.model,
+            base_model_id,
             req_top_k=getattr(request, 'top_k', None),
             req_repetition_penalty=getattr(request, 'repetition_penalty', None),
             req_max_tokens=request.max_output_tokens,
+            profile_name=profile_name,
         )
     )
     chat_kwargs = {

@@ -179,6 +179,7 @@ Load LLMs, VLMs, embedding models, and rerankers within the same server. Models 
 Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
+- **Model profiles**: set a custom settings for each model profile. Can be used on "the fly" with `:` delimeter. Pattern like this `(model_name|model_alias):model_profile name` will process request with selected profile. If no profile provided - proceed with defaults.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
 
 <p align="center">
