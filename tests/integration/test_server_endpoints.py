@@ -579,6 +579,8 @@ class TestModelsStatusEndpoint:
             model_alias = "gpt-4o"
             max_context_window = 32768
             max_tokens = 8192
+            enable_thinking = True
+            preserve_thinking = False
 
         class SettingsManager:
             def get_settings(self, model_id):

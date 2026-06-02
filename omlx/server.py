@@ -1738,7 +1738,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         m["preserve_thinking"] = config.preserve_thinking
         ma = getattr(config.settings, "model_alias", None)
         if ma is not None:
-            m["model_alias"] = ms.model_alias
+            m["model_alias"] = ma
 
     return status
 

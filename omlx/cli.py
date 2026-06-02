@@ -429,6 +429,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
+        preserve_thinking=model_info.get("preserve_thinking"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
     )

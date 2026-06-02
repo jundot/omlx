@@ -195,7 +195,7 @@ name = "old-omlx"
         config_path = tmp_path / "config.toml"
         codex = CodexIntegration()
         with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(port=8000, api_key="", model="qwen3.6", reasoning=True)
+            codex.configure(ctx(port=8000, api_key="", model="qwen3.6", reasoning=True))
 
         content = config_path.read_text()
         assert 'model_reasoning_effort = "high"' in content
@@ -204,9 +204,7 @@ name = "old-omlx"
         config_path = tmp_path / "config.toml"
         codex = CodexIntegration()
         with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(
-                port=8000, api_key="", model="deepseek-r1-distill", reasoning=False
-            )
+            codex.configure(ctx(port=8000, api_key="", model="deepseek-r1-distill", reasoning=False))
 
         content = config_path.read_text()
         assert "model_reasoning_effort" not in content
@@ -948,7 +946,7 @@ class TestPiIntegration:
             patch.object(PiIntegration, "MODELS_PATH", models_path),
             patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
         ):
-            pi.configure(port=8000, api_key="key", model="qwen3.6", reasoning=True)
+            pi.configure(ctx(port=8000, api_key="key", model="qwen3.6", reasoning=True))
 
         model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
         assert model_config["reasoning"] is True
@@ -963,9 +961,8 @@ class TestPiIntegration:
             patch.object(PiIntegration, "MODELS_PATH", models_path),
             patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
         ):
-            pi.configure(
-                port=8000, api_key="key", model="some-thinking-model", reasoning=False
-            )
+            pi.configure(ctx(port=8000, api_key="key", model="some-thinking-model", reasoning=False))
+             
 
         model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
         assert model_config["reasoning"] is False
@@ -980,7 +977,7 @@ class TestPiIntegration:
             patch.object(PiIntegration, "MODELS_PATH", models_path),
             patch.object(PiIntegration, "SETTINGS_PATH", settings_path),
         ):
-            pi.configure(port=8000, api_key="key", model="qwen3-thinking")
+            pi.configure(ctx(port=8000, api_key="key", model="qwen3-thinking"))
 
         model_config = json.loads(models_path.read_text())["providers"]["omlx"]["models"][0]
         assert model_config["reasoning"] is True
