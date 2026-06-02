@@ -236,7 +236,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     Also handles JSON variant:
         <|tool_call_start|>{"name": "func", "arguments": {...}}<|tool_call_end|>
 
-    Hermes models (NousResearch/Hermes) emit tool calls in this format.
+    Some clients/agents emit tool calls using this Hermes-style wire format.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
