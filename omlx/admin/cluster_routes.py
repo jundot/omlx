@@ -52,7 +52,9 @@ def _base_path() -> Path:
             return Path(bp)
     except Exception:  # pragma: no cover - defensive, getter not wired in tests
         pass
-    return Path(os.environ.get("OMLX_BASE_PATH") or (Path.home() / ".omlx"))
+    from ..settings import resolve_default_base_path
+
+    return resolve_default_base_path()
 
 
 def _config_path() -> Path:

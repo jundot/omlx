@@ -104,9 +104,11 @@ class Config:
 
 
 def _config_path() -> Path:
+    from ..settings import resolve_default_base_path
+
     return Path(
         os.environ.get("OMLX_CLUSTER_CONFIG")
-        or (Path.home() / ".omlx" / "cluster.json")
+        or (resolve_default_base_path() / "cluster.json")
     )
 
 

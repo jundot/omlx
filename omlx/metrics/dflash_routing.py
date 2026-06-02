@@ -41,10 +41,12 @@ def get_metric_path() -> Path:
     want isolation. Directory is created on demand so a fresh box can
     start emitting metrics without a manual ``mkdir``.
     """
+    from ..settings import resolve_default_base_path
+
     base = Path(
         os.environ.get(
             "DFLASH_METRIC_DIR",
-            str(Path.home() / ".omlx" / "metrics"),
+            str(resolve_default_base_path() / "metrics"),
         )
     )
     base.mkdir(parents=True, exist_ok=True)

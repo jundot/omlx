@@ -39,8 +39,34 @@ logger = logging.getLogger(__name__)
 # Settings file version for future migrations
 SETTINGS_VERSION = "1.0"
 
-# Default base path
-DEFAULT_BASE_PATH = Path.home() / ".omlx"
+# Default base path. The brand dir is ~/.fmlx (matches the `fmlx` CLI). For
+# backward compat with existing oMLX installs, fall back to the legacy ~/.omlx
+# when it exists and ~/.fmlx does not, so a running deployment keeps working
+# until it is migrated. Env override: FMLX_BASE_PATH (or legacy OMLX_BASE_PATH).
+BRAND_BASE_DIR = ".fmlx"
+LEGACY_BASE_DIR = ".omlx"
+
+
+def resolve_default_base_path() -> Path:
+    """Resolve the default data base dir, honoring env override and legacy compat.
+
+    Priority: FMLX_BASE_PATH > OMLX_BASE_PATH > ~/.fmlx (or legacy ~/.omlx if it
+    exists and ~/.fmlx does not) > ~/.fmlx for a fresh install.
+    """
+    env = os.environ.get("FMLX_BASE_PATH") or os.environ.get("OMLX_BASE_PATH")
+    if env:
+        return Path(env).expanduser().resolve()
+    home = Path.home()
+    brand = home / BRAND_BASE_DIR
+    legacy = home / LEGACY_BASE_DIR
+    if brand.exists():
+        return brand
+    if legacy.exists():
+        return legacy
+    return brand
+
+
+DEFAULT_BASE_PATH = resolve_default_base_path()
 
 
 def get_system_memory() -> int:
