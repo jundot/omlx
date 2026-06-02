@@ -874,6 +874,10 @@ class ToolCallStreamFilter:
             idx = text.find(marker)
             if idx >= 0:
                 starts.append((idx, len(marker), close))
+            if close:
+                close_idx = text.find(close)
+                if close_idx >= 0:
+                    starts.append((close_idx, len(close), None))
 
         ns_match = self._namespaced_open_re.search(text)
         if ns_match:
@@ -937,6 +941,8 @@ class ToolCallStreamFilter:
         keep = 0
         for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
+            if _close:
+                keep = max(keep, self._partial_prefix_len(text, _close))
 
         last_lt = text.rfind("<")
         if last_lt >= 0:
@@ -977,6 +983,8 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                return True
+            if _close and _close.startswith(tail):
                 return True
 
         # Drop unresolved bracket tool-call prefixes

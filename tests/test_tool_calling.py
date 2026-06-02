@@ -831,6 +831,21 @@ class TestToolCallStreamFilter:
         assert "execute_code" not in result
         assert result == "Before  After"
 
+    def test_orphan_hermes_end_marker_is_suppressed(self):
+        """A closing Hermes marker without a visible open marker must not leak."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Before <|tool_call_end|> After")
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_split_orphan_hermes_end_marker_is_suppressed(self):
+        """Split closing Hermes markers must be buffered until classified."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        chunks = ["Before ", "<|tool_call_en", "d|>", " After"]
+        result = "".join(f.feed(chunk) for chunk in chunks)
+        result += f.finish()
+        assert result == "Before  After"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())
@@ -1320,6 +1335,36 @@ class TestParseBracketToolCalls:
         assert second_args["timeout"] == 400
         assert "diversify_hermes.py" in first_args["command"]
         assert "diversify_v2.py" in second_args["command"]
+
+    def test_hermes_fallback_runs_when_native_parser_rejects_bracket_payload(self):
+        """Tokenizer native parser failures should fall through to Hermes fallback."""
+
+        class NativeRejectingTokenizer:
+            has_tool_calling = True
+            tool_call_start = "<|tool_call_start|>"
+            tool_call_end = "<|tool_call_end|>"
+
+            @staticmethod
+            def tool_parser(text, tools):
+                raise ValueError("native parser rejected Hermes bracket payload")
+
+        text = (
+            "Before <|tool_call_start|>"
+            "[execute_code(command='python3 script.py', timeout=400)]"
+            "<|tool_call_end|>"
+        )
+        result = extract_tool_calls_with_thinking(
+            "",
+            text,
+            tokenizer=NativeRejectingTokenizer(),
+            tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        )
+        assert result.cleaned_text == "Before"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "execute_code"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "python3 script.py", "timeout": 400}
 
 
 class TestParseToolCallsWithThinkingFallback:
