@@ -635,11 +635,14 @@ private struct TextExportSection: View {
             if isOpen {
                 ListGroup {
                     FreeRow(isLast: true) {
-                        Text(text)
-                            .font(.omlxMono(11))
-                            .foregroundStyle(theme.text)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
+                        ScrollView(.horizontal, showsIndicators: true) {
+                            Text(text)
+                                .font(.omlxMono(11))
+                                .foregroundStyle(theme.text)
+                                .fixedSize(horizontal: true, vertical: true)
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
                 .padding(.bottom, 18)

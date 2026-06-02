@@ -2,6 +2,7 @@
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
 import importlib
+import inspect
 import sys
 
 import pytest
@@ -677,6 +678,49 @@ class TestPoolingCacheStateRoundTrip:
         handler = CacheTypeRegistry.get_handler_by_class_name("PoolingCache")
         state = handler.extract_state(cache)
         assert handler.get_seq_len(state) == 12
+
+
+class TestCacheMaterialization:
+    """DeepSeek-V4 cache arrays are materialized after forward updates."""
+
+    def test_helper_collects_plain_and_cachelist_leaf_arrays(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Leaf:
+            def __init__(self, arr):
+                self.arr = arr
+                self.none_value = None
+                self.scalar = 7
+
+        leaf_a = Leaf(mx.array([1], dtype=mx.int32))
+        leaf_b = Leaf(mx.array([2], dtype=mx.int32))
+        leaf_c = Leaf(mx.array([3], dtype=mx.int32))
+        calls = []
+
+        def fake_eval(*arrays):
+            calls.append(arrays)
+
+        monkeypatch.setattr(dsv4.mx, "eval", fake_eval)
+
+        dsv4._materialize_cache_arrays([CacheList(leaf_a, leaf_b), leaf_c, None])
+
+        assert len(calls) == 1
+        assert calls[0] == (leaf_a.arr, leaf_b.arr, leaf_c.arr)
+
+    def test_model_call_materializes_cache_after_layer_loop(self, applied_patch):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        source = inspect.getsource(dsv4.DeepseekV4Model.__call__)
+
+        loop_pos = source.index("for layer, layer_cache in zip")
+        materialize_pos = source.index("_materialize_cache_arrays(cache)")
+        pipeline_send_pos = source.index("if pipeline_rank != 0")
+
+        assert loop_pos < materialize_pos < pipeline_send_pos
 
 
 class TestPreLoadDispatch:

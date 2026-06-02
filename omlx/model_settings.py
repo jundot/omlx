@@ -53,6 +53,8 @@ class ModelSettings:
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
+        guided_grammar_enabled: Whether a default guided grammar is active.
+        guided_grammar: Default EBNF grammar for constrained decoding.
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
@@ -119,6 +121,8 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    guided_grammar_enabled: bool = False
+    guided_grammar: Optional[str] = None
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False

@@ -27,7 +27,7 @@ jobs:
 
       - name: Update formula
         run: |
-          sed -i 's|url "https://github.com/.*/archive/refs/tags/v.*\.tar\.gz"|url "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"|' Formula/omlx.rb
+          sed -i 's|url "https://github.com/.*/archive/refs/tags/v.*\.tar\.gz"|url "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"|' Formula/omlx.rb
           sed -i 's|sha256 ".*"|sha256 "${{ steps.sha.outputs.sha256 }}"|' Formula/omlx.rb
 
       - name: Commit and push

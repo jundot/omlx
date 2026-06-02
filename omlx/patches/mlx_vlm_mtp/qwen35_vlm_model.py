@@ -65,11 +65,19 @@ def apply() -> bool:
         # weight's own magnitude (raw-HF center ~0, MLX-shifted ~1). Mirrors
         # the fix in mlx_lm_mtp/qwen35_model.py. The magnitude is unreadable
         # during oQ streaming plan discovery (the weight is a no-data
-        # ``_TrackedTensor`` and ``mx.mean(...).item()`` raises), so fall back
-        # to the shape-based ``should_shift_norm_weights`` there, or the +1
-        # shift is dropped from the plan and the oQ output ships unshifted MTP
-        # norms (the ~0% acceptance bug, baked into the artifact).
+        # ``_TrackedTensor`` and ``mx.mean(...).item()`` raises), so emit a
+        # conditional replay transform there. A fixed fallback is wrong for
+        # full-precision Qwen3.6 sources where MTP norm conventions are mixed.
         import mlx.core as _mx
+
+        def _is_oq_tracked_tensor(_w):
+            return (
+                _w.__class__.__name__ == "_TrackedTensor"
+                and hasattr(_w, "_clone")
+            )
+
+        def _mark_mtp_norm_conditional_add(_w):
+            return _w._clone(transform="add_if_mean_lt_0_5")
 
         def _mtp_norm_is_raw_hf(_w, _fallback):
             try:
@@ -123,9 +131,9 @@ def apply() -> bool:
                 if "mtp." in key:
                     # Per-key: a head norm may still be raw-HF even when a
                     # sibling head norm (e.g. mtp.norm) is already shifted.
-                    # Under oQ tracking the magnitude is unreadable, so fall
-                    # back to the backbone signal (same for a raw-HF source).
-                    if _mtp_norm_is_raw_hf(value, should_shift_norm_weights):
+                    if _is_oq_tracked_tensor(value):
+                        value = _mark_mtp_norm_conditional_add(value)
+                    elif _mtp_norm_is_raw_hf(value, should_shift_norm_weights):
                         value = value + 1.0
                 elif should_shift_norm_weights:
                     value = value + 1.0

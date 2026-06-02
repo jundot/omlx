@@ -155,6 +155,19 @@ class TestFunctionCallAndToolCall:
         assert fc.name == "no_args"
         assert fc.arguments == "{}"
 
+    def test_function_call_strips_name_whitespace(self):
+        """Model-emitted function names must not include incidental whitespace."""
+        fc = FunctionCall(name="Bash\n\n", arguments={})
+
+        assert fc.name == "Bash"
+        assert fc.arguments == "{}"
+
+    def test_function_call_rejects_non_string_name(self):
+        """Name normalization must not widen FunctionCall.name beyond str."""
+        for name in (None, 123, {"name": "Bash"}, ["Bash"]):
+            with pytest.raises(ValidationError):
+                FunctionCall(name=name, arguments={})
+
     def test_tool_call(self):
         """Test creating tool call."""
         tc = ToolCall(
@@ -465,6 +478,15 @@ class TestChatCompletionRequest:
         )
         assert req.xtc_probability == 0.5
         assert req.xtc_threshold == 0.1
+
+    def test_guided_grammar_accepted(self):
+        """Test guided_grammar is accepted as a grammar alias."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            guided_grammar='root ::= "YES"',
+        )
+        assert req.guided_grammar == 'root ::= "YES"'
 
 
 class TestChatCompletionResponse:

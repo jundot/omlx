@@ -42,7 +42,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
 
     struct ModelSettings: Codable, Equatable, Sendable {
         let modelDirs: [String]?
-        let maxModelMemory: String?
+        let modelDir: String?
         let modelFallback: Bool?
     }
 
@@ -62,12 +62,12 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     /// Mirrors the `memory.*` block of GET /admin/api/global-settings.
-    /// `max_process_memory` accepts "auto", "disabled", or "NN%". The
-    /// prefill guard is a runtime-applied bool — when on, the server
-    /// preflights prefill memory before kicking the engine.
+    /// The prefill guard and tier are runtime-applied. When enabled, the
+    /// server preflights prefill memory before kicking the engine.
     struct MemorySettings: Codable, Equatable, Sendable {
-        let maxProcessMemory: String?
         let prefillMemoryGuard: Bool?
+        let memoryGuardTier: String?
+        let memoryGuardCustomCeilingGb: Double?
     }
 
     /// Mirrors the `idle_timeout.*` block. `idle_timeout_seconds == nil`
@@ -234,19 +234,21 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     //
     // All flat (snake-cased on the wire by `convertToSnakeCase`). Server
     // applies live wherever possible — see `omlx/admin/routes.py` for the
-    // per-field apply paths. `initial_cache_blocks` and `max_process_memory`
-    // are persisted but only take effect on restart; everything else is
-    // hot-applied.
+    // per-field apply paths. `initial_cache_blocks` requires restart;
+    // memory guard settings are hot-applied.
 
-    /// Free-form memory limit. Accepts `"auto"`, `"disabled"`, or `"NN%"`.
-    var maxProcessMemory: String? = nil
     var memoryPrefillMemoryGuard: Bool? = nil
+    /// Memory guard tier: `"safe"`, `"balanced"`, `"aggressive"`, or
+    /// `"custom"`. For custom, pair with `memoryGuardCustomCeilingGb`.
+    var memoryGuardTier: String? = nil
+    var memoryGuardCustomCeilingGb: Double? = nil
 
-    /// Max bytes the engine pool will hold (`"24GB"`, `"50%"`, etc.).
-    var maxModelMemory: String? = nil
     /// When the requested model isn't loaded, fall back to any loaded
     /// model rather than 404.
     var modelFallback: Bool? = nil
+    /// Ordered model roots. The first directory is the primary download
+    /// target; all entries are scanned for local models.
+    var modelDirs: [String]? = nil
 
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil

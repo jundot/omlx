@@ -60,7 +60,7 @@ _STATIC_RESERVE_LARGE: dict[str, int] = {
     "safe": 12 * 1024**3,  # aligned with Apple iogpu.wired_limit 75%
     "balanced": 8 * 1024**3,
     "aggressive": 6 * 1024**3,
-    "custom": 8 * 1024**3,
+    "custom": 2 * 1024**3,
 }
 
 # Fraction of "active" pages we count as reclaimable via macOS
@@ -287,9 +287,9 @@ class ProcessMemoryEnforcer:
         settings_manager: ModelSettingsManager | None = None,
         prefill_memory_guard: bool = True,
         global_settings: GlobalSettings | None = None,
-        soft_threshold: float = 0.85,
+        soft_threshold: float = 0.90,
         hard_threshold: float = 0.95,
-        prefill_safe_zone_ratio: float = 0.80,
+        prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 32,
     ):
         """
@@ -438,6 +438,8 @@ class ProcessMemoryEnforcer:
         from .settings import get_system_memory
 
         system_bytes = get_system_memory()
+        if self._memory_guard_tier == "custom":
+            return max(0, system_bytes - _STATIC_RESERVE_LARGE["custom"])
         if system_bytes < _SMALL_SYSTEM_THRESHOLD:
             reserve = _SMALL_SYSTEM_RESERVE
         else:
@@ -490,15 +492,20 @@ class ProcessMemoryEnforcer:
         so users who have not raised iogpu.wired_limit_mb still get a
         safe (smaller) ceiling rather than a panic.
 
+        For `custom` tier the dynamic ceiling (vm_stat-based) is skipped;
+        the user-specified value is capped only by static (total - 2 GB)
+        and metal_cap.
+
         Returns 0 if the memory guard is disabled (callers treat 0 as
         "no limit").
         """
         if not self._prefill_memory_guard:
             return 0
-        candidates = [
-            self._get_static_ceiling(),
-            self._get_dynamic_ceiling(),
-        ]
+        candidates = [self._get_static_ceiling()]
+        if self._memory_guard_tier == "custom":
+            candidates.append(max(0, self._memory_guard_custom_ceiling_bytes))
+        else:
+            candidates.append(self._get_dynamic_ceiling())
         metal_cap = get_effective_metal_cap_bytes()
         if metal_cap > 0:
             candidates.append(metal_cap)

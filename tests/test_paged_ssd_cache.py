@@ -1545,6 +1545,61 @@ class TestAsyncBackgroundWrite:
             assert restored.dtype == mx_dtype
             assert mx.array_equal(original, restored).item()
 
+    def test_extract_materializes_lazy_slice(self, mx):
+        """_extract_tensor_bytes handles lazy block slices."""
+        base = mx.arange(1 * 2 * 16 * 4, dtype=mx.float32).reshape(1, 2, 16, 4)
+        mx.eval(base)
+        lazy_slice = base[:, :, 3:11, :]
+
+        raw, dtype_str, shape = _extract_tensor_bytes(lazy_slice)
+
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        expected = base[:, :, 3:11, :]
+        mx.eval(expected)
+        assert dtype_str == "F32"
+        assert shape == [1, 2, 8, 4]
+        assert mx.allclose(expected, restored).item()
+
+    def test_extract_materializes_lazy_bfloat16_slice(self, mx):
+        """_extract_tensor_bytes handles lazy bf16 slices and uint16 views."""
+        base = mx.arange(1 * 2 * 12 * 4, dtype=mx.float32).reshape(1, 2, 12, 4)
+        base = base.astype(mx.bfloat16)
+        mx.eval(base)
+        lazy_slice = base[:, :, 2:10, :]
+
+        raw, dtype_str, shape = _extract_tensor_bytes(lazy_slice)
+
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        expected = base[:, :, 2:10, :]
+        mx.eval(expected)
+        assert dtype_str == "BF16"
+        assert shape == [1, 2, 8, 4]
+        assert restored.dtype == mx.bfloat16
+        assert mx.allclose(
+            expected.astype(mx.float32), restored.astype(mx.float32)
+        ).item()
+
+    def test_extract_materializes_lazy_clone(self, mx):
+        """_extract_tensor_bytes handles block-like lazy clone/copy tensors."""
+        base = mx.arange(1 * 2 * 16 * 4, dtype=mx.float32).reshape(1, 2, 16, 4)
+        mx.eval(base)
+        tensor = base[:, :, 4:12, :]
+        if hasattr(mx, "copy"):
+            cloned = mx.copy(tensor)
+        elif hasattr(tensor, "copy"):
+            cloned = tensor.copy()
+        else:
+            cloned = mx.array(tensor)
+
+        raw, dtype_str, shape = _extract_tensor_bytes(cloned)
+
+        restored = _restore_tensor_from_bytes(raw, dtype_str, shape)
+        expected = base[:, :, 4:12, :]
+        mx.eval(expected)
+        assert dtype_str == "F32"
+        assert shape == [1, 2, 8, 4]
+        assert mx.allclose(expected, restored).item()
+
     def test_write_safetensors_no_mx_roundtrip(self, mx, tmp_path):
         """Write safetensors without mx API, then load with mx.load()."""
         t1 = mx.random.normal((2, 3, 4))

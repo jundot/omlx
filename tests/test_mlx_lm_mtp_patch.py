@@ -310,10 +310,10 @@ class TestQwen35MtpNormShift:
     def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
         placeholders where the per-key magnitude can't be read. The helper
-        must fall back to the shape-based conv1d signal so the +1 shift is
-        recorded as a replayable ``add`` for MTP norms (a raw-HF source).
-        Otherwise the shift is dropped from the plan and the oQ-quantized
-        artifact ships unshifted MTP norms (regression guard for the fix)."""
+        must record a conditional replay transform for MTP norms so the
+        materialization path can still decide from the real tensor value.
+        Otherwise full-precision Qwen3.6 sources with mixed MTP norm
+        conventions can be double-shifted or left unshifted."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -336,10 +336,14 @@ class TestQwen35MtpNormShift:
         }
         plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
 
-        # Backbone and MTP norms alike must carry the replayable +1 add.
+        # Backbone still has a fixed +1 add from the raw-HF conv1d signal.
+        # MTP norms need per-key value checks at materialization time.
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
-        assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
-        assert plan["mtp.norm.weight"]["transform"] == "add"
+        assert (
+            plan["mtp.layers.0.input_layernorm.weight"]["transform"]
+            == "add_if_mean_lt_0_5"
+        )
+        assert plan["mtp.norm.weight"]["transform"] == "add_if_mean_lt_0_5"
 
 
 class TestQwen35MoeSanitize:
@@ -500,6 +504,20 @@ class TestDeepseekV4Model:
         # Idempotent.
         applied_again = deepseek_v4_model.apply()
         assert applied_again is True
+
+    def test_mtp_patch_materializes_backbone_and_mtp_cache(self):
+        """DeepSeek-V4 MTP override must keep the base Metal leak fix."""
+        import inspect
+
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        call_source = inspect.getsource(
+            deepseek_v4_model._patch_deepseek_v4_model_call
+        )
+        model_source = inspect.getsource(deepseek_v4_model._patch_model)
+
+        assert "materialize_cache_arrays(cache)" in call_source
+        assert "materialize_cache_arrays(cache)" in model_source
 
 
 class TestBatchGeneratorDispatch:

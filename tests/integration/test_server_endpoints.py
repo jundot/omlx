@@ -571,6 +571,33 @@ class TestModelsStatusEndpoint:
         data = response.json()
         assert "models" in data
 
+    def test_models_status_includes_model_alias(self, client):
+        """Model aliases should be available to clients that join status metadata."""
+        from omlx.server import _server_state
+
+        class Settings:
+            model_alias = "gpt-4o"
+            max_context_window = 32768
+            max_tokens = 8192
+
+        class SettingsManager:
+            def get_settings(self, model_id):
+                return Settings()
+
+        original_settings_manager = _server_state.settings_manager
+        try:
+            _server_state.settings_manager = SettingsManager()
+            response = client.get("/v1/models/status")
+        finally:
+            _server_state.settings_manager = original_settings_manager
+
+        assert response.status_code == 200
+        model = response.json()["models"][0]
+        assert model["id"] == "test-model"
+        assert model["model_alias"] == "gpt-4o"
+        assert model["max_context_window"] == 32768
+        assert model["max_tokens"] == 8192
+
 
 class TestCompletionEndpoint:
     """Tests for the /v1/completions endpoint."""

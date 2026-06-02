@@ -96,7 +96,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Native macOS app for the oMLX server"
+            "value" : "Local AI, no more waiting on your Mac."
           }
         }
       }
@@ -1613,6 +1613,18 @@
         }
       }
     },
+    "common.back" : {
+      "comment" : "Back button label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Back"
+          }
+        }
+      }
+    },
     "common.open" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -2923,13 +2935,13 @@
       }
     },
     "menubar.header.running" : {
-      "comment" : "Menubar status header when the server is running; placeholders are PID and port",
+      "comment" : "Menubar status header when the server is running; placeholder is the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: running · pid %1$@ · :%2$@"
+            "value" : "Server: running (port %@)"
           }
         }
       }
@@ -2971,13 +2983,13 @@
       }
     },
     "menubar.header.unresponsive" : {
-      "comment" : "Menubar status header when the server is unresponsive; placeholder is PID",
+      "comment" : "Menubar status header when the server is unresponsive",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: unresponsive · pid %@ (auto-recover or Force Restart)"
+            "value" : "Server: unresponsive (auto-recover or Force Restart)"
           }
         }
       }
@@ -7372,7 +7384,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Default 8080. Server restarts on save."
+            "value" : "Default 8000. Server restarts on save."
           }
         }
       }
@@ -9924,7 +9936,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Session Stats"
+            "value" : "Serving Stats"
           }
         },
         "ja" : {
@@ -9953,6 +9965,66 @@
         }
       }
     },
+    "status.speed.prompt_processing" : {
+      "comment" : "Label for average prompt-processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing_note" : {
+      "comment" : "Note after prompt-processing speed label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing.tile" : {
+      "comment" : "Tile label for average prompt-processing speed excluding cached tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing (excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.section_label" : {
+      "comment" : "Header label above average serving speed metrics",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Speed"
+          }
+        }
+      }
+    },
+    "status.speed.token_generation" : {
+      "comment" : "Label for average token-generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token Generation"
+          }
+        }
+      }
+    },
     "status.system.subtitle" : {
       "comment" : "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers",
       "extractionState" : "extracted_with_value",
@@ -9971,7 +10043,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cached"
+            "value" : "Cached Tokens"
+          }
+        }
+      }
+    },
+    "status.tile.cache_efficiency" : {
+      "comment" : "Stat tile label for cache efficiency percentage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache Efficiency"
           }
         }
       }
@@ -10040,7 +10124,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Total Tokens"
+            "value" : "Total Prefill Tokens"
           }
         }
       }
@@ -10100,7 +10184,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Download in the background, install on next launch"
+            "value" : "Download in the background, then show Install & Restart"
           }
         }
       }
@@ -10318,54 +10402,6 @@
         }
       }
     },
-    "welcome.api_key.confirm.label" : {
-      "comment" : "Row label for the API key confirmation field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Confirm"
-          }
-        }
-      }
-    },
-    "welcome.api_key.confirm.sub" : {
-      "comment" : "Sublabel for the Confirm API key field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Re-enter the key to catch typos"
-          }
-        }
-      }
-    },
-    "welcome.api_key.generate" : {
-      "comment" : "Button label that mints a random API key",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Generate"
-          }
-        }
-      }
-    },
-    "welcome.api_key.generate.help" : {
-      "comment" : "Tooltip on the Generate API key button",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Generate a random 40-char API key"
-          }
-        }
-      }
-    },
     "welcome.api_key.hide" : {
       "comment" : "Tooltip on the eye-slash button that masks the API key field",
       "extractionState" : "manual",
@@ -10391,25 +10427,13 @@
       }
     },
     "welcome.api_key.placeholder" : {
-      "comment" : "Placeholder text inside the API key text fields",
+      "comment" : "Placeholder text inside the API key text field",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "sk-omlx-…"
-          }
-        }
-      }
-    },
-    "welcome.api_key.section" : {
-      "comment" : "Section heading above the API key rows in Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API Key"
+            "value" : "Create an API key"
           }
         }
       }
@@ -10427,13 +10451,13 @@
       }
     },
     "welcome.api_key.sub" : {
-      "comment" : "Sublabel describing API key format requirements",
+      "comment" : "Sublabel explaining API key usage",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "At least 4 printable characters, no whitespace"
+            "value" : "This key is also your Web Dashboard login password."
           }
         }
       }
@@ -10486,32 +10510,32 @@
         }
       }
     },
-    "welcome.button.open_admin" : {
-      "comment" : "Secondary footer button: start server and open the browser dashboard",
+    "welcome.button.get_started" : {
+      "comment" : "Primary footer button that advances from the intro to setup",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Open Admin Panel & Close"
+            "value" : "Get Started"
           }
         }
       }
     },
-    "welcome.button.reset" : {
-      "comment" : "Clear the Model Directory override",
+    "welcome.button.open_dashboard" : {
+      "comment" : "Footer button that opens the local web dashboard",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Reset"
+            "value" : "Open Web Dashboard"
           }
         }
       }
     },
     "welcome.button.start_server" : {
-      "comment" : "Primary footer button that spawns the server and closes the wizard",
+      "comment" : "Primary footer button that spawns the server",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -10529,7 +10553,43 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Starting…"
+            "value" : "Starting Server..."
+          }
+        }
+      }
+    },
+    "welcome.complete.description" : {
+      "comment" : "Description on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX is running locally at http://127.0.0.1:%@. Open the web dashboard to download your first model, manage settings, and connect your coding tools."
+          }
+        }
+      }
+    },
+    "welcome.complete.status" : {
+      "comment" : "Short success status on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server started. Dashboard is ready."
+          }
+        }
+      }
+    },
+    "welcome.complete.title" : {
+      "comment" : "Heading on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All set!"
           }
         }
       }
@@ -10554,18 +10614,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Invalid port."
-          }
-        }
-      }
-    },
-    "welcome.error.key_mismatch" : {
-      "comment" : "Welcome wizard validation: confirm field differs",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API keys do not match."
           }
         }
       }
@@ -10697,7 +10745,31 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "LLM inference, optimized for your Mac"
+            "value" : "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90."
+          }
+        }
+      }
+    },
+    "welcome.header.subtitle" : {
+      "comment" : "Short tagline under the Welcome wizard's main heading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local AI, no more waiting."
+          }
+        }
+      }
+    },
+    "welcome.header.meta" : {
+      "comment" : "Short metadata line on the Welcome intro page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Silicon · macOS-native · Apache 2.0"
           }
         }
       }
@@ -10709,31 +10781,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Welcome to oMLX"
-          }
-        }
-      }
-    },
-    "welcome.hint.models_library" : {
-      "comment" : "Hint line pointing the user to Downloads after first-run",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Your model library starts empty — visit Downloads to fetch your first model."
-          }
-        }
-      }
-    },
-    "welcome.hint.reopen" : {
-      "comment" : "Hint line telling the user how to get back to the Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "You can re-open this wizard anytime from the menubar."
+            "value" : "oMLX"
           }
         }
       }
@@ -10745,7 +10793,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security."
+            "value" : "Settings are stored in ~/.omlx/settings.json."
           }
         }
       }
@@ -10757,19 +10805,43 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Confirm where weights live and pick an API key. You can change either later in Settings."
+            "value" : "Choose where models live, pick a port, and create the API key you'll use from apps and the web dashboard."
           }
         }
       }
     },
-    "welcome.storage.base_dir.label" : {
-      "comment" : "Row label for the Base Directory picker in Welcome wizard",
+    "welcome.setup.title" : {
+      "comment" : "Heading on the Welcome setup page",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Base Directory"
+            "value" : "Set up your local server"
+          }
+        }
+      }
+    },
+    "welcome.setup.local.title" : {
+      "comment" : "Title for the local server setup card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local server"
+          }
+        }
+      }
+    },
+    "welcome.setup.local.body" : {
+      "comment" : "Body for the local server setup card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network."
           }
         }
       }
@@ -10786,26 +10858,14 @@
         }
       }
     },
-    "welcome.storage.model_dir.placeholder" : {
-      "comment" : "Placeholder string shown when Model Directory is unset; placeholder is the base path's leaf name",
-      "extractionState" : "extracted_with_value",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "<%@>/models"
-          }
-        }
-      }
-    },
     "welcome.storage.model_dir.sub" : {
-      "comment" : "Sublabel hinting that Model Directory is optional",
+      "comment" : "Sublabel explaining the model directory",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Optional — defaults to <base>/models"
+            "value" : "Where downloaded models are stored."
           }
         }
       }
@@ -10823,25 +10883,13 @@
       }
     },
     "welcome.storage.port.sub" : {
-      "comment" : "Sublabel for the port field with the recommended range",
+      "comment" : "Sublabel for the port field with the recommended default",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "1024-65535 recommended; default 8080"
-          }
-        }
-      }
-    },
-    "welcome.storage.section" : {
-      "comment" : "Section heading above the Storage rows in Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Storage"
+            "value" : "Default 8000. Change this only if the port is already in use."
           }
         }
       }

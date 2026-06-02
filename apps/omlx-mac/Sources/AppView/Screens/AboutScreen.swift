@@ -54,7 +54,7 @@ private struct HeroCard: View {
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "about.hero.tagline",
-                            defaultValue: "Native macOS app for the oMLX server",
+                            defaultValue: "Local AI, no more waiting on your Mac.",
                             comment: "Tagline shown under the oMLX product name on the About screen hero card"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)

@@ -173,6 +173,7 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     from mlx_lm.models.base import create_attention_mask
 
     CacheList = dsv4.CacheList
+    materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     def __call__(
         self,
@@ -209,6 +210,8 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+
+        materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -254,6 +257,7 @@ def _patch_model(dsv4: Any) -> None:
     PoolingCache = dsv4.PoolingCache
     RotatingKVCache = dsv4.RotatingKVCache
     SparseCompressedAttention = getattr(dsv4, "SparseCompressedAttention", None)
+    materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     original_init = cls.__init__
 
@@ -346,6 +350,8 @@ def _patch_model(dsv4: Any) -> None:
                 h, self.model.embed_tokens, input_ids, mask, layer_cache
             )
             last_block = mtp_block
+
+        materialize_cache_arrays(cache)
 
         out = last_block.hc_head(h)
         out = last_block.norm(out)

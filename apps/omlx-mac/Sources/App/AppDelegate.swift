@@ -9,10 +9,10 @@
 //   applicationDidFinishLaunching   → load AppConfig
 //                                     → install NSWindow observers (drive
 //                                       the dock-icon toggle)
-//                                     → if first run (no config.json):
-//                                         • create MenubarController (no server)
+//                                     → if first run (no settings.json):
 //                                         • show Welcome window (wizard
-//                                           persists config + spawns server)
+//                                           persists config + spawns server
+//                                           only after Start Server)
 //                                     else (returning user):
 //                                         • resolve PythonRuntime
 //                                         • spawn ServerProcess
@@ -126,6 +126,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installWindowObservers()
+        if !isRunningUnitTests {
+            do {
+                try ShellEnvWriter.ensureCLIShim()
+            } catch {
+                NSLog("oMLX: CLI shim setup failed — \(error)")
+            }
+        }
 
         let config = AppConfig.load()
         services.updateConfig(config)
@@ -138,15 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             bootstrapServer(config: config)
             scheduleAccessoryPolicyFlip()
         } else {
-            // First run: stand up the menubar without a server, then run the
-            // wizard. The wizard's "Start Server" creates a ServerProcess via
-            // `services.bind(server:)`; AppDelegate adopts it back on close.
-            self.menubar = makeMenubar(server: nil, config: config)
-            // Stay in .regular until the wizard closes so the user sees the
-            // window in the Dock.
+            // First run: show the wizard only. Do not create the menubar or
+            // persist settings until the user clicks Start Server.
             NSApp.activate(ignoringOtherApps: true)
             presentWelcome()
         }
+    }
+
+    private var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 
     /// All three MenubarController construction sites (first-run, returning
@@ -171,7 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let runtime = try PythonRuntime.resolve()
             let server = ServerProcess(
                 runtime: runtime,
-                host: config.host,
+                bindAddress: config.bindAddress,
                 port: config.port,
                 basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
             )
@@ -295,25 +302,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             didFinish: { [weak self] _, finishedServer in
                 // The wizard returns the spawned ServerProcess. Adopt it so
                 // applicationWillTerminate can clean up correctly.
-                self?.server = finishedServer
+                guard let self else { return }
+                self.server = finishedServer
                 if let proc = finishedServer {
                     SignalHandlers.shared.install { [weak proc] in
                         proc?.reapSync()
                     }
                 }
-            },
-            didSkip: { [weak self] snapshot in
-                // Spec §State machine: write the current Storage values on
-                // close so the next launch lands on AppView with the
-                // API-key-not-configured banner instead of re-firing the
-                // wizard.
-                guard let self else { return }
-                do {
-                    try snapshot.save()
-                    self.services.updateConfig(snapshot)
-                } catch {
-                    NSLog("oMLX: welcome skip — failed to persist partial config: \(error)")
-                }
+                self.menubar = self.makeMenubar(
+                    server: finishedServer,
+                    config: self.services.config
+                )
             }
         )
         self.welcomeController = controller
@@ -338,9 +337,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         welcomeController = nil
 
-        // The wizard either spawned the server itself (success path) or the
-        // user closed it without starting (skipped). Rebuild the menubar
-        // with whatever state we ended up with.
+        // Close before Start Server is cancellation: no menubar, no settings,
+        // no base directory. Quit completely so relaunch shows Welcome again.
+        guard server != nil else {
+            explicitQuitRequested = true
+            NSApp.terminate(nil)
+            return
+        }
+
+        // The wizard spawned the server itself. Rebuild the menubar with the
+        // running server state and switch to menubar-only mode.
         if let server, menubar != nil {
             self.menubar = MenubarController(
                 server: server,
@@ -349,9 +355,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 requestQuit:  { [weak self] in self?.requestQuit() }
             )
         }
-        // First-run flow always ends in menubar-only mode. The observer's
-        // flag-based policy drop only fires for explicit Cmd-Q / Dock Quit
-        // closes, so we set .accessory here directly.
         scheduleAccessoryPolicyFlip()
     }
 

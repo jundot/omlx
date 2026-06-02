@@ -151,6 +151,8 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
     reasoning_parser: str | None = None
+    guided_grammar_enabled: bool | None = None
+    guided_grammar: str | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
@@ -2104,6 +2106,11 @@ async def update_model_settings(
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
+    if "guided_grammar_enabled" in sent:
+        current_settings.guided_grammar_enabled = request.guided_grammar_enabled or False
+    if "guided_grammar" in sent:
+        grammar = request.guided_grammar.strip() if request.guided_grammar else None
+        current_settings.guided_grammar = grammar or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

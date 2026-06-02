@@ -12,7 +12,7 @@
 //      we keep — its sole job is to tell us where settings.json lives.
 //   3. Default `~/.omlx`.
 //
-// Every other field (host, port, api_key, model_dir, hf_endpoint) lives
+// Every other field (host, port, api_key, model_dirs, hf_endpoint) lives
 // in `<basePath>/settings.json` — owned by the running Python server,
 // written by AppConfig.save() when the server is offline. Unknown keys
 // in settings.json (cache, integrations, ui, …) are preserved verbatim.
@@ -25,7 +25,13 @@
 import Foundation
 
 struct AppConfig: Sendable, Equatable, Codable {
-    var host: String
+    /// The raw bind address the user configured (e.g. `0.0.0.0`, `127.0.0.1`, `localhost`).
+    var bindAddress: String
+    /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
+    /// `0.0.0.0` is a bind wildcard, not a connectable address.
+    var host: String {
+        Self.connectableHost(for: bindAddress)
+    }
     var port: Int
     var apiKey: String?
     /// Always `OMLX_BASE_PATH` if set, else `~/.omlx`. Set at load() time
@@ -34,21 +40,63 @@ struct AppConfig: Sendable, Equatable, Codable {
     /// the user moves their data root.
     var basePath: String
     /// Always a literal path. Defaults to `<basePath>/models` and can be
-    /// pointed at any folder; never empty in memory or on disk.
+    /// pointed at any folder; never empty in memory or on disk. Kept as
+    /// the primary path for older call sites and the deprecated server key.
     var modelDir: String
+    /// Ordered model roots. The first path mirrors `modelDir`; additional
+    /// entries are scanned for local models but are not download targets.
+    var modelDirs: [String] = []
     /// HuggingFace endpoint override. Empty = default `huggingface.co`.
     var hfEndpoint: String
 
+    init(
+        bindAddress: String,
+        port: Int,
+        apiKey: String?,
+        basePath: String,
+        modelDir: String,
+        modelDirs: [String]? = nil,
+        hfEndpoint: String
+    ) {
+        self.bindAddress = bindAddress
+        self.port = port
+        self.apiKey = apiKey
+        self.basePath = basePath
+        self.modelDir = modelDir
+        let cleanedModelDirs = (modelDirs ?? [modelDir]).filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        self.modelDirs = cleanedModelDirs.isEmpty ? [modelDir] : cleanedModelDirs
+        if let primary = self.modelDirs.first {
+            self.modelDir = primary
+        }
+        self.hfEndpoint = hfEndpoint
+    }
+
     static var `default`: AppConfig {
         let base = currentBasePath()
+        let modelDir = defaultModelDir(forBasePath: base)
         return AppConfig(
-            host: "127.0.0.1",
-            port: 8080,
+            bindAddress: "127.0.0.1",
+            port: 8000,
             apiKey: nil,
             basePath: base,
-            modelDir: defaultModelDir(forBasePath: base),
+            modelDir: modelDir,
+            modelDirs: [modelDir],
             hfEndpoint: ""
         )
+    }
+
+    var effectiveModelDirs: [String] {
+        let dirs = modelDirs.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return dirs.isEmpty ? [modelDir] : dirs
+    }
+
+    mutating func setModelDirs(_ dirs: [String]) {
+        let cleaned = dirs.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard let primary = cleaned.first else { return }
+        modelDirs = cleaned
+        modelDir = primary
     }
 
     /// `<basePath>/models` — the literal the server falls back to when the
@@ -57,6 +105,10 @@ struct AppConfig: Sendable, Equatable, Codable {
         URL(fileURLWithPath: base, isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
             .path
+    }
+
+    static func connectableHost(for bindAddress: String) -> String {
+        bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
     }
 
     var baseURL: URL? {
@@ -179,20 +231,28 @@ struct AppConfig: Sendable, Equatable, Codable {
         var c = Self.default
 
         if let slice = try? readSettings(basePath: c.basePath) {
-            if let h = slice.host { c.host = h }
+            if let h = slice.bindAddress { c.bindAddress = h }
             if let p = slice.port { c.port = p }
             if let k = slice.apiKey, !k.isEmpty { c.apiKey = k }
-            // settings.json may not have model_dir on a brand-new install;
-            // in that case `c.modelDir` keeps the `<basePath>/models`
+            // settings.json may not have model_dirs on a brand-new install;
+            // in that case `c.modelDirs` keeps the `<basePath>/models`
             // default that `Self.default` already populated.
-            if let m = slice.modelDir, !m.isEmpty { c.modelDir = m }
+            let dirs = (slice.modelDirs ?? [])
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            if let first = dirs.first {
+                c.modelDirs = dirs
+                c.modelDir = first
+            } else if let m = slice.modelDir, !m.isEmpty {
+                c.modelDir = m
+                c.modelDirs = [m]
+            }
             if let hf = slice.hfEndpoint { c.hfEndpoint = hf }
         }
 
         // Env overrides for non-path fields. basePath is already env-driven
         // via currentBasePath().
         let env = ProcessInfo.processInfo.environment
-        if let h = env["OMLX_HOST"], !h.isEmpty { c.host = h }
+        if let h = env["OMLX_HOST"], !h.isEmpty { c.bindAddress = h }
         if let pStr = env["OMLX_PORT"], let p = Int(pStr) { c.port = p }
         if let k = env["OMLX_API_KEY"], !k.isEmpty { c.apiKey = k }
         return c
@@ -218,7 +278,8 @@ struct AppConfig: Sendable, Equatable, Codable {
         }
 
         var server = (json["server"] as? [String: Any]) ?? [:]
-        server["host"] = host
+        server["host"] = bindAddress
+        server.removeValue(forKey: "bind_address")
         server["port"] = port
         json["server"] = server
 
@@ -227,10 +288,11 @@ struct AppConfig: Sendable, Equatable, Codable {
         json["auth"] = auth
 
         var model = (json["model"] as? [String: Any]) ?? [:]
-        // `modelDir` is always a literal path (never empty). On a basePath
-        // move, AppServices.relocate() rewrites it so the persisted value
-        // tracks the new root when modelDir lived inside basePath.
-        model["model_dir"] = modelDir
+        // `modelDirs` is always persisted as the canonical ordered list, with
+        // `model_dir` kept in sync for older server/app builds.
+        let dirs = effectiveModelDirs
+        model["model_dirs"] = dirs
+        model["model_dir"] = dirs[0]
         json["model"] = model
 
         var hf = (json["huggingface"] as? [String: Any]) ?? [:]
@@ -250,11 +312,16 @@ struct AppConfig: Sendable, Equatable, Codable {
 
     /// Subset of `<basePath>/settings.json` we project into AppConfig.
     struct ServerSettingsSlice {
-        var host: String?
+        var bindAddress: String?
         var port: Int?
         var apiKey: String?
+        var modelDirs: [String]?
         var modelDir: String?
         var hfEndpoint: String?
+    }
+
+    static func readSettingsForTests(basePath: String) throws -> ServerSettingsSlice {
+        try readSettings(basePath: basePath)
     }
 
     private static func readSettings(basePath: String) throws -> ServerSettingsSlice {
@@ -268,10 +335,15 @@ struct AppConfig: Sendable, Equatable, Codable {
         let auth   = json["auth"]   as? [String: Any]
         let model  = json["model"]  as? [String: Any]
         let hf     = json["huggingface"] as? [String: Any]
+        // `host` remains the Python/admin settings key. `bind_address` is a
+        // read-only compatibility fallback for builds that briefly wrote it.
+        let bindAddr = server?["host"] as? String
+            ?? server?["bind_address"] as? String
         return ServerSettingsSlice(
-            host: server?["host"] as? String,
+            bindAddress: bindAddr,
             port: server?["port"] as? Int,
             apiKey: auth?["api_key"] as? String,
+            modelDirs: model?["model_dirs"] as? [String],
             modelDir: model?["model_dir"] as? String,
             hfEndpoint: hf?["endpoint"] as? String
         )

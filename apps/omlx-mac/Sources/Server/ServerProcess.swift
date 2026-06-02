@@ -70,7 +70,12 @@ final class ServerProcess: @unchecked Sendable {
 
     // Inputs
 
-    private(set) var host: String
+    private(set) var bindAddress: String
+    /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
+    /// `0.0.0.0` is a bind wildcard, not a connectable address.
+    var host: String {
+        AppConfig.connectableHost(for: bindAddress)
+    }
     private(set) var port: Int
     private(set) var basePath: URL
     private let runtime: PythonRuntime
@@ -82,14 +87,14 @@ final class ServerProcess: @unchecked Sendable {
     /// process so a stale resolver / spawn args can never reach a running
     /// uvicorn.
     enum ReconfigureError: Error { case serverIsLive }
-    func reconfigure(host: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
+    func reconfigure(bindAddress: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
         switch state {
         case .running, .starting, .stopping, .unresponsive:
             throw ReconfigureError.serverIsLive
         case .stopped, .failed:
             break
         }
-        if let host { self.host = host }
+        if let bindAddress { self.bindAddress = bindAddress }
         if let port { self.port = port }
         if let basePath { self.basePath = basePath }
         self.resolver = PortConflictResolver(host: self.host, port: self.port)
@@ -117,16 +122,19 @@ final class ServerProcess: @unchecked Sendable {
 
     init(
         runtime: PythonRuntime,
-        host: String = "127.0.0.1",
-        port: Int = 8080,
+        bindAddress: String = "127.0.0.1",
+        port: Int = 8000,
         basePath: URL = ServerProcess.defaultBasePath()
     ) {
         self.runtime  = runtime
-        self.host     = host
+        self.bindAddress = bindAddress
         self.port     = port
         self.basePath = basePath
         self.logURL   = ServerProcess.defaultLogURL()
-        self.resolver = PortConflictResolver(host: host, port: port)
+        self.resolver = PortConflictResolver(
+            host: AppConfig.connectableHost(for: bindAddress),
+            port: port
+        )
     }
 
     // MARK: - Public surface
@@ -381,7 +389,7 @@ final class ServerProcess: @unchecked Sendable {
     private func makeArguments() -> [String] {
         let env = ProcessInfo.processInfo.environment
         if let dev = env["OMLX_DEV_SERVER_SCRIPT"], !dev.isEmpty {
-            return [dev, "--host", host, "--port", String(port)]
+            return [dev, "--host", bindAddress, "--port", String(port)]
         }
         return [
             "-m", "omlx.cli", "serve",

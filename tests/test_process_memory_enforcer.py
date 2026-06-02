@@ -407,6 +407,29 @@ class TestStaticCeiling:
             result = enforcer._get_static_ceiling()
         assert result == 8 * 1024**3
 
+    def test_custom_uses_2gb_reserve_on_large_system(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=50.0,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 64 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 62 * 1024**3
+
+    def test_custom_uses_2gb_reserve_on_small_system(self, mock_engine_pool):
+        """Custom bypasses the 4 GB small-system reserve."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=8.0,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 12 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 10 * 1024**3
+
 
 class TestDynamicCeilingActiveRatio:
     """Dynamic ceiling sums free + inactive + active * tier ratio
@@ -494,7 +517,7 @@ class TestDynamicCeilingCustom:
             return_value=48 * 1024**3,
         ):
             ceiling = enforcer._get_hard_limit_bytes()
-        # static = 64 - 8 = 56 GB; metal = 48 GB; custom = 1024 GB
+        # static = 64 - 2 = 62 GB; metal = 48 GB; custom = 1024 GB
         # → clamped to metal 48 GB
         assert ceiling == 48 * 1024**3
 

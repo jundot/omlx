@@ -549,16 +549,10 @@ final class IntegrationsScreenVM: ObservableObject {
         return out
     }
 
-    /// Composed `omlx launch claude` command — kept reactive on field
-    /// changes so the user sees their selection immediately.
+    /// Composed `omlx launch claude` command. Claude tier selections are
+    /// persisted in settings, so the launcher reads them without extra flags.
     var claudeLaunchCommand: String {
-        if claudeMode == "cloud" {
-            return "\(cliPrefix) launch claude"
-        }
-        let opus   = opusModel.isEmpty   ? "<opus-model>"   : opusModel
-        let sonnet = sonnetModel.isEmpty ? "<sonnet-model>" : sonnetModel
-        let haiku  = haikuModel.isEmpty  ? "<haiku-model>"  : haikuModel
-        return "\(cliPrefix) launch claude --opus \(opus) --sonnet \(sonnet) --haiku \(haiku)"
+        "\(cliPrefix) launch claude"
     }
 
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors

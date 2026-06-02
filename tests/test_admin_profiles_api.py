@@ -173,7 +173,18 @@ def test_all_model_settings_fields_classified():
     )
     from omlx.model_settings import ModelSettings
 
-    classified = set(UNIVERSAL_PROFILE_FIELDS) | set(MODEL_SPECIFIC_PROFILE_FIELDS) | EXCLUDED_FROM_PROFILES
+    universal = set(UNIVERSAL_PROFILE_FIELDS)
+    model_specific = set(MODEL_SPECIFIC_PROFILE_FIELDS)
+    excluded = set(EXCLUDED_FROM_PROFILES)
+    assert len(UNIVERSAL_PROFILE_FIELDS) == len(universal)
+    assert len(MODEL_SPECIFIC_PROFILE_FIELDS) == len(model_specific)
+    assert not (universal & model_specific)
+    assert not (universal & excluded)
+    assert not (model_specific & excluded)
+    assert "preserve_thinking" in universal
+    assert "preserve_thinking" not in excluded
+
+    classified = universal | model_specific | excluded
     all_fields = {f.name for f in fields(ModelSettings)}
     missing = all_fields - classified
     assert not missing, (
@@ -257,6 +268,22 @@ class TestModelsResponseActiveProfile:
         models = r.json()["models"]
         entry = next(m for m in models if m["id"] == "model-a")
         assert entry["settings"]["active_profile_name"] == "coding"
+
+    def test_guided_grammar_surfaces_in_list_models(self, client):
+        c, _ = client
+        r = c.put("/admin/api/models/model-a/settings", json={
+            "guided_grammar_enabled": True,
+            "guided_grammar": '  root ::= "YES"  ',
+        })
+        assert r.status_code == 200
+        assert r.json()["settings"]["guided_grammar_enabled"] is True
+        assert r.json()["settings"]["guided_grammar"] == 'root ::= "YES"'
+
+        r = c.get("/admin/api/models")
+        assert r.status_code == 200
+        entry = next(m for m in r.json()["models"] if m["id"] == "model-a")
+        assert entry["settings"]["guided_grammar_enabled"] is True
+        assert entry["settings"]["guided_grammar"] == 'root ::= "YES"'
 
 
 class TestActiveProfileDriftClearing:

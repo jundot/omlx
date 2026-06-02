@@ -547,11 +547,19 @@ def _patch_text_model(q35: Any) -> None:
         # magnitude: raw-HF RMSNorm weights center near 0, MLX-shifted near 1.
         # The magnitude can't be read during oQ's streaming plan discovery
         # (the weight is a no-data ``_TrackedTensor`` placeholder and
-        # ``mx.mean(...).item()`` raises), so fall back to the shape-based
-        # ``should_shift_norm_weights`` there — otherwise the +1 shift is
-        # dropped from the discovered plan and the oQ output ships unshifted
-        # MTP norms (the same ~0% acceptance bug, baked into the artifact).
+        # ``mx.mean(...).item()`` raises), so emit a conditional replay
+        # transform there. A fixed fallback is wrong for Qwen3.6 sources
+        # where MTP norm conventions are mixed.
         import mlx.core as _mx
+
+        def _is_oq_tracked_tensor(_w):
+            return (
+                _w.__class__.__name__ == "_TrackedTensor"
+                and hasattr(_w, "_clone")
+            )
+
+        def _mark_mtp_norm_conditional_add(_w):
+            return _w._clone(transform="add_if_mean_lt_0_5")
 
         def _mtp_norm_is_raw_hf(_w, _fallback):
             try:
@@ -596,10 +604,10 @@ def _patch_text_model(q35: Any) -> None:
                 if "mtp." in k:
                     # Per-key decision: a head norm may still be raw-HF even
                     # when a sibling head norm (e.g. mtp.norm) is already in
-                    # the +1 convention. Shift only the raw-HF ones. Under oQ
-                    # tracking the magnitude is unreadable, so fall back to the
-                    # backbone signal (same result for a raw-HF source).
-                    if _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
+                    # the +1 convention. Shift only the raw-HF ones.
+                    if _is_oq_tracked_tensor(v):
+                        weights[k] = _mark_mtp_norm_conditional_add(v)
+                    elif _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
                         weights[k] = v + 1.0
                 elif should_shift_norm_weights:
                     weights[k] = v + 1.0

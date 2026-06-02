@@ -36,6 +36,25 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
 
+    def test_guided_grammar_defaults(self):
+        """Test guided grammar defaults to disabled."""
+        settings = ModelSettings()
+        assert settings.guided_grammar_enabled is False
+        assert settings.guided_grammar is None
+
+    def test_guided_grammar_roundtrip(self):
+        """Test guided grammar survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            guided_grammar_enabled=True,
+            guided_grammar='root ::= "YES"',
+        )
+        d = original.to_dict()
+        assert d["guided_grammar_enabled"] is True
+        assert d["guided_grammar"] == 'root ::= "YES"'
+        restored = ModelSettings.from_dict(d)
+        assert restored.guided_grammar_enabled is True
+        assert restored.guided_grammar == 'root ::= "YES"'
+
     def test_trust_remote_code_excluded_from_profiles(self):
         """Security flag must never propagate via profiles or templates."""
         from omlx.model_profiles import EXCLUDED_FROM_PROFILES

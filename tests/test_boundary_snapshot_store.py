@@ -22,7 +22,10 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
-from omlx.cache.boundary_snapshot_store import BoundarySnapshotSSDStore
+from omlx.cache.boundary_snapshot_store import (
+    BoundarySnapshotSSDStore,
+    reset_boundary_snapshot_root,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +81,19 @@ class TestBoundarySnapshotSSDStore:
         yield
         self.store.shutdown()
 
+    def _wait_for_disk(self, store, request_id: str, token_count: int) -> Path:
+        import time
+
+        file_path = store._file_path(request_id, token_count)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if file_path.exists():
+                with store._pending_lock:
+                    store._pending_writes.pop((request_id, token_count), None)
+                return file_path
+            time.sleep(0.02)
+        raise AssertionError(f"snapshot was not written: {file_path}")
+
     def test_save_and_load_roundtrip(self):
         """Save a snapshot and load it back — tensors should match."""
         ok = self.store.save(
@@ -129,8 +145,8 @@ class TestBoundarySnapshotSSDStore:
 
         assert not self.store.has("req-1", 1024)
         assert not self.store.has("req-2", 2048)
-        # Directory still exists (recreated).
-        assert (self.base_dir / "_boundary_snapshots").exists()
+        # Session directory still exists (recreated).
+        assert self.store._snapshot_dir.exists()
 
     def test_load_from_disk_after_pending_writes_cleared(self):
         """After background writer completes, load should read from disk."""
@@ -190,18 +206,73 @@ class TestBoundarySnapshotSSDStore:
         assert loaded[0]["state"][0].dtype == mx.bfloat16
         assert loaded[0]["meta_state"] == (1, 2, 3)
 
-    def test_startup_cleans_orphaned_files(self):
-        """Constructor should remove orphaned files from previous crashes."""
-        # Create some orphaned files.
-        orphan_dir = self.base_dir / "_boundary_snapshots" / "orphan-req"
+    def test_constructor_preserves_foreign_session_files(self):
+        """Constructor must not delete snapshots owned by another store."""
+        orphan_dir = (
+            self.base_dir
+            / "_boundary_snapshots"
+            / "foreign-session"
+            / "orphan-req"
+        )
         orphan_dir.mkdir(parents=True)
         (orphan_dir / "1024.safetensors").write_text("garbage")
 
-        # Re-create store — should clean up.
-        self.store.shutdown()
         store2 = BoundarySnapshotSSDStore(base_dir=self.base_dir)
+        try:
+            assert orphan_dir.exists()
+            assert store2._snapshot_dir.exists()
+            assert store2._snapshot_dir != self.store._snapshot_dir
+        finally:
+            store2.shutdown()
+
+        reset_boundary_snapshot_root(self.base_dir)
         assert not orphan_dir.exists()
-        store2.shutdown()
+        assert (self.base_dir / "_boundary_snapshots").exists()
+
+    def test_store_creation_does_not_delete_existing_session(self):
+        self.store.save("req-a", 1024, [MagicMock()], _mock_extract_cache_states)
+        self._wait_for_disk(self.store, "req-a", 1024)
+
+        store2 = BoundarySnapshotSSDStore(base_dir=self.base_dir)
+        try:
+            assert self.store._snapshot_dir.exists()
+            assert store2._snapshot_dir.exists()
+            assert store2._snapshot_dir != self.store._snapshot_dir
+            assert self.store.load("req-a", 1024) is not None
+        finally:
+            store2.shutdown()
+
+    def test_cleanup_all_only_removes_current_session(self):
+        self.store.save("req-a", 1024, [MagicMock()], _mock_extract_cache_states)
+        self._wait_for_disk(self.store, "req-a", 1024)
+
+        store2 = BoundarySnapshotSSDStore(base_dir=self.base_dir)
+        try:
+            store2.save("req-b", 2048, [MagicMock()], _mock_extract_cache_states)
+            self._wait_for_disk(store2, "req-b", 2048)
+
+            store2.cleanup_all()
+
+            assert self.store.load("req-a", 1024) is not None
+            assert store2.load("req-b", 2048) is None
+        finally:
+            store2.shutdown()
+
+    def test_cleanup_request_only_removes_current_session(self):
+        self.store.save("same-req", 1024, [MagicMock()], _mock_extract_cache_states)
+        self._wait_for_disk(self.store, "same-req", 1024)
+
+        store2 = BoundarySnapshotSSDStore(base_dir=self.base_dir)
+        try:
+            store2.save("same-req", 2048, [MagicMock()], _mock_extract_cache_states)
+            self._wait_for_disk(store2, "same-req", 2048)
+
+            store2.cleanup_request("same-req")
+
+            assert self.store.load("same-req", 1024) is not None
+            assert store2.load("same-req", 2048) is None
+        finally:
+            store2.shutdown()
 
     def test_cleanup_request_skips_queued_writes(self):
         """Writer thread should skip items for a cleaned-up request."""
@@ -217,7 +288,7 @@ class TestBoundarySnapshotSSDStore:
         time.sleep(1.0)
 
         # No files should have been written for req-1.
-        req_dir = self.base_dir / "_boundary_snapshots" / "req-1"
+        req_dir = self.store._snapshot_dir / "req-1"
         assert not req_dir.exists()
 
     def test_cleanup_all_drains_queue(self):
@@ -238,7 +309,7 @@ class TestBoundarySnapshotSSDStore:
         self.store.cleanup_all()
 
         # Snapshot directory should be clean (recreated but empty).
-        snapshot_dir = self.base_dir / "_boundary_snapshots"
+        snapshot_dir = self.store._snapshot_dir
         assert snapshot_dir.exists()
         children = list(snapshot_dir.iterdir())
         assert len(children) == 0
@@ -309,7 +380,7 @@ class TestBoundarySnapshotSSDStore:
         # Give the writer one more tick to fully exit _process_write_item
         # before asserting on the directory.
         time.sleep(0.1)
-        snapshot_dir = self.base_dir / "_boundary_snapshots"
+        snapshot_dir = self.store._snapshot_dir
         assert snapshot_dir.exists()
         assert list(snapshot_dir.iterdir()) == []
 
@@ -360,7 +431,7 @@ class TestBoundarySnapshotSSDStore:
 
         # After cleanup_request the per-request directory must be gone.
         time.sleep(0.1)
-        req_dir = self.base_dir / "_boundary_snapshots" / "req-cleanup"
+        req_dir = self.store._snapshot_dir / "req-cleanup"
         assert not req_dir.exists()
 
     def test_cleanup_request_keeps_counter_on_timeout(self):
@@ -571,10 +642,7 @@ class TestBoundarySnapshotSSDStore:
                 if self.store.has("never-saved-rid", 4096):
                     break
                 time.sleep(0.02)
-            file_path = (
-                self.base_dir / "_boundary_snapshots" / "never-saved-rid"
-                / "4096.safetensors"
-            )
+            file_path = self.store._file_path("never-saved-rid", 4096)
             # Either the file is on disk OR still buffered in pending —
             # but it must not have been silently discarded.
             with self.store._pending_lock:
@@ -771,7 +839,6 @@ class TestBoundarySnapshotProvider:
             request_id="req-1",
             valid_tcs=[1024],
             in_memory_snapshots=snapshots,
-            extract_fn=_mock_extract_cache_states,
         )
 
         assert bool(provider)
@@ -784,24 +851,23 @@ class TestBoundarySnapshotProvider:
 
         store.shutdown()
 
-    def test_provider_falls_back_to_in_memory(self):
-        """Provider should extract from in-memory snapshots when value is not None."""
+    def test_provider_uses_pre_extracted_in_memory_snapshot(self):
+        """Provider should not extract raw cache objects from the worker path."""
         from omlx.scheduler import _BoundarySnapshotProvider
 
-        mock_cache = MagicMock()
-        snapshots = {1024: mock_cache}  # Not None = in-memory
+        extracted = [{"state": ("already",), "cache_type": "ArraysCache"}]
+        snapshots = {1024: extracted}
 
         provider = _BoundarySnapshotProvider(
             store=None,
             request_id="req-1",
             valid_tcs=[1024],
             in_memory_snapshots=snapshots,
-            extract_fn=_mock_extract_cache_states,
         )
 
         loaded = provider[1024]
-        assert loaded is not None
-        assert len(loaded) == 4
+        assert loaded is extracted
+        assert list(provider.iter_in_memory_extracted()) == [extracted]
 
     def test_provider_empty(self):
         """Empty provider should be falsy."""
@@ -812,7 +878,6 @@ class TestBoundarySnapshotProvider:
             request_id="req-1",
             valid_tcs=[],
             in_memory_snapshots={},
-            extract_fn=_mock_extract_cache_states,
         )
 
         assert not bool(provider)

@@ -146,6 +146,11 @@ class FunctionCall(BaseModel):
     name: str
     arguments: str  # JSON string
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, v: Any) -> str:
+        return v.strip() if isinstance(v, str) else v
+
     @field_validator("arguments", mode="before")
     @classmethod
     def _validate_arguments_json(cls, v: Any) -> str:
@@ -246,6 +251,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # vLLM-compatible structured output (grammar, regex, choice, json)
     structured_outputs: Optional[Union[StructuredOutputOptions, dict]] = None
+    # vLLM/OpenAI-compatible grammar alias, normalized to structured_outputs
+    guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)

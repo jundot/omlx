@@ -1,7 +1,7 @@
-// AppView shell. TabView(.sidebarAdaptable) backed by the `AppSection` enum,
-// one tab per screen, grouped into Server / Models / Benchmark / General
-// sections. Sized to the design canvas (1140×760) with a sane minimum so
-// the window survives a resize.
+// AppView shell. NavigationSplitView backed by the `AppSection` enum, one
+// sidebar row per screen, grouped into Server / Models / Benchmark / General
+// sections. Sized close to the minimum comfortable settings window so the
+// first open does not feel oversized, while still surviving a resize.
 //
 // The shell is the entry point for the menubar's `Admin Panel` item and is
 // hosted in the SwiftUI `Window` scene declared in `oMLXApp.swift`.
@@ -9,98 +9,26 @@
 import SwiftUI
 
 struct AppView: View {
-    @State private var selection: AppSection = .server
+    @State private var selection: AppSection? = .status
 
     @Environment(\.colorScheme) private var scheme
     @EnvironmentObject private var services: AppServices
 
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        let section = selectedSection
 
-        // Experiment: TabView(.sidebarAdaptable). Tabs are top-level parallel
-        // destinations (fits our app better than NavSplit master-detail), and
-        // macOS 26 renders this style with the sidebar extending under the
-        // traffic-light buttons — what Settings.app uses.
-        TabView(selection: bindingForSelection()) {
-            TabSection {
-                Tab(AppSection.server.title, systemImage: AppSection.server.symbol, value: AppSection.server) {
-                    ContentScaffold(section: .server, detailTitle: detailTitle) { ServerScreen() }
-                }
-                Tab(AppSection.status.title, systemImage: AppSection.status.symbol, value: AppSection.status) {
-                    ContentScaffold(section: .status, detailTitle: detailTitle) { StatusScreen() }
-                }
-                Tab(AppSection.network.title, systemImage: AppSection.network.symbol, value: AppSection.network) {
-                    ContentScaffold(section: .network, detailTitle: detailTitle) { NetworkScreen() }
-                }
-                Tab(AppSection.performance.title, systemImage: AppSection.performance.symbol, value: AppSection.performance) {
-                    ContentScaffold(section: .performance, detailTitle: detailTitle) { PerformanceScreen() }
-                }
-                Tab(AppSection.logs.title, systemImage: AppSection.logs.symbol, value: AppSection.logs) {
-                    ContentScaffold(section: .logs, detailTitle: detailTitle) { LogsScreen() }
-                }
-            } header: {
-                Text(String(localized: "sidebar.group.server",
-                            defaultValue: "Server",
-                            comment: "Sidebar group heading for server-related screens"))
-            }
-            TabSection {
-                Tab(AppSection.models.title, systemImage: AppSection.models.symbol, value: AppSection.models) {
-                    ContentScaffold(section: .models, detailTitle: detailTitle) {
-                        if let id = services.modelDetailID {
-                            ModelSettingsScreen(modelID: id)
-                        } else {
-                            ModelsScreen()
-                        }
-                    }
-                }
-                Tab(AppSection.downloads.title, systemImage: AppSection.downloads.symbol, value: AppSection.downloads) {
-                    ContentScaffold(section: .downloads, detailTitle: detailTitle) { DownloadsScreen() }
-                }
-                Tab(AppSection.integrations.title, systemImage: AppSection.integrations.symbol, value: AppSection.integrations) {
-                    ContentScaffold(section: .integrations, detailTitle: detailTitle) { IntegrationsScreen() }
-                }
-                Tab(AppSection.quantization.title, systemImage: AppSection.quantization.symbol, value: AppSection.quantization) {
-                    ContentScaffold(section: .quantization, detailTitle: detailTitle) { QuantizationScreen() }
-                }
-            } header: {
-                Text(String(localized: "sidebar.group.models",
-                            defaultValue: "Models",
-                            comment: "Sidebar group heading for models/downloads/quant screens"))
-            }
-            TabSection {
-                Tab(AppSection.throughputBench.title, systemImage: AppSection.throughputBench.symbol, value: AppSection.throughputBench) {
-                    ContentScaffold(section: .throughputBench, detailTitle: detailTitle) {
-                        ThroughputBenchScreen(vm: services.throughputBench)
-                    }
-                }
-                Tab(AppSection.accuracyBench.title, systemImage: AppSection.accuracyBench.symbol, value: AppSection.accuracyBench) {
-                    ContentScaffold(section: .accuracyBench, detailTitle: detailTitle) {
-                        AccuracyBenchScreen(vm: services.accuracyBench)
-                    }
-                }
-            } header: {
-                Text(String(localized: "sidebar.group.benchmark",
-                            defaultValue: "Benchmark",
-                            comment: "Sidebar group heading for accuracy + throughput bench screens"))
-            }
-            TabSection {
-                Tab(AppSection.security.title, systemImage: AppSection.security.symbol, value: AppSection.security) {
-                    ContentScaffold(section: .security, detailTitle: detailTitle) { SecurityScreen() }
-                }
-                Tab(AppSection.about.title, systemImage: AppSection.about.symbol, value: AppSection.about) {
-                    ContentScaffold(section: .about, detailTitle: detailTitle) { AboutScreen() }
-                }
-            } header: {
-                Text(String(localized: "sidebar.group.general",
-                            defaultValue: "General",
-                            comment: "Sidebar group heading for the about/integrations/logs screens"))
+        NavigationSplitView {
+            SettingsSidebar(selection: bindingForSelection())
+        } detail: {
+            ContentScaffold(section: section, detailTitle: detailTitle) {
+                screen(for: section)
             }
         }
-        .tabViewStyle(.sidebarAdaptable)
-        .frame(minWidth: 880, idealWidth: 1140, minHeight: 600, idealHeight: 760)
-        // DesktopWash backdrop, kept on the outer container so it provides
-        // the radial-gradient background everywhere outside the sidebar.
-        .background(DesktopWash())
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 880, idealWidth: 880, minHeight: 600, idealHeight: 600)
+        // The theme resolves this through the dynamic macOS window color so
+        // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
         .onChange(of: services.requestedSection) { _, requested in
@@ -119,18 +47,23 @@ struct AppView: View {
     /// Drilling out of ModelSettingsScreen via the sidebar (changing section)
     /// must clear the per-model detail id so we don't accidentally re-enter
     /// the detail when the user returns to Models.
-    private func bindingForSelection() -> Binding<AppSection> {
+    private func bindingForSelection() -> Binding<AppSection?> {
         Binding(
             get: { selection },
             set: { newValue in
+                guard let newValue else { return }
                 if newValue != .models { services.modelDetailID = nil }
                 selection = newValue
             }
         )
     }
 
+    private var selectedSection: AppSection {
+        selection ?? .status
+    }
+
     private var detailTitle: String? {
-        if selection == .models, let id = services.modelDetailID, !id.isEmpty {
+        if selectedSection == .models, let id = services.modelDetailID, !id.isEmpty {
             return id
         }
         return nil
@@ -157,6 +90,66 @@ struct AppView: View {
         case .accuracyBench:   AccuracyBenchScreen(vm: services.accuracyBench)
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
+        }
+    }
+}
+
+// MARK: - Sidebar
+
+private struct SettingsSidebar: View {
+    @Binding var selection: AppSection?
+
+    var body: some View {
+        List(selection: $selection) {
+            Section {
+                SidebarRow(section: .status)
+                SidebarRow(section: .server)
+                SidebarRow(section: .network)
+                SidebarRow(section: .performance)
+                SidebarRow(section: .logs)
+            } header: {
+                Text(String(localized: "sidebar.group.server",
+                            defaultValue: "Server",
+                            comment: "Sidebar group heading for server-related screens"))
+            }
+            Section {
+                SidebarRow(section: .models)
+                SidebarRow(section: .downloads)
+                SidebarRow(section: .integrations)
+                SidebarRow(section: .quantization)
+            } header: {
+                Text(String(localized: "sidebar.group.models",
+                            defaultValue: "Models",
+                            comment: "Sidebar group heading for models/downloads/quant screens"))
+            }
+            Section {
+                SidebarRow(section: .throughputBench)
+                SidebarRow(section: .accuracyBench)
+            } header: {
+                Text(String(localized: "sidebar.group.benchmark",
+                            defaultValue: "Benchmark",
+                            comment: "Sidebar group heading for accuracy + throughput bench screens"))
+            }
+            Section {
+                SidebarRow(section: .security)
+                SidebarRow(section: .about)
+            } header: {
+                Text(String(localized: "sidebar.group.general",
+                            defaultValue: "General",
+                            comment: "Sidebar group heading for the about/integrations/logs screens"))
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationSplitViewColumnWidth(min: 180, ideal: 195, max: 215)
+    }
+}
+
+private struct SidebarRow: View {
+    let section: AppSection
+
+    var body: some View {
+        NavigationLink(value: section) {
+            Label(section.title, systemImage: section.symbol)
         }
     }
 }
@@ -205,6 +198,7 @@ private struct ContentScaffold<Content: View>: View {
                 .frame(maxWidth: 720, alignment: .topLeading)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.bottom, 18)
+                .background(theme.windowBg)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -240,9 +234,12 @@ private struct ContentScaffold<Content: View>: View {
                         }
                         services.requestedServerAnchor = nil
                     }
+                    .scrollContentBackground(.hidden)
+                    .background(theme.windowBg)
                 }
             }
         }
+        .background(theme.windowBg)
         // Title is rendered as content via sectionTitleHeader() — no
         // .navigationTitle here because the window toolbar is hidden in
         // AppView (matches the Settings.app pattern of inline titles on

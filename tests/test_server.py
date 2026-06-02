@@ -14,12 +14,50 @@ from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
+    _reset_boundary_snapshots_for_server,
     app,
     get_engine,
     model_config,
     get_sampling_params,
 )
 from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+
+
+class TestBoundarySnapshotLifecycle:
+    def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert (tmp_path / "_boundary_snapshots").exists()
+        assert not stale_dir.exists()
+
+    def test_reset_helper_skips_no_cache(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=None)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert stale_dir.exists()
 
 
 class TestGetSamplingParams:

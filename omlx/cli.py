@@ -277,7 +277,10 @@ def serve_command(args):
         )
 
         print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
-        uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        try:
+            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        except KeyboardInterrupt:
+            pass
     finally:
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
@@ -292,8 +295,11 @@ def launch_command(args, extra_args: list[str] | None = None):
     """
     import requests
 
-    from .integrations import get_integration, list_integrations
+    from .integrations import IntegrationContext, get_integration, list_integrations
     from .settings import GlobalSettings
+
+    def _optional_str(value) -> str | None:
+        return value if isinstance(value, str) and value else None
 
     tool_name = args.tool
 
@@ -333,6 +339,22 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
 
+    claude_settings = getattr(settings, "claude_code", None)
+    cli_opus_model = _optional_str(getattr(args, "opus_model", None))
+    cli_sonnet_model = _optional_str(getattr(args, "sonnet_model", None))
+    cli_haiku_model = _optional_str(getattr(args, "haiku_model", None))
+    settings_opus_model = _optional_str(getattr(claude_settings, "opus_model", None))
+    settings_sonnet_model = _optional_str(
+        getattr(claude_settings, "sonnet_model", None)
+    )
+    settings_haiku_model = _optional_str(getattr(claude_settings, "haiku_model", None))
+    opus_model = cli_opus_model or settings_opus_model
+    sonnet_model = cli_sonnet_model or settings_sonnet_model
+    haiku_model = cli_haiku_model or settings_haiku_model
+    claude_has_tier_models = (
+        tool_name == "claude" and any((opus_model, sonnet_model, haiku_model))
+    )
+
     # Build headers for authenticated requests
     headers = {}
     if api_key:
@@ -344,12 +366,19 @@ def launch_command(args, extra_args: list[str] | None = None):
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
             for m in resp.json().get("models", []):
-                models_status_map[m["id"]] = m
+                if m_id := m.get("id"):
+                    models_status_map[m_id] = m
+                if model_alias := m.get("model_alias"):
+                    models_status_map[model_alias] = m
     except Exception:
         pass
 
-    # Determine model
+    # Determine model. Claude Code can use separate Opus/Sonnet/Haiku defaults
+    # from settings, so bare `omlx launch claude` should not force a second
+    # interactive model choice when those tiers are configured.
     model = args.model
+    if not model and claude_has_tier_models:
+        model = sonnet_model or opus_model or haiku_model or ""
     if not model:
         # Fetch available models from server
         try:
@@ -388,26 +417,29 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
-    context_window = model_info.get("max_context_window")
-    max_tokens = model_info.get("max_tokens")
-    model_type = model_info.get("model_type")
-    reasoning = model_info.get("enable_thinking")  # may be None
-
-    # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
-    tools_profile = getattr(args, "tools_profile", "coding")
-    integration.launch(
+    ctx = IntegrationContext(
+        host=connect_host,
         port=port,
         api_key=api_key,
         model=model,
-        host=connect_host,
-        tools_profile=tools_profile,
-        context_window=context_window,
-        max_tokens=max_tokens,
-        model_type=model_type,
-        reasoning=reasoning,
-        extra_args=extra_args,
+        opus_model=opus_model if tool_name == "claude" else None,
+        sonnet_model=sonnet_model if tool_name == "claude" else None,
+        haiku_model=haiku_model if tool_name == "claude" else None,
+        context_window=model_info.get("max_context_window"),
+        max_tokens=model_info.get("max_tokens"),
+        model_type=model_info.get("model_type"),
+        reasoning=model_info.get("enable_thinking"),
+        tools_profile=getattr(args, "tools_profile", "coding"),
+        extra_args=tuple(extra_args or ()),
     )
+
+    # Launch
+    print(f"Launching {integration.display_name} with model {model}...")
+    integration.launch(ctx)
+
+    # Launch
+    print(f"Launching {integration.display_name} with model {model}...")
+    integration.launch(ctx)
 
 
 def diagnose_menubar() -> int:
@@ -723,6 +755,27 @@ Example directory structure:
         default="coding",
         choices=["minimal", "coding", "messaging", "full"],
         help="OpenClaw tools profile (default: coding)",
+    )
+    launch_parser.add_argument(
+        "--opus",
+        dest="opus_model",
+        type=str,
+        default=None,
+        help="Claude Code Opus tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--sonnet",
+        dest="sonnet_model",
+        type=str,
+        default=None,
+        help="Claude Code Sonnet tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--haiku",
+        dest="haiku_model",
+        type=str,
+        default=None,
+        help="Claude Code Haiku tier model (Claude integration only)",
     )
 
     # Diagnose command

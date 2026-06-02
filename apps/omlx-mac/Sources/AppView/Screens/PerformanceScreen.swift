@@ -3,13 +3,13 @@
 // One tab for every "how the engine runs" knob. Three sections:
 //   • Scheduler — max_concurrent_requests (moved from ServerScreen for
 //     scheduler coherence), embedding_batch_size, and chunked_prefill.
-//   • Memory & Lifecycle — process / model memory limits, prefill memory
-//     guard, server-wide idle timeout, model fallback routing.
+//   • Memory & Lifecycle — prefill memory guard tier, server-wide idle
+//     timeout, model fallback routing.
 //   • Cache — master enable toggle gates a hot-cache toggle + size, a
 //     cold-cache directory + size, and an advanced initial-blocks tuning
 //     knob (requires restart).
 //
-// All thirteen fields are server-side already (`omlx/admin/routes.py:191-272`)
+// All fields are server-side already (`omlx/admin/routes.py:198-235`)
 // — Phase 3 is pure UI. Single Apply button at the bottom, Storage /
 // Network pattern: disabled until at least one trimmed draft diverges
 // from its loaded value, and only changed fields are sent in the PATCH
@@ -115,55 +115,71 @@ private struct MemoryLifecycleSection: View {
                    defaultValue: "Memory & Lifecycle",
                    comment: "Section header for memory and lifecycle settings"),
             subtitle: String(localized: "performance.section.memory.sub",
-                             defaultValue: "Ceilings + auto-unload behavior. Memory limits accept \"auto\", \"disabled\", \"24GB\", or \"50%\".",
-                             comment: "Subtitle explaining accepted memory limit values")
+                             defaultValue: "Memory admission control and auto-unload behavior.",
+                             comment: "Subtitle explaining memory and lifecycle settings")
         )
 
         ListGroup {
-            Row(
-                label: String(localized: "performance.memory.max_process",
-                              defaultValue: "Max Process Memory",
-                              comment: "Row label for the max process memory field"),
-                sublabel: String(localized: "performance.memory.max_process.sub",
-                                 defaultValue: "Total resident memory ceiling for the server process.",
-                                 comment: "Sublabel for max process memory")
-            ) {
-                TextInput(
-                    text: $vm.maxProcessMemory,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
-                    mono: true,
-                    width: 140
-                )
-            }
-            Row(
-                label: String(localized: "performance.memory.max_model",
-                              defaultValue: "Max Model Memory",
-                              comment: "Row label for the max model memory field"),
-                sublabel: String(localized: "performance.memory.max_model.sub",
-                                 defaultValue: "Engine pool ceiling. Models above this won't be auto-loaded.",
-                                 comment: "Sublabel for max model memory")
-            ) {
-                TextInput(
-                    text: $vm.maxModelMemory,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
-                    mono: true,
-                    width: 140
-                )
-            }
             Row(
                 label: String(localized: "performance.memory.prefill_guard",
                               defaultValue: "Prefill Memory Guard",
                               comment: "Row label for prefill memory guard toggle"),
                 sublabel: String(localized: "performance.memory.prefill_guard.sub",
-                                 defaultValue: "Preflight prefill memory before kicking the engine. Drops requests that would OOM.",
+                                 defaultValue: "Preflight prefill memory before kicking the engine and defer generation scheduling near the ceiling.",
                                  comment: "Sublabel for prefill memory guard")
             ) {
                 Toggle("", isOn: $vm.prefillMemoryGuard)
                     .labelsHidden().toggleStyle(.switch)
+            }
+            Row(
+                label: String(localized: "performance.memory.guard_tier",
+                              defaultValue: "Memory Guard Tier",
+                              comment: "Row label for memory guard tier popup"),
+                sublabel: vm.memoryGuardTierDescription
+            ) {
+                Popup(
+                    selection: $vm.memoryGuardTier,
+                    width: 150,
+                    options: [
+                        ("safe",
+                         String(localized: "performance.memory.guard_tier.safe",
+                                defaultValue: "Safe",
+                                comment: "Memory guard tier option: safe")),
+                        ("balanced",
+                         String(localized: "performance.memory.guard_tier.balanced",
+                                defaultValue: "Balanced",
+                                comment: "Memory guard tier option: balanced")),
+                        ("aggressive",
+                         String(localized: "performance.memory.guard_tier.aggressive",
+                                defaultValue: "Aggressive",
+                                comment: "Memory guard tier option: aggressive")),
+                        ("custom",
+                         String(localized: "performance.memory.guard_tier.custom",
+                                defaultValue: "Custom",
+                                comment: "Memory guard tier option: custom")),
+                    ]
+                )
+                .disabled(!vm.prefillMemoryGuard)
+            }
+            if vm.prefillMemoryGuard && vm.memoryGuardTier == "custom" {
+                Row(
+                    label: String(localized: "performance.memory.custom_ceiling",
+                                  defaultValue: "Custom Ceiling",
+                                  comment: "Row label for memory guard custom ceiling"),
+                    sublabel: String(localized: "performance.memory.custom_ceiling.sub",
+                                     defaultValue: "Fixed process memory ceiling in GB. Used only with the Custom tier.",
+                                     comment: "Sublabel for memory guard custom ceiling")
+                ) {
+                    TextInput(
+                        text: $vm.memoryGuardCustomCeilingText,
+                        placeholder: String(localized: "performance.memory.custom_ceiling.placeholder",
+                                            defaultValue: "GB",
+                                            comment: "Placeholder for custom memory guard ceiling"),
+                        mono: true,
+                        suffix: "GB",
+                        width: 110
+                    )
+                }
             }
             Row(
                 label: String(localized: "performance.memory.idle_timeout",
@@ -323,9 +339,9 @@ final class PerformanceScreenVM: ObservableObject {
     @Published var chunkedPrefill: Bool = false
 
     // Memory & Lifecycle
-    @Published var maxProcessMemory: String = ""
-    @Published var maxModelMemory: String = ""
     @Published var prefillMemoryGuard: Bool = false
+    @Published var memoryGuardTier: String = "balanced"
+    @Published var memoryGuardCustomCeilingText: String = ""
     @Published var idleTimeoutText: String = ""
     @Published var modelFallback: Bool = false
 
@@ -341,9 +357,9 @@ final class PerformanceScreenVM: ObservableObject {
     @Published private(set) var loadedMaxConcurrent: Int = 8
     @Published private(set) var loadedEmbeddingBatchSize: Int = 32
     @Published private(set) var loadedChunkedPrefill: Bool = false
-    @Published private(set) var loadedMaxProcessMemory: String = ""
-    @Published private(set) var loadedMaxModelMemory: String = ""
     @Published private(set) var loadedPrefillMemoryGuard: Bool = false
+    @Published private(set) var loadedMemoryGuardTier: String = "balanced"
+    @Published private(set) var loadedMemoryGuardCustomCeilingGb: Double = 0
     @Published private(set) var loadedIdleTimeoutSeconds: Int? = nil
     @Published private(set) var loadedModelFallback: Bool = false
     @Published private(set) var loadedCacheEnabled: Bool = true
@@ -360,9 +376,9 @@ final class PerformanceScreenVM: ObservableObject {
         parsedMaxConcurrent != loadedMaxConcurrent
             || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
             || chunkedPrefill != loadedChunkedPrefill
-            || trim(maxProcessMemory) != loadedMaxProcessMemory
-            || trim(maxModelMemory) != loadedMaxModelMemory
             || prefillMemoryGuard != loadedPrefillMemoryGuard
+            || canonicalMemoryGuardTier(memoryGuardTier) != loadedMemoryGuardTier
+            || parsedMemoryGuardCustomCeiling != loadedMemoryGuardCustomCeilingGb
             || parsedIdleTimeout != loadedIdleTimeoutSeconds
             || modelFallback != loadedModelFallback
             || cacheEnabled != loadedCacheEnabled
@@ -386,14 +402,16 @@ final class PerformanceScreenVM: ObservableObject {
                 self.loadedChunkedPrefill = sched.chunkedPrefill ?? false
             }
             if let mem = s.memory {
-                self.maxProcessMemory = mem.maxProcessMemory ?? ""
-                self.loadedMaxProcessMemory = mem.maxProcessMemory ?? ""
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
                 self.loadedPrefillMemoryGuard = mem.prefillMemoryGuard ?? false
+                let tier = canonicalMemoryGuardTier(mem.memoryGuardTier ?? "balanced")
+                self.memoryGuardTier = tier
+                self.loadedMemoryGuardTier = tier
+                let customGb = mem.memoryGuardCustomCeilingGb ?? 0
+                self.memoryGuardCustomCeilingText = customGb > 0 ? trimDouble(customGb) : ""
+                self.loadedMemoryGuardCustomCeilingGb = customGb
             }
             if let model = s.model {
-                self.maxModelMemory = model.maxModelMemory ?? ""
-                self.loadedMaxModelMemory = model.maxModelMemory ?? ""
                 self.modelFallback = model.modelFallback ?? false
                 self.loadedModelFallback = model.modelFallback ?? false
             }
@@ -461,6 +479,14 @@ final class PerformanceScreenVM: ObservableObject {
             }
             initBlocks = n
         }
+        let tier = canonicalMemoryGuardTier(memoryGuardTier)
+        let customCeiling = parsedMemoryGuardCustomCeiling
+        if prefillMemoryGuard && tier == "custom" && customCeiling <= 0 {
+            self.lastError = String(localized: "performance.error.custom_ceiling_invalid",
+                                    defaultValue: "Custom Ceiling must be greater than 0 GB.",
+                                    comment: "Performance screen error when custom memory guard ceiling is invalid")
+            return
+        }
 
         var patch = GlobalSettingsPatch()
         // Scheduler
@@ -470,12 +496,14 @@ final class PerformanceScreenVM: ObservableObject {
         }
         if chunkedPrefill != loadedChunkedPrefill { patch.chunkedPrefill = chunkedPrefill }
         // Memory & lifecycle
-        let mpm = trim(maxProcessMemory)
-        if mpm != loadedMaxProcessMemory { patch.maxProcessMemory = mpm }
-        let mmm = trim(maxModelMemory)
-        if mmm != loadedMaxModelMemory { patch.maxModelMemory = mmm }
         if prefillMemoryGuard != loadedPrefillMemoryGuard {
             patch.memoryPrefillMemoryGuard = prefillMemoryGuard
+        }
+        if tier != loadedMemoryGuardTier {
+            patch.memoryGuardTier = tier
+        }
+        if customCeiling != loadedMemoryGuardCustomCeilingGb {
+            patch.memoryGuardCustomCeilingGb = customCeiling
         }
         if idleSeconds != loadedIdleTimeoutSeconds, let s = idleSeconds {
             patch.idleTimeoutSeconds = s
@@ -502,9 +530,9 @@ final class PerformanceScreenVM: ObservableObject {
             self.loadedMaxConcurrent = mc
             self.loadedEmbeddingBatchSize = embeddingBatchSize
             self.loadedChunkedPrefill = chunkedPrefill
-            self.loadedMaxProcessMemory = mpm
-            self.loadedMaxModelMemory = mmm
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
+            self.loadedMemoryGuardTier = tier
+            self.loadedMemoryGuardCustomCeilingGb = customCeiling
             if let s = idleSeconds { self.loadedIdleTimeoutSeconds = s }
             self.loadedModelFallback = modelFallback
             self.loadedCacheEnabled = cacheEnabled
@@ -539,8 +567,50 @@ final class PerformanceScreenVM: ObservableObject {
         return t.isEmpty ? nil : Int(t)
     }
 
+    private var parsedMemoryGuardCustomCeiling: Double {
+        let t = memoryGuardCustomCeilingText.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? 0 : (Double(t) ?? -1)
+    }
+
     private func trim(_ s: String) -> String {
         s.trimmingCharacters(in: .whitespaces)
+    }
+
+    private func trimDouble(_ v: Double) -> String {
+        let rounded = (v * 100).rounded() / 100
+        if rounded == Double(Int(rounded)) { return String(Int(rounded)) }
+        return String(rounded)
+    }
+
+    private func canonicalMemoryGuardTier(_ value: String) -> String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "safe", "balanced", "aggressive", "custom":
+            return normalized
+        default:
+            return "balanced"
+        }
+    }
+
+    var memoryGuardTierDescription: String {
+        switch canonicalMemoryGuardTier(memoryGuardTier) {
+        case "safe":
+            return String(localized: "performance.memory.guard_tier.safe.sub",
+                          defaultValue: "Most conservative. Leaves more headroom before scheduling memory-heavy prefill.",
+                          comment: "Description for safe memory guard tier")
+        case "aggressive":
+            return String(localized: "performance.memory.guard_tier.aggressive.sub",
+                          defaultValue: "Uses more memory before throttling. Best when the Mac has ample headroom.",
+                          comment: "Description for aggressive memory guard tier")
+        case "custom":
+            return String(localized: "performance.memory.guard_tier.custom.sub",
+                          defaultValue: "Use a fixed GB ceiling instead of the adaptive tier calculation.",
+                          comment: "Description for custom memory guard tier")
+        default:
+            return String(localized: "performance.memory.guard_tier.balanced.sub",
+                          defaultValue: "Default tier. Balances throughput with process memory safety.",
+                          comment: "Description for balanced memory guard tier")
+        }
     }
 
 }

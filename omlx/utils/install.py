@@ -1,16 +1,39 @@
 """Installation method detection."""
 
+import os
 import sys
 from pathlib import Path
 
-_APP_BUNDLE_CLI = "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
+_APP_BUNDLE_CLI_NAME = "omlx-cli"
 _PATH_CLI = "omlx"
+_USER_CLI_SHIM = Path(".omlx") / "bin" / "omlx"
 
 
 def is_app_bundle() -> bool:
     """Return True if running inside the macOS .app bundle."""
     here = Path(__file__).resolve()
     return ".app/Contents/" in str(here)
+
+
+def get_app_bundle_cli_path() -> Path:
+    """Return the app-bundle CLI path for the currently running bundle."""
+    here = Path(__file__).resolve()
+    marker = ".app/Contents/"
+    path = str(here)
+    idx = path.find(marker)
+    if idx == -1:
+        return Path("/Applications/oMLX.app/Contents/MacOS") / _APP_BUNDLE_CLI_NAME
+    app_root = Path(path[: idx + len(".app")])
+    return app_root / "Contents" / "MacOS" / _APP_BUNDLE_CLI_NAME
+
+
+def get_user_cli_shim_path() -> Path:
+    """Return the user PATH shim installed by the macOS app."""
+    return Path.home() / _USER_CLI_SHIM
+
+
+def _is_executable(path: Path) -> bool:
+    return path.exists() and os.access(path, os.X_OK)
 
 
 def is_homebrew() -> bool:
@@ -31,5 +54,7 @@ def get_install_method() -> str:
 def get_cli_prefix() -> str:
     """Return the correct CLI command prefix for the current installation."""
     if is_app_bundle():
-        return _APP_BUNDLE_CLI
+        if _is_executable(get_user_cli_shim_path()):
+            return _PATH_CLI
+        return str(get_app_bundle_cli_path())
     return _PATH_CLI

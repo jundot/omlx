@@ -204,28 +204,31 @@ _ST_DTYPE_TO_NP = {
 
 
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
-    """Extract raw bytes from an evaluated mx.array.
+    """Extract raw bytes from an mx.array.
 
-    Caller MUST ensure ``arr`` is already mx.eval'd before calling. This
-    function does NOT call mx.eval — it only reads the materialized buffer
-    via the Python buffer protocol. That keeps the call cross-thread safe
-    when the source array was evaluated on the inference thread.
+    Materialize the array at this last-mile boundary before touching the
+    Python buffer protocol. ``store_cache`` may create lazy block slices,
+    clones, or placeholder arrays after scheduler-side pre-eval collection,
+    and ``memoryview(arr)`` would otherwise trigger an implicit eval from the
+    background cache-store worker thread.
 
     For bfloat16 arrays, uses view(uint16) since the buffer protocol does
-    not support bfloat16 directly. The view shares the source buffer; no
-    Metal command is issued by view() alone, and bytes(memoryview(view))
-    on an already-materialized source returns the raw bf16 bits unchanged.
+    not support bfloat16 directly. Materialize the view as well so the raw
+    buffer read never becomes an implicit MLX eval.
 
     Args:
-        arr: Evaluated MLX array (caller's responsibility).
+        arr: MLX array to serialize.
 
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
     """
+    mx.eval(arr)
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
     if arr.dtype == mx.bfloat16:
-        raw = bytes(memoryview(arr.view(mx.uint16)))
+        u16 = arr.view(mx.uint16)
+        mx.eval(u16)
+        raw = bytes(memoryview(u16))
     else:
         raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
@@ -1362,20 +1365,13 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Caller (scheduler._cleanup_finished, async store-cache path)
-            # dispatches real KV arrays via mx.async_eval on the inference
-            # thread's generation_stream before submitting to the
-            # omlx-store-cache executor. The worker then waits on that same
-            # stream via mx.synchronize(generation_stream) (see
-            # _async_store_cache_worker) before reaching this code path,
-            # so the arrays are fully materialized by the time
-            # _extract_tensor_bytes hits the buffer protocol. The tiny
-            # mx.zeros((1,)) placeholders allocated above are lazy nodes
-            # whose buffer materialization happens implicitly via the buffer
-            # protocol. Skipping any explicit mx.eval here keeps save_block
-            # off the Metal command-submission path when invoked from a
-            # non-inference thread, which is the source of the cross-thread
-            # race tracked in #978/#1040/#1106/#1437.
+            # Last-mile materialization happens in _extract_tensor_bytes.
+            # scheduler._cleanup_finished still pre-dispatches real KV arrays,
+            # but store_cache creates additional lazy slices, clones, and
+            # placeholders here after that collection step. Evaluate those
+            # derived arrays before memoryview() so the buffer protocol never
+            # becomes the first MLX eval site on the store-cache worker thread.
+            # Race history: #978/#1040/#1106/#1437/#1558.
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
