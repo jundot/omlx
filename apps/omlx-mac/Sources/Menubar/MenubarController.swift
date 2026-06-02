@@ -45,7 +45,6 @@ final class MenubarController: NSObject {
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
     private var adminPanelItem: NSMenuItem!
-    private var clusterItem: NSMenuItem!
     private var chatItem: NSMenuItem!
 
     private let iconOutline: NSImage?
