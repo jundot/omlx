@@ -632,7 +632,7 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot)."""
+    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot, clnkr)."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
@@ -640,6 +640,7 @@ class IntegrationSettings:
     hermes_model: str | None = None
     pi_model: str | None = None
     copilot_model: str | None = None
+    clnkr_model: str | None = None
     openclaw_tools_profile: str = "coding"
 
     def to_dict(self) -> dict[str, Any]:
@@ -651,6 +652,7 @@ class IntegrationSettings:
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
+            "clnkr_model": self.clnkr_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
         }
 
@@ -664,6 +666,7 @@ class IntegrationSettings:
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
+            clnkr_model=data.get("clnkr_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
         )
 

@@ -2,6 +2,7 @@
 
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
+from omlx.integrations.clnkr import ClnkrIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
@@ -11,6 +12,7 @@ from omlx.integrations.pi import PiIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
     "claude": ClaudeCodeIntegration(),
+    "clnkr": ClnkrIntegration(),
     "codex": CodexIntegration(),
     "opencode": OpenCodeIntegration(),
     "openclaw": OpenClawIntegration(),
@@ -34,6 +36,7 @@ __all__ = [
     "Integration",
     "IntegrationContext",
     "ClaudeCodeIntegration",
+    "ClnkrIntegration",
     "CopilotIntegration",
     "HermesIntegration",
     "INTEGRATIONS",
