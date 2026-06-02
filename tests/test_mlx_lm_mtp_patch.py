@@ -387,15 +387,18 @@ class TestQwen35MoeSanitize:
         weights["language_model.model.embed_tokens.weight"] = mx.zeros((256, 64))
         return weights
 
-    def test_sanitize_no_mtp_weights(self, moe_model, caplog):
+    def test_sanitize_no_mtp_weights(self, moe_model):
         """Config declares mtp_num_hidden_layers=1 but no MTP weights exist
-        (model quantized without preserve_mtp). Must not crash."""
-        import logging
-
-        with caplog.at_level(logging.DEBUG, logger="omlx"):
-            result = moe_model.sanitize(self._backbone_weights())
+        (model quantized without preserve_mtp). Must not crash, and must
+        still produce the unfused backbone weights."""
+        result = moe_model.sanitize(self._backbone_weights())
+        assert isinstance(result, dict)
         assert not any("mtp" in k for k in result)
-        assert any("no MTP weights found" in r.getMessage() for r in caplog.records)
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+            assert f"{pfx}.switch_mlp.down_proj.weight" in result
+        assert "language_model.model.embed_tokens.weight" in result
 
     def test_sanitize_switch_mlp_form(self, moe_model):
         """oQ outputs store MTP experts in switch_mlp form — sanitize skips."""
