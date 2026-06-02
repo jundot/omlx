@@ -224,6 +224,97 @@ def _parse_namespaced_tool_calls(
     return cleaned, tool_calls
 
 
+def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for Hermes-style tool call formats.
+
+    Handles models that use <|tool_call_start|>...<|tool_call_end|> markers
+    with bracket-style content inside:
+        <|tool_call_start|>[function_name(arg1=value1, arg2=value2)]<|tool_call_end|>
+
+    Also handles JSON variant:
+        <|tool_call_start|>{"name": "func", "arguments": {...}}<|tool_call_end|>
+
+    Hermes models (NousResearch/Hermes) emit tool calls in this format.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    tool_calls = []
+    pattern = r"<\|tool_call_start\|>(.*?)<\|tool_call_end\|>"
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    for match in matches:
+        content = match.strip()
+
+        # Try JSON format first: {"name": "func", "arguments": {...}}
+        try:
+            parsed = json.loads(content)
+            name = parsed.get("name", "")
+            arguments = parsed.get("arguments", {})
+            if name:
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=name,
+                            arguments=_serialize_tool_call_arguments(arguments),
+                        ),
+                    )
+                )
+                continue
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Hermes bracket format: [func_name(arg1=val1, arg2=val2)]
+        # Content may or may not have outer brackets
+        stripped = content.strip("[]")
+        bracket_match = re.match(
+            r"([A-Za-z_][\w.]*)\((.*?)\)\s*$", stripped, re.DOTALL
+        )
+        if bracket_match:
+            func_name = bracket_match.group(1)
+            args_str = bracket_match.group(2).strip()
+
+            arguments = {}
+            if args_str:
+                for arg_match in re.finditer(
+                    r'([A-Za-z_][\w]*)\s*=\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\{.*?\}|\[.*?\]|[^\s,]+)',
+                    args_str,
+                    re.DOTALL,
+                ):
+                    key = arg_match.group(1)
+                    val = arg_match.group(2).strip()
+
+                    if (val.startswith('"') and val.endswith('"')) or (
+                        val.startswith("'") and val.endswith("'")
+                    ):
+                        arguments[key] = val[1:-1]
+                    else:
+                        try:
+                            arguments[key] = json.loads(val)
+                        except (json.JSONDecodeError, ValueError):
+                            arguments[key] = val
+
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=func_name,
+                            arguments=json.dumps(arguments, ensure_ascii=False),
+                        ),
+                    )
+                )
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
 def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for bracket-style tool call formats.
@@ -542,6 +633,12 @@ def parse_tool_calls(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
 
+    # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
+    if "<|tool_call_start|>" in cleaned_text:
+        hermes_result = _parse_hermes_tool_calls(cleaned_text)
+        if hermes_result[1] is not None:
+            return hermes_result
+
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
@@ -578,6 +675,15 @@ def parse_tool_calls(
                     cleaned_text[idx:],
                 )
                 cleaned_text = cleaned_text[:idx].strip()
+
+    # Strip Hermes markers if still present (models without has_tool_calling)
+    if "<|tool_call_start|>" in cleaned_text:
+        cleaned_text = re.sub(
+            r"<\|tool_call_start\|>.*?<\|tool_call_end\|>",
+            "",
+            cleaned_text,
+            flags=re.DOTALL,
+        ).strip()
 
     return cleaned_text, None
 
