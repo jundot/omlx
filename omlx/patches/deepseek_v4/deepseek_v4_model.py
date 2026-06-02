@@ -18,6 +18,27 @@ from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
+def _materialize_cache_arrays(cache: Optional[Any]) -> None:
+    """Detach DeepSeek-V4 cache update graphs from prior decode steps."""
+    if cache is None:
+        return
+
+    cache_arrays = []
+    for layer_cache in cache:
+        if layer_cache is None:
+            continue
+        leaves = getattr(layer_cache, "caches", None) or (layer_cache,)
+        for leaf in leaves:
+            if leaf is None:
+                continue
+            for value in vars(leaf).values():
+                if isinstance(value, mx.array):
+                    cache_arrays.append(value)
+
+    if cache_arrays:
+        mx.eval(*cache_arrays)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v4"
@@ -971,6 +992,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+
+        _materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)

@@ -150,7 +150,10 @@ def maybe_apply_pre_load_patches(
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
-        from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+        )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
@@ -350,28 +353,27 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(
-                k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map
-            )
+            return any(k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map)
         except Exception as e:
-            logger.debug(
-                "Failed to read %s for mtp weight scan: %s", index_path, e
-            )
+            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
     shards = sorted(p.glob("*.safetensors"))
     if not shards:
         return False
     try:
         import safetensors
-
-        with safetensors.safe_open(str(shards[0]), framework="numpy") as f:
-            for k in f.keys():
-                if k.startswith(_MTP_WEIGHT_PREFIXES):
-                    return True
     except Exception as e:
-        logger.debug(
-            "Failed to read %s header for mtp weight scan: %s", shards[0], e
-        )
+        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+        return False
+
+    for shard in shards:
+        try:
+            with safetensors.safe_open(str(shard), framework="numpy") as f:
+                for k in f.keys():
+                    if k.startswith(_MTP_WEIGHT_PREFIXES):
+                        return True
+        except Exception as e:
+            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
     return False
 
 

@@ -17,10 +17,6 @@ struct ListGroup<Content: View>: View {
         }
         .background(theme.groupBg)
         .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
         .padding(.horizontal, 14)
         .padding(.bottom, 6)
     }

@@ -55,7 +55,8 @@ struct DownloadsScreen: View {
                     onSaveMirror: { vm.saveMirror(client: services.client) },
                     onResetMirror: { vm.resetMirror(client: services.client) },
                     onPickResult: { vm.pickSearchResult($0) },
-                    onDismissSearch: { vm.dismissSearch() }
+                    onDismissSearch: { vm.dismissSearch() },
+                    onShowCard: { repo in vm.showModelCard(repoId: repo) }
                 )
                 .onChange(of: vm.repoText) { _, newValue in
                     vm.updateSearch(query: newValue, client: services.client)
@@ -76,7 +77,8 @@ struct DownloadsScreen: View {
                     onSaveMirror: { vm.saveMsMirror(client: services.client) },
                     onResetMirror: { vm.resetMsMirror(client: services.client) },
                     onPickResult: { vm.pickMsSearchResult($0) },
-                    onDismissSearch: { vm.dismissMsSearch() }
+                    onDismissSearch: { vm.dismissMsSearch() },
+                    onShowCard: { repo in vm.showModelCard(repoId: repo) }
                 )
                 .onChange(of: vm.msRepoText) { _, newValue in
                     vm.updateMsSearch(query: newValue, client: services.client)
@@ -92,7 +94,8 @@ struct DownloadsScreen: View {
             CompletedTasksSection(
                 tasks: vm.terminalTasks,
                 onRetry: { id in vm.retry(taskId: id, client: services.client) },
-                onRemove: { id in vm.remove(taskId: id, client: services.client) }
+                onRemove: { id in vm.remove(taskId: id, client: services.client) },
+                onShowCard: { repo in vm.showModelCard(repoId: repo) }
             )
 
             SuggestedSection(
@@ -100,7 +103,8 @@ struct DownloadsScreen: View {
                 sort: $vm.recommendedSort,
                 isLoading: vm.recommendedLoading,
                 onGet: { repo in vm.startDownload(repo: repo, client: services.client) },
-                onRefresh: { Task { await vm.loadRecommended(client: services.client) } }
+                onRefresh: { Task { await vm.loadRecommended(client: services.client) } },
+                onShowCard: { repo in vm.showModelCard(repoId: repo) }
             )
 
             if let error = vm.lastError {
@@ -113,6 +117,18 @@ struct DownloadsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+        .sheet(item: $vm.modelCardTarget) { target in
+            ModelCardSheet(
+                target: target,
+                client: services.client,
+                onDownload: { repo in
+                    // Sheet dismisses itself before this fires; the
+                    // download lands in the Active section under
+                    // whichever source the sheet was opened from.
+                    vm.startDownload(repo: repo, client: services.client)
+                }
+            )
+        }
     }
 }
 
@@ -168,6 +184,7 @@ private struct AddFromHFSection: View {
     let onResetMirror: () -> Void
     let onPickResult: (HFModelInfo) -> Void
     let onDismissSearch: () -> Void
+    let onShowCard: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
     @FocusState private var mirrorFocused: Bool
@@ -214,7 +231,8 @@ private struct AddFromHFSection: View {
                             results: searchResults,
                             isLoading: searchLoading,
                             onPick: onPickResult,
-                            onDismiss: onDismissSearch
+                            onDismiss: onDismissSearch,
+                            onShowCard: onShowCard
                         )
                     }
                     if isEditingMirror {
@@ -322,6 +340,7 @@ private struct AddFromMSSection: View {
     let onResetMirror: () -> Void
     let onPickResult: (MSModelInfo) -> Void
     let onDismissSearch: () -> Void
+    let onShowCard: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
     @FocusState private var mirrorFocused: Bool
@@ -368,7 +387,8 @@ private struct AddFromMSSection: View {
                             results: searchResults,
                             isLoading: searchLoading,
                             onPick: onPickResult,
-                            onDismiss: onDismissSearch
+                            onDismiss: onDismissSearch,
+                            onShowCard: onShowCard
                         )
                     }
                     if isEditingMirror {
@@ -462,8 +482,16 @@ private struct SearchDropdown: View {
     let isLoading: Bool
     let onPick: (HFModelInfo) -> Void
     let onDismiss: () -> Void
+    /// Reveal a small `info.circle` action on the hovered row. Skipped
+    /// from the always-visible button family because each dropdown row
+    /// is itself a Button (`onPick`); a permanent trailing icon would
+    /// crowd the dense row and confuse "did the user mean to pick this
+    /// or open the card?". Finder-style hover reveal sidesteps both
+    /// problems.
+    let onShowCard: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
+    @State private var hoveredId: String?
 
     /// Cap visible rows at 8 — anything more is noise and the user can keep
     /// typing to narrow further. The HF API returns up to `limit` items
@@ -485,12 +513,42 @@ private struct SearchDropdown: View {
                 .padding(.vertical, 8)
             } else {
                 ForEach(Array(visible.enumerated()), id: \.element.repoId) { idx, m in
-                    Button {
-                        onPick(m)
-                    } label: {
-                        row(model: m)
+                    // Two distinct tap targets in a single HStack:
+                    //   1. row Button (left) — selects this result for download
+                    //   2. info Button (right, hover-only) — opens the model card
+                    // On hover we also hide the downloads count so the icon
+                    // slots into the trailing area cleanly instead of overlapping.
+                    HStack(spacing: 0) {
+                        Button {
+                            onPick(m)
+                        } label: {
+                            row(model: m, isHovered: hoveredId == m.repoId)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity)
+                        if hoveredId == m.repoId {
+                            Button {
+                                onShowCard(m.repoId)
+                            } label: {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(String(localized: "downloads.button.show_card",
+                                         defaultValue: "View model card",
+                                         comment: "Tooltip on the info button that opens a model's README sheet"))
+                            .transition(.opacity)
+                        }
                     }
-                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            hoveredId = hovering ? m.repoId : nil
+                        }
+                    }
                     if idx < visible.count - 1 {
                         Divider().opacity(0.4)
                     }
@@ -506,7 +564,7 @@ private struct SearchDropdown: View {
         .onExitCommand(perform: onDismiss)
     }
 
-    private func row(model m: HFModelInfo) -> some View {
+    private func row(model m: HFModelInfo, isHovered: Bool) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "cube.transparent")
                 .font(.system(size: 11))
@@ -525,13 +583,17 @@ private struct SearchDropdown: View {
                 }
             }
             Spacer(minLength: 6)
-            if let downloads = m.downloads, downloads > 0 {
+            // Hide the downloads count on hover so the trailing slot is
+            // free for the info button (rendered as a sibling outside
+            // this row Button so its tap doesn't fall through to onPick).
+            if !isHovered, let downloads = m.downloads, downloads > 0 {
                 Text(formatNumber(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
+                    .padding(.trailing, 12)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.leading, 12)
         .padding(.vertical, 6)
         .contentShape(Rectangle())
     }
@@ -689,6 +751,9 @@ private struct CompletedTasksSection: View {
     let tasks: [HFTaskDTO]
     let onRetry: (String) -> Void
     let onRemove: (String) -> Void
+    /// Open the model-card sheet for a row. Source is resolved by the VM
+    /// from the active downloader tab.
+    let onShowCard: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -718,6 +783,16 @@ private struct CompletedTasksSection: View {
                                     .buttonStyle(.omlx(.normal, size: .small))
                             }
                             Button {
+                                onShowCard(task.repoId)
+                            } label: {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 11))
+                            }
+                            .buttonStyle(.omlx(.plain, size: .small))
+                            .help(String(localized: "downloads.button.show_card",
+                                         defaultValue: "View model card",
+                                         comment: "Tooltip on the info button that opens a model's README sheet"))
+                            Button {
                                 onRemove(task.taskId)
                             } label: {
                                 Image(systemName: "trash")
@@ -740,6 +815,9 @@ private struct SuggestedSection: View {
     let isLoading: Bool
     let onGet: (String) -> Void
     let onRefresh: () -> Void
+    /// Open the model-card sheet for a row. Same intent as the equivalent
+    /// callback on CompletedTasksSection.
+    let onShowCard: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
 
@@ -809,6 +887,16 @@ private struct SuggestedSection: View {
                                     .truncationMode(.middle)
                             }
                             Spacer(minLength: 8)
+                            Button {
+                                onShowCard(m.repoId)
+                            } label: {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 11))
+                            }
+                            .buttonStyle(.omlx(.plain, size: .small))
+                            .help(String(localized: "downloads.button.show_card",
+                                         defaultValue: "View model card",
+                                         comment: "Tooltip on the info button that opens a model's README sheet"))
                             Button {
                                 onGet(m.repoId)
                             } label: {
@@ -930,6 +1018,19 @@ final class DownloadsScreenVM: ObservableObject {
     @Published private(set) var recommendedLoading: Bool = false
     @Published var recommendedSort: SuggestedSort = .downloads
     @Published var lastError: String?
+
+    /// Target for the model-card sheet. Non-nil while the sheet is open;
+    /// `ModelCardSheet` updates it back to nil on dismiss via `.sheet(item:)`.
+    /// Identifiable on `repoId+source`, so re-tapping the same row while a
+    /// sheet for a different row was open re-fires the fetch task.
+    @Published var modelCardTarget: ModelCardTarget?
+
+    /// Open the model-card sheet for a row. Source is resolved from the
+    /// active tab — `.hf` rows always belong to the HF tab and vice versa.
+    func showModelCard(repoId: String) {
+        let resolvedSource: ModelCardSource = (source == .hf) ? .huggingFace : .modelScope
+        modelCardTarget = ModelCardTarget(repoId: repoId, source: resolvedSource)
+    }
 
     /// Host the user sees on the Downloads screen. Strips scheme so the
     /// inline label reads like `huggingface.co` / `hf-mirror.com` per design.

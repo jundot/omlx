@@ -1,12 +1,10 @@
-// Top-level sections rendered by AppView's TabView. Each case becomes one
-// `Tab` value in `TabView(selection:)`, with `title` driving the visible
-// label (localized with a `defaultValue` fallback so the catalog isn't
-// load-bearing) and `symbol` driving the SF Symbol on the tab.
+// Top-level sections rendered by AppView's settings sidebar. Each case becomes
+// one selectable row, with `title` driving the visible label (localized with a
+// `defaultValue` fallback so the catalog isn't load-bearing) and `symbol`
+// driving the SF Symbol on the row.
 //
-// Section groupings (Server / Models / Benchmark / General) live inline
-// in AppView via `TabSection` blocks — there's no separate `SidebarGroup`
-// enum anymore; the visual grouping is purely a layout decision in the
-// TabView body.
+// Section groupings (Server / Models / Benchmark / General) live inline in
+// AppView; the visual grouping is purely a layout decision in the shell.
 
 import SwiftUI
 

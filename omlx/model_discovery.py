@@ -277,6 +277,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -393,6 +394,16 @@ def _has_vision_subconfig(config: dict) -> bool:
         or "vit_config" in config
         or bool(config.get("mm_vision_tower"))
     )
+
+
+def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
+    """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
+
+    Liquid LFM text checkpoints (LFM2, LFM2.5 MoE, etc.) use ``lfm*`` model
+    types and ``*ForCausalLM`` classes. mlx-audio LFM STS uses ``LFM2AudioModel``
+    and is handled earlier via :data:`AUDIO_STS_ARCHITECTURES`.
+    """
+    return any("causallm" in arch.lower() for arch in architectures)
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -546,8 +557,12 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
+    # mlx-audio LFM STS may use an "lfm*" model_type without a known architecture
+    # string yet. Liquid LFM *text* checkpoints share that prefix — disambiguate
+    # with CausalLM architecture names (LFM2 / LFM2.5 MoE, future lfm* LMs).
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        if _architecture_indicates_causal_lm(architectures):
+            return "llm"
         return "audio_sts"
 
     return "llm"
@@ -595,6 +610,81 @@ def detect_thinking_default(model_path: Path) -> bool | None:
         return True  # ON by default (Qwen pattern)
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
+
+    return None
+
+
+# Context-length keys, in priority order. Order mirrors HuggingFace
+# Transformers conventions: ``max_position_embeddings`` is the canonical
+# field for decoder-only LLMs; ``max_seq_len`` / ``seq_length`` show up on
+# Llama / Mistral / Qwen forks; ``n_positions`` is the GPT-2 lineage.
+_CONTEXT_LENGTH_KEYS = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "max_seq_length",
+    "seq_length",
+    "n_positions",
+)
+
+# tokenizer_config.json's ``model_max_length`` is Transformers' fallback
+# field. Transformers seeds it with ``int(1e30)`` when the tokenizer has
+# no real cap, and downstream code distinguishes that sentinel from a
+# real long context. Anything above ~1e18 is treated as the sentinel.
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
+
+
+def _read_model_context_length(model_path: Path) -> int | None:
+    """Discover the declared context length from a model's config files.
+
+    Resolution order:
+
+    1. Top-level ``config.json`` keys (``max_position_embeddings`` first,
+       then the rest of :data:`_CONTEXT_LENGTH_KEYS`).
+    2. Nested ``text_config`` / ``language_config`` keys (used by VLM
+       wrappers and Qwen-style MoE configs that put the language head in
+       a sub-object).
+    3. ``tokenizer_config.json``'s ``model_max_length`` — but only when
+       it is a finite positive integer, since Transformers seeds it with
+       ``int(1e30)`` as a "no cap" sentinel.
+
+    Returns:
+        Positive integer context length, or ``None`` when no usable
+        value was found in any of the above.
+    """
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                model_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read config.json for {model_path}: {e}")
+            model_config = {}
+
+        for key in _CONTEXT_LENGTH_KEYS:
+            value = model_config.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+
+        for nest_key in ("text_config", "language_config"):
+            nested = model_config.get(nest_key)
+            if isinstance(nested, dict):
+                for key in _CONTEXT_LENGTH_KEYS:
+                    value = nested.get(key)
+                    if isinstance(value, int) and value > 0:
+                        return value
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path, encoding="utf-8") as f:
+                tc = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read tokenizer_config.json for {model_path}: {e}")
+            tc = {}
+
+        value = tc.get("model_max_length")
+        if isinstance(value, int) and 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return value
 
     return None
 
@@ -748,6 +838,7 @@ def _register_model(
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
+        model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -758,6 +849,7 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            model_context_length=model_context_length,
         )
 
         size_gb = estimated_size / (1024**3)

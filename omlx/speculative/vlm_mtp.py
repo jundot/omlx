@@ -47,6 +47,8 @@ from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 # the symbols are still ``_``-prefixed but this is now their canonical home.
 from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch  # noqa: SLF001
 
+from ..utils.model_loading import materialize_lazy_state
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,6 +106,17 @@ def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
             GEMMA4_ASSISTANT_MODEL_TYPES,
         )
         return None
+
+    # Materialize frozen buffers (RoPE freqs, masked_embedding tables, etc.) on
+    # the loader thread. mlx-vlm's load_model only materializes parameters via
+    # ``mx.eval(model.parameters())`` and leaves siblings lazy; those buffers
+    # stay bound to whichever stream is current here. When per-engine
+    # scheduler.step() later evaluates draft_block outputs from a different
+    # thread, mx.async_eval hits "no Stream(gpu, X) in current thread" because
+    # those lazy ops target a stream that does not exist on the inference
+    # thread. Same root cause and fix as 9d5bed8 for the main VLM model.
+    # Issue #1469.
+    materialize_lazy_state(drafter_model)
 
     logger.info(
         "VLM MTP drafter loaded: path=%s kind=%s model_type=%s",

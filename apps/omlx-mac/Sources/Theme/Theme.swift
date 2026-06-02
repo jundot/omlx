@@ -1,9 +1,9 @@
-// PR 3 — design tokens for the Tahoe (macOS 26) liquid-glass system.
+// Design tokens for the macOS settings UI.
 //
-// Lifted verbatim from omlx-components.jsx:10-94 in the design bundle.
-// Both light and dark variants must stay in sync with the canvas; mismatches
-// are caught by manual visual diffs and the snapshot tests in the test
-// target.
+// Surface, text, selection, and control colors intentionally resolve through
+// dynamic AppKit system colors so the app tracks System Settings across light
+// mode, dark mode, accent colors, accessibility contrast, and future macOS
+// appearance updates.
 
 import SwiftUI
 
@@ -73,89 +73,161 @@ struct OMLXTheme: Sendable {
 extension OMLXTheme {
     static let light = OMLXTheme(
         isDark: false,
-        windowBg: .white,
-        sidebarBg: .white(0.55),
-        sidebarBorder: .black(0.06),
-        contentBg: .white(0.75),
-        toolbarBg: .white(0.55),
-        toolbarBorder: .black(0.06),
-        groupBg: .white(0.72),
-        groupBorder: .black(0.06),
-        rowSep: .black(0.06),
-        separator: .black(0.08),
-        text: .black(0.88),
-        textSecondary: Color(rgb24: 0x3C3C43, opacity: 0.62),
-        textTertiary: Color(rgb24: 0x3C3C43, opacity: 0.32),
-        accent: Color(rgb24: 0x007AFF),
-        accentSoft: Color(rgb24: 0x007AFF, opacity: 0.16),
-        accentText: .white,
-        selBg: .black(0.06),
-        hoverBg: .black(0.04),
-        controlBg: .white(0.65),
-        controlBgHover: .white(0.85),
-        glassBg: .white(0.55),
-        glassBgStrong: .white(0.78),
-        inputBg: .white(0.85),
-        inputBorder: .black(0.10),
-        inputBorderFocus: Color(rgb24: 0x007AFF),
-        greenDot: Color(rgb24: 0x30D158),
-        amberDot: Color(rgb24: 0xFF9500),
-        redDot: Color(rgb24: 0xFF3B30),
-        blueDot: Color(rgb24: 0x007AFF),
-        codeBg: .black(0.05),
-        warningBg: Color(rgb24: 0xFFF4E0),
-        warningText: Color(rgb24: 0xB35900),
-        successBg: Color(rgb24: 0xE3F7EA),
-        successText: Color(rgb24: 0x1E7C3A),
-        desktopWashTopLeft: Color(rgb24: 0xA88CFF, opacity: 0.30),
-        desktopWashBottomRight: Color(rgb24: 0x78C8EB, opacity: 0.30),
-        desktopWashBase: Color(rgb24: 0xF3F1EE),
-        groupHighlightTopOpacity: 0.90,
+        windowBg: systemWindowBg,
+        sidebarBg: systemWindowBg,
+        sidebarBorder: systemSeparator,
+        contentBg: systemWindowBg,
+        toolbarBg: systemWindowBg,
+        toolbarBorder: systemSeparator,
+        groupBg: systemGroupBgLight,
+        groupBorder: systemSeparator,
+        rowSep: systemSeparator,
+        separator: systemSeparator,
+        text: systemText,
+        textSecondary: systemTextSecondary,
+        textTertiary: systemTextTertiary,
+        accent: systemAccent,
+        accentSoft: systemAccent.opacity(0.16),
+        accentText: systemAccentText,
+        selBg: systemSelection,
+        hoverBg: systemHover,
+        controlBg: systemControlBg,
+        controlBgHover: systemControlBg.opacity(0.92),
+        glassBg: systemWindowBg.opacity(0.70),
+        glassBgStrong: systemGroupBgLight,
+        inputBg: systemInputBg,
+        inputBorder: systemSeparator,
+        inputBorderFocus: systemAccent,
+        greenDot: systemGreen,
+        amberDot: systemOrange,
+        redDot: systemRed,
+        blueDot: systemAccent,
+        codeBg: systemCodeBgLight,
+        warningBg: systemOrange.opacity(0.16),
+        warningText: systemOrange,
+        successBg: systemGreen.opacity(0.16),
+        successText: systemGreen,
+        desktopWashTopLeft: .clear,
+        desktopWashBottomRight: .clear,
+        desktopWashBase: systemWindowBg,
+        groupHighlightTopOpacity: 0.35,
         groupShadowOpacity: 0.06
     )
 
     static let dark = OMLXTheme(
         isDark: true,
-        windowBg: Color(rgb24: 0x16161A),
-        sidebarBg: Color(rgb24: 0x1C1C20, opacity: 0.55),
-        sidebarBorder: .white(0.07),
-        contentBg: Color(rgb24: 0x16161A, opacity: 0.72),
-        toolbarBg: Color(rgb24: 0x1C1C20, opacity: 0.55),
-        toolbarBorder: .white(0.07),
-        groupBg: Color(rgb24: 0x303036, opacity: 0.55),
-        groupBorder: .white(0.08),
-        rowSep: .white(0.06),
-        separator: .white(0.10),
-        text: .white(0.94),
-        textSecondary: Color(rgb24: 0xEBEBF5, opacity: 0.65),
-        textTertiary: Color(rgb24: 0xEBEBF5, opacity: 0.35),
-        accent: Color(rgb24: 0x0A84FF),
-        accentSoft: Color(rgb24: 0x0A84FF, opacity: 0.22),
-        accentText: .white,
-        selBg: .white(0.10),
-        hoverBg: .white(0.05),
-        controlBg: .white(0.10),
-        controlBgHover: .white(0.16),
-        glassBg: .white(0.10),
-        glassBgStrong: .white(0.14),
-        inputBg: .black(0.30),
-        inputBorder: .white(0.10),
-        inputBorderFocus: Color(rgb24: 0x0A84FF),
-        greenDot: Color(rgb24: 0x30D158),
-        amberDot: Color(rgb24: 0xFF9F0A),
-        redDot: Color(rgb24: 0xFF453A),
-        blueDot: Color(rgb24: 0x0A84FF),
-        codeBg: .white(0.07),
-        warningBg: Color(rgb24: 0xFF9F0A, opacity: 0.18),
-        warningText: Color(rgb24: 0xFFB340),
-        successBg: Color(rgb24: 0x30D158, opacity: 0.18),
-        successText: Color(rgb24: 0x34C759),
-        desktopWashTopLeft: Color(rgb24: 0x6048DC, opacity: 0.22),
-        desktopWashBottomRight: Color(rgb24: 0x28A0D2, opacity: 0.18),
-        desktopWashBase: Color(rgb24: 0x0E0E12),
+        windowBg: systemWindowBg,
+        sidebarBg: systemWindowBg,
+        sidebarBorder: systemSeparator,
+        contentBg: systemWindowBg,
+        toolbarBg: systemWindowBg,
+        toolbarBorder: systemSeparator,
+        groupBg: systemGroupBgDark,
+        groupBorder: systemSeparator,
+        rowSep: systemSeparator,
+        separator: systemSeparator,
+        text: systemText,
+        textSecondary: systemTextSecondary,
+        textTertiary: systemTextTertiary,
+        accent: systemAccent,
+        accentSoft: systemAccent.opacity(0.22),
+        accentText: systemAccentText,
+        selBg: systemSelection,
+        hoverBg: systemHover,
+        controlBg: systemControlBg,
+        controlBgHover: systemControlBg.opacity(0.85),
+        glassBg: systemWindowBg.opacity(0.70),
+        glassBgStrong: systemGroupBgDark,
+        inputBg: systemInputBg,
+        inputBorder: systemSeparator,
+        inputBorderFocus: systemAccent,
+        greenDot: systemGreen,
+        amberDot: systemOrange,
+        redDot: systemRed,
+        blueDot: systemAccent,
+        codeBg: systemCodeBgDark,
+        warningBg: systemOrange.opacity(0.18),
+        warningText: systemOrange,
+        successBg: systemGreen.opacity(0.18),
+        successText: systemGreen,
+        desktopWashTopLeft: .clear,
+        desktopWashBottomRight: .clear,
+        desktopWashBase: systemWindowBg,
         groupHighlightTopOpacity: 0.08,
-        groupShadowOpacity: 0.30
+        groupShadowOpacity: 0.08
     )
+
+    private static var systemWindowBg: Color {
+        Color(nsColor: .underPageBackgroundColor)
+    }
+
+    private static var systemGroupBgLight: Color {
+        Color(nsColor: .windowBackgroundColor)
+    }
+
+    private static var systemGroupBgDark: Color {
+        Color(nsColor: .labelColor).opacity(0.03)
+    }
+
+    private static var systemControlBg: Color {
+        Color(nsColor: .controlColor)
+    }
+
+    private static var systemCodeBgLight: Color {
+        systemText.opacity(0.05)
+    }
+
+    private static var systemCodeBgDark: Color {
+        systemText.opacity(0.07)
+    }
+
+    private static var systemInputBg: Color {
+        Color(nsColor: .textBackgroundColor)
+    }
+
+    private static var systemSeparator: Color {
+        Color(nsColor: .separatorColor)
+    }
+
+    private static var systemText: Color {
+        Color(nsColor: .labelColor)
+    }
+
+    private static var systemTextSecondary: Color {
+        Color(nsColor: .secondaryLabelColor)
+    }
+
+    private static var systemTextTertiary: Color {
+        Color(nsColor: .tertiaryLabelColor)
+    }
+
+    private static var systemAccent: Color {
+        Color(nsColor: .controlAccentColor)
+    }
+
+    private static var systemAccentText: Color {
+        Color(nsColor: .alternateSelectedControlTextColor)
+    }
+
+    private static var systemSelection: Color {
+        Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+    }
+
+    private static var systemHover: Color {
+        Color(nsColor: .quaternaryLabelColor)
+    }
+
+    private static var systemGreen: Color {
+        Color(nsColor: .systemGreen)
+    }
+
+    private static var systemOrange: Color {
+        Color(nsColor: .systemOrange)
+    }
+
+    private static var systemRed: Color {
+        Color(nsColor: .systemRed)
+    }
 }
 
 // MARK: - Environment

@@ -11,6 +11,38 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class IntegrationContext:
+    """Resolved launch/configuration inputs for an external tool integration."""
+
+    host: str
+    port: int
+    api_key: str = ""
+    model: str = ""
+    context_window: int | None = None
+    max_tokens: int | None = None
+    model_type: str | None = None
+    reasoning: bool | None = None
+    tools_profile: str = "coding"
+    extra_args: tuple[str, ...] = ()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def openai_base_url(self) -> str:
+        return f"{self.base_url}/v1"
+
+    @property
+    def auth_token(self) -> str:
+        return self.api_key or "omlx"
+
+    @property
+    def supports_images(self) -> bool:
+        return self.model_type == "vlm"
+
+
 @dataclass
 class Integration:
     """Base integration definition."""
@@ -21,17 +53,15 @@ class Integration:
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
 
-    def get_command(
-        self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
-    ) -> str:
+    def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
         raise NotImplementedError
 
-    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
+    def configure(self, ctx: IntegrationContext) -> None:
         """Configure the tool (write config files, etc.)."""
         pass
 
-    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+    def launch(self, ctx: IntegrationContext) -> None:
         """Configure and launch the tool."""
         raise NotImplementedError
 

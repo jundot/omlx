@@ -428,6 +428,32 @@ class MemoryMonitor:
         kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
+    def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
+        """Transient SDPA activation bytes for ONE prefill chunk.
+
+        Isolates the per-chunk attention transient — the spike that drives
+        prefill OOM — for a chunk of ``n_tokens`` query tokens attending over
+        ``kv_len`` total context tokens. Unlike ``estimate_prefill_peak_bytes``
+        this excludes newly-allocated KV (that becomes resident and is counted
+        in the caller's ``current`` baseline once eval'd); it is the quantity
+        the adaptive throttle must keep under the remaining headroom.
+
+        head_dim > 128: MLX SDPA fallback materializes the full attention
+        matrix [B, n_q, n_tokens, kv_len] in float32, plus a small output
+        buffer — so the transient scales with ``n_tokens * kv_len``.
+        head_dim <= 128: fused kernel is tiled / O(n), so only the output
+        buffer is allocated and throttling is effectively a no-op (correct).
+
+        Returns 0 when model info is unavailable.
+        """
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        if n_q == 0 or hd == 0 or n_tokens <= 0:
+            return 0
+        if hd > 128:
+            return n_q * n_tokens * max(kv_len, 0) * 4 + n_q * n_tokens * hd * 4
+        return n_q * n_tokens * hd * 4
+
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
         Estimate number of blocks to evict to free the given bytes.

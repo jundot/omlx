@@ -76,6 +76,18 @@ final class GlobalSettingsSamplingTests: XCTestCase {
 
     // MARK: - Patch encode
 
+    func testPatchEncodesEmbeddingBatchSizeAsSnakeCaseFlatKey() throws {
+        // Scheduler writes use the flat GlobalSettingsRequest shape, so the
+        // Swift camelCase property must encode to embedding_batch_size.
+        var patch = GlobalSettingsPatch()
+        patch.embeddingBatchSize = 8
+
+        let data = try encoder.encode(patch)
+        let str = String(data: data, encoding: .utf8) ?? ""
+
+        XCTAssertTrue(str.contains("\"embedding_batch_size\":8"), "got: \(str)")
+    }
+
     func testPatchEncodesSamplingFieldsAsSnakeCaseFlatKeys() throws {
         // The Python `GlobalSettingsRequest` accepts the sampling defaults
         // as flat `sampling_*` keys (omlx/admin/routes.py:229-234), not

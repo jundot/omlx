@@ -11,6 +11,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_unsupported_model,
+    _read_model_context_length,
     _resolve_hf_cache_entry,
     detect_model_type,
     discover_models,
@@ -410,6 +411,51 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_lfm_text_moe_family_as_llm_not_audio_sts(self, tmp_path):
+        """LFM text MoE (lfm*_moe + *ForCausalLM) must not use mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_future_moe_variant_as_llm_not_audio_sts(self, tmp_path):
+        """Any lfm*_moe text type with *ForCausalLM uses LLM, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_5_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
+        """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": ["LFM2AudioModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_lfm_audio_model_type_as_sts(self, tmp_path):
+        """lfm_audio model_type is STS even without a recognized architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": [],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_unknown_lfm_prefix_without_causal_lm_as_sts(self, tmp_path):
+        """Unknown mlx-audio lfm* types without CausalLM still use prefix fallback."""
+        config = {
+            "model_type": "lfm_custom_audio",
+            "architectures": ["SomeLegacyLFMAudioWrapper"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
 
 class TestEstimateModelSize:
     """Tests for estimate_model_size function."""
@@ -778,6 +824,76 @@ class TestDiscoveredModel:
 
         assert model.model_type == "embedding"
         assert model.engine_type == "embedding"
+
+
+class TestReadModelContextLength:
+    """Tests for _read_model_context_length — the discovery-time
+    config.json reader that backs #1308's API exposure fix."""
+
+    def _write(self, tmp_path, config=None, tokenizer_config=None):
+        if config is not None:
+            (tmp_path / "config.json").write_text(json.dumps(config))
+        if tokenizer_config is not None:
+            (tmp_path / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+
+    def test_max_position_embeddings_wins(self, tmp_path):
+        self._write(tmp_path, config={"max_position_embeddings": 262144})
+        assert _read_model_context_length(tmp_path) == 262144
+
+    def test_alternate_keys(self, tmp_path):
+        for key in ("max_seq_len", "max_seq_length", "seq_length", "n_positions"):
+            sub = tmp_path / key
+            sub.mkdir()
+            self._write(sub, config={key: 8192})
+            assert _read_model_context_length(sub) == 8192, key
+
+    def test_top_level_takes_precedence_over_nested(self, tmp_path):
+        self._write(tmp_path, config={
+            "max_position_embeddings": 200000,
+            "text_config": {"max_position_embeddings": 32768},
+        })
+        assert _read_model_context_length(tmp_path) == 200000
+
+    def test_text_config_fallback(self, tmp_path):
+        """VLM wrappers stash the language head's ctx in text_config."""
+        self._write(tmp_path, config={"text_config": {"max_position_embeddings": 131072}})
+        assert _read_model_context_length(tmp_path) == 131072
+
+    def test_language_config_fallback(self, tmp_path):
+        """Some Qwen-style configs use language_config instead."""
+        self._write(tmp_path, config={"language_config": {"max_position_embeddings": 65536}})
+        assert _read_model_context_length(tmp_path) == 65536
+
+    def test_tokenizer_max_length_fallback(self, tmp_path):
+        """When config.json doesn't expose a length, tokenizer_config wins."""
+        self._write(tmp_path, config={"model_type": "llama"}, tokenizer_config={"model_max_length": 4096})
+        assert _read_model_context_length(tmp_path) == 4096
+
+    def test_tokenizer_sentinel_rejected(self, tmp_path):
+        """Transformers' int(1e30) "no cap" sentinel must NOT leak through."""
+        self._write(
+            tmp_path,
+            config={"model_type": "llama"},
+            tokenizer_config={"model_max_length": int(1e30)},
+        )
+        assert _read_model_context_length(tmp_path) is None
+
+    def test_no_config_returns_none(self, tmp_path):
+        assert _read_model_context_length(tmp_path) is None
+
+    def test_invalid_types_rejected(self, tmp_path):
+        """A string or zero in the config must not be returned as a length."""
+        self._write(tmp_path, config={"max_position_embeddings": "long"})
+        assert _read_model_context_length(tmp_path) is None
+        sub = tmp_path / "zero"
+        sub.mkdir()
+        self._write(sub, config={"max_position_embeddings": 0})
+        assert _read_model_context_length(sub) is None
+
+    def test_malformed_config_is_silent(self, tmp_path):
+        """A broken config.json must not raise — discovery should keep going."""
+        (tmp_path / "config.json").write_text("{not valid json")
+        assert _read_model_context_length(tmp_path) is None
 
 
 class TestTwoLevelDiscovery:

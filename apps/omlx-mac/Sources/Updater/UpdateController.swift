@@ -60,7 +60,17 @@ final class UpdateController: ObservableObject {
         didSet { if !suspendPersist { persist() } }
     }
     @Published var autoCheck: Bool {
-        didSet { if !suspendPersist { persist() } }
+        didSet {
+            guard !suspendPersist else { return }
+            persist()
+            if autoCheck {
+                backgroundCheck()
+                scheduleBackgroundChecker()
+            } else {
+                backgroundTimer?.invalidate()
+                backgroundTimer = nil
+            }
+        }
     }
     @Published var autoDownload: Bool {
         didSet { if !suspendPersist { persist() } }

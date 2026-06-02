@@ -8,7 +8,7 @@ import shutil
 import time
 from pathlib import Path
 
-from omlx.integrations.base import Integration
+from omlx.integrations.base import Integration, IntegrationContext
 from omlx.utils.install import get_cli_prefix
 
 
@@ -26,15 +26,13 @@ class CodexIntegration(Integration):
             install_hint="npm install -g @openai/codex",
         )
 
-    def get_command(
-        self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
-    ) -> str:
+    def get_command(self, ctx: IntegrationContext) -> str:
         return (
             f"{get_cli_prefix()} "
-            f"launch codex --model {model or 'select-a-model'}"
+            f"launch codex --model {ctx.model or 'select-a-model'}"
         )
 
-    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
+    def configure(self, ctx: IntegrationContext) -> None:
         config_path = self.CONFIG_PATH
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -55,15 +53,19 @@ class CodexIntegration(Integration):
         new_lines = []
         in_any_section = False
         in_omlx_section = False
-        
+
         # Keys to override at the top level
         top_level_overrides = {
-            "model": f'"{model or "select-a-model"}"',
-            "model_provider": '"omlx"'
+            "model": f'"{ctx.model or "select-a-model"}"',
+            "model_provider": '"omlx"',
         }
-        
+
         # If it is a reasoning model, add reasoning effort
-        is_reasoning = bool(re.search(r'\b(thinking|o1|o3|r1)\b', (model or "").lower()))
+        is_reasoning = (
+            bool(ctx.reasoning)
+            if ctx.reasoning is not None
+            else bool(re.search(r"\b(thinking|o1|o3|r1)\b", ctx.model.lower()))
+        )
         if is_reasoning:
             top_level_overrides["model_reasoning_effort"] = '"high"'
 
@@ -76,7 +78,7 @@ class CodexIntegration(Integration):
             stripped = line.strip()
             if stripped.startswith("[") and stripped.endswith("]"):
                 in_any_section = True
-                in_omlx_section = (stripped == "[model_providers.omlx]")
+                in_omlx_section = stripped == "[model_providers.omlx]"
 
             # Handle top-level keys
             if not in_any_section and "=" in stripped:
@@ -87,11 +89,11 @@ class CodexIntegration(Integration):
                     continue
                 if key in managed_keys:
                     continue
-            
+
             # Skip old oMLX section
             if in_omlx_section:
                 continue
-                
+
             new_lines.append(line)
 
         # Add missing top-level keys
@@ -102,29 +104,21 @@ class CodexIntegration(Integration):
         # Append new oMLX provider section
         new_lines.append("\n[model_providers.omlx]")
         new_lines.append('name = "oMLX"')
-        new_lines.append(f'base_url = "http://{host}:{port}/v1"')
+        new_lines.append(f'base_url = "{ctx.openai_base_url}"')
         new_lines.append('env_key = "OMLX_API_KEY"')
 
         config_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         print(f"Config updated: {config_path}")
 
-    def launch(
-        self,
-        port: int,
-        api_key: str,
-        model: str,
-        host: str = "127.0.0.1",
-        extra_args: list[str] | None = None,
-        **kwargs,
-    ) -> None:
-        self.configure(port, api_key, model, host=host)
+    def launch(self, ctx: IntegrationContext) -> None:
+        self.configure(ctx)
 
         env = self._scrubbed_env()
-        env["OMLX_API_KEY"] = api_key or "omlx"
+        env["OMLX_API_KEY"] = ctx.auth_token
 
         args = ["codex"]
-        if model:
-            args.extend(["-m", model])
-        args.extend(extra_args or [])
+        if ctx.model:
+            args.extend(["-m", ctx.model])
+        args.extend(ctx.extra_args)
 
         os.execvpe("codex", args, env)

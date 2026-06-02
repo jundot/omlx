@@ -221,6 +221,7 @@ class HarmonyStreamingParser:
         # Check if this is a special token (should not be streamed)
         is_special_token = token_id in self._special_tokens
         is_stop = token_id in self._stop_tokens
+        was_analysis = self._prev_channel == "analysis"
 
         # Passthrough: parser crashed earlier, buffer all tokens silently.
         # Tokens are still tracked by the scheduler for non-streaming tool
@@ -243,6 +244,12 @@ class HarmonyStreamingParser:
 
         channel = self._parser.current_channel
         control_text = ""
+
+        # Harmony uses the same end token for analysis, final, and tool/action
+        # messages. Ending analysis should let generation continue into the
+        # final channel; ending other channels should stop the request.
+        if was_analysis and is_stop:
+            is_stop = False
 
         # Handle channel transitions for <think> tags
         if channel != self._prev_channel:
@@ -372,11 +379,13 @@ def parse_tool_calls_from_tokens(
     try:
         encoding = load_harmony_encoding("HarmonyGptOss")
 
-        # The model's chat template includes "<|start|>assistant" in the prompt,
-        # so the model generates starting from "<|channel|>".
-        # We need to prepend "<|start|>assistant" for proper parsing.
-        if prepend_start:
-            start_tokens = encoding.encode("<|start|>assistant", allowed_special="all")
+        start_tokens = encoding.encode("<|start|>assistant", allowed_special="all")
+        has_start = list(token_ids[: len(start_tokens)]) == start_tokens
+
+        # The normal chat template includes "<|start|>assistant" in the prompt,
+        # so completions start from "<|channel|>" and need the prefix restored.
+        # Budget-forced or recovered Harmony completions may already include it.
+        if prepend_start and not has_start:
             full_token_ids = start_tokens + list(token_ids)
         else:
             full_token_ids = list(token_ids)

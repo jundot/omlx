@@ -38,6 +38,8 @@ def create_grammar_compiler(tokenizer, model):
 
     Returns None if vocab_size cannot be determined.
     """
+    from .._torch_stub import install as _install_torch_stub
+    _install_torch_stub()
     import xgrammar as xgr
 
     from ..utils.tokenizer import resolve_vocab_size, unwrap_tokenizer
@@ -63,6 +65,8 @@ class GrammarConstraintProcessor:
     """
 
     def __init__(self, compiled_grammar, vocab_size: int):
+        from .._torch_stub import install as _install_torch_stub
+        _install_torch_stub()
         import xgrammar as xgr
         from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
 

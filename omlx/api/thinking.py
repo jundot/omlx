@@ -10,6 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
+from collections.abc import Callable
 from typing import List, Optional, Tuple
 
 
@@ -278,6 +279,7 @@ class ThinkingBudgetProcessor:
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
+        token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -288,31 +290,24 @@ class ThinkingBudgetProcessor:
         )
         self._budget = budget
         self._think_start_id = think_start_token_id
+        self._token_to_piece = token_to_piece
 
         # State
         self._thinking_tokens: int = 0
         self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
         self._forcing: bool = False
+        self._waiting_utf8: bool = False
         self._force_idx: int = 0
         self._done: bool = False
         self._first_call: bool = True
-        # After forced sequence, suppress duplicate </think> tokens
-        self._suppress_end: bool = False
         # Sliding window for multi-token end detection
         self._recent_tokens: List[int] = []
-        # Flat set for fast single-token suppression check
-        self._end_id_set = set(think_end_token_ids)
+        self._last_token_utf8_complete: bool = True
+        self._pending_utf8: bytes = b""
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
         import mlx.core as mx
-
-        if self._done:
-            return logits
-
-        # Post-forcing phase: suppress duplicate </think> tokens
-        if self._suppress_end:
-            return self._suppress_end_tokens(logits, mx)
 
         # In new mlx-lm API, tokens is the full history list.
         # Accept each genuinely generated token exactly once (see grammar.py).
@@ -327,31 +322,44 @@ class ThinkingBudgetProcessor:
         # If state changed by _update_state, handle immediately
         if self._done:
             return logits
-        if self._suppress_end:
-            return self._suppress_end_tokens(logits, mx)
 
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        if self._waiting_utf8:
+            return logits
+
         if self._in_thinking:
             self._thinking_tokens += 1
             if self._thinking_tokens >= self._budget:
-                self._forcing = True
-                self._force_idx = 0
-                return self._force_next_token(logits, mx)
+                if self._last_token_utf8_complete:
+                    self._forcing = True
+                    self._force_idx = 0
+                    self._recent_tokens = []
+                    return self._force_next_token(logits, mx)
+                self._waiting_utf8 = True
+                self._recent_tokens = []
 
         return logits
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
+        self._last_token_utf8_complete = self._is_utf8_complete(token_id)
+
+        if self._done:
+            if self._think_start_id and token_id == self._think_start_id:
+                self._in_thinking = True
+                self._done = False
+                self._thinking_tokens = 0
+                self._recent_tokens = []
+            return
+
         if self._forcing:
             self._force_idx += 1
             if self._force_idx >= len(self._force_sequence):
                 self._in_thinking = False
                 self._forcing = False
-                # Don't set _done — enter suppression mode to prevent
-                # the model from generating a duplicate </think>.
-                self._suppress_end = True
+                self._done = True
             return
 
         # Detect natural close-think via sliding window
@@ -369,9 +377,46 @@ class ThinkingBudgetProcessor:
                 self._done = True
                 return
 
+        if self._waiting_utf8:
+            if self._last_token_utf8_complete:
+                self._waiting_utf8 = False
+                self._forcing = True
+                self._force_idx = 0
+                self._recent_tokens = []
+            return
+
         # Detect re-entry into thinking (rare but possible)
         if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
             self._in_thinking = True
+            self._done = False
+            self._thinking_tokens = 0
+            self._recent_tokens = []
+
+    def _is_utf8_complete(self, token_id: int) -> bool:
+        """Best-effort UTF-8 boundary check for accepted token bytes."""
+        if self._token_to_piece is None:
+            return True
+        try:
+            piece = self._token_to_piece(token_id)
+        except Exception:
+            return True
+        if piece is None:
+            return True
+        if isinstance(piece, str):
+            self._pending_utf8 = b""
+            return True
+        self._pending_utf8 += piece
+        try:
+            self._pending_utf8.decode("utf-8")
+            self._pending_utf8 = b""
+            return True
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data" or exc.end == len(
+                self._pending_utf8
+            ):
+                return False
+            self._pending_utf8 = b""
+            return True
 
     def _force_next_token(self, logits, mx):
         """Force the next token in the close-think + trailing sequence."""
@@ -379,11 +424,3 @@ class ThinkingBudgetProcessor:
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
-
-    def _suppress_end_tokens(self, logits, mx):
-        """Suppress duplicate </think> tokens after forced close."""
-        # Set logits of all end-token IDs to -inf so the model
-        # cannot produce another </think>.
-        for tid in self._end_id_set:
-            logits[..., tid] = float("-inf")
-        return logits

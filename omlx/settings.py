@@ -189,6 +189,7 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
+    embedding_batch_size: int = 32
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
@@ -208,8 +209,10 @@ class SchedulerSettings:
             value = data.get("completion_batch_size")
         if value is None:
             value = 8
+        embedding_batch_size = data.get("embedding_batch_size", 32)
         return cls(
             max_concurrent_requests=value,
+            embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
         )
 
@@ -817,6 +820,13 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_MAX_CONCURRENT_REQUESTS value: {max_concurrent}"
                 )
+        if embedding_batch_size := os.getenv("OMLX_EMBEDDING_BATCH_SIZE"):
+            try:
+                self.scheduler.embedding_batch_size = int(embedding_batch_size)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -898,6 +908,11 @@ class GlobalSettings:
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
+        if (
+            hasattr(args, "embedding_batch_size")
+            and args.embedding_batch_size is not None
+        ):
+            self.scheduler.embedding_batch_size = args.embedding_batch_size
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1071,6 +1086,11 @@ class GlobalSettings:
                 f"Invalid max_concurrent_requests: "
                 f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
+        if self.scheduler.embedding_batch_size <= 0:
+            errors.append(
+                f"Invalid embedding_batch_size: "
+                f"{self.scheduler.embedding_batch_size} (must be > 0)"
+            )
 
         # Cache validation
         if self.cache.ssd_cache_max_size.lower() != "auto":
@@ -1172,6 +1192,7 @@ class GlobalSettings:
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
+            embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,

@@ -357,7 +357,8 @@ class TestAdvanceChunkedPrefills:
         assert rejected == []
 
     def test_runtime_error_surfaces_as_request_error(self):
-        """RuntimeError mid-chunk yields a finish_reason=\"error\" RequestOutput."""
+        """A non-memory RuntimeError mid-chunk yields a finish_reason="error"
+        RequestOutput immediately (only memory-pressure errors are requeued)."""
         sched = _make_scheduler()
         req = _make_request("oom")
         sched.requests[req.request_id] = req
@@ -367,7 +368,7 @@ class TestAdvanceChunkedPrefills:
 
         with patch.object(
             sched, "_step_prefill_chunk",
-            side_effect=RuntimeError("Memory limit exceeded")
+            side_effect=RuntimeError("kernel panic")
         ):
             scheduled = []
             rejected = []
@@ -382,7 +383,33 @@ class TestAdvanceChunkedPrefills:
         assert out.request_id == "oom"
         assert out.finished is True
         assert out.finish_reason == "error"
-        assert "Memory limit" in out.error
+        assert "kernel panic" in out.error
+
+    def test_memory_error_requeues_instead_of_surfacing(self):
+        """A memory-pressure RuntimeError mid-chunk requeues the request for a
+        fresh attempt instead of immediately surfacing an error to the client."""
+        sched = _make_scheduler()
+        req = _make_request("oom-mem")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        with patch.object(
+            sched, "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded during chunked prefill")
+        ):
+            scheduled = []
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
+
+        # No client-facing error; the request is reset and back on the queue.
+        assert rejected == []
+        assert req.request_id not in sched._prefill_states
+        assert req not in sched.prefilling
+        assert sched.requests.get(req.request_id) is req
+        assert req in sched.waiting
+        assert req.prefill_oom_retries == 1
 
     def test_multiple_requests_all_advanced(self):
         """All requests in prefilling get one chunk advanced per call."""
@@ -649,3 +676,152 @@ class TestScheduleWaitingChunkedFork:
             assert "Memory limit" in out.error
         finally:
             tracker.clear()
+
+
+# ---------------------------------------------------------------------------
+# Prefill-rejection paged-cache cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestPrefillRejectionReleasesPagedCache:
+    """Rejection paths must release block_aware_cache refs / paged_cache
+    block_table entries that ``add_request`` populated via ``fetch_cache``.
+
+    Without this, every rejected request leaks an entry in
+    ``BlockAwarePrefixCache._request_tables`` plus the ref counts on its
+    prefix-matched blocks — pinning the paged cache and compounding the
+    very memory pressure that triggered the rejection. The existing
+    ``self.requests.pop(...)`` and ``get_prefill_tracker().remove(...)``
+    cleanups handle scheduler-side state but never reach into the
+    paged-cache layer.
+    """
+
+    def test_helper_calls_block_aware_cache_release(self):
+        """The helper delegates to block_aware_cache.release_cache when one
+        is attached — the normal production wiring."""
+        sched = _make_scheduler()
+        sched.block_aware_cache = MagicMock()
+        sched.paged_cache_manager = MagicMock()
+
+        sched._release_paged_cache_for_request("rid-1")
+
+        sched.block_aware_cache.release_cache.assert_called_once_with("rid-1")
+        # release_cache delegates to delete_block_table internally; the
+        # helper must NOT also call it directly (double-delete).
+        sched.paged_cache_manager.delete_block_table.assert_not_called()
+
+    def test_helper_falls_back_to_paged_cache_manager(self):
+        """Without a BlockAwarePrefixCache, fall back to deleting the block
+        table directly on the paged cache manager."""
+        sched = _make_scheduler()
+        sched.block_aware_cache = None
+        sched.paged_cache_manager = MagicMock()
+
+        sched._release_paged_cache_for_request("rid-2")
+
+        sched.paged_cache_manager.delete_block_table.assert_called_once_with("rid-2")
+
+    def test_helper_is_noop_without_any_paged_cache(self):
+        """No paged-cache layer attached → silent no-op."""
+        sched = _make_scheduler()
+        sched.block_aware_cache = None
+        sched.paged_cache_manager = None
+
+        # Should not raise.
+        sched._release_paged_cache_for_request("rid-3")
+
+    def test_advance_chunked_prefills_releases_on_runtime_error(self):
+        """_advance_chunked_prefills' RuntimeError handler must call
+        release_cache so the paged-cache block refs from the request's
+        prefix-cache lookup don't leak."""
+        sched = _make_scheduler()
+        sched.block_aware_cache = MagicMock()
+        req = _make_request("oom-chunked")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        with patch.object(
+            sched, "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded"),
+        ):
+            sched._advance_chunked_prefills([], [])
+
+        sched.block_aware_cache.release_cache.assert_called_once_with(
+            "oom-chunked"
+        )
+
+    def test_schedule_waiting_non_chunked_releases_on_runtime_error(self):
+        """The non-chunked _do_external_prefill rejection path must release
+        the paged-cache footprint before popping self.requests."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        # No prefix-cache hit: fetch_cache returns (None, prompt_tokens) so
+        # add_request falls through to the waiting queue without trying to
+        # preload/reconstruct.
+        sched.block_aware_cache.fetch_cache.return_value = (None, [0, 1, 2])
+        req = _make_request("oom-direct", n_tokens=3)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        with patch.object(
+            sched, "_do_external_prefill",
+            side_effect=RuntimeError("kernel panic"),
+        ):
+            sched._schedule_waiting()
+
+        sched.block_aware_cache.release_cache.assert_called_once_with(
+            "oom-direct"
+        )
+
+    def test_schedule_waiting_chunked_first_chunk_releases_on_runtime_error(self):
+        """The chunked first-chunk rejection path must release the
+        paged-cache footprint before popping self.requests."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(10)))
+        req = _make_request("oom-first-chunk", n_tokens=10)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        with patch.object(
+            sched, "_begin_prefill",
+            return_value=_make_prefill_state(sched, req),
+        ):
+            with patch.object(
+                sched, "_step_prefill_chunk",
+                side_effect=RuntimeError("kernel panic"),
+            ):
+                sched._schedule_waiting()
+
+        sched.block_aware_cache.release_cache.assert_called_once_with(
+            "oom-first-chunk"
+        )
+
+    def test_schedule_waiting_preflight_rejection_releases(self):
+        """_preflight_memory_check rejection (the non-RuntimeError path
+        inside _schedule_waiting) must also release the paged-cache
+        footprint. Same leak shape as the RuntimeError rejections — the
+        request reached this point via add_request → fetch_cache so
+        _request_tables is populated and prefix block refs are held."""
+        sched = _make_scheduler(step_size=4)
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.fetch_cache.return_value = (None, list(range(5)))
+        req = _make_request("oom-preflight", n_tokens=5)
+        sched.add_request(req)
+        sched.block_aware_cache.reset_mock()
+
+        with patch.object(
+            sched, "_preflight_memory_check",
+            return_value="Memory limit exceeded by preflight estimate",
+        ):
+            scheduled, rejected = sched._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == "oom-preflight"
+        assert rejected[0].finish_reason == "error"
+        sched.block_aware_cache.release_cache.assert_called_once_with(
+            "oom-preflight"
+        )

@@ -1,9 +1,9 @@
 // PR 7 — Status screen. Lays out:
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
-//   • Session Stats — 4 StatTiles from /admin/api/stats (scope segmented)
+//   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
-//   • Updates — three-state row + Channel/AutoCheck/AutoDownload (UpdateController stub)
+//   • Updates — release check status + auto-check/auto-download prefs
 //   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
@@ -57,6 +57,16 @@ struct StatusScreen: View {
                 }
             }
             StatTilesRow(stats: vm.stats)
+
+            SectionHeader(String(localized: "status.speed.section_label",
+                                  defaultValue: "Average Speed",
+                                  comment: "Header label above average serving speed metrics"))
+            AverageSpeedTilesRow(stats: vm.stats)
+
+            SectionHeader(String(localized: "status.section.active_now",
+                                  defaultValue: "Active Now",
+                                  comment: "Section header for the currently active models list"))
+            ActiveNowList(models: vm.stats?.activeModels.models ?? [])
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
@@ -115,11 +125,6 @@ struct StatusScreen: View {
                                   defaultValue: "Updates",
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
-
-            SectionHeader(String(localized: "status.section.active_now",
-                                  defaultValue: "Active Now",
-                                  comment: "Section header for the currently active models list"))
-            ActiveNowList(models: vm.stats?.activeModels.models ?? [])
 
             if let error = vm.lastError {
                 Text(error)
@@ -339,53 +344,26 @@ private struct StatTilesRow: View {
     let stats: StatsDTO?
 
     var body: some View {
-        // `.top` alignment + each tile claiming `maxHeight: .infinity` keeps
-        // the four cards visually flush even when one of them wraps a
-        // subtitle to two lines at narrower widths.
         HStack(alignment: .top, spacing: 10) {
             StatTile(
                 label: String(localized: "status.tile.total",
-                              defaultValue: "Total Tokens",
-                              comment: "Stat tile label for total tokens served"),
-                value: stats.map { fmtNum($0.totalTokensServed) } ?? "—",
-                sub: String(localized: "status.tile.total.sub",
-                            defaultValue: "prompt + completion",
-                            comment: "Sub-label for the total tokens stat tile")
+                              defaultValue: "Total Prefill Tokens",
+                              comment: "Stat tile label for total prefill tokens processed"),
+                value: stats.map { fmtNum($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
-                              defaultValue: "Cached",
+                              defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—",
-                sub: stats.map {
-                    String(localized: "status.tile.cached.sub",
-                           defaultValue: "\(String(format: "%.1f", $0.cacheEfficiency))% efficiency",
-                           comment: "Sub-label showing cache efficiency percentage on the cached tile; placeholder is a formatted percentage")
-                },
-                accentRole: .success
+                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
-                label: String(localized: "status.tile.generation",
-                              defaultValue: "Generation",
-                              comment: "Stat tile label for average generation rate"),
-                value: stats.map { String(format: "%.1f tok/s", $0.avgGenerationTps) } ?? "—",
-                sub: String(localized: "status.tile.generation.sub",
-                            defaultValue: "across active models",
-                            comment: "Sub-label for the generation rate tile")
-            )
-            StatTile(
-                label: String(localized: "status.tile.requests",
-                              defaultValue: "Requests",
-                              comment: "Stat tile label for the total requests count"),
-                value: stats.map { fmtNum($0.totalRequests) } ?? "—",
-                sub: stats.map {
-                    String(localized: "status.tile.requests.sub",
-                           defaultValue: "\(($0.activeModels.totalActiveRequests ?? 0)) in flight",
-                           comment: "Sub-label showing in-flight request count; placeholder is the number of active requests")
-                }
+                label: String(localized: "status.tile.cache_efficiency",
+                              defaultValue: "Cache Efficiency",
+                              comment: "Stat tile label for cache efficiency percentage"),
+                value: stats.map { String(format: "%.1f%%", $0.cacheEfficiency) } ?? "—"
             )
         }
-        .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 14)
         .padding(.bottom, 4)
     }
@@ -408,26 +386,25 @@ private struct StatTile: View {
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
                 .kerning(0.6)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
             Text(value)
                 .font(.omlxText(22, weight: .semibold))
                 .kerning(-0.5)
                 .foregroundStyle(accentColor)
+                .frame(maxWidth: .infinity)
             if let sub {
                 Text(sub)
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
             }
         }
         .padding(16)
-        // maxHeight: .infinity lets every tile match the tallest sibling so
-        // the card backgrounds line up even when one subtitle wraps.
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .center)
         .background(theme.groupBg)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
     }
 
     private var accentColor: Color {
@@ -437,6 +414,29 @@ private struct StatTile: View {
         case .warning: return theme.amberDot
         case .danger:  return theme.redDot
         }
+    }
+}
+
+private struct AverageSpeedTilesRow: View {
+    let stats: StatsDTO?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            StatTile(
+                label: String(localized: "status.speed.prompt_processing.tile",
+                              defaultValue: "Prompt Processing (excl. cached)",
+                              comment: "Tile label for average prompt-processing speed excluding cached tokens"),
+                value: stats.map { String(format: "%.1f tok/s", $0.avgPrefillTps) } ?? "—"
+            )
+            StatTile(
+                label: String(localized: "status.speed.token_generation",
+                              defaultValue: "Token Generation",
+                              comment: "Label for average token-generation speed"),
+                value: stats.map { String(format: "%.1f tok/s", $0.avgGenerationTps) } ?? "—"
+            )
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 4)
     }
 }
 
@@ -636,23 +636,6 @@ private struct UpdatesSection: View {
                 }
             }
             Row(
-                label: String(localized: "status.updates.channel",
-                              defaultValue: "Update Channel",
-                              comment: "Row label for the update channel picker"),
-                sublabel: String(localized: "status.updates.channel.sub",
-                                 defaultValue: "Stable receives tested releases. Beta gets new features sooner.",
-                                 comment: "Sublabel for the update channel picker")
-            ) {
-                Popup(
-                    selection: Binding(
-                        get: { updates.channel },
-                        set: { updates.channel = $0 }
-                    ),
-                    width: 130,
-                    options: UpdateChannel.allCases.map { ($0, $0.displayName) }
-                )
-            }
-            Row(
                 label: String(localized: "status.updates.auto_check",
                               defaultValue: "Automatically Check",
                               comment: "Row label for the auto-check updates toggle"),
@@ -672,7 +655,7 @@ private struct UpdatesSection: View {
                               defaultValue: "Auto-download Updates",
                               comment: "Row label for the auto-download updates toggle"),
                 sublabel: String(localized: "status.updates.auto_download.sub",
-                                 defaultValue: "Download in the background, install on next launch",
+                                 defaultValue: "Download in the background, then show Install & Restart",
                                  comment: "Sublabel for the auto-download toggle"),
                 isLast: true
             ) {
@@ -851,7 +834,7 @@ final class StatusScreenVM: ObservableObject {
     var endpointText: String {
         guard let s = stats else { return "—" }
         let host = s.host ?? "127.0.0.1"
-        let port = s.port ?? 8080
+        let port = s.port ?? 8000
         return "\(host):\(port)"
     }
 

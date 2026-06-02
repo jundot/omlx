@@ -217,11 +217,13 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
+        assert settings.embedding_batch_size == 32
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = SchedulerSettings(max_concurrent_requests=128)
+        settings = SchedulerSettings(max_concurrent_requests=128, embedding_batch_size=16)
         assert settings.max_concurrent_requests == 128
+        assert settings.embedding_batch_size == 16
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
@@ -229,6 +231,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "embedding_batch_size": 32,
             "chunked_prefill": False,
         }
 
@@ -237,6 +240,12 @@ class TestSchedulerSettings:
         data = {"max_concurrent_requests": 512}
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_concurrent_requests == 512
+        assert settings.embedding_batch_size == 32
+
+        data = {"max_concurrent_requests": 512, "embedding_batch_size": 24}
+        settings = SchedulerSettings.from_dict(data)
+        assert settings.max_concurrent_requests == 512
+        assert settings.embedding_batch_size == 24
 
     def test_from_dict_backwards_compat(self):
         """Test creation from dictionary with old keys."""
@@ -644,6 +653,7 @@ class TestGlobalSettings:
             assert settings.server.port == 8000
             assert settings.memory.memory_guard_tier == "balanced"
             assert settings.scheduler.max_concurrent_requests == 8
+            assert settings.scheduler.embedding_batch_size == 32
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
@@ -680,6 +690,7 @@ class TestGlobalSettings:
                         "memory": {"memory_guard_tier": "safe"},
                         "scheduler": {
                             "max_concurrent_requests": 128,
+                            "embedding_batch_size": 24,
                         },
                         "cache": {
                             "enabled": False,
@@ -700,6 +711,7 @@ class TestGlobalSettings:
             assert settings.model.model_dir == "/models"  # Backward compat field
             assert settings.memory.memory_guard_tier == "safe"
             assert settings.scheduler.max_concurrent_requests == 128
+            assert settings.scheduler.embedding_batch_size == 24
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.auth.api_key == "secret"
@@ -917,6 +929,11 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("max_concurrent_requests" in e.lower() for e in errors)
 
+        settings = GlobalSettings()
+        settings.scheduler.embedding_batch_size = 0
+        errors = settings.validate()
+        assert any("embedding_batch_size" in e.lower() for e in errors)
+
     def test_validate_invalid_cache_size(self):
         """Test validation catches invalid cache size."""
         settings = GlobalSettings()
@@ -1006,6 +1023,17 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.scheduler.max_concurrent_requests == 512
+
+    def test_env_override_embedding_batch_size(self):
+        """Test environment variable override for embedding batch size."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_EMBEDDING_BATCH_SIZE": "24"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.scheduler.embedding_batch_size == 24
 
     def test_env_override_scheduler_legacy_fallback(self):
         """Test legacy OMLX_MAX_NUM_SEQS env var is accepted as fallback."""
@@ -1160,9 +1188,10 @@ class TestGlobalSettings:
     def test_cli_override_scheduler(self):
         """Test CLI override for scheduler settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            args = Namespace(max_concurrent_requests=64)
+            args = Namespace(max_concurrent_requests=64, embedding_batch_size=12)
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.scheduler.max_concurrent_requests == 64
+            assert settings.scheduler.embedding_batch_size == 12
 
     def test_cli_override_cache(self):
         """Test CLI override for cache settings."""
@@ -1271,10 +1300,12 @@ class TestGlobalSettings:
         """Test conversion to SchedulerConfig."""
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
+        settings.scheduler.embedding_batch_size = 12
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
         assert scheduler_config.completion_batch_size == 128
+        assert scheduler_config.embedding_batch_size == 12
         assert scheduler_config.initial_cache_blocks == 256  # default
 
     def test_to_scheduler_config_initial_cache_blocks(self):

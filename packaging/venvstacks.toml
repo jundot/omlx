@@ -1,7 +1,7 @@
 # oMLX venvstacks layer template
 #
 # Layer structure + runtime pin + uv resolver settings live here. The
-# actual `requirements = [...]` for the mlx-framework layer is generated
+# actual `requirements = [...]` for the mlx-base layer is generated
 # at build time by packaging/build.py:_generate_venvstacks_toml() from
 # pyproject.toml's [project] dependencies + [bundle] optional extra, so
 # this file does not list package versions. Single source of truth for
@@ -19,7 +19,7 @@ platforms = [
 ]
 
 [[frameworks]]
-name = "mlx-framework"
+name = "mlx-base"
 runtime = "cpython-3.11"
 # Populated by _generate_venvstacks_toml() — do not hand-edit.
 requirements = []

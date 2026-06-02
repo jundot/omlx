@@ -81,10 +81,17 @@ def install_dflash_lifecycle_wrap() -> bool:
             "_install_speculative_linear_cache_hook",
             "_dflash_speculative_call_installed",
         )
+        # dflash 0.1.7 renamed the Qwen full-attention installer from
+        # ``_install_split_full_attention_hook`` to ``_install_full_attention_gqa_hook``
+        # (target_qwen_gdn). Without wrapping the new name the pre-dflash
+        # ``Attention.__call__`` is never snapshotted, so a DFlash -> MTP
+        # transition leaves dflash's hook on the class and the MTP draft
+        # cycle crashes with "[convert] Only length-1 arrays ..." on the
+        # per-row batched ``cache.offset`` (issue #1510).
         wrapped_any |= _wrap_installer(
             _qwen_gdn,
-            "_install_split_full_attention_hook",
-            "_dflash_split_full_attention_installed",
+            "_install_full_attention_gqa_hook",
+            "_dflash_full_attention_gqa_installed",
         )
 
     try:

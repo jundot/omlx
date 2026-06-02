@@ -18,6 +18,8 @@ import argparse
 import faulthandler
 import sys
 
+from ._version import __version__
+
 
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
@@ -32,6 +34,8 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "host") and args.host is not None:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
+        return True
+    if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
         return True
     if hasattr(args, "mcp_config") and args.mcp_config is not None:
         return True
@@ -128,6 +132,14 @@ def serve_command(args):
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
 
+    # Validate before persisting CLI overrides, so invalid flags never poison
+    # settings.json.
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        sys.exit(1)
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -153,119 +165,126 @@ def serve_command(args):
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
 
-    # Validate settings
-    errors = settings.validate()
-    if errors:
-        for error in errors:
-            print(f"Configuration error: {error}")
-        sys.exit(1)
-
-    # Import server and config
-    from .server import app, init_server
-    from .config import parse_size
-
-    model_dirs = settings.model.get_model_dirs(settings.base_path)
-    print(f"Base path: {settings.base_path}")
-    print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
-    print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
-
-    # Store MCP config path for FastAPI startup
-    # Priority: CLI arg > settings.json
-    mcp_config = args.mcp_config or settings.mcp.config_path
-    if mcp_config:
-        print(f"MCP config: {mcp_config}")
-        os.environ["OMLX_MCP_CONFIG"] = mcp_config
-
-    # Determine paged SSD cache directory
-    # Priority: --no-cache > CLI arg > settings file
-    if args.no_cache:
-        paged_ssd_cache_dir = None
-    elif args.paged_ssd_cache_dir:
-        # CLI argument takes precedence
-        paged_ssd_cache_dir = args.paged_ssd_cache_dir
-    elif settings.cache.enabled:
-        # Use settings file value (resolved path or default)
-        paged_ssd_cache_dir = str(settings.cache.get_ssd_cache_dir(settings.base_path))
-    else:
-        # Cache explicitly disabled in settings
-        paged_ssd_cache_dir = None
-
-    # Build scheduler config for BatchedEngine
-    scheduler_config = settings.to_scheduler_config()
-    # Set paged SSD cache options
-    scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
-    # Determine cache max size: CLI arg > settings (with auto resolution)
-    if paged_ssd_cache_dir:
-        if args.paged_ssd_cache_max_size:
-            # CLI argument specified explicitly
-            cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
-        else:
-            # Use settings value (handles "auto" -> 10% of SSD capacity)
-            cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(settings.base_path)
-        scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
-    else:
-        scheduler_config.paged_ssd_cache_max_size = 0
-        cache_max_size_bytes = 0
-
-    # Hot cache: CLI arg > settings
-    if paged_ssd_cache_dir:
-        if args.hot_cache_max_size:
-            hot_cache_max_bytes = parse_size(args.hot_cache_max_size)
-        else:
-            hot_cache_max_bytes = settings.cache.get_hot_cache_max_size_bytes()
-        scheduler_config.hot_cache_max_size = hot_cache_max_bytes
-    else:
-        scheduler_config.hot_cache_max_size = 0
-
-    if args.no_cache:
-        print("Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)")
-    elif paged_ssd_cache_dir:
-        print("Mode: Multi-model serving (continuous batching + paged SSD cache)")
-        # Format cache size for display
-        cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
-        print(f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})")
-        if scheduler_config.hot_cache_max_size > 0:
-            hot_display = f"{scheduler_config.hot_cache_max_size / (1024**3):.1f}GB"
-            print(f"Hot cache: {hot_display} (in-memory)")
-    else:
-        print("Mode: Multi-model serving (continuous batching, no cache)")
-
-    # Set MLX buffer cache limit high to prevent the allocator from
-    # immediately releasing Metal buffers when the cache is full.
-    # Without this, allocator::free() can call buf->release() while the
-    # GPU is still using the buffer, causing kernel panics on M4.
-    # With a large cache limit, freed buffers always stay in the pool
-    # and are only released via mx.clear_cache() (which we protect
-    # with mx.synchronize()). See issue #300.
-    import mlx.core as mx
-    total_mem = mx.device_info().get("memory_size", 0)
-    if total_mem > 0:
-        mx.set_cache_limit(total_mem)
-
-    # Initialize server
-    # Note: pinned_models and default_model are managed via admin page (model_settings.json)
-    # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
-    init_server(
-        model_dirs=[str(d) for d in model_dirs],
-        scheduler_config=scheduler_config,
-        api_key=settings.auth.api_key,
-        global_settings=settings,
-    )
-
-    # Start server
-    print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
+    # Bind the socket before importing/initializing the server. Uvicorn's
+    # normal startup runs ASGI lifespan before binding host/port, which means
+    # pinned models can be preloaded before a port conflict is detected.
+    print(f"Binding server at http://{settings.server.host}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = "debug" if settings.server.log_level == "trace" else settings.server.log_level
     # Only show access logs at trace level
     show_access_log = settings.server.log_level == "trace"
-    uvicorn.run(
-        app,
+    uvicorn_config = uvicorn.Config(
+        "omlx.server:app",
         host=settings.server.host,
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
+    serve_socket = uvicorn_config.bind_socket()
 
+    try:
+        # Import server and config after the port is known to be available.
+        from .server import init_server
+        from .config import parse_size
+
+        model_dirs = settings.model.get_model_dirs(settings.base_path)
+        print(f"Base path: {settings.base_path}")
+        print(f"Model directories: {', '.join(str(d) for d in model_dirs)}")
+        print(f"Memory guard tier: {settings.memory.memory_guard_tier}")
+
+        # Store MCP config path for FastAPI startup
+        # Priority: CLI arg > settings.json
+        mcp_config = args.mcp_config or settings.mcp.config_path
+        if mcp_config:
+            print(f"MCP config: {mcp_config}")
+            os.environ["OMLX_MCP_CONFIG"] = mcp_config
+
+        # Determine paged SSD cache directory
+        # Priority: --no-cache > CLI arg > settings file
+        if args.no_cache:
+            paged_ssd_cache_dir = None
+        elif args.paged_ssd_cache_dir:
+            # CLI argument takes precedence
+            paged_ssd_cache_dir = args.paged_ssd_cache_dir
+        elif settings.cache.enabled:
+            # Use settings file value (resolved path or default)
+            paged_ssd_cache_dir = str(settings.cache.get_ssd_cache_dir(settings.base_path))
+        else:
+            # Cache explicitly disabled in settings
+            paged_ssd_cache_dir = None
+
+        # Build scheduler config for BatchedEngine
+        scheduler_config = settings.to_scheduler_config()
+        # Set paged SSD cache options
+        scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
+        # Determine cache max size: CLI arg > settings (with auto resolution)
+        if paged_ssd_cache_dir:
+            if args.paged_ssd_cache_max_size:
+                # CLI argument specified explicitly
+                cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
+            else:
+                # Use settings value (handles "auto" -> 10% of SSD capacity)
+                cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(settings.base_path)
+            scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
+        else:
+            scheduler_config.paged_ssd_cache_max_size = 0
+            cache_max_size_bytes = 0
+
+        # Hot cache: CLI arg > settings
+        if paged_ssd_cache_dir:
+            if args.hot_cache_max_size:
+                hot_cache_max_bytes = parse_size(args.hot_cache_max_size)
+            else:
+                hot_cache_max_bytes = settings.cache.get_hot_cache_max_size_bytes()
+            scheduler_config.hot_cache_max_size = hot_cache_max_bytes
+        else:
+            scheduler_config.hot_cache_max_size = 0
+
+        if args.no_cache:
+            print("Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)")
+        elif paged_ssd_cache_dir:
+            print("Mode: Multi-model serving (continuous batching + paged SSD cache)")
+            # Format cache size for display
+            cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
+            print(f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})")
+            if scheduler_config.hot_cache_max_size > 0:
+                hot_display = f"{scheduler_config.hot_cache_max_size / (1024**3):.1f}GB"
+                print(f"Hot cache: {hot_display} (in-memory)")
+        else:
+            print("Mode: Multi-model serving (continuous batching, no cache)")
+
+        # Set MLX buffer cache limit high to prevent the allocator from
+        # immediately releasing Metal buffers when the cache is full.
+        # Without this, allocator::free() can call buf->release() while the
+        # GPU is still using the buffer, causing kernel panics on M4.
+        # With a large cache limit, freed buffers always stay in the pool
+        # and are only released via mx.clear_cache() (which we protect
+        # with mx.synchronize()). See issue #300.
+        import mlx.core as mx
+
+        total_mem = mx.device_info().get("memory_size", 0)
+        if total_mem > 0:
+            mx.set_cache_limit(total_mem)
+
+        # Initialize server
+        # Note: pinned_models and default_model are managed via admin page (model_settings.json)
+        # Sampling parameters (max_tokens, temperature, etc.) are per-model settings
+        init_server(
+            model_dirs=[str(d) for d in model_dirs],
+            scheduler_config=scheduler_config,
+            api_key=settings.auth.api_key,
+            global_settings=settings,
+        )
+
+        print(f"Starting server at http://{settings.server.host}:{settings.server.port}")
+        try:
+            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+        except KeyboardInterrupt:
+            pass
+    finally:
+        # Uvicorn closes sockets during normal shutdown; this covers failures
+        # after bind succeeds but before the server takes ownership.
+        serve_socket.close()
 
 
 def launch_command(args, extra_args: list[str] | None = None):
@@ -276,7 +295,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     """
     import requests
 
-    from .integrations import get_integration, list_integrations
+    from .integrations import IntegrationContext, get_integration, list_integrations
     from .settings import GlobalSettings
 
     tool_name = args.tool
@@ -328,7 +347,10 @@ def launch_command(args, extra_args: list[str] | None = None):
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
             for m in resp.json().get("models", []):
-                models_status_map[m["id"]] = m
+                if m_id := m.get("id"):
+                    models_status_map[m_id] = m
+                if model_alias := m.get("model_alias"):
+                    models_status_map[model_alias] = m
     except Exception:
         pass
 
@@ -372,24 +394,22 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
-    context_window = model_info.get("max_context_window")
-    max_tokens = model_info.get("max_tokens")
-    model_type = model_info.get("model_type")
-
-    # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
-    tools_profile = getattr(args, "tools_profile", "coding")
-    integration.launch(
+    ctx = IntegrationContext(
+        host=connect_host,
         port=port,
         api_key=api_key,
         model=model,
-        host=connect_host,
-        tools_profile=tools_profile,
-        context_window=context_window,
-        max_tokens=max_tokens,
-        model_type=model_type,
-        extra_args=extra_args,
+        context_window=model_info.get("max_context_window"),
+        max_tokens=model_info.get("max_tokens"),
+        model_type=model_info.get("model_type"),
+        reasoning=model_info.get("enable_thinking"),
+        tools_profile=getattr(args, "tools_profile", "coding"),
+        extra_args=tuple(extra_args or ()),
     )
+
+    # Launch
+    print(f"Launching {integration.display_name} with model {model}...")
+    integration.launch(ctx)
 
 
 def diagnose_menubar() -> int:
@@ -496,6 +516,12 @@ Examples:
   omlx launch codex --model qwen3.5
         """,
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__version__,
+        help="Print the oMLX version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Serve command (multi-model)
@@ -553,6 +579,12 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=None,
+        help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
 
     # paged SSD cache options

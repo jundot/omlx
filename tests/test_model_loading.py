@@ -26,9 +26,7 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
     if has_mtp:
         keys["language_model.mtp.fc.weight"] = "model.safetensors"
     (tmp_path / "model.safetensors.index.json").write_text(
-        '{"metadata": {}, "weight_map": '
-        + str(keys).replace("'", '"')
-        + "}"
+        '{"metadata": {}, "weight_map": ' + str(keys).replace("'", '"') + "}"
     )
 
 
@@ -408,9 +406,7 @@ class TestCheckpointHasMtpWeights:
 
     def test_returns_false_for_nonexistent_path(self, tmp_path):
         assert (
-            model_loading._checkpoint_has_mtp_weights(
-                str(tmp_path / "does-not-exist")
-            )
+            model_loading._checkpoint_has_mtp_weights(str(tmp_path / "does-not-exist"))
             is False
         )
 
@@ -419,3 +415,22 @@ class TestCheckpointHasMtpWeights:
         # Falls through to safetensors-header scan; no shards exist, so
         # the helper conservatively returns False.
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_true_when_later_shard_has_mtp(self, tmp_path):
+        from safetensors.numpy import save_file
+        import numpy as np
+
+        save_file(
+            {
+                "language_model.model.embed_tokens.weight": np.zeros(
+                    (1,), dtype=np.float16
+                )
+            },
+            str(tmp_path / "model-00001-of-00002.safetensors"),
+        )
+        save_file(
+            {"language_model.mtp.fc.weight": np.zeros((1,), dtype=np.float16)},
+            str(tmp_path / "model-00002-of-00002.safetensors"),
+        )
+
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True

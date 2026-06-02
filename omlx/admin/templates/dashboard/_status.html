@@ -102,7 +102,26 @@
 
                     <!-- Active Models -->
                     <div class="bg-white rounded-2xl border border-neutral-200 mb-8">
-                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                        <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+                            </div>
+                            <div class="flex flex-col gap-1.5 w-full min-w-0">
+                                <div class="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                                    <div class="rounded-full transition-all duration-300"
+                                         :style="activeModelsPressureBarStyle"></div>
+                                    <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
+                                         x-cloak
+                                         class="absolute inset-y-0"
+                                         :style="activeModelsSoftMarkerStyle">
+                                    </div>
+                                </div>
+                                <span class="text-xs font-medium text-neutral-500"
+                                      x-text="activeModelsPressureLabel()"></span>
+                            </div>
+                        </div>
+                        <div class="hidden lg:flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
@@ -132,8 +151,52 @@
                             </div>
                             <!-- Model rows -->
                             <template x-for="m in (stats.active_models.models || [])" :key="m.id">
-                                <div class="px-6 py-3 group">
-                                    <div class="flex items-center justify-between">
+                                <div class="px-4 lg:px-6 py-3 group min-w-0">
+                                    <div class="lg:hidden flex items-center gap-2 min-w-0">
+                                        <i x-show="m.pinned" data-lucide="pin" class="w-3 h-3 text-neutral-400 flex-shrink-0"></i>
+                                        <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
+                                        <div class="min-w-0 flex-1">
+                                            <div class="text-sm font-medium text-neutral-800 min-w-0 break-words leading-snug" x-text="m.id"></div>
+                                            <div class="mt-1.5 space-y-1 min-w-0">
+                                                <template x-if="m.is_loading">
+                                                    <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
+                                                        <svg class="w-3 h-3 shrink-0 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                                        <span class="min-w-0" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-blue-600 font-medium">
+                                                        <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse shrink-0"></span>
+                                                        <span x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-green-600 font-medium">
+                                                        <span class="w-2 h-2 rounded-full bg-green-500 shrink-0"></span>
+                                                        <span x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
+                                                    </div>
+                                                </template>
+                                                <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
+                                                    <div class="flex items-center gap-1.5 text-xs text-neutral-400 min-w-0">
+                                                        <span class="w-2 h-2 rounded-full bg-neutral-300 shrink-0"></span>
+                                                        <span class="min-w-0"
+                                                              x-text="'idle' + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
+                                                    </div>
+                                                </template>
+                                                <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
+                                                     x-text="(m.is_loading ? 'est. ' : '') + modelSizeLabel(m)"></div>
+                                            </div>
+                                        </div>
+                                        <div x-show="!m.is_loading" class="relative shrink-0 self-center">
+                                            <button @click="unloadModel(m.id)"
+                                                    class="p-1.5 rounded-md text-neutral-400 hover:text-red-500 hover:bg-red-50 transition-all"
+                                                    :aria-label="window.t('status.active_models.unload')">
+                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                        <div x-show="m.is_loading" class="shrink-0 w-9 self-center" aria-hidden="true"></div>
+                                    </div>
+                                    <div class="hidden lg:flex items-center justify-between">
                                         <div class="flex items-center gap-2">
                                             <!-- Pin icon -->
                                             <i x-show="m.pinned" data-lucide="pin" class="w-3 h-3 text-neutral-400 flex-shrink-0"></i>
@@ -287,7 +350,71 @@
 
                     <!-- Runtime Cache Observability -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                        <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3 min-w-0">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500 shrink-0"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600 break-words">Runtime Cache Observability</span>
+                            </div>
+                            <div class="flex flex-col gap-2 min-w-0">
+                                <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex flex-wrap items-center gap-2 min-w-0">
+                                    <span class="text-xs text-neutral-400 shrink-0">Memory</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeHotCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 min-w-0 break-words"
+                                          x-text="formatSizeBytes(stats.runtime_cache.hot_cache_size_bytes) + ' / ' + formatSizeBytes(stats.runtime_cache.hot_cache_max_bytes) + ' · ' + (stats.runtime_cache.hot_cache_entries || 0) + ' entries'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
+                                                @click="showClearHotCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                title="Clear memory cache">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <button @click="clearHotCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearHotCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2 min-w-0">
+                                    <span class="text-xs text-neutral-400 shrink-0">SSD</span>
+                                    <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
+                                        <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
+                                             :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
+                                    </div>
+                                    <span class="text-xs font-medium text-neutral-500 min-w-0 break-words"
+                                          x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                                    <div class="flex items-center gap-1.5">
+                                        <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
+                                                @click="showClearSsdCacheConfirm = true"
+                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
+                                                :title="window.t('status.clear_ssd_cache_tooltip')">
+                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
+                                            <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
+                                            <button @click="clearSsdCache()"
+                                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                {{ t('status.clear_yes') }}
+                                            </button>
+                                            <button @click="showClearSsdCacheConfirm = false"
+                                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                {{ t('status.clear_cancel') }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hidden lg:flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>

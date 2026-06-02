@@ -47,9 +47,9 @@ struct CodeChip: View {
 
 #Preview("CodeChip") {
     VStack(alignment: .leading, spacing: 10) {
-        CodeChip(value: "http://127.0.0.1:8080/v1")
-        CodeChip(value: "http://127.0.0.1:8080/health")
-        CodeChip(value: "OPENAI_BASE_URL=http://127.0.0.1:8080/v1", maxWidth: 280)
+        CodeChip(value: "http://127.0.0.1:8000/v1")
+        CodeChip(value: "http://127.0.0.1:8000/health")
+        CodeChip(value: "OPENAI_BASE_URL=http://127.0.0.1:8000/v1", maxWidth: 280)
     }
     .padding(24)
     .omlxThemed()

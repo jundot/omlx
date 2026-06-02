@@ -49,7 +49,6 @@ from omlx.oq import (
     validate_quantizable,
 )
 
-
 # =============================================================================
 # Test universal_quant_predicate
 # =============================================================================
@@ -85,25 +84,42 @@ class TestUniversalQuantPredicate:
     # Stage 0: Non-quantization (should return False)
 
     def test_moe_router_fp16(self, moe_config, module):
-        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
-        assert result is False  # MoE router gates kept fp16 (some models lack to_quantized)
+        result = universal_quant_predicate(
+            "model.layers.0.mlp.gate", module, moe_config
+        )
+        assert (
+            result is False
+        )  # MoE router gates kept fp16 (some models lack to_quantized)
 
     def test_shared_expert_gate_8bit(self, moe_config, module):
-        result = universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config)
+        result = universal_quant_predicate(
+            "model.layers.0.shared_expert_gate", module, moe_config
+        )
         assert isinstance(result, dict) and result["bits"] == 8
 
     def test_non_quantizable_module_skipped(self, dense_config, module):
-        cfg = {**dense_config, "_oq_non_quantizable": {
-            "language_model.model.per_layer_model_projection",
-        }}
-        assert universal_quant_predicate(
-            "language_model.model.per_layer_model_projection.weight", module, cfg
-        ) is False
+        cfg = {
+            **dense_config,
+            "_oq_non_quantizable": {
+                "language_model.model.per_layer_model_projection",
+            },
+        }
+        assert (
+            universal_quant_predicate(
+                "language_model.model.per_layer_model_projection.weight", module, cfg
+            )
+            is False
+        )
 
-    def test_non_quantizable_set_does_not_affect_other_paths(self, dense_config, module):
-        cfg = {**dense_config, "_oq_non_quantizable": {
-            "language_model.model.per_layer_model_projection",
-        }}
+    def test_non_quantizable_set_does_not_affect_other_paths(
+        self, dense_config, module
+    ):
+        cfg = {
+            **dense_config,
+            "_oq_non_quantizable": {
+                "language_model.model.per_layer_model_projection",
+            },
+        }
         result = universal_quant_predicate(
             "language_model.model.layers.0.per_layer_input_gate.weight", module, cfg
         )
@@ -117,25 +133,48 @@ class TestUniversalQuantPredicate:
         assert result is not False
 
     def test_vision_encoder_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("visual.encoder.layers.0.self_attn.q_proj", module, dense_config) is False
+        assert (
+            universal_quant_predicate(
+                "visual.encoder.layers.0.self_attn.q_proj", module, dense_config
+            )
+            is False
+        )
 
     def test_patch_embed_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.patch_embed.proj", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.patch_embed.proj", module, dense_config)
+            is False
+        )
 
     def test_ssm_alpha_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.layers.0.ssm_alpha", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.layers.0.ssm_alpha", module, dense_config)
+            is False
+        )
 
     def test_ssm_beta_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.layers.0.ssm_beta", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.layers.0.ssm_beta", module, dense_config)
+            is False
+        )
 
     def test_a_log_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.layers.0.a_log", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.layers.0.a_log", module, dense_config)
+            is False
+        )
 
     def test_mamba_d_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.layers.0.mixer.D", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.layers.0.mixer.D", module, dense_config)
+            is False
+        )
 
     def test_time_decay_not_quantized(self, dense_config, module):
-        assert universal_quant_predicate("model.layers.0.time_decay", module, dense_config) is False
+        assert (
+            universal_quant_predicate("model.layers.0.time_decay", module, dense_config)
+            is False
+        )
 
     # Qwen3_5 hybrid (GatedDeltaNet) — issue #913 regression guards.
     # Real weight names use capital `A_log`, so the skip check must be case-insensitive.
@@ -169,7 +208,9 @@ class TestUniversalQuantPredicate:
     # Stage 1: High-precision protection
 
     def test_ssm_output_8bit(self, dense_config, module):
-        result = universal_quant_predicate("model.layers.0.ssm_output", module, dense_config)
+        result = universal_quant_predicate(
+            "model.layers.0.ssm_output", module, dense_config
+        )
         assert isinstance(result, dict)
         assert result["bits"] == 8
 
@@ -179,12 +220,16 @@ class TestUniversalQuantPredicate:
         assert result["bits"] == 6
 
     def test_mla_kv_b_proj_6bit(self, dense_config, module):
-        result = universal_quant_predicate("model.layers.0.self_attn.kv_b_proj", module, dense_config)
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.kv_b_proj", module, dense_config
+        )
         assert isinstance(result, dict)
         assert result["bits"] == 6
 
     def test_dense_o_proj_5bit(self, dense_config, module):
-        result = universal_quant_predicate("model.layers.5.self_attn.o_proj", module, dense_config)
+        result = universal_quant_predicate(
+            "model.layers.5.self_attn.o_proj", module, dense_config
+        )
         assert isinstance(result, dict)
         assert result["bits"] == 5
 
@@ -276,11 +321,17 @@ class TestUniversalQuantPredicate:
     # Group size
 
     def test_moe_router_fp16_group_size(self, moe_config, module):
-        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
+        result = universal_quant_predicate(
+            "model.layers.0.mlp.gate", module, moe_config
+        )
         assert result is False  # MoE router gates kept fp16
 
     def test_150_expert_group_size_128(self, module):
-        config = {"num_hidden_layers": 32, "num_local_experts": 200, "hidden_size": 2048}
+        config = {
+            "num_hidden_layers": 32,
+            "num_local_experts": 200,
+            "hidden_size": 2048,
+        }
         result = universal_quant_predicate(
             "model.layers.10.mlp.gate_proj", module, config
         )
@@ -386,26 +437,28 @@ class TestHelpers:
         assert _normalize_quant_path("lm_head.scales") == "lm_head"
 
     def test_is_audio_tensor_audio_tower(self):
-        assert _is_audio_tensor(
-            "audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight"
-        ) is True
+        assert (
+            _is_audio_tensor(
+                "audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight"
+            )
+            is True
+        )
 
     def test_is_audio_tensor_embed_audio_not_excluded(self):
         # embed_audio.embedding_projection is the projection from audio output
         # to text hidden — should be quantizable like embed_vision counterpart.
-        assert _is_audio_tensor(
-            "embed_audio.embedding_projection.weight"
-        ) is False
+        assert _is_audio_tensor("embed_audio.embedding_projection.weight") is False
 
     def test_is_audio_tensor_language_model(self):
-        assert _is_audio_tensor(
-            "language_model.model.layers.0.self_attn.q_proj.weight"
-        ) is False
+        assert (
+            _is_audio_tensor("language_model.model.layers.0.self_attn.q_proj.weight")
+            is False
+        )
 
     def test_is_audio_tensor_vision_tower(self):
-        assert _is_audio_tensor(
-            "vision_tower.layers.0.self_attn.k_proj.weight"
-        ) is False
+        assert (
+            _is_audio_tensor("vision_tower.layers.0.self_attn.k_proj.weight") is False
+        )
 
     def test_universal_quant_predicate_skips_audio_tower(self):
         # audio_tower tensors must be kept in fp16 (return False from predicate)
@@ -434,13 +487,19 @@ class TestResolveOutputName:
         assert resolve_output_name("Qwen3.5-122B-A10B", 4) == "Qwen3.5-122B-A10B-oQ4"
 
     def test_strip_existing_bit_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B-8bit", 4) == "Qwen3.5-122B-A10B-oQ4"
+        assert (
+            resolve_output_name("Qwen3.5-122B-A10B-8bit", 4) == "Qwen3.5-122B-A10B-oQ4"
+        )
 
     def test_strip_existing_oq_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B-oQ6", 2) == "Qwen3.5-122B-A10B-oQ2"
+        assert (
+            resolve_output_name("Qwen3.5-122B-A10B-oQ6", 2) == "Qwen3.5-122B-A10B-oQ2"
+        )
 
     def test_strip_existing_enhanced_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
+        assert (
+            resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
+        )
 
     def test_all_levels(self):
         for level in OQ_LEVELS:
@@ -454,10 +513,7 @@ class TestResolveOutputName:
         assert resolve_output_name("Llama-3-8B", 4, "float16") == "Llama-3-8B-oQ4-fp16"
 
     def test_float16_strips_existing_dtype_suffix(self):
-        assert (
-            resolve_output_name("Model-oQ6-fp16", 4, "float16")
-            == "Model-oQ4-fp16"
-        )
+        assert resolve_output_name("Model-oQ6-fp16", 4, "float16") == "Model-oQ4-fp16"
 
     def test_bfloat16_strips_chained_suffixes(self):
         assert resolve_output_name("Model-oQ6-fp16", 4, "bfloat16") == "Model-oQ4"
@@ -533,9 +589,7 @@ class TestMtpFcFullPrecision:
     def test_qwen_mtp_fc_nested_returns_none(self):
         from omlx.oq import _get_predicate_bits
 
-        bits, gs, mode = _get_predicate_bits(
-            "language_model.mtp.fc.weight", {}, 4, 64
-        )
+        bits, gs, mode = _get_predicate_bits("language_model.mtp.fc.weight", {}, 4, 64)
         assert bits is None and gs is None and mode is None
 
     def test_deepseek_e_proj_protected(self):
@@ -577,17 +631,13 @@ class TestMtpFcFullPrecision:
         from omlx.oq import _get_predicate_bits
 
         # MTPBlock 의 내부 attention/ffn 은 backbone 과 같은 양자화 정책
-        bits, _, _ = _get_predicate_bits(
-            "mtp.0.block.attn.wq_a.weight", {}, 4, 64
-        )
+        bits, _, _ = _get_predicate_bits("mtp.0.block.attn.wq_a.weight", {}, 4, 64)
         assert bits is not None
 
     def test_normal_weights_unaffected(self):
         from omlx.oq import _get_predicate_bits
 
-        bits, _, _ = _get_predicate_bits(
-            "model.layers.0.attn.q_proj.weight", {}, 4, 64
-        )
+        bits, _, _ = _get_predicate_bits("model.layers.0.attn.q_proj.weight", {}, 4, 64)
         assert bits is not None
 
     def test_non_mtp_e_proj_not_protected(self):
@@ -644,11 +694,17 @@ class TestValidateQuantizable:
 
     def test_fp8_native_is_quantizable(self):
         # Native FP8 models (MiniMax, DeepSeek) should be quantizable
-        assert validate_quantizable({"quantization_config": {"quant_method": "fp8"}}) is True
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "fp8"}})
+            is True
+        )
 
     def test_non_fp8_quantization_config(self):
         # Other quant methods (gptq, awq) are already quantized
-        assert validate_quantizable({"quantization_config": {"quant_method": "gptq"}}) is False
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "gptq"}})
+            is False
+        )
 
 
 # =============================================================================
@@ -681,7 +737,9 @@ class TestMakePredicate:
         config = {
             "num_hidden_layers": 32,
             "_oq_use_budget_plan": True,
-            "_oq_boost_map": {"lm_head": {"bits": 6, "group_size": 64, "mode": "affine"}},
+            "_oq_boost_map": {
+                "lm_head": {"bits": 6, "group_size": 64, "mode": "affine"}
+            },
         }
         pred = make_predicate(config, oq_level=4)
         module = MagicMock(spec=[])
@@ -716,16 +774,30 @@ class TestEstimateMemory:
 
 class TestStreamingHelpers:
     def test_should_quantize_2d_weight(self):
-        assert _should_quantize_tensor("model.layers.0.self_attn.q_proj.weight", (4096, 4096)) is True
+        assert (
+            _should_quantize_tensor(
+                "model.layers.0.self_attn.q_proj.weight", (4096, 4096)
+            )
+            is True
+        )
 
     def test_should_not_quantize_1d(self):
-        assert _should_quantize_tensor("model.layers.0.input_layernorm.weight", (4096,)) is False
+        assert (
+            _should_quantize_tensor("model.layers.0.input_layernorm.weight", (4096,))
+            is False
+        )
 
     def test_should_not_quantize_bias(self):
-        assert _should_quantize_tensor("model.layers.0.self_attn.q_proj.bias", (4096,)) is False
+        assert (
+            _should_quantize_tensor("model.layers.0.self_attn.q_proj.bias", (4096,))
+            is False
+        )
 
     def test_should_not_quantize_norm(self):
-        assert _should_quantize_tensor("model.layers.0.rmsnorm.weight", (4096, 4096)) is False
+        assert (
+            _should_quantize_tensor("model.layers.0.rmsnorm.weight", (4096, 4096))
+            is False
+        )
 
     def test_get_predicate_bits_lm_head(self):
         config = {"num_hidden_layers": 32}
@@ -741,21 +813,27 @@ class TestStreamingHelpers:
 
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
-        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 4, 64)
+        bits, gs, mode = _get_predicate_bits(
+            "model.layers.10.mlp.gate_proj.weight", config, 4, 64
+        )
         assert bits == 4
         assert gs == 64
         assert mode == "affine"
 
     def test_get_predicate_bits_3bit_affine(self):
         config = {"num_hidden_layers": 32}
-        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 3, 64)
+        bits, gs, mode = _get_predicate_bits(
+            "model.layers.10.mlp.gate_proj.weight", config, 3, 64
+        )
         # oQ3 → base 3-bit → affine
         assert bits == 3
         assert mode == "affine"
 
     def test_get_predicate_bits_8bit(self):
         config = {"num_hidden_layers": 32}
-        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 8, 64)
+        bits, gs, mode = _get_predicate_bits(
+            "model.layers.10.mlp.gate_proj.weight", config, 8, 64
+        )
         # oQ8 → base 8-bit, always affine mode to minimize kernel combos
         assert bits == 8
         assert gs == 64
@@ -771,7 +849,9 @@ class TestStreamingHelpers:
             "model.layers.1.mlp.up_proj": (14336, 4096),
         }
         config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
-        plan = _build_quant_plan(named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7)
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
         assert plan.effective_bpw <= 4.7
         assert plan.boost_map
 
@@ -840,8 +920,11 @@ class TestLevelBudgetPlan:
         }
         config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
         plan = _build_quant_plan(
-            named_shapes, config, oq_level,
-            target_bpw=target, hard_cap_bpw=cap,
+            named_shapes,
+            config,
+            oq_level,
+            target_bpw=target,
+            hard_cap_bpw=cap,
         )
         assert plan.effective_bpw <= cap
 
@@ -941,9 +1024,15 @@ class TestLevelBudgetPlan:
             named_shapes[f"model.layers.{i}.self_attn.o_proj"] = (4096, 1024)
         for i in range(n_layers):
             for e in range(n_experts):
-                named_shapes[f"model.layers.{i}.mlp.experts.{e}.down_proj"] = (4096, 1024)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.down_proj"] = (
+                    4096,
+                    1024,
+                )
                 named_shapes[f"model.layers.{i}.mlp.experts.{e}.up_proj"] = (1024, 4096)
-                named_shapes[f"model.layers.{i}.mlp.experts.{e}.gate_proj"] = (1024, 4096)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.gate_proj"] = (
+                    1024,
+                    4096,
+                )
         sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
         config = {
             "num_hidden_layers": n_layers,
@@ -971,11 +1060,25 @@ class TestLevelBudgetPlan:
             named_shapes[f"backbone.layers.{i}.mixer.v_proj"] = (1024, 2688)
             named_shapes[f"backbone.layers.{i}.mixer.in_proj"] = (10304, 2688)
             named_shapes[f"backbone.layers.{i}.mixer.out_proj"] = (2688, 4096)
-            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.up_proj"] = (3712, 2688)
-            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.down_proj"] = (2688, 3712)
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.up_proj"] = (
+                3712,
+                2688,
+            )
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.down_proj"] = (
+                2688,
+                3712,
+            )
         for i in range(n_layers):
-            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc1"] = (128, 1856, 2688)
-            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc2"] = (128, 2688, 1856)
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc1"] = (
+                128,
+                1856,
+                2688,
+            )
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc2"] = (
+                128,
+                2688,
+                1856,
+            )
         sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
         config = {
             "num_hidden_layers": n_layers,
@@ -985,9 +1088,9 @@ class TestLevelBudgetPlan:
         plan = _build_quant_plan(
             named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
         )
-        assert plan.effective_bpw >= 2.7, (
-            f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
-        )
+        assert (
+            plan.effective_bpw >= 2.7
+        ), f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
         assert plan.effective_bpw <= 3.0
         # Attention should be boosted via protection floor
         attn_boosts = [k for k in plan.boost_map if "q_proj" in k or "v_proj" in k]
@@ -1033,14 +1136,17 @@ class TestForwardLayer:
     def test_returns_none_when_all_signatures_fail(self):
         def bad_block(*args, **kwargs):
             raise TypeError("unsupported")
+
         result = _forward_layer(bad_block, mx.ones((2, 4)), None, None)
         assert result is None
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_fallback_signature_with_tuple(self):
         tensor = mx.ones((2, 4, 8))
+
         def block_only_one_arg(x):
             return (x * 3, {"cache": True})
+
         result = _forward_layer(block_only_one_arg, tensor, None, None)
         assert isinstance(result, mx.array)
 
@@ -1116,7 +1222,8 @@ class TestLazyTensorIndex:
             result = idx[name]
             assert isinstance(result, mx.array)
             np.testing.assert_allclose(
-                np.array(result.astype(mx.float32)), expected.astype(np.float32),
+                np.array(result.astype(mx.float32)),
+                expected.astype(np.float32),
                 atol=1e-3,
             )
 
@@ -1325,9 +1432,15 @@ class TestDiscoverSanitizePlan:
     def sf_file(self, tmp_path):
         path = tmp_path / "weights.safetensors"
         tensors = {
-            "model.layers.0.self_attn.q_proj.weight": np.random.randn(8, 8).astype(np.float16),
-            "model.layers.0.self_attn.k_proj.weight": np.random.randn(4, 8).astype(np.float16),
-            "model.layers.0.mlp.gate_proj.weight": np.random.randn(16, 8).astype(np.float16),
+            "model.layers.0.self_attn.q_proj.weight": np.random.randn(8, 8).astype(
+                np.float16
+            ),
+            "model.layers.0.self_attn.k_proj.weight": np.random.randn(4, 8).astype(
+                np.float16
+            ),
+            "model.layers.0.mlp.gate_proj.weight": np.random.randn(16, 8).astype(
+                np.float16
+            ),
             "model.embed_tokens.weight": np.random.randn(32, 8).astype(np.float16),
         }
         _write_safetensors(str(path), tensors)
@@ -1380,6 +1493,39 @@ class TestDiscoverSanitizePlan:
 
         with pytest.raises(ValueError, match="non-replayable"):
             _discover_sanitize_plan(slice_sanitize, idx)
+
+    def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
+        path = tmp_path / "mtp_norms.safetensors"
+        tensors = {
+            "raw.weight": np.full((8,), 0.04, dtype=np.float16),
+            "shifted.weight": np.full((8,), 1.27, dtype=np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        plan = {
+            "raw.weight": {
+                "sources": ["raw.weight"],
+                "transform": "add_if_mean_lt_0_5",
+                "shape": (8,),
+                "axis": None,
+            },
+            "shifted.weight": {
+                "sources": ["shifted.weight"],
+                "transform": "add_if_mean_lt_0_5",
+                "shape": (8,),
+                "axis": None,
+            },
+        }
+        discovered = _DiscoveredPlan(plan, idx)
+
+        raw = discovered.pop("raw.weight")
+        shifted = discovered.pop("shifted.weight")
+
+        assert float(raw.astype(mx.float32)[0].item()) == pytest.approx(1.04, abs=1e-3)
+        assert float(shifted.astype(mx.float32)[0].item()) == pytest.approx(
+            1.27, abs=1e-3
+        )
 
 
 # =============================================================================
@@ -1435,9 +1581,7 @@ class TestBuildProxyForSensitivity:
     def test_invokes_mlx_lm_convert_with_uniform_4bit_affine(self, tmp_path):
         """Proxy build delegates to mlx_lm.convert with uniform 4-bit affine."""
         fake_convert = MagicMock()
-        with patch.dict(
-            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
-        ):
+        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"), dtype="bfloat16"
             )
@@ -1456,9 +1600,7 @@ class TestBuildProxyForSensitivity:
         """Proxy lives under the system temp dir, not next to the source."""
         import tempfile
 
-        with patch.dict(
-            "sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}
-        ):
+        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}):
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"), dtype="bfloat16"
             )
@@ -1471,9 +1613,7 @@ class TestBuildProxyForSensitivity:
         fake_convert = MagicMock(
             side_effect=lambda **kw: __import__("os").makedirs(kw["mlx_path"])
         )
-        with patch.dict(
-            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
-        ):
+        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"), dtype="bfloat16"
             )
@@ -1483,12 +1623,8 @@ class TestBuildProxyForSensitivity:
     def test_propagates_dtype_argument(self, tmp_path):
         """dtype is forwarded so the proxy matches the target output dtype."""
         fake_convert = MagicMock()
-        with patch.dict(
-            "sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}
-        ):
-            _build_proxy_for_sensitivity(
-                str(tmp_path / "src_model"), dtype="float16"
-            )
+        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=fake_convert)}):
+            _build_proxy_for_sensitivity(str(tmp_path / "src_model"), dtype="float16")
         assert fake_convert.call_args.kwargs["dtype"] == "float16"
 
     def test_working_dir_pins_proxy_to_output_volume(self, tmp_path):
@@ -1500,9 +1636,7 @@ class TestBuildProxyForSensitivity:
         """
         anchor = tmp_path / "out_volume"
         anchor.mkdir()
-        with patch.dict(
-            "sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}
-        ):
+        with patch.dict("sys.modules", {"mlx_lm": MagicMock(convert=MagicMock())}):
             proxy_dir = _build_proxy_for_sensitivity(
                 str(tmp_path / "src_model"),
                 dtype="bfloat16",
@@ -1525,7 +1659,9 @@ class TestSensitivityRequiredEnforcement:
 
         src = tmp_path / "src"
         src.mkdir()
-        np_save({"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors"))
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors")
+        )
         (src / "config.json").write_text('{"model_type": "llama"}')
 
         # Force OOM by pretending system has 0 bytes of RAM.
@@ -1606,7 +1742,9 @@ class TestSensitivityRequiredEnforcement:
 
         src = tmp_path / "src"
         src.mkdir()
-        np_save({"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors"))
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)}, str(src / "w.safetensors")
+        )
         (src / "config.json").write_text('{"model_type": "llama"}')
 
         from omlx import settings as _settings
@@ -1614,7 +1752,9 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
         # Stub mlx_lm.convert so that the proxy build raises.
         fake_mlx_lm = MagicMock()
-        fake_mlx_lm.convert = MagicMock(side_effect=RuntimeError("simulated build fail"))
+        fake_mlx_lm.convert = MagicMock(
+            side_effect=RuntimeError("simulated build fail")
+        )
         monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
 
         with pytest.raises(RuntimeError, match="auto-proxy sensitivity failed"):
@@ -1638,10 +1778,13 @@ class TestOnTheFlyFp8Dequant:
         w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
         s = np.ones((1, 1), dtype=np.float32)
         path = str(tmp_path / "vllm.safetensors")
-        _write_safetensors(path, {
-            "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
-            "layer.weight_scale_inv": s,
-        })
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
+                "layer.weight_scale_inv": s,
+            },
+        )
         idx = _LazyTensorIndex([path])
         assert len(idx._fp8_pairs) == 1
         assert "layer.weight" in idx
@@ -1654,10 +1797,13 @@ class TestOnTheFlyFp8Dequant:
         w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
         s = np.full((1, 1), 127, dtype=np.uint8)  # E8M0 127 = 2^0 = 1.0
         path = str(tmp_path / "mxfp.safetensors")
-        _write_safetensors(path, {
-            "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
-            "layer.scale": (s.tobytes(), [1, 1], "F8_E8M0"),
-        })
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": (w.tobytes(), [128, 128], "F8_E4M3"),
+                "layer.scale": (s.tobytes(), [1, 1], "F8_E8M0"),
+            },
+        )
         idx = _LazyTensorIndex([path])
         assert "layer.weight" in idx
         assert "layer.scale" not in idx
@@ -1670,10 +1816,13 @@ class TestOnTheFlyFp8Dequant:
         w = np.random.randint(-128, 127, (32, 32), dtype=np.int8)
         s = np.full((32, 2), 127, dtype=np.uint8)  # 1x16 blocking, scale=1.0
         path = str(tmp_path / "i8.safetensors")
-        _write_safetensors(path, {
-            "expert.weight": (w.tobytes(), [32, 32], "I8"),
-            "expert.scale": (s.tobytes(), [32, 2], "F8_E8M0"),
-        })
+        _write_safetensors(
+            path,
+            {
+                "expert.weight": (w.tobytes(), [32, 32], "I8"),
+                "expert.scale": (s.tobytes(), [32, 2], "F8_E8M0"),
+            },
+        )
         idx = _LazyTensorIndex([path])
         result = idx["expert.weight"]
         expected = mx.array(w.astype(np.float32)).astype(mx.bfloat16)
@@ -1681,9 +1830,12 @@ class TestOnTheFlyFp8Dequant:
 
     def test_no_scale_keys_no_pairs(self, tmp_path):
         path = str(tmp_path / "plain.safetensors")
-        _write_safetensors(path, {
-            "layer.weight": np.random.randn(4, 8).astype(np.float16),
-        })
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": np.random.randn(4, 8).astype(np.float16),
+            },
+        )
         idx = _LazyTensorIndex([path])
         assert len(idx._fp8_pairs) == 0
         assert len(idx) == 1
@@ -1694,8 +1846,9 @@ class TestOnTheFlyFp8Dequant:
 # =============================================================================
 
 
-def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
-                    fp8_convention="mxfp"):
+def _make_fp8_model(
+    model_dir, n_layers=2, hidden=128, n_experts=0, fp8_convention="mxfp"
+):
     """Create a synthetic FP8 model directory for integration testing.
 
     Returns the path and total raw bytes of FP8 weight data.
@@ -1715,9 +1868,9 @@ def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
     tensors = {}
 
     # Embedding (plain F16 — not FP8)
-    tensors["model.embed_tokens.weight"] = np.random.randn(
-        256, hidden
-    ).astype(np.float16)
+    tensors["model.embed_tokens.weight"] = np.random.randn(256, hidden).astype(
+        np.float16
+    )
 
     for i in range(n_layers):
         pfx = f"model.layers.{i}"
@@ -1728,15 +1881,21 @@ def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
             if fp8_convention == "mxfp":
                 s = np.full((1, 1), 127, dtype=np.uint8)  # E8M0 scale=1.0
                 tensors[f"{pfx}.self_attn.{proj}.weight"] = (
-                    w.tobytes(), [hidden, hidden], "F8_E4M3"
+                    w.tobytes(),
+                    [hidden, hidden],
+                    "F8_E4M3",
                 )
                 tensors[f"{pfx}.self_attn.{proj}.scale"] = (
-                    s.tobytes(), [1, 1], "F8_E8M0"
+                    s.tobytes(),
+                    [1, 1],
+                    "F8_E8M0",
                 )
             else:  # vllm
                 s = np.ones((1, 1), dtype=np.float32)
                 tensors[f"{pfx}.self_attn.{proj}.weight"] = (
-                    w.tobytes(), [hidden, hidden], "F8_E4M3"
+                    w.tobytes(),
+                    [hidden, hidden],
+                    "F8_E4M3",
                 )
                 tensors[f"{pfx}.self_attn.{proj}.weight_scale_inv"] = s
 
@@ -1746,15 +1905,17 @@ def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
             if fp8_convention == "mxfp":
                 s = np.full((1, 1), 127, dtype=np.uint8)
                 tensors[f"{pfx}.mlp.{proj}.weight"] = (
-                    w.tobytes(), [hidden * 4, hidden], "F8_E4M3"
+                    w.tobytes(),
+                    [hidden * 4, hidden],
+                    "F8_E4M3",
                 )
-                tensors[f"{pfx}.mlp.{proj}.scale"] = (
-                    s.tobytes(), [1, 1], "F8_E8M0"
-                )
+                tensors[f"{pfx}.mlp.{proj}.scale"] = (s.tobytes(), [1, 1], "F8_E8M0")
             else:
                 s = np.ones((1, 1), dtype=np.float32)
                 tensors[f"{pfx}.mlp.{proj}.weight"] = (
-                    w.tobytes(), [hidden * 4, hidden], "F8_E4M3"
+                    w.tobytes(),
+                    [hidden * 4, hidden],
+                    "F8_E4M3",
                 )
                 tensors[f"{pfx}.mlp.{proj}.weight_scale_inv"] = s
 
@@ -1763,22 +1924,22 @@ def _make_fp8_model(model_dir, n_layers=2, hidden=128, n_experts=0,
         if fp8_convention == "mxfp":
             s = np.full((1, 1), 127, dtype=np.uint8)
             tensors[f"{pfx}.mlp.down_proj.weight"] = (
-                w.tobytes(), [hidden, hidden * 4], "F8_E4M3"
+                w.tobytes(),
+                [hidden, hidden * 4],
+                "F8_E4M3",
             )
-            tensors[f"{pfx}.mlp.down_proj.scale"] = (
-                s.tobytes(), [1, 1], "F8_E8M0"
-            )
+            tensors[f"{pfx}.mlp.down_proj.scale"] = (s.tobytes(), [1, 1], "F8_E8M0")
         else:
             s = np.ones((1, 1), dtype=np.float32)
             tensors[f"{pfx}.mlp.down_proj.weight"] = (
-                w.tobytes(), [hidden, hidden * 4], "F8_E4M3"
+                w.tobytes(),
+                [hidden, hidden * 4],
+                "F8_E4M3",
             )
             tensors[f"{pfx}.mlp.down_proj.weight_scale_inv"] = s
 
         # Layer norms (plain F16)
-        tensors[f"{pfx}.input_layernorm.weight"] = np.ones(
-            hidden, dtype=np.float16
-        )
+        tensors[f"{pfx}.input_layernorm.weight"] = np.ones(hidden, dtype=np.float16)
         tensors[f"{pfx}.post_attention_layernorm.weight"] = np.ones(
             hidden, dtype=np.float16
         )
@@ -1868,12 +2029,12 @@ class TestQuantizeOqStreamingFp8:
         quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         from safetensors import safe_open
+
         for sf in out.glob("*.safetensors"):
             with safe_open(str(sf), framework="numpy") as f:
                 for k in f.keys():
                     assert not k.endswith(".scale"), f"scale key leaked: {k}"
-                    assert not k.endswith("_scale_inv"), \
-                        f"scale_inv key leaked: {k}"
+                    assert not k.endswith("_scale_inv"), f"scale_inv key leaked: {k}"
 
     def test_output_tensors_are_bf16_or_quantized(self, tmp_path):
         """All output tensors are either quantized (uint32) or bf16."""
@@ -1893,6 +2054,7 @@ class TestQuantizeOqStreamingFp8:
     def test_exceeds_ram_skips_eager_sanitize(self, tmp_path):
         """When model exceeds simulated RAM, eager sanitize is skipped."""
         from unittest.mock import patch
+
         src = tmp_path / "src"
         src.mkdir()
         _make_fp8_model(src, n_layers=2, hidden=128, fp8_convention="mxfp")
@@ -1983,6 +2145,7 @@ class TestQuantizeOqStreamingFp8:
         quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         from safetensors import safe_open
+
         out_keys = set()
         for sf in out.glob("*.safetensors"):
             with safe_open(str(sf), framework="numpy") as f:
@@ -2004,13 +2167,11 @@ class TestQuantizeOqStreamingFp8:
 
         hidden = 64
         tensors = {
-            "model.embed_tokens.weight": np.random.randn(
-                256, hidden
-            ).astype(np.float16),
-            "lm_head.weight": np.random.randn(256, hidden).astype(np.float16),
-            "model.layers.0.input_layernorm.weight": np.ones(
-                hidden, dtype=np.float16
+            "model.embed_tokens.weight": np.random.randn(256, hidden).astype(
+                np.float16
             ),
+            "lm_head.weight": np.random.randn(256, hidden).astype(np.float16),
+            "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype=np.float16),
         }
         # I8 weight with 1x16 blocking
         w_i8 = np.random.randint(-128, 127, (hidden, hidden), dtype=np.int8)
@@ -2018,10 +2179,14 @@ class TestQuantizeOqStreamingFp8:
         sn = hidden // bs_col
         s_e8m0 = np.full((hidden, sn), 127, dtype=np.uint8)
         tensors["model.layers.0.self_attn.q_proj.weight"] = (
-            w_i8.tobytes(), [hidden, hidden], "I8"
+            w_i8.tobytes(),
+            [hidden, hidden],
+            "I8",
         )
         tensors["model.layers.0.self_attn.q_proj.scale"] = (
-            s_e8m0.tobytes(), [hidden, sn], "F8_E8M0"
+            s_e8m0.tobytes(),
+            [hidden, sn],
+            "F8_E8M0",
         )
 
         _write_safetensors(str(src / "model.safetensors"), tensors)
@@ -2040,6 +2205,7 @@ class TestQuantizeOqStreamingFp8:
 
         assert (out / "config.json").exists()
         from safetensors import safe_open
+
         out_keys = set()
         for sf in out.glob("*.safetensors"):
             with safe_open(str(sf), framework="numpy") as f:
@@ -2052,16 +2218,21 @@ class TestQuantizeOqStreamingFp8:
         src.mkdir()
         hidden = 64
         tensors = {
-            "model.embed_tokens.weight": np.random.randn(256, hidden).astype(np.float16),
+            "model.embed_tokens.weight": np.random.randn(256, hidden).astype(
+                np.float16
+            ),
             "lm_head.weight": np.random.randn(256, hidden).astype(np.float16),
             "model.layers.0.input_layernorm.weight": np.ones(hidden, dtype=np.float16),
             "model.layers.0.self_attn.q_proj.weight": np.random.randn(
-                hidden, hidden).astype(np.float16),
+                hidden, hidden
+            ).astype(np.float16),
             "model.layers.0.self_attn.q_proj.scale": np.ones(
-                (1, hidden), dtype=np.float32),
+                (1, hidden), dtype=np.float32
+            ),
         }
         _write_safetensors(str(src / "model.safetensors"), tensors)
         import json
+
         config = {
             "architectures": ["TestModelForCausalLM"],
             "model_type": "test_bf16_scale",
@@ -2074,7 +2245,9 @@ class TestQuantizeOqStreamingFp8:
 
         idx = _LazyTensorIndex([str(src / "model.safetensors")])
         assert len(idx._fp8_pairs) == 0, "BF16 weight should not pair with .scale"
-        assert "model.layers.0.self_attn.q_proj.scale" in idx, "scale key must remain visible"
+        assert (
+            "model.layers.0.self_attn.q_proj.scale" in idx
+        ), "scale key must remain visible"
 
 
 # =============================================================================
@@ -2175,7 +2348,10 @@ class TestBuildProxyForSensitivityMtpPatch:
                 is_mtp_active=mock_is_active,
                 set_mtp_active=mock_set_active,
             ),
-            mock_apply, mock_is_active, mock_set_active, mock_convert,
+            mock_apply,
+            mock_is_active,
+            mock_set_active,
+            mock_convert,
         )
 
     def _patch(self, monkeypatch, mtp_mod, mock_convert):
@@ -2184,11 +2360,16 @@ class TestBuildProxyForSensitivityMtpPatch:
 
     def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
         """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
-        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = self._make_mocks()
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
+            self._make_mocks()
+        )
         self._patch(monkeypatch, mtp_mod, mock_convert)
 
         result = _build_proxy_for_sensitivity(
-            "/my/model", dtype="bfloat16", working_dir=str(tmp_path), trust_remote_code=True,
+            "/my/model",
+            dtype="bfloat16",
+            working_dir=str(tmp_path),
+            trust_remote_code=True,
         )
 
         assert isinstance(result, Path)
@@ -2213,13 +2394,16 @@ class TestBuildProxyForSensitivityMtpPatch:
     def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):
         """Convert error → finally block restores previous MTP state."""
         mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
-            convert_side_effect=RuntimeError("boom"), is_active=prev_state,
+            convert_side_effect=RuntimeError("boom"),
+            is_active=prev_state,
         )
         self._patch(monkeypatch, mtp_mod, mock_convert)
 
         with pytest.raises(RuntimeError, match="boom"):
             _build_proxy_for_sensitivity(
-                "/fake/model", dtype="float16", working_dir=str(tmp_path),
+                "/fake/model",
+                dtype="float16",
+                working_dir=str(tmp_path),
             )
 
         assert mock_set_active.call_count == 2
@@ -2227,11 +2411,15 @@ class TestBuildProxyForSensitivityMtpPatch:
 
     def test_patch_returns_false_no_toggle(self, tmp_path, monkeypatch):
         """apply_mlx_lm_mtp_patch returns False → no MTP toggle, convert is still called."""
-        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(patch_return=False)
+        mtp_mod, _, _, mock_set_active, mock_convert = self._make_mocks(
+            patch_return=False
+        )
         self._patch(monkeypatch, mtp_mod, mock_convert)
 
         _build_proxy_for_sensitivity(
-            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+            "/fake/model",
+            dtype="float16",
+            working_dir=str(tmp_path),
         )
 
         mock_set_active.assert_not_called()
@@ -2244,7 +2432,9 @@ class TestBuildProxyForSensitivityMtpPatch:
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
 
         result = _build_proxy_for_sensitivity(
-            "/fake/model", dtype="float16", working_dir=str(tmp_path),
+            "/fake/model",
+            dtype="float16",
+            working_dir=str(tmp_path),
         )
 
         assert isinstance(result, Path)
@@ -2269,27 +2459,35 @@ class TestMeasureSensitivityVlmMtp:
     self-consistently strips mtp.* when no head is attached).
     """
 
-    def _patch_common(self, monkeypatch, has_mtp, prev_active=False):
+    def _patch_common(
+        self, monkeypatch, has_mtp, has_mtp_weights=None, prev_active=False
+    ):
         from omlx import oq as oq_mod
 
+        if has_mtp_weights is None:
+            has_mtp_weights = has_mtp
         mock_apply_patch = MagicMock()
         mock_apply_runtime = MagicMock()
         mock_set_active = MagicMock()
         mock_is_active = MagicMock(return_value=prev_active)
 
         monkeypatch.setitem(
-            sys.modules, "omlx.utils.model_loading",
+            sys.modules,
+            "omlx.utils.model_loading",
             MagicMock(
                 maybe_apply_pre_load_patches=MagicMock(),
                 _has_mtp_heads=MagicMock(return_value=has_mtp),
+                _checkpoint_has_mtp_weights=MagicMock(return_value=has_mtp_weights),
             ),
         )
         monkeypatch.setitem(
-            sys.modules, "omlx.patches.mlx_lm_mtp",
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
             MagicMock(is_mtp_active=mock_is_active, set_mtp_active=mock_set_active),
         )
         monkeypatch.setitem(
-            sys.modules, "omlx.patches.mlx_vlm_mtp",
+            sys.modules,
+            "omlx.patches.mlx_vlm_mtp",
             MagicMock(
                 apply_mlx_vlm_mtp_patch=mock_apply_patch,
                 apply_mlx_vlm_mtp_runtime_patch=mock_apply_runtime,
@@ -2297,16 +2495,19 @@ class TestMeasureSensitivityVlmMtp:
         )
         monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
         monkeypatch.setitem(
-            sys.modules, "mlx_vlm.utils",
+            sys.modules,
+            "mlx_vlm.utils",
             MagicMock(load_model=MagicMock(return_value=MagicMock())),
         )
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock())
         monkeypatch.setitem(
-            sys.modules, "mlx_lm.tokenizer_utils",
+            sys.modules,
+            "mlx_lm.tokenizer_utils",
             MagicMock(load=MagicMock(return_value=MagicMock())),
         )
         monkeypatch.setattr(
-            oq_mod, "_measure_sensitivity_from_model",
+            oq_mod,
+            "_measure_sensitivity_from_model",
             MagicMock(return_value={0: 0.1}),
         )
         return mock_apply_patch, mock_apply_runtime, mock_set_active
@@ -2314,11 +2515,14 @@ class TestMeasureSensitivityVlmMtp:
     def test_vlm_with_mtp_heads_attaches_head(self, monkeypatch):
         """VLM + MTP heads → runtime patch applied, mtp_active toggled True for load."""
         mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
-            monkeypatch, has_mtp=True,
+            monkeypatch,
+            has_mtp=True,
         )
 
         result = _measure_sensitivity(
-            "/fake/vlm-mtp", {"vision_config": {}}, 6,
+            "/fake/vlm-mtp",
+            {"vision_config": {}},
+            6,
         )
 
         assert result == {0: 0.1}
@@ -2331,7 +2535,9 @@ class TestMeasureSensitivityVlmMtp:
     def test_mtp_active_restored_after_load(self, monkeypatch, prev_active):
         """The previous mtp_active state is restored once the load returns."""
         _, _, mock_set_active = self._patch_common(
-            monkeypatch, has_mtp=True, prev_active=prev_active,
+            monkeypatch,
+            has_mtp=True,
+            prev_active=prev_active,
         )
 
         _measure_sensitivity("/fake/vlm-mtp", {"vision_config": {}}, 6)
@@ -2341,7 +2547,8 @@ class TestMeasureSensitivityVlmMtp:
     def test_vlm_without_mtp_heads_no_toggle(self, monkeypatch):
         """VLM without MTP heads → no runtime patch, no mtp_active toggle."""
         mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
-            monkeypatch, has_mtp=False,
+            monkeypatch,
+            has_mtp=False,
         )
 
         _measure_sensitivity("/fake/vlm", {"vision_config": {}}, 6)
@@ -2350,13 +2557,29 @@ class TestMeasureSensitivityVlmMtp:
         mock_apply_runtime.assert_not_called()
         mock_set_active.assert_not_called()
 
+    def test_vlm_declares_mtp_without_weights_no_toggle(self, monkeypatch):
+        """Config-only MTP declarations must not attach a missing MTP head."""
+        mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
+            monkeypatch,
+            has_mtp=True,
+            has_mtp_weights=False,
+        )
+
+        _measure_sensitivity("/fake/vlm-mtp-config-only", {"vision_config": {}}, 6)
+
+        mock_apply_patch.assert_not_called()
+        mock_apply_runtime.assert_not_called()
+        mock_set_active.assert_not_called()
+
     def test_text_model_no_vlm_toggle(self, monkeypatch):
         """Text checkpoint → VLM MTP toggling is skipped entirely."""
         mock_apply_patch, mock_apply_runtime, mock_set_active = self._patch_common(
-            monkeypatch, has_mtp=True,
+            monkeypatch,
+            has_mtp=True,
         )
         monkeypatch.setitem(
-            sys.modules, "mlx_lm",
+            sys.modules,
+            "mlx_lm",
             MagicMock(load=MagicMock(return_value=(MagicMock(), MagicMock()))),
         )
 
@@ -2407,14 +2630,18 @@ class TestPrecomputedSensitivityMap:
 
         # Stub all measurement functions — they should NOT be called
         monkeypatch.setattr(
-            _oq, "_measure_sensitivity", MagicMock(side_effect=RuntimeError("should not call"))
-        )
-        monkeypatch.setattr(
-            _oq, "_measure_sensitivity_from_quantized_model",
+            _oq,
+            "_measure_sensitivity",
             MagicMock(side_effect=RuntimeError("should not call")),
         )
         monkeypatch.setattr(
-            _oq, "_build_proxy_for_sensitivity",
+            _oq,
+            "_measure_sensitivity_from_quantized_model",
+            MagicMock(side_effect=RuntimeError("should not call")),
+        )
+        monkeypatch.setattr(
+            _oq,
+            "_build_proxy_for_sensitivity",
             MagicMock(side_effect=RuntimeError("should not call")),
         )
 
@@ -2425,9 +2652,7 @@ class TestPrecomputedSensitivityMap:
         _oq._measure_sensitivity_from_quantized_model.assert_not_called()
         _oq._build_proxy_for_sensitivity.assert_not_called()
 
-    def test_sensitivity_map_used_in_quant_plan(
-        self, tmp_path, monkeypatch
-    ):
+    def test_sensitivity_map_used_in_quant_plan(self, tmp_path, monkeypatch):
         """The loaded sensitivity map is stored in config['_oq_sensitivity_map']
         and flows into _build_quant_plan."""
         if not HAS_MLX:
@@ -2441,15 +2666,17 @@ class TestPrecomputedSensitivityMap:
             str(src / "w.safetensors"),
         )
         (src / "config.json").write_text(
-            json.dumps({
-                "model_type": "llama",
-                "num_hidden_layers": 32,
-                "hidden_size": 128,
-                "intermediate_size": 256,
-                "num_attention_heads": 8,
-                "rms_norm_eps": 1e-5,
-                "vocab_size": 256,
-            })
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 32,
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 8,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 256,
+                }
+            )
         )
 
         sensitivity_map = {str(i): 0.1 / (i + 1) for i in range(32)}
@@ -2478,9 +2705,7 @@ class TestPrecomputedSensitivityMap:
         loaded_sens = config["_oq_sensitivity_map"]
         assert loaded_sens == sensitivity_map
 
-    def test_no_sensitivity_map_falls_back_to_measurement(
-        self, tmp_path, monkeypatch
-    ):
+    def test_no_sensitivity_map_falls_back_to_measurement(self, tmp_path, monkeypatch):
         """When oq_sensitivity_map.json does NOT exist, measurement runs."""
         if not HAS_MLX:
             pytest.skip("mlx not available")
@@ -2497,7 +2722,8 @@ class TestPrecomputedSensitivityMap:
         from omlx import oq as _oq
 
         monkeypatch.setattr(
-            _oq, "_measure_sensitivity",
+            _oq,
+            "_measure_sensitivity",
             MagicMock(return_value={"0": 0.05, "1": 0.03}),
         )
 

@@ -32,8 +32,20 @@ def _make_fake_dflash_module():
         cls._dflash_speculative_call_installed = True
         captures.append(linear_attn)
 
+    def fake_gqa_installer(attn):
+        cls = type(attn)
+        # Mimic dflash 0.1.7's full-attention GQA hook: overwrite __call__
+        # and set its idempotency flag. The real hook's first line does
+        # int(cache.offset), which is what crashes on batched offsets.
+        def fake_attention_call(self, x, mask=None, cache=None):
+            return x
+        cls.__call__ = fake_attention_call
+        cls._dflash_full_attention_gqa_installed = True
+        captures.append(attn)
+
     mod = SimpleNamespace(
         _install_speculative_linear_cache_hook=fake_installer,
+        _install_full_attention_gqa_hook=fake_gqa_installer,
         _captures=captures,
     )
     return mod
@@ -172,13 +184,55 @@ class TestRoundTrip:
         assert FakeLinearAttn.__call__ is mtp_call
 
 
+class TestQwenGqaHook:
+    """The Qwen full-attention GQA hook (dflash 0.1.7) must round-trip too.
+
+    Regression for issue #1510: dflash renamed the Qwen full-attention
+    installer to ``_install_full_attention_gqa_hook``; the lifecycle wrap
+    must track it so a DFlash -> MTP transition restores the attention
+    class instead of leaving dflash's offset-unsafe hook on it.
+    """
+
+    def test_gqa_hook_round_trips(self, _clear_backup_state):
+        from omlx.patches.dflash_lifecycle import (
+            _DFLASH_BACKUP,
+            _wrap_installer,
+            restore_dflash_class_patches,
+        )
+
+        mod = _make_fake_dflash_module()
+
+        class FakeAttention:
+            def __call__(self, x, mask=None, cache=None):
+                return "stock-attn"
+
+        installed = _wrap_installer(
+            mod,
+            "_install_full_attention_gqa_hook",
+            "_dflash_full_attention_gqa_installed",
+        )
+        assert installed is True
+
+        stock_call = FakeAttention.__call__
+        mod._install_full_attention_gqa_hook(FakeAttention())
+        # dflash hook is now on the class.
+        assert FakeAttention.__call__ is not stock_call
+        assert FakeAttention._dflash_full_attention_gqa_installed is True
+        assert FakeAttention in _DFLASH_BACKUP
+
+        # DFlash engine stops -> restore must revert the class and drop flag.
+        restore_dflash_class_patches()
+        assert FakeAttention.__call__ is stock_call
+        assert "_dflash_full_attention_gqa_installed" not in FakeAttention.__dict__
+
+
 class TestRealDflashIntegration:
     """Integration tests against the real dflash-mlx module if installed."""
 
     def test_install_wrap_against_real_dflash(self, _clear_backup_state):
         from omlx.patches.dflash_lifecycle import install_dflash_lifecycle_wrap
         try:
-            from dflash_mlx.engine import target_qwen_gdn  # noqa: F401
+            from dflash_mlx.engine import target_qwen_gdn
         except ImportError:
             pytest.skip("dflash-mlx not installed in this environment")
 
@@ -186,3 +240,14 @@ class TestRealDflashIntegration:
         assert install_dflash_lifecycle_wrap() is True
         # Idempotent.
         assert install_dflash_lifecycle_wrap() is True
+        # The Qwen full-attention GQA hook (dflash 0.1.7) must be wrapped so
+        # its class patch is restorable on DFlash teardown (issue #1510).
+        if hasattr(target_qwen_gdn, "_install_full_attention_gqa_hook"):
+            assert (
+                getattr(
+                    target_qwen_gdn,
+                    "_omlx_wrapped__install_full_attention_gqa_hook",
+                    False,
+                )
+                is True
+            )

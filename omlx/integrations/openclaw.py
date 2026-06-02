@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from omlx.integrations.base import Integration
+from omlx.integrations.base import Integration, IntegrationContext
 from omlx.utils.install import get_cli_prefix
 
 DEFAULT_GATEWAY_PORT = 18789
@@ -30,59 +30,55 @@ class OpenClawIntegration(Integration):
             install_hint="npm install -g openclaw",
         )
 
-    def get_command(
-        self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
-    ) -> str:
+    def get_command(self, ctx: IntegrationContext) -> str:
         return (
             f"{get_cli_prefix()} "
-            f"launch openclaw --model {model or 'select-a-model'}"
+            f"launch openclaw --model {ctx.model or 'select-a-model'}"
         )
 
-    def configure(
-        self,
-        port: int,
-        api_key: str,
-        model: str,
-        host: str = "127.0.0.1",
-        tools_profile: str = "coding",
-    ) -> None:
+    def configure(self, ctx: IntegrationContext) -> None:
         def updater(config: dict) -> None:
             config.setdefault("models", {}).setdefault("providers", {})
             provider_config = {
-                "baseUrl": f"http://{host}:{port}/v1",
-                "apiKey": api_key or "omlx",
+                "baseUrl": ctx.openai_base_url,
+                "apiKey": ctx.auth_token,
                 "api": "openai-completions",
             }
-            if model:
+            if ctx.model:
+                model_entry: dict = {
+                    "id": ctx.model,
+                    "name": ctx.model,
+                    "api": "openai-completions",
+                    "reasoning": bool(ctx.reasoning)
+                    if ctx.reasoning is not None
+                    else False,
+                    "input": ["text", "image"] if ctx.supports_images else ["text"],
+                    "cost": {
+                        "input": 0,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                    },
+                }
+                if ctx.context_window:
+                    model_entry["contextWindow"] = ctx.context_window
+                if ctx.max_tokens:
+                    model_entry["maxTokens"] = ctx.max_tokens
                 provider_config["models"] = [
-                    {
-                        "id": model,
-                        "name": model,
-                        "api": "openai-completions",
-                        "reasoning": False,
-                        "input": ["text"],
-                        "cost": {
-                            "input": 0,
-                            "output": 0,
-                            "cacheRead": 0,
-                            "cacheWrite": 0,
-                        },
-                        "contextWindow": 131072,
-                        "maxTokens": 8192,
-                    }
+                    model_entry
                 ]
             config["models"]["providers"]["omlx"] = provider_config
 
             # Set as default model
-            if model:
-                config.setdefault("agents", {}).setdefault(
-                    "defaults", {}
-                ).setdefault("model", {})
-                config["agents"]["defaults"]["model"]["primary"] = f"omlx/{model}"
+            if ctx.model:
+                config.setdefault("agents", {}).setdefault("defaults", {}).setdefault(
+                    "model", {}
+                )
+                config["agents"]["defaults"]["model"]["primary"] = f"omlx/{ctx.model}"
 
             # Set tools profile
             config.setdefault("tools", {})
-            config["tools"]["profile"] = tools_profile
+            config["tools"]["profile"] = ctx.tools_profile
 
         self._write_json_config(self.CONFIG_PATH, updater)
 
@@ -152,17 +148,9 @@ class OpenClawIntegration(Integration):
 
         self._write_json_config(self.EXEC_APPROVALS_PATH, updater)
 
-    def launch(
-        self,
-        port: int,
-        api_key: str,
-        model: str,
-        host: str = "127.0.0.1",
-        tools_profile: str = "coding",
-        **kwargs,
-    ) -> None:
-        self.configure(port, api_key, model, host=host, tools_profile=tools_profile)
-        self.configure_exec_approvals(tools_profile)
+    def launch(self, ctx: IntegrationContext) -> None:
+        self.configure(ctx)
+        self.configure_exec_approvals(ctx.tools_profile)
 
         env = self._scrubbed_env()
         bin_name = "openclaw"
@@ -170,7 +158,7 @@ class OpenClawIntegration(Integration):
         # Run onboarding if not yet completed (like ollama does)
         if not self._is_onboarded():
             print("Setting up OpenClaw with oMLX...")
-            print(f"  Model: {model}")
+            print(f"  Model: {ctx.model}")
             subprocess.run(
                 [
                     bin_name,
@@ -188,8 +176,8 @@ class OpenClawIntegration(Integration):
                 env=env,
             )
             # Onboarding overwrites config, re-apply
-            self.configure(port, api_key, model, host=host, tools_profile=tools_profile)
-            self.configure_exec_approvals(tools_profile)
+            self.configure(ctx)
+            self.configure_exec_approvals(ctx.tools_profile)
 
         _, gw_port = self._gateway_info()
         addr = ("localhost", gw_port)

@@ -210,6 +210,26 @@ class TestPassthroughMode:
         _, _, _, is_stop = parser.process_token(stop_token)
         assert is_stop is True
 
+    def test_analysis_end_does_not_stop_generation(self, tokenizer, encoding):
+        """Ending analysis closes thinking but lets the final channel continue."""
+        parser = HarmonyStreamingParser(tokenizer=tokenizer)
+
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>thinking<|end|>",
+            allowed_special="all",
+        )
+
+        result = None
+        for token_id in tokens:
+            result = parser.process_token(token_id)
+
+        assert result is not None
+        control_text, stream_token, visible_token, is_stop = result
+        assert "</think>\n" in control_text
+        assert stream_token is None
+        assert visible_token is None
+        assert is_stop is False
+
     def test_passthrough_closes_think_tag(self, tokenizer, encoding):
         """Passthrough activation while in analysis channel closes think tag."""
         parser = HarmonyStreamingParser(tokenizer=tokenizer)
@@ -311,3 +331,16 @@ class TestParseToolCallsFromTokens:
         )
         assert analysis_text == ""
         assert "Hello world" in output_text
+
+    def test_does_not_prepend_duplicate_start_header(self, encoding):
+        """Budget-forced Harmony completions may already include the start header."""
+        tokens = encoding.encode(
+            "<|start|>assistant<|channel|>analysis<|message|>thinking<|end|>",
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert output_text == ""
+        assert "thinking" in analysis_text
+        assert tool_calls == []

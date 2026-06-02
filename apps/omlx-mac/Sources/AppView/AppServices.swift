@@ -147,10 +147,14 @@ final class AppServices: NSObject, ObservableObject {
     ///   • `modelDir`: writes the explicit override into
     ///     `<basePath>/settings.json`. Empty string clears it back to the
     ///     server's default (`<basePath>/models`).
+    ///   • `port`: a port change bundled into the same Apply. The spawn
+    ///     uses cached `--port` args, so the restart below must carry the
+    ///     new port or the server silently comes back on the old one. The
+    ///     caller already PATCHed it to settings.json before us.
     /// The server is stopped once before any mutation and restarted once
     /// at the end — the user-stated rule: restart only fires when at
     /// least one of the inputs actually differs from the current config.
-    func applyStorageChanges(basePath: String? = nil, modelDir: String? = nil) async throws {
+    func applyStorageChanges(basePath: String? = nil, modelDir: String? = nil, port: Int? = nil) async throws {
         let normalizedBase = basePath.map(Self.normalize)
         let trimmedDir = modelDir?.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -182,9 +186,21 @@ final class AppServices: NSObject, ObservableObject {
             self.config = updated
         }
 
+        // Fold a bundled port change into the same single restart. Mirrors
+        // applyServerEndpoint's persistence rule: the running Python server
+        // owns settings.json, so we only write AppConfig to disk when the
+        // server is offline. The HTTP client always needs the new endpoint.
+        if let port {
+            var updated = config
+            updated.port = port
+            if server == nil { try updated.save() }
+            self.config = updated
+            client.configure(host: updated.host, port: port, apiKey: updated.apiKey)
+        }
+
         if let server {
             let baseURL = URL(fileURLWithPath: config.basePath, isDirectory: true)
-            try server.reconfigure(basePath: baseURL)
+            try server.reconfigure(port: port, basePath: baseURL)
             _ = try server.start()
         }
     }
@@ -333,9 +349,10 @@ final class AppServices: NSObject, ObservableObject {
     }
 
     /// Persist a new host/port to AppConfig, reconfigure the running server
-    /// process, and bounce it. Without this, ServerScreenVM.savePort would
-    /// only update the server's `settings.json`, but the next spawn still
-    /// uses the cached --host / --port arguments captured at app launch.
+    /// process, and bounce it. Without this, ServerScreenVM's port path in
+    /// `applyServerSettings` (and `saveHost` for Listen Address) would only
+    /// update the server's `settings.json`, but the next spawn still uses
+    /// the cached --host / --port arguments captured at app launch.
     ///
     /// The Python server is the canonical writer of `settings.json` while
     /// it's running — the caller already PATCHed it before us, so we don't

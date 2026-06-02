@@ -7,10 +7,57 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from omlx.engine_pool import EngineEntry
 from omlx.exceptions import ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
+from omlx.server import (
+    EngineType,
+    SamplingDefaults,
+    ServerState,
+    _reset_boundary_snapshots_for_server,
+    app,
+    get_engine,
+    get_max_context_window,
+    get_sampling_params,
+)
 from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+
+
+class TestBoundarySnapshotLifecycle:
+    def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert (tmp_path / "_boundary_snapshots").exists()
+        assert not stale_dir.exists()
+
+    def test_reset_helper_skips_no_cache(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=None)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert stale_dir.exists()
 
 
 class TestGetSamplingParams:
@@ -45,13 +92,14 @@ class TestGetSamplingParams:
     def test_request_overrides(self):
         """Test request params override global defaults."""
         temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-            0.5, 0.8, req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
+            0.5, 0.8, req_top_k=40, req_repetition_penalty=1.15,
+            req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
             req_max_tokens=1024,
         )
         assert temp == 0.5
         assert top_p == 0.8
-        assert top_k == 0  # not overridable via request
-        assert rep_penalty == 1.0
+        assert top_k == 40
+        assert rep_penalty == 1.15
         assert min_p == 0.1
         assert presence_penalty == 0.5
         assert frequency_penalty == 0.3
@@ -112,14 +160,21 @@ class TestGetSamplingParams:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
-            settings = ModelSettings(temperature=0.3, min_p=0.05, max_tokens=2048)
+            settings = ModelSettings(
+                temperature=0.3, top_k=50, repetition_penalty=1.2,
+                min_p=0.05, max_tokens=2048,
+            )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
             temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-                0.7, None, "test-model", req_min_p=0.1, req_max_tokens=4096,
+                0.7, None, "test-model",
+                req_top_k=10, req_repetition_penalty=1.05,
+                req_min_p=0.1, req_max_tokens=4096,
             )
             assert temp == 0.7  # request wins
+            assert top_k == 10  # request wins over model
+            assert rep_penalty == 1.05  # request wins over model
             assert min_p == 0.1  # request wins over model
             assert max_tokens == 4096  # request wins over model
 
@@ -415,3 +470,75 @@ class TestGetEngineLLMTypeValidation:
 
         engine = await get_engine("llama-3", EngineType.LLM)
         assert engine is llm
+
+
+class TestGetMaxContextWindow:
+    """Tests for get_max_context_window precedence rule (#1308).
+
+    Resolution order:
+        1. Explicit per-model setting (admin / settings.json).
+        2. Context length discovered from the model's config.json at
+           startup (EngineEntry.model_context_length).
+        3. Global SamplingDefaults.max_context_window (32K).
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    @staticmethod
+    def _entry(model_id: str, ctx_length: int | None) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/fake/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=0,
+            model_context_length=ctx_length,
+        )
+
+    def _mount_pool(self, entries: dict):
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_entry.side_effect = lambda mid: entries.get(mid)
+        self._state.engine_pool = pool
+
+    def _mount_settings(self, overrides: dict):
+        """Mount a settings_manager that returns the given per-model overrides."""
+        manager = MagicMock()
+        manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        self._state.settings_manager = manager
+
+    def test_global_default_when_nothing_discovered(self):
+        """No model context, no per-model override → global default."""
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        assert get_max_context_window("llama-3") == 32768
+
+    def test_discovered_context_returned_when_no_override(self):
+        """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        assert get_max_context_window("qwen3-coder") == 262144
+
+    def test_per_model_override_wins_over_discovery(self):
+        """Admin set 16384 → that wins over the model's declared 262144."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        self._mount_settings({"qwen3-coder": ModelSettings(max_context_window=16384)})
+        assert get_max_context_window("qwen3-coder") == 16384
+
+    def test_per_model_override_wins_over_global(self):
+        """Override of 8192 wins even when the model didn't declare a value."""
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        self._mount_settings({"llama-3": ModelSettings(max_context_window=8192)})
+        assert get_max_context_window("llama-3") == 8192
+
+    def test_no_model_id_returns_global_default(self):
+        """A bare /v1/messages-style call with no model id falls to the default."""
+        assert get_max_context_window(None) == 32768
+
+    def test_unknown_model_id_returns_global_default(self):
+        """An unknown model id doesn't crash — falls through to the default."""
+        self._mount_pool({})
+        assert get_max_context_window("ghost-model") == 32768

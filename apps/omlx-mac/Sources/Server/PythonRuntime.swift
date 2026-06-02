@@ -3,15 +3,16 @@
 //
 // Resolution order (first match wins):
 //   1. OMLX_PYTHON_OVERRIDE env var — dev escape hatch.
-//   2. Bundle.main/Contents/Frameworks/cpython-3.11/bin/python3 — production.
+//   2. Bundle.main/Contents/Resources/Python/cpython-3.11/bin/python3 — production.
 //      Layout matches the venvstacks export tree, which
 //      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
+//   3. Legacy bundle layouts under Contents/Python or Contents/Frameworks.
 //
 // In the bundled case the spawn environment also sets:
-//   PYTHONHOME = Contents/Frameworks/cpython-3.11
+//   PYTHONHOME = Contents/Resources/Python/cpython-3.11
 //     so the relocated interpreter finds its stdlib without grepping the
 //     host system's /usr/lib.
-//   PYTHONPATH = Contents/Resources : framework-mlx-framework/site-packages
+//   PYTHONPATH = Contents/Resources : framework-mlx-base/site-packages
 //     : __venvstacks__/site-customize
 //     so `python -m omlx.cli` resolves both the omlx package (shipped as a
 //     pure source tree in Resources/omlx/, matching today's Python build)
@@ -64,14 +65,23 @@ struct PythonRuntime {
         }
 
         let bundleRoot = Bundle.main.bundleURL
-        let frameworks = bundleRoot.appendingPathComponent("Contents/Frameworks")
-        let cpython = frameworks.appendingPathComponent("cpython-3.11")
-        let bundled = cpython.appendingPathComponent("bin/python3")
-        tried.append(bundled.path)
-        if FileManager.default.isExecutableFile(atPath: bundled.path) {
-            let resources = bundleRoot.appendingPathComponent("Contents/Resources")
-            let mlxFramework = frameworks
-                .appendingPathComponent("framework-mlx-framework/lib/python3.11/site-packages")
+        let resources = bundleRoot.appendingPathComponent("Contents/Resources")
+        let pythonRoots = [
+            resources.appendingPathComponent("Python"),
+            bundleRoot.appendingPathComponent("Contents/Python"),
+            bundleRoot.appendingPathComponent("Contents/Frameworks"),
+        ]
+
+        for pythonRoot in pythonRoots {
+            let cpython = pythonRoot.appendingPathComponent("cpython-3.11")
+            let bundled = cpython.appendingPathComponent("bin/python3")
+            tried.append(bundled.path)
+            guard FileManager.default.isExecutableFile(atPath: bundled.path) else {
+                continue
+            }
+
+            let mlxFramework = pythonRoot
+                .appendingPathComponent("framework-mlx-base/lib/python3.11/site-packages")
             return PythonRuntime(
                 executable: bundled,
                 homebrewPaths: defaultHomebrewPaths,

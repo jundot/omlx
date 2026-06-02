@@ -228,6 +228,8 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -244,6 +246,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # vLLM-compatible structured output (grammar, regex, choice, json)
     structured_outputs: Optional[Union[StructuredOutputOptions, dict]] = None
+    # vLLM/OpenAI-compatible grammar alias, normalized to structured_outputs
+    guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
@@ -327,6 +331,8 @@ class CompletionRequest(BaseModel):
     prompt: Union[str, List[str]]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -377,6 +383,10 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=get_unix_timestamp)
     owned_by: str = "omlx"
+    # vLLM-compatible extension: lets OpenAI-style clients discover the
+    # effective context window from the listing without a separate call
+    # to /v1/models/status (see #1308).
+    max_model_len: int | None = None
 
 
 class ModelsResponse(BaseModel):

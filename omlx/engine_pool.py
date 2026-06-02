@@ -60,6 +60,7 @@ class EngineEntry:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -134,6 +135,19 @@ class EnginePool:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
 
+    async def apply_embedding_batch_size(self, batch_size: int) -> None:
+        """Apply embedding batch size to future and currently loaded embedding engines."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("embedding batch size must be > 0")
+
+        async with self._lock:
+            self._scheduler_config.embedding_batch_size = batch_size
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                if isinstance(engine, EmbeddingEngine):
+                    engine._batch_size = batch_size
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:
@@ -176,6 +190,7 @@ class EnginePool:
                     config_model_type=getattr(info, "config_model_type", ""),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
+                    model_context_length=getattr(info, "model_context_length", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -627,6 +642,7 @@ class EnginePool:
                     engine = EmbeddingEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(

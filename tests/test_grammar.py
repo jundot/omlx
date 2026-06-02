@@ -142,6 +142,100 @@ class TestBuildFormatElement:
 
 
 # =========================================================================
+# _normalize_structured_outputs / _settings_guided_grammar
+# =========================================================================
+
+class TestNormalizeStructuredOutputs:
+    """Tests for guided_grammar compatibility normalization."""
+
+    def test_guided_grammar_becomes_structured_outputs_grammar(self):
+        from omlx.server import _normalize_structured_outputs
+
+        assert _normalize_structured_outputs(None, 'root ::= "YES"') == {
+            "grammar": 'root ::= "YES"',
+        }
+
+    def test_structured_outputs_takes_precedence_over_guided_grammar(self):
+        from omlx.server import _normalize_structured_outputs
+
+        assert _normalize_structured_outputs(
+            {"regex": r"\d+"},
+            'root ::= "YES"',
+        ) == {"regex": r"\d+"}
+
+    def test_empty_guided_grammar_returns_none(self):
+        from omlx.server import _normalize_structured_outputs
+
+        assert _normalize_structured_outputs(None, "") is None
+
+
+class TestSettingsGuidedGrammar:
+    """Tests for model-level guided grammar defaults."""
+
+    def test_disabled_setting_returns_none(self):
+        from omlx.server import _settings_guided_grammar
+
+        settings = SimpleNamespace(
+            guided_grammar_enabled=False,
+            guided_grammar='root ::= "YES"',
+        )
+        assert _settings_guided_grammar(settings) is None
+
+    def test_enabled_empty_setting_returns_none(self):
+        from omlx.server import _settings_guided_grammar
+
+        settings = SimpleNamespace(
+            guided_grammar_enabled=True,
+            guided_grammar="   ",
+        )
+        assert _settings_guided_grammar(settings) is None
+
+    def test_enabled_setting_returns_trimmed_grammar(self):
+        from omlx.server import _settings_guided_grammar
+
+        settings = SimpleNamespace(
+            guided_grammar_enabled=True,
+            guided_grammar='  root ::= "YES"  ',
+        )
+        assert _settings_guided_grammar(settings) == 'root ::= "YES"'
+
+
+class TestEffectiveGuidedGrammar:
+    """Tests for request-vs-settings guided grammar precedence."""
+
+    def test_request_guided_grammar_wins(self):
+        from omlx.server import _effective_guided_grammar
+
+        assert _effective_guided_grammar(
+            request_guided_grammar='root ::= "REQ"',
+            settings_guided_grammar='root ::= "SETTINGS"',
+        ) == 'root ::= "REQ"'
+
+    def test_settings_guided_grammar_used_when_request_unstructured(self):
+        from omlx.server import _effective_guided_grammar
+
+        assert _effective_guided_grammar(
+            settings_guided_grammar='root ::= "SETTINGS"',
+        ) == 'root ::= "SETTINGS"'
+
+    def test_settings_guided_grammar_skipped_for_response_format(self):
+        from omlx.server import _effective_guided_grammar
+
+        assert _effective_guided_grammar(
+            response_format={"type": "json_object"},
+            settings_guided_grammar='root ::= "SETTINGS"',
+        ) is None
+
+    def test_settings_guided_grammar_skipped_for_structured_outputs(self):
+        from omlx.server import _effective_guided_grammar
+
+        assert _effective_guided_grammar(
+            structured_outputs={"regex": r"\d+"},
+            settings_guided_grammar='root ::= "SETTINGS"',
+        ) is None
+
+
+# =========================================================================
 # _patch_output_format
 # =========================================================================
 

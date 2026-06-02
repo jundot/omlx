@@ -112,7 +112,7 @@ def _is_text_only_position_ids(position_ids: "mx.array") -> bool:
     return bool(same_12)
 
 
-def _build_replacement_call():
+def _build_replacement_call(original_call: Optional[Any] = None):
     """Construct the replacement Qwen3_5Attention.__call__."""
 
     def __call__(
@@ -121,7 +121,22 @@ def _build_replacement_call():
         mask: Optional["mx.array"] = None,
         cache: Optional[Any] = None,
         position_ids: Optional["mx.array"] = None,
+        position_embeddings: Optional[tuple["mx.array", "mx.array"]] = None,
+        target_verify: bool = False,
     ) -> "mx.array":
+        if original_call is not None and (
+            target_verify or position_embeddings is not None
+        ):
+            return original_call(
+                self,
+                x,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                target_verify=target_verify,
+            )
+
         B, L, D = x.shape
 
         q_proj_output = self.q_proj(x)
@@ -285,7 +300,7 @@ def _build_replacement_call():
 def _patch_class(cls: Any, label: str) -> bool:
     if id(cls) in _patched_classes:
         return True
-    cls.__call__ = _build_replacement_call()
+    cls.__call__ = _build_replacement_call(cls.__call__)
     _patched_classes.add(id(cls))
     logger.info(f"Qwen3_5Attention patch applied (body replacement): {label}")
     return True

@@ -699,6 +699,100 @@ class TestEnginePoolAsync:
         assert pool.current_model_memory > 0
 
     @pytest.mark.asyncio
+    async def test_embedding_engine_receives_scheduler_config(self, tmp_path):
+        """Embedding chunk sizing should come from the shared scheduler config."""
+        from omlx.scheduler import SchedulerConfig
+
+        model_path = tmp_path / "embed-model"
+        model_path.mkdir()
+        scheduler_config = SchedulerConfig(
+            completion_batch_size=6,
+            embedding_batch_size=4,
+        )
+        pool = _make_pool(
+            ceiling=10 * 1024**3,
+            scheduler_config=scheduler_config,
+        )
+        pool._entries["embed-model"] = EngineEntry(
+            model_id="embed-model",
+            model_path=str(model_path),
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+        )
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.EmbeddingEngine",
+            return_value=mock_engine,
+        ) as MockEmbeddingEngine:
+            engine = await pool.get_engine("embed-model")
+
+        assert engine is mock_engine
+        MockEmbeddingEngine.assert_called_once_with(
+            model_name=str(model_path),
+            trust_remote_code=False,
+            scheduler_config=scheduler_config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_embedding_engine_receives_fallback_scheduler_config(self, tmp_path):
+        """A bare EnginePool should pass its fallback scheduler config consistently."""
+        model_path = tmp_path / "embed-model"
+        model_path.mkdir()
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries["embed-model"] = EngineEntry(
+            model_id="embed-model",
+            model_path=str(model_path),
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+        )
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.EmbeddingEngine",
+            return_value=mock_engine,
+        ) as MockEmbeddingEngine:
+            engine = await pool.get_engine("embed-model")
+
+        assert engine is mock_engine
+        MockEmbeddingEngine.assert_called_once_with(
+            model_name=str(model_path),
+            trust_remote_code=False,
+            scheduler_config=pool._scheduler_config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_embedding_batch_size_updates_loaded_embedding_engines(self):
+        """Runtime setting changes should update pool config and loaded embedding engines."""
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.scheduler import SchedulerConfig
+
+        engine = EmbeddingEngine("embed-model", batch_size=8)
+        pool = _make_pool(
+            ceiling=10 * 1024**3,
+            scheduler_config=SchedulerConfig(embedding_batch_size=8),
+        )
+        pool._entries["embed-model"] = EngineEntry(
+            model_id="embed-model",
+            model_path="/tmp/embed-model",
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+            engine=engine,
+        )
+
+        await pool.apply_embedding_batch_size(5)
+
+        assert pool._scheduler_config.embedding_batch_size == 5
+        assert engine.get_stats()["batch_size"] == 5
+
+    @pytest.mark.asyncio
     async def test_get_engine_returns_cached(self, pool_with_mock_engines):
         """Test that get_engine returns cached engine on second call."""
         pool = pool_with_mock_engines

@@ -152,6 +152,7 @@ class OQManager:
 
         def _scan() -> tuple[list[dict], list[dict]]:
             from ..oq import validate_quantizable, estimate_memory
+            from ..utils.model_loading import _checkpoint_has_mtp_weights
 
             source_models = []
             all_models = []
@@ -179,30 +180,32 @@ class OQManager:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
                             size = sum(
-                                f.stat().st_size
-                                for f in path.glob("*.safetensors")
+                                f.stat().st_size for f in path.glob("*.safetensors")
                             )
                             if size == 0:
-                                size = sum(
-                                    f.stat().st_size
-                                    for f in path.glob("*.bin")
-                                )
+                                size = sum(f.stat().st_size for f in path.glob("*.bin"))
                             if size == 0:
                                 continue
                             tc = config.get("text_config", {})
                             # has_mtp_heads: top-level OR text_config nested
-                            has_mtp = (
+                            config_declares_mtp = (
                                 int(config.get("mtp_num_hidden_layers", 0) or 0) > 0
-                                or int(config.get("num_nextn_predict_layers", 0) or 0) > 0
+                                or int(config.get("num_nextn_predict_layers", 0) or 0)
+                                > 0
                                 or int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
                                 or int(tc.get("num_nextn_predict_layers", 0) or 0) > 0
+                            )
+                            has_mtp = (
+                                config_declares_mtp
+                                and _checkpoint_has_mtp_weights(path)
                             )
                             info = {
                                 "name": path.name,
                                 "path": str(path),
                                 "size": size,
                                 "size_formatted": _format_size(size),
-                                "model_type": config.get("model_type", "") or tc.get("model_type", ""),
+                                "model_type": config.get("model_type", "")
+                                or tc.get("model_type", ""),
                                 "is_quantized": "quantization" in config,
                                 # Treat vision_config / vit_config / mm_vision_tower as VLM
                                 # evidence (Molmo / Molmo2 use vit_config; FastVLM uses
@@ -219,9 +222,7 @@ class OQManager:
                                 info_full["num_experts"] = config.get(
                                     "num_local_experts", 0
                                 )
-                                info_full["memory_streaming"] = estimate_memory(
-                                    size
-                                )
+                                info_full["memory_streaming"] = estimate_memory(size)
                                 source_models.append(info_full)
                         except Exception:
                             continue
@@ -255,19 +256,26 @@ class OQManager:
             ValueError: On invalid inputs or output conflict.
         """
         from ..oq import OQ_DTYPES, OQ_LEVELS, resolve_output_name
+        from ..utils.model_loading import _checkpoint_has_mtp_weights
 
         if oq_level not in OQ_LEVELS:
             raise ValueError(
                 f"Invalid oQ level {oq_level}. Must be one of {sorted(OQ_LEVELS)}"
             )
         if dtype not in OQ_DTYPES:
-            raise ValueError(
-                f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}"
-            )
+            raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
 
         source = Path(model_path)
         if not source.exists() or not (source / "config.json").exists():
             raise ValueError(f"Model not found: {model_path}")
+
+        if preserve_mtp and not _checkpoint_has_mtp_weights(source):
+            logger.warning(
+                "Preserve MTP requested for %s, but no mtp.* tensors were "
+                "found in the checkpoint; disabling MTP preservation",
+                source.name,
+            )
+            preserve_mtp = False
 
         model_name = source.name
         output_name = resolve_output_name(
@@ -294,9 +302,7 @@ class OQManager:
                     f"({dtype}) is already in progress"
                 )
 
-        source_size = sum(
-            f.stat().st_size for f in source.glob("*.safetensors")
-        )
+        source_size = sum(f.stat().st_size for f in source.glob("*.safetensors"))
         if source_size == 0:
             source_size = sum(f.stat().st_size for f in source.glob("*.bin"))
 
@@ -363,13 +369,16 @@ class OQManager:
         if active_task and not active_task.done():
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(active_task), timeout=30.0,
+                    asyncio.shield(active_task),
+                    timeout=30.0,
                 )
             except asyncio.TimeoutError:
                 # Thread didn't exit cooperatively (e.g. stuck in long GPTQ
                 # block). Force-cancel as last resort and wait a bit for
                 # Metal to settle.
-                logger.warning("oQ cancel: cooperative exit timed out, force-cancelling")
+                logger.warning(
+                    "oQ cancel: cooperative exit timed out, force-cancelling"
+                )
                 active_task.cancel()
                 try:
                     await active_task
@@ -389,9 +398,7 @@ class OQManager:
                 except Exception:
                     await asyncio.sleep(1.0)
 
-        logger.info(
-            f"oQ quantization cancelled: {task.model_name} (task_id={task_id})"
-        )
+        logger.info(f"oQ quantization cancelled: {task.model_name} (task_id={task_id})")
         return True
 
     def remove_task(self, task_id: str) -> bool:
@@ -412,9 +419,7 @@ class OQManager:
     @property
     def is_quantizing(self) -> bool:
         """Check if any quantization task is actively running."""
-        return any(
-            t.status in _ACTIVE_STATUSES for t in self._tasks.values()
-        )
+        return any(t.status in _ACTIVE_STATUSES for t in self._tasks.values())
 
     async def shutdown(self) -> None:
         """Cancel all active tasks."""
@@ -510,9 +515,7 @@ class OQManager:
                 task.status = QuantStatus.FAILED
                 task.error = str(e)
                 task.completed_at = time.time()
-                logger.exception(
-                    f"oQ quantization failed: {task.model_name} -> {e}"
-                )
+                logger.exception(f"oQ quantization failed: {task.model_name} -> {e}")
                 # Clean up partial output
                 output = Path(task.output_path)
                 if output.exists():
@@ -569,7 +572,11 @@ class OQManager:
             current = parts[1] if len(parts) > 1 else "?"
             total = parts[2] if len(parts) > 2 else "?"
             eta = parts[3] if len(parts) > 3 and parts[3] else ""
-            pct = int(int(current) / max(int(total), 1) * 100) if current.isdigit() and total.isdigit() else 0
+            pct = (
+                int(int(current) / max(int(total), 1) * 100)
+                if current.isdigit() and total.isdigit()
+                else 0
+            )
             label = f"oQ{oq_level:g}: {pct}%"
             if eta:
                 label += f" ({eta} remaining)"

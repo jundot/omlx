@@ -81,6 +81,7 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.auth,          "auth block missing")
         XCTAssertNotNil(settings.claudeCode,    "claude_code block missing")
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
+        XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
     }
 
     // MARK: - Models list

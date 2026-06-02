@@ -60,7 +60,7 @@ struct TextInput: View {
 }
 
 #Preview("TextInput") {
-    @Previewable @State var port = "8080"
+    @Previewable @State var port = "8000"
     @Previewable @State var pwd = "sk-omlx-2k4j8"
     @Previewable @State var alias = ""
     return VStack(alignment: .leading, spacing: 14) {
