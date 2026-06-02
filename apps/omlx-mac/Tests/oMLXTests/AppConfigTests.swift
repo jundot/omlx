@@ -121,6 +121,18 @@ final class AppConfigTests: XCTestCase {
                        "cache.ssd_cache_dir is not in AppConfig's slice")
     }
 
+    // MARK: default base path (rebrand)
+
+    func testDefaultBasePathIsFmlx() {
+        // The data root rebranded ~/.omlx -> ~/.fmlx. The deployed launcher
+        // passes this value as `--base-path` when no env/bootstrap override
+        // exists, so locking it here guards the native-fmlx contract.
+        XCTAssertTrue(
+            AppConfig.defaultBasePath().hasSuffix("/.fmlx"),
+            "defaultBasePath() must resolve to ~/.fmlx after the rebrand"
+        )
+    }
+
     // MARK: modelDir invariant
 
     func testDefaultConfigHasNonEmptyModelDir() {

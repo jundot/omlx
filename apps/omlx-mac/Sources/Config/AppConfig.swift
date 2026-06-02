@@ -10,7 +10,7 @@
 //      path through the in-app Storage row, so Finder relaunches still
 //      land on the right data root. This is the *only* Swift-side config
 //      we keep — its sole job is to tell us where settings.json lives.
-//   3. Default `~/.omlx`.
+//   3. Default `~/.fmlx`.
 //
 // Every other field (host, port, api_key, model_dir, hf_endpoint) lives
 // in `<basePath>/settings.json` — owned by the running Python server,
@@ -28,7 +28,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     var host: String
     var port: Int
     var apiKey: String?
-    /// Always `OMLX_BASE_PATH` if set, else `~/.omlx`. Set at load() time
+    /// Always `OMLX_BASE_PATH` if set, else `~/.fmlx`. Set at load() time
     /// from the current process env so the running app sees a consistent
     /// view; `AppServices.changeBasePath` updates the env in place when
     /// the user moves their data root.
@@ -67,7 +67,7 @@ struct AppConfig: Sendable, Equatable, Codable {
 
     /// Resolve the user-effective base path. `OMLX_BASE_PATH` env wins,
     /// then the bootstrap file under Library/Application Support, then the
-    /// `~/.omlx` default.
+    /// `~/.fmlx` default.
     static func currentBasePath() -> String {
         let env = ProcessInfo.processInfo.environment
         if let custom = env["OMLX_BASE_PATH"], !custom.isEmpty {
@@ -127,7 +127,7 @@ struct AppConfig: Sendable, Equatable, Codable {
     ///     inherit shell rc)
     ///   • shell rc (so terminal-launched `omlx` invocations agree)
     /// Pass `nil` (or an empty string) to clear every override — the
-    /// "reset to ~/.omlx default" flow. Callers should compare against
+    /// "reset to ~/.fmlx default" flow. Callers should compare against
     /// `defaultBasePath()` first and pass `nil` when the user chose the
     /// default so a default install isn't left with stale state.
     static func persistBasePath(_ path: String?) {
@@ -142,8 +142,11 @@ struct AppConfig: Sendable, Equatable, Codable {
     }
 
     static func defaultBasePath() -> String {
+        // Data root rebranded ~/.omlx -> ~/.fmlx. A ~/.omlx -> ~/.fmlx compat
+        // symlink is kept on deployed machines so legacy absolute paths inside
+        // settings.json (e.g. cache.ssd_cache_dir) still resolve.
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".omlx", isDirectory: true).path
+        return home.appendingPathComponent(".fmlx", isDirectory: true).path
     }
 
     static func settingsURL(basePath: String) -> URL {

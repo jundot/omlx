@@ -5,7 +5,7 @@
 //   • When a non-default basePath is set, write `export OMLX_BASE_PATH="…"`
 //     to the user's primary rc file so future shells (and future launches
 //     of this app from a terminal) inherit it.
-//   • When the path is reset to the default (`~/.omlx`), strip every
+//   • When the path is reset to the default (`~/.fmlx`), strip every
 //     `OMLX_BASE_PATH` declaration from all known rc files — the default
 //     doesn't need an env override.
 //
