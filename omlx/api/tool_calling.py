@@ -16,6 +16,7 @@ Also includes structured output (JSON Schema) utilities:
 - validate_json_schema: Validate JSON against a schema
 """
 
+import ast
 import json
 import logging
 import re
@@ -267,46 +268,45 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # Hermes bracket format: [func_name(arg1=val1, arg2=val2)]
-        # Content may or may not have outer brackets
-        stripped = content.strip("[]")
-        bracket_match = re.match(
-            r"([A-Za-z_][\w.]*)\((.*?)\)\s*$", stripped, re.DOTALL
-        )
-        if bracket_match:
-            func_name = bracket_match.group(1)
-            args_str = bracket_match.group(2).strip()
+        # Hermes bracket format: [func_name(arg1=val1), other_tool(arg2=val2)]
+        # The payload is Python-expression-like; use ast so commas inside quoted
+        # strings or nested lists/dicts do not split calls incorrectly.
+        try:
+            parsed_expr = ast.parse(content, mode="eval").body
+        except SyntaxError:
+            parsed_expr = None
+
+        calls = parsed_expr.elts if isinstance(parsed_expr, ast.List) else [parsed_expr]
+        for call in calls:
+            if not isinstance(call, ast.Call):
+                continue
+
+            if isinstance(call.func, ast.Name):
+                func_name = call.func.id
+            elif isinstance(call.func, ast.Attribute):
+                func_name = ast.unparse(call.func)
+            else:
+                continue
 
             arguments = {}
-            if args_str:
-                for arg_match in re.finditer(
-                    r'([A-Za-z_][\w]*)\s*=\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|\{.*?\}|\[.*?\]|[^\s,]+)',
-                    args_str,
-                    re.DOTALL,
-                ):
-                    key = arg_match.group(1)
-                    val = arg_match.group(2).strip()
+            for kw in call.keywords:
+                if kw.arg is None:
+                    continue
+                try:
+                    arguments[kw.arg] = ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError):
+                    arguments[kw.arg] = ast.unparse(kw.value)
 
-                    if (val.startswith('"') and val.endswith('"')) or (
-                        val.startswith("'") and val.endswith("'")
-                    ):
-                        arguments[key] = val[1:-1]
-                    else:
-                        try:
-                            arguments[key] = json.loads(val)
-                        except (json.JSONDecodeError, ValueError):
-                            arguments[key] = val
-
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
-                        type="function",
-                        function=FunctionCall(
-                            name=func_name,
-                            arguments=json.dumps(arguments, ensure_ascii=False),
-                        ),
-                    )
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
                 )
+            )
 
     if not tool_calls:
         return text, None
@@ -831,7 +831,10 @@ class ToolCallStreamFilter:
             marker = ""
         if marker_end is None:
             marker_end = ""
-        self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
+        self._marker_pairs: List[Tuple[str, str]] = [
+            ("<|tool_call_start|>", "<|tool_call_end|>"),
+            ("<tool_call>", "</tool_call>"),
+        ]
         self._suppress_after_markers: List[str] = []
         if marker:
             if marker_end:
