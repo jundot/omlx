@@ -53,8 +53,10 @@ class OpenCodeIntegration(Integration):
             if ctx.api_key:
                 provider_config["options"]["apiKey"] = ctx.api_key
             if ctx.model:
+                reasoning = bool(ctx.reasoning) if ctx.reasoning is not None else False
                 model_entry: dict = {
                     "name": ctx.model,
+                    "reasoning": reasoning,
                     "modalities": self._modalities_for_model(ctx.model_type),
                 }
                 if ctx.supports_images:

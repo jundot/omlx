@@ -209,6 +209,43 @@ name = "old-omlx"
         content = config_path.read_text()
         assert "model_reasoning_effort" not in content
 
+    def test_configure_sets_context_window(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(
+                ctx(port=8000, model="qwen3.5", context_window=128000)
+            )
+
+        content = config_path.read_text()
+        # Bare TOML integer, not a quoted string.
+        assert "model_context_window = 128000" in content
+
+    def test_configure_omits_context_window_when_unset(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(ctx(port=8000, model="qwen3.5"))
+
+        content = config_path.read_text()
+        assert "model_context_window" not in content
+
+    def test_configure_clears_stale_context_window(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-model"\n'
+            'model_provider = "omlx"\n'
+            "model_context_window = 32768\n"
+        )
+
+        codex = CodexIntegration()
+        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
+            codex.configure(ctx(port=8000, model="llama-3.1-8b"))
+
+        content = config_path.read_text()
+        assert 'model = "llama-3.1-8b"' in content
+        assert "model_context_window" not in content
+
     def test_launch_forwards_extra_args(self, tmp_path):
         codex = CodexIntegration()
         config_path = tmp_path / "codex" / "config.toml"
@@ -418,6 +455,46 @@ class TestOpenCodeIntegration:
         config = json.loads(config_path.read_text())
         model_config = config["provider"]["omlx"]["models"]["qwen3.5"]
         assert "limit" not in model_config
+
+    def test_configure_reasoning_flag_true(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                ctx(port=8000, api_key="key", model="llama-3.1-8b", reasoning=True)
+            )
+
+        config = json.loads(config_path.read_text())
+        assert config["provider"]["omlx"]["models"]["llama-3.1-8b"]["reasoning"] is True
+
+    def test_configure_reasoning_flag_false(self, tmp_path):
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="deepseek-r1-distill",
+                    reasoning=False,
+                )
+            )
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["deepseek-r1-distill"]
+        assert model_config["reasoning"] is False
+
+    def test_configure_reasoning_defaults_false_when_unknown(self, tmp_path):
+        # When the server hasn't plumbed a value through (None), default to
+        # False rather than guessing from the model name.
+        oc = OpenCodeIntegration()
+        config_path = tmp_path / "opencode" / "opencode.json"
+        with patch.object(OpenCodeIntegration, "CONFIG_PATH", config_path):
+            oc.configure(ctx(port=8000, api_key="key", model="deepseek-r1-distill"))
+
+        config = json.loads(config_path.read_text())
+        model_config = config["provider"]["omlx"]["models"]["deepseek-r1-distill"]
+        assert model_config["reasoning"] is False
 
     def test_launch_scrubs_python_env(self, tmp_path):
         oc = OpenCodeIntegration()
@@ -790,6 +867,60 @@ class TestHermesIntegration:
 
         model_config = yaml.safe_load(config_path.read_text())["model"]
         assert model_config["context_length"] == 64000
+
+    def test_configure_reasoning_true_sets_high_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                ctx(port=8000, api_key="key", model="qwen3.5", reasoning=True)
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["reasoning_effort"] == "high"
+
+    def test_configure_reasoning_false_sets_none_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(
+                ctx(port=8000, api_key="key", model="qwen3.5", reasoning=False)
+            )
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["agent"]["reasoning_effort"] == "none"
+
+    def test_configure_reasoning_none_leaves_effort_unset(self, tmp_path):
+        # Auto (None) must not write reasoning_effort: guessing "none" here
+        # would disable thinking on reasoning models. Hermes' own "medium"
+        # default should stand instead.
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        config = yaml.safe_load(config_path.read_text())
+        assert "agent" not in config
+
+    def test_configure_reasoning_none_clears_stale_effort(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "agent": {"max_turns": 90, "reasoning_effort": "high"},
+                    "model": {"provider": "omlx", "default": "old"},
+                }
+            )
+        )
+
+        hermes = HermesIntegration()
+        with patch.object(HermesIntegration, "CONFIG_PATH", config_path):
+            hermes.configure(ctx(port=8000, api_key="key", model="new"))
+
+        agent_config = yaml.safe_load(config_path.read_text())["agent"]
+        # Stale reasoning_effort removed; unmanaged agent keys preserved.
+        assert "reasoning_effort" not in agent_config
+        assert agent_config["max_turns"] == 90
 
     def test_launch_sets_config_and_execs(self, tmp_path):
         config_path = tmp_path / "config.yaml"
