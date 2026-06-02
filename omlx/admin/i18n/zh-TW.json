@@ -293,7 +293,7 @@
   "settings.server.host": "主機",
   "settings.server.host_localhost": "僅本機（127.0.0.1）",
   "settings.server.host_public": "對外開放（0.0.0.0）",
-  "settings.server.host_custom": "自訂",
+  "settings.server.host_custom": "自訂（謹慎）",
   "settings.server.host_placeholder": "例如 192.168.1.100",
   "settings.server.host_multi_hint": "多個位址以逗號分隔",
   "settings.server.port": "連接埠",

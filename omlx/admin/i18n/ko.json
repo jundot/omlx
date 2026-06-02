@@ -293,7 +293,7 @@
   "settings.server.host": "호스트",
   "settings.server.host_localhost": "로컬만 (127.0.0.1)",
   "settings.server.host_public": "전체 공개 (0.0.0.0)",
-  "settings.server.host_custom": "사용자 지정",
+  "settings.server.host_custom": "사용자 지정 (주의)",
   "settings.server.host_placeholder": "예: 192.168.1.100",
   "settings.server.host_multi_hint": "여러 주소는 쉼표로 구분",
   "settings.server.port": "포트",

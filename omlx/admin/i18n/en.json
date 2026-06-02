@@ -293,7 +293,7 @@
   "settings.server.host": "Host",
   "settings.server.host_localhost": "Localhost only (127.0.0.1)",
   "settings.server.host_public": "Open to all (0.0.0.0)",
-  "settings.server.host_custom": "Custom",
+  "settings.server.host_custom": "Custom (caution)",
   "settings.server.host_placeholder": "e.g. 192.168.1.100",
   "settings.server.host_multi_hint": "Separate multiple addresses with commas",
   "settings.server.port": "Port",
