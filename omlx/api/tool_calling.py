@@ -229,7 +229,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for Hermes-style tool call formats.
 
-    Handles models that use <|tool_call_start|>...<|tool_call_end|> markers
+    Handles outputs that use <|tool_call_start|>...<|tool_call_end|> markers
     with bracket-style content inside:
         <|tool_call_start|>[function_name(arg1=value1, arg2=value2)]<|tool_call_end|>
 
