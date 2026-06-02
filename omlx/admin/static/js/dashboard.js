@@ -685,10 +685,10 @@
                         setTimeout(() => { this.cluster.saveSuccess = false; }, 3000);
                         this.loadClusterStatus();
                     } else {
-                        this.cluster.saveError = d.detail || 'Save failed';
+                        this.cluster.saveError = d.detail || window.t('cluster.save.failed');
                     }
                 } catch (e) {
-                    this.cluster.saveError = 'Save failed';
+                    this.cluster.saveError = window.t('cluster.save.failed');
                 } finally {
                     this.cluster.saving = false;
                 }
