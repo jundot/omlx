@@ -12,6 +12,8 @@ from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
+from omlx.integrations.omp import OhMyPiIntegration
+from omlx.integrations.omp import _get_agent_dir as _get_omp_agent_dir
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
@@ -31,7 +33,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 7
+        assert len(integrations) == 8
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -41,6 +43,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "omp",
         }
 
     def test_get_integration(self):
@@ -51,6 +54,7 @@ class TestIntegrationRegistry:
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
+        assert get_integration("omp") is not None
         assert get_integration("nonexistent") is None
 
 
@@ -1083,6 +1087,164 @@ class TestPiIntegration:
         pi = PiIntegration()
         assert pi.type == "config_file"
         assert pi.display_name == "Pi"
+
+
+class TestOhMyPiIntegration:
+    def test_get_agent_dir_default(self, monkeypatch):
+        """Default agent dir is ~/.omp/agent when env var is not set."""
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        assert _get_omp_agent_dir() == Path.home() / ".omp" / "agent"
+
+    def test_get_agent_dir_custom_env(self, tmp_path, monkeypatch):
+        """PI_CODING_AGENT_DIR env var overrides the default path."""
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "custom_omp"))
+        assert _get_omp_agent_dir() == tmp_path / "custom_omp"
+
+    def test_get_command(self):
+        omp = OhMyPiIntegration()
+        cmd = omp.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
+        assert "omlx launch omp" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        omp = OhMyPiIntegration()
+        cmd = omp.get_command(ctx(port=8000, api_key="", model=""))
+        assert "select-a-model" in cmd
+
+    def test_configure_new_file(self, tmp_path):
+        models_path = tmp_path / "omp" / "agent" / "models.yml"
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+
+        provider = yaml.safe_load(models_path.read_text())["providers"]["omlx"]
+        assert provider["baseUrl"] == "http://127.0.0.1:8000/v1"
+        assert provider["api"] == "openai-completions"
+        assert provider["apiKey"] == "test-key"
+        assert provider["authHeader"] is True
+        assert provider["models"][0]["id"] == "qwen3.5"
+        assert provider["models"][0]["input"] == ["text"]
+
+    def test_configure_custom_host(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(
+                ctx(port=9000, api_key="key", model="test", host="192.168.1.100")
+            )
+
+        provider = yaml.safe_load(models_path.read_text())["providers"]["omlx"]
+        assert provider["baseUrl"] == "http://192.168.1.100:9000/v1"
+
+    def test_configure_creates_backup(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+        models_path.write_text("providers:\n  old: {}\n")
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(ctx(port=8000, api_key="", model="test"))
+
+        backups = list(tmp_path.glob("models.*.bak"))
+        assert len(backups) == 1
+        assert yaml.safe_load(backups[0].read_text()) == {"providers": {"old": {}}}
+
+    def test_configure_vlm_model(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="qwen2.5-vl",
+                    model_type="vlm",
+                    context_window=32768,
+                    max_tokens=8192,
+                )
+            )
+
+        model_config = yaml.safe_load(models_path.read_text())["providers"]["omlx"][
+            "models"
+        ][0]
+        assert model_config["input"] == ["text", "image"]
+        assert model_config["contextWindow"] == 32768
+        assert model_config["maxTokens"] == 8192
+
+    def test_configure_reasoning_true_overrides_slug(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(ctx(port=8000, model="qwen3.6", reasoning=True))
+
+        model_config = yaml.safe_load(models_path.read_text())["providers"]["omlx"][
+            "models"
+        ][0]
+        assert model_config["reasoning"] is True
+
+    def test_configure_reasoning_falls_back_to_slug(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(ctx(port=8000, model="qwen3-thinking"))
+
+        model_config = yaml.safe_load(models_path.read_text())["providers"]["omlx"][
+            "models"
+        ][0]
+        assert model_config["reasoning"] is True
+
+    def test_configure_preserves_existing(self, tmp_path):
+        models_path = tmp_path / "models.yml"
+        models_path.write_text(
+            yaml.safe_dump(
+                {"providers": {"anthropic": {"baseUrl": "https://api.anthropic.com"}}}
+            )
+        )
+
+        omp = OhMyPiIntegration()
+        with patch.object(OhMyPiIntegration, "MODELS_PATH", models_path):
+            omp.configure(ctx(port=9000, api_key="", model="llama"))
+
+        models_config = yaml.safe_load(models_path.read_text())
+        assert "anthropic" in models_config["providers"]
+        assert models_config["providers"]["omlx"]["apiKey"] == "omlx"
+
+    def test_launch_scrubs_python_env(self, tmp_path):
+        omp = OhMyPiIntegration()
+        models_path = tmp_path / "models.yml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(OhMyPiIntegration, "MODELS_PATH", models_path),
+            patch("omlx.integrations.omp.os.environ", base_env),
+            patch("omlx.integrations.omp.os.execvpe", side_effect=fake_execvpe),
+        ):
+            omp.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        assert captured["argv"] == ["omp", "--model", "omlx/qwen3.5"]
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+    def test_type(self):
+        omp = OhMyPiIntegration()
+        assert omp.type == "config_file"
+        assert omp.display_name == "Oh My Pi"
+        assert omp.install_check == "omp"
 
 
 class TestClaudeCodeIntegration:
