@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .engine_pool import EngineEntry
 from .model_settings import ModelSettings
-from .settings import GlobalSettings
 
 if TYPE_CHECKING:
     # SamplingDefaults lives in server.py, which imports this module.
@@ -48,14 +47,16 @@ class ConfiguredModel:
     constructed instances (e.g. ``ModelSettings()`` with every field
     ``None``, an ``EngineEntry`` with empty strings and zeroes, etc.).
     This keeps property accessors simple — no ``None`` guards needed.
+    However, multilayer resolution will not continue past a field that
+    has a default value; currently this does not affect any lookups
+    but an alternative approach may be required in the future.
     """
 
-    # Priority is generally settings > model_entry > sampling > global_settings.
+    # Priority is generally settings > model_entry > sampling.
 
     settings: ModelSettings
     model_entry: EngineEntry
     sampling: SamplingDefaults
-    global_settings: GlobalSettings
 
     @property
     def enable_thinking(self) -> Optional[bool]:
@@ -116,7 +117,6 @@ def new_configured_model(
     settings: ModelSettings | None = None,
     model_entry: EngineEntry | None = None,
     sampling: SamplingDefaults | None = None,
-    global_settings: GlobalSettings | None = None,
 ) -> ConfiguredModel:
     """Build a ConfiguredModel, filling absent layers with defaults."""
     # Lazy import: SamplingDefaults lives in server.py, which imports us.
@@ -125,5 +125,4 @@ def new_configured_model(
         settings=settings or ModelSettings(),
         model_entry=model_entry or _EMPTY_ENGINE_ENTRY,
         sampling=sampling or _SD(),
-        global_settings=global_settings or GlobalSettings(),
     )
