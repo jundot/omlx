@@ -16,11 +16,12 @@ Note: BatchGenerator is mocked; step() is too complex for unit tests.
 """
 
 from collections import deque
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
+import omlx.scheduler as scheduler_module
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
 
@@ -191,6 +192,35 @@ class TestSchedulerInitialization:
         )
 
         assert scheduler.config.max_num_seqs == 64
+
+    def test_init_falls_back_when_paged_ssd_cache_unavailable(
+        self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
+    ):
+        """Unusable SSD cache directories should not leave partial cache state."""
+        if not scheduler_module.HAS_TIERED_CACHE:
+            pytest.skip("tiered cache modules are unavailable")
+
+        class BrokenPagedSSDCacheManager:
+            def __init__(self, *args, **kwargs):
+                raise OSError("cache directory is not writable")
+
+        monkeypatch.setattr(
+            scheduler_module,
+            "PagedSSDCacheManager",
+            BrokenPagedSSDCacheManager,
+        )
+
+        config = SchedulerConfig(paged_ssd_cache_dir=str(tmp_path / "missing-drive"))
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        assert scheduler.paged_ssd_cache_manager is None
+        assert scheduler.paged_cache_manager is None
+        assert scheduler.block_aware_cache is None
+        assert scheduler._boundary_snapshot_store is None
+        assert scheduler._store_cache_executor is None
+        assert scheduler._store_cache_gate is None
+        assert "Failed to initialize paged SSD cache" in caplog.text
 
     def test_init_statistics_zero(self, mock_model, mock_tokenizer):
         """Test Scheduler initializes with zero statistics."""
@@ -2158,6 +2188,7 @@ class TestDetectNeedsThinkPrefix:
         in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
         """
         from unittest.mock import PropertyMock
+
         from conftest import MockTokenizer
 
         tokenizer = MockTokenizer()

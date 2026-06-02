@@ -906,11 +906,13 @@ class Scheduler:
                 paged_cache_manager=self.paged_cache_manager,
             )
 
-            # Initialize paged SSD cache
-            self._init_tiered_cache()
+            # Initialize paged SSD cache. If the backing directory is not
+            # usable (for example, an external cache drive is disconnected),
+            # continue with cache disabled instead of leaving partial state.
+            cache_initialized = self._init_tiered_cache()
 
             # Set cold restore callback for prefix cache
-            if self.paged_ssd_cache_manager is not None:
+            if cache_initialized and self.paged_ssd_cache_manager is not None:
                 self.block_aware_cache.set_cold_restore_callback(
                     self._restore_block_from_cold
                 )
@@ -927,18 +929,23 @@ class Scheduler:
                         f"max_blocks={max_blocks}"
                     )
 
-            # Async store_cache executor: single worker so submissions are
-            # serialized (matches the original synchronous order) and we
-            # never have two stores racing on the same paged_ssd index.
-            self._store_cache_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="omlx-store-cache",
-            )
-            # Gate caps the post-completion store-cache pipeline so a burst
-            # of finishes cannot pile up unbounded KV caches in memory while
-            # the single writer drains. Cap starts at max_concurrent_requests
-            # and is shrunk by ProcessMemoryEnforcer under pressure (#1383).
-            self._store_cache_gate = _StoreCacheGate(cap=self.config.max_num_seqs)
+                # Async store_cache executor: single worker so submissions are
+                # serialized (matches the original synchronous order) and we
+                # never have two stores racing on the same paged_ssd index.
+                self._store_cache_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="omlx-store-cache",
+                )
+                # Gate caps the post-completion store-cache pipeline so a burst
+                # of finishes cannot pile up unbounded KV caches in memory while
+                # the single writer drains. Cap starts at max_concurrent_requests
+                # and is shrunk by ProcessMemoryEnforcer under pressure (#1383).
+                self._store_cache_gate = _StoreCacheGate(cap=self.config.max_num_seqs)
+            else:
+                self._disable_paged_cache_components()
+                logger.info(
+                    "oMLX cache disabled after paged SSD cache initialization failed"
+                )
         else:
             logger.info(
                 "oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)"
@@ -6974,7 +6981,7 @@ class Scheduler:
         except Exception as e:
             logger.debug(f"Failed to extract model info: {e}")
 
-    def _init_tiered_cache(self) -> None:
+    def _init_tiered_cache(self) -> bool:
         """Initialize paged SSD cache components if configured.
 
         In paged SSD-only mode:
@@ -6988,14 +6995,14 @@ class Scheduler:
                     "paged SSD cache requested but ssd_cache/memory_monitor modules "
                     "not available. Install required dependencies."
                 )
-            return
+            return False
 
         # In paged SSD-only mode, paged_ssd_cache_dir is required
         if not self.config.paged_ssd_cache_dir:
             logger.debug(
                 "paged SSD cache not configured (no --ssd-cache-dir specified)"
             )
-            return
+            return False
 
         try:
             cache_dir = (
@@ -7062,10 +7069,24 @@ class Scheduler:
                     f"max_size={self._format_bytes(self.config.paged_ssd_cache_max_size)}, "
                     f"block_size={self.config.paged_cache_block_size} tokens"
                 )
+            return True
 
         except Exception as e:
             logger.error(f"Failed to initialize paged SSD cache: {e}")
             self.paged_ssd_cache_manager = None
+            return False
+
+    def _disable_paged_cache_components(self) -> None:
+        """Clear paged-cache runtime state after SSD cache setup fails."""
+        if self.paged_ssd_cache_manager is not None:
+            try:
+                self.paged_ssd_cache_manager.close()
+            except Exception as e:
+                logger.debug("Failed to close paged SSD cache manager: %s", e)
+        self.paged_ssd_cache_manager = None
+        self.paged_cache_manager = None
+        self.block_aware_cache = None
+        self._boundary_snapshot_store = None
 
     def _check_memory_pressure(self) -> None:
         """Check memory and evict blocks if needed.
