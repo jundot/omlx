@@ -437,10 +437,6 @@ def launch_command(args, extra_args: list[str] | None = None):
     print(f"Launching {integration.display_name} with model {model}...")
     integration.launch(ctx)
 
-    # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
-    integration.launch(ctx)
-
 
 def diagnose_menubar() -> int:
     """Diagnose why the oMLX menubar icon might be missing.

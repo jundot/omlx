@@ -244,7 +244,6 @@ class ServerState:
             settings=ms,
             model_entry=ee,
             sampling=self.sampling,
-            global_settings=self.global_settings,
         )
 
 # Global server state instance
