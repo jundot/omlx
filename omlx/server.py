@@ -1220,7 +1220,9 @@ def init_server(
     logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
-    base_path = Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
+    from .settings import resolve_default_base_path
+
+    base_path = Path(global_settings.base_path) if global_settings else resolve_default_base_path()
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
     # Get pinned models from settings file only (managed via admin page)

@@ -643,10 +643,18 @@ class MSDownloader:
                 task.status = DownloadStatus.DOWNLOADING
                 task.started_at = time.time()
 
-                # Preserve {owner}/{model} layout to match other tools
-                # (LMStudio, huggingface-cli) and avoid duplicate downloads
-                # when sharing a model directory.
-                target_dir = self._model_dir / task.repo_id
+                # Download into the ModelScope cache (dedup-friendly, canonical),
+                # not the model registry. The registry stays alias-only: after the
+                # download we expose the cached model via a symlink. The alias is
+                # the repo's model name; rename it to the flyto convention later.
+                ms_cache = Path(
+                    os.environ.get(
+                        "MODELSCOPE_CACHE",
+                        str(Path.home() / ".cache" / "modelscope"),
+                    )
+                )
+                cache_path = ms_cache / "hub" / task.repo_id
+                alias_path = self._model_dir / task.repo_id.split("/")[-1]
 
                 # Get total file size for progress estimation
                 try:
@@ -666,64 +674,59 @@ class MSDownloader:
                         "Progress estimation will be unavailable."
                     )
 
-                # Start progress polling
+                # Start progress polling on the cache path (where files land)
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
+                    self._poll_progress(task_id, cache_path)
                 )
 
-                # Build download kwargs
-                dl_kwargs = {
-                    "model_id": task.repo_id,
-                    "local_dir": str(target_dir),
-                }
+                # Build download kwargs (cache mode: no local_dir)
+                dl_kwargs = {"model_id": task.repo_id}
                 if ms_token:
                     dl_kwargs["token"] = ms_token
 
-                # Run snapshot_download in a thread (blocking call)
+                # Run snapshot_download in a thread (blocking call). It returns the
+                # local path of the cached model.
                 # Note: Thread cannot be interrupted, cancellation is checked after completion
-                await asyncio.to_thread(
+                real_path = await asyncio.to_thread(
                     ms_snapshot_download,
                     **dl_kwargs,
                 )
 
-                # Check if cancelled while downloading - clean up downloaded files
+                # Check if cancelled while downloading. The partial download stays
+                # in the ModelScope cache (resumable); we only drop a dangling alias.
                 if task_id in self._cancelled:
                     logger.info(
                         f"MS Download was cancelled during execution: {task.repo_id}. "
-                        "Cleaning up downloaded files..."
+                        "Leaving cache partial for resume."
                     )
-                    if target_dir.exists():
-                        try:
-                            shutil.rmtree(target_dir)
-                            logger.info(f"Cleaned up cancelled download: {target_dir}")
-                        except Exception as cleanup_err:
-                            logger.warning(f"Failed to clean up {target_dir}: {cleanup_err}")
-                    # Drop empty org folder left behind by the cancelled download.
-                    parent = target_dir.parent
-                    if (
-                        parent != self._model_dir
-                        and parent.exists()
-                        and not any(parent.iterdir())
-                    ):
-                        try:
-                            parent.rmdir()
-                        except OSError as cleanup_err:
-                            logger.debug(
-                                f"Could not remove empty org folder {parent}: "
-                                f"{cleanup_err}"
-                            )
+                    if alias_path.is_symlink():
+                        alias_path.unlink(missing_ok=True)
                     return
 
-                # Success
+                # Success: expose the cached model in the registry via a symlink.
+                final_path = Path(real_path) if real_path else cache_path
+                if not alias_path.exists() and not alias_path.is_symlink():
+                    try:
+                        alias_path.symlink_to(final_path)
+                        logger.info(
+                            f"Registry alias: {alias_path.name} -> {final_path} "
+                            "(rename to flyto convention as needed)"
+                        )
+                    except OSError as link_err:
+                        logger.warning(
+                            f"Failed to create registry alias for {task.repo_id}: "
+                            f"{link_err}"
+                        )
+
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
                 task.downloaded_size = task.total_size or self._get_dir_size(
-                    target_dir
+                    final_path
                 )
                 task.completed_at = time.time()
 
                 logger.info(
-                    f"MS Download completed: {task.repo_id} -> {target_dir} "
+                    f"MS Download completed: {task.repo_id} -> {final_path} "
                     f"({time.time() - task.started_at:.1f}s)"
                 )
 

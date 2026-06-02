@@ -61,14 +61,16 @@ class TestOQManagerUpdateModelDirs:
         assert "Llama-3B" in names_after
         assert "Qwen-7B" in names_after
 
-    def test_output_dir_tracks_primary_dir(
+    def test_output_dir_is_quant_store_beside_primary(
         self, fp_model_dir, second_fp_model_dir
     ):
-        # Output is always written to the primary (first) directory.
+        # oQ outputs go to a central <base>/quant-store beside the primary model
+        # registry, not into the registry itself. On completion the registry
+        # gets a symlink alias, so it stays alias-only.
         manager = OQManager(model_dirs=[str(fp_model_dir)])
-        assert manager._output_dir == fp_model_dir
+        assert manager._output_dir == fp_model_dir.parent / "quant-store"
 
         manager.update_model_dirs(
             [str(second_fp_model_dir), str(fp_model_dir)]
         )
-        assert manager._output_dir == second_fp_model_dir
+        assert manager._output_dir == second_fp_model_dir.parent / "quant-store"

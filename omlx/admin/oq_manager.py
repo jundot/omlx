@@ -131,7 +131,14 @@ class OQManager:
         on_complete: Optional[Callable] = None,
     ):
         self._model_dirs = [Path(d) for d in model_dirs]
-        self._output_dir = self._model_dirs[0] if self._model_dirs else Path(".")
+        # oQ outputs go to a central <base>/quant-store (sibling of the model
+        # registry <base>/models), not into the registry itself. The registry
+        # then holds only symlink aliases (flyto unified-store convention).
+        self._output_dir = (
+            self._model_dirs[0].parent / "quant-store"
+            if self._model_dirs
+            else Path("quant-store")
+        )
         self._tasks: dict[str, QuantTask] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._progress_tasks: dict[str, asyncio.Task] = {}
@@ -143,7 +150,7 @@ class OQManager:
         """Update model directory paths."""
         self._model_dirs = [Path(d) for d in model_dirs]
         if self._model_dirs:
-            self._output_dir = self._model_dirs[0]
+            self._output_dir = self._model_dirs[0].parent / "quant-store"
 
     async def list_quantizable_models(self) -> tuple[list[dict], list[dict]]:
         """Scan all model dirs. Returns (source_models, all_models)."""
@@ -479,6 +486,23 @@ class OQManager:
                 task.phase = "Completed"
                 task.completed_at = time.time()
                 task.output_size = _dir_size(Path(task.output_path))
+
+                # Expose the quant output (written under <base>/quant-store) in
+                # the model registry via a symlink alias, so the registry stays
+                # alias-only and oQ products do not scatter as real dirs.
+                try:
+                    if self._model_dirs:
+                        alias = self._model_dirs[0] / task.output_name
+                        if not alias.exists() and not alias.is_symlink():
+                            alias.symlink_to(Path(task.output_path))
+                            logger.info(
+                                f"oQ registry alias: {alias} -> {task.output_path}"
+                            )
+                except OSError as alias_err:
+                    logger.warning(
+                        f"Failed to create oQ registry alias for "
+                        f"{task.output_name}: {alias_err}"
+                    )
 
                 elapsed = task.completed_at - task.started_at
                 logger.info(

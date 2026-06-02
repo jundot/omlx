@@ -207,10 +207,15 @@ class TestMSDownloader:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
-    async def test_download_uses_owner_model_layout(self, model_dir):
-        """ms_snapshot_download must receive local_dir under the org subfolder."""
+    async def test_download_to_cache_then_registry_alias(self, model_dir):
+        """Download uses the ModelScope cache (no local_dir into the registry);
+        on completion the registry gets a symlink alias named after the repo
+        model, pointing at the cached path (flyto unified-store convention)."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = MSDownloader(model_dir=str(model_dir))
+
+        fake_cache = model_dir.parent / "ms-cache" / "Qwen2.5-7B-Instruct-MLX"
+        fake_cache.mkdir(parents=True, exist_ok=True)
 
         with patch(
             "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
@@ -222,15 +227,20 @@ class TestMSDownloader:
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
             mock_get_api.return_value = mock_api
+            mock_download.return_value = str(fake_cache)
 
             await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
             await asyncio.sleep(0.5)
 
             assert mock_download.called
             call_kwargs = mock_download.call_args[1]
-            assert call_kwargs["local_dir"] == str(
-                model_dir / "qwen" / "Qwen2.5-7B-Instruct-MLX"
-            )
+            # cache mode: must NOT force a local_dir into the registry
+            assert "local_dir" not in call_kwargs
+            assert call_kwargs["model_id"] == "qwen/Qwen2.5-7B-Instruct-MLX"
+            # registry exposes the cached model via a symlink alias
+            alias = model_dir / "Qwen2.5-7B-Instruct-MLX"
+            assert alias.is_symlink()
+            assert alias.resolve() == fake_cache.resolve()
 
             await downloader.shutdown()
 
