@@ -19,6 +19,7 @@
 // Tahoe ControlCenter silently block the status item (issue #725).
 
 import AppKit
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -50,6 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = AppConfig.load()
         bootstrapServer(config: config)
         scheduleAccessoryPolicyFlip()
+
+        // Register as a login item on first launch so the app appears in
+        // System Settings > Login Items and survives reboot without relying
+        // solely on the legacy LaunchAgent. Registered once, then the user owns
+        // the toggle from the settings panel.
+        LaunchAtLogin.registerOnceOnFirstLaunch()
     }
 
     private func bootstrapServer(config: AppConfig) {
@@ -128,5 +135,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // deadlock the very task we're waiting on.
         NotificationCenter.default.removeObserver(self)
         server?.reapSync(timeout: 5)
+    }
+}
+
+// MARK: - Launch at login (SMAppService)
+
+/// Wraps `SMAppService.mainApp` so the menubar app registers itself as a
+/// macOS login item -- visible and toggleable in System Settings > Login
+/// Items. `mainApp` is the least-restrictive SMAppService tier (no Developer
+/// ID required), so an ad-hoc signed local build can register; it may land in
+/// `.enabled` or `.requiresApproval` (user approves in the panel) -- both are
+/// visible there.
+enum LaunchAtLogin {
+    private static let didInitKey = "didInitialLoginItemRegistration"
+
+    /// Register exactly once, on the first launch that sees this build. The
+    /// UserDefaults flag is set only after a throw-free `register()`, so:
+    ///   - a register() failure retries on the next launch (never silently
+    ///     stuck off and absent from the panel), and
+    ///   - a user who later turns the item OFF in System Settings is not
+    ///     overridden on subsequent launches.
+    static func registerOnceOnFirstLaunch() {
+        guard !UserDefaults.standard.bool(forKey: didInitKey) else { return }
+        do {
+            try SMAppService.mainApp.register()
+            UserDefaults.standard.set(true, forKey: didInitKey)
+            NSLog("[LaunchAtLogin] registered; status=\(statusDescription)")
+        } catch {
+            NSLog("[LaunchAtLogin] register() failed, will retry next launch: \(error)")
+        }
+    }
+
+    /// Human-readable `SMAppService.mainApp.status`, read live (never cached).
+    static var statusDescription: String {
+        switch SMAppService.mainApp.status {
+        case .notRegistered:    return "notRegistered"
+        case .enabled:          return "enabled"
+        case .requiresApproval: return "requiresApproval"
+        case .notFound:         return "notFound"
+        @unknown default:       return "unknown"
+        }
     }
 }
