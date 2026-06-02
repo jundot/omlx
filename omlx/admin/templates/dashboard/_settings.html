@@ -244,6 +244,8 @@
                                                type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
                                                class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                     </div>
+                                    <p x-show="hostMode === 'custom'" x-cloak
+                                       class="text-xs text-neutral-400 mt-1 text-right">{{ t('settings.server.host_multi_hint') }}</p>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">

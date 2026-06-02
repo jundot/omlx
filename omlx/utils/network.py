@@ -64,6 +64,25 @@ def is_valid_alias(value: str) -> bool:
     return is_valid_ip(value)
 
 
+def is_valid_bind_host(value: str) -> bool:
+    """Return True if ``value`` is a valid host to bind a server socket to.
+
+    Accepts any parseable IP address (including ``0.0.0.0`` and ``::``) and
+    valid DNS hostnames. Unlike :func:`is_valid_alias`, unspecified addresses
+    are allowed because they are legitimate bind targets.
+    """
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return is_valid_hostname(value)
+
+
 def _local_ipv4_addresses() -> list[str]:
     """Best-effort enumeration of non-loopback IPv4 addresses.
 
