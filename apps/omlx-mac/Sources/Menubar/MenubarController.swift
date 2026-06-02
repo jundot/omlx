@@ -28,6 +28,7 @@ final class MenubarController: NSObject {
 
     private let server: ServerProcess?
     private let config: AppConfig
+    private let updates: UpdateController?
     private let bootstrapError: Error?
     private let openAppView: () -> Void
     private let requestQuit: () -> Void
@@ -53,6 +54,7 @@ final class MenubarController: NSObject {
     private var adminPanelItem: NSMenuItem!
     private var webAdminItem: NSMenuItem!
     private var chatItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
 
     private let iconOutline: NSImage?
     private let iconFilled: NSImage?
@@ -62,12 +64,14 @@ final class MenubarController: NSObject {
     init(
         server: ServerProcess?,
         config: AppConfig,
+        updates: UpdateController? = nil,
         lastError: Error? = nil,
         openAppView: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
         self.config = config
+        self.updates = updates
         self.bootstrapError = lastError
         self.openAppView = openAppView
         self.requestQuit = requestQuit
@@ -121,9 +125,21 @@ final class MenubarController: NSObject {
                 object: server
             )
         }
+        if let updates {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(updateStateChanged(_:)),
+                name: UpdateController.stateDidChangeNotification,
+                object: updates
+            )
+        }
 
         startStatsPoller()
         startVisibilityWatcher()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Menu construction
@@ -193,6 +209,13 @@ final class MenubarController: NSObject {
         menu.addItem(chatItem)
 
         menu.addItem(.separator())
+
+        updateItem = item(String(localized: "menubar.item.update_available",
+                                 defaultValue: "Install Update…",
+                                 comment: "Menubar item shown when an app update is available"),
+                          action: #selector(installUpdate),
+                          symbol: "arrow.down.circle")
+        menu.addItem(updateItem)
 
         adminPanelItem = item(String(localized: "menubar.item.settings",
                                      defaultValue: "Settings…",
@@ -279,10 +302,36 @@ final class MenubarController: NSObject {
         webAdminItem.isEnabled = isRunning
         chatItem.isEnabled = isRunning
 
+        refreshUpdateMenuItem()
+
         // Icon swap — outline when not actively serving, filled otherwise
         let serving = state.isRunningLike
         statusItem.button?.image = serving ? iconFilled : iconOutline
         statusItem.button?.image?.isTemplate = true
+    }
+
+    private func refreshUpdateMenuItem() {
+        guard let updates else {
+            updateItem.isHidden = true
+            return
+        }
+        switch updates.state {
+        case .available(let info), .ready(let info):
+            updateItem.isHidden = false
+            updateItem.isEnabled = info.dmgURL != nil
+            updateItem.title = String(localized: "menubar.item.install_update_version",
+                                      defaultValue: "Install oMLX \(info.version)…",
+                                      comment: "Menubar update item when an app update is available; placeholder is the version")
+        case .downloading(let pct):
+            updateItem.isHidden = false
+            updateItem.isEnabled = false
+            updateItem.title = String(localized: "menubar.item.downloading_update",
+                                      defaultValue: "Downloading update… \(pct)%",
+                                      comment: "Menubar update item while an app update is downloading; placeholder is the percent")
+        default:
+            updateItem.isHidden = true
+            updateItem.isEnabled = false
+        }
     }
 
     private func headerDisplay(_ state: ServerProcess.State) -> (String, NSColor) {
@@ -495,6 +544,10 @@ final class MenubarController: NSObject {
         rebuildStatsSubmenu()
     }
 
+    @objc private func updateStateChanged(_ note: Notification) {
+        refreshUpdateMenuItem()
+    }
+
     // MARK: - Actions
 
     @objc private func startServer() {
@@ -578,6 +631,10 @@ final class MenubarController: NSObject {
         let port = MenubarController.displayPort(server: server, fallback: config.port)
         guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func installUpdate() {
+        updates?.installAndRestart()
     }
 
     @objc private func showAbout() {

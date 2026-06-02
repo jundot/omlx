@@ -456,6 +456,8 @@ if [ "$SKIP_EMBEDDED_SIGN" -eq 1 ]; then
 else
     log "Ad-hoc signing embedded native code…"
     _sign_embedded_mach_o_files "$PYTHON_DIR"
+    codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
+    ok "  + signed omlx-cli wrapper"
 fi
 
 log "Ad-hoc resigning app bundle…"

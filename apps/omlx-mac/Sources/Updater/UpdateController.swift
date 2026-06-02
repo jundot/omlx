@@ -1,7 +1,7 @@
 // Updates section view-model.
 //
 // Drives the AppView's Status screen: the check state (idle / checking /
-// available), the channel (Stable / Beta / Nightly), and two background
+// available), the channel (Stable / Release Candidate / Dev), and two background
 // prefs (autoCheck + autoDownload). Channel + prefs persist to
 // `~/Library/Application Support/oMLX/update-prefs.json` so they survive
 // a relaunch.
@@ -15,7 +15,10 @@ import AppKit
 import Foundation
 
 enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
-    case stable, beta, nightly
+    case stable
+    case releaseCandidate = "release_candidate"
+    case dev
+
     var id: String { rawValue }
 
     var displayName: String {
@@ -24,15 +27,34 @@ enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
             return String(localized: "update.channel.stable",
                           defaultValue: "Stable",
                           comment: "Display name for the Stable update channel")
-        case .beta:
-            return String(localized: "update.channel.beta",
-                          defaultValue: "Beta",
-                          comment: "Display name for the Beta update channel")
-        case .nightly:
-            return String(localized: "update.channel.nightly",
-                          defaultValue: "Nightly",
-                          comment: "Display name for the Nightly update channel")
+        case .releaseCandidate:
+            return String(localized: "update.channel.release_candidate",
+                          defaultValue: "Release Candidate",
+                          comment: "Display name for the Release Candidate update channel")
+        case .dev:
+            return String(localized: "update.channel.dev",
+                          defaultValue: "Dev",
+                          comment: "Display name for the Dev update channel")
         }
+    }
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "stable":
+            self = .stable
+        case "release_candidate", "beta":
+            self = .releaseCandidate
+        case "dev", "nightly":
+            self = .dev
+        default:
+            self = .stable
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 }
 
@@ -46,6 +68,8 @@ struct AvailableUpdate: Equatable, Sendable {
 
 @MainActor
 final class UpdateController: ObservableObject {
+    static let stateDidChangeNotification = Notification.Name("OMLXUpdateControllerStateDidChange")
+
     enum CheckState: Equatable, Sendable {
         case idle(lastChecked: Date?)
         case checking
@@ -54,10 +78,21 @@ final class UpdateController: ObservableObject {
         case ready(AvailableUpdate)
     }
 
-    @Published private(set) var state: CheckState = .idle(lastChecked: nil)
+    @Published private(set) var state: CheckState = .idle(lastChecked: nil) {
+        didSet {
+            NotificationCenter.default.post(
+                name: Self.stateDidChangeNotification,
+                object: self
+            )
+        }
+    }
     @Published private(set) var lastError: String?
     @Published var channel: UpdateChannel {
-        didSet { if !suspendPersist { persist() } }
+        didSet {
+            guard !suspendPersist else { return }
+            persist()
+            checkForUpdates()
+        }
     }
     @Published var autoCheck: Bool {
         didSet {
@@ -82,6 +117,7 @@ final class UpdateController: ObservableObject {
     private var checkTask: Task<Void, Never>?
     private var updater: AppUpdater?
     private var backgroundTimer: Timer?
+    private var terminateForUpdate: (@MainActor () -> Void)?
 
     init(
         storeURL: URL = AppConfig.appSupportURL().appendingPathComponent("update-prefs.json"),
@@ -107,6 +143,10 @@ final class UpdateController: ObservableObject {
             backgroundCheck()
             scheduleBackgroundChecker()
         }
+    }
+
+    func setTerminateForUpdate(_ handler: @escaping @MainActor () -> Void) {
+        self.terminateForUpdate = handler
     }
 
     /// User-initiated check.
@@ -144,7 +184,11 @@ final class UpdateController: ObservableObject {
 
     private func performSwap() {
         if AppUpdater.performSwapAndRelaunch() {
-            NSApp.terminate(nil)
+            if let terminateForUpdate {
+                terminateForUpdate()
+            } else {
+                NSApp.terminate(nil)
+            }
         } else {
             lastError = String(localized: "update.error.swap_failed",
                                defaultValue: "Could not find the staged update. Try downloading again.",
