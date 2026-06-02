@@ -84,8 +84,19 @@ destructive / shared-state operation" rule for this repo only.
 
 ## Machines
 
-- oMLX servers run on **m2max** and **m5max** at `~/Code/omlx`, launched by
-  `/Applications/oMLX.app` running fork code (GUI bundle hack — do not upgrade
-  the app). The local clone dir is named `omlx`; it is this `flyto-mlx` repo.
-- `omlx serve` binds `settings.server.host` at startup (`~/.omlx/settings.json`);
-  a config change needs a genuine server-process restart to take effect.
+- Flyto MLX servers run on **m2max** and **m5max** at `~/Code/omlx`, launched by
+  `/Applications/Flyto MLX.app` -- a thin Swift menubar shell whose source lives
+  in this repo at `apps/omlx-mac` (bundle dir/MachO still named `oMLX`). The
+  shell embeds no Python; it shells out to the host venv
+  `~/Code/omlx/.venv/bin/python -m omlx.cli serve` (see `PythonRuntime.swift`),
+  so editing a `.py` in the worktree + restarting the server applies instantly.
+  The local clone dir is named `omlx`; it is this `flyto-mlx` repo.
+- Rebuilding the menubar shell: `apps/omlx-mac/Scripts/build.sh` (needs Xcode;
+  emits a few-MB `build/Stage/oMLX.app`, version tracked from `omlx/_version.py`).
+  Deploy by replacing `/Applications/Flyto MLX.app` (`ditto` + `codesign --force
+  --sign -` + `xattr -dr com.apple.quarantine`), then relaunch. Base-path default
+  is `apps/omlx-mac/Sources/Config/AppConfig.swift` `defaultBasePath()`.
+- `omlx serve` binds `settings.server.host` at startup; settings live at
+  `~/.fmlx/settings.json` (a legacy `~/.omlx -> ~/.fmlx` compat symlink is kept
+  so old absolute paths still resolve). A config change needs a genuine
+  server-process restart to take effect.

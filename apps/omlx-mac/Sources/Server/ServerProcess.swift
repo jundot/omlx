@@ -431,8 +431,10 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     static func defaultBasePath() -> URL {
+        // Fallback only; AppDelegate passes the AppConfig-resolved basePath.
+        // Kept in sync with AppConfig.defaultBasePath() (~/.fmlx rebrand).
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent(".fmlx", isDirectory: true)
     }
 
     static func defaultLogURL() -> URL {
