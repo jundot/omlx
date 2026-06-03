@@ -513,27 +513,28 @@ class TestLaunchCommandFunction:
         ctx = integration.launch.call_args.args[0]
         assert ctx.extra_args == ("--resume", "abc123")
 
-    def test_launch_command_uses_saved_claude_tiers_without_model_prompt(self):
-        """Bare `omlx launch claude` should use saved tier models."""
+    def test_launch_command_shows_picker_and_clears_saved_tiers(self):
+        """Bare `omlx launch claude` shows the picker and ignores saved tier models."""
         from omlx.cli import launch_command
 
         integration = MagicMock()
         integration.display_name = "Claude Code"
         integration.is_installed.return_value = True
+        integration.select_model.return_value = "sonnet-local"
 
         health_response = MagicMock()
         health_response.raise_for_status.return_value = None
 
-        status_response = MagicMock()
-        status_response.ok = True
-        status_response.json.return_value = {
-            "models": [
-                {
-                    "id": "sonnet-local",
-                    "model_type": "llm",
-                    "max_context_window": 65536,
-                    "max_tokens": 8192,
-                }
+        status_map_response = MagicMock()
+        status_map_response.ok = True
+        status_map_response.json.return_value = {"models": []}
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [
+                {"id": "sonnet-local", "model_type": "llm"},
+                {"id": "opus-local", "model_type": "llm"},
             ]
         }
 
@@ -560,20 +561,22 @@ class TestLaunchCommandFunction:
         )
 
         with (
-            patch("requests.get", side_effect=[health_response, status_response]),
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_map_response, models_response],
+            ),
             patch("omlx.integrations.get_integration", return_value=integration),
             patch("omlx.settings.GlobalSettings.load", return_value=settings),
         ):
             launch_command(args)
 
-        integration.select_model.assert_not_called()
+        integration.select_model.assert_called_once()
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == "sonnet-local"
-        assert ctx.opus_model == "opus-local"
-        assert ctx.sonnet_model == "sonnet-local"
-        assert ctx.haiku_model == "haiku-local"
+        assert ctx.opus_model is None
+        assert ctx.sonnet_model is None
+        assert ctx.haiku_model is None
         assert ctx.api_key == "saved-key"
-        assert ctx.context_window == 65536
 
     def test_launch_command_claude_cli_tiers_override_saved_settings(self):
         """Explicit --opus/--sonnet/--haiku should win over saved settings."""

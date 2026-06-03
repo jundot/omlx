@@ -411,11 +411,12 @@ def launch_command(args, extra_args: list[str] | None = None):
     except Exception:
         pass
 
-    # Determine model. Claude Code can use separate Opus/Sonnet/Haiku defaults
-    # from settings, so bare `omlx launch claude` should not force a second
-    # interactive model choice when those tiers are configured.
+    # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
+    # prompt interactively so the user's selection is honoured.
     model = args.model
-    if not model:
+    if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+        model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
+    elif not model:
         # Fetch available models from server
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
