@@ -415,8 +415,6 @@ def launch_command(args, extra_args: list[str] | None = None):
     # from settings, so bare `omlx launch claude` should not force a second
     # interactive model choice when those tiers are configured.
     model = args.model
-    if not model and claude_has_tier_models:
-        model = sonnet_model or opus_model or haiku_model or ""
     if not model:
         # Fetch available models from server
         try:
@@ -449,6 +447,14 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"{integration.display_name} is not installed.")
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
+
+    # If the model was chosen interactively (no --model and no explicit tier flags),
+    # use the picked model for all tiers instead of letting settings-based tier
+    # models override the user's selection.
+    if args.model is None and not (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+        opus_model = None
+        sonnet_model = None
+        haiku_model = None
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
