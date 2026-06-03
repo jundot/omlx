@@ -115,6 +115,13 @@ def maybe_apply_pre_load_patches(
 
     _patch_mlx_lm_load_config()
 
+    try:
+        from ..patches.lfm2_tool_parser import apply_lfm2_tool_parser_patch
+
+        apply_lfm2_tool_parser_patch()
+    except Exception as exc:
+        logger.debug("LFM2/LFM2.5 tool parser patch not applied: %s", exc)
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
