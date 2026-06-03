@@ -1077,12 +1077,41 @@ private struct ExperimentalSection: View {
                 }
                 Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
                                   defaultValue: "Draft Quantization",
-                                  comment: "Row label for the DFlash draft-quantization picker")) {
-                    Popup(
-                        selection: vm.bindProfile($vm.dflashDraftQuantBits),
-                        width: 160,
-                        options: ModelSettingsScreenVM.dflashDraftQuantOptions
-                    )
+                                  comment: "Row label for the DFlash draft quantization toggle"),
+                    sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
+                                     defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
+                                     comment: "Sublabel for the DFlash draft quantization toggle")) {
+                    Toggle("", isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                if vm.dflashDraftQuantEnabled {
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
+                                      defaultValue: "Weight Bits",
+                                      comment: "Row label for the DFlash draft quantization weight bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantWeightBits),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_activation.label",
+                                      defaultValue: "Activation Bits",
+                                      comment: "Row label for the DFlash draft quantization activation bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
+                                      defaultValue: "Group Size",
+                                      comment: "Row label for the DFlash draft quantization group size picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantGroupSize),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
+                        )
+                    }
                 }
                 Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
                                   defaultValue: "Max Context (fallback)",
@@ -1095,6 +1124,36 @@ private struct ExperimentalSection: View {
                                                   defaultValue: "unlimited",
                                                   comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
                               mono: true, suffix: "tk", width: 130)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
+                                  defaultValue: "Verify Mode",
+                                  comment: "Row label for the DFlash verifier algorithm picker"),
+                    sublabel: String(localized: "settings.experimental.dflash.verify_mode.sub",
+                                     defaultValue: "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify.",
+                                     comment: "Sublabel for the DFlash verify mode picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.dflashVerifyMode),
+                        width: 140,
+                        options: ModelSettingsScreenVM.dflashVerifyModeOptions
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.dflash.window_size.label",
+                                  defaultValue: "Draft Window Size",
+                                  comment: "Row label for the DFlash draft sliding-attention window size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (1024).",
+                                     comment: "Sublabel for the DFlash draft window size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
+                              placeholder: "1024", mono: true, width: 110)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
+                                  defaultValue: "Draft Sink Size",
+                                  comment: "Row label for the DFlash attention-sink tokens field"),
+                    sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (64).",
+                                     comment: "Sublabel for the DFlash draft sink size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
+                              placeholder: "64", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
@@ -1111,6 +1170,17 @@ private struct ExperimentalSection: View {
                             .labelsHidden().toggleStyle(.switch)
                     }
                 }
+                if vm.dflashInMemoryCache {
+                    Row(label: String(localized: "settings.experimental.dflash.mem_cache_entries.label",
+                                      defaultValue: "Cache Entries",
+                                      comment: "Row label for the DFlash L1 in-memory cache max entries field"),
+                        sublabel: String(localized: "settings.experimental.dflash.mem_cache_entries.sub",
+                                         defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
+                                         comment: "Sublabel for the DFlash L1 cache max entries field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
+                                  placeholder: "4", mono: true, width: 110)
+                    }
+                }
                 Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
                                   defaultValue: "DFlash SSD cache",
                                   comment: "Row label for the DFlash L2 SSD cache toggle"),
@@ -1118,6 +1188,17 @@ private struct ExperimentalSection: View {
                     Toggle("", isOn: vm.bindProfile($vm.dflashSsdCache))
                         .labelsHidden().toggleStyle(.switch)
                         .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
+                }
+                if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
+                    Row(label: String(localized: "settings.experimental.dflash.ssd_cache_size.label",
+                                      defaultValue: "SSD Cache Size",
+                                      comment: "Row label for the DFlash L2 SSD cache disk budget field"),
+                        sublabel: String(localized: "settings.experimental.dflash.ssd_cache_size.sub",
+                                         defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
+                                         comment: "Sublabel for the DFlash SSD cache size field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
+                                  placeholder: "20", mono: true, suffix: "GiB", width: 110)
+                    }
                 }
             }
 
@@ -1218,8 +1299,12 @@ final class ModelSettingsScreenVM: ObservableObject {
         case turboquantKvEnabled, turboquantKvBits
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
-        case dflashEnabled, dflashDraftModel, dflashDraftQuantBits, dflashMaxCtx
-        case dflashInMemoryCache, dflashInMemoryCacheGib, dflashSsdCache
+        case dflashEnabled, dflashDraftModel, dflashMaxCtx
+        case dflashDraftQuantEnabled, dflashDraftQuantWeightBits
+        case dflashDraftQuantActivationBits, dflashDraftQuantGroupSize
+        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize
+        case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
+        case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
     }
 
@@ -1303,17 +1388,59 @@ final class ModelSettingsScreenVM: ObservableObject {
         ]
     }
 
-    static var dflashDraftQuantOptions: [(String, String)] {
+    static var dflashDraftQuantWeightBitsOptions: [(String, String)] {
         [
-            ("", String(localized: "settings.dflash.quant.bf16",
-                        defaultValue: "bf16 (default)",
-                        comment: "DFlash draft quantization option for bf16 (no quantization)")),
-            ("4", String(localized: "settings.dflash.quant.4bit",
+            ("2", String(localized: "settings.dflash.quant.weight.2",
+                         defaultValue: "2-bit",
+                         comment: "DFlash draft quantization weight bits option")),
+            ("4", String(localized: "settings.dflash.quant.weight.4",
                          defaultValue: "4-bit",
-                         comment: "DFlash draft quantization option")),
-            ("8", String(localized: "settings.dflash.quant.8bit",
+                         comment: "DFlash draft quantization weight bits option")),
+            ("8", String(localized: "settings.dflash.quant.weight.8",
                          defaultValue: "8-bit",
-                         comment: "DFlash draft quantization option")),
+                         comment: "DFlash draft quantization weight bits option")),
+        ]
+    }
+
+    static var dflashDraftQuantActivationBitsOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.quant.activation.default",
+                        defaultValue: "default",
+                        comment: "DFlash draft quantization activation bits — use server default")),
+            ("16", String(localized: "settings.dflash.quant.activation.16",
+                          defaultValue: "16-bit",
+                          comment: "DFlash draft quantization activation bits option")),
+            ("32", String(localized: "settings.dflash.quant.activation.32",
+                          defaultValue: "32-bit",
+                          comment: "DFlash draft quantization activation bits option")),
+        ]
+    }
+
+    static var dflashDraftQuantGroupSizeOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.quant.group.default",
+                        defaultValue: "default",
+                        comment: "DFlash draft quantization group size — use server default")),
+            ("32", "32"),
+            ("64", "64"),
+            ("128", "128"),
+        ]
+    }
+
+    static var dflashVerifyModeOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.verify_mode.default",
+                        defaultValue: "default (adaptive)",
+                        comment: "DFlash verify mode option meaning the server default is used")),
+            ("adaptive", String(localized: "settings.dflash.verify_mode.adaptive",
+                                defaultValue: "adaptive",
+                                comment: "DFlash verify mode: shrinks block size when acceptance drops")),
+            ("dflash", String(localized: "settings.dflash.verify_mode.dflash",
+                              defaultValue: "dflash",
+                              comment: "DFlash verify mode: standard dflash verifier")),
+            ("off", String(localized: "settings.dflash.verify_mode.off",
+                           defaultValue: "off",
+                           comment: "DFlash verify mode: disable speculative verify")),
         ]
     }
 
@@ -1385,12 +1512,19 @@ final class ModelSettingsScreenVM: ObservableObject {
     // Experimental: DFlash
     @Published var dflashEnabled: Bool = false
     @Published var dflashDraftModel: String = ""
-    /// "" (bf16 default), "4", or "8".
-    @Published var dflashDraftQuantBits: String = ""
+    @Published var dflashDraftQuantEnabled: Bool = false
+    @Published var dflashDraftQuantWeightBits: String = "4"
+    @Published var dflashDraftQuantActivationBits: String = ""
+    @Published var dflashDraftQuantGroupSize: String = ""
     @Published var dflashMaxCtx: String = ""
+    @Published var dflashVerifyMode: String = ""
+    @Published var dflashDraftWindowSize: String = ""
+    @Published var dflashDraftSinkSize: String = ""
     @Published var dflashInMemoryCache: Bool = false
     @Published var dflashInMemoryCacheGib: String = "8"
+    @Published var dflashInMemoryCacheMaxEntries: String = "4"
     @Published var dflashSsdCache: Bool = false
+    @Published var dflashSsdCacheGib: String = "20"
 
     // Experimental: native MTP
     @Published var mtpEnabled: Bool = false
@@ -1504,12 +1638,21 @@ final class ModelSettingsScreenVM: ObservableObject {
                     self.specprefillThreshold = s.specprefillThreshold.map(String.init) ?? "8192"
                     self.dflashEnabled = s.dflashEnabled ?? false
                     self.dflashDraftModel = s.dflashDraftModel ?? ""
-                    self.dflashDraftQuantBits = s.dflashDraftQuantBits.map(String.init) ?? ""
+                    self.dflashDraftQuantEnabled = s.dflashDraftQuantEnabled ?? false
+                    self.dflashDraftQuantWeightBits = s.dflashDraftQuantWeightBits.map(String.init) ?? "4"
+                    self.dflashDraftQuantActivationBits = s.dflashDraftQuantActivationBits.map(String.init) ?? ""
+                    self.dflashDraftQuantGroupSize = s.dflashDraftQuantGroupSize.map(String.init) ?? ""
                     self.dflashMaxCtx = s.dflashMaxCtx.map(String.init) ?? ""
+                    self.dflashVerifyMode = s.dflashVerifyMode ?? ""
+                    self.dflashDraftWindowSize = s.dflashDraftWindowSize.map(String.init) ?? ""
+                    self.dflashDraftSinkSize = s.dflashDraftSinkSize.map(String.init) ?? ""
                     self.dflashInMemoryCache = s.dflashInMemoryCache ?? false
                     self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s.dflashInMemoryCacheMaxBytes)
                         .map(String.init) ?? "8"
+                    self.dflashInMemoryCacheMaxEntries = s.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
                     self.dflashSsdCache = s.dflashSsdCache ?? false
+                    self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s.dflashSsdCacheMaxBytes)
+                        .map(String.init) ?? "20"
                     self.mtpEnabled = s.mtpEnabled ?? false
                     self.activeProfileName = s.activeProfileName
                 }
@@ -1622,8 +1765,23 @@ final class ModelSettingsScreenVM: ObservableObject {
         case .specprefillThreshold:    patch.specprefillThreshold = Int(specprefillThreshold)
         case .dflashEnabled:           patch.dflashEnabled = dflashEnabled
         case .dflashDraftModel:        patch.dflashDraftModel = dflashDraftModel.isEmpty ? nil : dflashDraftModel
-        case .dflashDraftQuantBits:    patch.dflashDraftQuantBits = Int(dflashDraftQuantBits)
+        case .dflashDraftQuantEnabled:
+            patch.dflashDraftQuantEnabled = dflashDraftQuantEnabled
+            if !dflashDraftQuantEnabled {
+                patch.dflashDraftQuantWeightBits = nil
+                patch.dflashDraftQuantActivationBits = nil
+                patch.dflashDraftQuantGroupSize = nil
+            }
+        case .dflashDraftQuantWeightBits:
+            patch.dflashDraftQuantWeightBits = Int(dflashDraftQuantWeightBits)
+        case .dflashDraftQuantActivationBits:
+            patch.dflashDraftQuantActivationBits = Int(dflashDraftQuantActivationBits)
+        case .dflashDraftQuantGroupSize:
+            patch.dflashDraftQuantGroupSize = Int(dflashDraftQuantGroupSize)
         case .dflashMaxCtx:            patch.dflashMaxCtx = Int(dflashMaxCtx)
+        case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
+        case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
+        case .dflashDraftSinkSize:     patch.dflashDraftSinkSize = Int(dflashDraftSinkSize)
         case .dflashInMemoryCache:
             patch.dflashInMemoryCache = dflashInMemoryCache
             if !dflashInMemoryCache {
@@ -1634,7 +1792,11 @@ final class ModelSettingsScreenVM: ObservableObject {
             }
         case .dflashInMemoryCacheGib:
             patch.dflashInMemoryCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib))
+        case .dflashInMemoryCacheMaxEntries:
+            patch.dflashInMemoryCacheMaxEntries = Int(dflashInMemoryCacheMaxEntries)
         case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
+        case .dflashSsdCacheGib:
+            patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
         case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
         }
         do {
@@ -1779,13 +1941,29 @@ final class ModelSettingsScreenVM: ObservableObject {
         putBool(ProfileSettingsKey.dflashEnabled, dflashEnabled)
         if dflashEnabled {
             putString(ProfileSettingsKey.dflashDraftModel, dflashDraftModel)
-            putInt(ProfileSettingsKey.dflashDraftQuantBits, dflashDraftQuantBits)
+            putBool(ProfileSettingsKey.dflashDraftQuantEnabled, dflashDraftQuantEnabled)
+            if dflashDraftQuantEnabled {
+                putInt(ProfileSettingsKey.dflashDraftQuantWeightBits, dflashDraftQuantWeightBits)
+                putInt(ProfileSettingsKey.dflashDraftQuantActivationBits, dflashDraftQuantActivationBits)
+                putInt(ProfileSettingsKey.dflashDraftQuantGroupSize, dflashDraftQuantGroupSize)
+            }
             putInt(ProfileSettingsKey.dflashMaxCtx, dflashMaxCtx)
+            if !dflashVerifyMode.isEmpty {
+                out[ProfileSettingsKey.dflashVerifyMode] = AnyCodable(dflashVerifyMode)
+            }
+            putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
+            putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
             putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
-            if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
-                out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+            if dflashInMemoryCache {
+                if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
+                    out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+                }
+                putInt(ProfileSettingsKey.dflashInMemoryCacheMaxEntries, dflashInMemoryCacheMaxEntries)
             }
             putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
+            if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
+                out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
+            }
         }
         putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
 

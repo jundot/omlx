@@ -77,11 +77,19 @@ struct ModelSettingsSnapshot: Equatable {
     var specprefillThreshold: String
     var dflashEnabled: Bool
     var dflashDraftModel: String
-    var dflashDraftQuantBits: String
+    var dflashDraftQuantEnabled: Bool
+    var dflashDraftQuantWeightBits: String
+    var dflashDraftQuantActivationBits: String
+    var dflashDraftQuantGroupSize: String
     var dflashMaxCtx: String
+    var dflashVerifyMode: String
+    var dflashDraftWindowSize: String
+    var dflashDraftSinkSize: String
     var dflashInMemoryCache: Bool
     var dflashInMemoryCacheGib: String
+    var dflashInMemoryCacheMaxEntries: String
     var dflashSsdCache: Bool
+    var dflashSsdCacheGib: String
     var mtpEnabled: Bool
 }
 
@@ -128,11 +136,19 @@ enum ProfileSettingsKey {
     static let specprefillThreshold = "specprefill_threshold"
     static let dflashEnabled = "dflash_enabled"
     static let dflashDraftModel = "dflash_draft_model"
-    static let dflashDraftQuantBits = "dflash_draft_quant_bits"
+    static let dflashDraftQuantEnabled = "dflash_draft_quant_enabled"
+    static let dflashDraftQuantWeightBits = "dflash_draft_quant_weight_bits"
+    static let dflashDraftQuantActivationBits = "dflash_draft_quant_activation_bits"
+    static let dflashDraftQuantGroupSize = "dflash_draft_quant_group_size"
     static let dflashMaxCtx = "dflash_max_ctx"
+    static let dflashVerifyMode = "dflash_verify_mode"
+    static let dflashDraftWindowSize = "dflash_draft_window_size"
+    static let dflashDraftSinkSize = "dflash_draft_sink_size"
     static let dflashInMemoryCache = "dflash_in_memory_cache"
     static let dflashInMemoryCacheMaxBytes = "dflash_in_memory_cache_max_bytes"
+    static let dflashInMemoryCacheMaxEntries = "dflash_in_memory_cache_max_entries"
     static let dflashSsdCache = "dflash_ssd_cache"
+    static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
     static let mtpEnabled = "mtp_enabled"
 }
 
