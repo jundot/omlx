@@ -581,7 +581,7 @@ class TestModelsStatusEndpoint:
             max_tokens = 8192
 
         class SettingsManager:
-            def get_settings(self, model_id):
+            def get_settings(self, model_id, profile_name=None):
                 return Settings()
 
         original_settings_manager = _server_state.settings_manager

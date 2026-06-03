@@ -509,7 +509,7 @@ class TestGetMaxContextWindow:
     def _mount_settings(self, overrides: dict):
         """Mount a settings_manager that returns the given per-model overrides."""
         manager = MagicMock()
-        manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        manager.get_settings.side_effect = lambda mid, profile_name=None: overrides.get(mid)
         self._state.settings_manager = manager
 
     def test_global_default_when_nothing_discovered(self):
