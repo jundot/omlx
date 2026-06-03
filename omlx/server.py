@@ -207,7 +207,19 @@ class EngineType(Enum):
 class SamplingDefaults:
     """Default sampling parameters."""
 
+    # Fallback context length used by ``get_max_context_window`` only
+    # when neither a per-model override nor a model-config-discovered
+    # native context length is available. Setting this does NOT cap
+    # models that declare their own context — use
+    # ``max_context_window_policy`` for the operator-policy cap.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, models whose native
+    # context length is discovered get ``min(native, policy)``. Per-model
+    # overrides and the fallback default above are not affected — those
+    # represent explicit choices that the policy cannot override
+    # without surprising migration semantics for existing
+    # ``settings.json`` files.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -1148,14 +1160,25 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority (#1308):
-        1. Explicit per-model setting (admin UI / settings.json override).
-        2. Context length discovered from the model's ``config.json`` at
-           server startup (``max_position_embeddings`` etc.); without
-           this tier the server would advertise the 32 K global default
-           even for models that declare 256 K+ natively.
-        3. Global default from ``SamplingConfig`` — last-resort fallback
-           for models whose config files don't expose a context length.
+    Resolution:
+        1. **Per-model override** (admin UI / settings.json) — always
+           wins. An operator who has set a per-model number knows what
+           they want; ``max_context_window_policy`` does not clamp it.
+        2. **Model-config-discovered native context length** (#1308),
+           optionally clamped by the operator policy: if
+           ``sampling.max_context_window_policy`` is set, return
+           ``min(native, policy)``; otherwise return ``native`` as-is.
+        3. **Fallback default** from ``SamplingSettings.max_context_window``
+           — only used when neither tier 1 nor tier 2 yields a value.
+           Treated as a default, NOT capped by the policy; existing
+           ``settings.json`` files carrying the historical ``32768``
+           default keep working unchanged after upgrade.
+
+    The policy field is intentionally nullable and unset by default so
+    no existing install behavior shifts. Setting it engages
+    ``min(native, policy)`` across every model whose native context is
+    discoverable; per-model overrides remain the operator's escape
+    hatch for individual models that should exceed the policy.
 
     Returns:
         Max context window token count, or ``None`` if no tier resolves
@@ -1169,15 +1192,25 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
 
+    # Priority 2: model-native context, optionally clamped by policy
     pool = _server_state.engine_pool
     if model_id and pool is not None:
         entry = pool.get_entry(model_id)
         if entry is not None and entry.model_context_length is not None:
-            return entry.model_context_length
+            native = entry.model_context_length
+            policy = getattr(
+                _server_state.sampling, "max_context_window_policy", None
+            )
+            if policy is not None and policy > 0:
+                return min(native, policy)
+            return native
 
+    # Priority 3: fallback default (not capped — preserves legacy
+    # settings.json behavior).
     return _server_state.sampling.max_context_window
 
 
@@ -1312,6 +1345,9 @@ def init_server(
     if global_settings and global_settings.sampling:
         _server_state.sampling = SamplingDefaults(
             max_context_window=global_settings.sampling.max_context_window,
+            max_context_window_policy=getattr(
+                global_settings.sampling, "max_context_window_policy", None
+            ),
             max_tokens=global_settings.sampling.max_tokens,
             temperature=global_settings.sampling.temperature,
             top_p=global_settings.sampling.top_p,

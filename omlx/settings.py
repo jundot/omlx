@@ -511,7 +511,18 @@ class NetworkSettings:
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
+    # Fallback context length used by ``server.get_max_context_window``
+    # only when neither a per-model override nor a model-config
+    # discovered native context length is available. Default kept at
+    # 32768 so existing ``settings.json`` files carrying the historical
+    # default keep working unchanged after upgrade.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, the server returns
+    # ``min(native_context, max_context_window_policy)`` for models
+    # whose native context length is discovered. Unset (None) by
+    # default so no install behavior changes implicitly. Per-model
+    # overrides and the fallback default above are not affected.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -522,6 +533,7 @@ class SamplingSettings:
         """Convert to dictionary."""
         return {
             "max_context_window": self.max_context_window,
+            "max_context_window_policy": self.max_context_window_policy,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -534,6 +546,9 @@ class SamplingSettings:
         """Create from dictionary."""
         return cls(
             max_context_window=data.get("max_context_window", 32768),
+            max_context_window_policy=data.get(
+                "max_context_window_policy", None
+            ),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),

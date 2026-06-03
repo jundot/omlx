@@ -513,7 +513,13 @@ class TestGetMaxContextWindow:
         self._state.settings_manager = manager
 
     def test_global_default_when_nothing_discovered(self):
-        """No model context, no per-model override → global default."""
+        """No model context, no per-model override → global default.
+
+        Fallback default kept at 32768 so existing ``settings.json``
+        files carrying the historical default keep working unchanged.
+        Operators who want a real server-wide cap set
+        ``max_context_window_policy`` instead — see TestPolicyCap below.
+        """
         self._mount_pool({"llama-3": self._entry("llama-3", None)})
         assert get_max_context_window("llama-3") == 32768
 
