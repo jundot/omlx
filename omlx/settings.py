@@ -108,6 +108,7 @@ class ServerSettings:
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
     server_aliases: list[str] = field(default_factory=list)
     sse_keepalive_mode: str = "chunk"
+    auto_start_on_launch: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -117,12 +118,13 @@ class ServerSettings:
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=data.get("host", data.get("bind_address", "127.0.0.1")),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
             server_aliases=data.get("server_aliases", []),
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
+            auto_start_on_launch=data.get("auto_start_on_launch", True),
         )
 
 
@@ -275,12 +277,16 @@ class CacheSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CacheSettings:
         """Create from dictionary."""
+        hot_cache_max_size = data.get("hot_cache_max_size", "0")
+        if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
+            hot_cache_max_size = "0"
+
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
-            hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -293,7 +299,9 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 class MemorySettings:
     """Process-level memory enforcement settings."""
 
-    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
+    prefill_memory_guard: bool = (
+        True  # Memory guard: prefill estimation + generation scheduling defer
+    )
     # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
     # or, for "custom", lets the user pin the dynamic ceiling to a fixed
     # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
@@ -337,12 +345,8 @@ class MemorySettings:
             ),
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
-            prefill_safe_zone_ratio=float(
-                data.get("prefill_safe_zone_ratio", 0.80)
-            ),
-            prefill_min_chunk_tokens=int(
-                data.get("prefill_min_chunk_tokens", 32)
-            ),
+            prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
+            prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
         )
 
 
@@ -415,9 +419,7 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
-            sub_keys=[
-                SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
-            ],
+            sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
 
@@ -442,15 +444,22 @@ class HuggingFaceSettings:
     """HuggingFace Hub configuration settings."""
 
     endpoint: str = ""  # Empty string = use HF default (https://huggingface.co)
+    hf_cache_enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"endpoint": self.endpoint}
+        return {
+            "endpoint": self.endpoint,
+            "hf_cache_enabled": self.hf_cache_enabled,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HuggingFaceSettings:
         """Create from dictionary."""
-        return cls(endpoint=data.get("endpoint", ""))
+        return cls(
+            endpoint=data.get("endpoint", ""),
+            hf_cache_enabled=data.get("hf_cache_enabled", True),
+        )
 
 
 @dataclass
@@ -689,7 +698,9 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
-    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(
+        default_factory=ModelIdleTimeoutSettings
+    )
 
     @classmethod
     def load(
@@ -778,13 +789,13 @@ class GlobalSettings:
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
             if "integrations" in data:
-                self.integrations = IntegrationSettings.from_dict(
-                    data["integrations"]
-                )
+                self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
             if "idle_timeout" in data:
-                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
+                    data["idle_timeout"]
+                )
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -856,6 +867,13 @@ class GlobalSettings:
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
+        if hf_cache_enabled := os.getenv("OMLX_HF_CACHE_ENABLED"):
+            self.huggingface.hf_cache_enabled = hf_cache_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         # ModelScope settings
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
@@ -914,6 +932,13 @@ class GlobalSettings:
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
 
+        # Memory guard settings
+        if hasattr(args, "memory_guard") and args.memory_guard is not None:
+            self.memory.memory_guard_tier = args.memory_guard
+        if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
+            self.memory.memory_guard_tier = "custom"
+            self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
             self.cache.enabled = args.cache_enabled
@@ -938,6 +963,8 @@ class GlobalSettings:
         # HuggingFace settings
         if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
             self.huggingface.endpoint = args.hf_endpoint
+        if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
+            self.huggingface.hf_cache_enabled = args.hf_cache_enabled
 
         # ModelScope settings
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
@@ -952,6 +979,45 @@ class GlobalSettings:
             self.network.no_proxy = args.no_proxy
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
+
+    def get_hf_cache_dir(self) -> Path:
+        """Return the standard HuggingFace Hub cache directory."""
+        if hf_hub_cache := os.getenv("HF_HUB_CACHE"):
+            return Path(hf_hub_cache).expanduser().resolve()
+        if hf_home := os.getenv("HF_HOME"):
+            return (Path(hf_home).expanduser() / "hub").resolve()
+        return (Path.home() / ".cache" / "huggingface" / "hub").resolve()
+
+    def get_effective_model_dirs(
+        self, model_dirs: list[str] | None = None
+    ) -> list[Path]:
+        """Return model directories in discovery order, including HF cache."""
+        if model_dirs is None:
+            configured = self.model.get_model_dirs(self.base_path)
+        elif model_dirs:
+            configured = [Path(d).expanduser().resolve() for d in model_dirs]
+        else:
+            configured = [self.base_path / "models"]
+        effective: list[Path] = []
+        seen: set[Path] = set()
+
+        def add(path: Path, *, require_exists: bool = False) -> None:
+            resolved = path.expanduser().resolve()
+            if require_exists and not resolved.exists():
+                return
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            effective.append(resolved)
+
+        if configured:
+            add(configured[0])
+        if self.huggingface.hf_cache_enabled:
+            add(self.get_hf_cache_dir(), require_exists=True)
+        for directory in configured[1:]:
+            add(directory)
+
+        return effective
 
     def save(self) -> None:
         """Save current settings to the settings file."""
@@ -988,6 +1054,8 @@ class GlobalSettings:
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
+        from .model_discovery import model_directory_access_error
+
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
@@ -1007,17 +1075,22 @@ class GlobalSettings:
         # Model directories - skip unavailable paths (e.g. disconnected external drive)
         valid_dirs = []
         for directory in self.model.get_model_dirs(self.base_path):
-            if directory.exists():
-                valid_dirs.append(str(directory))
+            if not directory.exists():
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    logger.debug(f"Created directory: {directory}")
+                except OSError as e:
+                    logger.warning(
+                        f"Model directory unavailable, skipping: {directory} ({e})"
+                    )
+                    continue
+
+            access_error = model_directory_access_error(directory)
+            if access_error is not None:
+                logger.warning(f"Model directory unavailable, skipping: {access_error}")
                 continue
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"Created directory: {directory}")
-                valid_dirs.append(str(directory))
-            except OSError as e:
-                logger.warning(
-                    f"Model directory unavailable, skipping: {directory} ({e})"
-                )
+
+            valid_dirs.append(str(directory))
 
         # Update model_dirs to only include valid paths
         self.model.model_dirs = valid_dirs
@@ -1034,9 +1107,7 @@ class GlobalSettings:
 
         # Server validation
         if not 1 <= self.server.port <= 65535:
-            errors.append(
-                f"Invalid port: {self.server.port} (must be 1-65535)"
-            )
+            errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
 
         valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
@@ -1100,6 +1171,19 @@ class GlobalSettings:
                     errors.append("ssd_cache_max_size must be positive")
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
+
+        try:
+            hot_cache_size = parse_size(self.cache.hot_cache_max_size)
+            if hot_cache_size < 0:
+                errors.append("hot_cache_max_size must be non-negative")
+        except ValueError as e:
+            if self.cache.hot_cache_max_size.strip().lower() == "auto":
+                errors.append(
+                    "Invalid hot_cache_max_size: 'auto' is not supported; "
+                    "use '0' to disable or a size like '8GB'"
+                )
+            else:
+                errors.append(f"Invalid hot_cache_max_size: {e}")
 
         if self.cache.initial_cache_blocks <= 0:
             errors.append(
@@ -1187,7 +1271,9 @@ class GlobalSettings:
         # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
-        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        ssd_dir = (
+            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        )
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
@@ -1197,7 +1283,9 @@ class GlobalSettings:
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
-            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
+                self.base_path
+            ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
@@ -1241,9 +1329,7 @@ def get_settings() -> GlobalSettings:
     """
     global _global_settings
     if _global_settings is None:
-        raise RuntimeError(
-            "Settings not initialized. Call init_settings() first."
-        )
+        raise RuntimeError("Settings not initialized. Call init_settings() first.")
     return _global_settings
 
 

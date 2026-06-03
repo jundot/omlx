@@ -261,6 +261,29 @@ class TestUpdateGlobalSettingsAliases:
         assert gs.server.server_aliases == []
 
 
+class TestUpdateGlobalSettingsHotCache:
+    """update_global_settings: validate hot cache size before runtime apply."""
+
+    def test_rejects_hot_cache_auto_with_400(self):
+        gs = _make_global_settings()
+        gs.cache.enabled = True
+        gs.cache.hot_cache_max_size = "0"
+        request = GlobalSettingsRequest(cache_enabled=False, hot_cache_max_size="auto")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "hot_cache_max_size" in exc_info.value.detail
+        assert "auto" in exc_info.value.detail
+        assert gs.cache.enabled is True
+        assert gs.cache.hot_cache_max_size == "0"
+        gs.save.assert_not_called()
+
+
 class TestUpdateGlobalSettingsEmbeddingBatchSize:
     """update_global_settings: saving and hot-applying embedding batch size."""
 

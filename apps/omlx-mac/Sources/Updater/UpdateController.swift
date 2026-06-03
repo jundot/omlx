@@ -1,8 +1,8 @@
 // Updates section view-model.
 //
 // Drives the AppView's Status screen: the check state (idle / checking /
-// available), the channel (Stable / Beta / Nightly), and two background
-// prefs (autoCheck + autoDownload). Channel + prefs persist to
+// available), the channel (Stable / Release Candidate / Dev), and two background
+// prefs (autoCheck + autoNotify). Channel + prefs persist to
 // `~/Library/Application Support/oMLX/update-prefs.json` so they survive
 // a relaunch.
 //
@@ -15,7 +15,10 @@ import AppKit
 import Foundation
 
 enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
-    case stable, beta, nightly
+    case stable
+    case releaseCandidate = "release_candidate"
+    case dev
+
     var id: String { rawValue }
 
     var displayName: String {
@@ -24,28 +27,51 @@ enum UpdateChannel: String, Codable, CaseIterable, Identifiable, Sendable {
             return String(localized: "update.channel.stable",
                           defaultValue: "Stable",
                           comment: "Display name for the Stable update channel")
-        case .beta:
-            return String(localized: "update.channel.beta",
-                          defaultValue: "Beta",
-                          comment: "Display name for the Beta update channel")
-        case .nightly:
-            return String(localized: "update.channel.nightly",
-                          defaultValue: "Nightly",
-                          comment: "Display name for the Nightly update channel")
+        case .releaseCandidate:
+            return String(localized: "update.channel.release_candidate",
+                          defaultValue: "Release Candidate",
+                          comment: "Display name for the Release Candidate update channel")
+        case .dev:
+            return String(localized: "update.channel.dev",
+                          defaultValue: "Dev",
+                          comment: "Display name for the Dev update channel")
         }
+    }
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "stable":
+            self = .stable
+        case "release_candidate", "beta":
+            self = .releaseCandidate
+        case "dev", "nightly":
+            self = .dev
+        default:
+            self = .stable
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 }
 
-struct AvailableUpdate: Equatable, Sendable {
+struct AvailableUpdate: Equatable, Identifiable, Sendable {
     let version: String
     let sizeText: String?
     let notes: String
     let htmlURL: URL
     let dmgURL: URL?
+
+    var id: String { version }
 }
 
 @MainActor
 final class UpdateController: ObservableObject {
+    static let stateDidChangeNotification = Notification.Name("OMLXUpdateControllerStateDidChange")
+
     enum CheckState: Equatable, Sendable {
         case idle(lastChecked: Date?)
         case checking
@@ -54,10 +80,22 @@ final class UpdateController: ObservableObject {
         case ready(AvailableUpdate)
     }
 
-    @Published private(set) var state: CheckState = .idle(lastChecked: nil)
+    @Published private(set) var state: CheckState = .idle(lastChecked: nil) {
+        didSet {
+            NotificationCenter.default.post(
+                name: Self.stateDidChangeNotification,
+                object: self
+            )
+        }
+    }
     @Published private(set) var lastError: String?
+    @Published private(set) var confirmationUpdate: AvailableUpdate?
     @Published var channel: UpdateChannel {
-        didSet { if !suspendPersist { persist() } }
+        didSet {
+            guard !suspendPersist else { return }
+            persist()
+            checkForUpdates()
+        }
     }
     @Published var autoCheck: Bool {
         didSet {
@@ -72,7 +110,7 @@ final class UpdateController: ObservableObject {
             }
         }
     }
-    @Published var autoDownload: Bool {
+    @Published var autoNotify: Bool {
         didSet { if !suspendPersist { persist() } }
     }
 
@@ -82,6 +120,9 @@ final class UpdateController: ObservableObject {
     private var checkTask: Task<Void, Never>?
     private var updater: AppUpdater?
     private var backgroundTimer: Timer?
+    private var terminateForUpdate: (@MainActor () -> Void)?
+    private var presentUpdateConfirmation: (@MainActor () -> Void)?
+    private var deferredPromptVersion: String?
 
     init(
         storeURL: URL = AppConfig.appSupportURL().appendingPathComponent("update-prefs.json"),
@@ -90,11 +131,12 @@ final class UpdateController: ObservableObject {
         self.storeURL = storeURL
         self.currentVersion = currentVersion
         let prefs = Self.readPrefs(from: storeURL) ?? Prefs(
-            channel: .stable, autoCheck: true, autoDownload: false
+            channel: .stable, autoCheck: true, autoNotify: false
         )
         self.channel = prefs.channel
         self.autoCheck = prefs.autoCheck
-        self.autoDownload = prefs.autoDownload
+        self.autoNotify = prefs.autoNotify
+        self.deferredPromptVersion = prefs.deferredPromptVersion
         self.suspendPersist = false
     }
 
@@ -109,6 +151,14 @@ final class UpdateController: ObservableObject {
         }
     }
 
+    func setTerminateForUpdate(_ handler: @escaping @MainActor () -> Void) {
+        self.terminateForUpdate = handler
+    }
+
+    func setPresentUpdateConfirmation(_ handler: @escaping @MainActor () -> Void) {
+        self.presentUpdateConfirmation = handler
+    }
+
     /// User-initiated check.
     func checkForUpdates() {
         checkTask?.cancel()
@@ -120,22 +170,55 @@ final class UpdateController: ObservableObject {
         }
     }
 
-    /// One-button "Install & Restart" — matches the PyObjC menubar's
-    /// flow. When the state is `.available`, kick off the download and
-    /// auto-finish into `.ready`, then swap + terminate from the
-    /// `onReady` callback below. When the state is already `.ready`
-    /// (auto-download completed in the background), swap immediately.
-    func installAndRestart() {
+    func requestUpdateConfirmation() {
         switch state {
         case .available(let info):
+            guard info.dmgURL != nil else {
+                lastError = noInstallableDMGMessage
+                return
+            }
+            presentConfirmation(for: info, automatic: false)
+        case .ready(let info):
+            presentConfirmation(for: info, automatic: false)
+        default:
+            break
+        }
+    }
+
+    func dismissUpdateConfirmation() {
+        confirmationUpdate = nil
+    }
+
+    func deferUpdate(_ info: AvailableUpdate) {
+        deferredPromptVersion = info.version
+        persist()
+        confirmationUpdate = nil
+    }
+
+    func confirmUpdate(_ info: AvailableUpdate) {
+        confirmationUpdate = nil
+        installAndRestart(matchingVersion: info.version)
+    }
+
+    /// One-button "Install & Restart". When the state is `.available`, kick
+    /// off the download and auto-finish into `.ready`, then swap + terminate
+    /// from the `onReady` callback below. When the state is already `.ready`,
+    /// swap immediately.
+    func installAndRestart() {
+        installAndRestart(matchingVersion: nil)
+    }
+
+    private func installAndRestart(matchingVersion: String?) {
+        switch state {
+        case .available(let info):
+            guard matchingVersion == nil || matchingVersion == info.version else { return }
             guard let dmg = info.dmgURL else {
-                lastError = String(localized: "update.error.no_dmg",
-                                   defaultValue: "No installable DMG was attached to this release.",
-                                   comment: "Shown when the release has no matching DMG asset")
+                lastError = noInstallableDMGMessage
                 return
             }
             startDownload(info: info, dmgURL: dmg, autoInstall: true)
-        case .ready:
+        case .ready(let info):
+            guard matchingVersion == nil || matchingVersion == info.version else { return }
             performSwap()
         default:
             break
@@ -144,7 +227,11 @@ final class UpdateController: ObservableObject {
 
     private func performSwap() {
         if AppUpdater.performSwapAndRelaunch() {
-            NSApp.terminate(nil)
+            if let terminateForUpdate {
+                terminateForUpdate()
+            } else {
+                NSApp.terminate(nil)
+            }
         } else {
             lastError = String(localized: "update.error.swap_failed",
                                defaultValue: "Could not find the staged update. Try downloading again.",
@@ -190,8 +277,14 @@ final class UpdateController: ObservableObject {
                         dmgURL: release.dmgURL
                     )
                     self.state = .available(info)
-                    if self.autoDownload, let dmg = info.dmgURL, !userInitiated {
-                        self.startDownload(info: info, dmgURL: dmg, autoInstall: false)
+                    if userInitiated {
+                        if info.dmgURL == nil {
+                            self.lastError = self.noInstallableDMGMessage
+                        } else {
+                            self.presentConfirmation(for: info, automatic: false)
+                        }
+                    } else if self.autoNotify, info.dmgURL != nil {
+                        self.presentConfirmation(for: info, automatic: true)
                     }
                 } else {
                     self.state = .idle(lastChecked: Date())
@@ -246,12 +339,66 @@ final class UpdateController: ObservableObject {
         updater.start()
     }
 
+    private func presentConfirmation(for info: AvailableUpdate, automatic: Bool) {
+        if automatic, deferredPromptVersion == info.version {
+            return
+        }
+        lastError = nil
+        confirmationUpdate = info
+        presentUpdateConfirmation?()
+    }
+
+    private var noInstallableDMGMessage: String {
+        String(localized: "update.error.no_dmg",
+               defaultValue: "No installable DMG was attached to this release.",
+               comment: "Shown when the release has no matching DMG asset")
+    }
+
     // MARK: - Persistence
 
     private struct Prefs: Codable {
         var channel: UpdateChannel
         var autoCheck: Bool
-        var autoDownload: Bool
+        var autoNotify: Bool
+        var deferredPromptVersion: String?
+
+        enum CodingKeys: String, CodingKey {
+            case channel
+            case autoCheck
+            case autoNotify
+            case autoDownload
+            case deferredPromptVersion
+        }
+
+        init(
+            channel: UpdateChannel,
+            autoCheck: Bool,
+            autoNotify: Bool,
+            deferredPromptVersion: String? = nil
+        ) {
+            self.channel = channel
+            self.autoCheck = autoCheck
+            self.autoNotify = autoNotify
+            self.deferredPromptVersion = deferredPromptVersion
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.channel = try container.decodeIfPresent(UpdateChannel.self, forKey: .channel) ?? .stable
+            self.autoCheck = try container.decodeIfPresent(Bool.self, forKey: .autoCheck) ?? true
+            self.autoNotify = try container.decodeIfPresent(Bool.self, forKey: .autoNotify)
+                ?? container.decodeIfPresent(Bool.self, forKey: .autoDownload)
+                ?? false
+            self.deferredPromptVersion = try container.decodeIfPresent(String.self, forKey: .deferredPromptVersion)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(channel, forKey: .channel)
+            try container.encode(autoCheck, forKey: .autoCheck)
+            try container.encode(autoNotify, forKey: .autoNotify)
+            try container.encodeIfPresent(deferredPromptVersion, forKey: .deferredPromptVersion)
+        }
     }
 
     private static func readPrefs(from url: URL) -> Prefs? {
@@ -263,9 +410,14 @@ final class UpdateController: ObservableObject {
         let prefs = Prefs(
             channel: channel,
             autoCheck: autoCheck,
-            autoDownload: autoDownload
+            autoNotify: autoNotify,
+            deferredPromptVersion: deferredPromptVersion
         )
         guard let data = try? JSONEncoder().encode(prefs) else { return }
+        try? FileManager.default.createDirectory(
+            at: storeURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try? data.write(to: storeURL, options: [.atomic])
     }
 }

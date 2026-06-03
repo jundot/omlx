@@ -271,16 +271,17 @@ final class WelcomeViewModel: ObservableObject {
                              as NSString).expandingTildeInPath as NSString)
             .standardizingPath
         var config = services.config
-        config.host = "127.0.0.1"
+        config.bindAddress = "127.0.0.1"
         config.basePath = resolvedBase
         config.port = port
         // modelDir is always a literal path. The wizard's "Reset" button
         // clears the field — interpret that as "use the default for the
         // basePath I just picked" rather than persisting an empty string.
         let trimmedDir = modelDir.trimmingCharacters(in: .whitespaces)
-        config.modelDir = trimmedDir.isEmpty
+        let resolvedModelDir = trimmedDir.isEmpty
             ? AppConfig.defaultModelDir(forBasePath: resolvedBase)
             : trimmedDir
+        config.setModelDirs([resolvedModelDir])
         // hf_endpoint is set later from Downloads → "HF Mirror" — we don't
         // touch the existing value here so a returning user's mirror choice
         // survives a re-entry into the wizard.
@@ -325,7 +326,7 @@ final class WelcomeViewModel: ObservableObject {
                 let runtime = try PythonRuntime.resolve()
                 proc = ServerProcess(
                     runtime: runtime,
-                    host: config.host,
+                    bindAddress: config.bindAddress,
                     port: config.port,
                     basePath: URL(fileURLWithPath: config.basePath, isDirectory: true)
                 )
@@ -383,9 +384,7 @@ final class WelcomeViewModel: ObservableObject {
     @discardableResult
     func openWebDashboard() -> Bool {
         guard let services else { return false }
-        let port = services.config.port
-        let host = services.config.host
-        guard let url = URL(string: "http://\(host):\(port)/admin/dashboard") else {
+        guard let url = URL(string: "http://\(services.config.host):\(services.config.port)/admin/dashboard") else {
             return false
         }
         NSWorkspace.shared.open(url)

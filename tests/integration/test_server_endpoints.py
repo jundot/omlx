@@ -794,6 +794,114 @@ class TestChatCompletionEndpoint:
         assert message["tool_calls"][0]["function"]["arguments"] == '{"city": "SF"}'
         assert data["choices"][0]["finish_reason"] == "tool_calls"
 
+    @pytest.mark.parametrize(
+        ("tool_choice", "request_tools", "expect_tools"),
+        [
+            (None, None, True),
+            ("auto", None, True),
+            ("none", None, False),
+            (
+                "none",
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "user_search",
+                            "description": "Search from request tools",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+                False,
+            ),
+        ],
+    )
+    def test_chat_completion_tool_choice_controls_mcp_tools(
+        self,
+        client,
+        mock_llm_engine,
+        tool_choice,
+        request_tools,
+        expect_tools,
+    ):
+        """tool_choice='none' should suppress request and globally configured tools."""
+        from omlx.server import _server_state
+
+        class RecordingMCPManager:
+            def __init__(self):
+                self.calls = []
+
+            def get_merged_tools(self, user_tools=None):
+                self.calls.append(user_tools)
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_search",
+                            "description": "Search via MCP",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ]
+
+        recorded_count_tools = []
+        recorded_chat_kwargs = []
+
+        def count_chat_tokens(messages, tools=None, **kwargs):
+            recorded_count_tools.append(tools)
+            return 1
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = RecordingMCPManager()
+        mock_llm_engine.count_chat_tokens = count_chat_tokens
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if request_tools is not None:
+            payload["tools"] = request_tools
+
+        try:
+            _server_state.mcp_manager = manager
+            response = client.post("/v1/chat/completions", json=payload)
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+
+        if expect_tools:
+            assert manager.calls == [request_tools]
+            assert recorded_count_tools[0] is not None
+            assert "tools" in recorded_chat_kwargs[0]
+        else:
+            assert manager.calls == []
+            assert recorded_count_tools == [None]
+            assert "tools" not in recorded_chat_kwargs[0]
+
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""

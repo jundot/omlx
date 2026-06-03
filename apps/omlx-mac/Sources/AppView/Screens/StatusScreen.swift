@@ -3,7 +3,7 @@
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
-//   • Updates — release check status + auto-check/auto-download prefs
+//   • Updates — release check status + auto-check/auto-notify prefs
 //   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
@@ -636,6 +636,23 @@ private struct UpdatesSection: View {
                 }
             }
             Row(
+                label: String(localized: "status.updates.channel",
+                              defaultValue: "Update Channel",
+                              comment: "Row label for selecting the app update channel"),
+                sublabel: String(localized: "status.updates.channel.sub",
+                                 defaultValue: "Stable, release candidate, or dev builds",
+                                 comment: "Sublabel for the update channel picker")
+            ) {
+                Popup(
+                    selection: Binding(
+                        get: { updates.channel },
+                        set: { updates.channel = $0 }
+                    ),
+                    width: 190,
+                    options: UpdateChannel.allCases.map { ($0, $0.displayName) }
+                )
+            }
+            Row(
                 label: String(localized: "status.updates.auto_check",
                               defaultValue: "Automatically Check",
                               comment: "Row label for the auto-check updates toggle"),
@@ -652,16 +669,16 @@ private struct UpdatesSection: View {
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
-                              defaultValue: "Auto-download Updates",
-                              comment: "Row label for the auto-download updates toggle"),
+                              defaultValue: "Notify About Updates",
+                              comment: "Row label for the automatic update notification toggle"),
                 sublabel: String(localized: "status.updates.auto_download.sub",
-                                 defaultValue: "Download in the background, then show Install & Restart",
-                                 comment: "Sublabel for the auto-download toggle"),
+                                 defaultValue: "Show release notes before downloading in the background",
+                                 comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: Binding(
-                    get: { updates.autoDownload },
-                    set: { updates.autoDownload = $0 }
+                    get: { updates.autoNotify },
+                    set: { updates.autoNotify = $0 }
                 ))
                 .labelsHidden()
                 .toggleStyle(.switch)
@@ -691,9 +708,13 @@ private struct UpdatesSection: View {
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         case .idle:
-            Text(String(localized: "status.updates.up_to_date_primary",
-                        defaultValue: "oMLX is up to date",
-                        comment: "Primary update status line when no update is available"))
+            Text(updates.lastError == nil
+                 ? String(localized: "status.updates.up_to_date_primary",
+                          defaultValue: "oMLX is up to date",
+                          comment: "Primary update status line when no update is available")
+                 : String(localized: "status.updates.error_primary",
+                          defaultValue: "Update check failed",
+                          comment: "Primary update status line when checking for updates failed"))
                 .font(.omlxText(13, weight: .medium))
                 .foregroundStyle(theme.text)
         }
@@ -710,7 +731,7 @@ private struct UpdatesSection: View {
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
             Text(String(localized: "status.updates.available_secondary",
-                        defaultValue: "You have the current version · \(upd.sizeText ?? "—")",
+                        defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
                         comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
@@ -727,7 +748,7 @@ private struct UpdatesSection: View {
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         case .idle(let lastChecked):
-            Text(lastCheckedText(lastChecked))
+            Text(updates.lastError ?? lastCheckedText(lastChecked))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         }
@@ -738,9 +759,9 @@ private struct UpdatesSection: View {
         switch updates.state {
         case .available, .ready:
             Button(String(localized: "status.updates.install",
-                          defaultValue: "Install & Restart",
-                          comment: "Updates action button to install a downloaded update and restart")) {
-                updates.installAndRestart()
+                          defaultValue: "Review Update",
+                          comment: "Updates action button to review release notes before installing")) {
+                updates.requestUpdateConfirmation()
             }
                 .buttonStyle(.omlx(.primary, size: .small))
         case .downloading(let pct):

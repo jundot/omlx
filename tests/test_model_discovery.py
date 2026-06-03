@@ -18,6 +18,7 @@ from omlx.model_discovery import (
     discover_models_from_dirs,
     estimate_model_size,
     format_size,
+    model_directory_access_error,
 )
 
 
@@ -680,6 +681,45 @@ class TestDiscoverModels:
         with pytest.raises(ValueError, match="not a directory"):
             discover_models(file_path)
 
+    def test_unreadable_directory_is_skipped(self, tmp_path, monkeypatch):
+        """Test that unreadable model roots do not crash discovery."""
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == tmp_path:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        assert discover_models(tmp_path) == {}
+        assert "not readable" in model_directory_access_error(tmp_path)
+
+    def test_unreadable_directory_skipped_in_multi_dir_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        """Test that a readable directory still wins when another root is unreadable."""
+        unreadable = tmp_path / "unreadable"
+        unreadable.mkdir()
+        readable = tmp_path / "readable"
+        readable.mkdir()
+        model_dir = readable / "valid-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        models = discover_models_from_dirs([unreadable, readable])
+        assert list(models) == ["valid-model"]
+
     def test_model_with_weight_error_skipped(self, tmp_path):
         """Test that models with no weights are skipped."""
         # Model with config but no weights
@@ -1162,13 +1202,14 @@ class TestHfCacheDiscovery:
         (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
 
     def test_resolve_valid_entry(self, tmp_path):
-        """Valid HF cache entry resolves to snapshot path and model name."""
+        """Valid HF cache entry resolves to snapshot path and repo metadata."""
         entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B-4bit")
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
-        assert result[0] == snapshot
-        assert result[1] == "Qwen3-8B-4bit"
+        assert result.snapshot_path == snapshot
+        assert result.model_id == "mlx-community--Qwen3-8B-4bit"
+        assert result.source_repo_id == "mlx-community/Qwen3-8B-4bit"
 
     def test_resolve_regular_dir_returns_none(self, tmp_path):
         """Regular directory without models-- prefix returns None."""
@@ -1176,14 +1217,21 @@ class TestHfCacheDiscovery:
         regular.mkdir()
         assert _resolve_hf_cache_entry(regular) is None
 
-    def test_resolve_single_separator_returns_none(self, tmp_path):
-        """models--Name (no org separator) returns None."""
-        entry = tmp_path / "models--NoOrg"
-        entry.mkdir()
-        assert _resolve_hf_cache_entry(entry) is None
+    def test_resolve_unnamespaced_repo(self, tmp_path):
+        """models--Name (no org separator) is supported."""
+        entry, _ = self._make_hf_cache_entry(tmp_path, "", "gpt2")
+        entry.rename(tmp_path / "models--gpt2")
+        entry = tmp_path / "models--gpt2"
+        snapshot = entry / "snapshots" / self.FAKE_COMMIT
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result.snapshot_path == snapshot
+        assert result.model_id == "gpt2"
+        assert result.source_repo_id == "gpt2"
 
     def test_resolve_missing_refs_main_returns_none(self, tmp_path):
-        """Missing refs/main returns None."""
+        """Missing refs and snapshots returns None."""
         entry = tmp_path / "models--mlx-community--Qwen3-8B"
         entry.mkdir(parents=True)
         assert _resolve_hf_cache_entry(entry) is None
@@ -1204,7 +1252,7 @@ class TestHfCacheDiscovery:
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
-        assert result[0] == snapshot
+        assert result.snapshot_path == snapshot
 
     def test_discover_hf_cache_model(self, tmp_path):
         """HF cache entries are discovered as models."""
@@ -1212,8 +1260,13 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 1
-        assert "Qwen3-8B-4bit" in models
-        assert models["Qwen3-8B-4bit"].model_type == "llm"
+        assert "mlx-community--Qwen3-8B-4bit" in models
+        assert models["mlx-community--Qwen3-8B-4bit"].model_type == "llm"
+        assert models["mlx-community--Qwen3-8B-4bit"].source_type == "hf_cache"
+        assert (
+            models["mlx-community--Qwen3-8B-4bit"].source_repo_id
+            == "mlx-community/Qwen3-8B-4bit"
+        )
 
     def test_discover_multiple_hf_cache_models(self, tmp_path):
         """Multiple HF cache entries are all discovered."""
@@ -1222,15 +1275,15 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 2
-        assert "Qwen3-8B-4bit" in models
-        assert "Mistral-7B-v0.3" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models
+        assert "mlx-community--Mistral-7B-v0.3" in models
 
     def test_hf_cache_model_path_points_to_snapshot(self, tmp_path):
         """model_path points to the snapshot dir, not the cache entry."""
         self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
 
         models = discover_models(tmp_path)
-        assert models["Qwen3-8B-4bit"].model_path == str(
+        assert models["mlx-community--Qwen3-8B-4bit"].model_path == str(
             tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / self.FAKE_COMMIT
         )
 
@@ -1241,6 +1294,31 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_hf_cache_non_mlx_repo_skipped(self, tmp_path):
+        """HF cache entries without MLX metadata or repo-name hints are skipped."""
+        self._make_hf_cache_model(tmp_path, "acme", "PlainModel")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 0
+
+    def test_hf_cache_mlx_metadata_is_discovered(self, tmp_path):
+        """HF cache entries with safetensors format=mlx metadata are discovered."""
+        np = pytest.importorskip("numpy")
+        safetensors_numpy = pytest.importorskip("safetensors.numpy")
+
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "acme", "PlainModel")
+        (snapshot / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        safetensors_numpy.save_file(
+            {"weight": np.zeros((1,), dtype=np.float32)},
+            snapshot / "model.safetensors",
+            metadata={"format": "mlx"},
+        )
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "acme--PlainModel" in models
+        assert models["acme--PlainModel"].source_repo_id == "acme/PlainModel"
+
     def test_mixed_flat_and_hf_cache(self, tmp_path):
         """Mix of flat models and HF cache entries."""
         self._make_model(tmp_path / "mistral-7b")
@@ -1249,7 +1327,7 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 2
         assert "mistral-7b" in models
-        assert "Qwen3-8B-4bit" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models
 
     def test_mixed_org_and_hf_cache(self, tmp_path):
         """Mix of org folders and HF cache entries."""
@@ -1259,7 +1337,7 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 2
         assert "Qwen3-8B" in models
-        assert "Mistral-7B" in models
+        assert "mlx-community--Mistral-7B" in models
 
     def test_hf_cache_does_not_fall_through_to_org_scan(self, tmp_path):
         """HF cache entries don't get scanned as org folders."""
@@ -1267,4 +1345,4 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 1
-        assert "Qwen3-8B-4bit" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models

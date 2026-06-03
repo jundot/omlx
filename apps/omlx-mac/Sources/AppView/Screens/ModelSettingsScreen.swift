@@ -77,11 +77,16 @@ private struct Header: View {
         HStack(spacing: 12) {
             Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
             VStack(alignment: .leading, spacing: 2) {
-                Text(model?.settings?.displayName ?? model?.id ?? "—")
-                    .font(.omlxText(17, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Text(model?.settings?.displayName ?? model?.id ?? "—")
+                        .font(.omlxText(17, weight: .semibold))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let id = model?.id {
+                        CopyIconButton(value: id)
+                    }
+                }
                 if let m = model {
                     Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                         .font(.omlxMono(11))
@@ -90,6 +95,7 @@ private struct Header: View {
                         .truncationMode(.middle)
                 }
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             Button {
                 onBack()
@@ -785,14 +791,13 @@ private struct ChatTemplateKwargsEditor: View {
                     addMenu
                 }
             }
-            ForEach(Array(vm.chatTemplateEntries.enumerated()), id: \.element.id) { idx, entry in
-                let isLast = idx == vm.chatTemplateEntries.count - 1
+            ForEach(vm.chatTemplateEntries) { entry in
+                let isLast = entry.id == vm.chatTemplateEntries.last?.id
                 FreeRow(isLast: isLast) {
                     EntryEditor(
                         vm: vm,
                         client: client,
-                        index: idx,
-                        entry: entry
+                        entryID: entry.id
                     )
                 }
             }
@@ -835,15 +840,22 @@ private struct ChatTemplateKwargsEditor: View {
 private struct EntryEditor: View {
     @ObservedObject var vm: ModelSettingsScreenVM
     let client: OMLXClient
-    let index: Int
-    let entry: ChatTemplateKwargEntry
+    let entryID: UUID
 
     @Environment(\.omlxTheme) private var theme
 
+    private var entry: ChatTemplateKwargEntry {
+        vm.chatTemplateEntries.first { $0.id == entryID } ?? ChatTemplateKwargEntry(kind: .custom, value: "")
+    }
+
     private var binding: Binding<ChatTemplateKwargEntry> {
         Binding(
-            get: { vm.chatTemplateEntries[index] },
-            set: { vm.chatTemplateEntries[index] = $0 }
+            get: { vm.chatTemplateEntries.first { $0.id == entryID } ?? ChatTemplateKwargEntry(kind: .custom, value: "") },
+            set: { newValue in
+                if let idx = vm.chatTemplateEntries.firstIndex(where: { $0.id == entryID }) {
+                    vm.chatTemplateEntries[idx] = newValue
+                }
+            }
         )
     }
 
@@ -855,7 +867,7 @@ private struct EntryEditor: View {
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 Button {
-                    vm.removeKwarg(id: entry.id)
+                    vm.removeKwarg(id: entryID)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .medium))

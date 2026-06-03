@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.tokenizer module."""
 
-import pytest
+import json
 
 from omlx.utils.tokenizer import (
     apply_qwen3_fix,
@@ -10,6 +10,10 @@ from omlx.utils.tokenizer import (
     is_harmony_model,
     is_qwen3_model,
 )
+
+
+def _write_json(path, data):
+    path.write_text(json.dumps(data))
 
 
 class TestIsHarmonyModel:
@@ -111,6 +115,111 @@ class TestIsQwen3Model:
         # However, current implementation will match it since 'qwen3' is in 'qwen30'
         # This test documents the current behavior
         assert is_qwen3_model("qwen30-model") is True  # Contains 'qwen3'
+
+
+class TestLFM2ToolParserConfig:
+    """Test cases for the scoped LFM2 Pythonic tool parser fix."""
+
+    @staticmethod
+    def _write_lfm2_text_model(tmp_path, chat_template=None):
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "lfm2",
+                "architectures": ["LFM2ForCausalLM"],
+            },
+        )
+        if chat_template is not None:
+            _write_json(
+                tmp_path / "tokenizer_config.json",
+                {"chat_template": chat_template},
+            )
+
+    def test_lfm2_moe_text_model_gets_pythonic_tool_parser(self, tmp_path):
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "lfm2_moe",
+                "architectures": ["LFM2MoeForCausalLM"],
+            },
+        )
+        _write_json(
+            tmp_path / "tokenizer_config.json",
+            {"chat_template": "<|tool_call_start|>x<|tool_call_end|>"},
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert config["tool_parser_type"] == "pythonic"
+
+    def test_lfm2_audio_architecture_excluded(self, tmp_path):
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "lfm2",
+                "architectures": ["LFM2AudioModel"],
+            },
+        )
+        _write_json(
+            tmp_path / "tokenizer_config.json",
+            {"chat_template": "<|tool_call_start|>x<|tool_call_end|>"},
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert "tool_parser_type" not in config
+
+    def test_lfm_audio_model_type_excluded(self, tmp_path):
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "lfm2_audio",
+                "architectures": ["LFM2ForCausalLM"],
+            },
+        )
+        _write_json(
+            tmp_path / "tokenizer_config.json",
+            {"chat_template": "<|tool_call_start|>x<|tool_call_end|>"},
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert "tool_parser_type" not in config
+
+    def test_lfm2_text_model_gets_pythonic_tool_parser(self, tmp_path):
+        self._write_lfm2_text_model(
+            tmp_path,
+            "<|tool_call_start|>[call(arg='x')]<|tool_call_end|>",
+        )
+
+        config = get_tokenizer_config(str(tmp_path), trust_remote_code=True)
+
+        assert config["trust_remote_code"] is True
+        assert config["tool_parser_type"] == "pythonic"
+
+    def test_lfm2_text_model_without_markers_gets_parser(self, tmp_path):
+        self._write_lfm2_text_model(tmp_path, "plain template")
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert config["tool_parser_type"] == "pythonic"
+
+    def test_non_lfm2_model_with_markers_does_not_get_parser(self, tmp_path):
+        _write_json(
+            tmp_path / "config.json",
+            {
+                "model_type": "llama",
+                "architectures": ["LlamaForCausalLM"],
+            },
+        )
+        _write_json(
+            tmp_path / "tokenizer_config.json",
+            {"chat_template": "<|tool_call_start|>x<|tool_call_end|>"},
+        )
+
+        config = get_tokenizer_config(str(tmp_path))
+
+        assert "tool_parser_type" not in config
 
 
 class TestGetTokenizerConfig:

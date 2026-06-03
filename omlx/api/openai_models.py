@@ -146,6 +146,11 @@ class FunctionCall(BaseModel):
     name: str
     arguments: str  # JSON string
 
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, v: Any) -> str:
+        return v.strip() if isinstance(v, str) else v
+
     @field_validator("arguments", mode="before")
     @classmethod
     def _validate_arguments_json(cls, v: Any) -> str:

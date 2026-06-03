@@ -302,6 +302,8 @@
   "settings.model.add": "添加",
   "settings.model.placeholder_primary": "主模型目录",
   "settings.model.placeholder_additional": "附加模型目录",
+  "settings.model.hf_cache": "Use Hugging Face local cache",
+  "settings.model.hf_cache_desc": "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
   "settings.model.idle_timeout": "空闲超时",
   "settings.model.idle_timeout_desc": "空闲超过此时间后自动卸载模型。模型的独立 TTL 设置优先于本设置。",
   "settings.model.idle_timeout_none": "禁用",

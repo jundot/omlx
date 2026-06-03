@@ -72,6 +72,27 @@ struct ServerScreen: View {
             .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
 
+            SectionHeader(String(localized: "server.section.startup",
+                                  defaultValue: "Server Startup",
+                                  comment: "Section heading for server startup behavior settings"))
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.auto_start_on_launch",
+                                  defaultValue: "Automatically start server on launch",
+                                  comment: "Row label for automatically starting the managed server when the macOS app launches"),
+                    sublabel: String(localized: "server.row.auto_start_on_launch.sub",
+                                     defaultValue: "When disabled, the menu bar app opens without starting the server.",
+                                     comment: "Sublabel explaining the auto-start on launch setting"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: vm.bind($vm.autoStartOnLaunch, save: {
+                        vm.saveAutoStartOnLaunch(services: services)
+                    }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
+
             SectionHeader(String(localized: "server.section.logging",
                                   defaultValue: "Logging",
                                   comment: "Section heading for the Logging rows"))
@@ -123,16 +144,21 @@ struct ServerScreen: View {
                 ) {
                     TextInput(text: $vm.basePathText, mono: true, width: 280)
                 }
+                FreeRow {
+                    ModelDirectoriesEditor(vm: vm)
+                }
                 Row(
-                    label: String(localized: "server.row.models_directory",
-                                  defaultValue: "Models Directory",
-                                  comment: "Row label for the Models Directory text input"),
-                    sublabel: String(localized: "server.row.models_directory.sub",
-                                     defaultValue: "Where the server reads and writes model weights. Downloaded models land here.",
-                                     comment: "Sublabel under the Models Directory field"),
+                    label: String(localized: "server.row.hf_cache",
+                                  defaultValue: "Use Hugging Face local cache",
+                                  comment: "Row label for enabling standard Hugging Face Hub cache model discovery"),
+                    sublabel: String(localized: "server.row.hf_cache.sub",
+                                     defaultValue: "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
+                                     comment: "Sublabel for enabling Hugging Face local cache discovery"),
                     isLast: true
                 ) {
-                    TextInput(text: $vm.modelDirText, mono: true, width: 280)
+                    Toggle("", isOn: $vm.hfCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
             }
             ServerAdvancedSection(vm: vm)
@@ -167,6 +193,84 @@ struct ServerScreen: View {
             // After a restart triggered by saving host/port, reload to pick
             // up the new effective values.
             Task { await vm.load(client: services.client) }
+        }
+    }
+}
+
+private struct ModelDirectoriesEditor: View {
+    @ObservedObject var vm: ServerScreenVM
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(localized: "server.row.models_directories",
+                                defaultValue: "Model Directories",
+                                comment: "Row label for the model directories editor"))
+                        .font(.omlxText(13, weight: .medium))
+                        .foregroundStyle(theme.text)
+                    Text(String(localized: "server.row.models_directories.sub",
+                                defaultValue: "The first path is the download target. All paths are scanned for local models.",
+                                comment: "Sublabel under the model directories editor"))
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer(minLength: 12)
+                Button {
+                    vm.addModelDirectory()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                .help(String(localized: "server.model_dirs.add.help",
+                             defaultValue: "Add model directory",
+                             comment: "Tooltip for the add model directory button"))
+            }
+
+            VStack(spacing: 7) {
+                ForEach(Array(vm.modelDirTexts.indices), id: \.self) { index in
+                    modelDirRow(index: index)
+                }
+            }
+        }
+    }
+
+    private func modelDirRow(index: Int) -> some View {
+        HStack(spacing: 7) {
+            Text(index == 0
+                 ? String(localized: "server.model_dirs.primary",
+                          defaultValue: "Primary",
+                          comment: "Badge for the first model directory")
+                 : String(format: "#%d", index + 1))
+                .font(.omlxMono(10, weight: .semibold))
+                .foregroundStyle(index == 0 ? theme.accent : theme.textSecondary)
+                .frame(width: 52, alignment: .leading)
+
+            TextInput(text: Binding(
+                get: { vm.modelDirText(at: index) },
+                set: { vm.setModelDirText($0, at: index) }
+            ), mono: true, width: 340)
+
+            Button {
+                vm.browseModelDirectory(at: index)
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .help(String(localized: "server.model_dirs.browse.help",
+                         defaultValue: "Choose folder",
+                         comment: "Tooltip for choosing a model directory"))
+
+            Button {
+                vm.removeModelDirectory(at: index)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .help(String(localized: "server.model_dirs.remove.help",
+                         defaultValue: "Remove model directory",
+                         comment: "Tooltip for removing a model directory"))
         }
     }
 }
@@ -651,6 +755,7 @@ final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
     @Published var portText: String = "8000"
     @Published var logLevel: String = "info"
+    @Published var autoStartOnLaunch: Bool = true
 
     // Phase 4 — Advanced disclosure.
     @Published var sseKeepaliveMode: String = "chunk"
@@ -659,7 +764,8 @@ final class ServerScreenVM: ObservableObject {
     /// server. Empty string clears all aliases.
     @Published var serverAliasesText: String = ""
     @Published var basePathText: String = AppConfig.defaultBasePath()
-    @Published var modelDirText: String = ""
+    @Published var modelDirTexts: [String] = [""]
+    @Published var hfCacheEnabled: Bool = true
     @Published var lastError: String?
     @Published private(set) var isMovingBasePath: Bool = false
 
@@ -676,6 +782,7 @@ final class ServerScreenVM: ObservableObject {
     /// from `host`/`portText` so the URLs don't flicker mid-edit.
     @Published var effectiveHost: String = "127.0.0.1"
     @Published var effectivePort: Int = 8000
+    var appliedBindAddress: String = "127.0.0.1"
 
     /// Apply-button baselines: snapshots of each Apply-managed draft taken
     /// after a successful `load()` or `applyServerSettings()`. The button's
@@ -692,6 +799,8 @@ final class ServerScreenVM: ObservableObject {
     private var baselineSamplingTopKText: String = "0"
     private var baselineSamplingRepetitionPenaltyText: String = "1.0"
     private var baselineServerAliasesText: String = ""
+    private var baselineModelDirs: [String] = []
+    private var baselineHfCacheEnabled: Bool = true
 
     private weak var client: OMLXClient?
     private var hasLoaded = false
@@ -703,10 +812,19 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
-            self.effectiveHost = dto.server.host
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
+            self.appliedBindAddress = dto.server.host
+            self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            let modelDirs = Self.cleanedModelDirs(
+                dto.model?.modelDirs ?? dto.model?.modelDir.map { [$0] } ?? []
+            )
+            if !modelDirs.isEmpty {
+                self.modelDirTexts = modelDirs
+            }
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -737,6 +855,8 @@ final class ServerScreenVM: ObservableObject {
         baselineSamplingTopKText = t(samplingTopKText)
         baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
         baselineServerAliasesText = serverAliasesText
+        baselineModelDirs = Self.normalizedModelDirs(from: modelDirTexts)
+        baselineHfCacheEnabled = hfCacheEnabled
     }
 
     /// Apply-button gate: true when any Apply-managed draft diverges from
@@ -753,6 +873,7 @@ final class ServerScreenVM: ObservableObject {
         if t(samplingTopKText) != baselineSamplingTopKText { return true }
         if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
         if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        if hfCacheEnabled != baselineHfCacheEnabled { return true }
         return hasPendingStorageChanges(services: services)
     }
 
@@ -837,6 +958,9 @@ final class ServerScreenVM: ObservableObject {
         if newAliases != parseAliases(baselineServerAliasesText) {
             patch.serverAliases = newAliases
         }
+        if hfCacheEnabled != baselineHfCacheEnabled {
+            patch.hfCacheEnabled = hfCacheEnabled
+        }
 
         let diff = storageDiff(services: services)
         if diff.baseChanged && diff.normalizedBase.isEmpty {
@@ -845,11 +969,14 @@ final class ServerScreenVM: ObservableObject {
                                     comment: "Server screen error when Base Path is empty on Apply")
             return
         }
-        if diff.dirChanged && diff.normalizedModelDir.isEmpty {
+        if diff.modelDirsChanged && diff.normalizedModelDirs.isEmpty {
             self.lastError = String(localized: "server.error.models_dir_empty",
-                                    defaultValue: "Models Directory cannot be empty.",
-                                    comment: "Server screen error when Models Directory is empty on Apply")
+                                    defaultValue: "At least one model directory is required.",
+                                    comment: "Server screen error when all model directory fields are empty on Apply")
             return
+        }
+        if diff.modelDirsChanged && !diff.baseChanged {
+            patch.modelDirs = diff.normalizedModelDirs
         }
 
         let patchHasFields = patch.port != nil
@@ -860,6 +987,8 @@ final class ServerScreenVM: ObservableObject {
             || patch.samplingTopK != nil
             || patch.samplingRepetitionPenalty != nil
             || patch.serverAliases != nil
+            || patch.hfCacheEnabled != nil
+            || patch.modelDirs != nil
 
         if !patchHasFields && !diff.hasChanges {
             self.lastError = String(localized: "server.error.nothing_to_apply",
@@ -868,7 +997,7 @@ final class ServerScreenVM: ObservableObject {
             return
         }
 
-        if diff.hasChanges { isMovingBasePath = true }
+        if diff.baseChanged { isMovingBasePath = true }
         Task {
             defer {
                 Task { @MainActor in
@@ -876,25 +1005,43 @@ final class ServerScreenVM: ObservableObject {
                 }
             }
             do {
+                let oldBase = services.config.basePath
                 if patchHasFields, let client {
                     _ = try await client.updateGlobalSettings(patch)
                 }
-                if diff.hasChanges {
+                if diff.baseChanged {
                     // Hand the bundled port to the storage flow so its single
                     // restart binds the new port. Without this the restart
                     // reuses the cached --port args and silently keeps the old
                     // port even though we just PATCHed the new one.
+                    let relocatedModelDirs = diff.modelDirsChanged
+                        ? diff.normalizedModelDirs.map {
+                            AppServices.relocate(
+                                path: $0,
+                                oldBase: oldBase,
+                                newBase: diff.normalizedBase
+                            )
+                        }
+                        : nil
                     try await services.applyStorageChanges(
                         basePath: diff.baseChanged ? diff.normalizedBase : nil,
-                        modelDir: diff.dirChanged ? diff.normalizedModelDir : nil,
+                        modelDirs: relocatedModelDirs,
                         port: nextPort
                     )
                     self.basePathText = services.config.basePath
-                    self.modelDirText = services.config.modelDir
+                    self.modelDirTexts = services.config.effectiveModelDirs
                     if let p = nextPort { self.effectivePort = p }
-                } else if let p = nextPort {
-                    try await services.applyServerEndpoint(port: p)
-                    self.effectivePort = p
+                } else {
+                    if let p = nextPort {
+                        try await services.applyServerEndpoint(port: p)
+                        self.effectivePort = p
+                    }
+                    if diff.modelDirsChanged {
+                        var updated = services.config
+                        updated.setModelDirs(diff.normalizedModelDirs)
+                        services.updateConfig(updated)
+                        self.modelDirTexts = diff.normalizedModelDirs
+                    }
                 }
                 self.lastError = nil
                 self.snapshotApplyBaselines()
@@ -917,6 +1064,68 @@ final class ServerScreenVM: ObservableObject {
         return parts.filter { seen.insert($0).inserted }
     }
 
+    func modelDirText(at index: Int) -> String {
+        guard modelDirTexts.indices.contains(index) else { return "" }
+        return modelDirTexts[index]
+    }
+
+    func setModelDirText(_ value: String, at index: Int) {
+        guard modelDirTexts.indices.contains(index) else { return }
+        modelDirTexts[index] = value
+    }
+
+    func addModelDirectory(_ value: String = "") {
+        modelDirTexts.append(value)
+    }
+
+    func removeModelDirectory(at index: Int) {
+        guard modelDirTexts.indices.contains(index) else { return }
+        if modelDirTexts.count == 1 {
+            modelDirTexts[0] = ""
+        } else {
+            modelDirTexts.remove(at: index)
+        }
+    }
+
+    func browseModelDirectory(at index: Int) {
+        guard modelDirTexts.indices.contains(index) else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = String(localized: "server.model_dirs.browse.prompt",
+                              defaultValue: "Select",
+                              comment: "NSOpenPanel button label for choosing a model directory")
+        panel.message = String(localized: "server.model_dirs.browse.message",
+                               defaultValue: "Choose a directory containing MLX model folders.",
+                               comment: "NSOpenPanel message for choosing a model directory")
+        if panel.runModal() == .OK, let url = panel.url {
+            modelDirTexts[index] = url.path
+        }
+    }
+
+    private static func cleanedModelDirs(_ dirs: [String]) -> [String] {
+        dirs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        ((path.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
+            .expandingTildeInPath as NSString).standardizingPath
+    }
+
+    private static func normalizedModelDirs(from dirs: [String]) -> [String] {
+        var seen = Set<String>()
+        return dirs.compactMap { raw in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let normalized = normalizedPath(trimmed)
+            return seen.insert(normalized).inserted ? normalized : nil
+        }
+    }
+
     /// Format a double for an editable field: `1.0` → `"1.0"`, `0.95` →
     /// `"0.95"`, drops trailing zeros above the first decimal.
     private func trimDouble(_ v: Double) -> String {
@@ -927,18 +1136,21 @@ final class ServerScreenVM: ObservableObject {
 
     func applyConfig(_ config: AppConfig) {
         if !hasLoaded {
-            self.host = config.host
+            self.host = config.bindAddress
             self.portText = String(config.port)
+            self.appliedBindAddress = config.bindAddress
             self.effectiveHost = config.host
             self.effectivePort = config.port
         }
-        // basePath/modelDir always mirror the live config — they're not
-        // gated by `hasLoaded` because the global-settings PATCH path
-        // (which sets `hasLoaded = true`) doesn't carry them. modelDir is
-        // always a literal path (default `<basePath>/models` or whatever
-        // the user pointed it at) — never blank.
+        // basePath/modelDirs always mirror the live config before the server
+        // settings have loaded. After that, `model_dirs` comes from
+        // /global-settings so web-admin edits stay visible instead of being
+        // collapsed back to AppConfig's primary path on unrelated config
+        // notifications.
         self.basePathText = config.basePath
-        self.modelDirText = config.modelDir
+        if !hasLoaded {
+            self.modelDirTexts = config.effectiveModelDirs
+        }
     }
 
     func saveHost(services: AppServices) {
@@ -947,7 +1159,8 @@ final class ServerScreenVM: ObservableObject {
             await commit(GlobalSettingsPatch(host: next))
             do {
                 try await services.applyServerEndpoint(host: next)
-                self.effectiveHost = next
+                self.appliedBindAddress = next
+                self.effectiveHost = AppConfig.connectableHost(for: next)
             } catch {
                 self.lastError = error.omlxDescription
             }
@@ -961,35 +1174,35 @@ final class ServerScreenVM: ObservableObject {
         storageDiff(services: services).hasChanges
     }
 
-    /// Computed diff against `services.config`, with tilde expansion + path
-    /// normalization. modelDir always carries a literal path (no
-    /// "empty == default" magic). Internal so unit tests can drive it.
+    /// Computed diff against the last loaded settings, with tilde expansion,
+    /// path normalization, and duplicate removal. The primary model directory
+    /// is the first entry in `normalizedModelDirs`.
     struct StorageDiff: Equatable {
         let normalizedBase: String
-        let normalizedModelDir: String
+        let normalizedModelDirs: [String]
         let baseChanged: Bool
-        let dirChanged: Bool
-        var hasChanges: Bool { baseChanged || dirChanged }
+        let modelDirsChanged: Bool
+        var normalizedModelDir: String { normalizedModelDirs.first ?? "" }
+        var dirChanged: Bool { modelDirsChanged }
+        var hasChanges: Bool { baseChanged || modelDirsChanged }
     }
 
     func storageDiff(services: AppServices) -> StorageDiff {
-        let trimmedBase = basePathText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedBase = ((trimmedBase as NSString).expandingTildeInPath
-                              as NSString).standardizingPath
-        let currentBase = (services.config.basePath as NSString).standardizingPath
+        let normalizedBase = Self.normalizedPath(basePathText)
+        let currentBase = Self.normalizedPath(services.config.basePath)
         let baseChanged = !normalizedBase.isEmpty && normalizedBase != currentBase
 
-        let trimmedDir = modelDirText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedDir = ((trimmedDir as NSString).expandingTildeInPath
-                             as NSString).standardizingPath
-        let currentDir = (services.config.modelDir as NSString).standardizingPath
-        let dirChanged = !normalizedDir.isEmpty && normalizedDir != currentDir
+        let normalizedDirs = Self.normalizedModelDirs(from: modelDirTexts)
+        let currentDirs = baselineModelDirs.isEmpty
+            ? Self.normalizedModelDirs(from: services.config.effectiveModelDirs)
+            : baselineModelDirs
+        let modelDirsChanged = normalizedDirs != currentDirs
 
         return StorageDiff(
             normalizedBase: normalizedBase,
-            normalizedModelDir: normalizedDir,
+            normalizedModelDirs: normalizedDirs,
             baseChanged: baseChanged,
-            dirChanged: dirChanged
+            modelDirsChanged: modelDirsChanged
         )
     }
 
@@ -1001,7 +1214,7 @@ final class ServerScreenVM: ObservableObject {
         let trimmedPort = portText.trimmingCharacters(in: .whitespaces)
         let parsedPort = Int(trimmedPort)
         let portChanged = parsedPort.map { $0 != effectivePort } ?? false
-        let hostChanged = host != effectiveHost
+        let hostChanged = host != appliedBindAddress
 
         if portChanged, let p = parsedPort, !(1...65535).contains(p) {
             self.lastError = String(localized: "server.error.port_invalid",
@@ -1030,7 +1243,10 @@ final class ServerScreenVM: ObservableObject {
                         port: portChanged ? parsedPort : nil
                     )
                     if let p = parsedPort, portChanged { self.effectivePort = p }
-                    if hostChanged { self.effectiveHost = host }
+                    if hostChanged {
+                        self.appliedBindAddress = host
+                        self.effectiveHost = AppConfig.connectableHost(for: host)
+                    }
                 } else {
                     try await services.restartServer()
                 }
@@ -1046,6 +1262,24 @@ final class ServerScreenVM: ObservableObject {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveAutoStartOnLaunch(services: AppServices) {
+        let enabled = autoStartOnLaunch
+        Task {
+            do {
+                switch services.serverState {
+                case .running, .unresponsive:
+                    if await commit(GlobalSettingsPatch(autoStartOnLaunch: enabled)) {
+                        try services.setAutoStartOnLaunch(enabled, persist: false)
+                    }
+                default:
+                    try services.setAutoStartOnLaunch(enabled)
+                }
+            } catch {
+                self.lastError = error.omlxDescription
+            }
+        }
     }
 
     /// Build a `Binding` that calls `save` after the value changes. Used for
@@ -1064,13 +1298,16 @@ final class ServerScreenVM: ObservableObject {
         )
     }
 
-    private func commit(_ patch: GlobalSettingsPatch) async {
-        guard let client else { return }
+    @discardableResult
+    private func commit(_ patch: GlobalSettingsPatch) async -> Bool {
+        guard let client else { return false }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
+            return true
         } catch {
             self.lastError = error.omlxDescription
+            return false
         }
     }
 

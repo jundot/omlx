@@ -259,14 +259,12 @@ private struct CacheSection: View {
                               defaultValue: "Hot Cache Size",
                               comment: "Row label for the hot cache size field"),
                 sublabel: String(localized: "performance.cache.hot_size.sub",
-                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, \"8GB\" or \"auto\" accepted.",
+                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, sizes like \"8GB\" are accepted.",
                                  comment: "Sublabel describing accepted hot cache size values")
             ) {
                 TextInput(
                     text: $vm.hotCacheMaxSize,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
+                    placeholder: "0",
                     mono: true,
                     width: 140
                 )
@@ -383,7 +381,7 @@ final class PerformanceScreenVM: ObservableObject {
             || modelFallback != loadedModelFallback
             || cacheEnabled != loadedCacheEnabled
             || hotCacheOnly != loadedHotCacheOnly
-            || trim(hotCacheMaxSize) != loadedHotCacheMaxSize
+            || canonicalHotCacheMaxSize(hotCacheMaxSize) != loadedHotCacheMaxSize
             || trim(ssdCacheDir) != loadedSsdCacheDir
             || trim(ssdCacheMaxSize) != loadedSsdCacheMaxSize
             || parsedInitialCacheBlocks != loadedInitialCacheBlocks
@@ -424,8 +422,9 @@ final class PerformanceScreenVM: ObservableObject {
                 self.loadedCacheEnabled = cache.enabled
                 self.hotCacheOnly = cache.hotCacheOnly ?? false
                 self.loadedHotCacheOnly = cache.hotCacheOnly ?? false
-                self.hotCacheMaxSize = cache.hotCacheMaxSize ?? ""
-                self.loadedHotCacheMaxSize = cache.hotCacheMaxSize ?? ""
+                let hotCacheMaxSize = canonicalHotCacheMaxSize(cache.hotCacheMaxSize ?? "")
+                self.hotCacheMaxSize = hotCacheMaxSize
+                self.loadedHotCacheMaxSize = hotCacheMaxSize
                 self.ssdCacheDir = cache.ssdCacheDir ?? ""
                 self.loadedSsdCacheDir = cache.ssdCacheDir ?? ""
                 self.ssdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
@@ -512,7 +511,7 @@ final class PerformanceScreenVM: ObservableObject {
         // Cache
         if cacheEnabled != loadedCacheEnabled { patch.cacheEnabled = cacheEnabled }
         if hotCacheOnly != loadedHotCacheOnly { patch.hotCacheOnly = hotCacheOnly }
-        let hcm = trim(hotCacheMaxSize)
+        let hcm = canonicalHotCacheMaxSize(hotCacheMaxSize)
         if hcm != loadedHotCacheMaxSize { patch.hotCacheMaxSize = hcm }
         let scd = trim(ssdCacheDir)
         if scd != loadedSsdCacheDir { patch.ssdCacheDir = scd }
@@ -574,6 +573,14 @@ final class PerformanceScreenVM: ObservableObject {
 
     private func trim(_ s: String) -> String {
         s.trimmingCharacters(in: .whitespaces)
+    }
+
+    private func canonicalHotCacheMaxSize(_ value: String) -> String {
+        let normalized = trim(value)
+        if normalized.isEmpty || normalized.lowercased() == "auto" {
+            return "0"
+        }
+        return normalized
     }
 
     private func trimDouble(_ v: Double) -> String {

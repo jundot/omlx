@@ -54,6 +54,20 @@ class TestIntegrationRegistry:
         assert get_integration("nonexistent") is None
 
 
+class TestIntegrationCommands:
+    def test_commands_quote_full_app_cli_prefix(self):
+        with patch(
+            "omlx.utils.install.get_cli_prefix",
+            return_value="/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli",
+        ):
+            cmd = ClaudeCodeIntegration().get_command(ctx())
+
+        assert (
+            cmd
+            == "'/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli' launch claude"
+        )
+
+
 class TestCodexIntegration:
     def test_get_command(self):
         codex = CodexIntegration()
@@ -1163,6 +1177,37 @@ class TestClaudeCodeIntegration:
         assert "PYTHONHOME" not in env
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_sets_distinct_claude_tier_models(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="fallback",
+                    opus_model="opus-local",
+                    sonnet_model="sonnet-local",
+                    haiku_model="haiku-local",
+                )
+            )
+
+        env = captured["env"]
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-local"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-local"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-local"
+        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-local"
 
     def test_launch_open_server_uses_omlx_token(self):
         cc = ClaudeCodeIntegration()

@@ -28,6 +28,7 @@ final class MenubarController: NSObject {
 
     private let server: ServerProcess?
     private let config: AppConfig
+    private let updates: UpdateController?
     private let bootstrapError: Error?
     private let openAppView: () -> Void
     private let requestQuit: () -> Void
@@ -40,6 +41,8 @@ final class MenubarController: NSObject {
     /// host/port change can detect divergence and re-point the poller.
     private var statsPollerBaseURL: URL?
     private var visibilityWatcher: MenubarVisibilityWatcher?
+    private var lastPresentedFailureMessage: String?
+    private var lastPresentedPortConflictKey: String?
 
     // Strong refs to dynamic menu items so refreshMenuState() can edit
     // without rebuilding the live NSMenu (matches Python's
@@ -53,6 +56,7 @@ final class MenubarController: NSObject {
     private var adminPanelItem: NSMenuItem!
     private var webAdminItem: NSMenuItem!
     private var chatItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
 
     private let iconOutline: NSImage?
     private let iconFilled: NSImage?
@@ -62,12 +66,14 @@ final class MenubarController: NSObject {
     init(
         server: ServerProcess?,
         config: AppConfig,
+        updates: UpdateController? = nil,
         lastError: Error? = nil,
         openAppView: @escaping () -> Void = {},
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
         self.config = config
+        self.updates = updates
         self.bootstrapError = lastError
         self.openAppView = openAppView
         self.requestQuit = requestQuit
@@ -120,10 +126,37 @@ final class MenubarController: NSObject {
                 name: ServerProcess.stateDidChangeNotification,
                 object: server
             )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(serverPortConflict(_:)),
+                name: ServerProcess.portConflictNotification,
+                object: server
+            )
+        }
+        if let updates {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(updateStateChanged(_:)),
+                name: UpdateController.stateDidChangeNotification,
+                object: updates
+            )
         }
 
         startStatsPoller()
         startVisibilityWatcher()
+
+        if let bootstrapError {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentServerFailureAlert(
+                    message: String(describing: bootstrapError),
+                    logURL: ServerProcess.defaultLogURL()
+                )
+            }
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Menu construction
@@ -193,6 +226,13 @@ final class MenubarController: NSObject {
         menu.addItem(chatItem)
 
         menu.addItem(.separator())
+
+        updateItem = item(String(localized: "menubar.item.update_available",
+                                 defaultValue: "Install Update…",
+                                 comment: "Menubar item shown when an app update is available"),
+                          action: #selector(installUpdate),
+                          symbol: "arrow.down.circle")
+        menu.addItem(updateItem)
 
         adminPanelItem = item(String(localized: "menubar.item.settings",
                                      defaultValue: "Settings…",
@@ -279,10 +319,36 @@ final class MenubarController: NSObject {
         webAdminItem.isEnabled = isRunning
         chatItem.isEnabled = isRunning
 
+        refreshUpdateMenuItem()
+
         // Icon swap — outline when not actively serving, filled otherwise
         let serving = state.isRunningLike
         statusItem.button?.image = serving ? iconFilled : iconOutline
         statusItem.button?.image?.isTemplate = true
+    }
+
+    private func refreshUpdateMenuItem() {
+        guard let updates else {
+            updateItem.isHidden = true
+            return
+        }
+        switch updates.state {
+        case .available(let info), .ready(let info):
+            updateItem.isHidden = false
+            updateItem.isEnabled = info.dmgURL != nil
+            updateItem.title = String(localized: "menubar.item.install_update_version",
+                                      defaultValue: "Install oMLX \(info.version)…",
+                                      comment: "Menubar update item when an app update is available; placeholder is the version")
+        case .downloading(let pct):
+            updateItem.isHidden = false
+            updateItem.isEnabled = false
+            updateItem.title = String(localized: "menubar.item.downloading_update",
+                                      defaultValue: "Downloading update… \(pct)%",
+                                      comment: "Menubar update item while an app update is downloading; placeholder is the percent")
+        default:
+            updateItem.isHidden = true
+            updateItem.isEnabled = false
+        }
     }
 
     private func headerDisplay(_ state: ServerProcess.State) -> (String, NSColor) {
@@ -298,7 +364,7 @@ final class MenubarController: NSObject {
             }
             return (
                 String(localized: "menubar.header.stopped",
-                       defaultValue: "Server: stopped",
+                       defaultValue: "oMLX stopped",
                        comment: "Menubar status header when the server is stopped"),
                 .secondaryLabelColor
             )
@@ -416,7 +482,7 @@ final class MenubarController: NSObject {
     // MARK: - Pollers
 
     /// Bind endpoint the stats poller should hit. Sourced from the live
-    /// `ServerProcess` (which `reconfigure(host:port:)` keeps current) so a
+    /// `ServerProcess` (which `reconfigure(bindAddress:port:)` keeps current) so a
     /// runtime port/host change re-points the poller, falling back to the
     /// config snapshot only when there is no server. Mirrors the
     /// `displayPort`/`displayHost` resolution used for the visible items.
@@ -486,6 +552,20 @@ final class MenubarController: NSObject {
         refreshMenuState()
         rebuildStatsSubmenu()
         refreshStatsPollerEndpoint()
+
+        guard let server else { return }
+        if case .failed(let message) = server.state,
+           MenubarController.shouldShowGenericFailureAlert(message: message) {
+            presentServerFailureAlert(message: message, logURL: server.serverLogURL)
+        }
+    }
+
+    @objc private func serverPortConflict(_ note: Notification) {
+        guard let conflict = note.userInfo?["conflict"] as? PortConflict else { return }
+        let key = "\(conflict.pid.map { String($0) } ?? "unknown"):\(conflict.isOMLX)"
+        guard lastPresentedPortConflictKey != key else { return }
+        lastPresentedPortConflictKey = key
+        presentPortConflictAlert(conflict)
     }
 
     @objc private func statsDidUpdate(_ note: Notification) {
@@ -493,6 +573,10 @@ final class MenubarController: NSObject {
         // menuWillOpen (NSMenuDelegate) handles the latter, so for now we
         // rebuild eagerly — the next render will pick up fresh values.
         rebuildStatsSubmenu()
+    }
+
+    @objc private func updateStateChanged(_ note: Notification) {
+        refreshUpdateMenuItem()
     }
 
     // MARK: - Actions
@@ -503,8 +587,8 @@ final class MenubarController: NSObject {
             switch try server.start() {
             case .started, .alreadyRunning:
                 break
-            case .portConflict(let conflict):
-                presentPortConflictAlert(conflict)
+            case .portConflict:
+                break
             }
         } catch {
             NSLog("oMLX: start failed — \(error)")
@@ -557,6 +641,59 @@ final class MenubarController: NSObject {
         alert.runModal()
     }
 
+    private func presentServerFailureAlert(message: String, logURL: URL) {
+        guard !MenubarController.isRunningUnitTests else { return }
+        guard lastPresentedFailureMessage != message else { return }
+        lastPresentedFailureMessage = message
+
+        NSApp.activate(ignoringOtherApps: true)
+        let logTail = MenubarController.recentLogTail(from: logURL)
+        let accessHint = MenubarController.accessFailureHint(
+            message: message,
+            logTail: logTail
+        )
+
+        var parts = [
+            String(localized: "menubar.alert.server_failed.body",
+                   defaultValue: "The server process exited before it became healthy.",
+                   comment: "Introductory body text for the server startup failure alert"),
+            message,
+        ]
+        if let accessHint {
+            parts.append(accessHint)
+        }
+        parts.append(
+            String(localized: "menubar.alert.server_failed.log_path",
+                   defaultValue: "Log: \(logURL.path)",
+                   comment: "Server startup failure alert line that shows the server log path")
+        )
+
+        let alert = NSAlert()
+        alert.messageText = String(localized: "menubar.alert.server_failed.title",
+                                   defaultValue: "oMLX Server Failed to Start",
+                                   comment: "Title for the server startup failure alert")
+        alert.informativeText = parts.joined(separator: "\n\n")
+        alert.addButton(withTitle: String(localized: "menubar.alert.open_log",
+                                          defaultValue: "Open Log",
+                                          comment: "Button that opens the server log file"))
+        alert.addButton(withTitle: String(localized: "menubar.alert.open_settings",
+                                          defaultValue: "Open Settings",
+                                          comment: "Button that opens the oMLX settings window"))
+        alert.addButton(withTitle: String(localized: "menubar.alert.dismiss",
+                                          defaultValue: "Dismiss",
+                                          comment: "Button that dismisses an alert"))
+        alert.window.level = .floating
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            MenubarController.openLogFile(logURL)
+        case .alertSecondButtonReturn:
+            openAppView()
+        default:
+            break
+        }
+    }
+
     @objc private func openAdminPanel() {
         // AppDelegate owns the SwiftUI Window scene; we just ask it to
         // present. This avoids the Settings-scene + .accessory bug where
@@ -578,6 +715,10 @@ final class MenubarController: NSObject {
         let port = MenubarController.displayPort(server: server, fallback: config.port)
         guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func installUpdate() {
+        updates?.requestUpdateConfirmation()
     }
 
     @objc private func showAbout() {
@@ -683,6 +824,52 @@ extension MenubarController {
         comps.percentEncodedQuery = comps.percentEncodedQuery?
             .replacingOccurrences(of: "+", with: "%2B")
         return comps.url
+    }
+
+    static func shouldShowGenericFailureAlert(message: String) -> Bool {
+        let lower = message.lowercased()
+        return !(lower.hasPrefix("port ") && lower.contains(" in use"))
+    }
+
+    static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
+    static func accessFailureHint(message: String, logTail: String?) -> String? {
+        let haystack = ([message, logTail].compactMap { $0 }).joined(separator: "\n")
+            .lowercased()
+        guard haystack.contains("permissionerror")
+            || haystack.contains("operation not permitted")
+            || haystack.contains("permission denied")
+        else {
+            return nil
+        }
+        return String(localized: "menubar.alert.server_failed.access_hint",
+                      defaultValue: "Check that the configured model directory is mounted and readable. If it is on an external or protected location, grant oMLX access in macOS Privacy & Security settings.",
+                      comment: "Hint shown when the server failure log suggests a model directory permission problem")
+    }
+
+    static func recentLogTail(from url: URL, maxBytes: UInt64 = 8 * 1024) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let end = (try? handle.seekToEnd()) ?? 0
+        let offset = end > maxBytes ? end - maxBytes : 0
+        do {
+            try handle.seek(toOffset: offset)
+            let data = try handle.readToEnd() ?? Data()
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    static func openLogFile(_ logURL: URL) {
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([logURL])
+            return
+        }
+        NSWorkspace.shared.open(logURL.deletingLastPathComponent())
     }
 }
 

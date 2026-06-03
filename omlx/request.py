@@ -193,6 +193,7 @@ class Request:
 
     # Prefill memory-pressure recovery
     prefill_oom_retries: int = 0        # Per-request prefill-OOM requeue counter
+    prefill_eviction_retries: int = 0   # Per-request prefill-headroom eviction phase counter
 
     @property
     def num_output_tokens(self) -> int:

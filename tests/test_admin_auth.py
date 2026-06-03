@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -436,8 +437,11 @@ class TestCheckUpdate:
     """Tests for update-check version filtering."""
 
     def setup_method(self):
-        admin_routes._update_cache = None
-        admin_routes._update_cache_time = 0.0
+        admin_routes._update_cache = {}
+        admin_routes._update_cache_time = {}
+        admin_routes._UPDATE_PREFS_PATH = Path(
+            "/tmp/omlx-test-missing-update-prefs.json"
+        )
 
     @pytest.mark.asyncio
     async def test_prerelease_not_shown(self):

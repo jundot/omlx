@@ -524,6 +524,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        prefill_eviction_callback: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -531,6 +532,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._prefill_eviction_callback = prefill_eviction_callback
 
         self._vlm_model = None
         self._processor = None
@@ -706,6 +708,7 @@ class VLMBatchedEngine(BaseEngine):
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
+
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
@@ -766,6 +769,7 @@ class VLMBatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            prefill_eviction_callback=self._prefill_eviction_callback,
         )
 
         # Create engine with adapter as the "model"
@@ -1450,9 +1454,7 @@ class VLMBatchedEngine(BaseEngine):
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
-                    cached_whole = self._vision_cache.get(
-                        image_hash, self._model_name
-                    )
+                    cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use

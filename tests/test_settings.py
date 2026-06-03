@@ -43,6 +43,7 @@ class TestServerSettings:
         assert settings.log_level == "info"
         assert settings.cors_origins == ["*"]
         assert settings.sse_keepalive_mode == "chunk"
+        assert settings.auto_start_on_launch is True
 
     def test_custom_values(self):
         """Test custom values."""
@@ -68,6 +69,7 @@ class TestServerSettings:
             "cors_origins": ["*"],
             "server_aliases": [],
             "sse_keepalive_mode": "chunk",
+            "auto_start_on_launch": True,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -77,6 +79,12 @@ class TestServerSettings:
             assert settings.sse_keepalive_mode == mode
             assert settings.to_dict()["sse_keepalive_mode"] == mode
 
+    def test_from_dict_auto_start_on_launch(self):
+        """auto_start_on_launch round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"auto_start_on_launch": False})
+        assert settings.auto_start_on_launch is False
+        assert settings.to_dict()["auto_start_on_launch"] is False
+
     def test_from_dict(self):
         """Test creation from dictionary."""
         data = {"host": "0.0.0.0", "port": 9000, "log_level": "debug"}
@@ -85,6 +93,18 @@ class TestServerSettings:
         assert settings.port == 9000
         assert settings.log_level == "debug"
         assert settings.cors_origins == ["*"]  # default
+
+    def test_from_dict_reads_bind_address_fallback(self):
+        """bind_address is accepted only as a compatibility fallback."""
+        settings = ServerSettings.from_dict({"bind_address": "0.0.0.0"})
+        assert settings.host == "0.0.0.0"
+
+    def test_from_dict_host_wins_over_bind_address(self):
+        """host remains the canonical persisted/admin API key."""
+        settings = ServerSettings.from_dict(
+            {"host": "127.0.0.1", "bind_address": "0.0.0.0"}
+        )
+        assert settings.host == "127.0.0.1"
 
     def test_from_dict_with_cors_origins(self):
         """Test creation from dictionary with cors_origins."""
@@ -221,7 +241,9 @@ class TestSchedulerSettings:
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = SchedulerSettings(max_concurrent_requests=128, embedding_batch_size=16)
+        settings = SchedulerSettings(
+            max_concurrent_requests=128, embedding_batch_size=16
+        )
         assert settings.max_concurrent_requests == 128
         assert settings.embedding_batch_size == 16
 
@@ -332,6 +354,11 @@ class TestCacheSettings:
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
 
+    def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
+        """Legacy hot_cache_max_size=auto should load as disabled."""
+        settings = CacheSettings.from_dict({"hot_cache_max_size": "auto"})
+        assert settings.hot_cache_max_size == "0"
+
     def test_initial_cache_blocks_custom(self):
         """Test custom initial_cache_blocks value."""
         settings = CacheSettings(initial_cache_blocks=8192)
@@ -370,6 +397,7 @@ class TestAuthSettings:
     def test_to_dict_with_sub_keys(self):
         """Test conversion to dictionary with sub keys."""
         from omlx.settings import SubKeyEntry
+
         settings = AuthSettings(
             api_key="my-key",
             sub_keys=[SubKeyEntry(key="sk1", name="Test", created_at="2024-01-01")],
@@ -442,34 +470,47 @@ class TestHuggingFaceSettings:
         """Test default values."""
         settings = HuggingFaceSettings()
         assert settings.endpoint == ""
+        assert settings.hf_cache_enabled is True
 
     def test_custom_values(self):
         """Test custom values."""
-        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        settings = HuggingFaceSettings(
+            endpoint="https://hf-mirror.com",
+            hf_cache_enabled=False,
+        )
         assert settings.endpoint == "https://hf-mirror.com"
+        assert settings.hf_cache_enabled is False
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
+        settings = HuggingFaceSettings(
+            endpoint="https://hf-mirror.com",
+            hf_cache_enabled=False,
+        )
         result = settings.to_dict()
-        assert result == {"endpoint": "https://hf-mirror.com"}
+        assert result == {
+            "endpoint": "https://hf-mirror.com",
+            "hf_cache_enabled": False,
+        }
 
     def test_to_dict_empty(self):
         """Test conversion to dictionary with empty endpoint."""
         settings = HuggingFaceSettings()
         result = settings.to_dict()
-        assert result == {"endpoint": ""}
+        assert result == {"endpoint": "", "hf_cache_enabled": True}
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"endpoint": "https://hf-mirror.com"}
+        data = {"endpoint": "https://hf-mirror.com", "hf_cache_enabled": False}
         settings = HuggingFaceSettings.from_dict(data)
         assert settings.endpoint == "https://hf-mirror.com"
+        assert settings.hf_cache_enabled is False
 
     def test_from_dict_defaults(self):
         """Test creation from empty dictionary uses defaults."""
         settings = HuggingFaceSettings.from_dict({})
         assert settings.endpoint == ""
+        assert settings.hf_cache_enabled is True
 
 
 class TestNetworkSettings:
@@ -628,11 +669,13 @@ class TestMemorySettings:
 
     def test_from_dict_ignores_legacy_keys(self):
         """Legacy max_process_memory / is_explicit keys in old settings.json are ignored."""
-        settings = MemorySettings.from_dict({
-            "max_process_memory": "80%",
-            "max_process_memory_is_explicit": True,
-            "memory_guard_tier": "safe",
-        })
+        settings = MemorySettings.from_dict(
+            {
+                "max_process_memory": "80%",
+                "max_process_memory_is_explicit": True,
+                "memory_guard_tier": "safe",
+            }
+        )
         assert settings.memory_guard_tier == "safe"
         assert not hasattr(settings, "max_process_memory")
 
@@ -657,6 +700,59 @@ class TestGlobalSettings:
             assert settings.cache.enabled is True
             assert settings.auth.api_key is None
             assert settings.mcp.config_path is None
+
+    def test_get_effective_model_dirs_includes_hf_cache_between_dirs(
+        self, tmp_path, monkeypatch
+    ):
+        """HF cache is inserted between primary and additional model dirs."""
+        primary = tmp_path / "primary"
+        additional = tmp_path / "additional"
+        hf_cache = tmp_path / "hf" / "hub"
+        primary.mkdir()
+        additional.mkdir()
+        hf_cache.mkdir(parents=True)
+        monkeypatch.setenv("HF_HUB_CACHE", str(hf_cache))
+
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.model.model_dirs = [str(primary), str(additional)]
+
+        assert settings.get_effective_model_dirs() == [
+            primary.resolve(),
+            hf_cache.resolve(),
+            additional.resolve(),
+        ]
+
+    def test_get_effective_model_dirs_skips_disabled_hf_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """Disabled HF cache is not included in discovery dirs."""
+        primary = tmp_path / "primary"
+        hf_cache = tmp_path / "hf" / "hub"
+        primary.mkdir()
+        hf_cache.mkdir(parents=True)
+        monkeypatch.setenv("HF_HUB_CACHE", str(hf_cache))
+
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        settings.model.model_dirs = [str(primary)]
+        settings.huggingface.hf_cache_enabled = False
+
+        assert settings.get_effective_model_dirs() == [primary.resolve()]
+
+    def test_cli_override_memory_guard_tier(self, tmp_path):
+        """CLI memory guard tier should override loaded settings."""
+        args = Namespace(memory_guard="safe", memory_guard_gb=None)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.memory_guard_tier == "safe"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 0.0
+
+    def test_cli_override_memory_guard_gb_sets_custom_tier(self, tmp_path):
+        """CLI memory guard GB should select custom tier automatically."""
+        args = Namespace(memory_guard=None, memory_guard_gb=48.0)
+        settings = GlobalSettings.load(base_path=tmp_path, cli_args=args)
+
+        assert settings.memory.memory_guard_tier == "custom"
+        assert settings.memory.memory_guard_custom_ceiling_gb == 48.0
 
     def test_load_from_file(self):
         """Test loading settings from JSON file."""
@@ -685,7 +781,11 @@ class TestGlobalSettings:
                 json.dumps(
                     {
                         "version": "1.0",
-                        "server": {"host": "0.0.0.0", "port": 9000, "log_level": "debug"},
+                        "server": {
+                            "host": "0.0.0.0",
+                            "port": 9000,
+                            "log_level": "debug",
+                        },
                         "model": {"model_dir": "/models"},
                         "memory": {"memory_guard_tier": "safe"},
                         "scheduler": {
@@ -857,6 +957,29 @@ class TestGlobalSettings:
             assert len(resolved_dirs) == 1
             assert resolved_dirs[0] == valid_models.resolve()
 
+    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Test that existing but unreadable model dirs are skipped."""
+        base = tmp_path / "omlx"
+        valid_models = tmp_path / "valid_models"
+        unreadable = tmp_path / "unreadable_models"
+        unreadable.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        settings = GlobalSettings(base_path=base)
+        settings.model.model_dirs = [str(valid_models), str(unreadable)]
+        settings.ensure_directories()
+
+        resolved_dirs = settings.model.get_model_dirs(base)
+        assert resolved_dirs == [valid_models.resolve()]
+
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
         settings = GlobalSettings()
@@ -915,6 +1038,13 @@ class TestGlobalSettings:
             errors = settings.validate()
             assert not any("memory_guard_tier" in e for e in errors)
 
+        settings = GlobalSettings()
+        settings.memory.memory_guard_tier = "custom"
+        settings.memory.memory_guard_custom_ceiling_gb = 48.0
+        errors = settings.validate()
+        assert not any("memory_guard_tier" in e for e in errors)
+        assert not any("memory_guard_custom_ceiling_gb" in e for e in errors)
+
     def test_validate_memory_guard_tier_invalid(self):
         """Test validation flags unknown tier values."""
         settings = GlobalSettings()
@@ -940,6 +1070,24 @@ class TestGlobalSettings:
         settings.cache.ssd_cache_max_size = "not-a-size"
         errors = settings.validate()
         assert any("ssd_cache_max_size" in e.lower() for e in errors)
+
+    def test_validate_hot_cache_size(self):
+        """Hot cache accepts explicit sizes only; auto is SSD-cache-only."""
+        settings = GlobalSettings()
+        settings.cache.hot_cache_max_size = "0"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "8GB"
+        assert not any("hot_cache_max_size" in e for e in settings.validate())
+
+        settings.cache.hot_cache_max_size = "auto"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
+        assert any("auto" in e for e in errors)
+
+        settings.cache.hot_cache_max_size = "not-a-size"
+        errors = settings.validate()
+        assert any("hot_cache_max_size" in e for e in errors)
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""
@@ -1078,16 +1226,12 @@ class TestGlobalSettings:
         """Test various values for OMLX_CACHE_ENABLED."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for value in ["true", "1", "yes"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is True
 
             for value in ["false", "0", "no"]:
-                with patch.dict(
-                    os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False
-                ):
+                with patch.dict(os.environ, {"OMLX_CACHE_ENABLED": value}, clear=False):
                     settings = GlobalSettings.load(base_path=tmpdir)
                     assert settings.cache.enabled is False
 
@@ -1368,7 +1512,10 @@ class TestInitSettings:
 
     def test_multiple_init_overwrites(self):
         """Test calling init_settings multiple times overwrites."""
-        with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir1,
+            tempfile.TemporaryDirectory() as tmpdir2,
+        ):
             settings1 = init_settings(base_path=tmpdir1)
             settings2 = init_settings(base_path=tmpdir2)
 
@@ -1523,7 +1670,11 @@ class TestSamplingSettings:
 
     def test_from_dict(self):
         """Test creation from dictionary."""
-        data = {"max_context_window": 8192, "max_tokens": 1024, "repetition_penalty": 1.2}
+        data = {
+            "max_context_window": 8192,
+            "max_tokens": 1024,
+            "repetition_penalty": 1.2,
+        }
         settings = SamplingSettings.from_dict(data)
         assert settings.max_context_window == 8192
         assert settings.max_tokens == 1024
@@ -1724,6 +1875,7 @@ class TestClaudeCodeRouteIntegration:
         the field in model_fields_set so the POST handler can clear it.
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest.model_validate({"claude_code_opus_model": None})
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model is None
@@ -1734,6 +1886,7 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set — POST handler must not apply it (leave server value alone).
         """
         from omlx.admin.routes import GlobalSettingsRequest
+
         r = GlobalSettingsRequest()
         assert "claude_code_opus_model" not in r.model_fields_set
 
@@ -1743,7 +1896,10 @@ class TestClaudeCodeRouteIntegration:
         in model_fields_set and carry the value.
         """
         from omlx.admin.routes import GlobalSettingsRequest
-        r = GlobalSettingsRequest(claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit")
+
+        r = GlobalSettingsRequest(
+            claude_code_opus_model="mlx-community/Qwen3-30B-A3B-4bit"
+        )
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
 

@@ -302,6 +302,8 @@
   "settings.model.add": "追加",
   "settings.model.placeholder_primary": "メインモデルディレクトリ",
   "settings.model.placeholder_additional": "追加モデルディレクトリ",
+  "settings.model.hf_cache": "Use Hugging Face local cache",
+  "settings.model.hf_cache_desc": "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
   "settings.model.idle_timeout": "アイドルタイムアウト",
   "settings.model.idle_timeout_desc": "アイドル時間がこの値を超えると自動的にモデルをアンロードします。モデルごとのTTL設定はこれを上書きします。",
   "settings.model.idle_timeout_none": "無効",

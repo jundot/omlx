@@ -88,6 +88,39 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertTrue(str.contains("\"embedding_batch_size\":8"), "got: \(str)")
     }
 
+    func testPatchEncodesModelDirsAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.modelDirs = ["/Users/test/.omlx/models", "/Users/test/.lmstudio/models"]
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["model_dirs"] as? [String], [
+            "/Users/test/.omlx/models",
+            "/Users/test/.lmstudio/models"
+        ])
+    }
+
+    func testPatchEncodesHfCacheEnabledAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.hfCacheEnabled = false
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["hf_cache_enabled"] as? Bool, false)
+    }
+
+    func testPatchEncodesHotCacheMaxSizeAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.hotCacheMaxSize = "8GB"
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["hot_cache_max_size"] as? String, "8GB")
+    }
+
     func testPatchEncodesSamplingFieldsAsSnakeCaseFlatKeys() throws {
         // The Python `GlobalSettingsRequest` accepts the sampling defaults
         // as flat `sampling_*` keys (omlx/admin/routes.py:229-234), not

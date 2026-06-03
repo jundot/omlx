@@ -1243,6 +1243,8 @@ def init_server(
         dir_list = [model_dirs]
     else:
         dir_list = list(model_dirs)
+    if global_settings and hasattr(global_settings, "get_effective_model_dirs"):
+        dir_list = [str(d) for d in global_settings.get_effective_model_dirs()]
 
     # Create directories if needed
     for md in dir_list:
@@ -2272,9 +2274,11 @@ async def create_chat_completion(
         if json_instruction:
             messages = _inject_json_instruction(messages, json_instruction)
 
-    # Merge MCP tools with user-provided tools
-    effective_tools = request.tools
-    if _server_state.mcp_manager:
+    # Merge MCP tools with user-provided tools unless the request explicitly
+    # disables tool use.
+    tools_disabled = request.tool_choice == "none"
+    effective_tools = None if tools_disabled else request.tools
+    if _server_state.mcp_manager and not tools_disabled:
         # Convert Pydantic ToolDefinition models to dicts for merge_tools
         user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
         effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)

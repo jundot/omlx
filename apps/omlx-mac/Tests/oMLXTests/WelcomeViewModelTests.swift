@@ -17,7 +17,7 @@ final class WelcomeViewModelTests: XCTestCase {
                         port: Int = 8000,
                         apiKey: String? = nil) -> WelcomeViewModel {
         let cfg = AppConfig(
-            host: "127.0.0.1",
+            bindAddress: "127.0.0.1",
             port: port,
             apiKey: apiKey,
             basePath: basePath,

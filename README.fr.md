@@ -55,7 +55,7 @@
 
 ### Application macOS
 
-Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. À noter que l'application macOS n'installe pas la commande CLI `omlx`. Pour une utilisation en terminal, installez via Homebrew ou depuis les sources.
+Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. L'application macOS installe aussi un shim CLI léger dans `~/.omlx/bin/omlx`, ce qui permet de contrôler le serveur géré par l'app depuis le terminal ou Apple Shortcuts.
 
 ### Homebrew
 

@@ -18,7 +18,18 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 
@@ -86,7 +97,8 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _global_mlx_executor
     if _global_mlx_executor is None:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-global",
+            max_workers=1,
+            thread_name_prefix="mlx-global",
             initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
@@ -100,6 +112,7 @@ class EngineConfig:
     scheduler_config: Optional[SchedulerConfig] = None
     step_interval: float = 0.001  # 1ms between steps
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
+    prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
 
 
 class EngineCore:
@@ -216,7 +229,7 @@ class EngineCore:
 
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
-        use_simple_streaming = (stream_interval == 1)
+        use_simple_streaming = stream_interval == 1
 
         while self._running:
             try:
@@ -225,6 +238,7 @@ class EngineCore:
                         self._mlx_executor, self.scheduler.step
                     )
                     self._steps_executed += 1
+                    eviction_request = output.prefill_eviction_request
 
                     # Fast path: distribute outputs to collectors
                     outputs = output.outputs
@@ -245,7 +259,7 @@ class EngineCore:
                                     state = states.get(rid)
                                     if state and state.should_send(
                                         req_output.completion_tokens,
-                                        req_output.finished
+                                        req_output.finished,
                                     ):
                                         collector.put(req_output)
                                         state.mark_sent(req_output.completion_tokens)
@@ -262,6 +276,33 @@ class EngineCore:
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    if eviction_request is not None:
+                        callback = self.config.prefill_eviction_callback
+                        if callback is not None:
+                            logger.info(
+                                "Running prefill LRU eviction for request %s",
+                                eviction_request.request_id,
+                            )
+                            evicted = await callback(eviction_request)
+                            if evicted:
+                                logger.info(
+                                    "Prefill LRU eviction completed for request %s",
+                                    eviction_request.request_id,
+                                )
+                            else:
+                                logger.info(
+                                    "No idle model evicted for request %s; "
+                                    "scheduler will fall back to throttling",
+                                    eviction_request.request_id,
+                                )
+                        else:
+                            logger.debug(
+                                "Prefill eviction requested for %s but no callback "
+                                "is configured",
+                                eviction_request.request_id,
+                            )
+                        continue
                 else:
                     # No work, yield control
                     await asyncio.sleep(step_interval)
@@ -270,6 +311,7 @@ class EngineCore:
                 break
             except Exception as e:
                 import traceback
+
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
                 # infinite loop (has_requests() must return False).
@@ -529,8 +571,7 @@ class EngineCore:
                         output = collector.get_nowait()
                         if output is None:
                             output = await asyncio.wait_for(
-                                collector.get(),
-                                timeout=timeout
+                                collector.get(), timeout=timeout
                             )
                     else:
                         output = collector.get_nowait() or await collector.get()

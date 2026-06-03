@@ -6,11 +6,12 @@ This module provides shared tokenizer configuration and fixes that are used
 across multiple modules in the codebase.
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
 
 def unwrap_tokenizer(tokenizer):
     """Unwrap mlx-lm TokenizerWrapper to a HuggingFace PreTrainedTokenizer.
@@ -141,6 +142,43 @@ def is_qwen3_model(model_name: str) -> bool:
     return "qwen3" in model_lower or "Qwen3" in model_name
 
 
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("Failed to read %s: %s", path, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_lfm2_text_lm(model_name: str) -> bool:
+    """Return True for local LFM2 text causal LM checkpoints."""
+    config_path = Path(model_name) / "config.json"
+    config = _read_json_file(config_path)
+    if config is None:
+        return False
+
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    architectures = [
+        str(arch) for arch in config.get("architectures", []) if isinstance(arch, str)
+    ]
+    architectures_lower = [arch.lower() for arch in architectures]
+
+    if model_type in {"lfm_audio", "lfm2_audio"}:
+        return False
+    if any(key in config for key in ("audio_config", "tts_config", "stt_config")):
+        return False
+    if any("audio" in arch for arch in architectures_lower):
+        return False
+    if not any("forcausallm" in arch for arch in architectures_lower):
+        return False
+
+    return model_type.startswith("lfm2") or any(
+        arch.lower().startswith("lfm2") for arch in architectures
+    )
+
+
 def get_tokenizer_config(
     model_name: str,
     trust_remote_code: bool = False,
@@ -164,6 +202,10 @@ def get_tokenizer_config(
     if is_qwen3_model(model_name):
         config["eos_token"] = "<|im_end|>"
         logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
+
+    if _is_lfm2_text_lm(model_name):
+        config.setdefault("tool_parser_type", "pythonic")
+        logger.debug("LFM2 text LM detected: setting tool_parser_type to pythonic")
 
     return config
 

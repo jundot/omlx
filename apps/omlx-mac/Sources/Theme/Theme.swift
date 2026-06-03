@@ -73,11 +73,11 @@ struct OMLXTheme: Sendable {
 extension OMLXTheme {
     static let light = OMLXTheme(
         isDark: false,
-        windowBg: systemWindowBg,
-        sidebarBg: systemWindowBg,
+        windowBg: systemWindowBgLight,
+        sidebarBg: systemWindowBgLight,
         sidebarBorder: systemSeparator,
-        contentBg: systemWindowBg,
-        toolbarBg: systemWindowBg,
+        contentBg: systemWindowBgLight,
+        toolbarBg: systemWindowBgLight,
         toolbarBorder: systemSeparator,
         groupBg: systemGroupBgLight,
         groupBorder: systemSeparator,
@@ -93,7 +93,7 @@ extension OMLXTheme {
         hoverBg: systemHover,
         controlBg: systemControlBg,
         controlBgHover: systemControlBg.opacity(0.92),
-        glassBg: systemWindowBg.opacity(0.70),
+        glassBg: systemWindowBgLight.opacity(0.70),
         glassBgStrong: systemGroupBgLight,
         inputBg: systemInputBg,
         inputBorder: systemSeparator,
@@ -109,7 +109,7 @@ extension OMLXTheme {
         successText: systemGreen,
         desktopWashTopLeft: .clear,
         desktopWashBottomRight: .clear,
-        desktopWashBase: systemWindowBg,
+        desktopWashBase: systemWindowBgLight,
         groupHighlightTopOpacity: 0.35,
         groupShadowOpacity: 0.06
     )
@@ -161,8 +161,12 @@ extension OMLXTheme {
         Color(nsColor: .underPageBackgroundColor)
     }
 
-    private static var systemGroupBgLight: Color {
+    private static var systemWindowBgLight: Color {
         Color(nsColor: .windowBackgroundColor)
+    }
+
+    private static var systemGroupBgLight: Color {
+        Color(nsColor: .labelColor).opacity(0.035)
     }
 
     private static var systemGroupBgDark: Color {
