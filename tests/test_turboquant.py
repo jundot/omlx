@@ -425,10 +425,12 @@ def test_turboquant_eligible_gate():
 
     from omlx.scheduler import Scheduler
 
-    # _turboquant_eligible is pure (ignores self); call the unbound method
-    # with a throwaway self so we don't construct a full Scheduler.
+    # _turboquant_eligible consults the model for MLA architecture (#1613)
+    # before checking cache types; inject a non-MLA stub so this test isolates
+    # the cache-type gating it is exercising.
     def elig(cache):
-        return Scheduler._turboquant_eligible(SimpleNamespace(), cache)
+        stub = SimpleNamespace(_model_uses_mla=lambda: False)
+        return Scheduler._turboquant_eligible(stub, cache)
 
     assert elig([KVCache(), KVCache()]) is True
     assert elig([]) is False

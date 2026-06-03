@@ -16,6 +16,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -2526,3 +2527,105 @@ class TestBuildStateMachineStopStrings:
                 assert tok in node
                 node = node[tok]
             assert "__match__" in node
+
+
+class TestTurboQuantMLAGuard:
+    """Regression tests for #1613: MLA models must not be TurboQuant-converted.
+
+    GLM-4.7-Flash / DeepSeek use Multi-head Latent Attention and read fetched
+    cache tensors directly (k_pe.swapaxes(...)), which crashes on TurboQuant's
+    quantized NamedTuple states ('TurboQuantMSEState' object has no attribute
+    'swapaxes'). _turboquant_eligible() must return False for them so they stay
+    fp16.
+    """
+
+    def test_mla_model_ineligible_by_config(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # MLA config exposes kv_lora_rank (GLM-4.7-Flash, DeepSeek-V*).
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(kv_lora_rank=512))
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_model_ineligible_by_architecture(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # No kv_lora_rank in config, but an attention submodule with the MLA
+        # down-projection / latent layernorm.
+        attn = SimpleNamespace(
+            kv_a_proj_with_mqa=object(),
+            kv_a_layernorm=object(),
+            kv_lora_rank=512,
+        )
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(), modules=lambda: [attn]
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_standard_model_still_eligible(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # Standard MHA/GQA model: no kv_lora_rank, no MLA submodules.
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(num_hidden_layers=4), modules=lambda: []
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is False
+        assert scheduler._turboquant_eligible([KVCache()]) is True
+
+    def test_mla_model_ineligible_nested_text_config(self, mock_model, mock_tokenizer):
+        # VLM MLA (e.g. kimi_vl): kv_lora_rank is nested under text_config, not
+        # on the top-level args.
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(text_config=SimpleNamespace(kv_lora_rank=512))
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_vlm_adapter_delegates_to_language_model(
+        self, mock_model, mock_tokenizer
+    ):
+        # VLMModelAdapter exposes _language_model; its args surface kv_lora_rank.
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        lm = SimpleNamespace(args=SimpleNamespace(kv_lora_rank=512))
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(), _language_model=lm)
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_detection_is_memoized(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        calls = {"n": 0}
+
+        def _modules():
+            calls["n"] += 1
+            return []
+
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(), modules=_modules)
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is False
+        assert scheduler._model_uses_mla() is False
+        assert calls["n"] == 1  # walked once, then cached

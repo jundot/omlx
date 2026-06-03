@@ -793,6 +793,8 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
+        self._mla_model: bool | None = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1715,6 +1717,88 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
+    def _model_uses_mla(self) -> bool:
+        """Detect Multi-head Latent Attention models (DeepSeek-V2/V3/V4,
+        GLM-4-MoE / GLM-4.7-Flash, Kimi-K2, ...).
+
+        MLA compresses K/V into a low-rank latent plus a separate rope key and
+        reads the *fetched* cache tensors directly — e.g.
+        ``kv_latent, k_pe = cache.update_and_fetch(...)`` then
+        ``k_pe.swapaxes(-1, -2)`` (mlx_lm/models/glm4_moe_lite.py). TurboQuant
+        replaces the cache state with quantized NamedTuples that have no array
+        methods, so that ``.swapaxes`` raises ``AttributeError`` (#1613). MLA
+        also stores keys/values with mismatched head dims, which the codec does
+        not support. Such models stay fp16 — no crash, no TurboQuant.
+
+        Result is memoized: the model never changes for a scheduler instance.
+        """
+        cached = getattr(self, "_mla_model", None)
+        if cached is not None:
+            return cached
+
+        detected = False
+        model = getattr(self, "model", None)
+
+        # kv_lora_rank is the defining MLA hyperparameter and is an int on real
+        # models. It may sit on the top-level config or be nested under a
+        # text/LM sub-config (VLM MLA, e.g. kimi_vl -> text_config). The
+        # isinstance(int) check guards against mocks where it is a sentinel.
+        def _cfg_has_kv_lora(cfg: Any, depth: int = 0) -> bool:
+            if cfg is None or depth > 3:
+                return False
+            if isinstance(getattr(cfg, "kv_lora_rank", None), int):
+                return True
+            return any(
+                _cfg_has_kv_lora(getattr(cfg, sub, None), depth + 1)
+                for sub in (
+                    "text_config",
+                    "llm_config",
+                    "language_config",
+                    "thinker_config",
+                )
+            )
+
+        # Config signal. For VLMs the scheduler sees VLMModelAdapter, whose
+        # .args delegates to the language model; also probe (_)language_model.
+        for holder in (
+            model,
+            getattr(model, "_language_model", None),
+            getattr(model, "language_model", None),
+        ):
+            if holder is None:
+                continue
+            if _cfg_has_kv_lora(getattr(holder, "args", None)) or _cfg_has_kv_lora(
+                getattr(holder, "config", None)
+            ):
+                detected = True
+                break
+
+        # Architecture signal: an attention submodule carrying the MLA
+        # down-projection, latent layernorm, or latent rank. Covers models
+        # whose config does not surface kv_lora_rank where the scheduler can
+        # see it (e.g. a directly-loaded VLM with a nested text config).
+        if not detected and model is not None and hasattr(model, "modules"):
+            try:
+                for m in model.modules():
+                    if (
+                        hasattr(m, "kv_a_proj_with_mqa")
+                        or hasattr(m, "kv_a_layernorm")
+                        or isinstance(getattr(m, "kv_lora_rank", None), int)
+                    ):
+                        detected = True
+                        break
+            except Exception:
+                pass
+
+        if detected:
+            logger.info(
+                "TurboQuant disabled: model uses Multi-head Latent Attention "
+                "(MLA), which is incompatible with quantized KV cache states; "
+                "keeping fp16 KV cache (#1613)."
+            )
+        self._mla_model = detected
+        return detected
+
     def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
         """True if every cache layer can be safely TurboQuant-converted for
         continuous batching.
@@ -1725,8 +1809,15 @@ class Scheduler:
         rotating-attention caches (Llama-4, sliding-window) need
         maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
         not provide, so those models stay fp16 — no crash, no TurboQuant.
+
+        MLA models (DeepSeek / GLM-4.7-Flash) are also excluded: they keep
+        plain KVCache objects but read fetched cache tensors directly, which
+        TurboQuant's quantized states do not support (#1613).
         """
         from mlx_lm.models.cache import CacheList, KVCache
+
+        if self._model_uses_mla():
+            return False
 
         def _ok(c: Any) -> bool:
             if isinstance(c, KVCache):
