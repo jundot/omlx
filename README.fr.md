@@ -170,6 +170,7 @@ Chargez des LLM, VLM, modèles d'embedding et rerankers sur le même serveur. Le
 Configurez les paramètres d'échantillonnage, les kwargs du template de chat, le TTL, l'alias du modèle, le type de modèle, et plus encore — directement depuis le panneau d'admin. Les modifications s'appliquent immédiatement sans redémarrage du serveur.
 
 - **Alias de modèle** : définissez un nom personnalisé visible par l'API. `/v1/models` retourne l'alias, et les requêtes acceptent l'alias comme le nom du répertoire.
+- **Profil de modèle** : configurez des paramètres personnalisés pour chaque profil de modèle. Peut être utilisé "à la volée" avec un séparateur `:`. Le format `(model_name|model_alias):model_profile name` traitera la requête avec le profil sélectionné. Si aucun profil n'est fourni, les paramètres par défaut seront utilisés.
 - **Type de modèle** : forcez manuellement un modèle en LLM ou VLM indépendamment de l'auto-détection.
 
 <p align="center">

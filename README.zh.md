@@ -167,9 +167,10 @@ brew services info omlx     # 查看状态
 ### 模型级设置
 
 在管理后台直接配置每个模型的采样参数、聊天模板参数、TTL、模型别名、模型类型覆盖等。修改即时生效，无需重启服务器。
-
 - **模型别名**: 设置自定义 API 显示名称。`/v1/models` 返回别名，请求时别名和目录名均可使用。
+- **模型配置文件**: 为每个模型配置文件设置自定义配置。可以使用 `:` 分隔符即时使用。例如 `(model_name|model_alias):model_profile name` 这样的模式会使用选定的配置文件处理请求。如果未提供配置文件 - 则使用默认值。
 - **模型类型覆盖**: 无论自动检测结果如何，手动设置为 LLM 或 VLM。
+
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX 聊天模板参数" width="480">
