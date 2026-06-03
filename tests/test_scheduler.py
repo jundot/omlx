@@ -12,7 +12,7 @@ Tests cover:
 - get_request(): request lookup
 - get_stats(): statistics
 
-Note: BatchGenerator is mocked; step() is too complex for unit tests.
+Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
 from collections import deque
@@ -157,6 +157,44 @@ class TestSchedulerOutput:
         assert len(output.outputs) == 1
         assert output.outputs[0].request_id == "req-1"
         assert output.has_work is True
+
+
+class TestSchedulerStepOutputs:
+    """Tests for Scheduler.step output assembly."""
+
+    def test_decode_outputs_preserve_prefill_rejections(
+        self, mock_model, mock_tokenizer
+    ):
+        """Decode responses must not overwrite earlier rejection outputs."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        prefill_error = RequestOutput(
+            request_id="prefill-failed",
+            finished=True,
+            finish_reason="error",
+            error="Memory limit exceeded during prefill",
+        )
+        decode_output = RequestOutput(
+            request_id="running",
+            new_token_ids=[123],
+            new_text="x",
+        )
+
+        scheduler._schedule_waiting = MagicMock(return_value=([], [prefill_error]))
+        scheduler._process_batch_responses = MagicMock(
+            return_value=([decode_output], {"running"})
+        )
+        scheduler._cleanup_finished = MagicMock()
+
+        scheduler.running = {"running": MagicMock()}
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = iter([MagicMock()])
+
+        output = scheduler.step()
+
+        assert output.outputs == [prefill_error, decode_output]
+        assert output.finished_request_ids == {"running"}
+        scheduler._cleanup_finished.assert_called_once_with({"running"})
 
 
 class TestSchedulerInitialization:
