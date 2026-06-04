@@ -3078,7 +3078,11 @@ async def update_global_settings(
     if request.ms_endpoint is not None:
         global_settings.modelscope.endpoint = request.ms_endpoint
         if request.ms_endpoint:
-            os.environ["MODELSCOPE_DOMAIN"] = request.ms_endpoint
+            # modelscope SDK wants a bare host (it prepends https://); strip any
+            # scheme so we never end up with https://https://modelscope.cn.
+            os.environ["MODELSCOPE_DOMAIN"] = (
+                request.ms_endpoint.split("://", 1)[-1].strip("/")
+            )
         elif "MODELSCOPE_DOMAIN" in os.environ:
             del os.environ["MODELSCOPE_DOMAIN"]
         runtime_applied.append("ms_endpoint")

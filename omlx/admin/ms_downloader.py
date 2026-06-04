@@ -49,22 +49,24 @@ _MIN_DOWNLOADS = 50
 
 
 def _get_ms_endpoint() -> str:
-    """Get the configured ModelScope endpoint URL."""
-    # Check environment variable first (set by CLI/settings)
+    """Get the configured ModelScope endpoint as a full URL (with scheme).
+
+    MODELSCOPE_DOMAIN is a *bare host* (the form the modelscope SDK requires, since
+    it prepends https://), so re-add the scheme here for our own /api/v1 URL
+    construction. A full URL is accepted too (idempotent).
+    """
     endpoint = os.environ.get("MODELSCOPE_DOMAIN", "")
-    if endpoint:
-        return endpoint.rstrip("/")
+    if not endpoint:
+        try:
+            from ..settings import get_settings
 
-    try:
-        from ..settings import get_settings
-
-        endpoint = get_settings().modelscope.endpoint
-        if endpoint:
-            return endpoint.rstrip("/")
-    except (RuntimeError, AttributeError):
-        pass
-
-    return _DEFAULT_MS_ENDPOINT
+            endpoint = get_settings().modelscope.endpoint or ""
+        except (RuntimeError, AttributeError):
+            endpoint = ""
+    endpoint = (endpoint or _DEFAULT_MS_ENDPOINT).rstrip("/")
+    if not endpoint.startswith(("http://", "https://")):
+        endpoint = "https://" + endpoint
+    return endpoint
 
 
 def _get_ms_api():
