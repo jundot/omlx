@@ -245,6 +245,41 @@ class TestExtractGemma4Messages:
         assert "tool_calls" in result[0]
         assert result[0]["tool_calls"][0]["function"]["name"] == "search"
 
+    def test_stray_tool_call_close_marker_stripped_from_content(self):
+        """Stray ``<tool_call|>`` in content is stripped; tool_calls are preserved."""
+        msg = Message(
+            role="assistant",
+            content="<tool_call|>",
+            tool_calls=[_tool_call_dict("c1", "search")],
+        )
+        result = extract_gemma4_messages([msg])
+        assert result[0]["content"] == ""
+        assert "tool_calls" in result[0]
+
+    def test_stray_tool_call_open_marker_stripped_from_content(self):
+        """A bare ``<|tool_call>`` in assistant content is stripped; void message dropped."""
+        msg = Message(role="assistant", content="<|tool_call>")
+        result = extract_gemma4_messages([msg])
+        assert result == []
+
+    def test_stray_markers_stripped_leaving_surrounding_prose(self):
+        """Prose surrounding a stray marker is preserved; only the marker is removed."""
+        msg = Message(role="assistant", content="Here is the result.<tool_call|>")
+        result = extract_gemma4_messages([msg])
+        assert result[0]["content"] == "Here is the result."
+
+    def test_multiple_stray_markers_stripped_from_prose(self):
+        """Multiple stray markers in prose are all removed."""
+        msg = Message(role="assistant", content="Part 1.<tool_call|>Part 2.<tool_call|>")
+        result = extract_gemma4_messages([msg])
+        assert result[0]["content"] == "Part 1.Part 2."
+
+    def test_both_stray_markers_stripped_together(self):
+        """Both open and close markers removed; resulting void message is dropped."""
+        msg = Message(role="assistant", content="<|tool_call><tool_call|>")
+        result = extract_gemma4_messages([msg])
+        assert result == []
+
 
 class TestStripThinking:
     """``_strip_thinking`` removes leading thought blocks only."""
