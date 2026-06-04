@@ -78,8 +78,11 @@ def serve_command(args):
     import uvicorn
 
     from ._version import __version__
+    from . import process_title
     from .settings import init_settings, get_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
+
+    process_title.set_process_title()
 
     try:
         from ._build_info import build_number

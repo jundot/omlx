@@ -67,6 +67,7 @@ from .api.anthropic_models import (
     TokenCountRequest,
     TokenCountResponse,
 )
+from .process_title import set_process_title
 from .api.anthropic_utils import (
     convert_anthropic_to_internal,
     convert_anthropic_to_internal_harmony,
@@ -4976,13 +4977,13 @@ Note: Use the omlx CLI for full feature support.
 
     # Parse pinned models
     pinned_models = args.pin.split(",") if args.pin else []
-
+    set_process_title()
     # Initialize server
     init_server(
-        model_dir=args.model_dir,
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+        model_dirs=args.model_dir,
+        # pinned_models=pinned_models,
+        # default_model=args.default_model,
+        # max_tokens=args.max_tokens,
     )
 
     # Start server
