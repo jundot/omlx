@@ -1,6 +1,162 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "profile.detail.acceleration.vlm_mtp" : {
+      "comment" : "Acceleration chip: VLM multi-token prediction",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.block_size.label" : {
+      "comment" : "Row label for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft Block Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.block_size.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens drafted per round. Empty uses the mlx-vlm default."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.label" : {
+      "comment" : "Row label for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM Draft Model"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Assistant drafter sharing the target's tokenizer."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.label" : {
+      "comment" : "Row label for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.sub" : {
+      "comment" : "Default sublabel for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+          }
+        }
+      }
+    },
+    "settings.mtp.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling Native MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.dflash" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable DFlash before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.mtp" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Native MTP before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.specprefill" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable SpecPrefill before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.turboquant" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable TurboQuant KV before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.draft.placeholder" : {
+      "comment" : "Initial placeholder option in the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select assistant drafter…"
+          }
+        }
+      }
+    },
     "" : {
 
     },

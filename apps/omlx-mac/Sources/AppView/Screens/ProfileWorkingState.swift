@@ -134,6 +134,9 @@ enum ProfileSettingsKey {
     static let dflashInMemoryCacheMaxBytes = "dflash_in_memory_cache_max_bytes"
     static let dflashSsdCache = "dflash_ssd_cache"
     static let mtpEnabled = "mtp_enabled"
+    static let vlmMtpEnabled = "vlm_mtp_enabled"
+    static let vlmMtpDraftModel = "vlm_mtp_draft_model"
+    static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"
 }
 
 /// Resolves the *display* scope for the model's currently active profile.
