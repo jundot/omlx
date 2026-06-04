@@ -4980,10 +4980,10 @@ Note: Use the omlx CLI for full feature support.
     set_process_title()
     # Initialize server
     init_server(
-        model_dirs=args.model_dir,
-        # pinned_models=pinned_models,
-        # default_model=args.default_model,
-        # max_tokens=args.max_tokens,
+        model_dir=args.model_dir,
+        pinned_models=pinned_models,
+        default_model=args.default_model,
+        max_tokens=args.max_tokens,
     )
 
     # Start server
