@@ -845,6 +845,10 @@ class ToolCallStreamFilter:
         # Same for suppress-after markers (e.g. "[TOOL" for "[TOOL_CALLS]").
         for sa_marker in self._suppress_after_markers:
             keep = max(keep, self._partial_prefix_len(text, sa_marker))
+        # Hold partial prefix of a stray-close marker so it reassembles before
+        # the strip check — prevents the "hello<tool_call|" + ">" split leak.
+        for close_marker in self._stray_close_markers:
+            keep = max(keep, self._partial_prefix_len(text, close_marker))
 
         bracket_idx = -1
         for bp in self._bracket_prefixes:
@@ -1010,9 +1014,6 @@ class ToolCallStreamFilter:
             self._buffer = ""
             if self._should_drop_tail_at_finish(tail):
                 return ""
-            for close in self._stray_close_markers:
-                if close in tail:
-                    tail = tail.replace(close, "")
             return tail
 
         if keep:
