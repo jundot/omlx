@@ -82,6 +82,7 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.claudeCode,    "claude_code block missing")
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
         XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
+        XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
     }
 
     // MARK: - Models list

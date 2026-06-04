@@ -90,15 +90,27 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: DFlash (block diffusion speculative decoding)
     let dflashEnabled: Bool?
     let dflashDraftModel: String?
-    let dflashDraftQuantBits: Int?
+    let dflashDraftQuantEnabled: Bool?
+    let dflashDraftQuantWeightBits: Int?
+    let dflashDraftQuantActivationBits: Int?
+    let dflashDraftQuantGroupSize: Int?
     let dflashMaxCtx: Int?
     let dflashInMemoryCache: Bool?
+    let dflashInMemoryCacheMaxEntries: Int?
     /// Stored in bytes server-side; the editor row exposes a GiB-scaled
     /// view via `DflashByteSize.gibToBytes` / `bytesToGib`.
     let dflashInMemoryCacheMaxBytes: Int64?
     let dflashSsdCache: Bool?
+    let dflashSsdCacheMaxBytes: Int64?
+    let dflashDraftWindowSize: Int?
+    let dflashDraftSinkSize: Int?
+    let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
+    let vlmMtpEnabled: Bool?
+    let vlmMtpDraftModel: String?
+    let vlmMtpDraftBlockSize: Int?
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
@@ -141,13 +153,25 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: DFlash
     var dflashEnabled: Bool? = nil
     var dflashDraftModel: String? = nil
-    var dflashDraftQuantBits: Int? = nil
+    var dflashDraftQuantEnabled: Bool? = nil
+    var dflashDraftQuantWeightBits: Int? = nil
+    var dflashDraftQuantActivationBits: Int? = nil
+    var dflashDraftQuantGroupSize: Int? = nil
     var dflashMaxCtx: Int? = nil
     var dflashInMemoryCache: Bool? = nil
+    var dflashInMemoryCacheMaxEntries: Int? = nil
     var dflashInMemoryCacheMaxBytes: Int64? = nil
     var dflashSsdCache: Bool? = nil
+    var dflashSsdCacheMaxBytes: Int64? = nil
+    var dflashDraftWindowSize: Int? = nil
+    var dflashDraftSinkSize: Int? = nil
+    var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    // Experimental: VLM MTP
+    var vlmMtpEnabled: Bool? = nil
+    var vlmMtpDraftModel: String? = nil
+    var vlmMtpDraftBlockSize: Int? = nil
 }
 
 /// Generic acknowledgment shape returned by non-streaming admin endpoints

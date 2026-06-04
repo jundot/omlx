@@ -574,18 +574,7 @@ class TestScheduleWaitingChunkedFork:
         assert result == 1024
 
     def test_adaptive_throttle_tier_512(self):
-        """25-50% of band → 512."""
-        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 35% of band: 8 + 4*0.35 = 9.4 GB
-        a, b = self._mock_current(sched, 9.4)
-        with a, b:
-            result = sched._adaptive_chunk_size(
-                2048, request_id="r1", loop_label="external"
-            )
-        assert result == 512
-
-    def test_adaptive_throttle_tier_256(self):
-        """50-75% of band → 256."""
+        """50%+ of band → 512."""
         sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
         # 60% of band: 8 + 4*0.60 = 10.4 GB
         a, b = self._mock_current(sched, 10.4)
@@ -593,29 +582,18 @@ class TestScheduleWaitingChunkedFork:
             result = sched._adaptive_chunk_size(
                 2048, request_id="r1", loop_label="external"
             )
-        assert result == 256
-
-    def test_adaptive_throttle_tier_128(self):
-        """75%+ of band → 128 (or min_chunk if larger)."""
-        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 80% of band: 8 + 4*0.80 = 11.2 GB
-        a, b = self._mock_current(sched, 11.2)
-        with a, b:
-            result = sched._adaptive_chunk_size(
-                2048, request_id="r1", loop_label="external"
-            )
-        assert result == 128
+        assert result == 512
 
     def test_adaptive_throttle_requested_smaller_than_tier(self):
         """Requested chunk already smaller than the tier target → pass through."""
         sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 80% of band → tier 128. But requested=64 < 128.
-        a, b = self._mock_current(sched, 11.2)
+        # 60% of band → tier 512. But requested=256 < 512.
+        a, b = self._mock_current(sched, 10.4)
         with a, b:
             result = sched._adaptive_chunk_size(
-                64, request_id="r1", loop_label="external"
+                256, request_id="r1", loop_label="external"
             )
-        assert result == 64
+        assert result == 256
 
     def test_adaptive_throttle_no_cap_passthrough(self):
         """When hard limit or soft base is unset (=0), no throttle."""

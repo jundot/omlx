@@ -411,11 +411,12 @@ def _write_engine_commits(omlx_pkg_dir: Path):
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
+        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
     }
 
     commits = {}
     for full_req, git_url in git_reqs:
-        pkg_name = full_req.split("@")[0].strip().lower()
+        pkg_name = full_req.split("@")[0].strip().lower().split("[", 1)[0]
         # git_url format: git+https://github.com/ml-explore/mlx-lm@bcf6306...
         if "@" in git_url:
             commit = git_url.rsplit("@", 1)[1]
@@ -1078,6 +1079,11 @@ def main():
                         help="Print the donor fingerprint and exit. "
                              "`build.sh` uses this to detect drift between "
                              "sources and the cached `_export/`.")
+    parser.add_argument("--write-engine-commits",
+                        metavar="OMLX_PACKAGE_DIR",
+                        help="Write _engine_commits.json into the given "
+                             "staged omlx package directory and exit. "
+                             "`build.sh` uses this after copying Resources/omlx.")
     parser.add_argument("--macos-target",
                         help="Target macOS version for mlx/mlx-metal wheels "
                              "(e.g. 26.0). Downloads platform-specific wheels "
@@ -1086,6 +1092,10 @@ def main():
 
     if args.print_fingerprint:
         print(_compute_donor_fingerprint())
+        return
+
+    if args.write_engine_commits:
+        _write_engine_commits(Path(args.write_engine_commits))
         return
 
     print(f"Building {APP_NAME} v{VERSION}")

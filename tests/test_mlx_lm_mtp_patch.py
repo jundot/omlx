@@ -625,6 +625,34 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_singleton_activation_blocked_after_standard_multirow_decode(self):
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(batch) is False
+
+            batch._omlx_mtp_state = batch_generator._MtpState(uid=1)
+            assert batch_generator._is_mtp_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
     def test_batch_generator_activation_safe_helper(self):
         from collections import deque
 

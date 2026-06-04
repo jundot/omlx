@@ -54,7 +54,7 @@
 
 ### macOSアプリ
 
-[Releases](https://github.com/jundot/omlx/releases)から`.dmg`をダウンロードし、Applicationsにドラッグするだけです。アプリ内自動アップデートに対応しているので、以降のアップグレードはワンクリックで完了します。macOSアプリには`omlx` CLIコマンドは含まれていません。ターミナルで使用するにはHomebrewまたはソースからインストールしてください。
+[Releases](https://github.com/jundot/omlx/releases)から`.dmg`をダウンロードし、Applicationsにドラッグするだけです。アプリ内自動アップデートに対応しているので、以降のアップグレードはワンクリックで完了します。macOSアプリは軽量な`~/.omlx/bin/omlx` CLI shimもインストールするため、ターミナルコマンドやApple Shortcutsからアプリ管理のサーバーを制御できます。
 
 ### Homebrew
 

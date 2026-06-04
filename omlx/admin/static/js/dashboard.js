@@ -37,7 +37,7 @@
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
-                huggingface: { endpoint: '' },
+                huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
@@ -707,6 +707,9 @@
                         this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
+                        this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
+                            this.globalSettings.cache.hot_cache_max_size
+                        );
                         this.hotCachePercent = this.parseHotCacheToPercent(
                             this.globalSettings.cache.hot_cache_max_size,
                             this.globalSettings.system.total_memory_bytes
@@ -776,7 +779,9 @@
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
-                            hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
+                            hot_cache_max_size: this.normalizeHotCacheMaxSize(
+                                this.globalSettings.cache.hot_cache_max_size
+                            ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
@@ -786,6 +791,7 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
                             network_no_proxy: this.globalSettings.network.no_proxy,
@@ -2091,10 +2097,8 @@
             },
 
             _launchCmd(tool) {
-                // cli_prefix is always "omlx" or an app-bundle path with no
-                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
-                // in the dashboard command display.
-                const cli = this.stats.cli_prefix || 'omlx';
+                const raw = this.stats.cli_prefix || 'omlx';
+                const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
                 return `${cli} launch ${tool}`;
             },
 
@@ -3469,7 +3473,7 @@
                         ? 2
                         : totalGB < 16
                             ? 4
-                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
+                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
@@ -3584,6 +3588,12 @@
             },
 
             // Parse hot cache size string to percent of total memory
+            normalizeHotCacheMaxSize(value) {
+                const normalized = String(value ?? '').trim();
+                if (!normalized || normalized.toLowerCase() === 'auto') return '0';
+                return normalized;
+            },
+
             parseHotCacheToPercent(hotCacheStr, totalBytes) {
                 if (!hotCacheStr || hotCacheStr === '0' || !totalBytes || totalBytes === 0) {
                     return 0;

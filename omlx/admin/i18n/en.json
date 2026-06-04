@@ -302,6 +302,8 @@
   "settings.model.add": "Add",
   "settings.model.placeholder_primary": "Primary model directory",
   "settings.model.placeholder_additional": "Additional model directory",
+  "settings.model.hf_cache": "Use Hugging Face local cache",
+  "settings.model.hf_cache_desc": "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
   "settings.model.idle_timeout": "Idle Timeout",
   "settings.model.idle_timeout_desc": "Automatically unload models after inactivity. Per-model TTL overrides this.",
   "settings.model.idle_timeout_none": "None (disabled)",

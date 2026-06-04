@@ -1,6 +1,174 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "profile.detail.acceleration.vlm_mtp" : {
+      "comment" : "Acceleration chip: VLM multi-token prediction",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.block_size.label" : {
+      "comment" : "Row label for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft Block Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.block_size.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens drafted per round. Empty uses the mlx-vlm default."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.label" : {
+      "comment" : "Row label for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM Draft Model"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Assistant drafter sharing the target's tokenizer."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.label" : {
+      "comment" : "Row label for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.sub" : {
+      "comment" : "Default sublabel for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+          }
+        }
+      }
+    },
+    "settings.speculative.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling this feature."
+          }
+        }
+      }
+    },
+    "settings.mtp.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling Native MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.dflash" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable DFlash before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.mtp" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Native MTP before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.specprefill" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable SpecPrefill before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.turboquant" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable TurboQuant KV before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.draft.placeholder" : {
+      "comment" : "Initial placeholder option in the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select assistant drafter…"
+          }
+        }
+      }
+    },
     "" : {
 
     },
@@ -1602,6 +1770,18 @@
         }
       }
     },
+    "common.copy_model_id" : {
+      "comment" : "Tooltip and accessibility label for a button that copies a model identifier",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy model ID"
+          }
+        }
+      }
+    },
     "common.create" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -2965,7 +3145,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Server: stopped"
+            "value" : "oMLX stopped"
           }
         }
       }
@@ -7320,6 +7500,30 @@
         }
       }
     },
+    "server.row.auto_start_on_launch" : {
+      "comment" : "Row label for the server auto-start on app launch toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically start server on launch"
+          }
+        }
+      }
+    },
+    "server.row.auto_start_on_launch.sub" : {
+      "comment" : "Sublabel under the server auto-start on app launch toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When disabled, the menu bar app opens without starting the server."
+          }
+        }
+      }
+    },
     "server.row.listen_address" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -7443,6 +7647,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Logging"
+          }
+        }
+      }
+    },
+    "server.section.startup" : {
+      "comment" : "Section heading for server launch behavior settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server Startup"
           }
         }
       }
@@ -10166,25 +10382,25 @@
       }
     },
     "status.updates.auto_download" : {
-      "comment" : "Row label for the auto-download updates toggle",
+      "comment" : "Row label for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Auto-download Updates"
+            "value" : "Notify About Updates"
           }
         }
       }
     },
     "status.updates.auto_download.sub" : {
-      "comment" : "Sublabel for the auto-download toggle",
+      "comment" : "Sublabel for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Download in the background, then show Install & Restart"
+            "value" : "Show release notes before downloading in the background"
           }
         }
       }
@@ -10244,6 +10460,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Check Now"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_button" : {
+      "comment" : "Updates action button label while the download is in progress; placeholder is the percent complete",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading… %lld%%"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_primary" : {
+      "comment" : "Primary update status line while the new build is downloading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading update…"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_secondary" : {
+      "comment" : "Secondary update status line during download; placeholder is the percent complete",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading · %lld%%"
+          }
+        }
+      }
+    },
+    "status.updates.error_primary" : {
+      "comment" : "Primary update status line when checking for updates failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update check failed"
           }
         }
       }
@@ -10331,6 +10595,18 @@
         }
       }
     },
+    "status.updates.ready_secondary" : {
+      "comment" : "Secondary update status line once the staged bundle is ready; placeholder is the version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is ready to install"
+          }
+        }
+      }
+    },
     "status.updates.title" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10366,6 +10642,138 @@
         }
       }
     },
+    "update.confirm.empty_notes" : {
+      "comment" : "Empty state when a GitHub release has no release notes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This release does not include detailed notes."
+          }
+        }
+      }
+    },
+    "update.confirm.install" : {
+      "comment" : "Primary button to download, install, and relaunch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download, Install & Relaunch"
+          }
+        }
+      }
+    },
+    "update.confirm.install_ready" : {
+      "comment" : "Primary button when the update is already staged",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Install & Relaunch"
+          }
+        }
+      }
+    },
+    "update.confirm.later" : {
+      "comment" : "Dismiss button in the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Later"
+          }
+        }
+      }
+    },
+    "update.confirm.restart_notice" : {
+      "comment" : "Notice explaining what happens after confirming an update",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX will quit, install the update, and relaunch."
+          }
+        }
+      }
+    },
+    "update.confirm.size" : {
+      "comment" : "Update confirmation download size line; placeholder is a formatted byte size or Unknown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download size: %@"
+          }
+        }
+      }
+    },
+    "update.confirm.subtitle" : {
+      "comment" : "Subtitle for the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Review the release notes before downloading and relaunching."
+          }
+        }
+      }
+    },
+    "update.confirm.title" : {
+      "comment" : "Update confirmation sheet title; placeholder is the version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX %@ is available"
+          }
+        }
+      }
+    },
+    "update.confirm.view_release" : {
+      "comment" : "Tooltip for the release link button in the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View release on GitHub"
+          }
+        }
+      }
+    },
+    "update.error.no_dmg" : {
+      "comment" : "Shown when the release has no matching DMG asset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No installable DMG was attached to this release."
+          }
+        }
+      }
+    },
+    "update.error.swap_failed" : {
+      "comment" : "Shown when the swap script can't find the staged bundle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not find the staged update. Try downloading again."
+          }
+        }
+      }
+    },
     "update.channel.beta" : {
       "comment" : "Display name for the Beta update channel",
       "extractionState" : "manual",
@@ -10378,6 +10786,18 @@
         }
       }
     },
+    "update.channel.dev" : {
+      "comment" : "Display name for the Dev update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dev"
+          }
+        }
+      }
+    },
     "update.channel.nightly" : {
       "comment" : "Display name for the Nightly update channel",
       "extractionState" : "manual",
@@ -10386,6 +10806,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Nightly"
+          }
+        }
+      }
+    },
+    "update.channel.release_candidate" : {
+      "comment" : "Display name for the Release Candidate update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release Candidate"
           }
         }
       }

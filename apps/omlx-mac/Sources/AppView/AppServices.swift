@@ -96,6 +96,15 @@ final class AppServices: NSObject, ObservableObject {
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
     }
 
+    func setAutoStartOnLaunch(_ enabled: Bool, persist: Bool = true) throws {
+        var updated = config
+        updated.autoStartOnLaunch = enabled
+        if persist {
+            try updated.save()
+        }
+        self.config = updated
+    }
+
     // MARK: - Server lifecycle (proxied to ServerProcess)
 
     var hasServer: Bool { server != nil }
@@ -142,7 +151,7 @@ final class AppServices: NSObject, ObservableObject {
     /// optional so the caller (Server screen → Apply) can submit only
     /// what actually changed:
     ///   • `basePath`: relocates every file under the current root, sets
-    ///     `OMLX_BASE_PATH` (env + bootstrap file + shell rc), and
+    ///     `OMLX_BASE_PATH` (env + bootstrap file), and
     ///     reconfigures the spawn args.
     ///   • `modelDir` / `modelDirs`: writes the explicit model root list into
     ///     `<basePath>/settings.json`; the first entry is the primary

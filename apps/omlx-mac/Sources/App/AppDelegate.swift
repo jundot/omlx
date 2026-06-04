@@ -34,6 +34,7 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var server: ServerProcess?
     private var menubar: MenubarController?
+    private var controlServer: AppControlServer?
     let services = AppServices()
 
     private var welcomeController: WelcomeWindowController?
@@ -133,12 +134,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.terminate(nil)
             }
         }
+        services.updates.setPresentUpdateConfirmation { [weak self] in
+            self?.presentAppView()
+        }
         if !isRunningUnitTests {
             do {
-                try ShellEnvWriter.ensureCLIShim()
+                let cliResult = try ShellEnvWriter.ensureCLIShim()
+                handleCLISetupResult(cliResult)
             } catch {
                 NSLog("oMLX: CLI shim setup failed — \(error)")
             }
+            startControlServer()
         }
 
         let config = AppConfig.load()
@@ -156,6 +162,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // persist settings until the user clicks Start Server.
             NSApp.activate(ignoringOtherApps: true)
             presentWelcome()
+        }
+    }
+
+    private func handleCLISetupResult(_ result: ShellEnvWriter.CLISetupResult) {
+        guard case .needsShellPathPrompt(let reason) = result else { return }
+        guard !ShellEnvWriter.shouldSuppressCLIPathPrompt() else { return }
+        promptForShellPathExport(reason: reason)
+    }
+
+    private func promptForShellPathExport(reason: String) {
+        let alert = NSAlert()
+        alert.messageText = "Enable `omlx` in Terminal?"
+        alert.informativeText = """
+        oMLX could not create a public `omlx` command in /opt/homebrew/bin or /usr/local/bin.
+
+        To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
+
+        \(reason)
+        """
+        alert.addButton(withTitle: "Update Shell File")
+        alert.addButton(withTitle: "Dismiss Now")
+        alert.addButton(withTitle: "Don't Ask Again")
+        alert.window.level = .floating
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            do {
+                try ShellEnvWriter.ensureShellPathExport()
+            } catch {
+                NSLog("oMLX: CLI shell path setup failed — \(error)")
+            }
+        case .alertThirdButtonReturn:
+            ShellEnvWriter.suppressCLIPathPromptForever()
+        default:
+            break
         }
     }
 
@@ -201,14 +242,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 server?.reapSync()
             }
 
-            switch try server.start() {
-            case .started, .alreadyRunning:
-                break
-            case .portConflict:
-                // ServerProcess already posted .portConflictNotification +
-                // updated state to .failed; MenubarController will surface
-                // it on next click.
-                break
+            if config.autoStartOnLaunch {
+                switch try server.start() {
+                case .started, .alreadyRunning:
+                    break
+                case .portConflict:
+                    // ServerProcess already posted .portConflictNotification +
+                    // updated state to .failed; MenubarController will surface
+                    // it on next click.
+                    break
+                }
             }
         } catch {
             // Surface the failure in the menubar header so the user has a
@@ -373,6 +416,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // us out — so we run a short synchronous reap as belt-and-suspenders
         // (SignalHandlers also covers most external-kill paths).
         NotificationCenter.default.removeObserver(self)
+        controlServer?.stop()
+        controlServer = nil
 
         guard let server else { return }
         let group = DispatchGroup()
@@ -411,6 +456,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateCancel
     }
 
+    private func startControlServer() {
+        let control = AppControlServer()
+        control.handler = self
+        do {
+            try control.start()
+            self.controlServer = control
+        } catch {
+            NSLog("oMLX: app-control server failed to start — \(error)")
+        }
+    }
+
     /// Dock icon click while no window is visible: bring the main window
     /// back. macOS calls this only when the user clicks the Dock icon of an
     /// already-running app whose windows are all hidden. With our policy
@@ -421,5 +477,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             presentAppView()
         }
         return true
+    }
+}
+
+extension AppDelegate: AppControlHandling {
+    func handleAppControl(_ command: AppControlServer.Command) async -> AppControlServer.Response {
+        guard let server else {
+            return .failure(
+                status: "unavailable",
+                state: .stopped,
+                server: nil,
+                message: "Managed server is unavailable. Complete the oMLX first-run setup in the app."
+            )
+        }
+
+        switch command {
+        case .status:
+            return .success(status: "ok", state: server.state, server: server)
+
+        case .start:
+            do {
+                switch try server.start() {
+                case .started:
+                    return .success(status: "starting", state: server.state, server: server)
+                case .alreadyRunning:
+                    return .success(status: "running", state: server.state, server: server)
+                case .portConflict(let conflict):
+                    let pid = conflict.pid.map(String.init) ?? "unknown"
+                    return .failure(
+                        status: "port_conflict",
+                        state: server.state,
+                        server: server,
+                        message: "Port \(server.port) is in use by PID \(pid)."
+                    )
+                }
+            } catch {
+                return .failure(
+                    status: "error",
+                    state: server.state,
+                    server: server,
+                    message: String(describing: error)
+                )
+            }
+
+        case .stop:
+            await server.stop()
+            return .success(
+                status: "stopped",
+                state: server.state,
+                server: server,
+                message: "oMLX stopped"
+            )
+
+        case .restart:
+            await server.stop()
+            do {
+                switch try server.start() {
+                case .started:
+                    return .success(status: "starting", state: server.state, server: server)
+                case .alreadyRunning:
+                    return .success(status: "running", state: server.state, server: server)
+                case .portConflict(let conflict):
+                    let pid = conflict.pid.map(String.init) ?? "unknown"
+                    return .failure(
+                        status: "port_conflict",
+                        state: server.state,
+                        server: server,
+                        message: "Port \(server.port) is in use by PID \(pid)."
+                    )
+                }
+            } catch {
+                return .failure(
+                    status: "error",
+                    state: server.state,
+                    server: server,
+                    message: String(describing: error)
+                )
+            }
+        }
     }
 }

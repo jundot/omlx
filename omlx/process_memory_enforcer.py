@@ -57,9 +57,9 @@ _SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
 # `balanced` reserve so the static cap stays sane regardless of what
 # the user types into the custom ceiling field.
 _STATIC_RESERVE_LARGE: dict[str, int] = {
-    "safe": 12 * 1024**3,  # aligned with Apple iogpu.wired_limit 75%
-    "balanced": 8 * 1024**3,
-    "aggressive": 6 * 1024**3,
+    "safe": 8 * 1024**3,
+    "balanced": 6 * 1024**3,
+    "aggressive": 4 * 1024**3,
     "custom": 2 * 1024**3,
 }
 
@@ -70,6 +70,16 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "safe": 0.2,
     "balanced": 0.5,
     "aggressive": 0.8,
+}
+
+# Fraction of the effective physical cap used by the pre-chunk prediction
+# guard. Aggressive/custom are user-directed and can run closer to the
+# configured ceiling.
+_PREFILL_ABORT_MARGIN: dict[str, float] = {
+    "safe": 0.90,
+    "balanced": 0.90,
+    "aggressive": 0.95,
+    "custom": 0.95,
 }
 
 
@@ -290,7 +300,7 @@ class ProcessMemoryEnforcer:
         soft_threshold: float = 0.90,
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
-        prefill_min_chunk_tokens: int = 32,
+        prefill_min_chunk_tokens: int = 256,
     ):
         """
         Initialize the process memory enforcer.
@@ -538,6 +548,10 @@ class ProcessMemoryEnforcer:
             return min(static_ceiling, metal_cap)
         return static_ceiling
 
+    def _get_prefill_abort_margin(self) -> float:
+        """Tier-specific prediction margin for pre-chunk safety checks."""
+        return _PREFILL_ABORT_MARGIN[self._memory_guard_tier]
+
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
         ceiling = self._get_hard_limit_bytes()
@@ -648,6 +662,7 @@ class ProcessMemoryEnforcer:
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = ceiling
             scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
+            scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio

@@ -840,7 +840,6 @@ def test_vlm_mrope_integration(model_path):
 
     from omlx.engine.vlm import _patch_video_processor_bug
     from omlx.models.vlm import VLMModelAdapter
-    from omlx.patches.gated_delta_advance import apply_gated_delta_advance_patch
 
     _patch_video_processor_bug()
 
@@ -854,7 +853,6 @@ def test_vlm_mrope_integration(model_path):
     adapter = VLMModelAdapter(vlm_model)
     vlm_tokenizer = getattr(processor, "tokenizer", processor)
 
-    apply_gated_delta_advance_patch(adapter._language_model)
     print(f"  _uses_mrope: {adapter._uses_mrope}")
 
     try:

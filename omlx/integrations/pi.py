@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.utils.install import get_cli_prefix
+from omlx.utils.install import get_cli_command_prefix
 
 
 def _get_agent_dir() -> Path:
@@ -36,7 +36,7 @@ class PiIntegration(Integration):
 
     def get_command(self, ctx: IntegrationContext) -> str:
         return (
-            f"{get_cli_prefix()} "
+            f"{get_cli_command_prefix()} "
             f"launch pi --model {ctx.model or 'select-a-model'}"
         )
 

@@ -215,17 +215,21 @@ private struct LibrarySection: View {
                                      size: 26,
                                      gradient: gradient(for: m))
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(m.settings?.displayName ?? m.id)
-                                    .font(.omlxText(13, weight: .medium))
-                                    .foregroundStyle(theme.text)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
+                                HStack(spacing: 4) {
+                                    Text(m.settings?.displayName ?? m.id)
+                                        .font(.omlxText(13, weight: .medium))
+                                        .foregroundStyle(theme.text)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                    CopyIconButton(value: m.id)
+                                }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
+                            .layoutPriority(1)
                             Spacer(minLength: 8)
                             if isModelLoaded(m.id) {
                                 Button(String(localized: "models.library.unload",
@@ -375,7 +379,7 @@ final class ModelsScreenVM: ObservableObject {
     private func refresh() async {
         guard let client else { return }
         do {
-            self.allModels = try await client.listModels().models
+            self.allModels = sortModelsByName(try await client.listModels().models)
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -385,6 +389,19 @@ final class ModelsScreenVM: ObservableObject {
 }
 
 // MARK: - Helpers
+
+func sortModelsByName(_ models: [ModelDTO]) -> [ModelDTO] {
+    models.enumerated().sorted { lhs, rhs in
+        switch lhs.element.id.localizedCaseInsensitiveCompare(rhs.element.id) {
+        case .orderedAscending:
+            return true
+        case .orderedDescending:
+            return false
+        case .orderedSame:
+            return lhs.offset < rhs.offset
+        }
+    }.map(\.element)
+}
 
 func formatBytes(_ bytes: Int64) -> String {
     var v = Double(bytes)

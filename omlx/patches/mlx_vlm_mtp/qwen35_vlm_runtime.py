@@ -26,11 +26,9 @@ on draft rejection uses mlx-vlm's stock
 and consumes the ``gdn_states`` returned from this patched ``__call__``.
 
 Apply ordering: this patch must run *before* ``mlx_vlm.utils.load(...)``
-so the patched ``LanguageModel.__init__`` runs, and *before*
-``omlx/patches/gated_delta_advance.py`` overrides
-``Qwen3_5GatedDeltaNet.__call__``. ``maybe_apply_pre_load_patches`` in
+so the patched ``LanguageModel.__init__`` runs. ``maybe_apply_pre_load_patches`` in
 ``omlx/utils/model_loading.py`` calls ``apply_mlx_vlm_mtp_runtime_patch``
-ahead of both, satisfying the ordering for inference. The oQ path in
+before loading the model, satisfying the ordering for inference. The oQ path in
 ``omlx/oq.py:_measure_sensitivity`` also calls it before
 ``vlm_load_model`` for sensitivity measurement.
 """

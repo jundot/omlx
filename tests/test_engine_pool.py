@@ -15,6 +15,7 @@ from omlx.exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
+from omlx.scheduler import PrefillEvictionRequest
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -398,10 +399,9 @@ class TestVLMFallback:
         mock_batched_engine = MagicMock()
         mock_batched_engine.start = AsyncMock()
 
-        with patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
-        ), patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
         ):
             await pool._load_engine("model-a")
 
@@ -422,9 +422,10 @@ class TestVLMFallback:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
-        with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
-        ), pytest.raises(Exception, match="Load failed"):
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(Exception, match="Load failed"),
+        ):
             await pool._load_engine("model-a")
 
     @pytest.mark.asyncio
@@ -454,10 +455,9 @@ class TestVLMFallback:
         mock_vlm_engine = MagicMock()
         mock_vlm_engine.start = AsyncMock()
 
-        with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
-        ), patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
         ):
             await pool._load_engine("model-a", force_lm=True)
 
@@ -478,9 +478,10 @@ class TestVLMFallback:
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock(side_effect=Exception("Load failed"))
 
-        with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_engine
-        ), pytest.raises(Exception, match="Load failed"):
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(Exception, match="Load failed"),
+        ):
             await pool._load_engine("model-a", force_lm=True)
 
     @pytest.mark.asyncio
@@ -508,11 +509,11 @@ class TestVLMFallback:
             side_effect=Exception("Model type lfm2_vl not supported")
         )
 
-        with patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
-        ), patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
-        ), pytest.raises(RuntimeError) as excinfo:
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
             await pool._load_engine("model-a")
 
         msg = str(excinfo.value)
@@ -552,11 +553,11 @@ class TestVLMFallback:
             side_effect=Exception("vision encoder weights missing")
         )
 
-        with patch(
-            "omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine
-        ), patch(
-            "omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine
-        ), pytest.raises(RuntimeError) as excinfo:
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
             await pool._load_engine("model-a", force_lm=True)
 
         msg = str(excinfo.value)
@@ -881,9 +882,7 @@ class TestEnginePoolEviction:
             "omlx.engine_pool.get_phys_footprint",
             lambda: pool._current_model_memory,
         )
-        monkeypatch.setattr(
-            "omlx.engine_pool.mx.get_active_memory", lambda: 0
-        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
         return pool
 
     @pytest.mark.asyncio
@@ -939,6 +938,101 @@ class TestEnginePoolEviction:
             # Try to load model-b - should fail (can't evict pinned model-a)
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
+
+
+class TestEnginePoolPrefillEviction:
+    """Tests for request-time idle LRU eviction before prefill throttling."""
+
+    @staticmethod
+    def _entry(model_id: str, size: int, *, active: bool = False) -> EngineEntry:
+        engine = MagicMock()
+        engine.has_active_requests.return_value = active
+        engine.scheduler = None
+        engine._engine = None
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/models/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=size,
+            engine=engine,
+            last_access=0.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_prefill_eviction_evicts_idle_lru_until_target(self):
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+        pool._entries = {
+            "idle-a": self._entry("idle-a", 20 * gb),
+            "idle-b": self._entry("idle-b", 15 * gb),
+            "target": self._entry("target", 25 * gb),
+        }
+        pool._entries["idle-a"].last_access = 1.0
+        pool._entries["idle-b"].last_access = 2.0
+        pool._entries["target"].last_access = 3.0
+        pool._current_model_memory = 60 * gb
+        unloaded = []
+
+        async def fake_unload(model_id):
+            unloaded.append(model_id)
+            entry = pool._entries[model_id]
+            entry.engine = None
+            pool._current_model_memory -= entry.estimated_size
+
+        pool._unload_engine = fake_unload
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=60 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="adaptive_prefill_throttle",
+        )
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            evicted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert evicted is True
+        assert unloaded == ["idle-a", "idle-b"]
+        assert pool._entries["target"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_prefill_eviction_skips_active_pinned_loading_and_current(self):
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+        pool._entries = {
+            "active": self._entry("active", 20 * gb, active=True),
+            "pinned": self._entry("pinned", 20 * gb),
+            "loading": self._entry("loading", 20 * gb),
+            "target": self._entry("target", 25 * gb),
+        }
+        pool._entries["pinned"].is_pinned = True
+        pool._entries["loading"].is_loading = True
+        pool._current_model_memory = 85 * gb
+        pool._unload_engine = AsyncMock()
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=85 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="adaptive_prefill_throttle",
+        )
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            evicted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert evicted is False
+        pool._unload_engine.assert_not_awaited()
 
 
 class TestEnginePoolStatus:
@@ -1240,6 +1334,7 @@ class TestResolveModelId:
 
         settings_manager = MagicMock()
         from omlx.model_settings import ModelSettings
+
         settings_manager.get_all_settings.return_value = {
             "model-a": ModelSettings(model_alias="gpt-4"),
             "model-b": ModelSettings(),
@@ -1255,6 +1350,7 @@ class TestResolveModelId:
 
         settings_manager = MagicMock()
         from omlx.model_settings import ModelSettings
+
         settings_manager.get_all_settings.return_value = {
             "model-a": ModelSettings(),
         }
@@ -1277,6 +1373,7 @@ class TestResolveModelId:
 
         settings_manager = MagicMock()
         from omlx.model_settings import ModelSettings
+
         settings_manager.get_all_settings.return_value = {
             "model-a": ModelSettings(model_alias="gpt-4"),
             "model-b": ModelSettings(),
@@ -1300,6 +1397,7 @@ class TestResolveModelId:
 
         settings_manager = MagicMock()
         from omlx.model_settings import ModelSettings
+
         settings_manager.get_all_settings.return_value = {
             "model-a": ModelSettings(),
         }
@@ -1373,9 +1471,11 @@ class TestMemorySettleBarrier:
             call_idx[0] += 1
             return val
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
@@ -1406,9 +1506,11 @@ class TestMemorySettleBarrier:
         async def mock_sleep(duration):
             sleep_calls.append(duration)
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
-             patch("asyncio.sleep", side_effect=mock_sleep):
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=mock_sleep),
+        ):
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
@@ -1442,9 +1544,11 @@ class TestMemorySettleBarrier:
         async def mock_sleep(duration):
             sleep_calls.append(duration)
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
-             patch("asyncio.sleep", side_effect=mock_sleep):
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=mock_sleep),
+        ):
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
@@ -1461,9 +1565,11 @@ class TestMemorySettleBarrier:
         pool = pool_with_loaded_model
 
         # Memory never drops — stays at 10GB throughout (well above 5GB threshold)
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             mock_mx.get_active_memory = MagicMock(return_value=10 * 1024**3)
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
@@ -1472,9 +1578,7 @@ class TestMemorySettleBarrier:
                 await pool._unload_engine("model-a")
 
             # Should have logged an error about emergency reclaim failure
-            error_calls = [
-                str(c) for c in mock_logger.error.call_args_list
-            ]
+            error_calls = [str(c) for c in mock_logger.error.call_args_list]
             assert any("Emergency reclaim failed" in s for s in error_calls)
 
     @pytest.mark.asyncio
@@ -1498,9 +1602,11 @@ class TestMemorySettleBarrier:
                 return 10 * 1024**3  # 0GB freed
             return 5 * 1024**3  # 5GB freed >= 3GB needed
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             mock_mx.get_active_memory = mock_get_active
             mock_mx.synchronize = MagicMock()
             mock_mx.clear_cache = MagicMock()
@@ -1544,9 +1650,7 @@ class TestMemorySettleBarrier:
         call_idx = [0]
 
         def mock_get_active():
-            val = active_memory_values[
-                min(call_idx[0], len(active_memory_values) - 1)
-            ]
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
             call_idx[0] += 1
             return val
 
@@ -1565,9 +1669,7 @@ class TestMemorySettleBarrier:
         assert pool._current_model_memory == 0
 
     @pytest.mark.asyncio
-    async def test_settle_small_model_uses_floor_tolerance(
-        self, small_mock_model_dir
-    ):
+    async def test_settle_small_model_uses_floor_tolerance(self, small_mock_model_dir):
         """Test that 2GB floor tolerance applies for small models.
 
         For a 1GB model, 5% = 0.05GB << 2GB, so tolerance = 2GB floor.
@@ -1590,9 +1692,7 @@ class TestMemorySettleBarrier:
         call_idx = [0]
 
         def mock_get_active():
-            val = active_memory_values[
-                min(call_idx[0], len(active_memory_values) - 1)
-            ]
+            val = active_memory_values[min(call_idx[0], len(active_memory_values) - 1)]
             call_idx[0] += 1
             return val
 

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 from openai_harmony import load_harmony_encoding
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
@@ -50,6 +52,50 @@ class HarmonyTokenizer:
     @property
     def detokenizer(self):
         return FakeDetokenizer(lambda token_id: self._encoding.decode([token_id]))
+
+
+def _write_json(path, data):
+    path.write_text(json.dumps(data))
+
+
+def _spm_decoder():
+    return {
+        "type": "Sequence",
+        "decoders": [
+            {
+                "type": "Replace",
+                "pattern": {"String": "\u2581"},
+                "content": " ",
+            },
+            {"type": "ByteFallback"},
+            {"type": "Fuse"},
+            {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+        ],
+    }
+
+
+class ByteFallbackTokenizer:
+    clean_up_tokenization_spaces = False
+    vocab = {
+        "<pad>": 0,
+        "<0xEC>": 1,
+        "<0x9E>": 2,
+        "<0xA0>": 3,
+    }
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        table = {
+            0: b"",
+            1: bytes([0xEC]),
+            2: bytes([0x9E]),
+            3: bytes([0xA0]),
+        }
+        raw = b"".join(table[token_id] for token_id in token_ids)
+        if not raw:
+            return ""
+        if raw == bytes([0xEC, 0x9E, 0xA0]):
+            return "\uc7a0"
+        return "\ufffd" * sum(1 for token_id in token_ids if token_id != 0)
 
 
 class TestGemma4OutputParserSession:
@@ -223,6 +269,22 @@ class TestGemma4OutputParserSession:
         assert "<|tool_call>" in stream_text
         assert "<tool_call|>" in stream_text
         assert "call:bash{cmd:ls}" in stream_text
+
+    def test_spm_fallback_buffers_split_utf8(self, tmp_path):
+        _write_json(tmp_path / "tokenizer.json", {"decoder": _spm_decoder()})
+        session = Gemma4OutputParserSession(
+            ByteFallbackTokenizer(),
+            model_path=tmp_path,
+        )
+
+        parts = []
+        for token_id in [1, 2, 3]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "\uc7a0"
+        assert "\ufffd" not in text
 
 
 class TestOutputParserFactory:

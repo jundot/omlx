@@ -28,11 +28,9 @@ diff against mlx-vlm small (LanguageModel constructor + __call__ wrap
 that an earlier iteration of this patch attempted.
 
 Module-level apply ordering is significant: this patch must be applied
-*before* the model loads (so the patched ``__init__`` runs) and
-*before* ``omlx/patches/gated_delta_advance.py`` overrides
-``Qwen3_5GatedDeltaNet.__call__``. The current loader (``omlx/utils/model_loading.py``)
-calls ``apply_mlx_vlm_mtp_runtime_patch()`` in ``maybe_apply_pre_load_patches``
-which satisfies both.
+*before* the model loads so the patched ``__init__`` runs. The current loader
+(``omlx/utils/model_loading.py``) calls ``apply_mlx_vlm_mtp_runtime_patch()``
+in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 """
 
 from __future__ import annotations

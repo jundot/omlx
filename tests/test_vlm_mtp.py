@@ -38,6 +38,17 @@ def test_load_vlm_mtp_drafter_happy_path():
     assert drafter.model is fake_model
 
 
+def test_load_vlm_mtp_drafter_accepts_unified_assistant():
+    """Valid gemma4_unified_assistant artifact is accepted."""
+    fake_model = _fake_drafter_model("gemma4_unified_assistant")
+    with patch.object(
+        vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")
+    ):
+        drafter = vlm_mtp.load_vlm_mtp_drafter("/path/to/drafter")
+    assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
+    assert drafter.model is fake_model
+
+
 def test_load_vlm_mtp_drafter_rejects_dflash_kind():
     """A drafter that resolves to non-mtp kind is rejected (None + warn)."""
     fake_model = _fake_drafter_model("qwen3_dflash")

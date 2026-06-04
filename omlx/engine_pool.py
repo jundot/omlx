@@ -61,6 +61,8 @@ class EngineEntry:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"
+    source_repo_id: str | None = None
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -189,8 +191,12 @@ class EnginePool:
                     estimated_size=info.estimated_size,
                     config_model_type=getattr(info, "config_model_type", ""),
                     thinking_default=getattr(info, "thinking_default", None),
-                    preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
+                    preserve_thinking_default=getattr(
+                        info, "preserve_thinking_default", None
+                    ),
                     model_context_length=getattr(info, "model_context_length", None),
+                    source_type=getattr(info, "source_type", "local"),
+                    source_repo_id=getattr(info, "source_repo_id", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -320,8 +326,17 @@ class EnginePool:
         return model_id_or_alias
 
     async def get_engine(
-        self, model_id: str, force_lm: bool = False,
-    ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
+        self,
+        model_id: str,
+        force_lm: bool = False,
+    ) -> (
+        BaseEngine
+        | EmbeddingEngine
+        | RerankerEngine
+        | STTEngine
+        | STSEngine
+        | TTSEngine
+    ):
         """
         Get or load engine for the specified model.
 
@@ -431,9 +446,7 @@ class EnginePool:
                 continue
             try:
                 if e.engine.has_active_requests():
-                    logger.debug(
-                        f"Skipping victim '{mid}': has active requests"
-                    )
+                    logger.debug(f"Skipping victim '{mid}': has active requests")
                     continue
             except AttributeError:
                 pass
@@ -442,6 +455,98 @@ class EnginePool:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
+
+    @staticmethod
+    def _resolve_scheduler_from_engine(engine: object) -> object | None:
+        scheduler = getattr(engine, "scheduler", None)
+        if scheduler is not None:
+            return scheduler
+        try:
+            return engine._engine.engine.scheduler  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+
+    def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
+        engine = entry.engine
+        if engine is None or entry.is_pinned or entry.is_loading:
+            return False
+        try:
+            if engine.has_active_requests():
+                return False
+        except AttributeError:
+            pass
+
+        scheduler = self._resolve_scheduler_from_engine(engine)
+        if scheduler is None:
+            return True
+        for attr in ("running", "waiting", "prefilling", "requests"):
+            value = getattr(scheduler, attr, None)
+            if value:
+                return False
+        return True
+
+    def _find_lru_prefill_eviction_victim(self, *, exclude_model_id: str) -> str | None:
+        candidates = []
+        for mid, entry in self._entries.items():
+            if mid == exclude_model_id:
+                continue
+            if self._is_idle_for_prefill_eviction(entry):
+                candidates.append((entry.last_access, mid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    async def _evict_idle_lru_for_prefill(
+        self,
+        exclude_model_id: str,
+        eviction_request: object,
+    ) -> bool:
+        """Evict idle LRU models until the requested prefill step should fit."""
+        target = int(getattr(eviction_request, "target_cap_bytes", 0) or 0)
+        predicted = int(getattr(eviction_request, "predicted_transient_bytes", 0) or 0)
+        request_id = str(getattr(eviction_request, "request_id", ""))
+        if target <= 0 or predicted <= 0:
+            return False
+
+        evicted_any = False
+        async with self._lock:
+            while True:
+                current = max(
+                    mx.get_active_memory(),
+                    get_phys_footprint(),
+                    self._current_model_memory,
+                )
+                if current + predicted <= target:
+                    return evicted_any
+
+                victim = self._find_lru_prefill_eviction_victim(
+                    exclude_model_id=exclude_model_id
+                )
+                if victim is None:
+                    if evicted_any:
+                        logger.info(
+                            "Prefill eviction for request %s stopped with no "
+                            "more idle victims (current=%s, predicted=%s, "
+                            "target=%s)",
+                            request_id,
+                            format_size(current),
+                            format_size(predicted),
+                            format_size(target),
+                        )
+                    return evicted_any
+
+                logger.info(
+                    "Evicting idle model '%s' for prefill headroom on '%s' "
+                    "(request=%s, projected=%s > target=%s)",
+                    victim,
+                    exclude_model_id,
+                    request_id,
+                    format_size(current + predicted),
+                    format_size(target),
+                )
+                await self._unload_engine(victim)
+                evicted_any = True
 
     async def _unload_engine(self, model_id: str) -> None:
         """
@@ -629,13 +734,22 @@ class EnginePool:
                 if dflash_enabled and dflash_draft:
                     try:
                         from .engine.dflash import DFlashEngine
+
                         engine = DFlashEngine(
                             model_name=entry.model_path,
                             draft_model_path=dflash_draft,
-                            draft_quant_enabled=getattr(model_settings, "dflash_draft_quant_enabled", False),
-                            draft_quant_weight_bits=getattr(model_settings, "dflash_draft_quant_weight_bits", 4),
-                            draft_quant_activation_bits=getattr(model_settings, "dflash_draft_quant_activation_bits", 16),
-                            draft_quant_group_size=getattr(model_settings, "dflash_draft_quant_group_size", 64),
+                            draft_quant_enabled=getattr(
+                                model_settings, "dflash_draft_quant_enabled", False
+                            ),
+                            draft_quant_weight_bits=getattr(
+                                model_settings, "dflash_draft_quant_weight_bits", 4
+                            ),
+                            draft_quant_activation_bits=getattr(
+                                model_settings, "dflash_draft_quant_activation_bits", 16
+                            ),
+                            draft_quant_group_size=getattr(
+                                model_settings, "dflash_draft_quant_group_size", 64
+                            ),
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
@@ -643,7 +757,9 @@ class EnginePool:
                                 self._scheduler_config, "paged_ssd_cache_dir", None
                             ),
                         )
-                        logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                        logger.info(
+                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                        )
                     except ImportError:
                         logger.warning(
                             f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
@@ -659,7 +775,21 @@ class EnginePool:
             # When unset, defaults to False -- repos with custom modeling_*.py
             # will fail to load until the user explicitly toggles this on
             # in the admin UI's model settings modal.
-            trc = bool(getattr(model_settings, "trust_remote_code", False)) if model_settings else False
+            trc = (
+                bool(getattr(model_settings, "trust_remote_code", False))
+                if model_settings
+                else False
+            )
+
+            async def prefill_eviction_callback(
+                eviction_request: object,
+                *,
+                _model_id: str = model_id,
+            ) -> bool:
+                return await self._evict_idle_lru_for_prefill(
+                    exclude_model_id=_model_id,
+                    eviction_request=eviction_request,
+                )
 
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
@@ -680,6 +810,7 @@ class EnginePool:
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
                     )
                 elif entry.engine_type == "audio_stt":
                     engine = STTEngine(model_name=entry.model_path)
@@ -696,9 +827,12 @@ class EnginePool:
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
                     )
 
-            _is_dflash_engine = engine is not None and type(engine).__name__ == "DFlashEngine"
+            _is_dflash_engine = (
+                engine is not None and type(engine).__name__ == "DFlashEngine"
+            )
 
             try:
                 await engine.start()
@@ -727,6 +861,7 @@ class EnginePool:
                             trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
+                            prefill_eviction_callback=prefill_eviction_callback,
                         )
                     else:
                         engine = BatchedEngine(
@@ -734,6 +869,7 @@ class EnginePool:
                             trust_remote_code=trc,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
+                            prefill_eviction_callback=prefill_eviction_callback,
                         )
                     try:
                         await engine.start()
@@ -771,6 +907,7 @@ class EnginePool:
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
                         await engine.start()
@@ -806,6 +943,7 @@ class EnginePool:
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
                     )
                     try:
                         await engine.start()
@@ -818,23 +956,18 @@ class EnginePool:
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
                     logger.info(
-                        f"Successfully loaded {model_id} as LLM "
-                        f"(fallback from VLM)"
+                        f"Successfully loaded {model_id} as LLM " f"(fallback from VLM)"
                     )
                 else:
                     raise
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:
-                logger.warning(
-                    f"Model load aborted by memory enforcer: {model_id}"
-                )
+                logger.warning(f"Model load aborted by memory enforcer: {model_id}")
                 try:
                     await engine.stop()
                 except Exception as e:
-                    logger.warning(
-                        f"Error stopping aborted engine for {model_id}: {e}"
-                    )
+                    logger.warning(f"Error stopping aborted engine for {model_id}: {e}")
                 gc.collect()
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
@@ -842,8 +975,7 @@ class EnginePool:
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
                 raise ModelLoadingError(
-                    f"Model {model_id} load aborted: "
-                    f"process memory limit exceeded"
+                    f"Model {model_id} load aborted: " f"process memory limit exceeded"
                 )
 
             entry.engine = engine
@@ -861,12 +993,11 @@ class EnginePool:
             ):
                 drafter_id = model_settings.vlm_mtp_draft_model
                 drafter_entry = self._entries.get(drafter_id)
-                drafter_path = (
-                    drafter_entry.model_path if drafter_entry else drafter_id
-                )
+                drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
 
                 def _load_drafter_sync(path: str = drafter_path):
                     from .speculative.vlm_mtp import load_vlm_mtp_drafter
+
                     return load_vlm_mtp_drafter(path)
 
                 loop = asyncio.get_running_loop()
@@ -882,9 +1013,7 @@ class EnginePool:
                     drafter = None
                 if drafter is not None:
                     engine.set_vlm_mtp_drafter(drafter)
-                    logger.info(
-                        f"VLM MTP enabled for {model_id}, drafter={drafter_id}"
-                    )
+                    logger.info(f"VLM MTP enabled for {model_id}, drafter={drafter_id}")
                 else:
                     logger.warning(
                         f"VLM MTP toggle on for {model_id} but drafter "
@@ -918,9 +1047,13 @@ class EnginePool:
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
-            if load_completed and load_started_at is not None and entry.estimated_size > 0:
+            if (
+                load_completed
+                and load_started_at is not None
+                and entry.estimated_size > 0
+            ):
                 elapsed = max(0.0, time.monotonic() - load_started_at)
-                size_gb = entry.estimated_size / (1024 ** 3)
+                size_gb = entry.estimated_size / (1024**3)
                 if size_gb > 0 and elapsed > 0:
                     sample = elapsed / size_gb
                     if self._load_seconds_per_gb_ema is None:
@@ -980,7 +1113,9 @@ class EnginePool:
             "final_ceiling": self._current_ceiling(),
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
-            "loaded_count": sum(1 for e in self._entries.values() if e.engine is not None),
+            "loaded_count": sum(
+                1 for e in self._entries.values() if e.engine is not None
+            ),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
             "load_time_observations": self._load_time_observations,
             "models": [
@@ -998,6 +1133,8 @@ class EnginePool:
                     "config_model_type": e.config_model_type,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
+                    "source_type": e.source_type,
+                    "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

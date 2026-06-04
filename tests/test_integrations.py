@@ -54,6 +54,20 @@ class TestIntegrationRegistry:
         assert get_integration("nonexistent") is None
 
 
+class TestIntegrationCommands:
+    def test_commands_quote_full_app_cli_prefix(self):
+        with patch(
+            "omlx.utils.install.get_cli_prefix",
+            return_value="/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli",
+        ):
+            cmd = ClaudeCodeIntegration().get_command(ctx())
+
+        assert (
+            cmd
+            == "'/Users/me/My Apps/oMLX.app/Contents/MacOS/omlx-cli' launch claude"
+        )
+
+
 class TestCodexIntegration:
     def test_get_command(self):
         codex = CodexIntegration()

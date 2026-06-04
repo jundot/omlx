@@ -72,12 +72,11 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (6f60ee4, main) - includes both TurboQuant decode fixes:
-    # "Bug 1" (fused single-token-quantize, fixed earlier on main) and "Bug 2" (the
-    # RHT masked-decode kernel, Blaizzy/mlx-vlm#1244, now merged) — so oMLX no longer
-    # needs its interim monkey-patch. (Also provides: Gemma4 MTP server batching PR
-    # #1166, speculative utils refactor PR #1169, Qwen native MTP drafter, MiniCPM-V 4.6.)
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@6f60ee4458d85b636e2e6c09c33d32fc360d5e62",
+    # mlx-vlm from commit (041f889) - includes Qwen MTP batched
+    # target-verify drift fixes, Gemma4 rollback fixes, TurboQuant RHT L=1 value
+    # kernels, eager evaluation of cached MRoPE arrays on model load, and
+    # Gemma4 unified long text prefill fixes.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@041f8891176996c916f347e542b3aae179300546",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.8 (39b2520) — bstnxbt repo. Apple G17 NAX verify path plus v0.1.7 Qwen/Gemma4 DFlash fixes
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@39b2520e805f1d1be3852c62944b389cff73fa35",

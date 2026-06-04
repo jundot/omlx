@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.utils.install import get_cli_prefix
+from omlx.utils.install import get_cli_command_prefix
 
 
 class ClaudeCodeIntegration(Integration):
@@ -23,7 +23,7 @@ class ClaudeCodeIntegration(Integration):
         )
 
     def get_command(self, ctx: IntegrationContext) -> str:
-        return f"{get_cli_prefix()} launch claude"
+        return f"{get_cli_command_prefix()} launch claude"
 
     def _find_claude_binary(self) -> str:
         """Find the claude binary in PATH or ~/.claude/local/."""

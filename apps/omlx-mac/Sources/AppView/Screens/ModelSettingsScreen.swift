@@ -77,11 +77,16 @@ private struct Header: View {
         HStack(spacing: 12) {
             Squircle(systemSymbol: "cpu", size: 44, gradient: SquircleGradient.models)
             VStack(alignment: .leading, spacing: 2) {
-                Text(model?.settings?.displayName ?? model?.id ?? "—")
-                    .font(.omlxText(17, weight: .semibold))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Text(model?.settings?.displayName ?? model?.id ?? "—")
+                        .font(.omlxText(17, weight: .semibold))
+                        .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let id = model?.id {
+                        CopyIconButton(value: id)
+                    }
+                }
                 if let m = model {
                     Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                         .font(.omlxMono(11))
@@ -90,6 +95,7 @@ private struct Header: View {
                         .truncationMode(.middle)
                 }
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             Button {
                 onBack()
@@ -785,14 +791,13 @@ private struct ChatTemplateKwargsEditor: View {
                     addMenu
                 }
             }
-            ForEach(Array(vm.chatTemplateEntries.enumerated()), id: \.element.id) { idx, entry in
-                let isLast = idx == vm.chatTemplateEntries.count - 1
+            ForEach(vm.chatTemplateEntries) { entry in
+                let isLast = entry.id == vm.chatTemplateEntries.last?.id
                 FreeRow(isLast: isLast) {
                     EntryEditor(
                         vm: vm,
                         client: client,
-                        index: idx,
-                        entry: entry
+                        entryID: entry.id
                     )
                 }
             }
@@ -835,15 +840,22 @@ private struct ChatTemplateKwargsEditor: View {
 private struct EntryEditor: View {
     @ObservedObject var vm: ModelSettingsScreenVM
     let client: OMLXClient
-    let index: Int
-    let entry: ChatTemplateKwargEntry
+    let entryID: UUID
 
     @Environment(\.omlxTheme) private var theme
 
+    private var entry: ChatTemplateKwargEntry {
+        vm.chatTemplateEntries.first { $0.id == entryID } ?? ChatTemplateKwargEntry(kind: .custom, value: "")
+    }
+
     private var binding: Binding<ChatTemplateKwargEntry> {
         Binding(
-            get: { vm.chatTemplateEntries[index] },
-            set: { vm.chatTemplateEntries[index] = $0 }
+            get: { vm.chatTemplateEntries.first { $0.id == entryID } ?? ChatTemplateKwargEntry(kind: .custom, value: "") },
+            set: { newValue in
+                if let idx = vm.chatTemplateEntries.firstIndex(where: { $0.id == entryID }) {
+                    vm.chatTemplateEntries[idx] = newValue
+                }
+            }
         )
     }
 
@@ -855,7 +867,7 @@ private struct EntryEditor: View {
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 Button {
-                    vm.removeKwarg(id: entry.id)
+                    vm.removeKwarg(id: entryID)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .medium))
@@ -964,9 +976,7 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.turboquant.label",
                               defaultValue: "TurboQuant KV Cache",
                               comment: "Row label for the TurboQuant KV cache toggle"),
-                sublabel: String(localized: "settings.experimental.turboquant.sub",
-                                 defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                                 comment: "Sublabel describing TurboQuant KV cache")) {
+                sublabel: turboquantSublabel) {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
@@ -977,6 +987,8 @@ private struct ExperimentalSection: View {
                     }
                     Toggle("", isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .labelsHidden().toggleStyle(.switch)
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
             }
 
@@ -1004,11 +1016,11 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.specprefill.label",
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
-                sublabel: String(localized: "settings.experimental.specprefill.sub",
-                                 defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
-                                 comment: "Sublabel describing SpecPrefill")) {
+                sublabel: specprefillSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
                     .labelsHidden().toggleStyle(.switch)
+                    .disabled(vm.vlmMtpEnabled)
+                    .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
             if vm.specprefillEnabled {
                 Row(label: String(localized: "settings.experimental.specprefill.draft.label",
@@ -1050,8 +1062,8 @@ private struct ExperimentalSection: View {
                 sublabel: dflashSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
                     .labelsHidden().toggleStyle(.switch)
-                    .disabled(!(vm.model?.dflashCompatible ?? true))
-                    .help(vm.model?.dflashCompatibilityReason ?? "")
+                    .disabled(dflashToggleDisabled)
+                    .help(dflashHelp)
             }
             if vm.dflashEnabled {
                 Row(label: String(localized: "settings.experimental.dflash.draft.label",
@@ -1065,12 +1077,41 @@ private struct ExperimentalSection: View {
                 }
                 Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
                                   defaultValue: "Draft Quantization",
-                                  comment: "Row label for the DFlash draft-quantization picker")) {
-                    Popup(
-                        selection: vm.bindProfile($vm.dflashDraftQuantBits),
-                        width: 160,
-                        options: ModelSettingsScreenVM.dflashDraftQuantOptions
-                    )
+                                  comment: "Row label for the DFlash draft quantization toggle"),
+                    sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
+                                     defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
+                                     comment: "Sublabel for the DFlash draft quantization toggle")) {
+                    Toggle("", isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
+                        .labelsHidden().toggleStyle(.switch)
+                }
+                if vm.dflashDraftQuantEnabled {
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
+                                      defaultValue: "Weight Bits",
+                                      comment: "Row label for the DFlash draft quantization weight bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantWeightBits),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_activation.label",
+                                      defaultValue: "Activation Bits",
+                                      comment: "Row label for the DFlash draft quantization activation bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
+                                      defaultValue: "Group Size",
+                                      comment: "Row label for the DFlash draft quantization group size picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantGroupSize),
+                            width: 110,
+                            options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
+                        )
+                    }
                 }
                 Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
                                   defaultValue: "Max Context (fallback)",
@@ -1083,6 +1124,36 @@ private struct ExperimentalSection: View {
                                                   defaultValue: "unlimited",
                                                   comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
                               mono: true, suffix: "tk", width: 130)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
+                                  defaultValue: "Verify Mode",
+                                  comment: "Row label for the DFlash verifier algorithm picker"),
+                    sublabel: String(localized: "settings.experimental.dflash.verify_mode.sub",
+                                     defaultValue: "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify.",
+                                     comment: "Sublabel for the DFlash verify mode picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.dflashVerifyMode),
+                        width: 140,
+                        options: ModelSettingsScreenVM.dflashVerifyModeOptions
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.dflash.window_size.label",
+                                  defaultValue: "Draft Window Size",
+                                  comment: "Row label for the DFlash draft sliding-attention window size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (1024).",
+                                     comment: "Sublabel for the DFlash draft window size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
+                              placeholder: "1024", mono: true, width: 110)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
+                                  defaultValue: "Draft Sink Size",
+                                  comment: "Row label for the DFlash attention-sink tokens field"),
+                    sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (64).",
+                                     comment: "Sublabel for the DFlash draft sink size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
+                              placeholder: "64", mono: true, width: 110)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
                                   defaultValue: "DFlash in-memory cache",
@@ -1099,6 +1170,17 @@ private struct ExperimentalSection: View {
                             .labelsHidden().toggleStyle(.switch)
                     }
                 }
+                if vm.dflashInMemoryCache {
+                    Row(label: String(localized: "settings.experimental.dflash.mem_cache_entries.label",
+                                      defaultValue: "Cache Entries",
+                                      comment: "Row label for the DFlash L1 in-memory cache max entries field"),
+                        sublabel: String(localized: "settings.experimental.dflash.mem_cache_entries.sub",
+                                         defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
+                                         comment: "Sublabel for the DFlash L1 cache max entries field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
+                                  placeholder: "4", mono: true, width: 110)
+                    }
+                }
                 Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
                                   defaultValue: "DFlash SSD cache",
                                   comment: "Row label for the DFlash L2 SSD cache toggle"),
@@ -1107,20 +1189,99 @@ private struct ExperimentalSection: View {
                         .labelsHidden().toggleStyle(.switch)
                         .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
                 }
+                if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
+                    Row(label: String(localized: "settings.experimental.dflash.ssd_cache_size.label",
+                                      defaultValue: "SSD Cache Size",
+                                      comment: "Row label for the DFlash L2 SSD cache disk budget field"),
+                        sublabel: String(localized: "settings.experimental.dflash.ssd_cache_size.sub",
+                                         defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
+                                         comment: "Sublabel for the DFlash SSD cache size field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
+                                  placeholder: "20", mono: true, suffix: "GiB", width: 110)
+                    }
+                }
             }
 
-            // Native MTP — last row of the experimental group.
+            // Native MTP
             Row(label: String(localized: "settings.experimental.mtp.label",
                               defaultValue: "Native MTP",
                               comment: "Row label for the Native MTP toggle"),
-                sublabel: mtpSublabel,
-                isLast: true) {
+                sublabel: mtpSublabel) {
                 Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
                     .labelsHidden().toggleStyle(.switch)
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
             }
+
+            // VLM MTP — last row of the experimental group. Reveals the
+            // draft-model picker and block-size field when enabled.
+            Row(label: String(localized: "settings.experimental.vlm_mtp.label",
+                              defaultValue: "VLM MTP",
+                              comment: "Row label for the VLM MTP toggle"),
+                sublabel: vlmMtpSublabel,
+                isLast: !vm.vlmMtpEnabled) {
+                Toggle("", isOn: vm.bindProfile($vm.vlmMtpEnabled))
+                    .labelsHidden().toggleStyle(.switch)
+                    .disabled(vlmMtpToggleDisabled)
+                    .help(vm.vlmMtpConflictReason ?? "")
+            }
+            if vm.vlmMtpEnabled {
+                Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
+                                  defaultValue: "VLM Draft Model",
+                                  comment: "Row label for the VLM MTP draft-model picker"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.draft.sub",
+                                     defaultValue: "Assistant drafter sharing the target's tokenizer.",
+                                     comment: "Sublabel for the VLM MTP draft-model picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.vlmMtpDraftModel),
+                        width: 260,
+                        options: vm.vlmMtpDraftModelOptions()
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.vlm_mtp.block_size.label",
+                                  defaultValue: "Draft Block Size",
+                                  comment: "Row label for the VLM MTP draft block-size field"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.block_size.sub",
+                                     defaultValue: "Tokens drafted per round. Empty uses the mlx-vlm default.",
+                                     comment: "Sublabel for the VLM MTP draft block-size field"),
+                    isLast: true) {
+                    TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
+                              placeholder: "4", mono: true, width: 80)
+                }
+            }
         }
+    }
+
+    private var vlmMtpOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.vlm_mtp",
+               defaultValue: "Disable VLM MTP before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
+    }
+
+    private var turboquantSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.turboquant.sub",
+                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing TurboQuant KV cache")
+    }
+
+    private var specprefillSublabel: String {
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.specprefill.sub",
+                      defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
+                      comment: "Sublabel describing SpecPrefill")
+    }
+
+    private var dflashToggleDisabled: Bool {
+        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+    }
+
+    private var dflashHelp: String {
+        if let reason = vm.model?.dflashCompatibilityReason,
+           !(vm.model?.dflashCompatible ?? true) {
+            return reason
+        }
+        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
     }
 
     private var dflashSublabel: String {
@@ -1128,6 +1289,7 @@ private struct ExperimentalSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
@@ -1165,6 +1327,17 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.mtp.sub",
                       defaultValue: "Multi-token prediction. Speeds generation when the model supports it.",
                       comment: "Default sublabel for the Native MTP toggle")
+    }
+
+    private var vlmMtpToggleDisabled: Bool {
+        vm.vlmMtpConflictReason != nil
+    }
+
+    private var vlmMtpSublabel: String {
+        if let reason = vm.vlmMtpConflictReason { return reason }
+        return String(localized: "settings.experimental.vlm_mtp.sub",
+                      defaultValue: "Multi-token prediction for vision-language models via an assistant drafter.",
+                      comment: "Default sublabel for the VLM MTP toggle")
     }
 }
 
@@ -1206,9 +1379,14 @@ final class ModelSettingsScreenVM: ObservableObject {
         case turboquantKvEnabled, turboquantKvBits
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
-        case dflashEnabled, dflashDraftModel, dflashDraftQuantBits, dflashMaxCtx
-        case dflashInMemoryCache, dflashInMemoryCacheGib, dflashSsdCache
+        case dflashEnabled, dflashDraftModel, dflashMaxCtx
+        case dflashDraftQuantEnabled, dflashDraftQuantWeightBits
+        case dflashDraftQuantActivationBits, dflashDraftQuantGroupSize
+        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize
+        case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
+        case dflashSsdCache, dflashSsdCacheGib
         case mtpEnabled
+        case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -1291,17 +1469,62 @@ final class ModelSettingsScreenVM: ObservableObject {
         ]
     }
 
-    static var dflashDraftQuantOptions: [(String, String)] {
+    static var dflashDraftQuantWeightBitsOptions: [(String, String)] {
         [
-            ("", String(localized: "settings.dflash.quant.bf16",
-                        defaultValue: "bf16 (default)",
-                        comment: "DFlash draft quantization option for bf16 (no quantization)")),
-            ("4", String(localized: "settings.dflash.quant.4bit",
+            ("2", String(localized: "settings.dflash.quant.weight.2",
+                         defaultValue: "2-bit",
+                         comment: "DFlash draft quantization weight bits option")),
+            ("4", String(localized: "settings.dflash.quant.weight.4",
                          defaultValue: "4-bit",
-                         comment: "DFlash draft quantization option")),
-            ("8", String(localized: "settings.dflash.quant.8bit",
+                         comment: "DFlash draft quantization weight bits option")),
+            ("8", String(localized: "settings.dflash.quant.weight.8",
                          defaultValue: "8-bit",
-                         comment: "DFlash draft quantization option")),
+                         comment: "DFlash draft quantization weight bits option")),
+        ]
+    }
+
+    static var dflashDraftQuantActivationBitsOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.quant.activation.default",
+                        defaultValue: "default",
+                        comment: "DFlash draft quantization activation bits — use server default")),
+            ("16", String(localized: "settings.dflash.quant.activation.16",
+                          defaultValue: "16-bit",
+                          comment: "DFlash draft quantization activation bits option")),
+            ("32", String(localized: "settings.dflash.quant.activation.32",
+                          defaultValue: "32-bit",
+                          comment: "DFlash draft quantization activation bits option")),
+        ]
+    }
+
+    static var dflashDraftQuantGroupSizeOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.quant.group.default",
+                        defaultValue: "default",
+                        comment: "DFlash draft quantization group size — use server default")),
+            ("32", "32"),
+            ("64", "64"),
+            ("128", "128"),
+        ]
+    }
+
+    static var dflashVerifyModeOptions: [(String, String)] {
+        [
+            ("", String(localized: "settings.dflash.verify_mode.default",
+                        defaultValue: "default (adaptive)",
+                        comment: "DFlash verify mode option meaning the server default is used")),
+            ("adaptive", String(localized: "settings.dflash.verify_mode.adaptive",
+                                defaultValue: "adaptive",
+                                comment: "DFlash verify mode: shrinks block size when acceptance drops")),
+            ("dflash", String(localized: "settings.dflash.verify_mode.dflash",
+                              defaultValue: "dflash",
+                              comment: "DFlash verify mode: standard dflash verifier")),
+            ("ddtree", String(localized: "settings.dflash.verify_mode.ddtree",
+                              defaultValue: "ddtree",
+                              comment: "DFlash verify mode: DDTree verifier")),
+            ("off", String(localized: "settings.dflash.verify_mode.off",
+                           defaultValue: "off",
+                           comment: "DFlash verify mode: disable speculative verify")),
         ]
     }
 
@@ -1373,15 +1596,28 @@ final class ModelSettingsScreenVM: ObservableObject {
     // Experimental: DFlash
     @Published var dflashEnabled: Bool = false
     @Published var dflashDraftModel: String = ""
-    /// "" (bf16 default), "4", or "8".
-    @Published var dflashDraftQuantBits: String = ""
+    @Published var dflashDraftQuantEnabled: Bool = false
+    @Published var dflashDraftQuantWeightBits: String = "4"
+    @Published var dflashDraftQuantActivationBits: String = ""
+    @Published var dflashDraftQuantGroupSize: String = ""
     @Published var dflashMaxCtx: String = ""
+    @Published var dflashVerifyMode: String = ""
+    @Published var dflashDraftWindowSize: String = ""
+    @Published var dflashDraftSinkSize: String = ""
     @Published var dflashInMemoryCache: Bool = false
     @Published var dflashInMemoryCacheGib: String = "8"
+    @Published var dflashInMemoryCacheMaxEntries: String = "4"
     @Published var dflashSsdCache: Bool = false
+    @Published var dflashSsdCacheGib: String = "20"
 
     // Experimental: native MTP
     @Published var mtpEnabled: Bool = false
+
+    // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
+    // Block size is held as a string for the editor; empty = mlx-vlm default.
+    @Published var vlmMtpEnabled: Bool = false
+    @Published var vlmMtpDraftModel: String = ""
+    @Published var vlmMtpDraftBlockSize: String = ""
 
     // Profiles
     @Published var profiles: [ProfileDTO] = []
@@ -1492,13 +1728,25 @@ final class ModelSettingsScreenVM: ObservableObject {
                     self.specprefillThreshold = s.specprefillThreshold.map(String.init) ?? "8192"
                     self.dflashEnabled = s.dflashEnabled ?? false
                     self.dflashDraftModel = s.dflashDraftModel ?? ""
-                    self.dflashDraftQuantBits = s.dflashDraftQuantBits.map(String.init) ?? ""
+                    self.dflashDraftQuantEnabled = s.dflashDraftQuantEnabled ?? false
+                    self.dflashDraftQuantWeightBits = s.dflashDraftQuantWeightBits.map(String.init) ?? "4"
+                    self.dflashDraftQuantActivationBits = s.dflashDraftQuantActivationBits.map(String.init) ?? ""
+                    self.dflashDraftQuantGroupSize = s.dflashDraftQuantGroupSize.map(String.init) ?? ""
                     self.dflashMaxCtx = s.dflashMaxCtx.map(String.init) ?? ""
+                    self.dflashVerifyMode = s.dflashVerifyMode ?? ""
+                    self.dflashDraftWindowSize = s.dflashDraftWindowSize.map(String.init) ?? ""
+                    self.dflashDraftSinkSize = s.dflashDraftSinkSize.map(String.init) ?? ""
                     self.dflashInMemoryCache = s.dflashInMemoryCache ?? false
                     self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s.dflashInMemoryCacheMaxBytes)
                         .map(String.init) ?? "8"
+                    self.dflashInMemoryCacheMaxEntries = s.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
                     self.dflashSsdCache = s.dflashSsdCache ?? false
+                    self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s.dflashSsdCacheMaxBytes)
+                        .map(String.init) ?? "20"
                     self.mtpEnabled = s.mtpEnabled ?? false
+                    self.vlmMtpEnabled = s.vlmMtpEnabled ?? false
+                    self.vlmMtpDraftModel = s.vlmMtpDraftModel ?? ""
+                    self.vlmMtpDraftBlockSize = s.vlmMtpDraftBlockSize.map(String.init) ?? ""
                     self.activeProfileName = s.activeProfileName
                 }
             }
@@ -1610,8 +1858,23 @@ final class ModelSettingsScreenVM: ObservableObject {
         case .specprefillThreshold:    patch.specprefillThreshold = Int(specprefillThreshold)
         case .dflashEnabled:           patch.dflashEnabled = dflashEnabled
         case .dflashDraftModel:        patch.dflashDraftModel = dflashDraftModel.isEmpty ? nil : dflashDraftModel
-        case .dflashDraftQuantBits:    patch.dflashDraftQuantBits = Int(dflashDraftQuantBits)
+        case .dflashDraftQuantEnabled:
+            patch.dflashDraftQuantEnabled = dflashDraftQuantEnabled
+            if !dflashDraftQuantEnabled {
+                patch.dflashDraftQuantWeightBits = nil
+                patch.dflashDraftQuantActivationBits = nil
+                patch.dflashDraftQuantGroupSize = nil
+            }
+        case .dflashDraftQuantWeightBits:
+            patch.dflashDraftQuantWeightBits = Int(dflashDraftQuantWeightBits)
+        case .dflashDraftQuantActivationBits:
+            patch.dflashDraftQuantActivationBits = Int(dflashDraftQuantActivationBits)
+        case .dflashDraftQuantGroupSize:
+            patch.dflashDraftQuantGroupSize = Int(dflashDraftQuantGroupSize)
         case .dflashMaxCtx:            patch.dflashMaxCtx = Int(dflashMaxCtx)
+        case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
+        case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
+        case .dflashDraftSinkSize:     patch.dflashDraftSinkSize = Int(dflashDraftSinkSize)
         case .dflashInMemoryCache:
             patch.dflashInMemoryCache = dflashInMemoryCache
             if !dflashInMemoryCache {
@@ -1622,8 +1885,15 @@ final class ModelSettingsScreenVM: ObservableObject {
             }
         case .dflashInMemoryCacheGib:
             patch.dflashInMemoryCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib))
+        case .dflashInMemoryCacheMaxEntries:
+            patch.dflashInMemoryCacheMaxEntries = Int(dflashInMemoryCacheMaxEntries)
         case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
+        case .dflashSsdCacheGib:
+            patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
         case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
+        case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
+        case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
@@ -1667,6 +1937,29 @@ final class ModelSettingsScreenVM: ObservableObject {
         return out
     }
 
+    /// Draft-model options for VLM MTP. mlx-vlm's MTP loop takes an
+    /// "assistant" drafter, so the picker filters to model ids containing
+    /// "assistant" (case-insensitive), matching the HTML editor's filter,
+    /// and drops the current model so it can't draft for itself.
+    ///
+    /// The stored value is the model **id**, not its path: the server
+    /// resolves the drafter by registry id (`engine_pool` looks it up in
+    /// `_entries` keyed by model_id, then uses that entry's `model_path`).
+    /// This matches the web modal, which binds `m.id`.
+    func vlmMtpDraftModelOptions() -> [(String, String)] {
+        var out: [(String, String)] = [
+            ("", String(localized: "settings.vlm_mtp.draft.placeholder",
+                        defaultValue: "Select assistant drafter…",
+                        comment: "Initial placeholder option in the VLM MTP draft-model picker")),
+        ]
+        for m in allModels
+        where m.id != modelID
+            && m.id.range(of: "assistant", options: .caseInsensitive) != nil {
+            out.append((m.id, m.id))
+        }
+        return out
+    }
+
     var isDSAConfigModel: Bool {
         guard let type = model?.configModelType else { return false }
         return Self.dsaConfigModelTypes.contains(type)
@@ -1684,6 +1977,38 @@ final class ModelSettingsScreenVM: ObservableObject {
             return String(localized: "settings.mtp.conflict.turboquant",
                           defaultValue: "Disable TurboQuant KV before enabling MTP.",
                           comment: "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on")
+        }
+        if vlmMtpEnabled {
+            return String(localized: "settings.mtp.conflict.vlm_mtp",
+                          defaultValue: "Disable VLM MTP before enabling Native MTP.",
+                          comment: "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on")
+        }
+        return nil
+    }
+
+    /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
+    /// other speculative-decoding / KV-quant features. Mirrors the HTML
+    /// editor's gating so the toggle disables itself and surfaces why.
+    var vlmMtpConflictReason: String? {
+        if dflashEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on")
+        }
+        if specprefillEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.specprefill",
+                          defaultValue: "Disable SpecPrefill before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on")
+        }
+        if mtpEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.mtp",
+                          defaultValue: "Disable Native MTP before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on")
+        }
+        if turboquantKvEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.turboquant",
+                          defaultValue: "Disable TurboQuant KV before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on")
         }
         return nil
     }
@@ -1767,15 +2092,36 @@ final class ModelSettingsScreenVM: ObservableObject {
         putBool(ProfileSettingsKey.dflashEnabled, dflashEnabled)
         if dflashEnabled {
             putString(ProfileSettingsKey.dflashDraftModel, dflashDraftModel)
-            putInt(ProfileSettingsKey.dflashDraftQuantBits, dflashDraftQuantBits)
+            putBool(ProfileSettingsKey.dflashDraftQuantEnabled, dflashDraftQuantEnabled)
+            if dflashDraftQuantEnabled {
+                putInt(ProfileSettingsKey.dflashDraftQuantWeightBits, dflashDraftQuantWeightBits)
+                putInt(ProfileSettingsKey.dflashDraftQuantActivationBits, dflashDraftQuantActivationBits)
+                putInt(ProfileSettingsKey.dflashDraftQuantGroupSize, dflashDraftQuantGroupSize)
+            }
             putInt(ProfileSettingsKey.dflashMaxCtx, dflashMaxCtx)
+            if !dflashVerifyMode.isEmpty {
+                out[ProfileSettingsKey.dflashVerifyMode] = AnyCodable(dflashVerifyMode)
+            }
+            putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
+            putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
             putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
-            if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
-                out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+            if dflashInMemoryCache {
+                if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
+                    out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+                }
+                putInt(ProfileSettingsKey.dflashInMemoryCacheMaxEntries, dflashInMemoryCacheMaxEntries)
             }
             putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
+            if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
+                out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
+            }
         }
         putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+        putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
+        if vlmMtpEnabled {
+            putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
+            putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
+        }
 
         return out
     }

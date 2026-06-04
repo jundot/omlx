@@ -25,6 +25,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.model_loading import maybe_apply_pre_load_patches
+from ..utils.tokenizer import create_streaming_detokenizer
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -679,7 +680,7 @@ class DFlashEngine(BaseEngine):
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
-            # detokenization too, so the NaiveStreamingDetokenizer fallback is
+            # detokenization too, so the standard streaming detokenizer is
             # only created when no parser is available.
             parser_session = (
                 self._output_parser_factory.create_session(self._executor_tokenizer)
@@ -688,11 +689,12 @@ class DFlashEngine(BaseEngine):
             )
             detokenizer = None
             if parser_session is None:
-                try:
-                    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                    detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
-                except ImportError:
-                    pass
+                detokenizer = create_streaming_detokenizer(
+                    self._executor_tokenizer,
+                    model_path=self._model_name,
+                )
+                if detokenizer is not None:
+                    detokenizer.reset()
 
             for event in event_iter:
                 if stop_event.is_set():
