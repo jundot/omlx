@@ -116,9 +116,14 @@ def serve_command(args):
     if settings.huggingface.endpoint:
         os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
 
-    # Apply ModelScope endpoint if configured
+    # Apply ModelScope endpoint if configured. The modelscope SDK builds its URL
+    # as https://<MODELSCOPE_DOMAIN>, so this must be a BARE host -- a full URL
+    # like "https://modelscope.cn" becomes "https://https://modelscope.cn" and
+    # every API/download call fails to resolve host "https".
     if settings.modelscope.endpoint:
-        os.environ["MODELSCOPE_DOMAIN"] = settings.modelscope.endpoint
+        os.environ["MODELSCOPE_DOMAIN"] = (
+            settings.modelscope.endpoint.split("://", 1)[-1].strip("/")
+        )
 
     # Apply proxy/TLS settings if configured
     if settings.network.http_proxy:
