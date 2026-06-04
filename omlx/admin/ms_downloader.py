@@ -655,7 +655,13 @@ class MSDownloader:
                         str(Path.home() / ".cache" / "modelscope"),
                     )
                 )
-                cache_path = ms_cache / "hub" / task.repo_id
+                # modelscope SDK (>=1.x) downloads to <cache>/hub/models/<repo_id>
+                # and stages in-flight bytes under .../models/._____temp/<repo_id>
+                # before the final move. Poll both -- the old <cache>/hub/<repo_id>
+                # path never exists, so the progress bar sat at 0% the whole time.
+                ms_models = ms_cache / "hub" / "models"
+                cache_path = ms_models / task.repo_id
+                temp_path = ms_models / "._____temp" / task.repo_id
                 alias_path = self._model_dir / task.repo_id.split("/")[-1]
 
                 # Get total file size for progress estimation
@@ -678,7 +684,7 @@ class MSDownloader:
 
                 # Start progress polling on the cache path (where files land)
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, cache_path)
+                    self._poll_progress(task_id, [cache_path, temp_path])
                 )
 
                 # Build download kwargs (cache mode: no local_dir)
@@ -774,11 +780,11 @@ class MSDownloader:
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
 
-    async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
-        """Poll the target directory to estimate download progress.
+    async def _poll_progress(self, task_id: str, target_dirs: list[Path]) -> None:
+        """Poll the target directories to estimate download progress.
 
-        Uses both directory size and file modification times to detect
-        activity.
+        Sums size across all dirs (the final cache dir + the ._____temp staging
+        dir) and uses file modification times to detect activity.
         """
         task = self._tasks.get(task_id)
         if task is None:
@@ -794,7 +800,7 @@ class MSDownloader:
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
+                current_size = sum(self._get_dir_size(d) for d in target_dirs)
                 task.downloaded_size = current_size
 
                 if task.total_size > 0:
@@ -808,7 +814,10 @@ class MSDownloader:
                     last_size = current_size
                     last_activity_at = time.time()
                 else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
+                    latest_mtime = max(
+                        (self._get_latest_mtime(d) for d in target_dirs),
+                        default=0.0,
+                    )
                     if latest_mtime > last_activity_at:
                         last_activity_at = latest_mtime
 
