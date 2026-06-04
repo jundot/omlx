@@ -77,9 +77,10 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # PyPI spec for publish; dev pinned to commit f96138e (Gemma4 MTP server
-    # batching #1166, speculative utils refactor #1169, Qwen native MTP drafter,
-    # MiniCPM-V 4.6) via override below.
+    # PyPI spec for publish; dev pinned to commit 041f889 (adds gemma4_unified
+    # model support; Gemma4 MTP server batching #1166, speculative utils refactor
+    # #1169, Qwen native MTP drafter incl. batched target-verify, MiniCPM-V 4.6)
+    # via override below.
     "mlx-vlm>=0.5.0",
     "Pillow>=9.0.0",
     # PyPI spec for publish; dev pinned to commit 20d68db (bstnxbt repo: Gemma4
@@ -207,7 +208,7 @@ include = ["omlx*"]
 override-dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@041f8891176996c916f347e542b3aae179300546",
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
 ]
