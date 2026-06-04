@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import inspect
 import importlib
 import json
 import logging
@@ -75,6 +76,8 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|endoftext|>",
     "<|endofassistant|>",
 ]
+
+VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
@@ -1120,6 +1123,47 @@ class VLMBatchedEngine(BaseEngine):
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
+            image_position_ids = extra_model_inputs.get("image_position_ids")
+            if image_position_ids is not None:
+                try:
+                    signature = inspect.signature(model.encode_image)
+                except (TypeError, ValueError):
+                    signature = None
+
+                if signature is None:
+                    try:
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+                    except TypeError:
+                        logger.debug(
+                            "encode_image rejected image_position_ids; "
+                            "retrying without it",
+                            exc_info=True,
+                        )
+                else:
+                    parameters = signature.parameters
+                    accepts_kwargs = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in parameters.values()
+                    )
+                    if "image_position_ids" in parameters or accepts_kwargs:
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+
+                    positional_parameters = [
+                        p
+                        for p in parameters.values()
+                        if p.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+                    if len(positional_parameters) >= 2:
+                        return model.encode_image(pixel_values, image_position_ids)
+
             return model.encode_image(pixel_values)
 
         # Strategy 2: qwen-style (vision_tower + grid_thw)
@@ -1190,6 +1234,34 @@ class VLMBatchedEngine(BaseEngine):
         if features.ndim >= 3 and features.shape[0] == num_images:
             return [features[i : i + 1] for i in range(num_images)]
 
+        # Some mlx-vlm models, including Gemma4 unified, return compacted flat
+        # features after applying per-image position IDs.
+        if features.ndim == 2:
+            soft_tokens = self._as_int_list(
+                extra_model_inputs.get("num_soft_tokens_per_image")
+            )
+            if soft_tokens is not None:
+                if len(soft_tokens) != num_images:
+                    logger.debug(
+                        "Per-image soft token count mismatch: expected %d entries, got %d",
+                        num_images,
+                        len(soft_tokens),
+                    )
+                    return None
+                if sum(soft_tokens) != features.shape[0]:
+                    logger.debug(
+                        "Per-image soft token total mismatch: expected %d, got %d",
+                        sum(soft_tokens),
+                        features.shape[0],
+                    )
+                    return None
+                result = []
+                offset = 0
+                for count in soft_tokens:
+                    result.append(features[offset : offset + count])
+                    offset += count
+                return result
+
         # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
         if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
             grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -1218,6 +1290,95 @@ class VLMBatchedEngine(BaseEngine):
             return result
 
         return None
+
+    @staticmethod
+    def _as_int_list(value: Any) -> Optional[List[int]]:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (int, float)):
+            return [int(value)]
+        if not isinstance(value, (list, tuple)):
+            return None
+
+        result: List[int] = []
+        for item in value:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, (list, tuple)):
+                if len(item) != 1:
+                    return None
+                item = item[0]
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return result
+
+    @staticmethod
+    def _vision_feature_token_count(features: Any) -> Optional[int]:
+        if isinstance(features, (list, tuple)):
+            total = 0
+            for feature in features:
+                count = VLMBatchedEngine._vision_feature_token_count(feature)
+                if count is None:
+                    return None
+                total += count
+            return total
+
+        shape = getattr(features, "shape", None)
+        if not shape:
+            return None
+        if len(shape) == 1:
+            return 1
+
+        count = 1
+        for dim in shape[:-1]:
+            count *= int(dim)
+        return count
+
+    def _image_token_count(self, input_ids: Any) -> Optional[int]:
+        config = getattr(self._vlm_model, "config", None)
+        image_token_id = getattr(config, "image_token_id", None)
+        if image_token_id is None:
+            return None
+
+        try:
+            ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+            return int(mx.sum(ids == int(image_token_id)).item())
+        except Exception:
+            logger.debug("Failed to count VLM image tokens", exc_info=True)
+            return None
+
+    def _vision_features_match_image_tokens(
+        self, features: Any, image_token_count: Optional[int]
+    ) -> bool:
+        if image_token_count is None:
+            return True
+
+        feature_token_count = self._vision_feature_token_count(features)
+        if feature_token_count is None:
+            return True
+
+        if feature_token_count == image_token_count:
+            return True
+
+        logger.debug(
+            "Ignoring cached vision features: feature_tokens=%d, image_tokens=%d",
+            feature_token_count,
+            image_token_count,
+        )
+        return False
+
+    @staticmethod
+    def _language_prompt_kwargs(extra_model_inputs: dict[str, Any]) -> dict[str, Any]:
+        """Return processor kwargs that must survive into language prefill."""
+        return {
+            key: extra_model_inputs[key]
+            for key in VLM_LANGUAGE_PROMPT_KWARGS
+            if extra_model_inputs.get(key) is not None
+        }
 
     def _prepare_vision_inputs(
         self,
@@ -1484,6 +1645,7 @@ class VLMBatchedEngine(BaseEngine):
 
             # Try per-image vision feature cache
             if has_vision and self._vision_cache is not None and self._vision_cache_enabled:
+                image_token_count = self._image_token_count(input_ids)
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
@@ -1498,27 +1660,42 @@ class VLMBatchedEngine(BaseEngine):
                         image_hash, self._model_name
                     )
 
+                used_cached_features = False
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
-                    call_kwargs["cached_image_features"] = combined
-                    logger.debug(
-                        "Vision feature cache hit (per-image): all %d images cached",
-                        num_images,
-                    )
+                    if self._vision_features_match_image_tokens(
+                        combined, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = combined
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (per-image): all %d images cached",
+                            num_images,
+                        )
                 elif cached_whole is not None:
-                    call_kwargs["cached_image_features"] = cached_whole
-                    logger.debug(
-                        "Vision feature cache hit (whole-request): %s",
-                        image_hash[:16],
-                    )
-                else:
+                    if self._vision_features_match_image_tokens(
+                        cached_whole, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = cached_whole
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (whole-request): %s",
+                            image_hash[:16],
+                        )
+
+                if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
                             pixel_values, extra_model_inputs
                         )
-                        if features is not None:
+                        if (
+                            features is not None
+                            and self._vision_features_match_image_tokens(
+                                features, image_token_count
+                            )
+                        ):
                             mx.eval(features)
                             call_kwargs["cached_image_features"] = features
                             # Split and cache each image individually
@@ -1578,6 +1755,8 @@ class VLMBatchedEngine(BaseEngine):
                 for k, v in feat_dict.items():
                     if k != "inputs_embeds" and v is not None:
                         extra_kwargs[k] = v
+            for k, v in self._language_prompt_kwargs(extra_model_inputs).items():
+                extra_kwargs.setdefault(k, v)
 
             # Capture per-request mRoPE state set by
             # get_input_embeddings(). The language model stores these as

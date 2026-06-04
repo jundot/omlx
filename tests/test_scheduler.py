@@ -22,6 +22,7 @@ import mlx.core as mx
 import pytest
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
+import omlx.scheduler as scheduler_module
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
 
 
@@ -77,6 +78,31 @@ class TestSchedulerConfig:
         assert config.model_name == "test-model"
         assert config.gc_cleanup_interval == 5
         assert config.mlx_cache_cleanup_interval == 20
+
+
+class TestVLMExtraSlicing:
+    """Tests for VLM prompt-aligned extra kwargs used during external prefill."""
+
+    def test_slice_and_advance_token_type_ids(self):
+        """Multimodal token types should stay aligned with inputs_embeds chunks."""
+        extra = {
+            "mm_token_type_ids": mx.array([[0, 1, 1, 0]]),
+            "token_type_ids": mx.array([[0, 1, 1, 0]]),
+            "per_layer_inputs": mx.zeros((1, 4, 2, 3)),
+            "scalar": mx.array(7),
+        }
+
+        sliced = scheduler_module._slice_vlm_extra(extra, 3)
+        assert sliced["mm_token_type_ids"].tolist() == [[0, 1, 1]]
+        assert sliced["token_type_ids"].tolist() == [[0, 1, 1]]
+        assert sliced["per_layer_inputs"].shape == (1, 3, 2, 3)
+        assert sliced["scalar"] is extra["scalar"]
+
+        advanced = scheduler_module._advance_vlm_extra(extra, 1)
+        assert advanced["mm_token_type_ids"].tolist() == [[1, 1, 0]]
+        assert advanced["token_type_ids"].tolist() == [[1, 1, 0]]
+        assert advanced["per_layer_inputs"].shape == (1, 3, 2, 3)
+        assert advanced["scalar"] is extra["scalar"]
 
 
 class TestSchedulingPolicy:
