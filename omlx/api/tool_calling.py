@@ -96,7 +96,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         try:
             # Try JSON format first: {"name": "func", "arguments": {...}}
             parsed = json.loads(content)
-            name = parsed.get("name", "")
+            name = (parsed.get("name") or "").strip()
             arguments = parsed.get("arguments", {})
             tool_calls.append(
                 ToolCall(
@@ -439,7 +439,11 @@ def parse_tool_calls(
                     # <minimax:tool_call> block contains multiple <invoke>s.
                     items = parsed if isinstance(parsed, list) else [parsed]
                     for p in items:
-                        name = p.get("name", "")
+                        # Strip whitespace: some native parsers (e.g. GLM-4.x)
+                        # leave a trailing newline on the function name, which
+                        # makes OpenAI clients fail to match it ("No tool named
+                        # 'list_directory\n' exists").
+                        name = (p.get("name") or "").strip()
                         arguments = p.get("arguments", {})
                         tool_calls.append(
                             ToolCall(
@@ -471,7 +475,7 @@ def parse_tool_calls(
                                 parsed if isinstance(parsed, list) else [parsed]
                             )
                             for p in items:
-                                name = p.get("name", "")
+                                name = (p.get("name") or "").strip()
                                 arguments = p.get("arguments", {})
                                 tool_calls.append(
                                     ToolCall(
