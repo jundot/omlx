@@ -26,6 +26,8 @@ class MockGenerationOutput:
     finished: bool = False
     tool_calls: Optional[List[Dict[str, Any]]] = None
     cached_tokens: int = 0
+    prefill_duration: float = 0.0
+    generation_duration: float = 0.0
 
 
 class MockTokenizer:

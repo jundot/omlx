@@ -109,6 +109,8 @@ class FakeStreamingCore:
             finish_reason=None,
             tool_calls=None,
             cached_tokens=0,
+            prefill_duration=0.25,
+            generation_duration=0.5,
         )
 
     async def abort_request(self, request_id):

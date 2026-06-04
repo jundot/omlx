@@ -146,6 +146,8 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            prefill_duration=new.prefill_duration or existing.prefill_duration,
+            generation_duration=new.generation_duration,
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             cached_tokens=new.cached_tokens,
             error=new.error or existing.error,

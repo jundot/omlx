@@ -15,6 +15,7 @@ import gc
 import json
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -835,11 +836,13 @@ class DFlashEngine(BaseEngine):
 
         loop = asyncio.get_running_loop()
         stop_event = threading.Event()
+        request_start = time.perf_counter()
 
         def _run():
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
             event_iter = None
+            first_token_time = None
             # Per-request parser session (gemma4 channel markers, harmony
             # channels). Lives only inside the executor thread so the parser
             # state cannot leak across requests.
@@ -861,6 +864,8 @@ class DFlashEngine(BaseEngine):
                         logger.info("DFlash generation aborted by client")
                         break
                     if isinstance(event, TokenEvent):
+                        if first_token_time is None:
+                            first_token_time = time.perf_counter()
                         token_id = int(event.token_id)
                         if token_id in stop_ids:
                             continue
@@ -875,7 +880,13 @@ class DFlashEngine(BaseEngine):
                     final = parser_session.finalize()
                     if final.visible_text:
                         parsed_visible_parts.append(final.visible_text)
-                return summary, tokens, parser_session, parsed_visible_parts
+                return (
+                    summary,
+                    tokens,
+                    parser_session,
+                    parsed_visible_parts,
+                    first_token_time,
+                )
             finally:
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
@@ -889,9 +900,13 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated, parser_session, parsed_visible_parts = (
-                await asyncio.shield(asyncio.wrap_future(future))
-            )
+            (
+                summary,
+                generated,
+                parser_session,
+                parsed_visible_parts,
+                first_token_time,
+            ) = await asyncio.shield(asyncio.wrap_future(future))
         except asyncio.CancelledError:
             stop_event.set()
             logger.info("DFlash generate cancelled, waiting for executor to drain")
@@ -931,12 +946,21 @@ class DFlashEngine(BaseEngine):
         completion_token_count = (
             int(summary.generation_tokens) if summary is not None else len(generated)
         )
+        end_time = time.perf_counter()
+        ttft = (
+            first_token_time - request_start
+            if first_token_time is not None
+            else end_time - request_start
+        )
+        generation_duration = end_time - (first_token_time or request_start)
         return GenerationOutput(
             text=text,
             tokens=generated,
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             finish_reason="stop",
+            prefill_duration=ttft,
+            generation_duration=generation_duration,
         )
 
     async def stream_generate(
@@ -1021,10 +1045,15 @@ class DFlashEngine(BaseEngine):
         total_text = ""
         total_completion = 0
         finished_normally = False
+        start_time = time.perf_counter()
+        first_token_time = None
 
         try:
             while True:
                 new_text, new_tokens, finished, metrics = await queue.get()
+
+                if first_token_time is None and new_text:
+                    first_token_time = time.perf_counter()
 
                 if think_prefix_pending and new_text:
                     new_text = self._think_prefix_text() + new_text
@@ -1048,6 +1077,14 @@ class DFlashEngine(BaseEngine):
                     completion_tokens=total_completion,
                     finished=finished,
                     finish_reason=finish_reason,
+                    prefill_duration=(
+                        first_token_time - start_time
+                        if first_token_time is not None
+                        else 0.0
+                    ),
+                    generation_duration=(
+                        time.perf_counter() - (first_token_time or start_time)
+                    ),
                 )
 
                 if finished:
