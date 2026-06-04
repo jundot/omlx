@@ -1,191 +1,73 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replace mlx-vlm Qwen3_5GatedDeltaNet.__call__ body with the mlx-lm version.
+"""No-op as of mlx-vlm 041f889 -- the GatedDeltaNet fixes are now upstream.
 
-As of mlx-vlm 191d7c8 (target), upstream ships ``cache.advance(S)`` on its
-own, so the original ``ed7884c`` fix is no longer carried by this patch. Two
-items remain that upstream still does not have, both of which require touching
-the body mid-function:
+History
+-------
+This patch used to replace mlx-vlm ``Qwen3_5GatedDeltaNet.__call__`` to carry
+two fixes upstream lacked:
 
-- ``9dcefa5`` "break shared-buffer memory leak in GatedDeltaNet cache" — wrap
+- ``9dcefa5`` "break shared-buffer memory leak in GatedDeltaNet cache" -- wrap
   the ``cache[0]`` write in ``mx.contiguous`` and add the ``cache.lengths is
   not None`` per-element slicing branch.
+- Drop the mlx-vlm silent fallbacks (``conv_state.shape[0] != B`` => zeros,
+  same shape for state and mask) that mask real bugs.
 
-- Drop the mlx-vlm silent fallbacks (``conv_state.shape[0] != B`` ⇒ zeros,
-  same shape for state and mask) that mask real bugs in favor of mlx-lm
-  semantics.
+As of mlx-vlm 041f889 BOTH motivations are gone:
 
-The mlx-vlm-specific ``gdn_sink`` parameter is preserved: when given, append
-the same tuple the rollback path consumes.
+1. The ``mx.contiguous(cache[0])`` write and the ``cache.lengths`` /
+   ``take_along_axis`` per-element branch are now in upstream verbatim
+   (Qwen3_5GatedDeltaNet.__call__, mlx-vlm 041f889). Redundant.
 
-Patch target (current upstream):
-- mlx_vlm.models.qwen3_5.language.Qwen3_5GatedDeltaNet (commit 191d7c8)
+2. The ``conv_state.shape[0] != B`` and ``mask.shape[0] != B`` fallbacks this
+   patch used to DROP are now load-bearing: 041f889's batched ``target_verify``
+   (speculative-decode verify) path produces ragged-row shapes that rely on
+   those guards. Dropping them would BREAK spec-decode.
 
-mlx-lm's GatedDeltaNet already has both fixes, so we leave it untouched.
+3. Upstream's GatedDeltaNet is now a strict superset of the old body: it adds
+   ``target_verify``, ``_gated_delta_update_verify_decode``, a 12-element
+   ``gdn_sink`` tuple ending in ``intermediate_states``, and the
+   ``_causal_conv1d_verify`` / ``_causal_conv1d_decode`` fast paths. The 11-tuple
+   this patch's old body appended is consumed by mlx-vlm's stock
+   ``LanguageModel.rollback_speculative_cache`` -- which now expects the 12-tuple.
+   Installing the old body would feed a stale tuple to stock rollback and break
+   speculative cache rollback for the VLM MTP path.
+
+So overriding ``__call__`` is now both pointless and actively harmful. The patch
+is therefore a deliberate no-op: ``apply_gated_delta_advance_patch`` returns
+False without touching the class, leaving 041f889's GatedDeltaNet intact. The
+file is kept (not deleted) so the import sites in ``omlx/engine/vlm.py`` and
+``omlx/utils/model_loading.py`` stay valid and the decision is documented here.
+
+NOTE (flyto soft-fork): upstream jundot/omlx deleted this file in 3d2fef5 when
+it bumped mlx-vlm. flyto keeps the no-op shell rather than deleting, so the
+companion ``qwen3_5_attention.py`` correctness patch (which flyto retains and
+upstream dropped) and its apply call-sites remain undisturbed.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
-
-try:
-    import mlx.core as mx
-    import mlx.nn as nn
-    from mlx_lm.models.gated_delta import gated_delta_update
-
-    HAS_MLX = True
-except ImportError:
-    HAS_MLX = False
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-_patched_classes: set[int] = set()
-
-
-def _build_replacement_call():
-    """Construct the new __call__ matching mlx-lm semantics with mlx-vlm
-    signature (gdn_sink) preserved."""
-
-    def __call__(
-        self,
-        inputs: "mx.array",
-        mask: Optional["mx.array"] = None,
-        cache: Optional[Any] = None,
-        gdn_sink: Optional[list] = None,
-    ) -> "mx.array":
-        B, S, _ = inputs.shape
-
-        # Optional sharding group (mlx-lm only — mlx-vlm class has no such
-        # attribute, so guard with getattr).
-        sharding_group = getattr(self, "sharding_group", None)
-        if sharding_group is not None:
-            from mlx_lm.models.gated_delta import sum_gradients  # type: ignore
-
-            inputs = sum_gradients(sharding_group)(inputs)
-
-        qkv = self.in_proj_qkv(inputs)
-        # Use -1 for the v-head axis (mlx-vlm style) — equivalent to
-        # num_v_heads but tolerant if config drifts.
-        z = self.in_proj_z(inputs).reshape(B, S, -1, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
-
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
-        else:
-            conv_state = mx.zeros(
-                (B, self.conv_kernel_size - 1, self.conv_dim),
-                dtype=inputs.dtype,
-            )
-
-        if mask is not None:
-            qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            lengths = getattr(cache, "lengths", None)
-            if lengths is not None:
-                ends = mx.clip(lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-
-        conv_out = nn.silu(self.conv1d(conv_input))
-
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
-            )
-        ]
-
-        state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-
-        # mlx-vlm-only: capture pre-update tensors for speculative-cache
-        # rollback. Layout matches Qwen3_5GatedDeltaNet upstream.
-        if gdn_sink is not None:
-            gdn_sink.append(
-                (
-                    q,
-                    k,
-                    v,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    state,
-                    mask,
-                    conv_input,
-                    self.conv_kernel_size,
-                )
-            )
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
-
-        if cache is not None:
-            cache[1] = state
-            cache.advance(S)
-
-        out = self.norm(out, z)
-        out = self.out_proj(out.reshape(B, S, -1))
-
-        if sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=sharding_group)
-
-        return out
-
-    return __call__
-
-
-def _patch_class(cls: Any, label: str) -> bool:
-    """Replace cls.__call__ with the mlx-lm-equivalent body once."""
-    if id(cls) in _patched_classes:
-        return True
-    cls.__call__ = _build_replacement_call()
-    _patched_classes.add(id(cls))
-    logger.info(f"GatedDeltaNet patch applied (body replacement): {label}")
-    return True
-
-
 def apply_gated_delta_advance_patch(model: Any = None) -> bool:
-    """Patch mlx-vlm Qwen3_5GatedDeltaNet to mirror mlx-lm semantics.
+    """No-op as of mlx-vlm 041f889. See module docstring for why.
 
-    The ``model`` argument is accepted for backward compatibility but
-    not used: the patch is class-level. Returns True if the target class
-    was importable and (re-)patched.
+    Kept as a stable entry point so the call sites in
+    ``omlx/engine/vlm.py`` and ``omlx/utils/model_loading.py`` need no
+    change while flyto soft-forks. Overriding mlx-vlm 041f889's
+    ``Qwen3_5GatedDeltaNet.__call__`` is now both redundant (its fixes are
+    upstream) and unsafe (it would clobber the new ``target_verify`` path and
+    feed a stale 11-tuple to stock ``rollback_speculative_cache``, which now
+    expects a 12-tuple with ``intermediate_states``).
+
+    The ``model`` argument is accepted for backward compatibility but not
+    used. Always returns False -- no class is patched.
     """
-    if not HAS_MLX:
-        logger.debug("mlx not importable; skipping GatedDeltaNet patch")
-        return False
-
-    any_patched = False
-    try:
-        from mlx_vlm.models.qwen3_5.language import (
-            Qwen3_5GatedDeltaNet as _VLMGdn,
-        )
-
-        _patch_class(_VLMGdn, "mlx_vlm.models.qwen3_5.language.Qwen3_5GatedDeltaNet")
-        any_patched = True
-    except ImportError:
-        logger.debug("mlx_vlm.models.qwen3_5.language not importable")
-
-    return any_patched
+    logger.debug(
+        "gated_delta_advance patch is a no-op on mlx-vlm 041f889 "
+        "(fixes upstreamed; override would break target_verify rollback)"
+    )
+    return False
