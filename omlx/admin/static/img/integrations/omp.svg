@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800">
+  <style>
+    .bg { fill: #1a1a1a; }
+    .fg { fill: #ffffff; }
+    @media (prefers-color-scheme: light) {
+      .bg { fill: #f0ede8; }
+      .fg { fill: #1a1a1a; }
+    }
+  </style>
+  <rect class="bg" width="800" height="800"/>
+  <!-- Stylized pi glyph for Oh My Pi (omp) -->
+  <g class="fg">
+    <rect x="170" y="225" width="460" height="78"/>
+    <rect x="252" y="303" width="78" height="272"/>
+    <rect x="470" y="303" width="78" height="272"/>
+  </g>
+</svg>
