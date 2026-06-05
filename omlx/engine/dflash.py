@@ -988,12 +988,20 @@ class DFlashEngine(BaseEngine):
         completion_token_count = (
             int(summary.generation_tokens) if summary is not None else len(generated)
         )
+        metrics = {}
+        if summary is not None:
+            metrics = {
+                "cache_hit_kind": str(summary.hit_kind),
+                "acceptance_ratio": float(summary.acceptance_ratio),
+                "cycles_completed": int(summary.cycles_completed),
+            }
         return GenerationOutput(
             text=text,
             tokens=generated,
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             finish_reason="stop",
+            metrics=metrics,
         )
 
     async def stream_generate(
@@ -1105,6 +1113,7 @@ class DFlashEngine(BaseEngine):
                     completion_tokens=total_completion,
                     finished=finished,
                     finish_reason=finish_reason,
+                    metrics=metrics or {},
                 )
 
                 if finished:

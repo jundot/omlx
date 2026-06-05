@@ -355,6 +355,10 @@ class Usage(BaseUsage):
     generation_duration: Optional[float] = None
     prompt_tokens_per_second: Optional[float] = None
     generation_tokens_per_second: Optional[float] = None
+    # DFlash metrics (oMLX extension)
+    cache_hit_kind: Optional[str] = None
+    dflash_acceptance_ratio: Optional[float] = None
+    dflash_cycles_completed: Optional[int] = None
 
 
 class ChatCompletionResponse(BaseModel):

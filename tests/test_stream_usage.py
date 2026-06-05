@@ -109,6 +109,19 @@ class TestUsageExtendedFields:
         assert dumped["model_load_duration"] == 55.93
         assert "prompt_tokens_details" not in dumped
 
+    def test_usage_with_dflash_metrics(self):
+        usage = Usage(
+            prompt_tokens=8192,
+            completion_tokens=128,
+            cache_hit_kind="l1_exact",
+            dflash_acceptance_ratio=0.75,
+            dflash_cycles_completed=16,
+        )
+        dumped = usage.model_dump(exclude_none=True)
+        assert dumped["cache_hit_kind"] == "l1_exact"
+        assert dumped["dflash_acceptance_ratio"] == 0.75
+        assert dumped["dflash_cycles_completed"] == 16
+
 
 class TestUsageChunkFormat:
     """Tests for usage chunk structure (OpenAI spec: choices=[], usage present)."""
