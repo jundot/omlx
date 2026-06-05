@@ -572,6 +572,7 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = getattr(ctx, "runtime")
+        assert runtime.prefix_cache_l2_frontier_stride == 16384
         assert runtime.dflash_min_output_tokens == 32
 
     def test_get_stats_exposes_prefix_cache_knobs(self):
