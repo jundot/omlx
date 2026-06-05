@@ -2696,8 +2696,12 @@ def quantize_oq_streaming(
                     w_mx = w_mx.astype(target_dtype)
                 out_shard_data[tensor_name] = w_mx
         else:
-            if mx.issubdtype(w_mx.dtype, mx.floating) and w_mx.dtype != target_dtype:
-                w_mx = w_mx.astype(target_dtype)
+            if _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name):
+                if mx.issubdtype(w_mx.dtype, mx.floating) and w_mx.dtype != target_dtype:
+                    w_mx = w_mx.astype(mx.float32)
+            else:
+                if mx.issubdtype(w_mx.dtype, mx.floating) and w_mx.dtype != target_dtype:
+                    w_mx = w_mx.astype(target_dtype)
             out_shard_data[tensor_name] = w_mx
 
         del w_mx
