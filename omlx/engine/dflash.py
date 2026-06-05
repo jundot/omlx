@@ -740,10 +740,17 @@ class DFlashEngine(BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
-        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.engine.events import (
+            PrefillCompleteEvent,
+            SummaryEvent,
+            TokenEvent,
+        )
 
         event_iter = None
+        prefill_restored = 0
+        prefill_computed = len(prompt_tokens)
         try:
+            mx.reset_peak_memory()
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
@@ -772,7 +779,11 @@ class DFlashEngine(BaseEngine):
                     logger.info("DFlash generation aborted by client")
                     break
 
-                if isinstance(event, TokenEvent):
+                if isinstance(event, PrefillCompleteEvent):
+                    prefill_restored = int(event.prefill_tokens_restored)
+                    prefill_computed = int(event.prefill_tokens_computed)
+
+                elif isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
@@ -827,6 +838,9 @@ class DFlashEngine(BaseEngine):
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
                         "cache_hit_kind": str(event.hit_kind),
+                        "peak_memory_gb": event.peak_memory_gb,
+                        "prefill_tokens_restored": prefill_restored,
+                        "prefill_tokens_computed": prefill_computed,
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -921,6 +935,7 @@ class DFlashEngine(BaseEngine):
                 else None
             )
             try:
+                mx.reset_peak_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
@@ -1009,6 +1024,7 @@ class DFlashEngine(BaseEngine):
                 "cache_hit_kind": str(summary.hit_kind),
                 "acceptance_ratio": float(summary.acceptance_ratio),
                 "cycles_completed": int(summary.cycles_completed),
+                "peak_memory_gb": summary.peak_memory_gb,
             }
         return GenerationOutput(
             text=text,

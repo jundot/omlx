@@ -3688,6 +3688,13 @@ async def stream_chat_completion(
                     cache_hit_kind=engine_metrics.get("cache_hit_kind"),
                     dflash_acceptance_ratio=engine_metrics.get("acceptance_ratio"),
                     dflash_cycles_completed=engine_metrics.get("cycles_completed"),
+                    dflash_peak_memory_gb=engine_metrics.get("peak_memory_gb"),
+                    dflash_prefill_tokens_restored=engine_metrics.get(
+                        "prefill_tokens_restored"
+                    ),
+                    dflash_prefill_tokens_computed=engine_metrics.get(
+                        "prefill_tokens_computed"
+                    ),
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"

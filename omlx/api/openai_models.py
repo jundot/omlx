@@ -359,6 +359,9 @@ class Usage(BaseUsage):
     cache_hit_kind: Optional[str] = None
     dflash_acceptance_ratio: Optional[float] = None
     dflash_cycles_completed: Optional[int] = None
+    dflash_peak_memory_gb: Optional[float] = None
+    dflash_prefill_tokens_restored: Optional[int] = None
+    dflash_prefill_tokens_computed: Optional[int] = None
 
 
 class ChatCompletionResponse(BaseModel):

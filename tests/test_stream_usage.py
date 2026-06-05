@@ -116,11 +116,17 @@ class TestUsageExtendedFields:
             cache_hit_kind="l1_exact",
             dflash_acceptance_ratio=0.75,
             dflash_cycles_completed=16,
+            dflash_peak_memory_gb=31.25,
+            dflash_prefill_tokens_restored=8188,
+            dflash_prefill_tokens_computed=4,
         )
         dumped = usage.model_dump(exclude_none=True)
         assert dumped["cache_hit_kind"] == "l1_exact"
         assert dumped["dflash_acceptance_ratio"] == 0.75
         assert dumped["dflash_cycles_completed"] == 16
+        assert dumped["dflash_peak_memory_gb"] == 31.25
+        assert dumped["dflash_prefill_tokens_restored"] == 8188
+        assert dumped["dflash_prefill_tokens_computed"] == 4
 
 
 class TestUsageChunkFormat:
