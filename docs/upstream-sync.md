@@ -118,6 +118,28 @@ commit)。
     (boundary_snapshot flake 由 #1423 修掉, 不再算).
   - 全部 sync/* PR 已 self-merge 进 main.
 
+- **2026-06-05 Gemma4 Unified VLM 图像修复** — 分支 `sync/gemma4-vlm-image-dev2`
+  (基于 `main` @ `3605e36`), PR #46. cherry-pick 上游 v0.4.2.dev2 两个 commit:
+  - `ff041ed` "accept gemma4 unified assistant drafter" — 干净 cherry-pick.
+  - `77fb32a` "preserve VLM prompt kwargs for Gemma4" — 主修复, 保住
+    `mm_token_type_ids` / `token_type_ids` 走 external prefill 路径, 处理 Gemma4
+    Unified compacted vision features, vision feature cache 加 token-count 校验.
+  - 冲突解决: `omlx/engine/vlm.py` 保留 flyto 的 `has_vision` guard (audio
+    fallback) + 上游 `image_token_count` 初始化 (203 行修复仅 1 行冲突);
+    `tests/test_scheduler.py` 上游 diff 夹带无关漂移 (#1459 async-store-cache
+    泄漏测试 + mock 签名重构, 依赖 flyto 缺失的功能), 5 个冲突全取 flyto 侧, 只
+    补回真正相关的 `TestVLMExtraSlicing` (验证 `_slice_vlm_extra` /
+    `_advance_vlm_extra` 对 token_type_ids 的处理, 两函数 flyto 已有) +
+    `scheduler_module` 别名; `tests/test_vision_feature_cache.py` 干净自动合.
+  - 测试: 针对性 318 pass (scheduler 全量 + 全部 VLM 套件); 完整套件 m2max
+    4525 pass / 3 fail / 19 skip, 3 个 fail 是已知 `OMLX_SERVER_API_KEY`
+    env-override (test_settings.py), 零回归.
+  - 生产部署验证: m5max + m2max 都 pull + 重启 serve. 带图实测
+    (gemma4-dense-12b-bf16 + 测试图): 修复前 44s, content 是 "thought thought"
+    垃圾 + 图像幻觉成无关内容; 修复后 5s, content 准确描述图像. 根因 = 图像
+    prefill 的 token-type IDs 丢失导致模型输出整体崩坏 (正文被 thought 垃圾顶掉
+    + 幻觉), 纯文本不受影响. self-merge `f940162`.
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |
