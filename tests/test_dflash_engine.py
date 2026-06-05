@@ -212,6 +212,63 @@ class TestDFlashEngineInit:
         assert engine._draft_quant_activation_bits == 32
         assert engine._draft_quant_group_size == 128
 
+    def test_stream_events_forward_prefix_cache_hit_kind(self, monkeypatch):
+        """The adapter must preserve DFlash's live cache classification."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import dflash_mlx.runtime as dflash_runtime
+        from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._executor_tokenizer = MagicMock()
+        engine._draft_model = object()
+        engine._target_model = object()
+        engine._target_ops = object()
+        engine._draft_backend = object()
+        engine._runtime_context = object()
+
+        flow = SimpleNamespace(
+            snapshot=object(),
+            snapshot_service=object(),
+            stable_prefix_len=128,
+            cache_active=True,
+            publish_generation_snapshot=True,
+            hit_kind="l1_exact",
+        )
+        monkeypatch.setattr(
+            PrefixCacheFlow,
+            "for_request",
+            staticmethod(lambda **_kwargs: flow),
+        )
+        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda _tokenizer: [2])
+
+        captured = {}
+
+        def fake_stream_dflash_generate(**kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        monkeypatch.setattr(
+            dflash_runtime,
+            "stream_dflash_generate",
+            fake_stream_dflash_generate,
+        )
+
+        event_iter, returned_flow, stop_ids = engine._stream_dflash_events(
+            prompt_tokens=[1, 2, 3],
+            max_tokens=16,
+        )
+
+        assert list(event_iter) == []
+        assert returned_flow is flow
+        assert stop_ids == [2]
+        assert captured["prefix_hit_kind"] == "l1_exact"
+
 
     def test_get_stats_no_verify_mode(self):
         """Stats should not include verify_mode (removed in v2)."""

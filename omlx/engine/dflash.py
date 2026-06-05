@@ -705,6 +705,7 @@ class DFlashEngine(BaseEngine):
             stable_prefix_len=prefix_flow.stable_prefix_len,
             prefix_cache_active=prefix_flow.cache_active,
             publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
+            prefix_hit_kind=prefix_flow.hit_kind,
             runtime_context=self._runtime_context,
         )
         return event_iter, prefix_flow, stop_ids
