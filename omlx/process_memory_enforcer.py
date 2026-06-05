@@ -33,6 +33,7 @@ import ctypes.util
 import logging
 import subprocess
 import sys
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -291,6 +292,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.80,
         prefill_min_chunk_tokens: int = 32,
+        prefill_transient_margin_gb: float = 0.0,
     ):
         """
         Initialize the process memory enforcer.
@@ -317,6 +319,11 @@ class ProcessMemoryEnforcer:
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
+            prefill_transient_margin_gb: Conservative margin added to the
+                modelled per-chunk prefill peak by the scheduler's
+                forward-front gate, covering the MoE expert-dequant activation
+                spike that estimate_prefill_peak_bytes does not model.
+                Propagated to each scheduler. 0 = no extra margin.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -331,6 +338,9 @@ class ProcessMemoryEnforcer:
         self._hard_threshold = hard_threshold
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._prefill_transient_margin_bytes = max(
+            0, int(prefill_transient_margin_gb * 1024**3)
+        )
         self._task: asyncio.Task | None = None
         self._running = False
         # Most recently observed pressure level, consumed by scheduler /
@@ -340,6 +350,13 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
+        # Rolling window of recent usage readings + their high-water mark.
+        # Prefill memory dips into a trough between chunks, so the instant
+        # reading can read low mid-prefill; preflight admission consults this
+        # peak instead so it does not wave through a request that will wall
+        # the next chunk. Updated on every poll iteration.
+        self._usage_window: deque[int] = deque(maxlen=5)
+        self._recent_peak_bytes: int = 0
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -503,6 +520,10 @@ class ProcessMemoryEnforcer:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
 
+    def recent_peak_bytes(self) -> int:
+        """Recent high-water memory usage over the last few poll ticks."""
+        return self._recent_peak_bytes
+
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
         ceiling = self._get_hard_limit_bytes()
@@ -589,6 +610,10 @@ class ProcessMemoryEnforcer:
                 scheduler._admission_paused = admission_paused
                 scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
                 scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
+                scheduler._prefill_transient_margin_bytes = (
+                    self._prefill_transient_margin_bytes
+                )
+                scheduler._memory_recent_peak_bytes = self._recent_peak_bytes
                 bg = getattr(scheduler, "batch_generator", None)
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                     bg._memory_limit_bytes = soft_limit
@@ -671,6 +696,8 @@ class ProcessMemoryEnforcer:
             return
 
         current = self._current_usage_bytes()
+        self._usage_window.append(current)
+        self._recent_peak_bytes = max(self._usage_window) if self._usage_window else current
         soft = int(ceiling * self._soft_threshold)
         hard = int(ceiling * self._hard_threshold)
         prev_level = self._pressure_level

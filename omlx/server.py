@@ -359,6 +359,7 @@ async def lifespan(app: FastAPI):
             hard_threshold=mem_cfg.hard_threshold,
             prefill_safe_zone_ratio=mem_cfg.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=mem_cfg.prefill_min_chunk_tokens,
+            prefill_transient_margin_gb=mem_cfg.prefill_transient_margin_gb,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer

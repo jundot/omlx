@@ -391,6 +391,33 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Conservative transient margin added to the modelled per-chunk prefill
+    # peak by the scheduler's forward-FRONT memory gate. The model in
+    # memory_monitor.estimate_prefill_peak_bytes only accounts for KV + SDPA;
+    # it does NOT model the MoE expert-dequant activation spike, which on a
+    # MoE model (glm4.5-air-106b) is the dominant single-step transient. The
+    # gate refuses a chunk before its forward when current + estimate + this
+    # margin would breach the hard cap, so the transient never actually lands
+    # on the Metal ceiling (which would kernel-panic the whole machine, an
+    # after-the-fact Python check cannot catch it).
+    #
+    # At chunk granularity the KV+SDPA estimate is tiny (~0.3GB for a
+    # 256-token GLM chunk), so this margin IS the safety mechanism. The
+    # load-bearing guarantee is: margin > the worst-case single-step memory
+    # jump. Across the 2026-06-06 m5max glm4.5-air-106b crash log the max
+    # trough->peak single-step delta was 7.44GB (peak overshoot reached
+    # 110.4GB vs a 107.5GB cap). With margin=10GB the gate effectively fires
+    # once current exceeds ~cap - margin (~97GB); since every observed forward
+    # jumps <=7.44GB < 10GB, any chunk that would land above the cap starts
+    # from a current already past that trip point, so the gate refuses it
+    # before the forward. 10 = ceil(7.44) padded for an unobserved larger
+    # spike. NOTE: this holds only while `current` is read at true high-water
+    # at gate time (it relies on phys_footprint stickiness + recent_peak to
+    # mask the post-_sync_and_clear_cache trough in mx.get_active_memory());
+    # watch the [memgate]/[memcheck] logs on hardware and raise the margin if
+    # a sub-trip-point trough precedes an over-cap chunk. Set to 0 to disable
+    # the extra margin (the gate then uses the bare KV+SDPA estimate).
+    prefill_transient_margin_gb: float = 10.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -402,6 +429,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "prefill_transient_margin_gb": self.prefill_transient_margin_gb,
         }
 
     @classmethod
@@ -439,6 +467,9 @@ class MemorySettings:
             ),
             prefill_min_chunk_tokens=int(
                 data.get("prefill_min_chunk_tokens", 32)
+            ),
+            prefill_transient_margin_gb=float(
+                data.get("prefill_transient_margin_gb", 10.0)
             ),
         )
 
