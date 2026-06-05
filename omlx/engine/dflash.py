@@ -231,18 +231,36 @@ class DFlashEngine(BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
+        import inspect
+
         from dflash_mlx.runtime.config import runtime_config_from_defaults
         from dflash_mlx.runtime.context import build_runtime_context
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
-        # Only forward knobs that are explicitly configured (None → omit entirely so
-        # dflash-mlx fills DEFAULT_RUNTIME_CONFIG and older versions stay compatible).
+        # Only forward knobs that are explicitly configured (non-None) AND supported by
+        # the installed dflash-mlx version.  Older installs don't accept these kwargs;
+        # passing them unconditionally would raise TypeError.
+        _sig = inspect.signature(runtime_config_from_defaults).parameters
         optional_knobs: dict[str, Any] = {}
         if self._l2_frontier_stride is not None:
-            optional_knobs["prefix_cache_l2_frontier_stride"] = self._l2_frontier_stride
+            if "prefix_cache_l2_frontier_stride" in _sig:
+                optional_knobs["prefix_cache_l2_frontier_stride"] = self._l2_frontier_stride
+            else:
+                logger.warning(
+                    "dflash_l2_frontier_stride=%d ignored: installed dflash-mlx does not "
+                    "support prefix_cache_l2_frontier_stride; upgrade dflash-mlx to apply",
+                    self._l2_frontier_stride,
+                )
         if self._min_output_tokens is not None:
-            optional_knobs["dflash_min_output_tokens"] = self._min_output_tokens
+            if "dflash_min_output_tokens" in _sig:
+                optional_knobs["dflash_min_output_tokens"] = self._min_output_tokens
+            else:
+                logger.warning(
+                    "dflash_min_output_tokens=%d ignored: installed dflash-mlx does not "
+                    "support dflash_min_output_tokens; upgrade dflash-mlx to apply",
+                    self._min_output_tokens,
+                )
         cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,

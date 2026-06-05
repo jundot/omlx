@@ -550,15 +550,16 @@ class TestDFlashEngineInit:
         assert engine._min_output_tokens == 64
 
     def test_build_runtime_context_passes_prefix_cache_knobs(self):
-        """l2_frontier_stride and min_output_tokens reach dflash-mlx RuntimeContext."""
+        """l2_frontier_stride and min_output_tokens reach dflash-mlx RuntimeContext.
+
+        When the installed dflash-mlx predates PR3/PR4, the engine must silently
+        ignore the knobs (logging a warning) rather than raising TypeError.
+        """
+        import inspect
+
         try:
             from omlx.engine.dflash import DFlashEngine
-            import inspect
             from dflash_mlx.runtime.config import runtime_config_from_defaults
-            if "prefix_cache_l2_frontier_stride" not in inspect.signature(
-                runtime_config_from_defaults
-            ).parameters:
-                pytest.skip("dflash-mlx < PR3 (no prefix_cache_l2_frontier_stride)")
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
@@ -570,10 +571,15 @@ class TestDFlashEngineInit:
                 dflash_min_output_tokens=32,
             ),
         )
+        # Must not raise TypeError regardless of installed dflash-mlx version.
         ctx = engine._build_runtime_context()
         runtime = getattr(ctx, "runtime")
-        assert runtime.prefix_cache_l2_frontier_stride == 16384
-        assert runtime.dflash_min_output_tokens == 32
+
+        sig = inspect.signature(runtime_config_from_defaults).parameters
+        if "prefix_cache_l2_frontier_stride" in sig:
+            assert runtime.prefix_cache_l2_frontier_stride == 16384
+        if "dflash_min_output_tokens" in sig:
+            assert runtime.dflash_min_output_tokens == 32
 
     def test_get_stats_exposes_prefix_cache_knobs(self):
         """get_stats() should include l2_frontier_stride and min_output_tokens."""
