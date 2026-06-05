@@ -170,6 +170,19 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else None
         )
+        # None → dflash-mlx uses its 8192-token floor; set to raise the floor further.
+        self._l2_frontier_stride = (
+            getattr(model_settings, "dflash_l2_frontier_stride", None)
+            if model_settings
+            else None
+        )
+        # None → disabled (0). Route short-output requests to target-only when
+        # max_new_tokens < threshold and no exact prefix cache hit exists.
+        self._min_output_tokens = (
+            getattr(model_settings, "dflash_min_output_tokens", None)
+            if model_settings
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -223,6 +236,13 @@ class DFlashEngine(BaseEngine):
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
+        # Only forward knobs that are explicitly configured (None → omit entirely so
+        # dflash-mlx fills DEFAULT_RUNTIME_CONFIG and older versions stay compatible).
+        optional_knobs: dict[str, Any] = {}
+        if self._l2_frontier_stride is not None:
+            optional_knobs["prefix_cache_l2_frontier_stride"] = self._l2_frontier_stride
+        if self._min_output_tokens is not None:
+            optional_knobs["dflash_min_output_tokens"] = self._min_output_tokens
         cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,
@@ -237,6 +257,7 @@ class DFlashEngine(BaseEngine):
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
+            **optional_knobs,
         )
         return build_runtime_context(cfg)
 
@@ -772,6 +793,7 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "cache_hit_kind": str(event.hit_kind),
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -1216,6 +1238,8 @@ class DFlashEngine(BaseEngine):
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
+            "l2_frontier_stride": self._l2_frontier_stride,
+            "min_output_tokens": self._min_output_tokens,
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:

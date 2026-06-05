@@ -29,6 +29,8 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size is None
         assert settings.dflash_verify_mode is None
+        assert settings.dflash_l2_frontier_stride is None
+        assert settings.dflash_min_output_tokens is None
 
     def test_no_speculative_tokens_field(self):
         """dflash_speculative_tokens was removed in v2 and stays removed."""
@@ -57,6 +59,8 @@ class TestDFlashModelSettings:
         assert "dflash_draft_window_size" not in d
         assert "dflash_draft_sink_size" not in d
         assert "dflash_verify_mode" not in d
+        assert "dflash_l2_frontier_stride" not in d
+        assert "dflash_min_output_tokens" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
@@ -511,6 +515,83 @@ class TestDFlashEngineInit:
         ctx = engine._build_runtime_context()
         runtime = getattr(ctx, "runtime")
         assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
+
+
+    def test_prefix_cache_knobs_default_to_none(self):
+        """No settings → engine stores None → dflash-mlx fills its own defaults."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        assert engine._l2_frontier_stride is None
+        assert engine._min_output_tokens is None
+
+    def test_prefix_cache_knobs_read_from_settings(self):
+        """DFlashEngine picks up l2_frontier_stride and min_output_tokens from ModelSettings."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+                dflash_min_output_tokens=64,
+            ),
+        )
+        assert engine._l2_frontier_stride == 16384
+        assert engine._min_output_tokens == 64
+
+    def test_build_runtime_context_passes_prefix_cache_knobs(self):
+        """l2_frontier_stride and min_output_tokens reach dflash-mlx RuntimeContext."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+            import inspect
+            from dflash_mlx.runtime.config import runtime_config_from_defaults
+            if "prefix_cache_l2_frontier_stride" not in inspect.signature(
+                runtime_config_from_defaults
+            ).parameters:
+                pytest.skip("dflash-mlx < PR3 (no prefix_cache_l2_frontier_stride)")
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+                dflash_min_output_tokens=32,
+            ),
+        )
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+        assert runtime.dflash_min_output_tokens == 32
+
+    def test_get_stats_exposes_prefix_cache_knobs(self):
+        """get_stats() should include l2_frontier_stride and min_output_tokens."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+                dflash_min_output_tokens=64,
+            ),
+        )
+        stats = engine.get_stats()
+        assert stats["l2_frontier_stride"] == 16384
+        assert stats["min_output_tokens"] == 64
 
 
 class TestDFlashCompatibility:

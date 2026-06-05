@@ -81,6 +81,13 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_l2_frontier_stride: Token stride at which L2 frontier snapshots are written
+            during cold prefill (None = dflash 8192-token floor, rounded to prefill-step
+            multiple). Values below 8192 are silently raised. Larger strides reduce
+            sync SSD writes on long-context prompts.
+        dflash_min_output_tokens: Route short-output requests to target-only generation when
+            max_new_tokens < threshold and no exact prefix cache hit exists (None / 0 = disabled).
+            Speculative decoding is unprofitable for very short outputs.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -156,6 +163,8 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_l2_frontier_stride: Optional[int] = None  # Token stride for L2 frontier snapshots (None = 8192 floor)
+    dflash_min_output_tokens: Optional[int] = None  # Route to target-only when max_new_tokens < this and no exact hit
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
