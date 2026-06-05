@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -158,9 +159,7 @@ class TestSSDCache:
 
     def test_ssd_startup_scan(self, tmp_cache_dir):
         # Phase 1: create cache and store features
-        cache1 = VisionFeatureSSDCache(
-            cache_dir=tmp_cache_dir, max_memory_entries=3
-        )
+        cache1 = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
         features = mx.ones((4, 8))
         mx.eval(features)
         cache1.put("img_hash", "model_a", features)
@@ -168,9 +167,7 @@ class TestSSDCache:
         cache1.close()
 
         # Phase 2: create new cache instance — should scan existing files
-        cache2 = VisionFeatureSSDCache(
-            cache_dir=tmp_cache_dir, max_memory_entries=3
-        )
+        cache2 = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
 
         # Memory cache is empty, but SSD index should have the entry
         result = cache2.get("img_hash", "model_a")
@@ -219,9 +216,7 @@ class TestSSDCache:
         assert result is None
 
     def test_close_flushes_writes(self, tmp_cache_dir):
-        cache = VisionFeatureSSDCache(
-            cache_dir=tmp_cache_dir, max_memory_entries=3
-        )
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
         features = mx.ones((4, 8))
         mx.eval(features)
         cache.put("img_hash", "model_a", features)
@@ -276,7 +271,7 @@ class TestVLMEngineIntegration:
     """Integration tests for vision cache in VLMBatchedEngine using mocks."""
 
     def test_compute_vision_features_encode_image(self):
-        """Model with encode_image should use it directly."""
+        """Model with encode_image should receive image_position_ids when available."""
         from omlx.engine.vlm import VLMBatchedEngine
 
         engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
@@ -286,20 +281,54 @@ class TestVLMEngineIntegration:
         expected = mx.ones((10, 16))
         engine._vlm_model.encode_image.return_value = expected
 
+        pixel_values = mx.zeros((1, 3, 224, 224))
+        image_position_ids = mx.zeros((1, 10, 2))
         result = engine._compute_vision_features(
-            mx.zeros((1, 3, 224, 224)), {}
+            pixel_values, {"image_position_ids": image_position_ids}
         )
         assert result is expected
-        engine._vlm_model.encode_image.assert_called_once()
+        engine._vlm_model.encode_image.assert_called_once_with(
+            pixel_values, image_position_ids=image_position_ids
+        )
+
+    def test_compute_vision_features_encode_image_without_position_support(self):
+        """Models with a pixel-only encode_image signature should still work."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        expected = mx.ones((10, 16))
+
+        class PixelOnlyModel:
+            config = SimpleNamespace(model_type="pixel_only")
+
+            def __init__(self):
+                self.calls = []
+
+            def encode_image(self, pixel_values):
+                self.calls.append(pixel_values)
+                return expected
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._vlm_model = PixelOnlyModel()
+
+        pixel_values = mx.zeros((1, 3, 224, 224))
+        result = engine._compute_vision_features(
+            pixel_values, {"image_position_ids": mx.zeros((1, 10, 2))}
+        )
+
+        assert result is expected
+        assert engine._vlm_model.calls == [pixel_values]
 
     def test_compute_vision_features_qwen_style(self):
         """Qwen-style model should call vision_tower(pv, grid_thw) directly."""
         from omlx.engine.vlm import VLMBatchedEngine
 
         engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
-        engine._vlm_model = MagicMock(spec=[
-            "vision_tower", "config",
-        ])
+        engine._vlm_model = MagicMock(
+            spec=[
+                "vision_tower",
+                "config",
+            ]
+        )
         engine._vlm_model.config.model_type = "qwen3_5_moe"
 
         expected = mx.ones((10, 16))
@@ -334,9 +363,7 @@ class TestVLMEngineIntegration:
         engine._vlm_model = MagicMock(spec=["vision_tower", "config"])
         engine._vlm_model.config.model_type = "qwen2_vl"
 
-        result = engine._compute_vision_features(
-            mx.zeros((1, 3, 224, 224)), {}
-        )
+        result = engine._compute_vision_features(mx.zeros((1, 3, 224, 224)), {})
         assert result is None
 
     def test_compute_vision_features_llava_style(self):
@@ -344,22 +371,30 @@ class TestVLMEngineIntegration:
         from omlx.engine.vlm import VLMBatchedEngine
 
         engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
-        engine._vlm_model = MagicMock(spec=[
-            "vision_tower", "multi_modal_projector",
-            "vision_feature_layer", "vision_feature_select_strategy",
-            "config",
-        ])
+        engine._vlm_model = MagicMock(
+            spec=[
+                "vision_tower",
+                "multi_modal_projector",
+                "vision_feature_layer",
+                "vision_feature_select_strategy",
+                "config",
+            ]
+        )
         engine._vlm_model.config.model_type = "llava"
         engine._vlm_model.vision_feature_layer = -2
         engine._vlm_model.vision_feature_select_strategy = "default"
 
         # vision_tower returns (_, _, hidden_states)
         hidden_state = mx.ones((1, 257, 1024))  # 256 patches + 1 CLS
-        engine._vlm_model.vision_tower.return_value = (None, None, [
-            mx.zeros((1, 257, 1024)),  # layer -3
-            hidden_state,              # layer -2 (selected)
-            mx.zeros((1, 257, 1024)),  # layer -1
-        ])
+        engine._vlm_model.vision_tower.return_value = (
+            None,
+            None,
+            [
+                mx.zeros((1, 257, 1024)),  # layer -3
+                hidden_state,  # layer -2 (selected)
+                mx.zeros((1, 257, 1024)),  # layer -1
+            ],
+        )
         projected = mx.ones((1, 256, 4096))
         engine._vlm_model.multi_modal_projector.return_value = projected
 
@@ -369,3 +404,85 @@ class TestVLMEngineIntegration:
         assert result is projected
         engine._vlm_model.vision_tower.assert_called_once()
         engine._vlm_model.multi_modal_projector.assert_called_once()
+
+    def test_split_vision_features_with_soft_token_counts(self):
+        """Flat compacted features should split by num_soft_tokens_per_image."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._vlm_model = MagicMock()
+        engine._vlm_model.config.model_type = "gemma4_unified"
+
+        features = mx.array(list(range(20))).reshape(5, 4)
+        result = engine._split_vision_features(
+            features,
+            2,
+            {"num_soft_tokens_per_image": [2, 3]},
+        )
+
+        assert result is not None
+        assert len(result) == 2
+        assert result[0].shape == (2, 4)
+        assert result[1].shape == (3, 4)
+        assert mx.array_equal(result[0], features[:2])
+        assert mx.array_equal(result[1], features[2:])
+
+    def test_split_vision_features_rejects_bad_soft_token_total(self):
+        """Mismatched soft-token totals should fall back to whole-request cache."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._vlm_model = MagicMock()
+        engine._vlm_model.config.model_type = "gemma4_unified"
+
+        result = engine._split_vision_features(
+            mx.ones((5, 4)),
+            2,
+            {"num_soft_tokens_per_image": [2, 2]},
+        )
+
+        assert result is None
+
+    def test_vision_features_match_image_tokens(self):
+        """Cached features should be ignored when token counts do not match."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._vlm_model = MagicMock()
+        engine._vlm_model.config.image_token_id = 42
+
+        input_ids = mx.array([[1, 42, 2, 42, 3]])
+        image_token_count = engine._image_token_count(input_ids)
+
+        assert image_token_count == 2
+        assert engine._vision_features_match_image_tokens(
+            mx.ones((2, 8)), image_token_count
+        )
+        assert engine._vision_features_match_image_tokens(
+            mx.ones((1, 2, 8)), image_token_count
+        )
+        assert not engine._vision_features_match_image_tokens(
+            mx.ones((3, 8)), image_token_count
+        )
+
+    def test_language_prompt_kwargs_preserves_token_type_ids(self):
+        """Gemma4 unified needs multimodal token types during language prefill."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        mm_token_type_ids = mx.array([[0, 1, 1, 0]])
+        token_type_ids = mx.array([[0, 1, 1, 0]])
+
+        result = VLMBatchedEngine._language_prompt_kwargs(
+            {
+                "mm_token_type_ids": mm_token_type_ids,
+                "token_type_ids": token_type_ids,
+                "image_position_ids": mx.zeros((1, 2, 2)),
+                "num_soft_tokens_per_image": [2],
+                "ignored_none": None,
+            }
+        )
+
+        assert result == {
+            "mm_token_type_ids": mm_token_type_ids,
+            "token_type_ids": token_type_ids,
+        }
