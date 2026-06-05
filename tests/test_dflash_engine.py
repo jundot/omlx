@@ -24,6 +24,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_ssd_cache is False
         # New long-context tuning knobs (issue #1276). None → dflash-mlx default.
         assert settings.dflash_draft_window_size is None
@@ -74,6 +75,7 @@ class TestDFlashModelSettings:
             "dflash_in_memory_cache": False,
             "dflash_in_memory_cache_max_entries": 16,
             "dflash_in_memory_cache_max_bytes": 4 * 1024 * 1024 * 1024,
+            "dflash_max_snapshot_tokens": 65536,
             "dflash_ssd_cache": True,
         }
         settings = ModelSettings.from_dict(data)
@@ -87,6 +89,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is False
         assert settings.dflash_in_memory_cache_max_entries == 16
         assert settings.dflash_in_memory_cache_max_bytes == 4 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens == 65536
         assert settings.dflash_ssd_cache is True
 
     def test_from_dict_missing_new_fields_uses_defaults(self):
@@ -100,6 +103,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_ssd_cache is False
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
@@ -135,6 +139,7 @@ class TestDFlashModelSettings:
             dflash_draft_quant_group_size=64,
             dflash_max_ctx=16384,
             dflash_in_memory_cache=False,
+            dflash_max_snapshot_tokens=65536,
             dflash_ssd_cache=False,
             dflash_ssd_cache_max_bytes=30 * 1024**3,
         )
@@ -148,6 +153,7 @@ class TestDFlashModelSettings:
         assert restored.dflash_draft_quant_group_size == original.dflash_draft_quant_group_size
         assert restored.dflash_max_ctx == original.dflash_max_ctx
         assert restored.dflash_in_memory_cache == original.dflash_in_memory_cache
+        assert restored.dflash_max_snapshot_tokens == original.dflash_max_snapshot_tokens
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
         assert restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
 
@@ -286,6 +292,7 @@ class TestDFlashEngineInit:
         assert stats["model_name"] == "test-model"
         assert stats["draft_model"] == "test-draft"
         assert stats["loaded"] is False
+        assert stats["max_snapshot_tokens"] is None
         assert "verify_mode" not in stats
 
     def test_cache_stats_returns_none(self):
@@ -638,6 +645,28 @@ class TestDFlashEngineInit:
         if "dflash_min_output_tokens" in sig:
             assert runtime.dflash_min_output_tokens == 32
 
+    def test_build_runtime_context_passes_max_snapshot_tokens(self):
+        """Long-context L1 admission must be configurable through oMLX."""
+        import inspect
+
+        try:
+            from omlx.engine.dflash import DFlashEngine
+            from dflash_mlx.runtime.config import runtime_config_from_defaults
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_max_snapshot_tokens=65536),
+        )
+        runtime = engine._build_runtime_context().runtime
+
+        if "max_snapshot_tokens" in inspect.signature(
+            runtime_config_from_defaults
+        ).parameters:
+            assert runtime.max_snapshot_tokens == 65536
+
     def test_get_stats_exposes_prefix_cache_knobs(self):
         """get_stats() should include l2_frontier_stride and min_output_tokens."""
         try:
@@ -656,6 +685,17 @@ class TestDFlashEngineInit:
         stats = engine.get_stats()
         assert stats["l2_frontier_stride"] == 16384
         assert stats["min_output_tokens"] == 64
+
+    def test_get_stats_exposes_max_snapshot_tokens(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_max_snapshot_tokens=65536),
+        )
+
+        assert engine.get_stats()["max_snapshot_tokens"] == 65536
 
 
 class TestDFlashCompatibility:

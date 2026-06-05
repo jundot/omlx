@@ -143,6 +143,11 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else 8 * 1024**3
         )
+        self._max_snapshot_tokens = (
+            getattr(model_settings, "dflash_max_snapshot_tokens", None)
+            if model_settings
+            else None
+        )
         self._ssd_cache_requested = (
             bool(getattr(model_settings, "dflash_ssd_cache", False))
             if model_settings
@@ -260,6 +265,15 @@ class DFlashEngine(BaseEngine):
                     "dflash_min_output_tokens=%d ignored: installed dflash-mlx does not "
                     "support dflash_min_output_tokens; upgrade dflash-mlx to apply",
                     self._min_output_tokens,
+                )
+        if self._max_snapshot_tokens is not None:
+            if "max_snapshot_tokens" in _sig:
+                optional_knobs["max_snapshot_tokens"] = self._max_snapshot_tokens
+            else:
+                logger.warning(
+                    "dflash_max_snapshot_tokens=%d ignored: installed dflash-mlx does "
+                    "not support max_snapshot_tokens; upgrade dflash-mlx to apply",
+                    self._max_snapshot_tokens,
                 )
         cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
@@ -1265,6 +1279,7 @@ class DFlashEngine(BaseEngine):
             "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
+            "max_snapshot_tokens": self._max_snapshot_tokens,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
             "l2_frontier_stride": self._l2_frontier_stride,
             "min_output_tokens": self._min_output_tokens,

@@ -54,6 +54,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_in_memory_cache",
     "dflash_in_memory_cache_max_entries",
     "dflash_in_memory_cache_max_bytes",
+    "dflash_max_snapshot_tokens",
     "dflash_ssd_cache",
     "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
