@@ -1714,16 +1714,46 @@ def validate_quantizable(config: dict) -> bool:
 
     Models with 'quantization' key (mlx-lm quantized) are excluded.
     Models with 'quantization_config' are excluded UNLESS they are native FP8
-    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format.
+    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format,
+    or QAT-trained models (e.g. Google Gemma 4 QAT variants) whose
+    quantization_config records training-time settings but whose weights are
+    stored in full precision (bfloat16/float16).
     """
     if "quantization" in config:
         return False
     if "quantization_config" in config:
         qc = config["quantization_config"]
-        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
-            return True
+        if isinstance(qc, dict):
+            quant_method = qc.get("quant_method", "")
+            # FP8 models are full-precision weights stored in FP8 format
+            if quant_method == "fp8":
+                return True
+            # QAT models carry quantization_config with no recognised
+            # weight-quantization method — weights are full-precision.
+            if not quant_method:
+                return True
         return False
     return True
+
+
+def _sensitivity_lm_config_override(config: dict) -> dict | None:
+    """Return a model_config override for mlx_lm.load when the model has a
+    QAT quantization_config that mlx-lm cannot process (missing quant_method).
+
+    mlx-lm does ``quantization_config["quant_method"]`` without a fallback, so
+    QAT configs (e.g. Google Gemma 4 QAT) raise KeyError and abort the load.
+    Passing ``{"quantization_config": None}`` via model_config causes
+    config.update() to replace the offending key before that branch runs.
+    """
+    for qc in (
+        config.get("quantization_config"),
+        config.get("text_config", {}).get("quantization_config"),
+    ):
+        # `and qc`: mlx-lm uses a walrus/truthiness guard so a falsy (empty)
+        # quantization_config never reaches the quant_method access — no override needed.
+        if isinstance(qc, dict) and qc and "quant_method" not in qc:
+            return {"quantization_config": None}
+    return None
 
 
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
@@ -4070,13 +4100,28 @@ def _measure_sensitivity(
 
     try:
         if is_vlm:
+            import mlx.nn as _nn
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            model = vlm_load_model(
-                Path(model_path),
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-            )
+            # mlx_vlm.load_model calls model.load_weights(weights) without strict=False.
+            # Shared-KV models (e.g. Gemma 4 2B/4B) omit k/v weights for shared layers,
+            # so strict=True raises ValueError. Relax temporarily — sensitivity only needs
+            # approximate weights; shared layers receive pre-computed KV at inference time.
+            _orig_lw = _nn.Module.load_weights
+
+            def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
+                kwargs.pop("strict", None)
+                return _orig_lw(self, file_or_weights, *args, strict=False, **kwargs)
+
+            _nn.Module.load_weights = _lenient_load_weights
+            try:
+                model = vlm_load_model(
+                    Path(model_path),
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                )
+            finally:
+                _nn.Module.load_weights = _orig_lw
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
@@ -4087,6 +4132,7 @@ def _measure_sensitivity(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                model_config=_sensitivity_lm_config_override(config),
             )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")

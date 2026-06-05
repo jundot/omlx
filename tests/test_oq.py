@@ -17,19 +17,18 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.oq import (
-    OQ_LEVELS,
     _LEVEL_BITS,
     _MAX_MODEL_RAM_FRACTION,
     _OQ_BPW_TARGETS,
     _PROXY_QUANT_BITS,
     _PROXY_QUANT_GROUP_SIZE,
-    _DiscoveredPlan,
-    _TrackedTensor,
+    OQ_LEVELS,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_streaming_proxy_for_sensitivity,
     _build_quant_plan,
     _discover_sanitize_plan,
+    _DiscoveredPlan,
     _extract_layer_index,
     _format_size,
     _forward_layer,
@@ -44,7 +43,9 @@ from omlx.oq import (
     _perturb_bits_for,
     _progress_total_bytes,
     _quantize_chunked,
+    _sensitivity_lm_config_override,
     _should_quantize_tensor,
+    _TrackedTensor,
     _validate_oq_dtype_for_model,
     estimate_bpw_and_size,
     estimate_memory,
@@ -731,8 +732,14 @@ class TestValidateQuantizable:
     def test_already_quantized(self):
         assert validate_quantizable({"quantization": {"bits": 4}}) is False
 
-    def test_quantization_config(self):
-        assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
+    def test_quantization_config_with_known_method(self):
+        # Real HF quantization configs always carry quant_method
+        assert (
+            validate_quantizable(
+                {"quantization_config": {"quant_method": "gptq", "bits": 4}}
+            )
+            is False
+        )
 
     def test_fp8_native_is_quantizable(self):
         # Native FP8 models (MiniMax, DeepSeek) should be quantizable
@@ -747,6 +754,67 @@ class TestValidateQuantizable:
             validate_quantizable({"quantization_config": {"quant_method": "gptq"}})
             is False
         )
+
+    def test_qat_no_quant_method_is_quantizable(self):
+        # QAT models have quantization_config with no quant_method — full-precision weights
+        assert (
+            validate_quantizable({"quantization_config": {"quant_type": "q4_0"}})
+            is True
+        )
+
+    def test_qat_empty_quant_method_is_quantizable(self):
+        assert validate_quantizable({"quantization_config": {}}) is True
+
+    def test_awq_not_quantizable(self):
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "awq"}})
+            is False
+        )
+
+
+# =============================================================================
+# Test _sensitivity_lm_config_override
+# =============================================================================
+
+
+class TestSensitivityLmConfigOverride:
+    def test_no_quantization_config(self):
+        assert _sensitivity_lm_config_override({"model_type": "llama"}) is None
+
+    def test_qat_config_top_level(self):
+        # QAT config with no quant_method → should override
+        result = _sensitivity_lm_config_override(
+            {"quantization_config": {"quant_type": "q4_0"}}
+        )
+        assert result == {"quantization_config": None}
+
+    def test_qat_config_in_text_config(self):
+        # QAT config nested in text_config (VLM layout) → should override
+        result = _sensitivity_lm_config_override(
+            {"text_config": {"quantization_config": {"quant_type": "q4_0"}}}
+        )
+        assert result == {"quantization_config": None}
+
+    def test_fp8_config_no_override(self):
+        # FP8 has quant_method set — not a QAT config, no override needed
+        assert (
+            _sensitivity_lm_config_override(
+                {"quantization_config": {"quant_method": "fp8"}}
+            )
+            is None
+        )
+
+    def test_known_method_no_override(self):
+        assert (
+            _sensitivity_lm_config_override(
+                {"quantization_config": {"quant_method": "gptq"}}
+            )
+            is None
+        )
+
+    def test_empty_quantization_config(self):
+        # Empty dict: no quant_method but also nothing to process — no override
+        assert _sensitivity_lm_config_override({"quantization_config": {}}) is None
 
 
 # =============================================================================
@@ -1173,9 +1241,9 @@ class TestLevelBudgetPlan:
         plan = _build_quant_plan(
             named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
         )
-        assert (
-            plan.effective_bpw >= 2.7
-        ), f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
+        assert plan.effective_bpw >= 2.7, (
+            f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
+        )
         assert plan.effective_bpw <= 3.0
         # Attention should be boosted via protection floor
         attn_boosts = [k for k in plan.boost_map if "q_proj" in k or "v_proj" in k]
@@ -2727,9 +2795,9 @@ class TestQuantizeOqStreamingFp8:
 
     def test_exceeds_ram_no_scratch_files(self, tmp_path):
         """On-the-fly dequant produces zero scratch/temp shard files."""
-        from unittest.mock import patch
-        import tempfile
         import os
+        import tempfile
+        from unittest.mock import patch
 
         src = tmp_path / "src"
         src.mkdir()
@@ -2931,9 +2999,9 @@ class TestQuantizeOqStreamingFp8:
 
         idx = _LazyTensorIndex([str(src / "model.safetensors")])
         assert len(idx._fp8_pairs) == 0, "BF16 weight should not pair with .scale"
-        assert (
-            "model.layers.0.self_attn.q_proj.scale" in idx
-        ), "scale key must remain visible"
+        assert "model.layers.0.self_attn.q_proj.scale" in idx, (
+            "scale key must remain visible"
+        )
 
 
 # =============================================================================
