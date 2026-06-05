@@ -1709,3 +1709,210 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
+
+
+class TestEnginePoolInUseLease:
+    """Tests for the acquire-vs-use in-use lease (#1667).
+
+    The memory enforcer must never evict an engine that a request has
+    acquired but not yet registered activity on. The lease is taken under the
+    pool lock at acquire time and skipped by every eviction path, in addition
+    to the existing has_active_requests() gate.
+    """
+
+    @staticmethod
+    def _loaded_entry(model_id: str, last_access: float = 0.0) -> EngineEntry:
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False  # looks idle
+        engine.stop = AsyncMock()
+        # Mirror TestEnginePoolPrefillEviction: no scheduler → prefill-idle.
+        engine.scheduler = None
+        engine._engine = None
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/models/{model_id}",
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+            engine=engine,
+            last_access=last_access,
+        )
+
+    def test_engine_entry_in_use_default_zero(self):
+        """EngineEntry exposes an in_use lease counter defaulting to 0."""
+        entry = EngineEntry(
+            model_id="x",
+            model_path="/p",
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1,
+        )
+        assert entry.in_use == 0
+
+    def test_find_lru_victim_skips_in_use_engine(self):
+        """An idle-looking engine with in_use > 0 must not be an LRU victim."""
+        pool = _make_pool(ceiling=0)
+        pool._entries = {
+            "leased": self._loaded_entry("leased", last_access=1.0),  # oldest
+            "free": self._loaded_entry("free", last_access=2.0),
+        }
+        pool._entries["leased"].in_use = 1
+
+        victim = pool._find_lru_victim()
+        # Without the lease the older "leased" would be picked; lease forces "free".
+        assert victim == "free"
+
+    def test_find_lru_victim_none_when_only_in_use(self):
+        """If the only loaded engine is leased, there is no LRU victim."""
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"leased": self._loaded_entry("leased", last_access=1.0)}
+        pool._entries["leased"].in_use = 2
+
+        assert pool._find_lru_victim() is None
+
+    def test_is_idle_for_prefill_eviction_skips_in_use(self):
+        """Prefill-pressure eviction must skip a leased (in_use > 0) engine."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        # Idle-looking → would be evictable, but the lease blocks it.
+        assert pool._is_idle_for_prefill_eviction(entry) is True
+        entry.in_use = 1
+        assert pool._is_idle_for_prefill_eviction(entry) is False
+
+    @pytest.mark.asyncio
+    async def test_check_ttl_expirations_skips_in_use(self):
+        """TTL eviction must not unload a leased engine even when idle past TTL."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased", last_access=100.0)
+        entry.in_use = 1
+        pool._entries = {"leased": entry}
+
+        settings_manager = MagicMock()
+        settings = MagicMock()
+        settings.ttl_seconds = 60
+        settings_manager.get_settings.return_value = settings
+
+        with patch("time.time", return_value=200.0):  # 100s idle > 60s TTL
+            expired = await pool.check_ttl_expirations(settings_manager)
+
+        assert expired == []
+        assert pool._entries["leased"].engine is not None
+        # in_use counts as activity → last_access refreshed
+        assert pool._entries["leased"].last_access == 200.0
+
+    @pytest.mark.asyncio
+    async def test_release_engine_floors_at_zero(self):
+        """release_engine decrements under lock and never goes below 0."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        pool._entries = {"leased": entry}
+
+        await pool.release_engine("leased")
+        assert entry.in_use == 0
+        # Extra release is a no-op (floor at 0), not a negative count.
+        await pool.release_engine("leased")
+        assert entry.in_use == 0
+        # Unknown model id is a harmless no-op.
+        await pool.release_engine("nope")
+
+    @pytest.mark.asyncio
+    async def test_acquire_leases_then_releases_on_success(self):
+        """acquire() leases on enter and releases in finally on normal exit."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("model-a")
+        pool._entries = {"model-a": entry}
+
+        async with pool.acquire("model-a") as engine:
+            assert engine is entry.engine
+            assert entry.in_use == 1  # leased while in use
+        assert entry.in_use == 0  # released on exit
+
+    @pytest.mark.asyncio
+    async def test_acquire_releases_lease_on_exception(self):
+        """acquire() releases the lease even if the body raises."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("model-a")
+        pool._entries = {"model-a": entry}
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async with pool.acquire("model-a"):
+                assert entry.in_use == 1
+                raise RuntimeError("boom")
+        assert entry.in_use == 0  # no leaked lease
+
+
+class TestResetActivityTracking:
+    """Tests for BaseNonStreamingEngine._reset_activity_tracking (#1595)."""
+
+    @staticmethod
+    def _engine():
+        from omlx.engine.base import BaseNonStreamingEngine
+
+        class DummyEngine(BaseNonStreamingEngine):
+            @property
+            def model_name(self):
+                return "dummy"
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+            def get_stats(self):
+                return {}
+
+        return DummyEngine()
+
+    def test_reset_clears_leaked_counter_and_activities(self):
+        """Reset zeros a leaked _active_count and clears _activities.
+
+        Mirrors the immediate-abort eviction case where stop() runs without
+        the per-request completion callbacks, leaving a phantom busy count.
+        """
+        engine = self._engine()
+        with engine._active_lock:
+            engine._active_count = 2
+            engine._activities = {"a": {}, "b": {}}
+        assert engine.has_active_requests() is True  # phantom busy
+
+        engine._reset_activity_tracking()
+
+        assert engine._active_count == 0
+        assert engine._activities == {}
+        assert engine.has_active_requests() is False
+
+    @pytest.mark.asyncio
+    async def test_unload_engine_calls_reset_on_teardown(self):
+        """EnginePool._unload_engine resets activity tracking after stop()."""
+        pool = _make_pool(ceiling=0)
+        engine = self._engine()
+        with engine._active_lock:
+            engine._active_count = 1  # leaked phantom busy
+        entry = EngineEntry(
+            model_id="model-a",
+            model_path="/models/model-a",
+            model_type="embedding",
+            engine_type="embedding",
+            estimated_size=1024,
+            engine=engine,
+            last_access=0.0,
+        )
+        pool._entries = {"model-a": entry}
+        pool._current_model_memory = entry.estimated_size
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = MagicMock(return_value=0)
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Teardown reset the leaked counter (getattr-guarded reset called).
+        assert engine._active_count == 0
+        assert engine.has_active_requests() is False

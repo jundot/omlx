@@ -115,12 +115,12 @@ def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bo
     Check if the model is a Gemma 4 model.
 
     Detection priority:
-    1. model_type == "gemma4" in config.json
+    1. Gemma 4 model_type in config.json
     2. Fallback: model_name contains "gemma-4" or "gemma4" (case-insensitive)
     """
     if config is not None:
         model_type = config.get("model_type", "")
-        if model_type == "gemma4":
+        if model_type in {"gemma4", "gemma4_unified"}:
             logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
             return True
 

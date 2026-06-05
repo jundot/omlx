@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..settings import SubKeyEntry
 from ..utils.release_check import normalize_update_channel, select_latest_release
@@ -279,6 +280,11 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
+    markitdown_enabled: bool | None = None
+    markitdown_expose_model: bool | None = None
+    markitdown_max_file_size_mb: int | None = None
+    markitdown_max_files_per_request: int | None = None
+    markitdown_pdf_processing_engine: str | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -820,6 +826,8 @@ async def _apply_cache_settings_runtime(
         pool._scheduler_config.hot_cache_max_size = (
             global_settings.cache.get_hot_cache_max_size_bytes()
         )
+    if hasattr(pool, "configure_hot_cache_budget"):
+        pool.configure_hot_cache_budget()
 
     # Unload all loaded models so they use new config when reloaded
     loaded_models = pool.get_loaded_model_ids()
@@ -1710,6 +1718,41 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             model_data["settings"] = asdict(settings)
 
         models.append(model_data)
+
+    global_settings = _get_global_settings() if _get_global_settings else None
+    if markitdown_model_visible(global_settings) and not any(
+        m.get("id") == MARKITDOWN_MODEL_ID for m in models
+    ):
+        models.append(
+            {
+                "id": MARKITDOWN_MODEL_ID,
+                "model_path": "builtin://markitdown",
+                "loaded": True,
+                "is_loading": False,
+                "estimated_size": 0,
+                "estimated_size_formatted": format_size(0),
+                "actual_size": 0,
+                "actual_size_formatted": None,
+                "pinned": False,
+                "is_default": False,
+                "engine_type": "markitdown",
+                "model_type": "markitdown",
+                "config_model_type": "markitdown",
+                "thinking_default": None,
+                "preserve_thinking_default": None,
+                "source_type": "builtin",
+                "source_repo_id": None,
+                "last_access": None,
+                "dflash_compatible": False,
+                "dflash_compatibility_reason": "",
+                "dflash_ssd_cache_available": False,
+                "mtp_compatible": False,
+                "mtp_compatibility_reason": "",
+                "is_paroquant": False,
+                "paroquant_reason": "",
+                "virtual": True,
+            }
+        )
 
     return {"models": models}
 
@@ -2887,6 +2930,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
+            "markitdown_enabled": global_settings.integrations.markitdown_enabled,
+            "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
+            "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
+            "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -3340,6 +3388,51 @@ async def update_global_settings(
             request.integrations_openclaw_tools_profile
         )
         integrations_changed = True
+    if "markitdown_enabled" in request.model_fields_set:
+        global_settings.integrations.markitdown_enabled = bool(
+            request.markitdown_enabled
+        )
+        integrations_changed = True
+    if "markitdown_expose_model" in request.model_fields_set:
+        global_settings.integrations.markitdown_expose_model = bool(
+            request.markitdown_expose_model
+        )
+        integrations_changed = True
+    if "markitdown_max_file_size_mb" in request.model_fields_set:
+        if (
+            request.markitdown_max_file_size_mb is None
+            or request.markitdown_max_file_size_mb <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_max_file_size_mb must be > 0",
+            )
+        global_settings.integrations.markitdown_max_file_size_mb = (
+            request.markitdown_max_file_size_mb
+        )
+        integrations_changed = True
+    if "markitdown_max_files_per_request" in request.model_fields_set:
+        if (
+            request.markitdown_max_files_per_request is None
+            or request.markitdown_max_files_per_request <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_max_files_per_request must be > 0",
+            )
+        global_settings.integrations.markitdown_max_files_per_request = (
+            request.markitdown_max_files_per_request
+        )
+        integrations_changed = True
+    if "markitdown_pdf_processing_engine" in request.model_fields_set:
+        engine = (request.markitdown_pdf_processing_engine or "").strip()
+        if not engine:
+            raise HTTPException(
+                status_code=400,
+                detail="markitdown_pdf_processing_engine must not be empty",
+            )
+        global_settings.integrations.markitdown_pdf_processing_engine = engine
+        integrations_changed = True
 
     if integrations_changed:
         runtime_applied.append("integrations")
@@ -3350,7 +3443,10 @@ async def update_global_settings(
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
             f"hermes={global_settings.integrations.hermes_model}, "
-            f"pi={global_settings.integrations.pi_model}"
+            f"pi={global_settings.integrations.pi_model}, "
+            f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
+            f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
+            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
         )
 
     # Apply UI settings
@@ -3859,12 +3955,12 @@ def _build_runtime_cache_observability(
 
     payload["effective_block_sizes"] = sorted(block_sizes)
 
-    # Aggregate hot-cache and disk-max across models.
-    # hot_cache_max sums across models (each model reserves its own slice of
-    # the same process-wide hot cache budget) so the gauge denominator matches
-    # the summed numerator.  disk_max keeps the config fallback via max()
-    # because a single SSD cache directory is shared — the effective cap is
-    # the largest configured limit, not a per-model sum.
+    # Aggregate hot-cache and disk-max across models. Hot cache max is a single
+    # process-wide budget shared by all loaded model managers, so keep the
+    # largest reported cap instead of summing per-model rows. Disk max also
+    # keeps the config fallback via max() because a single SSD cache directory
+    # is shared — the effective cap is the largest configured limit, not a
+    # per-model sum.
     hot_cache_max = 0
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
@@ -3872,7 +3968,7 @@ def _build_runtime_cache_observability(
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
-        hot_cache_max += m.get("hot_cache_max_bytes", 0)
+        hot_cache_max = max(hot_cache_max, m.get("hot_cache_max_bytes", 0))
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total

@@ -37,6 +37,7 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
     "llava",
     "llava_next",
     "llava-qwen2",

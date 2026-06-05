@@ -1266,6 +1266,16 @@
                                                 </template>
                                             </div>
                                         </template>
+                                        <template x-if="getDocumentFiles(msg.content).length > 0">
+                                            <div class="flex flex-wrap gap-2 mb-2">
+                                                <template x-for="doc in getDocumentFiles(msg.content)" :key="doc.filename">
+                                                    <div class="inline-flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
+                                                        <i data-lucide="file-text" class="w-4 h-4 flex-shrink-0"></i>
+                                                        <span class="truncate max-w-56" x-text="doc.filename || window.t('chat.document_not_available')"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
                                         <!-- Text content -->
                                         <template x-if="getTextContent(msg.content)">
                                             <div class="user-message-bubble markdown-content"
@@ -1579,6 +1589,8 @@
                     <!-- Hidden file input for image upload (multiple) -->
                     <input type="file" id="imageInput" accept="image/*" multiple x-ref="imageInput"
                         @change="handleImageSelect($event)" class="hidden">
+                    <input type="file" id="documentInput" accept=".pdf,.docx,.pptx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/markdown,text/x-markdown" multiple x-ref="documentInput"
+                        @change="handleDocumentSelect($event)" class="hidden">
 
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
@@ -1596,6 +1608,20 @@
                             </div>
                         </template>
                     </div>
+                    <div x-show="uploadDocuments.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
+                        <template x-for="(doc, idx) in uploadDocuments" :key="doc.id">
+                            <div class="relative group flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
+                                <i data-lucide="file-text" class="w-4 h-4 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="truncate max-w-48" x-text="doc.filename"></span>
+                                <span x-show="!doc.base64" class="text-[10px]" style="color: var(--text-tertiary);">...</span>
+                                <button @click="removeDocument(idx)"
+                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                    :title="window.t('chat.remove_document')">
+                                    <i data-lucide="x" class="w-3 h-3"></i>
+                                </button>
+                            </div>
+                        </template>
+                    </div>
 
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
@@ -1604,6 +1630,12 @@
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                        </button>
+                        <button x-show="hasDocumentSupport()" @click="$refs.documentInput.click()"
+                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
+                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                            :title="window.t('chat.upload_document')">
+                            <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -1615,7 +1647,7 @@
                             style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
                             <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
-                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel"
+                                :disabled="(!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0) || hasPendingUploads() || !apiKeySet || !currentModel"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
@@ -1627,6 +1659,9 @@
                             <div x-show="uploadImages.length > 0"
                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadImages.length"></div>
+                            <div x-show="uploadDocuments.length > 0 && uploadImages.length === 0"
+                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                x-text="uploadDocuments.length"></div>
                         </div>
                     </div>
                 </div>
@@ -2068,6 +2103,12 @@
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
+            uploadDocuments: [],         // Array of { id, filename, mimeType, base64 }
+            markitdownSettings: {
+                enabled: true,
+                max_file_size_mb: 25,
+                max_files_per_request: 5,
+            },
             isDragOver: false,           // drag-and-drop state
 
             // Image Modal State
@@ -3390,6 +3431,15 @@
         return this.modelTypeMap[id] === 'vlm';
     },
 
+    hasDocumentSupport() {
+        return Boolean(this.currentModel && this.markitdownSettings.enabled);
+    },
+
+    hasPendingUploads() {
+        return this.uploadImages.some(img => !img.base64)
+            || this.uploadDocuments.some(doc => !doc.base64);
+    },
+
             // ===== MCP Tools =====
 
             async fetchMcpTools() {
@@ -3492,13 +3542,15 @@
     // ===== Image Upload Functions =====
 
     handleDrop(event) {
-        if (!this.hasVisionSupport()) return;
         const files = event.dataTransfer?.files;
-        if (files) {
-            Array.from(files)
-                .filter(f => f.type.startsWith('image/'))
-                .forEach(f => this.loadImageFile(f));
-        }
+        if (!files) return;
+        Array.from(files).forEach(file => {
+            if (this.hasVisionSupport() && file.type.startsWith('image/')) {
+                this.loadImageFile(file);
+            } else if (this.hasDocumentSupport() && this.isSupportedDocumentFile(file)) {
+                this.loadDocumentFile(file);
+            }
+        });
     },
 
     handleImageSelect(event) {
@@ -3544,6 +3596,85 @@
 
     removeImage(index) {
         this.uploadImages.splice(index, 1);
+    },
+
+    handleDocumentSelect(event) {
+        const files = event.target.files;
+        if (!files) return;
+        Array.from(files).forEach(file => this.loadDocumentFile(file));
+        event.target.value = '';
+    },
+
+    isSupportedDocumentFile(file) {
+        const name = (file.name || '').toLowerCase();
+        const type = (file.type || '').toLowerCase();
+        return name.endsWith('.pdf')
+            || name.endsWith('.docx')
+            || name.endsWith('.pptx')
+            || name.endsWith('.txt')
+            || name.endsWith('.md')
+            || type === 'application/pdf'
+            || type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            || type === 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            || type === 'text/plain'
+            || type === 'text/markdown'
+            || type === 'text/x-markdown';
+    },
+
+    loadDocumentFile(file) {
+        if (!this.isSupportedDocumentFile(file)) {
+            alert(window.t('chat.error.invalid_document_type'));
+            return;
+        }
+
+        const maxFiles = this.markitdownSettings.max_files_per_request || 5;
+        if (this.uploadDocuments.length >= maxFiles) {
+            alert(window.t('chat.error.too_many_documents'));
+            return;
+        }
+
+        const maxSize = (this.markitdownSettings.max_file_size_mb || 25) * 1024 * 1024;
+        if (file.size > maxSize) {
+            alert(window.t('chat.error.document_too_large'));
+            return;
+        }
+
+        const id = `doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        this.uploadDocuments.push({
+            id,
+            filename: file.name,
+            mimeType: file.type || this.mimeTypeForDocumentName(file.name),
+            base64: null,
+            _pending: true,
+        });
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const entry = this.uploadDocuments.find(doc => doc.id === id);
+            if (!entry?._pending) return;
+            entry.base64 = e.target.result;
+            delete entry._pending;
+        };
+        reader.onerror = () => {
+            const idx = this.uploadDocuments.findIndex(doc => doc.id === id);
+            if (idx >= 0) this.uploadDocuments.splice(idx, 1);
+            alert(window.t('chat.error.document_load_failed'));
+        };
+        reader.readAsDataURL(file);
+    },
+
+    mimeTypeForDocumentName(name) {
+        const lower = (name || '').toLowerCase();
+        if (lower.endsWith('.pdf')) return 'application/pdf';
+        if (lower.endsWith('.docx')) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        if (lower.endsWith('.pptx')) return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+        if (lower.endsWith('.txt')) return 'text/plain';
+        if (lower.endsWith('.md')) return 'text/markdown';
+        return 'application/octet-stream';
+    },
+
+    removeDocument(index) {
+        this.uploadDocuments.splice(index, 1);
     },
 
     handlePaste(event) {
@@ -3604,6 +3735,16 @@
         if (!Array.isArray(content)) return [];
         const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
         return Array.from({ length: count }, (_, i) => i);
+    },
+
+    getDocumentFiles(content) {
+        if (!Array.isArray(content)) return [];
+        return content
+            .filter(p => p.type === 'file' && p.file)
+            .map(p => ({
+                filename: p.file.filename || window.t('chat.document_not_available'),
+                hasData: Boolean(p.file.file_data || p.file.data),
+            }));
     },
 
     // ===== End Image Upload Functions =====
@@ -3718,11 +3859,12 @@
             const apiHeaders = this.getApiKey()
                 ? { 'Authorization': `Bearer ${this.getApiKey()}` }
                 : {};
-            // Fetch models, admin model list, and server health in parallel
-            const [modelsResponse, adminModelsResponse, healthResponse] = await Promise.all([
+            // Fetch models, admin model list, server health, and integration settings in parallel
+            const [modelsResponse, adminModelsResponse, healthResponse, settingsResponse] = await Promise.all([
                 fetch('/v1/models', { headers: apiHeaders }),
                 fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
-                fetch('/health')
+                fetch('/health'),
+                fetch('/admin/api/global-settings', { credentials: 'same-origin' })
             ]);
 
             if (!modelsResponse.ok) {
@@ -3752,6 +3894,15 @@
                         this.aliasToGateway[alias] = m.id;
                     }
                 }
+            }
+            if (settingsResponse.ok) {
+                const settingsData = await settingsResponse.json();
+                const integrations = settingsData.integrations || {};
+                this.markitdownSettings = {
+                    enabled: integrations.markitdown_enabled !== false,
+                    max_file_size_mb: integrations.markitdown_max_file_size_mb || 25,
+                    max_files_per_request: integrations.markitdown_max_files_per_request || 5,
+                };
             }
             this._mirrorAliasModelTypes();
 
@@ -4195,6 +4346,7 @@
         const systemPrompt = sysDefault ? sysDefault.content : '';
         this.currentChatId = chatId;
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.inputMessage = '';
         this.systemPrompt = systemPrompt;
         this.activePromptProfile = sysDefault ? sysDefault.name : null;
@@ -4313,6 +4465,16 @@
                     if (part.type === 'image_url') {
                         return { type: 'image_url', image_url: { url: '' } };
                     }
+                    if (part.type === 'file') {
+                        return {
+                            type: 'file',
+                            file: {
+                                filename: part.file?.filename || '',
+                                mime_type: part.file?.mime_type || '',
+                                data: '',
+                            },
+                        };
+                    }
                     return part;
                 })
             };
@@ -4404,13 +4566,16 @@
     async sendMessage() {
         const userText = this.inputMessage.trim();
         const images = this.uploadImages.filter(img => img.base64);
+        const documents = this.uploadDocuments.filter(doc => doc.base64);
 
-        if (!userText && images.length === 0) return;
+        if (this.hasPendingUploads()) return;
+        if (!userText && images.length === 0 && documents.length === 0) return;
         if (!this.currentModel || this.isCurrentChatStreaming()) return;
 
         // Clear input state
         this.inputMessage = '';
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.$nextTick(() => {
             if (this.$refs.messageInput) {
                 this.resetTextareaHeight(this.$refs.messageInput);
@@ -4430,10 +4595,19 @@
 
         // Build message content (OpenAI content array for images, string for text-only)
         let content;
-        if (images.length > 0) {
+        if (images.length > 0 || documents.length > 0) {
             content = [];
             for (const img of images) {
                 content.push({ type: 'image_url', image_url: { url: img.base64 } });
+            }
+            for (const doc of documents) {
+                content.push({
+                    type: 'file',
+                    file: {
+                        filename: doc.filename,
+                        file_data: doc.base64,
+                    },
+                });
             }
             if (userText) {
                 content.push({ type: 'text', text: userText });
@@ -5130,6 +5304,16 @@
                     if (part.type === 'image_url') {
                         return { type: 'image_url', image_url: { url: '' } };
                     }
+                    if (part.type === 'file') {
+                        return {
+                            type: 'file',
+                            file: {
+                                filename: part.file?.filename || '',
+                                mime_type: part.file?.mime_type || '',
+                                data: '',
+                            },
+                        };
+                    }
                     return part;
                 })
             };
@@ -5316,6 +5500,7 @@
         this.messages = [];
         this.inputMessage = '';
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.editingIndex = null;
         this.editContent = '';
         this.editImages = [];

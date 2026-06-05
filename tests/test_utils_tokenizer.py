@@ -160,6 +160,10 @@ class TestIsGemma4Model:
         config = {"model_type": "gemma4"}
         assert is_gemma4_model("some-model", config) is True
 
+    def test_gemma4_unified_model_via_config_model_type(self):
+        config = {"model_type": "gemma4_unified"}
+        assert is_gemma4_model("some-model", config) is True
+
     def test_gemma4_model_via_name(self):
         assert is_gemma4_model("google/gemma-4b", None) is True
         assert is_gemma4_model("GEMMA-4-27B", None) is True

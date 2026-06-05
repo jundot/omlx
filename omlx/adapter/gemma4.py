@@ -25,6 +25,17 @@ _LEADING_THOUGHT_RE = re.compile(
     re.DOTALL,
 )
 
+# Matches the STRAY bare-token spellings (<|tool_call> and <tool_call|>),
+# not the template's well-formed closing form (</tool_call|> with slash).
+_PROTOCOL_MARKER_RE = re.compile(r"<\|tool_call>|<tool_call\|>")
+
+
+def _strip_protocol_markers(text: Any) -> Any:
+    """Remove stray <|tool_call> / <tool_call|> tokens from assistant content."""
+    if not isinstance(text, str) or not text:
+        return text
+    return _PROTOCOL_MARKER_RE.sub("", text)
+
 
 def _try_parse_json(s: str) -> Any:
     """Parse string as JSON if possible, otherwise return as-is."""
@@ -172,6 +183,7 @@ def extract_gemma4_messages(
             # Per Gemma 4's multi-turn rule, prior thought blocks must not
             # be fed back into the next turn. Strip them before rendering.
             content = _strip_thinking(content)
+            content = _strip_protocol_markers(content)
 
             out_msg: dict = {"role": "assistant", "content": content or ""}
 
@@ -243,14 +255,17 @@ def extract_gemma4_messages(
             continue
 
         # All other roles (user, system)
-        # Preserve image_url parts for VLM processing
+        # Preserve image_url and input_audio parts for VLM processing
         content = msg.get("content", "")
         if isinstance(content, list):
             from ..api.utils import _extract_multimodal_content_list
 
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
-            if has_images:
+            multimodal_types = {"image_url", "input_audio"}
+            has_multimodal = any(
+                p.get("type") in multimodal_types for p in multimodal_parts
+            )
+            if has_multimodal:
                 content = multimodal_parts
             else:
                 content = _extract_text_from_content_list(content)

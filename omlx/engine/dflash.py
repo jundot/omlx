@@ -24,6 +24,7 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.tokenizer import create_streaming_detokenizer
 from .base import BaseEngine, GenerationOutput
@@ -118,6 +119,7 @@ class DFlashEngine(BaseEngine):
         self._fallback_lock = asyncio.Lock()
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        self._suppress_token_ids: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
         # the streaming detokenizer is used as-is (qwen, llama, etc.).
@@ -302,6 +304,18 @@ class DFlashEngine(BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
+
+        suppress_ref = (
+            getattr(self._executor_tokenizer, "name_or_path", None) or self._model_name
+        )
+        suppress_ids = load_generation_config_token_ids(suppress_ref, "suppress_tokens")
+        self._suppress_token_ids = suppress_ids or set()
+        if self._suppress_token_ids:
+            logger.info(
+                "DFlash loaded %d suppress token(s) from generation_config.json: %s",
+                len(self._suppress_token_ids),
+                self._suppress_token_ids,
+            )
 
         # Detect protocol-specific output parser (gemma4 channel markers,
         # harmony channels). Scheduler-driven engines apply this via
@@ -643,6 +657,9 @@ class DFlashEngine(BaseEngine):
             prompt="",
             max_new_tokens=max_tokens,
             stop_token_ids=stop_ids,
+            suppress_token_ids=(
+                sorted(self._suppress_token_ids) if self._suppress_token_ids else None
+            ),
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,

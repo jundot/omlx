@@ -2,6 +2,7 @@
 """Tests for DFlash engine integration."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -237,6 +238,62 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         assert engine.get_cache_stats() is None
+
+    def test_stream_events_passes_suppress_token_ids(self, monkeypatch):
+        try:
+            from dflash_mlx import runtime as dflash_runtime
+            from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._target_model = object()
+        engine._target_ops = object()
+        engine._executor_tokenizer = object()
+        engine._draft_model = object()
+        engine._draft_backend = object()
+        engine._runtime_context = object()
+        engine._suppress_token_ids = {258883, 258882}
+
+        fake_flow = SimpleNamespace(
+            snapshot=None,
+            snapshot_service=None,
+            stable_prefix_len=None,
+            cache_active=False,
+            publish_generation_snapshot=True,
+        )
+        captured = {}
+
+        monkeypatch.setattr(
+            PrefixCacheFlow,
+            "for_request",
+            classmethod(lambda cls, **kwargs: fake_flow),
+        )
+        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda tokenizer: [2])
+
+        def fake_stream_dflash_generate(**kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        monkeypatch.setattr(
+            dflash_runtime,
+            "stream_dflash_generate",
+            fake_stream_dflash_generate,
+        )
+
+        event_iter, _, stop_ids = engine._stream_dflash_events(
+            prompt_tokens=[1, 2],
+            max_tokens=3,
+        )
+
+        assert list(event_iter) == []
+        assert stop_ids == [2]
+        assert captured["suppress_token_ids"] == [258882, 258883]
 
     def test_should_fallback_unlimited_when_max_ctx_none(self):
         """A None threshold means dflash handles every prompt size."""

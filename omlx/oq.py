@@ -1667,6 +1667,23 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
+def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
+    """Cast an unquantized output tensor to its storage dtype."""
+    if not mx.issubdtype(w_mx.dtype, mx.floating):
+        return w_mx
+
+    if target_dtype == mx.float16 and (
+        _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
+    ):
+        if w_mx.dtype != mx.float32:
+            return w_mx.astype(mx.float32)
+        return w_mx
+
+    if w_mx.dtype != target_dtype:
+        return w_mx.astype(target_dtype)
+    return w_mx
+
+
 def _build_model_sanitizer(config: dict, text_only: bool = False):
     """Build a sanitize function from the model class.
 
@@ -2689,15 +2706,10 @@ def quantize_oq_streaming(
                     layer_cfg["mode"] = qmode
                     per_layer_config[base] = layer_cfg
             else:
-                if (
-                    mx.issubdtype(w_mx.dtype, mx.floating)
-                    and w_mx.dtype != target_dtype
-                ):
-                    w_mx = w_mx.astype(target_dtype)
+                w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
                 out_shard_data[tensor_name] = w_mx
         else:
-            if mx.issubdtype(w_mx.dtype, mx.floating) and w_mx.dtype != target_dtype:
-                w_mx = w_mx.astype(target_dtype)
+            w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
             out_shard_data[tensor_name] = w_mx
 
         del w_mx

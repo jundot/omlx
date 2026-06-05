@@ -63,25 +63,30 @@ def load_image(url_or_base64: str) -> Image.Image:
 
 def extract_images_from_messages(
     messages: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Image.Image]]:
+) -> Tuple[List[Dict[str, Any]], List[Image.Image], List]:
     """
-    Extract images from OpenAI-format messages.
+    Extract images and audio from OpenAI-format messages.
 
-    Processes messages containing content arrays with image_url parts,
-    loads the images, and returns cleaned text-only messages alongside
-    the loaded images.
+    Processes messages containing content arrays with image_url or input_audio
+    parts, loads the media, and returns cleaned text-only messages alongside
+    the loaded images and audio files.
 
     Args:
         messages: List of OpenAI-format chat messages. Each message may have
-            content as a string or a list of content parts (text/image_url).
+            content as a string or a list of content parts
+            (text/image_url/input_audio).
 
     Returns:
-        Tuple of (text_messages, images):
-        - text_messages: Messages with image parts removed, text parts joined
+        Tuple of (text_messages, images, audio):
+        - text_messages: Messages with media parts removed, text parts joined
         - images: List of loaded PIL Image objects in order of appearance
+        - audio: List of BytesIO/str audio references for load_audio()
     """
+    import binascii
+
     text_messages = []
     images = []
+    audio = []
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -96,7 +101,7 @@ def extract_images_from_messages(
                     text_messages[-1][key] = msg[key]
             continue
 
-        # Content array with text and/or image_url parts
+        # Content array with text, image_url, and/or input_audio parts
         text_parts = []
         for part in content:
             if isinstance(part, dict):
@@ -135,6 +140,36 @@ def extract_images_from_messages(
                     except Exception as e:
                         logger.warning(f"Failed to load image: {e}")
 
+            elif part_type == "input_audio":
+                # OpenAI audio format: {"type":"input_audio","input_audio":{"data":"...","format":"wav"}}
+                input_audio = (
+                    part.get("input_audio") if isinstance(part, dict)
+                    else getattr(part, "input_audio", None)
+                )
+                if input_audio and isinstance(input_audio, dict):
+                    data = input_audio.get("data", "")
+                    if isinstance(data, str):
+                        stripped = data.strip()
+                        # Handle data URI (data:audio/wav;base64,...)
+                        if stripped.startswith("data:"):
+                            prefix, separator, encoded = stripped.partition(",")
+                            if separator == "," and ";base64" in prefix:
+                                try:
+                                    audio.append(io.BytesIO(base64.b64decode(encoded, validate=True)))
+                                except (binascii.Error, ValueError) as exc:
+                                    logger.warning(f"Failed to decode input_audio base64: {exc}")
+                                continue
+                        # Try raw base64 decode
+                        try:
+                            audio.append(io.BytesIO(base64.b64decode(stripped, validate=True)))
+                        except (binascii.Error, ValueError):
+                            # Not base64 — treat as file path/reference
+                            audio.append(stripped)
+                    elif isinstance(data, bytes):
+                        audio.append(io.BytesIO(data))
+                    else:
+                        audio.append(data)
+
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields
         for key in msg:
@@ -142,9 +177,7 @@ def extract_images_from_messages(
                 new_msg[key] = msg[key]
         text_messages.append(new_msg)
 
-    return text_messages, images
-
-
+    return text_messages, images, audio
 def compute_image_hash(images: List[Image.Image]) -> Optional[str]:
     """
     Compute a SHA256 hash from a list of images for prefix cache deduplication.

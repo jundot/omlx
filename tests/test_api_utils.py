@@ -2368,6 +2368,49 @@ class TestExtractMultimodalContent:
             {"type": "image_url"},
         ])
         assert len(parts) == 0
+    def test_input_audio_pass_through(self):
+        """input_audio parts survive multimodal content extraction."""
+        parts = _extract_multimodal_content_list([
+            {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+        ])
+        assert len(parts) == 1
+        assert parts[0] == {
+            "type": "input_audio",
+            "input_audio": {"data": "abc", "format": "wav"},
+        }
+
+    def test_input_audio_non_dict_dropped(self):
+        """input_audio with non-dict data is dropped."""
+        parts = _extract_multimodal_content_list([
+            {"type": "input_audio", "input_audio": None},
+            {"type": "input_audio"},
+        ])
+        assert len(parts) == 0
+
+    def test_input_audio_preserved_with_image(self):
+        """input_audio and image_url coexist in extracted parts."""
+        parts = _extract_multimodal_content_list([
+            {"type": "text", "text": "Look and listen"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "input_audio", "input_audio": {"data": "xyz", "format": "mp3"}},
+        ])
+        assert len(parts) == 3
+        types = [p["type"] for p in parts]
+        assert types == ["text", "image_url", "input_audio"]
+
+    def test_input_audio_with_model_dump(self):
+        """input_audio from Pydantic model_dump works."""
+        from unittest.mock import MagicMock
+
+        audio_part = MagicMock()
+        audio_part.model_dump.return_value = {
+            "type": "input_audio",
+            "input_audio": {"data": "audio_data", "format": "wav"},
+        }
+        parts = _extract_multimodal_content_list([audio_part])
+        assert len(parts) == 1
+        assert parts[0]["type"] == "input_audio"
+        assert parts[0]["input_audio"]["format"] == "wav"
 
 
 # =============================================================================

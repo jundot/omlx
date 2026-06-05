@@ -15,6 +15,8 @@ Tests cover:
 Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
+import concurrent.futures
+import json
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -24,7 +26,13 @@ import pytest
 
 import omlx.scheduler as scheduler_module
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
-from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
+from omlx.scheduler import (
+    Scheduler,
+    SchedulerConfig,
+    SchedulerOutput,
+    SchedulingPolicy,
+    _StoreCacheGate,
+)
 
 
 class _ParserStopFactory:
@@ -743,6 +751,14 @@ class TestSchedulerQueryMethods:
         scheduler.add_request(request)
         assert scheduler.has_requests() is True
 
+    def test_has_requests_with_pending_async_cleanup(self, mock_model, mock_tokenizer):
+        """Async store-cache cleanup keeps the scheduler stepping."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        future = concurrent.futures.Future()
+        scheduler._pending_async_removes.append((123, "req-cleanup", future))
+
+        assert scheduler.has_requests() is True
+
     def test_get_num_waiting(self, mock_model, mock_tokenizer):
         """Test get_num_waiting() returns correct count."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -931,6 +947,135 @@ class TestSchedulerStopTokens:
 
         # MockTokenizer has eos_token_id = 2
         assert mock_tokenizer.eos_token_id in stop_tokens
+
+    def test_includes_eot_token_id(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() includes end-of-turn token when available."""
+        # eot_token_id as a single int
+        mock_tokenizer.eot_token_id = 106
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert mock_tokenizer.eos_token_id in stop_tokens  # EOS still there too
+
+    def test_includes_eot_token_id_list(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() handles eot_token_id as a list."""
+        mock_tokenizer.eot_token_id = [106, 107]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert 107 in stop_tokens
+
+    def test_falls_back_to_eot_token_encoding(self, mock_model, mock_tokenizer):
+        """When eot_token_id is absent but eot_token string is present, encode it."""
+        mock_tokenizer.eot_token = "<turn|>"
+        # Ensure eot_token_id is NOT present
+        assert not hasattr(mock_tokenizer, "eot_token_id") or mock_tokenizer.eot_token_id is None
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        # The MockTokenizer.encode() returns hash-based IDs, so we get something
+        assert len([t for t in stop_tokens if t != mock_tokenizer.eos_token_id]) > 0
+
+    def test_no_eot_token_when_absent(self, mock_model, mock_tokenizer):
+        """When neither eot_token_id nor eot_token string is present, no crash."""
+        # MockTokenizer has no eot_token_id or eot_token by default
+        assert not hasattr(mock_tokenizer, "eot_token_id")
+        assert not hasattr(mock_tokenizer, "eot_token")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert mock_tokenizer.eos_token_id in stop_tokens
+
+
+class TestSchedulerSuppressTokens:
+    """Tests for generation_config.suppress_tokens handling."""
+
+    def test_loads_generation_config_suppress_tokens(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"suppress_tokens": [258883, 258882]}),
+            encoding="utf-8",
+        )
+        mock_tokenizer.name_or_path = str(tmp_path)
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        assert scheduler._model_suppress_tokens == {258883, 258882}
+
+    def test_suppress_logits_processor_masks_configured_ids(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._model_suppress_tokens = {2}
+
+        _, processors = scheduler._build_sampler_and_processors(SamplingParams())
+
+        assert processors
+        logits = mx.array([[0.0, 4.0, 100.0, 2.0]])
+        masked = processors[-1](mx.array([1]), logits)
+        mx.eval(masked)
+
+        assert float(masked[0, 2].item()) == float("-inf")
+        assert float(masked[0, 1].item()) == 4.0
+
+    def test_vlm_mtp_first_bonus_uses_suppressing_sampler(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._model_suppress_tokens = {3}
+        scheduler._vlm_mtp_drafter = MagicMock()
+
+        class FakeLanguageModel:
+            def rollback_speculative_cache(self):
+                pass
+
+            def __call__(self, *args, **kwargs):
+                return SimpleNamespace(
+                    logits=mx.array([[[0.0, 0.0, 5.0, 99.0, 0.0]]]),
+                    hidden_states=mx.zeros((1, 1, 4)),
+                    shared_kv_states={},
+                )
+
+        mock_model._language_model = FakeLanguageModel()
+        request = Request(
+            request_id="req-mtp",
+            prompt=[1],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        cache = [SimpleNamespace(state=mx.array([0]))]
+
+        def sampler(logits):
+            return mx.argmax(logits, axis=-1)
+
+        captured = {}
+
+        def fake_run_vlm_mtp_decode(**kwargs):
+            captured.update(kwargs)
+
+            def _gen():
+                yield kwargs["first_bonus"]
+
+            return _gen()
+
+        with patch.object(
+            scheduler_module,
+            "run_vlm_mtp_decode",
+            side_effect=fake_run_vlm_mtp_decode,
+        ):
+            uid = scheduler._route_to_vlm_mtp(
+                request,
+                cache,
+                [1],
+                sampler,
+                state_machine=object(),
+            )
+
+        assert uid is not None
+        assert captured["first_bonus"] == 2
+
+        round_logits = mx.array([[0.0, 0.0, 1.0, 99.0, 0.0]])
+        round_token = captured["sampler"](round_logits)
+        mx.eval(round_token)
+        assert int(round_token.item()) == 2
 
 
 class TestSchedulerXtcSpecialTokens:
@@ -2184,6 +2329,146 @@ class TestCacheCorruptionRecovery:
         # uid mapping preserved for the async drain.
         assert scheduler.request_id_to_uid["req-async-cleanup"] == 999
         assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
+
+
+class TestStoreCacheAdmissionBackpressure:
+    """Tests for store-cache admission backpressure (#1684)."""
+
+    def _make_request(self, request_id: str = "req-store-gate") -> Request:
+        return Request(
+            request_id=request_id,
+            prompt="hello",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+        )
+
+    def _queue_request(self, scheduler: Scheduler, request: Request) -> None:
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+    def test_schedule_waiting_defers_when_gate_full_without_running(
+        self, mock_model, mock_tokenizer
+    ):
+        """Sequential turns must respect store-cache backpressure."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=1)
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request()
+        self._queue_request(scheduler, request)
+        scheduler._ensure_batch_generator = MagicMock()
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler.running == {}
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_schedule_waiting_allows_when_gate_has_capacity(
+        self, mock_model, mock_tokenizer
+    ):
+        """Below-cap store-cache cleanup must not block admission."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=2)
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request()
+        self._queue_request(scheduler, request)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert rejected == []
+        assert scheduled == [request]
+        assert scheduler.waiting == deque()
+        assert scheduler.running[request.request_id] is request
+        scheduler._ensure_batch_generator.assert_called_once_with(
+            request.sampling_params
+        )
+
+    def test_schedule_waiting_defers_when_pending_cleanups_reach_cap(
+        self, mock_model, mock_tokenizer
+    ):
+        """Deferred removals still own cache refs even if the gate has room."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._store_cache_gate = _StoreCacheGate(cap=2)
+        scheduler._pending_async_removes.append(
+            (1, "req-cleanup-1", concurrent.futures.Future())
+        )
+        scheduler._pending_async_removes.append(
+            (2, "req-cleanup-2", concurrent.futures.Future())
+        )
+        request = self._make_request()
+        self._queue_request(scheduler, request)
+        scheduler._ensure_batch_generator = MagicMock()
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_drain_pending_async_removes_releases_done_entries_out_of_order(
+        self, mock_model, mock_tokenizer
+    ):
+        """One slow store-cache future must not pin later completed caches."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        gate = _StoreCacheGate(cap=2)
+        gate.note_submitted()
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+
+        slow_future = concurrent.futures.Future()
+        done_future = concurrent.futures.Future()
+        done_future.set_result(None)
+
+        slow_request = self._make_request("req-slow")
+        done_request = self._make_request("req-done")
+        slow_request._extracted_cache = object()
+        done_request._extracted_cache = object()
+        scheduler.requests[slow_request.request_id] = slow_request
+        scheduler.requests[done_request.request_id] = done_request
+        scheduler._inflight_store_futures[slow_request.request_id] = slow_future
+        scheduler._inflight_store_futures[done_request.request_id] = done_future
+        scheduler.request_id_to_uid[slow_request.request_id] = 1
+        scheduler.request_id_to_uid[done_request.request_id] = 2
+        scheduler.uid_to_request_id[1] = slow_request.request_id
+        scheduler.uid_to_request_id[2] = done_request.request_id
+        scheduler._pending_async_removes.append(
+            (1, slow_request.request_id, slow_future)
+        )
+        scheduler._pending_async_removes.append(
+            (2, done_request.request_id, done_future)
+        )
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            drained = scheduler._drain_pending_async_removes()
+
+        assert drained is True
+        assert list(scheduler._pending_async_removes) == [
+            (1, slow_request.request_id, slow_future)
+        ]
+        assert slow_request.request_id in scheduler.requests
+        assert done_request.request_id not in scheduler.requests
+        assert done_request.request_id not in scheduler._inflight_store_futures
+        assert done_request.request_id not in scheduler.request_id_to_uid
+        assert 2 not in scheduler.uid_to_request_id
+        assert gate.in_flight == 1
+        scheduler.batch_generator.remove.assert_called_once_with([2])
 
 
 class TestDetectNeedsThinkPrefix:

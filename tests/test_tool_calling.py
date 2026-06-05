@@ -1146,6 +1146,51 @@ class TestParseToolCallsSyntaxError:
         assert args["path"] == "/etc/hosts"
         assert args["lines"] == 10  # json.loads converts numeric string
 
+    def test_json_fallback_recovers_raw_control_chars(self):
+        """Model-generated JSON tool calls may contain raw tabs or newlines."""
+
+        def failing_parser(text, tools):
+            raise json.JSONDecodeError("Invalid control character at", text, 90)
+
+        tok = self._qwen_tok(failing_parser)
+        old_string = (
+            "\t\t// Check if second word is a subcommand.\n"
+            "\t\tif len(ce.Args) > 1 && isSubcommand(ce.Args[1]) {"
+        )
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            '"file_path": "/Users/user/project/file.go", '
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "edit"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["old_string"] == old_string
+
+    def test_generic_xml_json_fallback_recovers_raw_control_chars(self):
+        """The non-native XML JSON fallback should recover the same malformed JSON."""
+
+        tok = _make_tokenizer()
+        old_string = "\tindent\nnext line"
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"old_string": old_string, "new_string": "x"}
+
     def test_unparseable_body_logs_and_drops(self, caplog):
         """Fully unparseable body drops gracefully and logs a warning."""
 
@@ -2018,3 +2063,103 @@ class TestSerializeToolCallArguments:
             result = _serialize_tool_call_arguments("[1, 2]")
         assert result == "{}"
         assert any("non-dict" in r.message for r in caplog.records)
+
+
+class TestToolCallStreamFilterGemma4StrayClose:
+    """Stray closing-marker suppression for Gemma 4 <|tool_call>/<tool_call|>."""
+
+    def _make_filter(self):
+        return ToolCallStreamFilter(
+            _make_tokenizer_with_end("<|tool_call>", "<tool_call|>")
+        )
+
+    def test_stray_close_marker_alone_dropped(self):
+        """Bare <tool_call|> with no preceding open is suppressed."""
+        f = self._make_filter()
+        result = f.feed("<tool_call|>")
+        result += f.finish()
+        assert result == ""
+
+    def test_stray_close_after_text_dropped(self):
+        """Text before a stray close passes through; the close itself is dropped."""
+        f = self._make_filter()
+        result = f.feed("hello<tool_call|>")
+        result += f.finish()
+        assert result == "hello"
+
+    def test_stray_close_split_across_feeds_dropped(self):
+        """Stray close split across two feed() calls is dropped."""
+        f = self._make_filter()
+        r1 = f.feed("<tool_call")
+        r2 = f.feed("|>")
+        result = r1 + r2 + f.finish()
+        assert result == ""
+
+    def test_normal_open_close_pair_still_suppressed(self):
+        """Regression: a valid open/close pair is still fully suppressed."""
+        f = self._make_filter()
+        result = f.feed('<|tool_call>call:search{"q":"test"}<tool_call|>')
+        result += f.finish()
+        assert result == ""
+
+    def test_multiple_stray_closes_in_one_delta_all_dropped(self):
+        """Multiple stray close tokens in a single delta are all removed."""
+        f = self._make_filter()
+        result = f.feed("a<tool_call|>b<tool_call|>c")
+        result += f.finish()
+        assert result == "abc"
+
+    def test_default_xml_close_in_prose_passes_through(self):
+        """Prose containing </tool_call> (hardcoded fallback pair) is not stripped.
+
+        The stray-close strip is scoped to the tokenizer-configured marker only.
+        A model discussing XML tag syntax must not have its output corrupted.
+        """
+        f = self._make_filter()
+        result = f.feed("The closing tag is </tool_call> here.")
+        result += f.finish()
+        assert result == "The closing tag is </tool_call> here."
+
+    def test_configured_xml_close_in_prose_passes_through(self):
+        """Configured XML close markers are not treated like Gemma 4 stray closes."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("<tool_call>", "</tool_call>")
+        )
+        result = f.feed("The closing tag is </tool_call> here.")
+        result += f.finish()
+        assert result == "The closing tag is </tool_call> here."
+
+    def test_configured_namespaced_close_in_prose_passes_through(self):
+        """Configured namespaced close markers are preserved in prose."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(
+                "<minimax:tool_call>",
+                "</minimax:tool_call>",
+            )
+        )
+        result = f.feed("The marker </minimax:tool_call> is a close marker.")
+        result += f.finish()
+        assert result == "The marker </minimax:tool_call> is a close marker."
+
+    def test_stray_close_split_after_pipe_dropped(self):
+        """Stray close split at the | boundary (<tool_call| + >) is reassembled and dropped."""
+        f = self._make_filter()
+        r1 = f.feed("<tool_call|")
+        r2 = f.feed(">")
+        result = r1 + r2 + f.finish()
+        assert result == ""
+
+    def test_stray_close_split_after_pipe_with_prose_dropped(self):
+        """Prose-wrapped stray close split at the | boundary: prose passes, marker dropped."""
+        f = self._make_filter()
+        r1 = f.feed("hello<tool_call|")
+        r2 = f.feed("> world")
+        result = r1 + r2 + f.finish()
+        assert result == "hello world"
+
+    def test_valid_pair_plus_stray_close_in_same_delta(self):
+        """Valid open/close pair suppressed; trailing stray close in same delta dropped."""
+        f = self._make_filter()
+        result = f.feed('<|tool_call>call()<tool_call|> extra<tool_call|>')
+        result += f.finish()
+        assert result == " extra"

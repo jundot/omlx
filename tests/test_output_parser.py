@@ -299,6 +299,17 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
+    def test_detects_gemma4_unified_by_config(self):
+        tokenizer = GemmaTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "some-model",
+            tokenizer,
+            {"model_type": "gemma4_unified"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "gemma4"
+
     def test_harmony_wrapper_regression(self):
         encoding = load_harmony_encoding("HarmonyGptOss")
         tokenizer = HarmonyTokenizer(encoding)

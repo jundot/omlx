@@ -16,6 +16,7 @@ from omlx.settings import (
     ClaudeCodeSettings,
     GlobalSettings,
     HuggingFaceSettings,
+    IntegrationSettings,
     LoggingSettings,
     MCPSettings,
     MemorySettings,
@@ -1780,6 +1781,51 @@ class TestClaudeCodeSettings:
         settings = ClaudeCodeSettings.from_dict(data)
         assert settings.mode == "cloud"
         assert settings.opus_model is None
+
+
+class TestIntegrationSettings:
+    """Tests for IntegrationSettings dataclass."""
+
+    def test_markitdown_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+        assert settings.markitdown_pdf_processing_engine == "markitdown"
+
+    def test_markitdown_to_dict(self):
+        settings = IntegrationSettings(
+            markitdown_enabled=False,
+            markitdown_expose_model=False,
+            markitdown_max_file_size_mb=10,
+            markitdown_max_files_per_request=2,
+            markitdown_pdf_processing_engine="OCR-Model",
+        )
+        result = settings.to_dict()
+        assert result["markitdown_enabled"] is False
+        assert result["markitdown_expose_model"] is False
+        assert result["markitdown_max_file_size_mb"] == 10
+        assert result["markitdown_max_files_per_request"] == 2
+        assert result["markitdown_pdf_processing_engine"] == "OCR-Model"
+
+    def test_markitdown_from_dict_backward_compat(self):
+        settings = IntegrationSettings.from_dict({})
+        assert settings.markitdown_enabled is True
+        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_max_file_size_mb == 25
+        assert settings.markitdown_max_files_per_request == 5
+        assert settings.markitdown_pdf_processing_engine == "markitdown"
+
+    def test_markitdown_validation(self):
+        settings = GlobalSettings()
+        settings.integrations.markitdown_max_file_size_mb = 0
+        settings.integrations.markitdown_max_files_per_request = 0
+        settings.integrations.markitdown_pdf_processing_engine = ""
+        errors = settings.validate()
+        assert "markitdown_max_file_size_mb must be > 0" in errors
+        assert "markitdown_max_files_per_request must be > 0" in errors
+        assert "markitdown_pdf_processing_engine must not be empty" in errors
 
 
 class TestClaudeCodeValidation:

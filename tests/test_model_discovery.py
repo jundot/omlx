@@ -231,6 +231,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_vlm_gemma4_unified(self, tmp_path):
+        """Test detection of Gemma4 unified as VLM."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "audio_config": {"feature_size": 128},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_text_only_gemma3_as_llm(self, tmp_path):
         """Text-only quant of Gemma3 (no vision_config) should be LLM."""
         config = {
@@ -245,6 +256,15 @@ class TestDetectModelType:
         config = {
             "model_type": "gemma4",
             "architectures": ["Gemma4ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_text_only_gemma4_unified_as_llm(self, tmp_path):
+        """Gemma4 unified without vision_config should not be forced to VLM."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"

@@ -45,6 +45,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.generation_config import load_generation_config_token_ids
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
@@ -52,6 +53,39 @@ from .utils.tokenizer import create_streaming_detokenizer
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
 # stream when no per-engine stream is provided.
 _default_generation_stream = generation_stream
+
+
+def _apply_suppress_token_ids(logits: Any, suppress_token_ids: tuple[int, ...]) -> Any:
+    if suppress_token_ids:
+        logits[..., list(suppress_token_ids)] = mx.array(float("-inf"))
+    return logits
+
+
+def _make_suppress_logits_processor(
+    suppress_token_ids: set[int],
+) -> Callable[[Any, Any], Any] | None:
+    suppress_tuple = tuple(sorted(int(t) for t in suppress_token_ids))
+    if not suppress_tuple:
+        return None
+
+    def _suppress_logits(tokens: Any, logits: Any) -> Any:
+        return _apply_suppress_token_ids(logits, suppress_tuple)
+
+    return _suppress_logits
+
+
+def _make_suppressing_sampler(
+    sampler: Callable[[Any], Any],
+    suppress_token_ids: set[int],
+) -> Callable[[Any], Any]:
+    suppress_tuple = tuple(sorted(int(t) for t in suppress_token_ids))
+    if not suppress_tuple:
+        return sampler
+
+    def _sample(logits: Any) -> Any:
+        return sampler(_apply_suppress_token_ids(logits, suppress_tuple))
+
+    return _sample
 
 
 @dataclass
@@ -153,11 +187,12 @@ class _StoreCacheGate:
 
     Tracks how many KV caches are alive in the post-completion store-cache
     pipeline. _cleanup_finished records each submission with note_submitted()
-    and the future's done callback clears it with note_done(); neither blocks
-    the generation step. Backpressure is applied at admission instead —
-    _schedule_waiting declines to admit new prefills while in_flight >= cap
-    (see has_capacity), so token generation never stalls waiting for an SSD
-    write (#1496).
+    and _drain_pending_async_removes clears it with note_done() after the
+    deferred batch_generator.remove() releases the request cache references;
+    neither blocks the generation step. Backpressure is applied at admission
+    instead — _schedule_waiting declines to admit new prefills while
+    in_flight >= cap (see has_capacity), so token generation never stalls
+    waiting for an SSD write (#1496).
 
     cap still bounds the concurrent extracted-KV count, which is the OOM
     guard for the burst-finish RAM growth reported in #1383. It is adjusted
@@ -639,6 +674,7 @@ class SchedulerConfig:
     hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
+    hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -777,6 +813,10 @@ class Scheduler:
         self._generation_config_eos: set[int] | None = (
             self._load_generation_config_eos()
         )
+
+        # Load generation_config.suppress_tokens once and apply them on every
+        # sampling path. Gemma 4 uses this to suppress multimodal close markers.
+        self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -1236,62 +1276,76 @@ class Scheduler:
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
-    def _drain_pending_async_removes(self) -> None:
+    def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
 
-        Called at the start of every step. For each pending entry, if the
-        async store_cache future has finished, perform the
-        batch_generator.remove() on the inference thread (Metal-safe) and
-        finalize cleanup state. Entries whose futures are still in flight
-        are left at the head of the deque for a later step.
+        Called at the start of every step. For each pending entry whose async
+        store_cache future has finished, perform batch_generator.remove() on
+        the inference thread (Metal-safe) and finalize cleanup state. Entries
+        whose futures are still in flight are kept for a later step, but they
+        do not block later completed entries from releasing cache references.
         """
         if not self._pending_async_removes:
-            return
+            return False
+        drained = False
+        pending: deque = deque()
         while self._pending_async_removes:
-            uid, request_id, future = self._pending_async_removes[0]
+            uid, request_id, future = self._pending_async_removes.popleft()
             if future is not None and not future.done():
-                # Worker still busy. Stop draining; check again next step.
-                # Inflight entry stays at deque head to preserve order.
-                break
-            self._pending_async_removes.popleft()
+                # Worker still busy. Keep it for the next step, but continue
+                # scanning so later completed futures can release memory now.
+                pending.append((uid, request_id, future))
+                continue
             # Surface worker exceptions for visibility (don't crash step loop).
             if future is not None:
-                exc = future.exception()
-                if exc is not None:
-                    logger.warning(
-                        "Async store_cache for %s raised: %s", request_id, exc
-                    )
-            # Run batch_generator.remove on the inference thread.
+                try:
+                    exc = future.exception()
+                except concurrent.futures.CancelledError:
+                    logger.warning("Async store_cache for %s was cancelled", request_id)
+                else:
+                    if exc is not None:
+                        logger.warning(
+                            "Async store_cache for %s raised: %s", request_id, exc
+                        )
             try:
-                _safe_sync_stream(self._stream)
-                self._remove_uid_from_active_batch(uid)
-                if hasattr(self.model, "unregister_rope_delta"):
-                    self.model.unregister_rope_delta(uid)
-            except Exception as e:
-                logger.warning(
-                    "Deferred batch_generator.remove(uid=%s) failed: %s",
-                    uid,
-                    e,
-                )
-            # Cleanup uid maps now that the slot is reclaimable.
-            if uid in self.uid_to_request_id:
-                del self.uid_to_request_id[uid]
-            if request_id in self.request_id_to_uid:
-                del self.request_id_to_uid[request_id]
-            self._inflight_store_futures.pop(request_id, None)
-            # Boundary snapshots were kept on disk for the worker; safe to
-            # delete now that the future has completed. Cleanup was
-            # deferred from _cleanup_finished to avoid racing the worker's
-            # boundary_snapshot_store.load() calls with rmtree.
-            if self._boundary_snapshot_store is not None:
-                self._boundary_snapshot_store.cleanup_request(request_id)
-            # Worker no longer holds extracted_cache — pop request from
-            # self.requests and drop the cache buffer references so MLX
-            # arrays can be freed.
-            req_to_remove = self.requests.pop(request_id, None)
-            if req_to_remove is not None:
-                req_to_remove._extracted_cache = None
-                req_to_remove.prompt_cache = None
+                # Run batch_generator.remove on the inference thread.
+                try:
+                    _safe_sync_stream(self._stream)
+                    self._remove_uid_from_active_batch(uid)
+                    if hasattr(self.model, "unregister_rope_delta"):
+                        self.model.unregister_rope_delta(uid)
+                except Exception as e:
+                    logger.warning(
+                        "Deferred batch_generator.remove(uid=%s) failed: %s",
+                        uid,
+                        e,
+                    )
+                # Cleanup uid maps now that the slot is reclaimable.
+                if uid in self.uid_to_request_id:
+                    del self.uid_to_request_id[uid]
+                if request_id in self.request_id_to_uid:
+                    del self.request_id_to_uid[request_id]
+                self._inflight_store_futures.pop(request_id, None)
+                # Boundary snapshots were kept on disk for the worker; safe to
+                # delete now that the future has completed. Cleanup was
+                # deferred from _cleanup_finished to avoid racing the worker's
+                # boundary_snapshot_store.load() calls with rmtree.
+                if self._boundary_snapshot_store is not None:
+                    self._boundary_snapshot_store.cleanup_request(request_id)
+                # Worker no longer holds extracted_cache — pop request from
+                # self.requests and drop the cache buffer references so MLX
+                # arrays can be freed.
+                req_to_remove = self.requests.pop(request_id, None)
+                if req_to_remove is not None:
+                    req_to_remove._extracted_cache = None
+                    req_to_remove.prompt_cache = None
+            finally:
+                gate = self._store_cache_gate
+                if gate is not None:
+                    gate.note_done()
+                drained = True
+        self._pending_async_removes = pending
+        return drained
 
     def _calculate_max_blocks(self) -> int:
         """
@@ -1482,37 +1536,16 @@ class Scheduler:
     def _load_generation_config_eos(self) -> set[int] | None:
         """Load EOS token IDs from generation_config.json if available."""
         try:
-            model_path = getattr(self.tokenizer, "name_or_path", None)
-            if not model_path:
+            model_ref = getattr(self.tokenizer, "name_or_path", None) or getattr(
+                self.config, "model_name", None
+            )
+            if not model_ref:
                 return None
-            import json
-            import os
 
-            gc_path = os.path.join(model_path, "generation_config.json")
-            if not os.path.exists(gc_path):
-                # name_or_path may be a HuggingFace repo ID (e.g. for VLM
-                # tokenizers loaded via AutoProcessor).  Try the HF cache.
-                try:
-                    from huggingface_hub import try_to_load_from_cache
-
-                    cached = try_to_load_from_cache(
-                        model_path, "generation_config.json"
-                    )
-                    if cached and isinstance(cached, str):
-                        gc_path = cached
-                    else:
-                        return None
-                except (ImportError, Exception):
-                    return None
-            with open(gc_path) as f:
-                gc = json.load(f)
-            eos = gc.get("eos_token_id")
-            if eos is None:
+            result = load_generation_config_token_ids(model_ref, "eos_token_id")
+            if result is None:
                 return None
-            if isinstance(eos, list):
-                result = set(eos)
-            else:
-                result = {eos}
+
             # Only return if there are tokens beyond what tokenizer already provides
             tokenizer_eos = getattr(self.tokenizer, "eos_token_id", None)
             if tokenizer_eos is not None:
@@ -1532,6 +1565,32 @@ class Scheduler:
         except Exception as e:
             logger.debug(f"Could not load generation_config.json: {e}")
             return None
+
+    def _load_model_suppress_tokens(self) -> set[int]:
+        """Load suppress_tokens from generation_config.json if available.
+
+        These tokens are set to -inf during generation. For Gemma 4 unified,
+        generation_config marks the multimodal close markers (<image|>,
+        <audio|>) this way.
+        """
+        try:
+            model_ref = getattr(self.tokenizer, "name_or_path", None) or getattr(
+                self.config, "model_name", None
+            )
+            if not model_ref:
+                return set()
+
+            result = load_generation_config_token_ids(model_ref, "suppress_tokens")
+            if not result:
+                return set()
+            logger.info(
+                f"Loaded {len(result)} suppress token(s) from "
+                f"generation_config.json: {result}"
+            )
+            return result
+        except Exception as e:
+            logger.debug(f"Could not load suppress_tokens from generation_config: {e}")
+            return set()
 
     def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer and generation_config."""
@@ -1553,6 +1612,26 @@ class Scheduler:
                 stop_tokens.add(eos_ids)
             else:
                 stop_tokens.update(eos_ids)
+
+        # Include end-of-turn token for models that use turn-based
+        # conversation delimiters (e.g. Gemma 4 with <turn|>).  Without
+        # this the model generates the full next turn after its response.
+        eot_token_id = getattr(self.tokenizer, "eot_token_id", None)
+        if eot_token_id is not None:
+            if isinstance(eot_token_id, list):
+                stop_tokens.update(eot_token_id)
+            else:
+                stop_tokens.add(eot_token_id)
+        elif hasattr(self.tokenizer, "eot_token") and self.tokenizer.eot_token:
+            # Encode the string value if eot_token_id isn't directly exposed
+            try:
+                encoded = self.tokenizer.encode(
+                    self.tokenizer.eot_token, add_special_tokens=False
+                )
+                if encoded:
+                    stop_tokens.update(encoded)
+            except Exception:
+                pass
 
         # Read additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1664,6 +1743,12 @@ class Scheduler:
                 else None
             ),
         )
+
+        suppress_processor = _make_suppress_logits_processor(
+            self._model_suppress_tokens
+        )
+        if suppress_processor is not None:
+            logits_processors.append(suppress_processor)
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
@@ -3118,6 +3203,12 @@ class Scheduler:
             ),
         )
 
+        suppress_processor = _make_suppress_logits_processor(
+            self._model_suppress_tokens
+        )
+        if suppress_processor is not None:
+            logits_processors.append(suppress_processor)
+
         # Add thinking budget processor for reasoning models
         if (
             sampling_params.thinking_budget is not None
@@ -4534,6 +4625,7 @@ class Scheduler:
             )
             return None
 
+        mtp_sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
         try:
             with mx.stream(self._stream):
@@ -4554,7 +4646,7 @@ class Scheduler:
             return None
 
         logits = out.logits[:, -1, :]
-        first_bonus_arr = sampler(logits)  # mx.array shape [1]
+        first_bonus_arr = mtp_sampler(logits)  # mx.array shape [1]
         mx.eval(first_bonus_arr)
 
         hidden_states = out.hidden_states
@@ -4582,7 +4674,7 @@ class Scheduler:
                 shared_kv_states=out.shared_kv_states,
                 first_bonus=int(first_bonus_arr.item()),
                 max_tokens=request.sampling_params.max_tokens,
-                sampler=sampler,
+                sampler=mtp_sampler,
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
@@ -4601,7 +4693,7 @@ class Scheduler:
             generator=generator,
             request=request,
             prompt_cache=prefilled_cache,
-            sampler=sampler,
+            sampler=mtp_sampler,
             state_machine=state_machine,
             max_tokens=request.sampling_params.max_tokens,
             stop_token_ids=set(eos_ids),
@@ -5174,6 +5266,7 @@ class Scheduler:
             self.waiting
             or self.prefilling
             or self.running
+            or self._pending_async_removes
             or self._deferred_clear_at is not None
         )
 
@@ -5369,19 +5462,23 @@ class Scheduler:
                 break
 
             # Store-cache backpressure: when the post-completion pipeline is
-            # at its in-flight cap, defer admitting new prefills instead of
+            # at its cleanup cap, defer admitting new prefills instead of
             # blocking the generation step on the store-cache write (#1496).
             # The cap bounds concurrent extracted-KV copies (the #1383 OOM
             # guard) and shrinks under memory pressure via
-            # adjust_store_cache_cap. In-flight requests keep generating;
-            # the first request always passes (self.running is empty) so a
-            # lone slow SSD write cannot deadlock admission.
+            # adjust_store_cache_cap. This also applies between sequential
+            # turns: a new prefill must not start while async store-cache
+            # cleanup still owns too many large cache payloads (#1684).
             gate = self._store_cache_gate
-            if gate is not None and self.running and not gate.has_capacity:
+            pending_store_cleanups = len(self._pending_async_removes)
+            if gate is not None and (
+                not gate.has_capacity or pending_store_cleanups >= gate.cap
+            ):
                 logger.debug(
                     "Admission deferred: store-cache pipeline full "
-                    "(in_flight=%d cap=%d), %d running",
+                    "(in_flight=%d pending_cleanups=%d cap=%d), %d running",
                     gate.in_flight,
+                    pending_store_cleanups,
                     gate.cap,
                     len(self.running),
                 )
@@ -6395,15 +6492,15 @@ class Scheduler:
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
-                                # has materialized KV arrays. The gate only
-                                # counts in-flight writes; backpressure is
-                                # applied at admission in _schedule_waiting
-                                # (in_flight >= cap defers new prefills) so
-                                # cache persistence does not wait in the token
-                                # loop after submission (#1496). note_submitted
-                                # is called before submit so a fast worker whose
-                                # done callback fires immediately still
-                                # decrements a counted slot.
+                                # has materialized KV arrays. The gate counts
+                                # cleanup slots that still own extracted cache
+                                # references; backpressure is applied at
+                                # admission in _schedule_waiting so cache
+                                # persistence does not wait in the token loop
+                                # after submission (#1496). note_submitted is
+                                # called before submit, and note_done happens in
+                                # _drain_pending_async_removes after the request
+                                # cache references are released.
                                 gate = self._store_cache_gate
                                 if gate is not None:
                                     gate.note_submitted()
@@ -6423,10 +6520,6 @@ class Scheduler:
                                     if gate is not None:
                                         gate.note_done()
                                     raise
-                                if gate is not None:
-                                    store_future.add_done_callback(
-                                        lambda _f, g=gate: g.note_done()
-                                    )
                                 self._inflight_store_futures[request_id] = store_future
                             else:
                                 # Executor unavailable — synchronous fallback.
@@ -6814,7 +6907,9 @@ class Scheduler:
         # Drain async store_cache completions from prior steps. Each completed
         # entry triggers the deferred batch_generator.remove(uid) on the
         # inference thread. Inflight entries are left for a later step.
-        self._drain_pending_async_removes()
+        drained_async_removes = self._drain_pending_async_removes()
+        if drained_async_removes:
+            output.has_work = True
 
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
@@ -7334,6 +7429,7 @@ class Scheduler:
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
+                hot_cache_budget=self.config.hot_cache_budget,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
             )

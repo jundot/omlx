@@ -587,6 +587,92 @@ class PagedSSDCacheIndex:
             return list(self._index.values())
 
 
+@dataclass
+class _HotCacheBudgetEntry:
+    owner: Any
+    block_hash: bytes
+    size_bytes: int
+
+
+class SharedHotCacheBudget:
+    """Process-wide byte budget for hot cache entries across cache managers."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(0, int(max_bytes))
+        self._entries: OrderedDict[tuple[int, bytes], _HotCacheBudgetEntry] = (
+            OrderedDict()
+        )
+        self._total_bytes = 0
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(owner: Any, block_hash: bytes) -> tuple[int, bytes]:
+        return (id(owner), block_hash)
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._total_bytes
+
+    @property
+    def remaining_bytes(self) -> int:
+        with self._lock:
+            return max(0, self.max_bytes - self._total_bytes)
+
+    def touch(self, owner: Any, block_hash: bytes) -> None:
+        """Mark an entry as recently used in the global LRU order."""
+        with self._lock:
+            key = self._key(owner, block_hash)
+            if key in self._entries:
+                self._entries.move_to_end(key)
+
+    def forget(self, owner: Any, block_hash: bytes) -> None:
+        """Remove one entry from budget accounting if present."""
+        with self._lock:
+            key = self._key(owner, block_hash)
+            entry = self._entries.pop(key, None)
+            if entry is not None:
+                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+
+    def forget_owner(self, owner: Any) -> None:
+        """Remove all entries owned by a cache manager."""
+        owner_id = id(owner)
+        with self._lock:
+            keys = [key for key in self._entries if key[0] == owner_id]
+            for key in keys:
+                entry = self._entries.pop(key)
+                self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
+
+    def put(
+        self, owner: Any, block_hash: bytes, size_bytes: int
+    ) -> list[tuple[Any, bytes]]:
+        """Account an entry and return globally-evicted owners/block hashes."""
+        victims: list[tuple[Any, bytes]] = []
+        size_bytes = max(0, int(size_bytes))
+        with self._lock:
+            key = self._key(owner, block_hash)
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._total_bytes = max(0, self._total_bytes - old.size_bytes)
+
+            self._entries[key] = _HotCacheBudgetEntry(
+                owner=owner,
+                block_hash=block_hash,
+                size_bytes=size_bytes,
+            )
+            self._total_bytes += size_bytes
+
+            while self._total_bytes > self.max_bytes and self._entries:
+                victim_key, victim = self._entries.popitem(last=False)
+                if victim_key == key and not self._entries:
+                    self._entries[victim_key] = victim
+                    break
+                self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
+                victims.append((victim.owner, victim.block_hash))
+
+        return victims
+
+
 class PagedSSDCacheManager(CacheManager):
     """
     Manages SSD storage for KV cache blocks.
@@ -617,6 +703,7 @@ class PagedSSDCacheManager(CacheManager):
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        hot_cache_budget: SharedHotCacheBudget | None = None,
         expected_model_name: str = "",
         expected_num_layers: int = 0,
     ):
@@ -631,6 +718,8 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            hot_cache_budget: Optional process-wide hot cache budget shared
+                by all loaded model cache managers.
             expected_model_name: Current model name. Blocks saved for a
                 different model name are unlinked at startup. Empty string
                 disables this check (backwards compatible).
@@ -671,8 +760,13 @@ class PagedSSDCacheManager(CacheManager):
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
-        self._hot_cache_max_bytes = hot_cache_max_bytes
-        self._hot_cache_enabled = hot_cache_max_bytes > 0
+        self._hot_cache_budget = hot_cache_budget
+        self._hot_cache_max_bytes = (
+            hot_cache_budget.max_bytes
+            if hot_cache_budget is not None
+            else hot_cache_max_bytes
+        )
+        self._hot_cache_enabled = self._hot_cache_max_bytes > 0
         self._hot_cache: OrderedDict[bytes, dict] = OrderedDict()
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
@@ -741,6 +835,20 @@ class PagedSSDCacheManager(CacheManager):
             return sum(len(raw) for raw, _, _ in entry["tensors_raw"].values())
         return 0
 
+    def _effective_hot_cache_max_bytes(self) -> int:
+        if self._hot_cache_budget is not None:
+            return self._hot_cache_budget.max_bytes
+        return self._hot_cache_max_bytes
+
+    def _hot_cache_available_bytes(self) -> int:
+        if self._hot_cache_budget is not None:
+            return self._hot_cache_budget.remaining_bytes
+        return max(0, self._hot_cache_max_bytes - self._hot_cache_total_bytes)
+
+    def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
+        self._stats["hot_cache_evictions"] += 1
+        self._enqueue_ssd_write(block_hash, entry)
+
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
@@ -748,6 +856,22 @@ class PagedSSDCacheManager(CacheManager):
         """
         entry_size = self._hot_cache_entry_size(entry)
         evicted_entries: list = []
+
+        if self._hot_cache_budget is not None:
+            with self._hot_cache_lock:
+                old = self._hot_cache.pop(block_hash, None)
+                if old is not None:
+                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+                self._hot_cache[block_hash] = entry
+                self._hot_cache_total_bytes += entry_size
+
+            victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            for owner, victim_hash in victims:
+                evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
+                if evicted is not None:
+                    owner._handle_hot_cache_eviction(victim_hash, evicted)
+            return
+
         with self._hot_cache_lock:
             # Remove old entry if updating
             if block_hash in self._hot_cache:
@@ -761,7 +885,6 @@ class PagedSSDCacheManager(CacheManager):
             ):
                 evicted_hash, evicted = self._hot_cache.popitem(last=False)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
-                self._stats["hot_cache_evictions"] += 1
                 evicted_entries.append((evicted_hash, evicted))
 
             self._hot_cache[block_hash] = entry
@@ -769,7 +892,7 @@ class PagedSSDCacheManager(CacheManager):
 
         # Flush evicted entries to SSD outside the hot cache lock
         for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+            self._handle_hot_cache_eviction(evicted_hash, evicted)
 
     def _enqueue_ssd_write(
         self, block_hash: bytes, entry: dict, *, blocking: bool = False,
@@ -836,20 +959,29 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             if block_hash in self._hot_cache:
                 self._hot_cache.move_to_end(block_hash)
-                return self._hot_cache[block_hash]
-            return None
+                entry = self._hot_cache[block_hash]
+            else:
+                return None
+        if self._hot_cache_budget is not None:
+            self._hot_cache_budget.touch(self, block_hash)
+        return entry
 
     def _pending_write_buffer_get(self, block_hash: bytes) -> dict | None:
         """Get entry from pending-write buffer. Returns None on miss."""
         with self._pending_write_hashes_lock:
             return self._pending_write_buffers.get(block_hash)
 
-    def _hot_cache_remove(self, block_hash: bytes) -> None:
+    def _hot_cache_remove(
+        self, block_hash: bytes, *, update_budget: bool = True
+    ) -> dict | None:
         """Remove entry from hot cache if present."""
         with self._hot_cache_lock:
             old = self._hot_cache.pop(block_hash, None)
             if old:
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
+        if old is not None and update_budget and self._hot_cache_budget is not None:
+            self._hot_cache_budget.forget(self, block_hash)
+        return old
 
     def _promote_to_hot_cache(
         self,
@@ -2092,7 +2224,7 @@ class PagedSSDCacheManager(CacheManager):
         # If we preload N blocks but hot cache can only hold M < N,
         # blocks evict each other and reconstruct_cache falls back to SSD.
         # CPD-accepted (GLM L1).
-        available = self._hot_cache_max_bytes - self._hot_cache_total_bytes
+        available = self._hot_cache_available_bytes()
         if available <= 0:
             return 0
 
@@ -2301,6 +2433,8 @@ class PagedSSDCacheManager(CacheManager):
             count = len(self._hot_cache)
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
+        if self._hot_cache_budget is not None:
+            self._hot_cache_budget.forget_owner(self)
         if count:
             logger.info("Cleared %d hot cache entries", count)
         return count
@@ -2345,7 +2479,7 @@ class PagedSSDCacheManager(CacheManager):
                 num_files=self._index.count,
                 hot_cache_entries=hot_entries,
                 hot_cache_size_bytes=hot_size,
-                hot_cache_max_bytes=self._hot_cache_max_bytes,
+                hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
@@ -2404,7 +2538,7 @@ class PagedSSDCacheManager(CacheManager):
                 num_files=indexed_count,
                 hot_cache_entries=len(hot_entries),
                 hot_cache_size_bytes=hot_size,
-                hot_cache_max_bytes=self._hot_cache_max_bytes,
+                hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),
                 hot_cache_hits=self._stats["hot_cache_hits"],
                 hot_cache_evictions=self._stats["hot_cache_evictions"],
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
@@ -2439,9 +2573,11 @@ class PagedSSDCacheManager(CacheManager):
                 "num_files": self._index.count,
                 "hot_cache_entries": hot_entries,
                 "hot_cache_size_bytes": hot_size,
-                "hot_cache_max_bytes": self._hot_cache_max_bytes,
+                "hot_cache_max_bytes": self._effective_hot_cache_max_bytes(),
                 "hot_cache_size_formatted": format_bytes(hot_size),
-                "hot_cache_max_formatted": format_bytes(self._hot_cache_max_bytes),
+                "hot_cache_max_formatted": format_bytes(
+                    self._effective_hot_cache_max_bytes()
+                ),
                 **self._stats,
             }
 
@@ -2499,6 +2635,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
+        if self._hot_cache_budget is not None:
+            self._hot_cache_budget.forget_owner(self)
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()

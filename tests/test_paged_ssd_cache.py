@@ -19,6 +19,7 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDBlockMetadata,
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
+    SharedHotCacheBudget,
     _extract_tensor_bytes,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
@@ -1946,7 +1947,15 @@ class TestPreloadMatchedBlocks:
         yield manager
         manager.close()
 
-    def _save_test_blocks(self, manager, mx, count=4, layers=2):
+    def _save_test_blocks(
+        self,
+        manager,
+        mx,
+        count=4,
+        layers=2,
+        hot_cache_max_bytes=512 * 1024**2,
+        hot_cache_budget=None,
+    ):
         """Save test blocks and flush them to SSD (not hot cache)."""
         hashes = []
         for i in range(count):
@@ -1974,7 +1983,8 @@ class TestPreloadMatchedBlocks:
         new_manager = PagedSSDCacheManager(
             cache_dir=manager._cache_dir,
             max_size_bytes=1024**3,
-            hot_cache_max_bytes=512 * 1024**2,
+            hot_cache_max_bytes=hot_cache_max_bytes,
+            hot_cache_budget=hot_cache_budget,
         )
         return new_manager, hashes
 
@@ -2100,6 +2110,58 @@ class TestPreloadMatchedBlocks:
         assert loaded == 0
 
         manager2.close()
+
+    def test_preload_skips_when_shared_hot_cache_budget_full(self, tmp_path, mx):
+        """Preload uses remaining shared budget, not only local hot cache bytes."""
+        budget = SharedHotCacheBudget(1024)
+        filler = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_filler",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=0,
+        )
+        manager2 = None
+
+        try:
+            filler._hot_cache_put(
+                b"preload_budget_filler",
+                {
+                    "tensors_raw": {
+                        "layer_0_keys": (bytes(1024), "uint8", [1024]),
+                    },
+                    "file_metadata": {},
+                    "num_layers": 1,
+                    "layer_cache_types": ["KVCache"],
+                    "block_metadata": None,
+                },
+            )
+            assert budget.remaining_bytes == 0
+
+            manager2, hashes = self._save_test_blocks(
+                manager,
+                mx,
+                count=4,
+                hot_cache_max_bytes=budget.max_bytes,
+                hot_cache_budget=budget,
+            )
+
+            loaded = manager2.preload_matched_blocks(hashes)
+            assert loaded == 0
+            assert budget.total_bytes == budget.max_bytes
+            for h in hashes:
+                assert manager2._hot_cache_get(h) is None
+        finally:
+            if manager2 is not None:
+                manager2.close()
+            else:
+                manager.close()
+            filler.close()
 
     def test_preload_empty_list(self, manager_with_hot_cache):
         """Empty hash list returns 0 immediately."""
