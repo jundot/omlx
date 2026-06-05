@@ -243,14 +243,17 @@ def extract_gemma4_messages(
             continue
 
         # All other roles (user, system)
-        # Preserve image_url parts for VLM processing
+        # Preserve image_url and input_audio parts for VLM processing
         content = msg.get("content", "")
         if isinstance(content, list):
             from ..api.utils import _extract_multimodal_content_list
 
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
-            if has_images:
+            multimodal_types = {"image_url", "input_audio"}
+            has_multimodal = any(
+                p.get("type") in multimodal_types for p in multimodal_parts
+            )
+            if has_multimodal:
                 content = multimodal_parts
             else:
                 content = _extract_text_from_content_list(content)

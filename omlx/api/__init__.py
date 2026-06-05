@@ -70,6 +70,7 @@ from .anthropic_models import (
     ContentBlockImage,
     ContentBlockToolUse,
     ContentBlockToolResult,
+    ContentBlockInputAudio,
     # Messages
     SystemContent,
     AnthropicMessage,

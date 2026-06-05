@@ -163,6 +163,22 @@ class TestExtractGemma4Messages:
         types = [p["type"] for p in result[0]["content"]]
         assert "image_url" in types
         assert "text" in types
+    def test_input_audio_preserved_in_user_message(self):
+        """User messages with input_audio parts keep them for VLM processing."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "listen to this"},
+                    {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+                ],
+            ),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert isinstance(result[0]["content"], list)
+        types = [p["type"] for p in result[0]["content"]]
+        assert "input_audio" in types
+        assert "text" in types
 
     def test_text_only_content_list_flattened(self):
         """User messages with text-only content list are flattened to string."""

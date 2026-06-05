@@ -679,3 +679,126 @@ class TestAnthropicToolUseConversion:
         # Must use [Calling tool: ...] not [Tool call: ...]
         assert "[Calling tool: get_weather(" in content
         assert "[Tool call:" not in content
+
+
+class TestAnthropicAudioConversion:
+    """Tests for input_audio block handling in convert_anthropic_to_internal."""
+
+    def test_input_audio_block_preserved_with_preserve_images(self):
+        """input_audio blocks should be passed through when preserve_images=True."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What sound is this?"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=True
+        )
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+
+        # Should have both text and audio parts
+        audio_parts = [p for p in content if p.get("type") == "input_audio"]
+        assert len(audio_parts) == 1
+        assert audio_parts[0]["input_audio"]["data"] == fake_audio
+        assert audio_parts[0]["input_audio"]["format"] == "wav"
+
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(text_parts) == 1
+
+    def test_input_audio_block_dropped_without_preserve_images(self):
+        """input_audio blocks should be dropped when preserve_images=False."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What sound is this?"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=False
+        )
+
+        content = messages[0]["content"]
+        # Without preserve_images, content should be string, not list
+        assert isinstance(content, str)
+        assert "input_audio" not in str(content).lower()
+
+    def test_audio_only_message(self):
+        """A message with only audio blocks should still produce valid output."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=True
+        )
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 1
+        assert content[0]["type"] == "input_audio"

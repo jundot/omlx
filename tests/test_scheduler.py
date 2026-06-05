@@ -933,6 +933,42 @@ class TestSchedulerStopTokens:
         # MockTokenizer has eos_token_id = 2
         assert mock_tokenizer.eos_token_id in stop_tokens
 
+    def test_includes_eot_token_id(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() includes end-of-turn token when available."""
+        # eot_token_id as a single int
+        mock_tokenizer.eot_token_id = 106
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert mock_tokenizer.eos_token_id in stop_tokens  # EOS still there too
+
+    def test_includes_eot_token_id_list(self, mock_model, mock_tokenizer):
+        """Test _get_stop_tokens() handles eot_token_id as a list."""
+        mock_tokenizer.eot_token_id = [106, 107]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert 106 in stop_tokens
+        assert 107 in stop_tokens
+
+    def test_falls_back_to_eot_token_encoding(self, mock_model, mock_tokenizer):
+        """When eot_token_id is absent but eot_token string is present, encode it."""
+        mock_tokenizer.eot_token = "<turn|>"
+        # Ensure eot_token_id is NOT present
+        assert not hasattr(mock_tokenizer, "eot_token_id") or mock_tokenizer.eot_token_id is None
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        # The MockTokenizer.encode() returns hash-based IDs, so we get something
+        assert len([t for t in stop_tokens if t != mock_tokenizer.eos_token_id]) > 0
+
+    def test_no_eot_token_when_absent(self, mock_model, mock_tokenizer):
+        """When neither eot_token_id nor eot_token string is present, no crash."""
+        # MockTokenizer has no eot_token_id or eot_token by default
+        assert not hasattr(mock_tokenizer, "eot_token_id")
+        assert not hasattr(mock_tokenizer, "eot_token")
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        stop_tokens = scheduler._get_stop_tokens()
+        assert mock_tokenizer.eos_token_id in stop_tokens
+
 
 class TestSchedulerXtcSpecialTokens:
     """Tests for _get_xtc_special_tokens()."""

@@ -488,7 +488,7 @@ class TestProcessChatMessages:
     def test_text_only_uses_vlm_prepare_path(self, mock_extract):
         """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [])
+        mock_extract.return_value = (text_msgs, [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -508,6 +508,7 @@ class TestProcessChatMessages:
         engine._prepare_vision_inputs.assert_called_once_with(
             text_msgs,
             [],
+            audio=None,
             chat_template_kwargs=None,
             tools=None,
         )
@@ -516,7 +517,7 @@ class TestProcessChatMessages:
     def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
         """Text-only + tools still convert and pass tools through VLM path."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [])
+        mock_extract.return_value = (text_msgs, [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -541,7 +542,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -570,7 +571,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -597,7 +598,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -693,6 +694,77 @@ class TestPrepareVisionInputs:
 
         with pytest.raises(ValueError, match="does not support multi-image"):
             engine._prepare_vision_inputs(messages, images)
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_audio_passed_to_prepare_inputs(self, mock_vlm_act, mock_prepare):
+        """When audio is provided, it's passed to prepare_inputs."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        from PIL import Image
+        messages = [{"role": "user", "content": "Describe this recording"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+        audio = [("fake_audio_array", 16000)]
+
+        engine._prepare_vision_inputs(messages, images, audio=audio)
+
+        # prepare_inputs should have been called with audio
+        mock_prepare.assert_called_once()
+        call_args = mock_prepare.call_args[0]
+        # First positional arg is images, second is processor, third is audio or config
+        # For gemma4, audio=audio kwarg should be present
+        call_kwargs = mock_prepare.call_args[1]
+        assert call_kwargs.get("audio") == audio
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_audio_none_not_passed(self, mock_vlm_act, mock_prepare):
+        """When audio is None, it is not passed to prepare_inputs."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        from PIL import Image
+        messages = [{"role": "user", "content": "Hello"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        engine._prepare_vision_inputs(messages, images, audio=None)
+
+        call_kwargs = mock_prepare.call_args[1]
+        assert call_kwargs.get("audio") is None
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_audio_empty_list_not_passed(self, mock_vlm_act, mock_prepare):
+        """Empty audio list is equivalent to None."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        from PIL import Image
+        messages = [{"role": "user", "content": "Hello"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        engine._prepare_vision_inputs(messages, images, audio=[])
+
+        call_kwargs = mock_prepare.call_args[1]
+        assert call_kwargs.get("audio") is None
 
 
 class TestFormatMessagesForVLMTemplate:
@@ -898,6 +970,101 @@ class TestFormatMessagesForVLMTemplate:
         assert isinstance(formatted[1]["content"], str)
         assert "reasoning_content" not in formatted[1]
 
+    def test_format_messages_with_audio_parts(self):
+        """Messages with input_audio parts retain audio type after formatting."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this recording?"},
+                    {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_audios=1
+        )
+
+        # System message should be string content
+        assert isinstance(formatted[0]["content"], str)
+        # User message with audio should be list content
+        assert isinstance(formatted[1]["content"], list)
+        types = [p.get("type") for p in formatted[1]["content"] if isinstance(p, dict)]
+        # get_message_json() converts "input_audio" to "audio" type markers
+        assert "audio" in types
+        assert image_ranges == []
+
+    def test_audio_parts_capped_by_num_audios(self):
+        """Only load up to num_audios audio parts even if more are in message."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "a", "format": "wav"}},
+                    {"type": "input_audio", "input_audio": {"data": "b", "format": "wav"}},
+                    {"type": "text", "text": "Compare these recordings"},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_audios=1
+        )
+
+        # Should have exactly 1 audio marker (get_message_json converts to "audio" type)
+        audio_count = 0
+        for part in formatted[0]["content"]:
+            if isinstance(part, dict) and part.get("type") == "audio":
+                audio_count += 1
+        assert audio_count == 1
+
+    def test_audio_and_image_in_same_message(self):
+        """Both audio and image placeholders coexist in the same user turn."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {"type": "input_audio", "input_audio": {"data": "xyz", "format": "wav"}},
+                    {"type": "text", "text": "Describe this image and audio"},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1, num_audios=1
+        )
+
+        content = formatted[0]["content"]
+        types = [p.get("type") for p in content if isinstance(p, dict)]
+        assert "image" in types or "image_url" in types
+        assert "audio" in types
+        # Image range should be recorded
+        assert len(image_ranges) == 1
+
+    def test_text_only_messages_with_zero_audio(self):
+        """Text-only messages with num_audios=0 should produce string content."""
+        engine = _make_loaded_engine(model_type="gemma4")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_audios=0
+        )
+
+        assert image_ranges == []
+        for msg in formatted:
+            assert isinstance(msg["content"], str), (
+                f"Expected string content for {msg['role']} message, "
+                f"got {type(msg['content'])}"
+            )
     def test_user_reasoning_content_is_ignored(self):
         """reasoning_content on user messages is not preserved verbatim.
 

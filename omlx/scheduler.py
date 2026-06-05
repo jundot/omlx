@@ -778,6 +778,11 @@ class Scheduler:
             self._load_generation_config_eos()
         )
 
+        # Load suppress_tokens from generation_config.json for Gemma 4 unified models.
+        # Prevents generation of multimodal placeholder tokens (<image|>, <audio|>)
+        # on text-only inputs.
+        self._model_suppress_tokens: set[int] = self._load_model_suppress_tokens()
+
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
         self._align_block_size_with_rotating_window()
@@ -1533,6 +1538,51 @@ class Scheduler:
             logger.debug(f"Could not load generation_config.json: {e}")
             return None
 
+    def _load_model_suppress_tokens(self) -> set[int]:
+        """Load suppress_tokens from generation_config.json if available.
+
+        These tokens are set to -inf during generation to prevent multimodal
+        placeholder token emission (e.g. <image|>, <audio|>) on text-only inputs.
+        """
+        try:
+            model_path = getattr(self.tokenizer, "name_or_path", None)
+            if not model_path:
+                return set()
+            import json
+            import os
+
+            gc_path = os.path.join(model_path, "generation_config.json")
+            if not os.path.exists(gc_path):
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+
+                    cached = try_to_load_from_cache(
+                        model_path, "generation_config.json"
+                    )
+                    if cached and isinstance(cached, str):
+                        gc_path = cached
+                    else:
+                        return set()
+                except (ImportError, Exception):
+                    return set()
+            with open(gc_path) as f:
+                gc = json.load(f)
+            suppress = gc.get("suppress_tokens")
+            if suppress is None:
+                return set()
+            if isinstance(suppress, list):
+                result = set(suppress)
+            else:
+                result = {suppress}
+            logger.info(
+                f"Loaded {len(result)} suppress token(s) from "
+                f"generation_config.json: {result}"
+            )
+            return result
+        except Exception as e:
+            logger.debug(f"Could not load suppress_tokens from generation_config: {e}")
+            return set()
+
     def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer and generation_config."""
         stop_tokens = set()
@@ -1553,6 +1603,26 @@ class Scheduler:
                 stop_tokens.add(eos_ids)
             else:
                 stop_tokens.update(eos_ids)
+
+        # Include end-of-turn token for models that use turn-based
+        # conversation delimiters (e.g. Gemma 4 with <turn|>).  Without
+        # this the model generates the full next turn after its response.
+        eot_token_id = getattr(self.tokenizer, "eot_token_id", None)
+        if eot_token_id is not None:
+            if isinstance(eot_token_id, list):
+                stop_tokens.update(eot_token_id)
+            else:
+                stop_tokens.add(eot_token_id)
+        elif hasattr(self.tokenizer, "eot_token") and self.tokenizer.eot_token:
+            # Encode the string value if eot_token_id isn't directly exposed
+            try:
+                encoded = self.tokenizer.encode(
+                    self.tokenizer.eot_token, add_special_tokens=False
+                )
+                if encoded:
+                    stop_tokens.update(encoded)
+            except Exception:
+                pass
 
         # Read additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -1664,6 +1734,16 @@ class Scheduler:
                 else None
             ),
         )
+
+        # Suppress model-specific tokens (e.g. Gemma 4 <image|>/<audio|>)
+        if self._model_suppress_tokens:
+            _suppress_list = list(self._model_suppress_tokens)
+
+            def _suppress_logits(tokens, logits):
+                logits[..., _suppress_list] = mx.array(float("-inf"))
+                return logits
+
+            logits_processors.append(_suppress_logits)
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
@@ -3117,6 +3197,16 @@ class Scheduler:
                 else None
             ),
         )
+
+        # Suppress model-specific tokens (e.g. Gemma 4 <image|>/<audio|>)
+        if self._model_suppress_tokens:
+            _suppress_list = list(self._model_suppress_tokens)
+
+            def _suppress_logits(tokens, logits):
+                logits[..., _suppress_list] = mx.array(float("-inf"))
+                return logits
+
+            logits_processors.append(_suppress_logits)
 
         # Add thinking budget processor for reasoning models
         if (

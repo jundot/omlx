@@ -72,6 +72,18 @@ class ContentBlockDocument(BaseModel):
     cache_control: dict[str, str] | None = None
 
 
+class ContentBlockInputAudio(BaseModel):
+    """Audio input content block for multimodal audio models.
+
+    Uses the same shape as OpenAI's input_audio content part so that
+    the internal VLM engine receives a uniform representation regardless
+    of which API endpoint the client used.
+    """
+
+    type: Literal["input_audio"] = "input_audio"
+    input_audio: dict[str, Any]  # {"data": "<base64>", "format": "wav"}
+
+
 # Union type for all content blocks
 ContentBlock = (
     ContentBlockText
@@ -80,6 +92,7 @@ ContentBlock = (
     | ContentBlockToolResult
     | ContentBlockThinking
     | ContentBlockDocument
+    | ContentBlockInputAudio
 )
 
 

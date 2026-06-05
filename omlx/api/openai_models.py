@@ -33,6 +33,13 @@ class ImageURL(BaseModel):
     detail: Optional[str] = "auto"  # "low", "high", "auto"
 
 
+class InputAudio(BaseModel):
+    """Audio input data for multimodal models (OpenAI format)."""
+
+    data: str  # Base64-encoded audio or data URI
+    format: str = "wav"  # Audio format: wav, mp3, etc.
+
+
 class ContentPart(BaseModel):
     """
     A part of a message content array.
@@ -40,10 +47,13 @@ class ContentPart(BaseModel):
     Supports:
     - text: Plain text content
     - image_url: Image input for vision models
+    - input_audio: Audio input for multimodal audio models
     """
-    type: str  # "text" or "image_url"
+
+    type: str  # "text", "image_url", or "input_audio"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    input_audio: Optional[InputAudio] = None
 
 
 # =============================================================================

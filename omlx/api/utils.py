@@ -48,6 +48,7 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
+    r"<\|image\|>|<\|audio\|>|"  # Gemma 4 VLM special tokens
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
 
@@ -117,9 +118,9 @@ def _extract_text_from_content_list(content: list) -> str:
 
 
 def _extract_multimodal_content_list(content: list) -> list:
-    """Extract text and image parts from a content array, preserving images.
+    """Extract text, image, and audio parts from a content array.
 
-    Keeps both text and image_url items for VLM processing.
+    Keeps text, image_url, and input_audio items for VLM processing.
     Other content types (tool_use, thinking, refusal, etc.) are dropped.
     """
     parts = []
@@ -173,6 +174,16 @@ def _extract_multimodal_content_list(content: list) -> list:
                             "image_url": {
                                 "url": f"data:{media_type};base64,{data}",
                             },
+                        }
+                    )
+            elif item_type == "input_audio":
+                # OpenAI audio format: pass through for engine-side decoding
+                input_audio = item.get("input_audio")
+                if input_audio and isinstance(input_audio, dict):
+                    parts.append(
+                        {
+                            "type": "input_audio",
+                            "input_audio": input_audio,
                         }
                     )
     return parts
@@ -678,10 +689,13 @@ def extract_multimodal_content(
         if isinstance(content, str):
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Preserve image_url parts for VLM processing
+            # Preserve image_url and input_audio parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
-            if has_images:
+            multimodal_types = {"image_url", "input_audio"}
+            has_multimodal = any(
+                p.get("type") in multimodal_types for p in multimodal_parts
+            )
+            if has_multimodal:
                 # Keep as content list for VLM engine
                 processed_messages.append(
                     {"role": role, "content": multimodal_parts, **_extra}
