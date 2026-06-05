@@ -1181,6 +1181,21 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     return _server_state.sampling.max_context_window
 
 
+def get_embedding_max_length(
+    model_id: str | None = None,
+    request_max_length: int | None = None,
+) -> int:
+    """Get max token length for embedding requests."""
+    if request_max_length is not None:
+        return request_max_length
+
+    max_context_window = get_max_context_window(model_id)
+    if max_context_window is not None:
+        return max_context_window
+
+    return 512
+
+
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
     """
     Scale token count for Anthropic API response if context scaling is enabled.
@@ -2157,11 +2172,17 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
+    max_length = get_embedding_max_length(request.model, request.max_length)
+
     async def _build_embeddings():
         start_time = time.perf_counter()
         try:
             async with acquire_embedding_engine(request.model) as engine:
-                output = await engine.embed(embedding_inputs)
+                output = await engine.embed(
+                    embedding_inputs,
+                    max_length=max_length,
+                    truncation=request.truncation,
+                )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except TypeError as e:
@@ -2170,7 +2191,8 @@ async def create_embeddings(
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-            f"{output.total_tokens} tokens in {elapsed:.3f}s"
+            f"{output.total_tokens} tokens, max_length={max_length}, "
+            f"truncation={request.truncation} in {elapsed:.3f}s"
         )
         get_server_metrics().record_request_complete(
             prompt_tokens=output.total_tokens,
