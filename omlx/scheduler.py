@@ -813,6 +813,9 @@ class Scheduler:
         # worst-case single-step current jump on m5max (see MemorySettings
         # .prefill_transient_margin_gb). 0 until the enforcer propagates it.
         self._prefill_transient_margin_bytes: int = 0
+        # One-shot guard for _log_prefill_gate_state_once (loud resolved-state
+        # log so a mis-propagated margin can't ship silently inert again).
+        self._prefill_gate_state_logged: bool = False
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -1751,36 +1754,44 @@ class Scheduler:
     ) -> None:
         """Forward-FRONT memory gate: refuse a prefill chunk BEFORE it runs.
 
-        The chunk-end check (after self.model(...) + mx.eval) only fires once
-        the transient has already been allocated -- on Apple Silicon a chunk
-        that overshoots the Metal cap kernel-panics the whole machine, so an
-        after-the-fact Python check never runs. This predicts the next chunk's
-        peak and raises BEFORE the forward when it would exceed the hard cap,
-        so the request is aborted cleanly (the #1405 cleanup paths convert this
-        RuntimeError into a finish_reason="error" output) instead of crashing.
+        PRIMARY protection against a single request's prefill transient breaching
+        the Metal cap and kernel-panicking the box. The legacy chunk-END check
+        (after self.model(...) + mx.eval) only fires once the transient has
+        already been allocated -- on Apple Silicon a chunk that overshoots the
+        cap panics the whole machine, so the after-the-fact check never runs.
+        This predicts the next chunk's peak and raises BEFORE the forward when it
+        would exceed the cap; the call-site handler in _schedule_waiting catches
+        the RuntimeError, _sync_and_clear_cache()s the accumulated KV, and emits
+        a finish_reason="error" output instead of crashing.
 
-        predicted_peak = current(high-water) + estimate(KV+SDPA) + margin
-          - current: max(active, phys_footprint, recent_peak). recent_peak is
-            the enforcer's rolling high-water mark, so a mid-prefill trough in
-            the instant reading does not mask the real footprint.
-          - estimate: memory_monitor.estimate_prefill_peak_bytes models this
-            chunk's KV + SDPA activation only.
-          - margin: _prefill_transient_margin_bytes covers what the estimate
-            does NOT model -- chiefly the MoE expert-dequant activation spike,
-            the dominant single-step transient on MoE models like glm4.5-air.
+        predicted_peak = current(phys high-water) + estimate(optional) + margin
+          - current: max(active, phys_footprint, recent_peak) -- ALL three are
+            LIVE production signals (the same readings [memcheck:external] and
+            the enforcer use). recent_peak is the enforcer's rolling high-water,
+            so a mid-prefill trough in the instant reading does not mask the
+            real footprint.
+          - estimate: OPTIONAL. memory_monitor.estimate_prefill_peak_bytes models
+            this chunk's KV + SDPA. In production scheduler.memory_monitor is
+            never wired (see estimate-guards-inert finding), so estimate is 0 and
+            the gate is phys+margin only -- which is correct, because at chunk
+            granularity the KV+SDPA term is tiny and the margin dominates anyway.
+          - margin: _prefill_transient_margin_bytes is the real safety mechanism.
+            It covers the un-modelled MoE expert-dequant spike (the dominant
+            single-step transient on glm4.5-air). CRITICALLY it is propagated from
+            the ENFORCER (live), not the memory_monitor (dead), so unlike the
+            estimate this gate's safety actually fires in production. Sized so
+            margin >= worst-case single-step transient (see settings).
 
-        No-op (returns) when the guard is off, the hard limit is unset, the
-        memory_monitor is missing, or the estimate is unavailable (0) -- in
-        every such case the legacy chunk-end check remains the only line of
-        defense, exactly as before this gate existed.
+        Trip point: with estimate~0, the gate fires once current > cap - margin.
+        Functional residual: on a model that fills most of the cap (glm4.5-air,
+        85GB on 128GB), a long prompt is refused cleanly (503-class) once its
+        accumulated KV approaches the headroom -- the correct behaviour (refuse
+        the request, do not crash the box); fit a longer context by using a
+        smaller quant. See MemorySettings.prefill_transient_margin_gb.
 
-        At chunk granularity the KV+SDPA estimate is small, so the margin is
-        the effective trip point (gate fires once current ~> cap - margin).
-        Correctness depends on `current` reflecting the true high-water mark:
-        this iteration runs right after the previous chunk's
-        _sync_and_clear_cache, when mx.get_active_memory() troughs, so the
-        gate leans on get_phys_footprint() + the propagated recent_peak to
-        avoid reading a trough. See MemorySettings.prefill_transient_margin_gb.
+        No-op (returns) only when the guard is off, the hard limit is unset, or
+        chunk_tokens <= 0. NOT a no-op when the monitor/estimate is missing --
+        that is the whole point of being phys-based.
 
         Raises:
             RuntimeError: when the predicted peak exceeds the hard limit.
@@ -1789,16 +1800,22 @@ class Scheduler:
             return
         if self._memory_hard_limit_bytes <= 0:
             return
-        if self.memory_monitor is None:
-            return
         if chunk_tokens <= 0:
             return
 
-        estimate = self.memory_monitor.estimate_prefill_peak_bytes(
-            chunk_tokens, self.config.prefill_step_size
-        )
-        if estimate == 0:
-            return  # can't estimate this model -> leave it to the chunk-end check
+        # Emit the resolved gate state ONCE, before it can matter, so a
+        # mis-propagated margin (the exact silent failure that made the prior
+        # monitor-based gate inert) is visible in the log instead of shipping
+        # blind. See _log_prefill_gate_state.
+        self._log_prefill_gate_state_once()
+
+        # Estimate is OPTIONAL (monitor is unwired in production). Phys reading
+        # + the enforcer-propagated margin carry the guarantee.
+        estimate = 0
+        if self.memory_monitor is not None:
+            estimate = self.memory_monitor.estimate_prefill_peak_bytes(
+                chunk_tokens, self.config.prefill_step_size
+            )
 
         predicted_transient = estimate + self._prefill_transient_margin_bytes
         current = max(
@@ -1832,6 +1849,48 @@ class Scheduler:
                 f"memory ceiling {self._memory_hard_limit_bytes / 1024**3:.1f}GB. "
                 "Reduce context length or increase --max-process-memory."
             )
+
+    def _log_prefill_gate_state_once(self) -> None:
+        """Log the resolved prefill-gate configuration exactly once.
+
+        The prior monitor-based gate shipped INERT and SILENT (its memory_monitor
+        was never wired, so it no-op'd with no signal -- found only on hardware).
+        This makes the resolved state loud, the first time the gate runs, so the
+        one dependency that still matters -- the margin propagated from the
+        enforcer -- is visible instead of shipping blind. A margin of 0 degrades
+        the gate to the bare cap check; that is surfaced as a WARNING, not a
+        silent no-op.
+        """
+        if getattr(self, "_prefill_gate_state_logged", False):
+            return
+        self._prefill_gate_state_logged = True
+
+        estimator_live = False
+        if self.memory_monitor is not None:
+            try:
+                estimator_live = (
+                    self.memory_monitor.estimate_prefill_peak_bytes(
+                        self.config.prefill_step_size,
+                        self.config.prefill_step_size,
+                    )
+                    > 0
+                )
+            except Exception:
+                estimator_live = False
+
+        margin_bytes = self._prefill_transient_margin_bytes
+        emit = logger.warning if margin_bytes <= 0 else logger.info
+        emit(
+            "[memgate] prefill forward gate ACTIVE (phys-based): "
+            "margin=%.1fGB, cap=%.1fGB, model-dim estimator=%s%s",
+            margin_bytes / 1024**3,
+            self._memory_hard_limit_bytes / 1024**3,
+            "active" if estimator_live
+            else "DISABLED (phys+margin only)",
+            "  -- WARNING: margin=0, gate degraded to the bare cap check"
+            if margin_bytes <= 0
+            else "",
+        )
 
     def _do_external_prefill(
         self,
@@ -4633,6 +4692,16 @@ class Scheduler:
     def _preflight_memory_check(self, request: "Request") -> str | None:
         """
         Estimate whether prefill would exceed memory limits.
+
+        NOTE: this guard is monitor-DEPENDENT and therefore INERT in production
+        -- scheduler.memory_monitor is never wired, so estimate==0 and this
+        returns None (no rejection) for every request (see the
+        estimate-guards-inert finding). It is kept for the test-injected-monitor
+        path and as documentation; the live single-request protection is the
+        phys-based _prefill_forward_gate. A phys-only version here would buy
+        nothing: at admission time current is the idle baseline (~weights), well
+        below cap - margin, so it would never reject. Do not mistake this for an
+        active guard.
 
         Computes worst-case peak memory for the last prefill chunk
         (model weights + KV cache + SDPA attention matrix) and rejects

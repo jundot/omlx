@@ -13,6 +13,7 @@ when the predicted peak exceeds the cap the model forward is NOT called --
 on pre-change code (no forward-front gate) the forward WOULD run.
 """
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -174,26 +175,46 @@ class TestPrefillForwardGateUnit:
         )
         _call_gate(s, 256, instant=200 * GB)  # no limit -> never raises
 
-    def test_noop_when_monitor_missing(self):
+    def test_fires_without_monitor_phys_based(self):
+        """THE fix: in production scheduler.memory_monitor is never wired, so
+        the gate must still fire on current(phys) + margin. estimate is treated
+        as 0 and the margin carries the guarantee."""
         s = _gate_scheduler(
             hard_limit=107 * GB,
-            recent_peak=200 * GB,
-            estimate=200 * GB,
+            recent_peak=100 * GB,
+            estimate=0,
             margin=10 * GB,
             monitor=False,
         )
-        _call_gate(s, 256, instant=200 * GB)  # no monitor -> never raises
+        # current 100 + estimate 0 + margin 10 = 110 > cap 107 -> refuse.
+        with pytest.raises(RuntimeError, match="refused before forward"):
+            _call_gate(s, 256, instant=100 * GB)
 
-    def test_noop_when_estimate_zero(self):
-        """estimate==0 means the model can't be estimated -> leave it to the
-        legacy chunk-end check, do not raise here."""
+    def test_passes_without_monitor_when_fits(self):
+        """Phys-based gate does not false-fire: current + margin <= cap passes
+        even with no monitor."""
         s = _gate_scheduler(
             hard_limit=107 * GB,
-            recent_peak=200 * GB,
+            recent_peak=90 * GB,
+            estimate=0,
+            margin=10 * GB,
+            monitor=False,
+        )
+        # current 90 + margin 10 = 100 <= cap 107 -> no raise.
+        _call_gate(s, 256, instant=90 * GB)
+
+    def test_fires_with_zero_estimate_margin_carries(self):
+        """Monitor present but estimate==0 (model can't be dim-estimated): the
+        gate still fires on current + margin -- the margin, not the estimate, is
+        the safety mechanism."""
+        s = _gate_scheduler(
+            hard_limit=107 * GB,
+            recent_peak=100 * GB,
             estimate=0,
             margin=10 * GB,
         )
-        _call_gate(s, 256, instant=200 * GB)  # estimate 0 -> never raises
+        with pytest.raises(RuntimeError, match="refused before forward"):
+            _call_gate(s, 256, instant=100 * GB)
 
     def test_noop_when_chunk_zero(self):
         s = _gate_scheduler(
@@ -353,3 +374,54 @@ class TestForwardGateExternalLoopWiring:
         mock_gate.assert_called_once()
         # Gate raised -> forward must not have run.
         model.assert_not_called()
+
+
+class TestGateStateLog:
+    """_log_prefill_gate_state_once surfaces the resolved gate config loudly --
+    the prior monitor-based gate shipped inert and SILENT, found only on metal."""
+
+    def test_logs_resolved_margin_once(self, caplog):
+        s = _gate_scheduler(
+            hard_limit=107 * GB, recent_peak=0, estimate=2 * GB, margin=12 * GB
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_prefill_gate_state_once()
+            s._log_prefill_gate_state_once()  # second call must be a no-op
+        hits = [
+            r for r in caplog.records
+            if "prefill forward gate ACTIVE" in r.getMessage()
+        ]
+        assert len(hits) == 1
+        msg = hits[0].getMessage()
+        assert "margin=12.0GB" in msg
+        assert "cap=107.0GB" in msg
+        assert "estimator=active" in msg  # monitor returns >0 here
+
+    def test_warns_when_margin_zero(self, caplog):
+        s = _gate_scheduler(
+            hard_limit=107 * GB, recent_peak=0, estimate=2 * GB, margin=0
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_prefill_gate_state_once()
+        rec = [
+            r for r in caplog.records
+            if "prefill forward gate" in r.getMessage()
+        ][0]
+        assert rec.levelno == logging.WARNING
+        assert "margin=0" in rec.getMessage().lower()
+
+    def test_reports_estimator_disabled_without_monitor(self, caplog):
+        s = _gate_scheduler(
+            hard_limit=107 * GB,
+            recent_peak=0,
+            estimate=0,
+            margin=12 * GB,
+            monitor=False,
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_prefill_gate_state_once()
+        rec = [
+            r for r in caplog.records
+            if "prefill forward gate ACTIVE" in r.getMessage()
+        ][0]
+        assert "DISABLED" in rec.getMessage()
