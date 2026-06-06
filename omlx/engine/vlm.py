@@ -758,9 +758,25 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                return vlm_load(
-                    self._model_name, trust_remote_code=self._trust_remote_code
-                )
+                try:
+                    return vlm_load(
+                        self._model_name, trust_remote_code=self._trust_remote_code
+                    )
+                except ValueError as e:
+                    if "parameters not in model" in str(e):
+                        import inspect
+
+                        load_sig = inspect.signature(vlm_load)
+                        if "strict" in load_sig.parameters:
+                            logger.warning(
+                                f"Caught parameter mismatch error. Retrying vlm_load with strict=False. Details: {e}"
+                            )
+                            return vlm_load(
+                                self._model_name,
+                                trust_remote_code=self._trust_remote_code,
+                                strict=False,
+                            )
+                    raise
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
