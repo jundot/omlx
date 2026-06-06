@@ -140,6 +140,51 @@ commit)。
     prefill 的 token-type IDs 丢失导致模型输出整体崩坏 (正文被 thought 垃圾顶掉
     + 幻觉), 纯文本不受影响. self-merge `f940162`.
 
+- **2026-06-05 上游稳定性报告候选核实** -- 不是引入批, 是对
+  `docs/upstream-stability-report.md` 行动清单 16 个候选 SHA 的逐个核实.
+  方法 = `git merge-base --is-ancestor <sha> main`(确定性图可达, 比子代理
+  报告里的 cherry-pick 实测可靠)+ 读 flyto 代码. fork 点 = `9749c40`
+  (2026-05-13), 此前所有 upstream commit 是共同历史 = 已在 flyto.
+  - **已在 flyto, 不重复 pick(12)**:
+    - fork 点前共同历史(10): `1831649` `f3859bd`(C1 kernel panic 降频 --
+      实证 scheduler.py `_should_periodic_clear_cache` 存活, flyto 还增强了
+      `_sync_and_clear_cache` sync-before-clear 和 `_tokens_since_clear_cache`
+      token gate)、`9d742d1` `a3c249b` `cb33a76` `3186780`(C2 dflash
+      无限循环)、`abaa478` `014b17f` `170cec9`(C4 cache corruption)、
+      `69becb3`(dflash-mlx 0.1.5.1).
+    - 已确认 / 已有等价(2): `37c73a0`(memory_guard_tier 重写覆盖, 见上
+      "确认已在" 段)、`60c26b6`(flyto batch_generator.py 已有
+      `mx.eval(logits)` backbone 计时).
+  - **真缺但非稳定性 bug / 取舍 / 优化(4, 2026-06-05 用户全部决定不 pick)**:
+    - `1efb140`: throttle/eviction 阈值放宽(soft_threshold 0.85->0.90,
+      prefill_safe_zone_ratio 0.80->0.89). flyto enforcer 仍旧值. 纯性能
+      调参, 是性能 vs 稳定取舍(放宽 = 更激进用内存, 与 kernel panic 方向
+      相反), 非 bug.
+    - `9aed907`: batch row-wise MTP, 性能特性非 bug. flyto 用
+      `_is_mtp_eligible` 的 `len(uids)==1` 总闸 + extend reconcile, 让
+      batch>=2 一律不用 MTP, 彻底规避了 9aed907 要修的 batch MTP cache
+      corruption -- flyto 不存在那个 bug. 引入 = 给 batch 加 MTP 加速
+      (647 行大改 + 与 flyto MTP patch 栈高冲突).
+    - `e693921`: SSD stale block(#1413). 防 corruption 核心已有(prefix_cache
+      运行时 layer-mismatch 拒绝 + `_read_file_metadata` 格式版本校验), 缺的是
+      startup 按 model-name unlink + reconstruct 命中 mismatch 时物理删 SSD
+      block(优化, 防每请求重复 warning), 非核心.
+    - `fd10281`: custom tier 2GB reserve. dynamic-ceiling 的 custom 特判
+      flyto 已有等价(`_get_dynamic_ceiling`), 缺 reserve 值(8GB vs 2GB)和
+      static-ceiling 特判. custom tier 是 admin 高级选项, 默认 balanced 不
+      触发, 低优.
+  - **决策(2026-06-05 用户拍板)**: 4 个可选项全不 pick. batch MTP(`9aed907`)
+    上游标 experimental 且对齐命中窄, 不值 647 行大改 + 与 flyto MTP 补丁栈高冲突;
+    throttle 放宽(`1efb140`)对 flyto 大内存机收益小且反增 kernel panic 风险;
+    `e693921`/`fd10281` 价值太小. cherry-pick 这摊收尾, 转去运维降 m5max kernel
+    panic 频率(MLX_MAX_OPS_PER_BUFFER / iogpu.wired_limit_mb, 子代理查现状中).
+  - **结论**: 报告(子代理 cherry-pick 实测 16 个全 MISSING)大幅高估了
+    flyto 缺失. 真正 "缺且是稳定性 bug" = 0. cherry-pick 实测被 flyto 后续
+    代码改动干扰而误报; merge-base + 读代码才是可靠核实路径.
+  - **kernel panic 头号痛点的真正抓手 = 运维项**, 非 cherry-pick(降频修复
+    flyto 已全有): `MLX_MAX_OPS_PER_BUFFER` 降到 10-20、`iogpu.wired_limit_mb`
+    sysctl、限上下文、留内存余量.
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |
