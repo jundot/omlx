@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import signal
 import subprocess
@@ -39,6 +38,7 @@ from ..utils.release_check import normalize_update_channel, select_latest_releas
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
@@ -1490,7 +1490,7 @@ async def create_sub_key(
         raise HTTPException(status_code=400, detail=error_msg)
 
     # Check for duplicate (against main key and existing sub keys)
-    if global_settings.auth.api_key and secrets.compare_digest(
+    if global_settings.auth.api_key and compare_keys(
         request.key, global_settings.auth.api_key
     ):
         raise HTTPException(
@@ -1498,7 +1498,7 @@ async def create_sub_key(
         )
 
     for sk in global_settings.auth.sub_keys:
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             raise HTTPException(status_code=400, detail="This key already exists")
 
     entry = SubKeyEntry(
@@ -1540,7 +1540,7 @@ async def delete_sub_key(
 
     # Find and remove the key
     for i, sk in enumerate(global_settings.auth.sub_keys):
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
                 global_settings.save()

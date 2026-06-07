@@ -364,3 +364,92 @@ class TestAdminAuth:
 
         # Empty key
         assert verify_api_key("", server_key) is False
+
+
+class TestNonAsciiApiKeys:
+    """Regression tests for #1717: non-ASCII keys must yield 401, not 500.
+
+    secrets.compare_digest raises TypeError for str arguments containing
+    non-ASCII characters, which surfaced as an unhandled 500 on every
+    authenticated endpoint. compare_keys compares UTF-8 bytes instead.
+    """
+
+    def test_compare_keys_non_ascii_mismatch(self):
+        """Non-ASCII client key against ASCII server key returns False."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("café-key", "secret123") is False
+
+    def test_compare_keys_non_ascii_match(self):
+        """Matching non-ASCII keys compare equal."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("clé-secrète-héhé", "clé-secrète-héhé") is True
+
+    def test_verify_api_key_non_ascii_client_key(self):
+        """verify_api_key must not raise on a non-ASCII client key."""
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("café", "secret123") is False
+
+    def test_verify_api_key_non_ascii_server_key(self):
+        """A configured non-ASCII key compares without raising.
+
+        Function-level only: over HTTP, Starlette decodes header values as
+        latin-1, so a client sending UTF-8 non-ASCII bytes will not match a
+        configured non-ASCII key anyway. The point here is no TypeError.
+        """
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("pässwörd", "pässwörd") is True
+        assert verify_api_key("password", "pässwörd") is False
+
+    def test_compare_keys_lone_surrogate(self):
+        """Lone surrogates (json.loads can produce them) must not raise.
+
+        Strict UTF-8 encoding rejects lone surrogates, which would revive
+        the 500 on any JSON route that compares keys without validating
+        printability first (delete_sub_key).
+        """
+        import json
+
+        from omlx.admin.auth import compare_keys
+
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert compare_keys(surrogate_key, "secret123") is False
+        assert compare_keys("secret123", surrogate_key) is False
+        assert compare_keys(surrogate_key, surrogate_key) is True
+
+    def test_verify_any_api_key_non_ascii_sub_keys(self):
+        """verify_any_api_key must not raise when sub keys are checked."""
+        from omlx.admin.auth import verify_any_api_key
+        from unittest.mock import MagicMock
+
+        sub_key = MagicMock()
+        sub_key.key = "sub-key-1"
+
+        assert verify_any_api_key("café", "main-key", [sub_key]) is False
+        sub_key.key = "clé-única"
+        assert verify_any_api_key("clé-única", "main-key", [sub_key]) is True
+
+    def test_server_dependency_non_ascii_bearer_returns_401(self):
+        """The server auth dependency turns a non-ASCII bearer into 401, not 500."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials="smart-quote-’key’"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=credentials)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key

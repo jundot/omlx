@@ -109,10 +109,35 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         return False
 
 
+def compare_keys(provided_key: str, expected_key: str) -> bool:
+    """Compare two API keys in constant time, tolerating any str input.
+
+    secrets.compare_digest raises TypeError when given str arguments that
+    contain non-ASCII characters, which turns a bad client key into an
+    unhandled 500 instead of a 401. Comparing UTF-8 bytes accepts any
+    input while keeping the constant-time guarantee. surrogatepass covers
+    lone surrogates, which json.loads can produce from escape sequences
+    and which strict UTF-8 encoding rejects.
+
+    Both arguments must be str; None is the caller's responsibility.
+
+    Args:
+        provided_key: The key supplied by the client (untrusted).
+        expected_key: The configured key to compare against.
+
+    Returns:
+        True if the keys match, False otherwise.
+    """
+    return secrets.compare_digest(
+        provided_key.encode("utf-8", "surrogatepass"),
+        expected_key.encode("utf-8", "surrogatepass"),
+    )
+
+
 def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """Verify an API key using constant-time comparison.
 
-    This function uses secrets.compare_digest to prevent timing attacks
+    This function uses constant-time comparison to prevent timing attacks
     when comparing the provided API key with the server's API key.
 
     Args:
@@ -130,7 +155,7 @@ def verify_api_key(api_key: str, server_api_key: str) -> bool:
     """
     if not api_key or not server_api_key:
         return False
-    return secrets.compare_digest(api_key, server_api_key)
+    return compare_keys(api_key, server_api_key)
 
 
 def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
@@ -150,11 +175,11 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     if not api_key:
         return False
     # Check main key
-    if main_key and secrets.compare_digest(api_key, main_key):
+    if main_key and compare_keys(api_key, main_key):
         return True
     # Check sub keys
     for sk in sub_keys:
-        if sk.key and secrets.compare_digest(api_key, sk.key):
+        if sk.key and compare_keys(api_key, sk.key):
             return True
     return False
 
