@@ -5589,6 +5589,10 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _num_admitted_requests(self) -> int:
+        """Return requests already occupying scheduler capacity."""
+        return len(self.running) + len(self.prefilling)
+
     def _preflight_memory_check(self, request: "Request") -> str | None:
         """
         Estimate whether prefill would exceed memory limits.
@@ -5674,15 +5678,19 @@ class Scheduler:
         # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
         batch_specprefill_status: bool | None = None
 
-        while self.waiting and len(self.running) < self.config.max_num_seqs:
+        while (
+            self.waiting
+            and self._num_admitted_requests() < self.config.max_num_seqs
+        ):
             # Admission pause: set by ProcessMemoryEnforcer when phys
             # crosses soft_threshold. New prefills wait; in-flight requests
-            # continue. First request always passes (self.running is empty)
+            # continue. First request always passes (no admitted work yet)
             # so admission can recover by completing the current generation.
-            if self._admission_paused and self.running:
+            admitted = self._num_admitted_requests()
+            if self._admission_paused and admitted:
                 logger.debug(
-                    "Admission paused by memory pressure, %d running",
-                    len(self.running),
+                    "Admission paused by memory pressure, %d admitted",
+                    admitted,
                 )
                 break
 
@@ -5709,23 +5717,23 @@ class Scheduler:
                 )
                 break
 
-            # Generation memory guard: when requests are already running,
+            # Generation memory guard: when requests are already admitted,
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
-            # First request always passes (self.running is empty).
+            # First request always passes (no admitted work yet).
             if (
                 self._prefill_memory_guard
                 and self._memory_limit_bytes > 0
-                and self.running
+                and admitted
             ):
                 current = max(mx.get_active_memory(), get_phys_footprint())
                 if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
+                        "(%s > %s), %d admitted",
                         current,
                         self._memory_limit_bytes,
-                        len(self.running),
+                        admitted,
                     )
                     break
 
