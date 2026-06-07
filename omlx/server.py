@@ -1217,16 +1217,19 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 def get_embedding_max_length(
     model_id: str | None = None,
     request_max_length: int | None = None,
-) -> int:
-    """Get max token length for embedding requests."""
+) -> int | None:
+    """Get max token length for embedding requests.
+
+    Returns ``None`` when neither the request nor the server's
+    ``max_context_window`` pins a limit, so the embedding model resolves its
+    own configured context length (``max_position_embeddings`` / tokenizer
+    ``model_max_length`` in ``MLXEmbeddingModel._resolve_max_length``) instead
+    of re-truncating long-context models at the legacy 512-token cap (#1687).
+    """
     if request_max_length is not None:
         return request_max_length
 
-    max_context_window = get_max_context_window(model_id)
-    if max_context_window is not None:
-        return max_context_window
-
-    return 512
+    return get_max_context_window(model_id)
 
 
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
