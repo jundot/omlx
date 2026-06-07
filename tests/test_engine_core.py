@@ -1194,3 +1194,40 @@ class TestGlobalMLXExecutor:
             f"Expected concurrent execution (max_concurrent >= 2), got {max_concurrent}. "
             f"Per-engine executors should allow parallel step() calls."
         )
+
+
+class TestEngineCoreCloseReleasesSSDManager:
+    """close() must release the SSD cache manager even if shutdown() fails.
+
+    The manager's writer thread holds a strong reference to it, so an unclosed
+    manager (and its hot cache) leaks until restart.
+    """
+
+    def test_manager_closed_when_shutdown_raises(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            scheduler = engine.scheduler
+            manager = MagicMock()
+            scheduler.paged_ssd_cache_manager = manager
+            scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
+
+            engine.close()  # must not raise
+
+            manager.close.assert_called_once()
+            assert scheduler.paged_ssd_cache_manager is None
+
+    def test_manager_closed_on_normal_close(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            scheduler = engine.scheduler
+            manager = MagicMock()
+            scheduler.paged_ssd_cache_manager = manager
+
+            engine.close()
+
+            manager.close.assert_called_once()
+            assert scheduler.paged_ssd_cache_manager is None
