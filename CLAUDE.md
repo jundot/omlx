@@ -38,3 +38,20 @@ Resolution conventions:
 
 ## After taking a side wholesale, prune orphaned tests
 Dropping a feature leaves fork tests that assert now-absent internals (they fail with `AttributeError` on `_SAMPLER_BATCH_*`, `_pending_cache_stores`, etc., or on changed behavior). Confirm a test is fork-only before deleting: `git show origin/main:tests/<file> | grep "def <test>"` (absent = fork-only). The 0.4.0rc1 bump removed 6 fork tests plus the whole fork-only file `tests/test_sampler_batching_patch.py`.
+
+## Bump history & what to expect now
+* `0.3.12 -> 0.4.0rc1`: hard merge, scheduler taken wholesale, 6+1 orphan tests pruned.
+* `0.4.0rc1 -> 0.4.0rc2 -> 0.4.2.dev2 -> 0.4.2.dev3`: **conflict-free** apart from one `modify/delete` (upstream removed `gated_delta_advance.py`). Since we stopped carrying scheduler customizations, the only recurring conflict class is `modify/delete` on patches upstream folds into its mlx-* pins. Expect clean `git merge origin/main` going forward; still run the full suite.
+* Recurring dep churn: `mlx-vlm` git pin bumps almost every release (same `0.x.y` version string, new commit -> always force-reinstall). New runtime deps arrive as plain pip pins (e.g. `markitdown[pdf,docx,pptx]==0.1.6` in dev3) and install via `pip install -e .`.
+
+## Deployment / runtime (this is the live inference backend on the MacBook)
+The repo is also the **running production server** on the M5 Max laptop, not just a checkout. Edits are live (editable install) but the running process only picks them up on restart.
+
+* **Service:** launchd agent `com.omlx.serve` (`~/Library/LaunchAgents/com.omlx.serve.plist`), `KeepAlive=true`, `RunAtLoad=true`, serving `omlx serve --host 0.0.0.0 --port 8000`. Logs: `~/.omlx/logs/omlx-serve.{log,err}`.
+* **Restart after a bump:** `launchctl kickstart -k gui/$(id -u)/com.omlx.serve`, then poll `curl -s http://127.0.0.1:8000/health`. Health reports `default_model` + loaded count (`loaded_count:0` right after restart is normal — models lazy-load on first request).
+* **Kokoro TTS is a SEPARATE server, not part of omlx:** `com.kokoro.tts.serve` on `:8001`, its own Python 3.12 + uvicorn `server:app`, independent of this repo (omlx is `:8000`, Python 3.14). Bumping omlx / mlx-vlm / mlx-audio does NOT touch it. omlx's own audio changes are audio-INPUT (Gemma4 understanding) + its built-in TTS model support (chatterbox etc.), distinct from the standalone Kokoro service.
+
+## Runtime config lives in `~/.omlx/` (NOT the repo)
+* `~/.omlx/settings.json` (server/auth/memory/cache/claude_code) and `~/.omlx/model_settings.json` (per-model settings, managed via the admin page). Models live in `~/.omlx/models/`.
+* **Default model = the `model_settings.json` entry with `is_default:true`** (`get_default_model_id()`); server.py falls back to `available_models[0]` with a `Default model '<x>' not found, using first model` warning if that id isn't discovered. **Gotcha:** when a model is re-downloaded under a new name (oMLX quant-naming changes, e.g. `Qwen3.6-35B-A3B-oQ6` -> `Qwen3.6-35B-A3B`, `...-oQ4` -> `...-6bit`), the stale `is_default` pointer AND `settings.json -> claude_code.{opus,sonnet,haiku}_model` silently break. Fix by repointing to a currently-served id (cross-check against `GET /v1/models`), then restart. Back up the json before editing; the admin write-back can otherwise clobber a live edit.
+* **Admin login uses the API key AS the password** (`auth.api_key` in settings.json; `POST /admin/api/login` compares against it). Shortcut: `GET /admin/auto-login?key=<API_KEY>`. The admin API needs a session cookie, so it can't be driven by curl with just the key — edit the json + restart instead.
