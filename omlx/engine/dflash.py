@@ -181,14 +181,6 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else None
         )
-        # None → disabled (0). Route short-output requests to target-only when
-        # max_new_tokens < threshold and no exact prefix cache hit exists.
-        self._min_output_tokens = (
-            getattr(model_settings, "dflash_min_output_tokens", None)
-            if model_settings
-            else None
-        )
-
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -256,15 +248,6 @@ class DFlashEngine(BaseEngine):
                     "dflash_l2_frontier_stride=%d ignored: installed dflash-mlx does not "
                     "support prefix_cache_l2_frontier_stride; upgrade dflash-mlx to apply",
                     self._l2_frontier_stride,
-                )
-        if self._min_output_tokens is not None:
-            if "dflash_min_output_tokens" in _sig:
-                optional_knobs["dflash_min_output_tokens"] = self._min_output_tokens
-            else:
-                logger.warning(
-                    "dflash_min_output_tokens=%d ignored: installed dflash-mlx does not "
-                    "support dflash_min_output_tokens; upgrade dflash-mlx to apply",
-                    self._min_output_tokens,
                 )
         if self._max_snapshot_tokens is not None:
             if "max_snapshot_tokens" in _sig:
@@ -1298,7 +1281,6 @@ class DFlashEngine(BaseEngine):
             "max_snapshot_tokens": self._max_snapshot_tokens,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
             "l2_frontier_stride": self._l2_frontier_stride,
-            "min_output_tokens": self._min_output_tokens,
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:

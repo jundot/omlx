@@ -1634,6 +1634,7 @@
                     dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
+                    dflash_max_snapshot_tokens: settings.dflash_max_snapshot_tokens ?? null,
                     dflash_ssd_cache: settings.dflash_ssd_cache || false,
                     dflash_ssd_cache_max_gib: settings.dflash_ssd_cache_max_bytes
                         ? Math.round(settings.dflash_ssd_cache_max_bytes / (1024 ** 3))
@@ -1641,6 +1642,7 @@
                     dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
                     dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
+                    dflash_l2_frontier_stride: settings.dflash_l2_frontier_stride ?? null,
                     dflash_compatible: model.dflash_compatible !== false,
                     dflash_compatibility_reason: model.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
@@ -1756,6 +1758,12 @@
                                 dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
                                     : 8 * (1024 ** 3),
+                                dflash_max_snapshot_tokens: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_max_snapshot_tokens !== null
+                                    && this.modelSettings.dflash_max_snapshot_tokens !== undefined
+                                    && this.modelSettings.dflash_max_snapshot_tokens !== ''
+                                    ? Math.max(0, parseInt(this.modelSettings.dflash_max_snapshot_tokens))
+                                    : null,
                                 dflash_ssd_cache: this.modelSettings.dflash_enabled
                                     && !!this.modelSettings.dflash_in_memory_cache
                                     && !!this.modelSettings.dflash_ssd_cache_available
@@ -1776,6 +1784,12 @@
                                     : null,
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
+                                    : null,
+                                dflash_l2_frontier_stride: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_l2_frontier_stride !== null
+                                    && this.modelSettings.dflash_l2_frontier_stride !== undefined
+                                    && this.modelSettings.dflash_l2_frontier_stride !== ''
+                                    ? Math.max(0, parseInt(this.modelSettings.dflash_l2_frontier_stride))
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
@@ -1864,11 +1878,13 @@
                         this.modelSettings.dflash_in_memory_cache = true;
                         this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
+                        this.modelSettings.dflash_max_snapshot_tokens = null;
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.dflash_l2_frontier_stride = null;
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {

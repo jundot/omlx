@@ -31,7 +31,6 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_sink_size is None
         assert settings.dflash_verify_mode is None
         assert settings.dflash_l2_frontier_stride is None
-        assert settings.dflash_min_output_tokens is None
 
     def test_no_speculative_tokens_field(self):
         """dflash_speculative_tokens was removed in v2 and stays removed."""
@@ -61,7 +60,6 @@ class TestDFlashModelSettings:
         assert "dflash_draft_sink_size" not in d
         assert "dflash_verify_mode" not in d
         assert "dflash_l2_frontier_stride" not in d
-        assert "dflash_min_output_tokens" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
@@ -581,7 +579,7 @@ class TestDFlashEngineInit:
         assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
 
 
-    def test_prefix_cache_knobs_default_to_none(self):
+    def test_prefix_cache_knob_defaults_to_none(self):
         """No settings → engine stores None → dflash-mlx fills its own defaults."""
         try:
             from omlx.engine.dflash import DFlashEngine
@@ -593,10 +591,9 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         assert engine._l2_frontier_stride is None
-        assert engine._min_output_tokens is None
 
-    def test_prefix_cache_knobs_read_from_settings(self):
-        """DFlashEngine picks up l2_frontier_stride and min_output_tokens from ModelSettings."""
+    def test_prefix_cache_knob_read_from_settings(self):
+        """DFlashEngine picks up l2_frontier_stride from ModelSettings."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -607,17 +604,15 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
             model_settings=ModelSettings(
                 dflash_l2_frontier_stride=16384,
-                dflash_min_output_tokens=64,
             ),
         )
         assert engine._l2_frontier_stride == 16384
-        assert engine._min_output_tokens == 64
 
-    def test_build_runtime_context_passes_prefix_cache_knobs(self):
-        """l2_frontier_stride and min_output_tokens reach dflash-mlx RuntimeContext.
+    def test_build_runtime_context_passes_prefix_cache_knob(self):
+        """l2_frontier_stride reaches dflash-mlx RuntimeContext.
 
-        When the installed dflash-mlx predates PR3/PR4, the engine must silently
-        ignore the knobs (logging a warning) rather than raising TypeError.
+        When the installed dflash-mlx predates the setting, the engine must
+        ignore it (logging a warning) rather than raising TypeError.
         """
         import inspect
 
@@ -632,7 +627,6 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
             model_settings=ModelSettings(
                 dflash_l2_frontier_stride=16384,
-                dflash_min_output_tokens=32,
             ),
         )
         # Must not raise TypeError regardless of installed dflash-mlx version.
@@ -642,8 +636,6 @@ class TestDFlashEngineInit:
         sig = inspect.signature(runtime_config_from_defaults).parameters
         if "prefix_cache_l2_frontier_stride" in sig:
             assert runtime.prefix_cache_l2_frontier_stride == 16384
-        if "dflash_min_output_tokens" in sig:
-            assert runtime.dflash_min_output_tokens == 32
 
     def test_build_runtime_context_passes_max_snapshot_tokens(self):
         """Long-context L1 admission must be configurable through oMLX."""
@@ -667,8 +659,8 @@ class TestDFlashEngineInit:
         ).parameters:
             assert runtime.max_snapshot_tokens == 65536
 
-    def test_get_stats_exposes_prefix_cache_knobs(self):
-        """get_stats() should include l2_frontier_stride and min_output_tokens."""
+    def test_get_stats_exposes_prefix_cache_knob(self):
+        """get_stats() should include l2_frontier_stride."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -679,12 +671,10 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
             model_settings=ModelSettings(
                 dflash_l2_frontier_stride=16384,
-                dflash_min_output_tokens=64,
             ),
         )
         stats = engine.get_stats()
         assert stats["l2_frontier_stride"] == 16384
-        assert stats["min_output_tokens"] == 64
 
     def test_get_stats_exposes_max_snapshot_tokens(self):
         from omlx.engine.dflash import DFlashEngine
