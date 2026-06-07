@@ -2632,3 +2632,35 @@ class TestInlineLRUUnlinks:
             assert mgr._stats["evict_unlink_failures"] >= 1
         finally:
             mgr.close()
+
+
+class TestSharedHotCacheBudgetClearAllOwners:
+    """clear_all_owners reaches managers the budget still pins (orphaned)."""
+
+    class _FakeOwner:
+        def __init__(self, budget, n):
+            self._budget = budget
+            self._n = n
+            self.cleared = False
+
+        def clear_hot_cache(self):
+            self._budget.forget_owner(self)
+            self.cleared = True
+            return self._n
+
+    def test_clears_every_tracked_owner(self):
+        budget = SharedHotCacheBudget(1 << 20)
+        o1 = self._FakeOwner(budget, 3)
+        o2 = self._FakeOwner(budget, 4)
+        budget.put(o1, b"h1", 100)
+        budget.put(o1, b"h2", 100)
+        budget.put(o2, b"h3", 200)
+
+        cleared = budget.clear_all_owners()
+
+        assert cleared == 7
+        assert o1.cleared and o2.cleared
+        assert len(budget._entries) == 0
+
+    def test_empty_budget_is_noop(self):
+        assert SharedHotCacheBudget(1 << 20).clear_all_owners() == 0

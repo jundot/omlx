@@ -4454,6 +4454,17 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         if rate_tracker is not None:
             rate_tracker.clear()
 
+    # Also clear managers orphaned by an abnormal teardown: they hold live
+    # hot cache but are no longer attached to a loaded scheduler, so the loop
+    # above cannot reach them. The shared budget still references them.
+    pool = _get_engine_pool()
+    budget = getattr(getattr(pool, "_scheduler_config", None), "hot_cache_budget", None)
+    if budget is not None and hasattr(budget, "clear_all_owners"):
+        try:
+            total_cleared += budget.clear_all_owners()
+        except Exception as exc:
+            logger.warning("Failed to clear orphaned hot caches: %s", exc)
+
     # Return the pooled buffers to the OS. On the MLX executor behind a
     # synchronize() barrier so we don't free buffers still in flight (#85,
     # #300), and unconditionally so it still works after every model unload.

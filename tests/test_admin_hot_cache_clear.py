@@ -116,3 +116,31 @@ class TestHotCacheClear:
 
         assert set(result.keys()) == {"status", "total_cleared", "bytes_reclaimed"}
         assert result["status"] == "ok"
+
+
+class TestClearReachesOrphans:
+    """Orphaned hot caches are reached through the shared budget."""
+
+    def test_clears_orphan_via_budget_with_no_model_loaded(self):
+        orphan_clear = MagicMock(return_value=5)
+        pool = _pool(models=[])
+        pool._scheduler_config = SimpleNamespace(
+            hot_cache_budget=SimpleNamespace(clear_all_owners=orphan_clear)
+        )
+        with _reclaim_env(), patch.object(
+            admin_routes, "_get_engine_pool", return_value=pool
+        ):
+            result = _run_clear()
+
+        assert orphan_clear.called
+        assert result["total_cleared"] == 5
+
+    def test_no_budget_is_tolerated(self):
+        pool = _pool(models=[])
+        pool._scheduler_config = SimpleNamespace(hot_cache_budget=None)
+        with _reclaim_env(), patch.object(
+            admin_routes, "_get_engine_pool", return_value=pool
+        ):
+            result = _run_clear()
+
+        assert result["total_cleared"] == 0
