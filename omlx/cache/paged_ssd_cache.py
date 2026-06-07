@@ -693,6 +693,38 @@ class SharedHotCacheBudget:
                 entry = self._entries.pop(key)
                 self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
 
+    def clear_all_owners(self) -> int:
+        """Clear the hot cache of every manager the budget still references.
+
+        The budget keeps a strong reference to each owning manager, so a
+        manager orphaned by an abnormal teardown stays reachable here even
+        when it is no longer attached to a loaded scheduler. Snapshot the
+        owners under the lock, then clear outside it (clear_hot_cache calls
+        forget_owner, which re-takes the lock).
+        """
+        with self._lock:
+            owners = []
+            seen = set()
+            for entry in self._entries.values():
+                if id(entry.owner) not in seen:
+                    seen.add(id(entry.owner))
+                    owners.append(entry.owner)
+        cleared = 0
+        for owner in owners:
+            fn = getattr(owner, "clear_hot_cache", None)
+            if callable(fn):
+                try:
+                    cleared += fn()
+                except Exception:
+                    # Keep going for the other owners, but do not hide the
+                    # failure: a silently-swallowed error makes admin recovery
+                    # look successful while memory is still pinned.
+                    logger.warning(
+                        "clear_hot_cache failed for an orphaned owner",
+                        exc_info=True,
+                    )
+        return cleared
+
     def put(
         self, owner: Any, block_hash: bytes, size_bytes: int
     ) -> list[tuple[Any, bytes]]:
