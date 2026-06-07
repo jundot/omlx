@@ -121,9 +121,13 @@ def test_batch_tq_decode_appends():
 
 def test_batch_tq_merge_extract():
     c1 = TurboQuantKVCache(bits=4.0)
-    c1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
+    c1.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
     c2 = TurboQuantKVCache(bits=4.0)
-    c2.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
+    c2.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
     mx.eval(c1.keys, c1.values, c2.keys, c2.values)
 
     batch = BatchTurboQuantKVCache.merge([c1, c2])
@@ -161,6 +165,7 @@ def test_batch_tq_merge_preserves_empty_rows():
 
 def test_batch_tq_extend_preserves_empty_rows():
     """Regression: extend() can mix initialized and empty batch rows."""
+
     def full_batch():
         full = BatchTurboQuantKVCache.merge([TurboQuantKVCache(bits=4.0)])
         full.update_and_fetch(
@@ -193,14 +198,36 @@ def test_batch_tq_extend_preserves_empty_rows():
         )
 
 
+def test_batch_tq_extend_rejects_plain_batch_cache():
+    """Regression guard for mixed BatchKVCache/BatchTurboQuantKVCache states."""
+    left = BatchTurboQuantKVCache([0], bits=4.0)
+    plain = object()
+
+    with pytest.raises(TypeError, match="BatchTurboQuantKVCache"):
+        left.extend(plain)  # type: ignore[arg-type]
+
+
+def test_batch_tq_merge_rejects_plain_cache_entries():
+    with pytest.raises(TypeError, match="TurboQuantKVCache"):
+        BatchTurboQuantKVCache.merge([object()])  # type: ignore[list-item]
+
+
 def test_batch_tq_continuous_batching_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
-    b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
-    b1.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
+    b1.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
+    b1.update_and_fetch(
+        mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32))
+    )
 
     b2 = BatchTurboQuantKVCache([0], bits=4.0)
-    b2.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
-    b2.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
+    b2.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    b2.update_and_fetch(
+        mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32))
+    )
 
     b1.extend(b2)
 
@@ -227,7 +254,7 @@ def test_batch_make_mask_matches_fp16_left_padding():
     bt = BatchTurboQuantKVCache(lp, bits=8.0)
     bt.update_and_fetch(K, V)
 
-    ref = bk.make_mask(1, return_array=True)        # decode-step mask
+    ref = bk.make_mask(1, return_array=True)  # decode-step mask
     got = bt.make_mask(1, return_array=True)
     assert mx.array_equal(ref, got).item(), (
         "B>1 make_mask diverges from BatchKVCache for left-padding "
@@ -247,10 +274,14 @@ def test_batch_tq_filter():
 
 def test_batch_tq_extend():
     b1 = BatchTurboQuantKVCache([0], bits=4.0)
-    b1.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
+    b1.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
 
     b2 = BatchTurboQuantKVCache([0], bits=4.0)
-    b2.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
+    b2.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
 
     b1.extend(b2)
     assert b1.keys.norms.shape[0] == 2
@@ -258,8 +289,12 @@ def test_batch_tq_extend():
 
 def test_batch_tq_dequantize():
     batch = BatchTurboQuantKVCache([0], bits=4.0)
-    batch.update_and_fetch(mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32)))
-    batch.update_and_fetch(mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32)))
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, 1, 32)), mx.random.normal((1, 2, 1, 32))
+    )
     dk, dv = batch.dequantize()
     assert dk.shape[2] == 9
     assert dv.shape[2] == 9
@@ -279,7 +314,9 @@ def test_batch_tq_state_property():
 
 def test_batch_tq_meta_state_round_trip():
     batch = BatchTurboQuantKVCache([0], bits=3.5, seed=42)
-    batch.update_and_fetch(mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32)))
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
 
     ms = batch.meta_state
     batch2 = BatchTurboQuantKVCache([0], bits=4.0)
@@ -464,8 +501,8 @@ def test_from_cache_merge_builds_working_batch():
     # Exactly what mlx-lm _merge_caches() does for one layer.
     batch = per_request[0].merge(per_request)
     assert isinstance(batch, BatchTurboQuantKVCache)
-    assert batch.left_padding.tolist() == [0, 4]   # request 1 left-padded
-    assert batch.offset.tolist() == [8, 4]         # per-request valid lengths
+    assert batch.left_padding.tolist() == [0, 4]  # request 1 left-padded
+    assert batch.offset.tolist() == [8, 4]  # per-request valid lengths
 
     # A decode step + the real attention path the model uses: update_and_fetch
     # returns correctly-sliced state proxies (NOT the full reserved buffer),
@@ -474,7 +511,7 @@ def test_from_cache_merge_builds_working_batch():
         mx.random.normal((2, 2, 1, 32)),
         mx.random.normal((2, 2, 1, 32)),
     )
-    assert batch.offset.tolist() == [9, 5]         # both requests advanced by 1
+    assert batch.offset.tolist() == [9, 5]  # both requests advanced by 1
     out = batch.decode_attention(
         mx.random.normal((2, 2, 1, 32)),
         keys_state=ks,
@@ -483,7 +520,7 @@ def test_from_cache_merge_builds_working_batch():
         mask=batch.make_mask(1, return_array=True),
     )
     mx.eval(out)
-    assert out.shape == (2, 2, 1, 32)              # (B, n_q_heads, 1, D)
+    assert out.shape == (2, 2, 1, 32)  # (B, n_q_heads, 1, D)
 
 
 def test_decode_single_token_quantize_is_accurate():
@@ -551,7 +588,9 @@ def test_batch_masked_decode_is_accurate():
     t_len = dk.shape[2]
     mask = mx.ones((2, 1, 1, t_len), dtype=mx.bool_)
 
-    out = mlx_base.scaled_dot_product_attention(q, ks, vs, batch, scale=32**-0.5, mask=mask)
+    out = mlx_base.scaled_dot_product_attention(
+        q, ks, vs, batch, scale=32**-0.5, mask=mask
+    )
     ref = mx.fast.scaled_dot_product_attention(
         q, dk.astype(q.dtype), dv.astype(q.dtype), scale=32**-0.5, mask=mask
     )
@@ -559,4 +598,6 @@ def test_batch_masked_decode_is_accurate():
     rel = mx.mean(mx.abs(out - ref)).item() / mx.mean(mx.abs(ref)).item()
     # 8-bit quantized masked decode vs dequantize+SDPA over the same states.
     # Broken RHT kernels give ~140%; the fix brings it into quantization noise.
-    assert rel < 0.05, f"B>1 masked decode inaccurate (err {rel:.1%}) — RHT fix missing from pinned mlx-vlm?"
+    assert (
+        rel < 0.05
+    ), f"B>1 masked decode inaccurate (err {rel:.1%}) — RHT fix missing from pinned mlx-vlm?"

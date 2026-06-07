@@ -132,6 +132,28 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_lfm2_text_model_is_llm(self, tmp_path):
+        """LFM2 text checkpoints share model_type with non-text variants."""
+        llm_dir = tmp_path / "LFM2-1.2B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
+    def test_detect_lfm2_5_moe_text_model_is_llm(self, tmp_path):
+        """LiquidAI/LFM2.5-8B-A1B is a text-generation MoE LLM."""
+        llm_dir = tmp_path / "LFM2.5-8B-A1B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"

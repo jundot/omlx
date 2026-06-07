@@ -256,6 +256,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Sampling defaults
     sampling_max_context_window: int | None = None
+    sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
     sampling_max_tokens: int | None = None
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
@@ -842,6 +843,8 @@ async def _apply_cache_settings_runtime(
 
 def _apply_sampling_settings_runtime(
     max_context_window: int | None,
+    max_context_window_policy: int | None,
+    max_context_window_policy_set: bool,
     max_tokens: int | None,
     temperature: float | None,
     top_p: float | None,
@@ -863,6 +866,10 @@ def _apply_sampling_settings_runtime(
     if max_context_window is not None:
         _server_state.sampling.max_context_window = max_context_window
         changes.append(f"max_context_window={max_context_window}")
+
+    if max_context_window_policy_set:
+        _server_state.sampling.max_context_window_policy = max_context_window_policy
+        changes.append(f"max_context_window_policy={max_context_window_policy}")
 
     if max_tokens is not None:
         _server_state.sampling.max_tokens = max_tokens
@@ -2902,6 +2909,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "sampling": {
             "max_context_window": global_settings.sampling.max_context_window,
+            "max_context_window_policy": (
+                global_settings.sampling.max_context_window_policy
+            ),
             "max_tokens": global_settings.sampling.max_tokens,
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
@@ -3287,6 +3297,11 @@ async def update_global_settings(
             request.sampling_max_context_window
         )
         sampling_changed = True
+    if "sampling_max_context_window_policy" in request.model_fields_set:
+        global_settings.sampling.max_context_window_policy = (
+            request.sampling_max_context_window_policy
+        )
+        sampling_changed = True
     if request.sampling_max_tokens is not None:
         global_settings.sampling.max_tokens = request.sampling_max_tokens
         sampling_changed = True
@@ -3308,6 +3323,8 @@ async def update_global_settings(
     if sampling_changed:
         success, msg = _apply_sampling_settings_runtime(
             request.sampling_max_context_window,
+            request.sampling_max_context_window_policy,
+            "sampling_max_context_window_policy" in request.model_fields_set,
             request.sampling_max_tokens,
             request.sampling_temperature,
             request.sampling_top_p,

@@ -14,6 +14,7 @@ The scheduler follows vLLM's design with:
 import concurrent.futures
 import copy
 import gc
+import importlib
 import logging
 import os
 import threading
@@ -34,7 +35,11 @@ from mlx_lm.generate import (
     SequenceStateMachine,
     generation_stream,
 )
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache as _MLXKVCache,
+    RotatingKVCache as _MLXRotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.sample_utils import make_logits_processors
 
 from .cache.observability import CacheRateTracker
@@ -400,6 +405,173 @@ except ImportError:
     pass
 
 
+# Regular singleton KV caches are already the fastest decode representation.
+# mlx-lm's default _merge_caches([cache]) turns them into BatchKVCache even
+# when there is only one active row, which slows text-only VLM decode. Install
+# the minimal BatchGenerator methods needed while the row count remains one;
+# _patched_extend_cache converts them back to batched caches before a second
+# row is appended.
+def _batch_indices_len(batch_indices: Any) -> int:
+    try:
+        return len(batch_indices)
+    except TypeError:
+        return int(getattr(batch_indices, "shape", (0,))[0] or 0)
+
+
+def _regular_kv_filter_singleton(self, batch_indices):
+    n = _batch_indices_len(batch_indices)
+    if n == 0:
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        return
+    if n == 1:
+        return
+    raise NotImplementedError(
+        f"{type(self).__name__}.filter only supports singleton pass-through; "
+        "convert to a batched cache before keeping multiple rows."
+    )
+
+
+def _regular_rotating_kv_filter_singleton(self, batch_indices):
+    n = _batch_indices_len(batch_indices)
+    if n == 0:
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._idx = 0
+        return
+    if n == 1:
+        return
+    raise NotImplementedError(
+        f"{type(self).__name__}.filter only supports singleton pass-through; "
+        "convert to a batched cache before keeping multiple rows."
+    )
+
+
+def _regular_cache_extract_singleton(self, idx: int):
+    if int(idx) != 0:
+        raise IndexError(f"{type(self).__name__} singleton cache only has row 0")
+    return self
+
+
+def _regular_cache_extend_singleton(self, other):
+    raise NotImplementedError(
+        f"{type(self).__name__}.extend requires batched conversion first"
+    )
+
+
+if not hasattr(_MLXKVCache, "filter"):
+    _MLXKVCache.filter = _regular_kv_filter_singleton
+if not hasattr(_MLXKVCache, "extract"):
+    _MLXKVCache.extract = _regular_cache_extract_singleton
+if not hasattr(_MLXKVCache, "extend"):
+    _MLXKVCache.extend = _regular_cache_extend_singleton
+
+if not hasattr(_MLXRotatingKVCache, "filter"):
+    _MLXRotatingKVCache.filter = _regular_rotating_kv_filter_singleton
+if not hasattr(_MLXRotatingKVCache, "extract"):
+    _MLXRotatingKVCache.extract = _regular_cache_extract_singleton
+if not hasattr(_MLXRotatingKVCache, "extend"):
+    _MLXRotatingKVCache.extend = _regular_cache_extend_singleton
+
+_mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
+_original_merge_caches = _mlx_lm_generate_module._merge_caches
+_original_ppb_split = PromptProcessingBatch.split
+_REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
+
+
+def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
+    sub_caches = getattr(cache_obj, "caches", None)
+    if isinstance(sub_caches, (list, tuple)):
+        return all(_cache_layer_supports_singleton_passthrough(c) for c in sub_caches)
+    return hasattr(cache_obj, "filter") and hasattr(cache_obj, "extract")
+
+
+def _to_batched_cache_layer(cache_obj: Any) -> Any:
+    sub_caches = getattr(cache_obj, "caches", None)
+    if isinstance(sub_caches, (list, tuple)):
+        converted = tuple(_to_batched_cache_layer(c) for c in sub_caches)
+        if all(a is b for a, b in zip(sub_caches, converted)):
+            return cache_obj
+        return type(cache_obj)(*converted)
+    if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
+        return cache_obj.merge([cache_obj])
+    return cache_obj
+
+
+def _extend_cache_layer(cache_a: Any, cache_b: Any) -> Any:
+    sub_a = getattr(cache_a, "caches", None)
+    sub_b = getattr(cache_b, "caches", None)
+    if isinstance(sub_a, (list, tuple)) and isinstance(sub_b, (list, tuple)):
+        cache_a.caches = tuple(
+            _extend_cache_layer(ca, cb) for ca, cb in zip(sub_a, sub_b)
+        )
+        return cache_a
+
+    cache_a = _to_batched_cache_layer(cache_a)
+    cache_b = _to_batched_cache_layer(cache_b)
+    cache_a.extend(cache_b)
+    return cache_a
+
+
+def _patched_merge_caches(caches):
+    if not caches:
+        return []
+    if len(caches) == 1:
+        merged = []
+        for layer_cache in caches[0]:
+            if _cache_layer_supports_singleton_passthrough(layer_cache):
+                merged.append(layer_cache)
+            elif hasattr(layer_cache, "merge"):
+                merged.append(layer_cache.merge([layer_cache]))
+            else:
+                raise ValueError(
+                    f"{type(layer_cache)} does not yet support batching with history"
+                )
+        return merged
+    return _original_merge_caches(caches)
+
+
+def _patched_extend_cache(cache_a, cache_b):
+    if not cache_a:
+        return cache_b
+    if not cache_b:
+        return cache_a
+    return [_extend_cache_layer(ca, cb) for ca, cb in zip(cache_a, cache_b)]
+
+
+def _patched_ppb_split(self, indices):
+    sorted_indices = sorted(indices)
+    if sorted_indices and sorted_indices == list(range(len(self.uids))):
+        new_batch = self.__class__.__new__(self.__class__)
+        new_batch.model = self.model
+        new_batch.uids = self.uids
+        new_batch.prompt_cache = self.prompt_cache
+        new_batch.tokens = self.tokens
+        new_batch.prefill_step_size = self.prefill_step_size
+        new_batch.samplers = self.samplers
+        new_batch.fallback_sampler = self.fallback_sampler
+        new_batch.logits_processors = self.logits_processors
+        new_batch.state_machines = self.state_machines
+        new_batch.max_tokens = self.max_tokens
+
+        self.uids = []
+        self.prompt_cache = []
+        self.tokens = []
+        self.samplers = []
+        self.logits_processors = []
+        self.state_machines = []
+        self.max_tokens = []
+        return new_batch
+    return _original_ppb_split(self, indices)
+
+
+_mlx_lm_generate_module._merge_caches = _patched_merge_caches
+_mlx_lm_generate_module._extend_cache = _patched_extend_cache
+PromptProcessingBatch.split = _patched_ppb_split
+
+
 # Monkey-patch ChunkedKVCache for Llama-4 (Scout / Maverick): mlx_lm's
 # ChunkedKVCache lacks the batch-aware methods (`merge`, `filter`, `extract`,
 # `size`, `extend`) that BatchGenerator's continuous-batching code path
@@ -564,6 +736,14 @@ def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     return False
 
 
+def _batch_generator_all_tokens(request: Any) -> list[int]:
+    """Seed tokens for mlx-lm's TokenBuffer before the kickoff token."""
+    token_ids = getattr(request, "prompt_token_ids", None)
+    if token_ids is None:
+        return []
+    return list(token_ids[:-1])
+
+
 def _cache_layer_token_count(cache_obj: Any) -> int:
     """Return the number of tokens stored in a single cache layer."""
     sub_caches = getattr(cache_obj, "caches", None)
@@ -592,6 +772,16 @@ def _cache_base_sizes(caches: list[Any]) -> int:
         return max(_cache_layer_token_count(c) for c in caches)
     except Exception:
         return 0
+
+
+def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> None:
+    """Seed zero mRoPE delta after clearing text-only cached-prefix state."""
+    if getattr(request, "cached_tokens", 0) <= 0:
+        return
+    lm = getattr(model, "_language_model", None)
+    if lm is None or not hasattr(lm, "_rope_deltas"):
+        return
+    lm._rope_deltas = mx.zeros((1, 1), dtype=mx.int64)
 
 
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
@@ -2047,6 +2237,7 @@ class Scheduler:
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
+            _seed_text_only_mrope_delta_for_cached_prefill(self.model, request)
 
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
@@ -2269,6 +2460,19 @@ class Scheduler:
                     f"{total_length} tokens: "
                     f"{len(abort_uids)} request(s) aborted"
                 )
+                if vlm_embeds is not None and _saved_rope_deltas is not None:
+                    self.model._language_model._rope_deltas = _saved_rope_deltas
+                request._prefill_saved_rope_deltas = None
+
+                # Drop partial-prefill references before clearing the Metal pool.
+                # Otherwise the traceback frame can keep large KV/cache arrays
+                # alive until after the abort handler returns.
+                input_arr = None
+                embeds_array = None
+                extra_kwargs = None
+                model_kwargs = {}
+                prompt_cache = None
+                _sync_and_clear_cache(self._stream)
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
@@ -2722,6 +2926,7 @@ class Scheduler:
         """
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
+            _seed_text_only_mrope_delta_for_cached_prefill(self.model, request)
 
         prompt_cache = (
             existing_cache
@@ -2956,6 +3161,7 @@ class Scheduler:
             [state.last_token],
             max_tokens=[request.sampling_params.max_tokens],
             caches=[state.cache] if state.cache else None,
+            all_tokens=[_batch_generator_all_tokens(request)],
             samplers=[state.sampler],
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
@@ -3030,6 +3236,7 @@ class Scheduler:
                 # Request aborted mid-chunk. Discard state; the abort will
                 # be fully processed by _process_pending_aborts() next step.
                 self._prefill_states.pop(rid, None)
+                _sync_and_clear_cache(self._stream)
                 continue
             except _PrefillEvictionNeeded as e:
                 self._pending_prefill_eviction_request = e.request
@@ -5121,6 +5328,24 @@ class Scheduler:
             request_id = self._pending_abort_ids.pop()
             self._do_abort_request(request_id)
 
+    def _cleanup_prefill_abort_request(
+        self, request: "Request", temp_uid: int | None = None
+    ) -> None:
+        """Finish cleanup for a request aborted while it was being prefetched.
+
+        External prefill removes the request from ``waiting`` before it has a
+        real BatchGenerator UID. If a client abort arrives at that point, the
+        normal next-step deferred abort can be stranded because ``has_requests``
+        no longer sees queued work. Finish it synchronously on the scheduler
+        thread instead.
+        """
+        if temp_uid is not None:
+            self.uid_to_request_id.pop(temp_uid, None)
+            self.request_id_to_uid.pop(request.request_id, None)
+
+        self._pending_abort_ids.discard(request.request_id)
+        self._do_abort_request(request.request_id)
+
     def request_idle_reclaim(self) -> None:
         """Enqueue a between-turn Metal reclaim (thread-safe, no Metal touch).
 
@@ -5846,7 +6071,13 @@ class Scheduler:
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
                     tracker.remove(request.request_id)
-                    raise
+                    sp_cache = None
+                    sys_arr = None
+                    conv_tokens = None
+                    selected = None
+                    _sync_and_clear_cache(self._stream)
+                    self._cleanup_prefill_abort_request(request)
+                    continue
                 except Exception as e:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
@@ -5886,7 +6117,9 @@ class Scheduler:
                     try:
                         done = self._step_prefill_chunk(state)
                     except _PrefillAbortedError:
-                        raise
+                        _sync_and_clear_cache(self._stream)
+                        self._cleanup_prefill_abort_request(request)
+                        continue
                     except _PrefillEvictionNeeded as e:
                         self._release_paged_cache_for_request(request.request_id)
                         self._pause_for_prefill_eviction(
@@ -5950,6 +6183,9 @@ class Scheduler:
                         cache_to_use,
                         vlm_embeds=vlm_embeds,
                     )
+                except _PrefillAbortedError:
+                    self._cleanup_prefill_abort_request(request, temp_uid=temp_uid)
+                    continue
                 except _PrefillEvictionNeeded as e:
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
@@ -6069,6 +6305,7 @@ class Scheduler:
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
+                all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[sampler],
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
@@ -7432,6 +7669,7 @@ class Scheduler:
                 hot_cache_budget=self.config.hot_cache_budget,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
+                expected_block_size=self.config.paged_cache_block_size,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

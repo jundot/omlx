@@ -983,3 +983,14 @@ class TestGlobalSettingsValidation:
     def test_idle_timeout_accepts_valid_value(self):
         req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
         assert req.idle_timeout_seconds == 1800
+
+    def test_context_window_policy_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(sampling_max_context_window_policy=-1)
+
+    def test_context_window_policy_accepts_null(self):
+        req = admin_routes.GlobalSettingsRequest(
+            sampling_max_context_window_policy=None
+        )
+        assert req.sampling_max_context_window_policy is None
+        assert "sampling_max_context_window_policy" in req.model_fields_set

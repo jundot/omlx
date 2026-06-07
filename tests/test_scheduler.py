@@ -31,6 +31,7 @@ from omlx.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
     SchedulingPolicy,
+    _PrefillState,
     _StoreCacheGate,
 )
 
@@ -697,6 +698,69 @@ class TestPrefillAbortInterrupt:
         result = scheduler._check_pending_aborts_for_uids([0])
         assert result == []
 
+    def test_external_prefill_abort_reclaims_metal_before_raise(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aborted external prefill must clear transients before unwinding."""
+        from omlx.scheduler import _PrefillAbortedError
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=2),
+        )
+        request = Request(
+            request_id="req-prefill-abort",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        cache = [SimpleNamespace(state=mx.array([0]))]
+
+        uid = 42
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        scheduler._pending_abort_ids.add(request.request_id)
+
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache:
+            with pytest.raises(_PrefillAbortedError):
+                scheduler._do_external_prefill(
+                    request,
+                    request.prompt_token_ids,
+                    cache,
+                )
+
+        clear_cache.assert_called_once_with(scheduler._stream)
+        assert request._prefill_saved_rope_deltas is None
+
+    def test_prefill_abort_cleanup_removes_temp_uid_and_pending_abort(
+        self, mock_model, mock_tokenizer
+    ):
+        """Schedule-time prefill aborts must not leave orphan scheduler state."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-clean-prefill-abort",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        scheduler.requests[request.request_id] = request
+
+        temp_uid = id(request)
+        scheduler.request_id_to_uid[request.request_id] = temp_uid
+        scheduler.uid_to_request_id[temp_uid] = request.request_id
+        scheduler._pending_abort_ids.add(request.request_id)
+
+        scheduler._cleanup_prefill_abort_request(request, temp_uid=temp_uid)
+
+        assert request.status == RequestStatus.FINISHED_ABORTED
+        assert request.request_id not in scheduler.requests
+        assert request.request_id not in scheduler.request_id_to_uid
+        assert temp_uid not in scheduler.uid_to_request_id
+        assert request.request_id not in scheduler._pending_abort_ids
+
     def test_prefill_aborted_error_resets_batch_generator(
         self, mock_model, mock_tokenizer
     ):
@@ -969,7 +1033,10 @@ class TestSchedulerStopTokens:
         """When eot_token_id is absent but eot_token string is present, encode it."""
         mock_tokenizer.eot_token = "<turn|>"
         # Ensure eot_token_id is NOT present
-        assert not hasattr(mock_tokenizer, "eot_token_id") or mock_tokenizer.eot_token_id is None
+        assert (
+            not hasattr(mock_tokenizer, "eot_token_id")
+            or mock_tokenizer.eot_token_id is None
+        )
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         stop_tokens = scheduler._get_stop_tokens()
         # The MockTokenizer.encode() returns hash-based IDs, so we get something
@@ -2471,6 +2538,175 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler.batch_generator.remove.assert_called_once_with([2])
 
 
+class TestBatchGeneratorAllTokens:
+    """TokenBuffer seed passed to mlx-lm BatchGenerator.insert."""
+
+    def _make_scheduler(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+        scheduler._validate_cache = MagicMock(return_value=True)
+        return scheduler
+
+    def _queue_request(
+        self,
+        scheduler: Scheduler,
+        request: Request,
+        *,
+        prompt_tokens: list[int],
+        remaining_tokens: list[int],
+        cached_tokens: int = 0,
+        prompt_cache=None,
+    ) -> None:
+        request.prompt_token_ids = prompt_tokens
+        request.num_prompt_tokens = len(prompt_tokens)
+        request.remaining_tokens = remaining_tokens
+        request.cached_tokens = cached_tokens
+        request.prompt_cache = prompt_cache
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+    def test_cache_hit_insert_seeds_prompt_prefix(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            request_id="req-cache-hit-all-tokens",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        self._queue_request(
+            scheduler,
+            request,
+            prompt_tokens=[11, 12, 13, 14],
+            remaining_tokens=[14],
+            cached_tokens=3,
+            prompt_cache=[MagicMock()],
+        )
+
+        scheduler._schedule_waiting()
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        assert call_kwargs["all_tokens"] == [[11, 12, 13]]
+
+    def test_external_prefill_insert_seeds_prompt_prefix(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._do_external_prefill = MagicMock(return_value=([MagicMock()], [14]))
+        request = Request(
+            request_id="req-prefill-all-tokens",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        self._queue_request(
+            scheduler,
+            request,
+            prompt_tokens=[11, 12, 13, 14],
+            remaining_tokens=[11, 12, 13, 14],
+        )
+
+        scheduler._schedule_waiting()
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        assert call_kwargs["all_tokens"] == [[11, 12, 13]]
+
+    def test_single_token_prompt_uses_empty_seed(self, mock_model, mock_tokenizer):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            request_id="req-single-token-all-tokens",
+            prompt=[99],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        self._queue_request(
+            scheduler,
+            request,
+            prompt_tokens=[99],
+            remaining_tokens=[99],
+        )
+
+        scheduler._schedule_waiting()
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        assert call_kwargs["all_tokens"] == [[]]
+
+    def test_concurrent_inserts_keep_per_request_seed(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        first = Request(
+            request_id="req-concurrent-a",
+            prompt=[11, 12, 13],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        second = Request(
+            request_id="req-concurrent-b",
+            prompt=[21, 22, 23, 24],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        self._queue_request(
+            scheduler,
+            first,
+            prompt_tokens=[11, 12, 13],
+            remaining_tokens=[13],
+            prompt_cache=[MagicMock()],
+        )
+        self._queue_request(
+            scheduler,
+            second,
+            prompt_tokens=[21, 22, 23, 24],
+            remaining_tokens=[24],
+            prompt_cache=[MagicMock()],
+        )
+
+        scheduler._schedule_waiting()
+
+        calls = scheduler.batch_generator.insert.call_args_list
+        assert [call.kwargs["all_tokens"] for call in calls] == [
+            [[11, 12]],
+            [[21, 22, 23]],
+        ]
+
+    def test_chunked_prefill_insert_seeds_prompt_prefix(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            request_id="req-chunked-all-tokens",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14]
+        request.num_prompt_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[MagicMock()],
+            tokens_remaining=mx.array([[]]),
+            last_token=[14],
+            tokens_processed=3,
+            base_size=0,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=4,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        assert call_kwargs["all_tokens"] == [[11, 12, 13]]
+        assert scheduled == [request]
+
+
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
 
@@ -2792,6 +3028,34 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+    def test_cached_text_only_prefill_seeds_zero_mrope_delta(self, mock_tokenizer):
+        """Cached text-only mRoPE suffixes must start at the restored offset."""
+        model = self._make_vlm_model()
+        model._language_model = MagicMock()
+        model._language_model._rope_deltas = mx.array([[123]])
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="text-cached-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.cached_tokens = 2048
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=[1, 2, 3, 4],
+            existing_cache=[],
+            vlm_embeds=None,
+        )
+
+        model.clear_vlm_position_state.assert_called_once()
+        seeded = model._language_model._rope_deltas
+        assert seeded.shape == (1, 1)
+        assert seeded.item() == 0
 
 
 class TestSchedulerPrefillBudget:

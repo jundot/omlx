@@ -11,7 +11,7 @@
 //                        dashboard in the browser via /admin/auto-login)
 //   • Chat with oMLX    (enabled when running — opens /admin/chat in browser)
 //   • Settings…         (Cmd-, — opens the SwiftUI AppView window via the
-//                        openAppView callback)
+//                        openAppView callback; available even when stopped)
 //   • About oMLX
 //   • Quit oMLX       (Cmd-Q)
 //
@@ -312,12 +312,13 @@ final class MenubarController: NSObject {
         startItem.isEnabled = (server != nil) && !liveLike
         stopItem.isEnabled = liveLike && !isStopping
 
-        // Settings + Web Dashboard + Chat enabled when actually running
-        // (not unresponsive). Web Dashboard / Chat open a browser against
-        // the live port, so there's no point enabling them when stopped.
-        adminPanelItem.isEnabled = isRunning
-        webAdminItem.isEnabled = isRunning
-        chatItem.isEnabled = isRunning
+        // Native Settings is the recovery surface for stopped/failed servers.
+        // Web Dashboard / Chat open browser URLs against the live port, so
+        // they stay gated on a healthy running server.
+        let availability = MenubarController.menuAvailability(for: state)
+        adminPanelItem.isEnabled = availability.settings
+        webAdminItem.isEnabled = availability.webDashboard
+        chatItem.isEnabled = availability.chat
 
         refreshUpdateMenuItem()
 
@@ -775,6 +776,26 @@ final class MenubarController: NSObject {
 // MARK: - Live endpoint resolution
 
 extension MenubarController {
+    struct MenuAvailability: Equatable {
+        let settings: Bool
+        let webDashboard: Bool
+        let chat: Bool
+    }
+
+    static func menuAvailability(for state: ServerProcess.State) -> MenuAvailability {
+        let browserItemsEnabled: Bool
+        if case .running = state {
+            browserItemsEnabled = true
+        } else {
+            browserItemsEnabled = false
+        }
+        return MenuAvailability(
+            settings: true,
+            webDashboard: browserItemsEnabled,
+            chat: browserItemsEnabled
+        )
+    }
+
     /// Source-of-truth port for any menubar item that renders the
     /// current bind port (status header, port-conflict alert, Chat URL).
     /// The running server is authoritative — `config` here is just the

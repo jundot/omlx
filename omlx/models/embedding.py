@@ -23,6 +23,16 @@ from .mlx_embeddings_compat import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_EMBEDDING_MAX_LENGTH = 512
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
+_CONTEXT_LENGTH_ATTRS = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "max_seq_length",
+    "seq_length",
+    "n_positions",
+)
+
 
 @dataclass
 class EmbeddingOutput:
@@ -310,6 +320,76 @@ class MLXEmbeddingModel:
             return [{"text": text} for text in inputs]
         return [dict(item) for item in inputs]
 
+    @staticmethod
+    def _positive_context_length(value: Any) -> Optional[int]:
+        """Return a usable positive context length from config/tokenizer metadata."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return value
+        return None
+
+    @classmethod
+    def _get_config_value(cls, config: Any, key: str) -> Optional[int]:
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            return cls._positive_context_length(config.get(key))
+        return cls._positive_context_length(getattr(config, key, None))
+
+    @classmethod
+    def _context_length_from_config(cls, config: Any) -> Optional[int]:
+        """Read context length from model config objects or dictionaries."""
+        for key in _CONTEXT_LENGTH_ATTRS:
+            value = cls._get_config_value(config, key)
+            if value is not None:
+                return value
+
+        for nested_key in ("text_config", "language_config"):
+            nested = None
+            if isinstance(config, dict):
+                nested = config.get(nested_key)
+            elif config is not None:
+                nested = getattr(config, nested_key, None)
+            for key in _CONTEXT_LENGTH_ATTRS:
+                value = cls._get_config_value(nested, key)
+                if value is not None:
+                    return value
+
+        return None
+
+    def _resolve_max_length(self, max_length: int | None) -> int:
+        """Resolve embedding token length when callers omit an explicit limit."""
+        if max_length is not None:
+            value = self._positive_context_length(max_length)
+            if value is None:
+                raise ValueError("max_length must be a positive integer")
+            return value
+
+        for config in (
+            getattr(self.model, "config", None),
+            getattr(self.processor, "config", None),
+        ):
+            value = self._context_length_from_config(config)
+            if value is not None:
+                return value
+
+        processor = self.processor
+        tokenizers = [
+            processor,
+            getattr(processor, "tokenizer", None),
+            getattr(processor, "_tokenizer", None),
+        ]
+        for tokenizer in tokenizers:
+            for attr_name in ("model_max_length", "max_length"):
+                value = self._positive_context_length(
+                    getattr(tokenizer, attr_name, None)
+                )
+                if value is not None:
+                    return value
+
+        return _DEFAULT_EMBEDDING_MAX_LENGTH
+
     def _prepare_embedding_inputs(
         self,
         processor,
@@ -407,7 +487,7 @@ class MLXEmbeddingModel:
     def embed(
         self,
         inputs: Union[str, List[str], List[Dict[str, str]]],
-        max_length: int = 512,
+        max_length: int | None = None,
         padding: bool = True,
         truncation: bool = True,
     ) -> EmbeddingOutput:
@@ -416,7 +496,8 @@ class MLXEmbeddingModel:
 
         Args:
             texts: List of input texts
-            max_length: Maximum token length for each text
+            max_length: Maximum token length for each text. If omitted, use
+                model/tokenizer metadata when available.
             padding: Whether to pad shorter sequences
             truncation: Whether to truncate longer sequences
 
@@ -426,6 +507,7 @@ class MLXEmbeddingModel:
         if not self._loaded:
             self.load()
 
+        max_length = self._resolve_max_length(max_length)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         input_texts = [item["text"] for item in normalized_inputs if "text" in item]
         has_image_inputs = any("image" in item for item in normalized_inputs)
@@ -459,7 +541,9 @@ class MLXEmbeddingModel:
                 masks = []
                 for text in input_texts:
                     enc = processor.encode(text, add_special_tokens=True)
-                    ids = list(enc.ids)[:max_length]
+                    ids = list(enc.ids)
+                    if truncation:
+                        ids = ids[:max_length]
                     encoded_ids.append(ids)
                 max_len = max(len(ids) for ids in encoded_ids)
                 padded = []

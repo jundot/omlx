@@ -104,7 +104,15 @@ class TestCreateStreamingDetokenizer:
             model_path=tmp_path,
         )
 
-        assert type(detokenizer).__name__ == "NaiveStreamingDetokenizer"
+        assert type(detokenizer).__name__ in {
+            "NaiveStreamingDetokenizer",
+            "_CompatNaiveStreamingDetokenizer",
+        }
+        for token_id in [1, 2, 3]:
+            detokenizer.add_token(token_id)
+        detokenizer.finalize()
+
+        assert detokenizer.text == "\uc7a0"
 
 
 class TestIsHarmonyModel:

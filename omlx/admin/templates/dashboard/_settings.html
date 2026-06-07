@@ -591,6 +591,14 @@
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_hint') }}</p>
                                     </div>

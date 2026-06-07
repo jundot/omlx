@@ -58,6 +58,17 @@ class EmbeddingRequest(BaseModel):
     Only supported by some models. If not supported, returns full dimensions.
     """
 
+    max_length: Optional[int] = Field(default=None, gt=0)
+    """
+    Optional maximum token length for each input text. When omitted, the
+    server uses the model's effective context window.
+    """
+
+    truncation: bool = True
+    """
+    Whether to truncate inputs longer than max_length.
+    """
+
     @model_validator(mode="after")
     def validate_input_source(self) -> "EmbeddingRequest":
         """Require exactly one input source."""

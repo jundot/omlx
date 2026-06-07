@@ -29,8 +29,9 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    # mlx-lm from commit (bdb77da, v0.31.3) - Gemma4 unified LLM remap,
+    # Qwen3.5 pipeline support, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@bdb77dae5389d193dcc333bed891d33f6b668285",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -53,6 +54,8 @@ dependencies = [
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
     "jinja2>=3.0",
+    # mlx-lm bdb77da imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
+    "rich>=13.0.0",
     "sentencepiece",
     "tiktoken",
     "protobuf",
@@ -62,6 +65,8 @@ dependencies = [
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
+    # Native process title support (shows as omlx-server instead of python)
+    "setproctitle>=1.3.3",
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
@@ -78,8 +83,9 @@ dependencies = [
     # arrays on model load.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@526c210b8ef841a2906beb2805e9c41b8b77f4e7",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.8 (39b2520) — bstnxbt repo. Apple G17 NAX verify path plus v0.1.7 Qwen/Gemma4 DFlash fixes
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@39b2520e805f1d1be3852c62944b389cff73fa35",
+    # dflash-mlx v0.1.9 (b7f192b) - bstnxbt repo. Apple G17 NAX verify
+    # plus PR #37 prefix snapshot performance and hit-kind metrics.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@b7f192b62bc5a59cad41fda888c1118c60fc58b1",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
@@ -186,7 +192,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@bdb77dae5389d193dcc333bed891d33f6b668285",
 ]
 
 [tool.black]

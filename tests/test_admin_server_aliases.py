@@ -284,6 +284,77 @@ class TestUpdateGlobalSettingsHotCache:
         gs.save.assert_not_called()
 
 
+class TestUpdateGlobalSettingsSampling:
+    """update_global_settings: saving and hot-applying sampling defaults."""
+
+    @staticmethod
+    def _make_sampling_settings(policy: int | None = None):
+        return SimpleNamespace(
+            max_context_window=32768,
+            max_context_window_policy=policy,
+            max_tokens=32768,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=0,
+            repetition_penalty=1.0,
+        )
+
+    def test_saves_and_hot_applies_context_window_policy(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(sampling=self._make_sampling_settings())
+        request = GlobalSettingsRequest(sampling_max_context_window_policy=128000)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_policy == 128000
+        assert server_state.sampling.max_context_window_policy == 128000
+        gs.save.assert_called_once()
+
+    def test_explicit_null_clears_context_window_policy(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings(policy=128000)
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(
+            sampling=self._make_sampling_settings(policy=128000)
+        )
+        request = GlobalSettingsRequest(sampling_max_context_window_policy=None)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert "sampling_max_context_window_policy" in request.model_fields_set
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_policy is None
+        assert server_state.sampling.max_context_window_policy is None
+        gs.save.assert_called_once()
+
+
 class TestUpdateGlobalSettingsEmbeddingBatchSize:
     """update_global_settings: saving and hot-applying embedding batch size."""
 

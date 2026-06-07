@@ -159,6 +159,39 @@ final class MenubarControllerPortTests: XCTestCase {
         }
     }
 
+    // MARK: - menuAvailability
+
+    func testMenuAvailabilityKeepsSettingsEnabledWhenServerIsOffline() {
+        for state in [ServerProcess.State.stopped, .failed(message: "Port 8000 in use")] {
+            let availability = MenubarController.menuAvailability(for: state)
+            XCTAssertTrue(availability.settings)
+            XCTAssertFalse(availability.webDashboard)
+            XCTAssertFalse(availability.chat)
+        }
+    }
+
+    func testMenuAvailabilityEnablesBrowserItemsOnlyWhenRunning() {
+        let availability = MenubarController.menuAvailability(for: .running(pid: 123))
+        XCTAssertTrue(availability.settings)
+        XCTAssertTrue(availability.webDashboard)
+        XCTAssertTrue(availability.chat)
+    }
+
+    func testMenuAvailabilityKeepsBrowserItemsDisabledDuringTransitions() {
+        let states: [ServerProcess.State] = [
+            .starting,
+            .stopping,
+            .unresponsive(pid: 123),
+        ]
+
+        for state in states {
+            let availability = MenubarController.menuAvailability(for: state)
+            XCTAssertTrue(availability.settings)
+            XCTAssertFalse(availability.webDashboard)
+            XCTAssertFalse(availability.chat)
+        }
+    }
+
     // MARK: - failure alerts
 
     func testGenericFailureAlertSkipsPortConflictMessages() {

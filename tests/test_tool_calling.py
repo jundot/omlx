@@ -815,6 +815,37 @@ class TestToolCallStreamFilter:
         assert "[Tool call:" not in result
         assert result == "Before  unfinished and then  done"
 
+    def test_hermes_marker_pair_suppressed_without_tokenizer_metadata(self):
+        """Hermes markers should not leak in streams when tokenizer lacks marker attrs."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        chunks = [
+            "Before ",
+            "<|tool_call_start|>",
+            "[execute_code(command='x', timeout=1)]",
+            "<|tool_call_end|>",
+            " After",
+        ]
+        result = "".join(f.feed(chunk) for chunk in chunks)
+        result += f.finish()
+        assert "<|tool_call_start|>" not in result
+        assert "execute_code" not in result
+        assert result == "Before  After"
+
+    def test_orphan_hermes_end_marker_is_suppressed(self):
+        """A closing Hermes marker without a visible open marker must not leak."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Before <|tool_call_end|> After")
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_split_orphan_hermes_end_marker_is_suppressed(self):
+        """Split closing Hermes markers must be buffered until classified."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        chunks = ["Before ", "<|tool_call_en", "d|>", " After"]
+        result = "".join(f.feed(chunk) for chunk in chunks)
+        result += f.finish()
+        assert result == "Before  After"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())
@@ -1317,6 +1348,68 @@ class TestParseBracketToolCalls:
         cleaned, tool_calls = _parse_bracket_tool_calls(text)
         assert tool_calls is None
         assert cleaned == text
+
+    def test_hermes_multi_call_block_parses_python_keyword_arguments(self):
+        """Hermes blocks may contain multiple Python-style calls in one list."""
+        text = (
+            "┊ 🐍 preparing execute_code…\n"
+            "<|tool_call_start|>"
+            "[execute_code(command='python3 diversify_hermes.py --model "
+            "\"Qwen3.6-35B-A3B-ConfigI-MLX\" --timeout 180 && echo "
+            "\"Hermes mode completed\"', timeout=400), "
+            "execute_code(command='python3 diversify_v2.py --runs 50 --per-run 54 "
+            "--timeout 300 && echo \"v2 dynamic completed\"', timeout=400)]"
+            "<|tool_call_end|>"
+        )
+        result = extract_tool_calls_with_thinking(
+            "",
+            text,
+            tokenizer=_make_tokenizer(),
+            tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        )
+        assert result.cleaned_text == "┊ 🐍 preparing execute_code…"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 2
+        assert [tc.function.name for tc in result.tool_calls] == [
+            "execute_code",
+            "execute_code",
+        ]
+        first_args = json.loads(result.tool_calls[0].function.arguments)
+        second_args = json.loads(result.tool_calls[1].function.arguments)
+        assert first_args["timeout"] == 400
+        assert second_args["timeout"] == 400
+        assert "diversify_hermes.py" in first_args["command"]
+        assert "diversify_v2.py" in second_args["command"]
+
+    def test_hermes_fallback_runs_when_native_parser_rejects_bracket_payload(self):
+        """Tokenizer native parser failures should fall through to Hermes fallback."""
+
+        class NativeRejectingTokenizer:
+            has_tool_calling = True
+            tool_call_start = "<|tool_call_start|>"
+            tool_call_end = "<|tool_call_end|>"
+
+            @staticmethod
+            def tool_parser(text, tools):
+                raise ValueError("native parser rejected Hermes bracket payload")
+
+        text = (
+            "Before <|tool_call_start|>"
+            "[execute_code(command='python3 script.py', timeout=400)]"
+            "<|tool_call_end|>"
+        )
+        result = extract_tool_calls_with_thinking(
+            "",
+            text,
+            tokenizer=NativeRejectingTokenizer(),
+            tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        )
+        assert result.cleaned_text == "Before"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "execute_code"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "python3 script.py", "timeout": 400}
 
 
 class TestParseToolCallsWithThinkingFallback:

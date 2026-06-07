@@ -1154,17 +1154,24 @@ class TestSSDWriteDrops:
         )
 
     def test_paged_ssd_cache_stats_default_and_reset(self):
-        """Dataclass: ssd_write_drops defaults to 0 and is zeroed by reset()."""
+        """Dataclass: drop/unlink counters default to 0 and reset to 0."""
         from omlx.cache.stats import PagedSSDCacheStats
 
         # Default is zero.
         stats = PagedSSDCacheStats()
         assert stats.ssd_write_drops == 0
+        assert stats.evict_unlink_failures == 0
 
         # reset() returns it to zero from a non-zero state.
-        stats = PagedSSDCacheStats(ssd_write_drops=5, saves=2, loads=3)
+        stats = PagedSSDCacheStats(
+            ssd_write_drops=5,
+            evict_unlink_failures=3,
+            saves=2,
+            loads=3,
+        )
         stats.reset()
         assert stats.ssd_write_drops == 0
+        assert stats.evict_unlink_failures == 0
         # Verify reset() didn't break the existing fields it already handled.
         assert stats.saves == 0
         assert stats.loads == 0
@@ -1203,6 +1210,23 @@ class TestSSDWriteDrops:
                 "get_stats_for_model() must pass _stats['ssd_write_drops'] "
                 "through to the dataclass field"
             )
+        finally:
+            mgr.close()
+
+    def test_evict_unlink_failures_round_trips_through_get_stats(self, tmp_path):
+        """evict_unlink_failures is visible through both stats accessors."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "unlink_failure_wiring_test",
+            max_size_bytes=100 * 1024**2,
+        )
+        try:
+            mgr._stats["evict_unlink_failures"] = 3
+
+            stats = mgr.get_stats()
+            assert stats.evict_unlink_failures == 3
+
+            model_stats = mgr.get_stats_for_model("any-model-name")
+            assert model_stats.evict_unlink_failures == 3
         finally:
             mgr.close()
 

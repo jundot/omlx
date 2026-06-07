@@ -113,7 +113,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
     async def embed(
         self,
         texts: Union[List[str], List[Dict[str, str]]],
-        max_length: int = 512,
+        max_length: int | None = None,
         padding: bool = True,
         truncation: bool = True,
     ) -> EmbeddingOutput:
@@ -122,7 +122,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         Args:
             texts: List of input texts
-            max_length: Maximum token length for each text
+            max_length: Maximum token length for each text. If omitted, the
+                model resolves its configured limit.
             padding: Whether to pad shorter sequences
             truncation: Whether to truncate longer sequences
 
