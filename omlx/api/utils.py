@@ -118,6 +118,47 @@ def _extract_text_from_content_list(content: list) -> str:
     return "\n".join(text_parts) if text_parts else ""
 
 
+def _has_multimodal_content_list(content: list) -> bool:
+    """Check if a content array contains image or audio parts.
+
+    Useful for detecting multimodal requests before choosing the
+    appropriate extraction path (text-only vs multimodal).
+
+    Args:
+        content: Content array from a message.
+
+    Returns:
+        True if the content contains image_url, input_image, input_audio, etc.
+    """
+    for item in content:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
+        elif hasattr(item, "dict"):
+            item = item.dict()
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type in ("image_url", "input_image", "input_audio", "image"):
+                return True
+    return False
+
+
+def _has_multimodal_messages(messages: List[Message]) -> bool:
+    """Check if any message contains image_url or other multimodal parts.
+
+    Args:
+        messages: List of Message objects to check.
+
+    Returns:
+        True if any message has multimodal content parts.
+    """
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, list):
+            if _has_multimodal_content_list(content):
+                return True
+    return False
+
+
 def _extract_multimodal_content_list(content: list) -> list:
     """Extract text, image, and audio parts from a content array.
 

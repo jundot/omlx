@@ -156,7 +156,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .api.utils import _has_multimodal_messages, clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -2594,11 +2594,23 @@ async def create_chat_completion(
         not is_vlm
         and getattr(engine, "supports_multimodal_fallback", False)
     )
+    # Detect multimodal content in the original request so that non-VLM
+    # engines can still process images when the underlying model supports it.
+    has_multimodal = _has_multimodal_messages(request.messages)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
     elif is_vlm or is_dflash_vlm:
         # VLM or DFlash with VLM fallback: preserve image_url content parts
+        messages = extract_multimodal_content(
+            request.messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            native_reasoning_content=native_reasoning,
+        )
+    elif has_multimodal:
+        # Non-VLM engine but request contains images — preserve image_url
+        # parts so the engine can detect them and delegate to VLM processing.
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,

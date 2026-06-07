@@ -12,7 +12,8 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..api.utils import _has_multimodal_content_list, clean_special_tokens, detect_and_strip_partial
+from ..utils.image import extract_images_from_messages
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -440,6 +441,212 @@ class BatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _has_multimodal_messages(self, messages: list[dict]) -> bool:
+        """Check if any message contains image_url content parts."""
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                if _has_multimodal_content_list(content):
+                    return True
+        return False
+
+    def _apply_chat_template_with_vision(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> tuple[str | list[int], Any, dict | None]:
+        """Apply chat template with vision support for multimodal messages.
+
+        When images are present, uses mlx-vlm's processor to preprocess
+        images and merge vision+text embeddings.
+
+        Args:
+            messages: Chat messages (text-only, media already extracted)
+            images: List of PIL Image objects
+            tools: Optional tool definitions
+            chat_template_kwargs: Optional kwargs for chat template
+            is_partial: Explicit partial-mode signal
+
+        Returns:
+            Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs)
+        """
+        import asyncio
+        import mx as mx
+
+        if not images:
+            # No images — fall back to standard text template
+            prompt = self._apply_chat_template(
+                messages, tools, chat_template_kwargs=chat_template_kwargs, is_partial=is_partial
+            )
+            return prompt, None, None
+
+        # Images present — use mlx-vlm for vision processing
+        try:
+            from mlx_vlm.prompt_utils import apply_chat_template
+            from mlx_vlm.utils import prepare_inputs
+        except ImportError:
+            logger.warning("mlx-vlm not available; skipping vision processing for multimodal request")
+            # Fall back to text-only — images will be silently dropped
+            prompt = self._apply_chat_template(
+                messages, tools, chat_template_kwargs=chat_template_kwargs, is_partial=is_partial
+            )
+            return prompt, None, None
+
+        model_type = self.model_type or ""
+        num_images = len(images)
+
+        # Format messages for VLM template with image placeholders
+        try:
+            formatted_messages, _ = self._format_vlm_template(
+                messages, num_images=num_images, num_audios=0
+            )
+        except Exception as e:
+            logger.debug("Falling back to mlx-vlm apply_chat_template: %s", e)
+            formatted_messages = apply_chat_template(
+                self._processor,
+                getattr(self._model, "config", None),
+                formatted_messages if isinstance(formatted_messages, list) else messages,
+                chat_template=getattr(self._tokenizer, "chat_template", None),
+            )
+
+        # Apply chat template
+        if is_partial is None:
+            is_partial = detect_and_strip_partial(formatted_messages if isinstance(formatted_messages, list) else [{"role": "user", "content": formatted_messages}])
+
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not is_partial,
+        }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if tools:
+            template_kwargs["tools"] = tools
+        if self._enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self._enable_thinking
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+
+        try:
+            prompt = apply_chat_template(
+                self._processor,
+                getattr(self._model, "config", None),
+                formatted_messages if isinstance(formatted_messages, list) else messages,
+                chat_template=getattr(self._tokenizer, "chat_template", None),
+            )
+        except Exception:
+            # Final fallback: use standard tokenizer
+            msg_list = formatted_messages if isinstance(formatted_messages, list) else messages
+            prompt = self._tokenizer.apply_chat_template(
+                msg_list, **{k: v for k, v in template_kwargs.items() if k != "tokenize"}
+            )
+
+        # Tokenize and preprocess with mlx-vlm
+        try:
+            inputs = prepare_inputs(
+                self._processor,
+                images=images if images else None,
+                prompts=[prompt] if isinstance(prompt, str) else prompt,
+            )
+
+            input_ids = inputs.get("input_ids", [])
+            pixel_values = inputs.get("pixel_values")
+            attention_mask = inputs.get("attention_mask")
+
+            if pixel_values is not None and num_images > 0:
+                # Compute vision embeddings via model
+                try:
+                    embed_features = self._vlm_model.get_input_embeddings(
+                        input_ids, pixel_values, mask=attention_mask
+                    )
+                    return input_ids, embed_features.inputs_embeds, None
+                except Exception as e:
+                    logger.debug("Vision embedding computation failed: %s", e)
+
+            # If vision embeddings couldn't be computed, return token IDs
+            # The BatchGenerator will handle them as text-only
+            if isinstance(input_ids, list):
+                return input_ids, None, None
+            return prompt, None, None
+
+        except Exception as e:
+            logger.debug("Vision preprocessing failed, falling back to text: %s", e)
+            prompt = self._apply_chat_template(
+                messages, tools, chat_template_kwargs=chat_template_kwargs, is_partial=is_partial
+            )
+            return prompt, None, None
+
+    def _format_vlm_template(
+        self,
+        messages: list[dict],
+        num_images: int = 0,
+        num_audios: int = 0,
+    ) -> tuple[list[dict], list]:
+        """Format messages for VLM template with image placeholder injection.
+
+        This is a simplified version of VLMBatchedEngine._format_messages_for_vlm_template
+        that works with the standard BatchedEngine's tokenizer.
+
+        Args:
+            messages: Chat messages (text-only)
+            num_images: Number of images to inject
+            num_audios: Number of audio items
+
+        Returns:
+            Tuple of (formatted_messages, image_message_ranges)
+        """
+        try:
+            from mlx_vlm.prompt_utils import get_message_json
+        except ImportError:
+            # Fallback: return messages as-is
+            return messages, []
+
+        model_type = self.model_type or ""
+        formatted_messages = []
+        image_message_ranges = []
+
+        # Count how many user turns need images
+        user_turns_with_images = 0
+        for msg in messages:
+            if msg.get("role") == "user" and user_turns_with_images < num_images:
+                user_turns_with_images += 1
+
+        images_remaining = num_images
+        image_idx = 0
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            # Skip system messages — don't inject images
+            if role in ("system", "developer"):
+                formatted_messages.append(dict(msg))
+                continue
+
+            # Tool messages — pass through
+            if role == "tool" or "tool_calls" in msg:
+                formatted_messages.append(dict(msg))
+                continue
+
+            # User messages — inject image placeholders if needed
+            if role == "user" and isinstance(content, str) and images_remaining > 0:
+                try:
+                    json_msg = get_message_json(
+                        content, model_type=model_type or None, image_idx=image_idx
+                    )
+                    formatted_messages.append(json_msg)
+                    image_message_ranges.append((image_idx, len(formatted_messages) - 1))
+                    images_remaining -= 1
+                    image_idx += 1
+                except Exception:
+                    formatted_messages.append(dict(msg))
+            else:
+                formatted_messages.append(dict(msg))
+
+        return formatted_messages, image_message_ranges
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -471,7 +678,7 @@ class BatchedEngine(BaseEngine):
 
     async def generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -480,13 +687,15 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        vlm_inputs_embeds: Any = None,
+        vlm_extra_kwargs: dict | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
         Generate a complete response (non-streaming).
 
         Args:
-            prompt: Input text
+            prompt: Input text or token IDs
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
@@ -495,6 +704,8 @@ class BatchedEngine(BaseEngine):
             repetition_penalty: Repetition penalty (1.0 = disabled)
             presence_penalty: Presence penalty (0.0 = disabled)
             stop: Stop sequences
+            vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM processing
+            vlm_extra_kwargs: Model-specific kwargs for VLM (grid_thw, etc.)
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -522,9 +733,16 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        gen_kwargs = dict(kwargs)
+        if vlm_inputs_embeds is not None:
+            gen_kwargs["vlm_inputs_embeds"] = vlm_inputs_embeds
+        if vlm_extra_kwargs is not None:
+            gen_kwargs["vlm_extra_kwargs"] = vlm_extra_kwargs
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            **gen_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -540,7 +758,7 @@ class BatchedEngine(BaseEngine):
 
     async def stream_generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -549,13 +767,15 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        vlm_inputs_embeds: Any = None,
+        vlm_extra_kwargs: dict | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
         Stream generation token by token.
 
         Args:
-            prompt: Input text
+            prompt: Input text or token IDs
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
@@ -564,6 +784,8 @@ class BatchedEngine(BaseEngine):
             repetition_penalty: Repetition penalty (1.0 = disabled)
             presence_penalty: Presence penalty (0.0 = disabled)
             stop: Stop sequences
+            vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM processing
+            vlm_extra_kwargs: Model-specific kwargs for VLM (grid_thw, etc.)
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -608,11 +830,18 @@ class BatchedEngine(BaseEngine):
                 "specprefill_system_end"
             )
 
+        # Pass vision embeddings to engine
+        gen_kwargs = dict(specprefill_kwargs)
+        if vlm_inputs_embeds is not None:
+            gen_kwargs["vlm_inputs_embeds"] = vlm_inputs_embeds
+        if vlm_extra_kwargs is not None:
+            gen_kwargs["vlm_extra_kwargs"] = vlm_extra_kwargs
+
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
-            **specprefill_kwargs,
+            **gen_kwargs,
         )
 
         finished_normally = False
@@ -691,18 +920,37 @@ class BatchedEngine(BaseEngine):
         # Preprocess messages for Harmony (gpt-oss) models
         messages = self._preprocess_messages(messages)
 
+        # Detect multimodal content — if images are present, use VLM processing
+        multimodal = self._has_multimodal_messages(messages)
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Apply chat template
+        # Apply chat template (text-only or vision-aware)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
+
+        if multimodal:
+            # Extract images and use vision-aware template
+            text_messages, images, audio = extract_images_from_messages(messages)
+            prompt, vlm_embeds, vlm_kwargs = self._apply_chat_template_with_vision(
+                text_messages, images, template_tools, chat_template_kwargs=ct_kwargs, is_partial=partial
+            )
+        else:
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
+            vlm_embeds = None
+            vlm_kwargs = None
+
+        gen_kwargs = dict(kwargs)
+        if vlm_embeds is not None:
+            gen_kwargs["vlm_inputs_embeds"] = vlm_embeds
+        if vlm_kwargs is not None:
+            gen_kwargs["vlm_extra_kwargs"] = vlm_kwargs
 
         return await self.generate(
             prompt=prompt,
@@ -713,7 +961,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
-            **kwargs,
+            **gen_kwargs,
         )
 
     async def stream_chat(
@@ -753,18 +1001,31 @@ class BatchedEngine(BaseEngine):
         # Preprocess messages for Harmony (gpt-oss) models
         messages = self._preprocess_messages(messages)
 
+        # Detect multimodal content — if images are present, use VLM processing
+        multimodal = self._has_multimodal_messages(messages)
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Apply chat template
+        # Apply chat template (text-only or vision-aware)
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
+
+        if multimodal:
+            # Extract images and use vision-aware template
+            text_messages, images, audio = extract_images_from_messages(messages)
+            prompt, vlm_embeds, vlm_kwargs = self._apply_chat_template_with_vision(
+                text_messages, images, template_tools, chat_template_kwargs=ct_kwargs, is_partial=partial
+            )
+        else:
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
+            vlm_embeds = None
+            vlm_kwargs = None
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
@@ -791,6 +1052,12 @@ class BatchedEngine(BaseEngine):
                 except Exception as e:
                     logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+        gen_kwargs = dict(kwargs)
+        if vlm_embeds is not None:
+            gen_kwargs["vlm_inputs_embeds"] = vlm_embeds
+        if vlm_kwargs is not None:
+            gen_kwargs["vlm_extra_kwargs"] = vlm_kwargs
+
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -800,7 +1067,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
-            **kwargs,
+            **gen_kwargs,
         ):
             yield output
 
