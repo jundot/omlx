@@ -1842,6 +1842,80 @@ class TestOnTheFlyFp8Dequant:
 
 
 # =============================================================================
+# End-to-end: protected pass-through tensor dtypes
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
+        """Protected VLM/audio tensors must not be saved as FP16."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "vision_tower.layers.0.self_attn.k_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+                "multi_modal_projector.linear.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+                "audio_tower.layers.0.self_attn.k_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+                "vision_tower.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4, dtype="float16")
+
+        tensors = {}
+        for sf in out.glob("*.safetensors"):
+            tensors.update(mx.load(str(sf)))
+
+        assert (
+            tensors["vision_tower.layers.0.self_attn.k_proj.weight"].dtype == mx.float32
+        )
+        assert tensors["multi_modal_projector.linear.weight"].dtype == mx.float32
+        assert (
+            tensors["audio_tower.layers.0.self_attn.k_proj.weight"].dtype == mx.float32
+        )
+        assert (
+            tensors["vision_tower.layers.0.input_layernorm.weight"].dtype == mx.float32
+        )
+        assert tensors["model.layers.0.input_layernorm.weight"].dtype == mx.float16
+        assert tensors["model.layers.0.self_attn.q_proj.weight"].dtype == mx.uint32
+
+
+# =============================================================================
 # End-to-end: quantize_oq_streaming with FP8 sources
 # =============================================================================
 

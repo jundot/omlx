@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -59,6 +60,23 @@ class TestEmbeddingModels:
         assert request.input == ["Hello", "World"]
         assert request.encoding_format == "base64"
         assert request.dimensions == 256
+
+    def test_embedding_request_max_length_and_truncation(self):
+        """Test optional embedding token length controls."""
+        request = EmbeddingRequest(
+            input="Hello",
+            model="all-MiniLM-L6-v2",
+            max_length=4096,
+            truncation=False,
+        )
+
+        assert request.max_length == 4096
+        assert request.truncation is False
+
+    def test_embedding_request_rejects_invalid_max_length(self):
+        """Test max_length must be a positive integer."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", max_length=0)
 
     def test_embedding_request_items_input(self):
         """Test EmbeddingRequest with structured items."""
@@ -503,6 +521,98 @@ class TestEmbeddingCompileFallback:
             result = model.embed(["test"])
 
         assert len(result.embeddings) == 1
+
+    def test_default_max_length_uses_model_config(self):
+        """Omitted max_length should use model context metadata, not 512."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(
+            config=SimpleNamespace(max_position_embeddings=40960)
+        )
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+
+        assert generate.call_args.kwargs["max_length"] == 40960
+
+    def test_default_max_length_uses_tokenizer_config_fallback(self):
+        """Tokenizer model_max_length is used when model config lacks a limit."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(config=SimpleNamespace())
+        model.processor = SimpleNamespace(model_max_length=8192)
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+
+        assert generate.call_args.kwargs["max_length"] == 8192
+
+    def test_unknown_default_max_length_falls_back_to_512(self):
+        """Keep a conservative final fallback when no metadata exists."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(config=SimpleNamespace())
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+
+        assert generate.call_args.kwargs["max_length"] == 512
+
+    def test_explicit_max_length_is_respected(self):
+        """Explicit max_length should override metadata."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(
+            config=SimpleNamespace(max_position_embeddings=40960)
+        )
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"], max_length=1024)
+
+        assert generate.call_args.kwargs["max_length"] == 1024
 
     def test_custom_processor_compiled_path_uses_prepare_embedding_inputs(self):
         """Custom embedding processors should use their own prepare API."""
@@ -1004,6 +1114,8 @@ class TestEmbeddingModelsPydantic:
 
         assert request.encoding_format == "float"
         assert request.dimensions is None
+        assert request.max_length is None
+        assert request.truncation is True
 
     def test_embedding_data_defaults(self):
         """Test EmbeddingData default values."""

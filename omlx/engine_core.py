@@ -17,8 +17,20 @@ import concurrent.futures
 import logging
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 
@@ -86,7 +98,8 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _global_mlx_executor
     if _global_mlx_executor is None:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-global",
+            max_workers=1,
+            thread_name_prefix="mlx-global",
             initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
@@ -98,8 +111,9 @@ class EngineConfig:
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.001  # 1ms between steps
+    step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
+    prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
 
 
 class EngineCore:
@@ -173,6 +187,8 @@ class EngineCore:
         # Engine state
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
@@ -183,6 +199,8 @@ class EngineCore:
         if self._running:
             return
 
+        self._loop = asyncio.get_running_loop()
+        self._wake_event = asyncio.Event()
         self._running = True
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
@@ -191,18 +209,35 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
+        if self._wake_event is not None:
+            self._wake_event.set()
         if self._task:
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
+        self._wake_event = None
+        self._loop = None
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
         """Check if engine is running."""
         return self._running
+
+    def _wake_engine_loop(self) -> None:
+        """Wake the idle engine loop after scheduler-visible state changes."""
+        event = getattr(self, "_wake_event", None)
+        loop = getattr(self, "_loop", None)
+        if event is None or loop is None or loop.is_closed():
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
 
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
@@ -216,7 +251,7 @@ class EngineCore:
 
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
-        use_simple_streaming = (stream_interval == 1)
+        use_simple_streaming = stream_interval == 1
 
         while self._running:
             try:
@@ -225,6 +260,7 @@ class EngineCore:
                         self._mlx_executor, self.scheduler.step
                     )
                     self._steps_executed += 1
+                    eviction_request = output.prefill_eviction_request
 
                     # Fast path: distribute outputs to collectors
                     outputs = output.outputs
@@ -245,7 +281,7 @@ class EngineCore:
                                     state = states.get(rid)
                                     if state and state.should_send(
                                         req_output.completion_tokens,
-                                        req_output.finished
+                                        req_output.finished,
                                     ):
                                         collector.put(req_output)
                                         state.mark_sent(req_output.completion_tokens)
@@ -262,14 +298,67 @@ class EngineCore:
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    if eviction_request is not None:
+                        callback = self.config.prefill_eviction_callback
+                        if callback is not None:
+                            logger.info(
+                                "Running prefill LRU eviction for request %s",
+                                eviction_request.request_id,
+                            )
+                            evicted = await callback(eviction_request)
+                            if evicted:
+                                logger.info(
+                                    "Prefill LRU eviction completed for request %s",
+                                    eviction_request.request_id,
+                                )
+                            else:
+                                logger.info(
+                                    "No idle model evicted for request %s; "
+                                    "scheduler will fall back to throttling",
+                                    eviction_request.request_id,
+                                )
+                        else:
+                            logger.debug(
+                                "Prefill eviction requested for %s but no callback "
+                                "is configured",
+                                eviction_request.request_id,
+                            )
+                        continue
+                    if not output.has_work:
+                        # Requests may be queued while scheduler admission is
+                        # intentionally throttled by async cache cleanup. Avoid
+                        # spinning the engine loop, but still let new requests
+                        # wake the wait immediately.
+                        event = self._wake_event
+                        if event is None:
+                            await asyncio.sleep(step_interval)
+                        else:
+                            event.clear()
+                            with suppress(TimeoutError):
+                                await asyncio.wait_for(
+                                    event.wait(), timeout=step_interval
+                                )
                 else:
-                    # No work, yield control
-                    await asyncio.sleep(step_interval)
+                    event = self._wake_event
+                    if event is None:
+                        await asyncio.sleep(step_interval)
+                    else:
+                        event.clear()
+                        # Avoid losing a request that arrived between
+                        # has_requests() and clear().
+                        if self.scheduler.has_requests():
+                            continue
+                        with suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                event.wait(), timeout=step_interval
+                            )
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 import traceback
+
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
                 # infinite loop (has_requests() must return False).
@@ -375,6 +464,7 @@ class EngineCore:
         await loop.run_in_executor(
             self._mlx_executor, self.scheduler.add_request, request
         )
+        self._wake_engine_loop()
 
         return request_id
 
@@ -417,6 +507,7 @@ class EngineCore:
         event = self._finished_events.get(request_id)
         if event is not None:
             event.set()
+        self._wake_engine_loop()
 
         return result
 
@@ -469,6 +560,7 @@ class EngineCore:
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
             )
+            self._wake_engine_loop()
         return len(request_ids)
 
     def _cleanup_request(self, request_id: str) -> None:
@@ -529,8 +621,7 @@ class EngineCore:
                         output = collector.get_nowait()
                         if output is None:
                             output = await asyncio.wait_for(
-                                collector.get(),
-                                timeout=timeout
+                                collector.get(), timeout=timeout
                             )
                     else:
                         output = collector.get_nowait() or await collector.get()

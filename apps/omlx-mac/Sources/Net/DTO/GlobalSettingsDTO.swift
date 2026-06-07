@@ -38,6 +38,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let logLevel: String
         let serverAliases: [String]
         let sseKeepaliveMode: String?
+        let autoStartOnLaunch: Bool?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
@@ -94,6 +95,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// the value via env var (HF_ENDPOINT) so the HF library picks it up.
     struct HuggingFaceDTO: Codable, Equatable, Sendable {
         let endpoint: String
+        let hfCacheEnabled: Bool?
     }
 
     /// Mirrors `omlx.settings.SamplingSettings`. The full server surface
@@ -171,6 +173,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// SSE keep-alive line strategy: `"chunk"` (default), `"comment"`, or
     /// `"off"`. Server rejects anything else with a 400.
     var sseKeepaliveMode: String? = nil
+    var autoStartOnLaunch: Bool? = nil
 
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil
@@ -217,6 +220,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// HF_ENDPOINT env var to the HF default (huggingface.co). Patches in-
     /// place via `omlx/admin/routes.py:2804`.
     var hfEndpoint: String? = nil
+    /// Discover MLX-compatible models from the standard Hugging Face Hub
+    /// local cache. Server default is true.
+    var hfCacheEnabled: Bool? = nil
 
     /// ModelScope mirror endpoint. Empty string = use modelscope.cn.
     /// Patched via `ms_endpoint` (encoder converts to snake_case).

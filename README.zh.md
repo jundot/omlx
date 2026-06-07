@@ -54,7 +54,7 @@
 
 ### macOS 应用
 
-从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。macOS 应用不包含 `omlx` CLI 命令。如需在终端使用，请通过 Homebrew 或从源码安装。
+从 [Releases](https://github.com/jundot/omlx/releases) 下载 `.dmg`，拖到 Applications 即可。应用支持自动更新，后续升级只需一键完成。macOS 应用也会安装轻量的 `~/.omlx/bin/omlx` CLI shim，因此可以从终端命令或 Apple Shortcuts 控制由应用管理的服务器。
 
 ### Homebrew
 

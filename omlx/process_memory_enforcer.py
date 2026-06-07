@@ -33,6 +33,8 @@ import ctypes.util
 import logging
 import subprocess
 import sys
+import time
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -48,18 +50,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Reserve below 16 GB systems regardless of tier — small Macs cannot
-# afford a tier-scaled cut and still load any useful model.
+# Reserve sub-24 GB systems regardless of tier. Small Macs cannot afford a
+# tier-scaled cut and still load any useful model.
 _SMALL_SYSTEM_RESERVE = 4 * 1024**3
-_SMALL_SYSTEM_THRESHOLD = 16 * 1024**3
+_SMALL_SYSTEM_THRESHOLD = 24 * 1024**3
 
-# Tier map: static reserve (>= 16 GB systems). `custom` shares the
-# `balanced` reserve so the static cap stays sane regardless of what
-# the user types into the custom ceiling field.
+# Tier map: static reserve for systems at or above the small-system threshold.
+# `custom` shares the `balanced` reserve so the static cap stays sane
+# regardless of what the user types into the custom ceiling field.
 _STATIC_RESERVE_LARGE: dict[str, int] = {
-    "safe": 12 * 1024**3,  # aligned with Apple iogpu.wired_limit 75%
-    "balanced": 8 * 1024**3,
-    "aggressive": 6 * 1024**3,
+    "safe": 8 * 1024**3,
+    "balanced": 6 * 1024**3,
+    "aggressive": 4 * 1024**3,
     "custom": 2 * 1024**3,
 }
 
@@ -70,6 +72,16 @@ _ACTIVE_RECLAIM_RATIO: dict[str, float] = {
     "safe": 0.2,
     "balanced": 0.5,
     "aggressive": 0.8,
+}
+
+# Fraction of the effective physical cap used by the pre-chunk prediction
+# guard. Aggressive/custom are user-directed and can run closer to the
+# configured ceiling.
+_PREFILL_ABORT_MARGIN: dict[str, float] = {
+    "safe": 0.90,
+    "balanced": 0.90,
+    "aggressive": 0.95,
+    "custom": 0.95,
 }
 
 
@@ -290,7 +302,7 @@ class ProcessMemoryEnforcer:
         soft_threshold: float = 0.90,
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
-        prefill_min_chunk_tokens: int = 32,
+        prefill_min_chunk_tokens: int = 256,
     ):
         """
         Initialize the process memory enforcer.
@@ -323,7 +335,10 @@ class ProcessMemoryEnforcer:
         self._memory_guard_custom_ceiling_bytes = max(
             0, int(memory_guard_custom_ceiling_gb * 1024**3)
         )
-        self._poll_interval = poll_interval
+        self._active_poll_interval = poll_interval
+        self._loaded_idle_poll_interval = 10.0
+        self._unloaded_idle_poll_interval = 30.0
+        self._current_poll_interval = poll_interval
         self._settings_manager = settings_manager
         self._prefill_memory_guard = prefill_memory_guard
         self._global_settings = global_settings
@@ -332,7 +347,10 @@ class ProcessMemoryEnforcer:
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
         self._task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._wake_event: asyncio.Event | None = None
         self._running = False
+        self._activity_hint_until = 0.0
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
@@ -430,8 +448,36 @@ class ProcessMemoryEnforcer:
             f"Process memory enforcer started "
             f"(tier={self._memory_guard_tier}, "
             f"ceiling={_format_gb(ceiling)}, "
-            f"interval={self._poll_interval}s)"
+            f"interval={self._active_poll_interval}s)"
         )
+
+    def wake(self, *, active: bool = False) -> None:
+        """Wake the polling loop before its current sleep timeout expires.
+
+        ``active=True`` keeps the loop on the fast interval briefly. This covers
+        request/model-load entry points before an engine's active-request
+        collectors are visible to ``_select_poll_interval``.
+        """
+        if active:
+            self._activity_hint_until = max(
+                self._activity_hint_until,
+                time.monotonic() + max(2.0, self._active_poll_interval * 2),
+            )
+
+        event = self._wake_event
+        loop = self._loop
+        if event is None or loop is None or loop.is_closed():
+            return
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is loop:
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
 
     def _get_static_ceiling(self) -> int:
         """Total RAM minus tier-scaled static reserve."""
@@ -537,6 +583,10 @@ class ProcessMemoryEnforcer:
         if metal_cap > 0:
             return min(static_ceiling, metal_cap)
         return static_ceiling
+
+    def _get_prefill_abort_margin(self) -> float:
+        """Tier-specific prediction margin for pre-chunk safety checks."""
+        return _PREFILL_ABORT_MARGIN[self._memory_guard_tier]
 
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
@@ -648,6 +698,7 @@ class ProcessMemoryEnforcer:
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = ceiling
             scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
+            scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
@@ -677,18 +728,24 @@ class ProcessMemoryEnforcer:
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
         self._running = False
+        if self._wake_event is not None:
+            self._wake_event.set()
         if self._task:
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
+        self._wake_event = None
+        self._loop = None
         logger.info("Process memory enforcer stopped")
 
     async def _enforcement_loop(self) -> None:
         """Main polling loop."""
+        self._loop = asyncio.get_running_loop()
+        self._wake_event = asyncio.Event()
         while self._running:
+            if self._wake_event is not None:
+                self._wake_event.clear()
             try:
                 await self._check_and_enforce()
                 await self._check_ttl()
@@ -696,7 +753,45 @@ class ProcessMemoryEnforcer:
                 break
             except Exception as e:
                 logger.error(f"Process memory enforcer error: {e}")
-            await asyncio.sleep(self._poll_interval)
+            interval = self._select_poll_interval()
+            self._current_poll_interval = interval
+            if self._wake_event is None:
+                await asyncio.sleep(interval)
+                continue
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._wake_event.wait(), timeout=interval)
+
+    def _select_poll_interval(self) -> float:
+        """Choose the next polling interval from current engine activity."""
+        if self._pressure_level != "ok":
+            return self._active_poll_interval
+
+        if time.monotonic() < self._activity_hint_until:
+            return self._active_poll_interval
+
+        has_loaded = False
+        for entry in self._engine_pool._entries.values():
+            if getattr(entry, "is_loading", False):
+                return self._active_poll_interval
+
+            engine = getattr(entry, "engine", None)
+            if engine is None:
+                continue
+
+            has_loaded = True
+            has_active_requests = getattr(engine, "has_active_requests", None)
+            if not callable(has_active_requests):
+                return self._active_poll_interval
+            try:
+                if has_active_requests():
+                    return self._active_poll_interval
+            except Exception:
+                # If activity detection itself fails, bias toward safety.
+                return self._active_poll_interval
+
+        if has_loaded:
+            return self._loaded_idle_poll_interval
+        return self._unloaded_idle_poll_interval
 
     async def _check_ttl(self) -> None:
         """Check and unload models that exceeded their TTL."""
@@ -917,4 +1012,7 @@ class ProcessMemoryEnforcer:
             "current_formatted": _format_gb(current),
             "pressure_level": self._pressure_level if self._running else "ok",
             "utilization": (current / ceiling if ceiling > 0 else 0.0),
+            "poll_interval_seconds": (
+                self._current_poll_interval if self._running else 0.0
+            ),
         }

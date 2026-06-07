@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -63,6 +64,7 @@ class MockEmbeddingEngineImpl(EmbeddingEngine):
         # Don't call super().__init__ to avoid loading real model
         self._model_name = model_name
         self._model = None  # Set as None but present
+        self.calls: List[Dict[str, Any]] = []
 
     @property
     def model_name(self) -> str:
@@ -75,6 +77,7 @@ class MockEmbeddingEngineImpl(EmbeddingEngine):
         pass
 
     async def embed(self, texts, **kwargs) -> MockEmbeddingOutput:
+        self.calls.append({"texts": list(texts), "kwargs": dict(kwargs)})
         return MockEmbeddingOutput(
             embeddings=[[0.1, 0.2, 0.3] for _ in texts],
             total_tokens=len(texts) * 5,
@@ -249,6 +252,7 @@ class MockEnginePool:
         self._models = [
             {"id": "test-model", "loaded": True, "pinned": False, "size": 1000000}
         ]
+        self._entries: Dict[str, Any] = {}
 
     @property
     def model_count(self) -> int:
@@ -267,7 +271,7 @@ class MockEnginePool:
         return 1000000
 
     def get_entry(self, model_id: str):
-        return None
+        return self._entries.get(model_id)
 
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
@@ -282,7 +286,9 @@ class MockEnginePool:
             "max_model_memory": self.max_model_memory,
         }
 
-    async def get_engine(self, model_id: str):
+    async def get_engine(self, model_id: str, _lease: bool = False):
+        # _lease mirrors the real EnginePool's acquire-vs-use lease (#1667);
+        # the mock has no eviction so it just accepts the flag.
         # Return appropriate engine based on model name pattern
         if "embed" in model_id.lower():
             if self._embedding_engine:
@@ -293,6 +299,10 @@ class MockEnginePool:
                 return self._reranker_engine
             raise ValueError(f"No reranker engine for {model_id}")
         return self._llm_engine
+
+    async def release_engine(self, model_id: str) -> None:
+        # No-op release counterpart of the in-use lease (#1667).
+        return None
 
 
 @pytest.fixture
@@ -796,6 +806,114 @@ class TestChatCompletionEndpoint:
         assert message["tool_calls"][0]["function"]["arguments"] == '{"city": "SF"}'
         assert data["choices"][0]["finish_reason"] == "tool_calls"
 
+    @pytest.mark.parametrize(
+        ("tool_choice", "request_tools", "expect_tools"),
+        [
+            (None, None, True),
+            ("auto", None, True),
+            ("none", None, False),
+            (
+                "none",
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "user_search",
+                            "description": "Search from request tools",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+                False,
+            ),
+        ],
+    )
+    def test_chat_completion_tool_choice_controls_mcp_tools(
+        self,
+        client,
+        mock_llm_engine,
+        tool_choice,
+        request_tools,
+        expect_tools,
+    ):
+        """tool_choice='none' should suppress request and globally configured tools."""
+        from omlx.server import _server_state
+
+        class RecordingMCPManager:
+            def __init__(self):
+                self.calls = []
+
+            def get_merged_tools(self, user_tools=None):
+                self.calls.append(user_tools)
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_search",
+                            "description": "Search via MCP",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ]
+
+        recorded_count_tools = []
+        recorded_chat_kwargs = []
+
+        def count_chat_tokens(messages, tools=None, **kwargs):
+            recorded_count_tools.append(tools)
+            return 1
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Plain response.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        original_mcp_manager = _server_state.mcp_manager
+        manager = RecordingMCPManager()
+        mock_llm_engine.count_chat_tokens = count_chat_tokens
+        mock_llm_engine.chat = chat
+
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if request_tools is not None:
+            payload["tools"] = request_tools
+
+        try:
+            _server_state.mcp_manager = manager
+            response = client.post("/v1/chat/completions", json=payload)
+        finally:
+            _server_state.mcp_manager = original_mcp_manager
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+
+        if expect_tools:
+            assert manager.calls == [request_tools]
+            assert recorded_count_tools[0] is not None
+            assert "tools" in recorded_chat_kwargs[0]
+        else:
+            assert manager.calls == []
+            assert recorded_count_tools == [None]
+            assert "tools" not in recorded_chat_kwargs[0]
+
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
@@ -936,6 +1054,54 @@ class TestEmbeddingsEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert len(data["data"]) == 2
+
+    def test_embeddings_use_discovered_context_length(self, client, mock_engine_pool):
+        """Embedding requests should not fall back to mlx-embeddings' 512 default."""
+        mock_engine_pool._models.append(
+            {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        mock_engine_pool._entries["test-embed-model"] = SimpleNamespace(
+            model_context_length=40960
+        )
+
+        response = client.post(
+            "/v1/embeddings",
+            json={
+                "model": "test-embed-model",
+                "input": "hello",
+            },
+        )
+
+        assert response.status_code == 200
+        kwargs = mock_engine_pool._embedding_engine.calls[-1]["kwargs"]
+        assert kwargs["max_length"] == 40960
+        assert kwargs["truncation"] is True
+
+    def test_embeddings_request_max_length_overrides_default(
+        self, client, mock_engine_pool
+    ):
+        """Explicit max_length should be forwarded to the embedding engine."""
+        mock_engine_pool._models.append(
+            {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        mock_engine_pool._entries["test-embed-model"] = SimpleNamespace(
+            model_context_length=40960
+        )
+
+        response = client.post(
+            "/v1/embeddings",
+            json={
+                "model": "test-embed-model",
+                "input": "hello",
+                "max_length": 1024,
+                "truncation": False,
+            },
+        )
+
+        assert response.status_code == 200
+        kwargs = mock_engine_pool._embedding_engine.calls[-1]["kwargs"]
+        assert kwargs["max_length"] == 1024
+        assert kwargs["truncation"] is False
 
     def test_embeddings_response_format(self, client, mock_engine_pool):
         """Test embeddings response format."""

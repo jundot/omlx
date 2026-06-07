@@ -72,6 +72,27 @@ struct ServerScreen: View {
             .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
 
+            SectionHeader(String(localized: "server.section.startup",
+                                  defaultValue: "Server Startup",
+                                  comment: "Section heading for server startup behavior settings"))
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.auto_start_on_launch",
+                                  defaultValue: "Automatically start server on launch",
+                                  comment: "Row label for automatically starting the managed server when the macOS app launches"),
+                    sublabel: String(localized: "server.row.auto_start_on_launch.sub",
+                                     defaultValue: "When disabled, the menu bar app opens without starting the server.",
+                                     comment: "Sublabel explaining the auto-start on launch setting"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: vm.bind($vm.autoStartOnLaunch, save: {
+                        vm.saveAutoStartOnLaunch(services: services)
+                    }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
+
             SectionHeader(String(localized: "server.section.logging",
                                   defaultValue: "Logging",
                                   comment: "Section heading for the Logging rows"))
@@ -123,8 +144,21 @@ struct ServerScreen: View {
                 ) {
                     TextInput(text: $vm.basePathText, mono: true, width: 280)
                 }
-                FreeRow(isLast: true) {
+                FreeRow {
                     ModelDirectoriesEditor(vm: vm)
+                }
+                Row(
+                    label: String(localized: "server.row.hf_cache",
+                                  defaultValue: "Use Hugging Face local cache",
+                                  comment: "Row label for enabling standard Hugging Face Hub cache model discovery"),
+                    sublabel: String(localized: "server.row.hf_cache.sub",
+                                     defaultValue: "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
+                                     comment: "Sublabel for enabling Hugging Face local cache discovery"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: $vm.hfCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
             }
             ServerAdvancedSection(vm: vm)
@@ -721,6 +755,7 @@ final class ServerScreenVM: ObservableObject {
     @Published var host: String = "127.0.0.1"
     @Published var portText: String = "8000"
     @Published var logLevel: String = "info"
+    @Published var autoStartOnLaunch: Bool = true
 
     // Phase 4 — Advanced disclosure.
     @Published var sseKeepaliveMode: String = "chunk"
@@ -730,6 +765,7 @@ final class ServerScreenVM: ObservableObject {
     @Published var serverAliasesText: String = ""
     @Published var basePathText: String = AppConfig.defaultBasePath()
     @Published var modelDirTexts: [String] = [""]
+    @Published var hfCacheEnabled: Bool = true
     @Published var lastError: String?
     @Published private(set) var isMovingBasePath: Bool = false
 
@@ -764,6 +800,7 @@ final class ServerScreenVM: ObservableObject {
     private var baselineSamplingRepetitionPenaltyText: String = "1.0"
     private var baselineServerAliasesText: String = ""
     private var baselineModelDirs: [String] = []
+    private var baselineHfCacheEnabled: Bool = true
 
     private weak var client: OMLXClient?
     private var hasLoaded = false
@@ -775,6 +812,7 @@ final class ServerScreenVM: ObservableObject {
             self.host = dto.server.host
             self.portText = String(dto.server.port)
             self.logLevel = canonicalize(level: dto.server.logLevel)
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
             self.appliedBindAddress = dto.server.host
             self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
@@ -786,6 +824,7 @@ final class ServerScreenVM: ObservableObject {
             if !modelDirs.isEmpty {
                 self.modelDirTexts = modelDirs
             }
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -817,6 +856,7 @@ final class ServerScreenVM: ObservableObject {
         baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
         baselineServerAliasesText = serverAliasesText
         baselineModelDirs = Self.normalizedModelDirs(from: modelDirTexts)
+        baselineHfCacheEnabled = hfCacheEnabled
     }
 
     /// Apply-button gate: true when any Apply-managed draft diverges from
@@ -833,6 +873,7 @@ final class ServerScreenVM: ObservableObject {
         if t(samplingTopKText) != baselineSamplingTopKText { return true }
         if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
         if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        if hfCacheEnabled != baselineHfCacheEnabled { return true }
         return hasPendingStorageChanges(services: services)
     }
 
@@ -917,6 +958,9 @@ final class ServerScreenVM: ObservableObject {
         if newAliases != parseAliases(baselineServerAliasesText) {
             patch.serverAliases = newAliases
         }
+        if hfCacheEnabled != baselineHfCacheEnabled {
+            patch.hfCacheEnabled = hfCacheEnabled
+        }
 
         let diff = storageDiff(services: services)
         if diff.baseChanged && diff.normalizedBase.isEmpty {
@@ -943,6 +987,7 @@ final class ServerScreenVM: ObservableObject {
             || patch.samplingTopK != nil
             || patch.samplingRepetitionPenalty != nil
             || patch.serverAliases != nil
+            || patch.hfCacheEnabled != nil
             || patch.modelDirs != nil
 
         if !patchHasFields && !diff.hasChanges {
@@ -1219,6 +1264,24 @@ final class ServerScreenVM: ObservableObject {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
     }
 
+    func saveAutoStartOnLaunch(services: AppServices) {
+        let enabled = autoStartOnLaunch
+        Task {
+            do {
+                switch services.serverState {
+                case .running, .unresponsive:
+                    if await commit(GlobalSettingsPatch(autoStartOnLaunch: enabled)) {
+                        try services.setAutoStartOnLaunch(enabled, persist: false)
+                    }
+                default:
+                    try services.setAutoStartOnLaunch(enabled)
+                }
+            } catch {
+                self.lastError = error.omlxDescription
+            }
+        }
+    }
+
     /// Build a `Binding` that calls `save` after the value changes. Used for
     /// Popups that have no `onSubmit` hook.
     func bind<T: Equatable>(
@@ -1235,13 +1298,16 @@ final class ServerScreenVM: ObservableObject {
         )
     }
 
-    private func commit(_ patch: GlobalSettingsPatch) async {
-        guard let client else { return }
+    @discardableResult
+    private func commit(_ patch: GlobalSettingsPatch) async -> Bool {
+        guard let client else { return false }
         do {
             _ = try await client.updateGlobalSettings(patch)
             self.lastError = nil
+            return true
         } catch {
             self.lastError = error.omlxDescription
+            return false
         }
     }
 

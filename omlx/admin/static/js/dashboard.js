@@ -6,7 +6,7 @@
         'deepseek_v32', 'glm_moe_dsa',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
@@ -35,13 +35,26 @@
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
-                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
+                sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
-                huggingface: { endpoint: '' },
+                huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: {
+                    copilot_model: null,
+                    codex_model: null,
+                    opencode_model: null,
+                    openclaw_model: null,
+                    hermes_model: null,
+                    pi_model: null,
+                    openclaw_tools_profile: 'full',
+                    markitdown_enabled: true,
+                    markitdown_expose_model: true,
+                    markitdown_max_file_size_mb: 25,
+                    markitdown_max_files_per_request: 5,
+                    markitdown_pdf_processing_engine: 'markitdown',
+                },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -707,6 +720,9 @@
                         this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
+                        this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
+                            this.globalSettings.cache.hot_cache_max_size
+                        );
                         this.hotCachePercent = this.parseHotCacheToPercent(
                             this.globalSettings.cache.hot_cache_max_size,
                             this.globalSettings.system.total_memory_bytes
@@ -776,16 +792,20 @@
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
-                            hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
+                            hot_cache_max_size: this.normalizeHotCacheMaxSize(
+                                this.globalSettings.cache.hot_cache_max_size
+                            ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
+                            sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
                             sampling_top_p: this.globalSettings.sampling.top_p,
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
                             network_no_proxy: this.globalSettings.network.no_proxy,
@@ -2091,10 +2111,8 @@
             },
 
             _launchCmd(tool) {
-                // cli_prefix is always "omlx" or an app-bundle path with no
-                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
-                // in the dashboard command display.
-                const cli = this.stats.cli_prefix || 'omlx';
+                const raw = this.stats.cli_prefix || 'omlx';
+                const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
                 return `${cli} launch ${tool}`;
             },
 
@@ -2127,6 +2145,13 @@
                 return this._launchCmd('pi');
             },
 
+            get markitdownOcrModels() {
+                return (this.models || []).filter((model) => {
+                    const configType = String(model.config_model_type || '').toLowerCase();
+                    return configType.includes('ocr');
+                });
+            },
+
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -2140,6 +2165,11 @@
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
+                            markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
+                            markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,
+                            markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
+                            markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
+                            markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
                         }),
                     });
                     if (!response.ok) {
@@ -3469,7 +3499,7 @@
                         ? 2
                         : totalGB < 16
                             ? 4
-                            : { safe: 12, balanced: 8, aggressive: 6 }[tier] ?? 8;
+                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
                 const staticCeiling = Math.max(0, totalGB - staticReserveGB);
                 const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
 
@@ -3584,6 +3614,12 @@
             },
 
             // Parse hot cache size string to percent of total memory
+            normalizeHotCacheMaxSize(value) {
+                const normalized = String(value ?? '').trim();
+                if (!normalized || normalized.toLowerCase() === 'auto') return '0';
+                return normalized;
+            },
+
             parseHotCacheToPercent(hotCacheStr, totalBytes) {
                 if (!hotCacheStr || hotCacheStr === '0' || !totalBytes || totalBytes === 0) {
                     return 0;

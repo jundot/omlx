@@ -145,26 +145,94 @@ enum ReleasesChecker {
     }
 
     static func compareVersions(_ a: String, _ b: String) -> ComparisonResult {
-        let lhs = parseVersionComponents(a)
-        let rhs = parseVersionComponents(b)
-        let count = max(lhs.count, rhs.count)
+        let lhs = parseVersion(a)
+        let rhs = parseVersion(b)
+        let count = max(lhs.release.count, rhs.release.count)
         for i in 0..<count {
-            let lv = i < lhs.count ? lhs[i] : 0
-            let rv = i < rhs.count ? rhs[i] : 0
+            let lv = i < lhs.release.count ? lhs.release[i] : 0
+            let rv = i < rhs.release.count ? rhs.release[i] : 0
             if lv < rv { return .orderedAscending }
             if lv > rv { return .orderedDescending }
         }
+        if lhs.phaseRank < rhs.phaseRank { return .orderedAscending }
+        if lhs.phaseRank > rhs.phaseRank { return .orderedDescending }
+        if lhs.phaseNumber < rhs.phaseNumber { return .orderedAscending }
+        if lhs.phaseNumber > rhs.phaseNumber { return .orderedDescending }
         return .orderedSame
     }
 
-    /// Extracts the leading numeric components of a PEP 440 version. Drops
-    /// `rc`, `dev`, `post`, build metadata. Good enough for ordering oMLX's
-    /// own tags; the prerelease distinction is already handled upstream
-    /// through GitHub's `prerelease` flag.
+    private struct ParsedVersion {
+        let release: [Int]
+        let phaseRank: Int
+        let phaseNumber: Int
+    }
+
+    private static func parseVersion(_ version: String) -> ParsedVersion {
+        let normalized = String(version.trimmingPrefix("v").trimmingPrefix("V")).lowercased()
+        let phase = parsePhase(normalized)
+        return ParsedVersion(
+            release: parseVersionComponents(normalized),
+            phaseRank: phase.rank,
+            phaseNumber: phase.number
+        )
+    }
+
+    /// Extracts the leading numeric components of a PEP 440-ish version.
     private static func parseVersionComponents(_ version: String) -> [Int] {
         let trimmed = version.split(whereSeparator: { !$0.isNumber && $0 != "." })
             .first.map(String.init) ?? version
         return trimmed.split(separator: ".").compactMap { Int($0) }
+    }
+
+    /// PEP 440-style prerelease ordering for oMLX tags:
+    /// dev < alpha < beta < rc < final.
+    private static func parsePhase(_ version: String) -> (rank: Int, number: Int) {
+        if let n = numberAfterFullMarker("dev", in: version) {
+            return (0, n)
+        }
+        if let n = numberAfterFullMarker("alpha", in: version)
+            ?? numberAfterShortMarker("a", in: version) {
+            return (1, n)
+        }
+        if let n = numberAfterFullMarker("beta", in: version)
+            ?? numberAfterShortMarker("b", in: version) {
+            return (2, n)
+        }
+        if let n = numberAfterFullMarker("rc", in: version) {
+            return (3, n)
+        }
+        return (4, 0)
+    }
+
+    private static func numberAfterFullMarker(_ marker: String, in version: String) -> Int? {
+        guard let range = version.range(of: marker) else { return nil }
+        return parseTrailingPhaseNumber(String(version[range.upperBound...]))
+    }
+
+    private static func numberAfterShortMarker(_ marker: Character, in version: String) -> Int? {
+        var idx = version.startIndex
+        while idx < version.endIndex {
+            guard version[idx] == marker else {
+                idx = version.index(after: idx)
+                continue
+            }
+            let prev = idx == version.startIndex ? nil : version[version.index(before: idx)]
+            let next = version.index(after: idx)
+            let nextChar = next < version.endIndex ? version[next] : nil
+            let prevOK = prev == nil || prev!.isNumber || prev == "." || prev == "-"
+            let nextOK = nextChar == nil || nextChar!.isNumber || nextChar == "." || nextChar == "-"
+            if prevOK && nextOK {
+                return parseTrailingPhaseNumber(String(version[next...]))
+            }
+            idx = version.index(after: idx)
+        }
+        return nil
+    }
+
+    private static func parseTrailingPhaseNumber(_ suffix: String) -> Int {
+        let trimmed = suffix.drop(while: { $0 == "." || $0 == "-" })
+        let digits = trimmed.prefix(while: { $0.isNumber })
+        return Int(digits) ?? 0
     }
 
     /// GitHub's `prerelease` flag is release metadata and can be set

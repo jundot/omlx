@@ -178,20 +178,19 @@ class BlockAwarePrefixCache(CacheManager):
         if paged_ssd_cache_manager is not None:
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
-    def _unlink_stale_ssd_block(self, block_hash: bytes | None) -> None:
-        """Permanently remove a stale block from SSD so the mismatch
-        warning does not fire on every subsequent request for the same
-        prefix. Catches cases that bypass the startup scan (e.g., a model
-        swap during a single server lifetime, or partially-written blocks
-        from an interrupted upgrade). Safe no-op when SSD cache is
-        disabled or the block has no hash.
+    def _forget_incompatible_ssd_block(self, block_hash: bytes | None) -> None:
+        """Remove an incompatible block from this manager without unlinking it.
+
+        The SSD cache directory can be shared by multiple loaded models. A
+        block that is stale for this prefix cache may still be valid for
+        another model, so mismatch handling must clear local indexes only.
         """
         if self.paged_ssd_cache is None or block_hash is None:
             return
         try:
-            self.paged_ssd_cache.delete_block(block_hash)
+            self.paged_ssd_cache.forget_block(block_hash)
         except Exception as e:
-            logger.debug(f"Failed to delete stale SSD block: {e}")
+            logger.debug(f"Failed to forget incompatible SSD block: {e}")
 
     def _detect_window_padding_from_blocks(
         self,
@@ -1513,7 +1512,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Block has no model_name (legacy cache), "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
-                            self._unlink_stale_ssd_block(block.block_hash)
+                            self._forget_incompatible_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
                         elif block_model_name != current_model_name:
                             # Block is from a different model
@@ -1521,7 +1520,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache model mismatch: block is for '{block_model_name}', "
                                 f"current model is '{current_model_name}'. Invalidating cache hit."
                             )
-                            self._unlink_stale_ssd_block(block.block_hash)
+                            self._forget_incompatible_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                     # Validate num_layers to catch cross-model cache issues
@@ -1532,7 +1531,24 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"Cache layer count mismatch: block has {block_num_layers} layers, "
                                 f"expected {self.expected_num_layers}. Invalidating cache hit."
                             )
-                            self._unlink_stale_ssd_block(block.block_hash)
+                            self._forget_incompatible_ssd_block(block.block_hash)
+                            break  # Stop here, don't use this block
+
+                    if "block_size" in block_metadata:
+                        block_size = block_metadata.get("block_size", 0)
+                        if block_size and block_size != self.block_size:
+                            logger.warning(
+                                f"Cache block size mismatch: block has block_size={block_size}, "
+                                f"expected {self.block_size}. Invalidating cache hit."
+                            )
+                            self._forget_incompatible_ssd_block(block.block_hash)
+                            break  # Stop here, don't use this block
+                        if not block_size and self.block_size:
+                            logger.warning(
+                                "Block has no block_size metadata (legacy cache), "
+                                f"current block_size is {self.block_size}. Invalidating cache hit."
+                            )
+                            self._forget_incompatible_ssd_block(block.block_hash)
                             break  # Stop here, don't use this block
 
                 # Extract type info from block metadata
@@ -1714,9 +1730,7 @@ class BlockAwarePrefixCache(CacheManager):
                     if (
                         last_block_meta_states
                         and layer_idx < len(last_block_meta_states)
-                        and isinstance(
-                            last_block_meta_states[layer_idx], (list, tuple)
-                        )
+                        and isinstance(last_block_meta_states[layer_idx], (list, tuple))
                         and len(last_block_meta_states[layer_idx]) >= 1
                         and isinstance(
                             last_block_meta_states[layer_idx][0], (list, tuple)
@@ -1816,9 +1830,7 @@ class BlockAwarePrefixCache(CacheManager):
                         adjusted_sub_metas = []
                         for j in range(num_sub_caches):
                             orig_sub_meta = (
-                                meta_state[1][j]
-                                if j < len(meta_state[1])
-                                else ""
+                                meta_state[1][j] if j < len(meta_state[1]) else ""
                             )
                             sub_class = (
                                 sub_class_names_for_layer[j]
@@ -2278,11 +2290,21 @@ class BlockAwarePrefixCache(CacheManager):
         if not cache_data:
             return False
 
-        # Cache types that don't support block slicing (have different shapes)
-        # ArraysCache: generic array cache used by some hybrid models (e.g., Qwen3-Next)
-        # RotatingKVCache: uses circular buffer with fixed max_size, cannot be sliced
-        # CacheList: composite cache with List[Tuple] format, not (keys, values) tuple
-        non_sliceable_types = {"ArraysCache", "RotatingKVCache", "CacheList"}
+        # Cache types that support per-block KV slicing. When cache type
+        # metadata is present, do not let non-KV hybrid states define the
+        # expected seq_len for KVCache layers.
+        sliceable_types = {
+            "KVCache",
+            "BatchKVCache",
+            "TurboQuantKVCache",
+            "BatchTurboQuantKVCache",
+        }
+        non_sliceable_types = {
+            "ArraysCache",
+            "RotatingKVCache",
+            "BatchRotatingKVCache",
+            "CacheList",
+        }
 
         expected_seq_len = None
 
@@ -2300,7 +2322,14 @@ class BlockAwarePrefixCache(CacheManager):
                         continue  # Sub-cache list — valid
                     # Fall through to standard check for placeholder (zeros tuple)
 
-                keys, values = layer_data
+                if not isinstance(layer_data, (list, tuple)) or len(layer_data) < 2:
+                    logger.debug(
+                        f"Block validation failed: layer {layer_idx} has "
+                        f"unsupported data type {type(layer_data).__name__}"
+                    )
+                    return False
+
+                keys, values = layer_data[0], layer_data[1]
 
                 # Check for None
                 if keys is None or values is None:
@@ -2313,6 +2342,8 @@ class BlockAwarePrefixCache(CacheManager):
                 # This includes placeholder entries (1D tensors from non-last blocks)
                 # used by the last-block-only RotatingKVCache storage strategy
                 if cache_type in non_sliceable_types:
+                    continue
+                if layer_cache_types and cache_type not in sliceable_types:
                     continue
 
                 # Check shape consistency for sliceable types (KVCache, RotatingKVCache)

@@ -22,15 +22,37 @@ from omlx.api.shared_models import (
     get_unix_timestamp,
 )
 
-
 # =============================================================================
 # Content Types
 # =============================================================================
 
+
 class ImageURL(BaseModel):
     """Image URL or base64 data URI for vision model input."""
+
     url: str  # "https://..." or "data:image/jpeg;base64,..."
     detail: Optional[str] = "auto"  # "low", "high", "auto"
+
+
+class InputAudio(BaseModel):
+    """Audio input data for multimodal models (OpenAI format)."""
+
+    data: str  # Base64-encoded audio or data URI
+    format: str = "wav"  # Audio format: wav, mp3, etc.
+
+
+class FileContent(BaseModel):
+    """File input for attachment preprocessing.
+
+    ``file_data`` matches OpenAI Chat Completions file content parts.
+    ``data`` is accepted as an oMLX legacy alias for dashboard clients.
+    """
+
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    file_data: Optional[str] = None
+    data: Optional[str] = None
+    file_id: Optional[str] = None
 
 
 class ContentPart(BaseModel):
@@ -40,15 +62,21 @@ class ContentPart(BaseModel):
     Supports:
     - text: Plain text content
     - image_url: Image input for vision models
+    - input_audio: Audio input for multimodal audio models
+    - file: Document or text input for attachment preprocessing
     """
-    type: str  # "text" or "image_url"
+
+    type: str  # "text", "image_url", "input_audio", or "file"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    input_audio: Optional[InputAudio] = None
+    file: Optional[FileContent] = None
 
 
 # =============================================================================
 # Messages
 # =============================================================================
+
 
 class Message(BaseModel):
     """
@@ -60,6 +88,7 @@ class Message(BaseModel):
     - Tool call messages (assistant with tool_calls)
     - Tool response messages (role="tool" with tool_call_id)
     """
+
     role: str
     content: Optional[Union[str, List[ContentPart], List[dict]]] = None
     # Reasoning/thinking content from <think> blocks (OpenAI reasoning_content field)
@@ -99,6 +128,7 @@ class Message(BaseModel):
 # Tool Calling
 # =============================================================================
 
+
 def _coerce_tool_call_arguments(v: Any) -> str:
     """Normalize a tool_call.arguments value to a JSON-object string.
 
@@ -116,7 +146,7 @@ def _coerce_tool_call_arguments(v: Any) -> str:
         raise ValueError(
             f"arguments must be a JSON-encoded string, got {type(v).__name__}. "
             "Per the OpenAI spec tool_call.arguments is a string containing JSON, "
-            "not a dict/list/number. Example: '{\"location\": \"Tokyo\"}'."
+            'not a dict/list/number. Example: \'{"location": "Tokyo"}\'.'
         )
     stripped = v.strip()
     if not stripped:
@@ -129,20 +159,21 @@ def _coerce_tool_call_arguments(v: Any) -> str:
             f"arguments must be valid JSON, got parse error: {e}. "
             "This usually means the client echoed a previous tool call "
             "with a malformed arguments value. Send arguments as a "
-            "JSON-encoded object string like '{\"location\": \"Tokyo\"}'. "
+            'JSON-encoded object string like \'{"location": "Tokyo"}\'. '
             f"Received: {snippet!r}"
         ) from e
     if not isinstance(parsed, dict):
         raise ValueError(
             f"arguments must be a JSON object, got {type(parsed).__name__}. "
             "Tool-call arguments cannot be a list, number, or bare string. "
-            "Example: '{\"location\": \"Tokyo\"}'."
+            'Example: \'{"location": "Tokyo"}\'.'
         )
     return v
 
 
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
+
     name: str
     arguments: str  # JSON string
 
@@ -159,6 +190,7 @@ class FunctionCall(BaseModel):
 
 class ToolCall(BaseModel):
     """A tool call from the model."""
+
     id: str
     type: str = "function"
     function: FunctionCall
@@ -166,6 +198,7 @@ class ToolCall(BaseModel):
 
 class ToolDefinition(BaseModel):
     """Definition of a tool that can be called by the model."""
+
     type: str = "function"
     function: dict
 
@@ -174,8 +207,10 @@ class ToolDefinition(BaseModel):
 # Structured Output (JSON Schema)
 # =============================================================================
 
+
 class ResponseFormatJsonSchema(BaseModel):
     """JSON Schema definition for structured output."""
+
     name: str
     description: Optional[str] = None
     schema_: dict = Field(alias="schema")  # JSON Schema specification
@@ -194,6 +229,7 @@ class ResponseFormat(BaseModel):
     - "json_object": Forces valid JSON output
     - "json_schema": Forces JSON matching a specific schema
     """
+
     type: str = "text"  # "text", "json_object", "json_schema"
     json_schema: Optional[ResponseFormatJsonSchema] = None
 
@@ -210,6 +246,7 @@ class StructuredOutputOptions(BaseModel):
     - choice: List of allowed string values (output will be exactly one)
     - grammar: EBNF/GBNF context-free grammar string
     """
+
     model_config = {"populate_by_name": True}
 
     json_schema: Optional[Union[str, dict]] = Field(None, alias="json")
@@ -222,13 +259,16 @@ class StructuredOutputOptions(BaseModel):
 # Chat Completion
 # =============================================================================
 
+
 class StreamOptions(BaseModel):
     """Options for streaming responses."""
+
     include_usage: bool = False
 
 
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
+
     model: str
     messages: List[Message]
     temperature: float | None = None
@@ -277,6 +317,7 @@ class ChatCompletionRequest(BaseModel):
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""
+
     role: str = "assistant"
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -285,6 +326,7 @@ class AssistantMessage(BaseModel):
 
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
+
     index: int = 0
     message: AssistantMessage
     finish_reason: Optional[str] = "stop"
@@ -330,8 +372,10 @@ class ChatCompletionResponse(BaseModel):
 # Text Completion
 # =============================================================================
 
+
 class CompletionRequest(BaseModel):
     """Request for text completion."""
+
     model: str
     prompt: Union[str, List[str]]
     temperature: float | None = None
@@ -361,6 +405,7 @@ class CompletionRequest(BaseModel):
 
 class CompletionChoice(BaseModel):
     """A single choice in text completion response."""
+
     index: int = 0
     text: str
     finish_reason: Optional[str] = "stop"
@@ -381,6 +426,7 @@ class CompletionResponse(BaseModel):
 # Models List
 # =============================================================================
 
+
 class ModelInfo(BaseModel):
     """Information about an available model."""
 
@@ -396,6 +442,7 @@ class ModelInfo(BaseModel):
 
 class ModelsResponse(BaseModel):
     """Response for listing models."""
+
     object: str = "list"
     data: List[ModelInfo]
 
@@ -404,8 +451,10 @@ class ModelsResponse(BaseModel):
 # MCP (Model Context Protocol)
 # =============================================================================
 
+
 class MCPToolInfo(BaseModel):
     """Information about an MCP tool."""
+
     name: str
     description: str
     server: str
@@ -414,12 +463,14 @@ class MCPToolInfo(BaseModel):
 
 class MCPToolsResponse(BaseModel):
     """Response for listing MCP tools."""
+
     tools: List[MCPToolInfo]
     count: int
 
 
 class MCPServerInfo(BaseModel):
     """Information about an MCP server."""
+
     name: str
     state: str
     transport: str
@@ -429,11 +480,13 @@ class MCPServerInfo(BaseModel):
 
 class MCPServersResponse(BaseModel):
     """Response for listing MCP servers."""
+
     servers: List[MCPServerInfo]
 
 
 class MCPExecuteRequest(BaseModel):
     """Request to execute an MCP tool."""
+
     model_config = {"populate_by_name": True}
 
     tool_name: str = Field(validation_alias=AliasChoices("tool_name", "tool"))
@@ -442,6 +495,7 @@ class MCPExecuteRequest(BaseModel):
 
 class MCPExecuteResponse(BaseModel):
     """Response from executing an MCP tool."""
+
     tool_name: str
     content: Optional[Union[str, list, dict]] = None
     is_error: bool = False
@@ -452,8 +506,10 @@ class MCPExecuteResponse(BaseModel):
 # Streaming (for SSE responses)
 # =============================================================================
 
+
 class ChatCompletionChunkDelta(BaseModel):
     """Delta content in a streaming chunk."""
+
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -462,6 +518,7 @@ class ChatCompletionChunkDelta(BaseModel):
 
 class ChatCompletionChunkChoice(BaseModel):
     """A single choice in a streaming chunk."""
+
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: Optional[str] = None

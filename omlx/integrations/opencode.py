@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.utils.install import get_cli_prefix
+from omlx.utils.install import get_cli_command_prefix
 
 
 class OpenCodeIntegration(Integration):
@@ -25,7 +25,7 @@ class OpenCodeIntegration(Integration):
 
     def get_command(self, ctx: IntegrationContext) -> str:
         return (
-            f"{get_cli_prefix()} "
+            f"{get_cli_command_prefix()} "
             f"launch opencode --model {ctx.model or 'select-a-model'}"
         )
 

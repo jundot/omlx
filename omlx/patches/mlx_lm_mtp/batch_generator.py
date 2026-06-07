@@ -139,6 +139,7 @@ def apply() -> bool:
                     _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            _mark_standard_multirow_decode(self)
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
@@ -246,7 +247,24 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
     if getattr(gen_batch, state_attr, None) is not None:
         return True
+    if getattr(gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False):
+        return False
     return bool(getattr(gen_batch, "_omlx_mtp_activation_safe", True))
+
+
+def _mark_standard_multirow_decode(gen_batch: Any) -> None:
+    """Remember that this batch has decoded with shared standard cache state.
+
+    A row that survives a standard multi-row decode and later becomes singleton
+    no longer satisfies the narrow invariant that singleton MTP initialization
+    relies on. Existing row-wise MTP state may continue, but starting a fresh
+    singleton MTP state after late-join/late-finish reshaping is unsafe.
+    """
+    try:
+        if len(getattr(gen_batch, "uids", []) or []) > 1:
+            gen_batch._omlx_mtp_saw_standard_multirow_decode = True
+    except Exception:
+        pass
 
 
 def _batch_rows_aligned_for_mtp(gen_batch: Any) -> bool:

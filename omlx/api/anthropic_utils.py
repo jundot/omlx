@@ -115,6 +115,35 @@ def _append_anthropic_image_part(image_parts: list[dict], block_dict: dict[str, 
                 "url": source.get("url", ""),
             },
         })
+def _append_anthropic_image_part(image_parts: list[dict], block_dict: dict[str, Any]) -> None:
+    """Convert Anthropic image blocks to OpenAI-style image_url parts."""
+    source = block_dict.get("source", {})
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/jpeg")
+        data = source.get("data", "")
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{data}",
+            },
+        })
+    elif source.get("type") == "url":
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {
+                "url": source.get("url", ""),
+            },
+        })
+
+
+def _append_anthropic_audio_part(audio_parts: list[dict], block_dict: dict[str, Any]) -> None:
+    """Pass through an input_audio block unchanged for the VLM engine."""
+    input_audio = block_dict.get("input_audio")
+    if input_audio and isinstance(input_audio, dict):
+        audio_parts.append({
+            "type": "input_audio",
+            "input_audio": input_audio,
+        })
 
 
 def _extract_images_from_tool_result_content(
@@ -133,10 +162,15 @@ def _build_message_from_parts(
     role: str,
     text_parts: list[str],
     image_parts: list[dict],
+    audio_parts: list[dict] | None = None,
 ) -> dict[str, Any] | None:
-    """Build a single internal message from accumulated text/image parts."""
-    if image_parts:
-        content_parts = list(image_parts)
+    """Build a single internal message from accumulated text/image/audio parts."""
+    media_parts = list(image_parts)
+    if audio_parts:
+        media_parts.extend(audio_parts)
+
+    if media_parts:
+        content_parts = list(media_parts)
         if text_parts:
             content_parts.append({
                 "type": "text",
@@ -211,6 +245,7 @@ def convert_anthropic_to_internal(
                 if role == "assistant":
                     text_parts: list[str] = []
                     image_parts: list[dict] = []
+                    audio_parts: list[dict] = []
                     tool_calls: list[dict] = []
                     thinking_parts: list[str] = []
                     for block in content:
@@ -222,6 +257,8 @@ def convert_anthropic_to_internal(
                             text_parts.append(block_dict.get("text", ""))
                         elif block_type == "image" and preserve_images:
                             _append_anthropic_image_part(image_parts, block_dict)
+                        elif block_type == "input_audio" and preserve_images:
+                            _append_anthropic_audio_part(audio_parts, block_dict)
                         elif block_type == "tool_use":
                             tool_input = block_dict.get("input", {})
                             if isinstance(tool_input, str):
@@ -249,7 +286,7 @@ def convert_anthropic_to_internal(
                                     text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
-                    msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
+                    msg_dict = _build_message_from_parts(role, text_parts, image_parts, audio_parts) or {
                         "role": role,
                         "content": "",
                     }
@@ -264,6 +301,7 @@ def convert_anthropic_to_internal(
                 if role == "user":
                     text_parts = []
                     image_parts = []
+                    audio_parts = []
                     saw_tool_result = False
                     for block in content:
                         block_dict = _content_block_to_dict(block)
@@ -274,12 +312,15 @@ def convert_anthropic_to_internal(
                             text_parts.append(block_dict.get("text", ""))
                         elif block_type == "image" and preserve_images:
                             _append_anthropic_image_part(image_parts, block_dict)
+                        elif block_type == "input_audio" and preserve_images:
+                            _append_anthropic_audio_part(audio_parts, block_dict)
                         elif block_type == "tool_result":
-                            msg_dict = _build_message_from_parts(role, text_parts, image_parts)
+                            msg_dict = _build_message_from_parts(role, text_parts, image_parts, audio_parts)
                             if msg_dict:
                                 processed_messages.append(msg_dict)
                             text_parts = []
                             image_parts = []
+                            audio_parts = []
                             saw_tool_result = True
                             processed_messages.append({
                                 "role": "tool",
@@ -304,7 +345,7 @@ def convert_anthropic_to_internal(
                                 text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
-                    msg_dict = _build_message_from_parts(role, text_parts, image_parts)
+                    msg_dict = _build_message_from_parts(role, text_parts, image_parts, audio_parts)
                     if msg_dict:
                         processed_messages.append(msg_dict)
                     elif not saw_tool_result:
@@ -314,6 +355,7 @@ def convert_anthropic_to_internal(
             # Content blocks list
             text_parts: list[str] = []
             image_parts: list[dict] = []
+            audio_parts: list[dict] = []
             thinking_parts: list[str] = []
             saw_tool_markup = False
             for block in content:
@@ -328,6 +370,9 @@ def convert_anthropic_to_internal(
 
                 elif block_type == "image" and preserve_images:
                     _append_anthropic_image_part(image_parts, block_dict)
+
+                elif block_type == "input_audio" and preserve_images:
+                    _append_anthropic_audio_part(audio_parts, block_dict)
 
                 elif block_type == "tool_use":
                     # Tool use in assistant message (model called a tool)
@@ -368,7 +413,7 @@ def convert_anthropic_to_internal(
                 elif block_type == "document":
                     text_parts.append(_decode_document_block(block_dict))
 
-            msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
+            msg_dict = _build_message_from_parts(role, text_parts, image_parts, audio_parts) or {
                 "role": role,
                 "content": "",
             }

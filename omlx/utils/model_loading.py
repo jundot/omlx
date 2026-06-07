@@ -82,6 +82,8 @@ def maybe_apply_pre_load_patches(
 
     - DeepSeek V4 patch (PR 1192) when ``config.json`` declares
       ``model_type == "deepseek_v4"``.
+    - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
+      declares ``model_type == "step3p7"``.
     - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
@@ -130,6 +132,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_deepseek_v4_patch():
             logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
+
+    if model_type == "step3p7":
+        from ..patches.step3p7 import apply_step3p7_patch
+
+        if apply_step3p7_patch():
+            logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
@@ -429,7 +437,6 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 
     Currently supports:
     - IndexCache: skip redundant indexer computation in DSA layers
-    - GatedDeltaNet advance: fix missing cache.advance() in qwen3_5
 
     Args:
         model: A loaded mlx-lm model instance.
@@ -438,16 +445,6 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
-    # GatedDeltaNet advance patch: always applied for qwen3_5 models
-    # (no settings needed — auto-detected by model type)
-    from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-    from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
-
-    if apply_gated_delta_advance_patch(model):
-        logger.info("GatedDeltaNet advance() patch applied")
-    if apply_qwen3_5_attention_patch(model):
-        logger.info("Qwen3_5Attention plain-rope patch applied")
-
     if model_settings is None:
         return model
 

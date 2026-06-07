@@ -2,6 +2,7 @@
 """Tests for ProcessMemoryEnforcer."""
 
 import asyncio
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -102,6 +103,82 @@ def enforcer(mock_engine_pool):
     2-watermark tests construct their own enforcer with default thresholds.
     """
     return _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+
+
+class TestAdaptivePolling:
+    """Tests for adaptive ProcessMemoryEnforcer polling cadence."""
+
+    def test_no_loaded_or_loading_models_uses_unloaded_idle_interval(self, enforcer):
+        enforcer._engine_pool._entries = {
+            f"model-{i}": _make_entry(f"model-{i}") for i in range(3)
+        }
+
+        assert enforcer._select_poll_interval() == 30.0
+
+    def test_loading_model_uses_active_interval(self, enforcer):
+        enforcer._engine_pool._entries = {
+            "loading": _make_entry("loading", is_loading=True)
+        }
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_loaded_idle_model_uses_loaded_idle_interval(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        enforcer._engine_pool._entries = {
+            "loaded": _make_entry("loaded", engine=engine)
+        }
+
+        assert enforcer._select_poll_interval() == 10.0
+
+    def test_loaded_active_model_uses_active_interval(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        enforcer._engine_pool._entries = {
+            "active": _make_entry("active", engine=engine)
+        }
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_pressure_uses_active_interval(self, enforcer):
+        enforcer._pressure_level = "soft"
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_activity_hint_uses_active_interval(self, enforcer):
+        enforcer._engine_pool._entries = {}
+        enforcer.wake(active=True)
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    @pytest.mark.asyncio
+    async def test_wake_interrupts_idle_sleep(self, enforcer):
+        enforcer._engine_pool._entries = {}
+        enforcer._running = True
+        enforcer._check_and_enforce = AsyncMock()
+        enforcer._check_ttl = AsyncMock()
+
+        task = asyncio.create_task(enforcer._enforcement_loop())
+        try:
+            for _ in range(20):
+                if enforcer._check_and_enforce.await_count >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert enforcer._check_and_enforce.await_count >= 1
+
+            enforcer.wake()
+            for _ in range(20):
+                if enforcer._check_and_enforce.await_count >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert enforcer._check_and_enforce.await_count >= 2
+        finally:
+            enforcer._running = False
+            enforcer.wake()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 class TestCheckAndEnforce:
@@ -376,13 +453,13 @@ class TestPrefillMemoryGuardToggle:
 class TestStaticCeiling:
     """Tier-driven static ceiling (`total_ram - tier.static_reserve`).
 
-    >= 16 GB systems use a tier-scaled reserve. < 16 GB systems always
-    use 4 GB regardless of tier.
+    >= 24 GB systems use a tier-scaled reserve. < 24 GB systems always
+    use a 4 GB reserve regardless of tier.
     """
 
     @pytest.mark.parametrize(
         "tier,expected_reserve_gb",
-        [("safe", 12), ("balanced", 8), ("aggressive", 6)],
+        [("safe", 8), ("balanced", 6), ("aggressive", 4)],
     )
     def test_large_system_tier_reserve(
         self, mock_engine_pool, tier, expected_reserve_gb
@@ -406,6 +483,48 @@ class TestStaticCeiling:
             mock_mem.return_value = 12 * 1024**3
             result = enforcer._get_static_ceiling()
         assert result == 8 * 1024**3
+
+    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
+    def test_16gb_system_uses_4gb_reserve_regardless_of_tier(
+        self, mock_engine_pool, tier
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 16 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 12 * 1024**3
+
+    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
+    def test_between_16gb_and_24gb_system_uses_4gb_reserve_regardless_of_tier(
+        self, mock_engine_pool, tier
+    ):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier=tier
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 16 * 1024**3 + 256 * 1024**2
+            result = enforcer._get_static_ceiling()
+        assert result == 12 * 1024**3 + 256 * 1024**2
+
+    def test_18gb_system_uses_4gb_reserve(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 18 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 14 * 1024**3
+
+    def test_24gb_system_uses_tier_reserve(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 24 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 18 * 1024**3
 
     def test_custom_uses_2gb_reserve_on_large_system(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -544,10 +663,10 @@ class TestHardLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic balanced = 2 + 30 + 10 + 5*0.5 = 44.5 GB
-            # static (40) wins → final ceiling is 40 GB
-            assert enforcer._get_hard_limit_bytes() == 40 * 1024**3
+            # static (42) wins → final ceiling is 42 GB
+            assert enforcer._get_hard_limit_bytes() == 42 * 1024**3
 
     def test_picks_dynamic_when_smaller(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -568,7 +687,7 @@ class TestHardLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic balanced = 1 + 5 + 2 + int(4 * 0.5) = 10 GB
             # → dynamic wins
             assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
@@ -599,9 +718,9 @@ class TestAbortLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=100 * 1024**3,
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
+            mock_mem.return_value = 48 * 1024**3  # static = 42 GB
             # dynamic (~10 GB) is far below, but the abort limit ignores it.
-            assert enforcer._get_abort_limit_bytes() == 40 * 1024**3
+            assert enforcer._get_abort_limit_bytes() == 42 * 1024**3
             # Sanity: the (jittery) hard limit DID drop to dynamic.
             assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
 
@@ -628,8 +747,8 @@ class TestAbortLimitCalculation:
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=0,  # unknown
         ):
-            # aggressive reserve = 6 GB → static = 42 GB
-            assert enforcer._get_abort_limit_bytes() == 42 * 1024**3
+            # aggressive reserve = 4 GB → static = 44 GB
+            assert enforcer._get_abort_limit_bytes() == 44 * 1024**3
 
     def test_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -677,12 +796,12 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 36 * 1024**3
             enforcer.start()
-        # balanced @ 48 GB => static_ceiling = 40 GB
-        mock_mx.set_wired_limit.assert_called_once_with(40 * 1024**3)
+        # balanced @ 48 GB => static_ceiling = 42 GB
+        mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
         # Stored value is the desired ceiling (not the post-clamp value)
         # so the admin UI can detect a kernel cap that's below the
         # request and surface the sysctl-raise hint.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        assert enforcer._metal_wired_limit_request == 42 * 1024**3
 
     def test_start_clamps_to_effective_cap_when_lower(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
@@ -703,10 +822,10 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 48 * 1024**3
             enforcer.start()
-        # aggressive @ 64 GB static = 58 GB, clamped to cap 42 GB
+        # aggressive @ 64 GB static = 60 GB, clamped to cap 42 GB
         mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
-        # Desired (58 GB) is stored, not the post-clamp 42 GB.
-        assert enforcer._metal_wired_limit_request == 58 * 1024**3
+        # Desired (60 GB) is stored, not the post-clamp 42 GB.
+        assert enforcer._metal_wired_limit_request == 60 * 1024**3
 
     def test_start_clamps_to_apple_default_when_sysctl_unset(
         self, mock_engine_pool
@@ -730,9 +849,9 @@ class TestMetalWiredLimit:
         ):
             mock_mx.set_wired_limit.return_value = 0
             enforcer.start()
-        # balanced @ 512 GB static = 504 GB, clamped to working set 128 GB
+        # balanced @ 512 GB static = 506 GB, clamped to working set 128 GB
         mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
-        assert enforcer._metal_wired_limit_request == 504 * 1024**3
+        assert enforcer._metal_wired_limit_request == 506 * 1024**3
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
         """Older macOS (<15) raises on the call; enforcer keeps going."""
@@ -753,7 +872,7 @@ class TestMetalWiredLimit:
             enforcer.start()  # must not raise
         # We store the desired static_ceiling even when the call fails,
         # so the admin UI can still surface a warning.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        assert enforcer._metal_wired_limit_request == 42 * 1024**3
 
     def test_start_skips_when_guard_disabled(self, mock_engine_pool):
         """Guard off means we should not touch Metal limits either."""
@@ -1243,6 +1362,15 @@ class TestTwoWatermarkPressureLevels:
         assert enforcer_2wm._soft_bytes() == int(100 * 1024**3 * 0.85)
         assert enforcer_2wm._hard_bytes() == int(100 * 1024**3 * 0.95)
 
+    def test_prefill_abort_margin_is_tier_specific(self, pool):
+        balanced = _make_enforcer(pool, tier="balanced")
+        aggressive = _make_enforcer(pool, tier="aggressive")
+        custom = _make_enforcer(pool, tier="custom")
+
+        assert balanced._get_prefill_abort_margin() == 0.90
+        assert aggressive._get_prefill_abort_margin() == 0.95
+        assert custom._get_prefill_abort_margin() == 0.95
+
     def test_get_pressure_level_when_not_running(self, enforcer_2wm):
         # _running=False → always ok regardless of cached level
         enforcer_2wm._pressure_level = "hard"
@@ -1352,6 +1480,28 @@ class TestTwoWatermarkPressureLevels:
             await enforcer_2wm._check_and_enforce()
 
         assert scheduler._memory_abort_limit_bytes == 42 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_propagates_prefill_abort_margin_to_scheduler(self, pool):
+        enforcer = _make_enforcer(pool, ceiling=100 * 1024**3, tier="custom")
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_abort_limit_bytes = 0
+        scheduler._prefill_abort_margin = 0.90
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer._check_and_enforce()
+
+        assert scheduler._prefill_abort_margin == 0.95
 
     @pytest.mark.asyncio
     async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):

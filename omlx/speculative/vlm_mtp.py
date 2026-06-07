@@ -54,7 +54,10 @@ logger = logging.getLogger(__name__)
 
 # What model_type strings count as a gemma4 assistant drafter. Kept as a
 # tuple so we can extend if upstream adds related drafter kinds later.
-GEMMA4_ASSISTANT_MODEL_TYPES: tuple[str, ...] = ("gemma4_assistant",)
+GEMMA4_ASSISTANT_MODEL_TYPES: tuple[str, ...] = (
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+)
 
 
 class VLMMTPDrafter:

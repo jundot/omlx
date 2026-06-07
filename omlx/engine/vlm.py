@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import inspect
 import importlib
 import json
 import logging
@@ -39,8 +40,6 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
-from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -74,6 +73,8 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|endoftext|>",
     "<|endofassistant|>",
 ]
+
+VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
@@ -257,6 +258,32 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
             "torch+torchvision or upgrade mlx-vlm."
         )
 
+    # Read feature_extractor config if present (needed for audio models like gemma4_unified)
+    fe_config = {}
+    fe_type = None
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        fe_section = cfg.get("feature_extractor", {})
+        if isinstance(fe_section, dict):
+            fe_config = dict(fe_section)
+            fe_type = fe_config.pop("feature_extractor_type", None)
+            if fe_type:
+                break
+
+    feature_extractor = None
+    if fe_type:
+        # Dynamically import the feature extractor class
+        fe_cls = _resolve_feature_extractor_class(fe_type)
+        if fe_cls is not None:
+            try:
+                feature_extractor = fe_cls(**fe_config)
+                logger.debug("Created feature_extractor %s from %s", fe_type, path)
+            except Exception as e:
+                logger.warning("Failed to create feature_extractor %s: %s", fe_type, e)
     pil_cls = _resolve_pil_image_processor_class(ip_type, IMAGE_PROCESSOR_MAPPING_NAMES)
     if pil_cls is None:
         raise ImportError(
@@ -276,7 +303,11 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
     except (ImportError, AttributeError):
         pass
 
-    return cls(image_processor=image_processor, tokenizer=tokenizer)
+    processor_kwargs = {"image_processor": image_processor, "tokenizer": tokenizer}
+    if feature_extractor is not None:
+        processor_kwargs["feature_extractor"] = feature_extractor
+
+    return cls(**processor_kwargs)
 
 
 def _resolve_pil_image_processor_class(ip_type, mapping_names):
@@ -298,6 +329,37 @@ def _resolve_pil_image_processor_class(ip_type, mapping_names):
         candidate = getattr(mod, pil_name, None)
         if candidate is not None and not getattr(candidate, "is_dummy", False):
             return candidate
+    return None
+
+
+# Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
+_FEATURE_EXTRACTOR_MAP = {
+    "Gemma4UnifiedAudioFeatureExtractor": (
+        "mlx_vlm.models.gemma4_unified.processing_gemma4_unified",
+        "Gemma4UnifiedAudioFeatureExtractor",
+    ),
+    "Gemma4AudioFeatureExtractor": (
+        "mlx_vlm.models.gemma4.audio_feature_extractor",
+        "Gemma4AudioFeatureExtractor",
+    ),
+}
+
+
+def _resolve_feature_extractor_class(fe_type: str):
+    """Resolve a feature extractor class by its ``feature_extractor_type`` string.
+
+    Returns the class object, or None if not found.
+    """
+    import importlib
+
+    if fe_type in _FEATURE_EXTRACTOR_MAP:
+        mod_name, cls_name = _FEATURE_EXTRACTOR_MAP[fe_type]
+        try:
+            mod = importlib.import_module(mod_name)
+            return getattr(mod, cls_name, None)
+        except ImportError:
+            return None
+
     return None
 
 
@@ -524,6 +586,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        prefill_eviction_callback: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -531,6 +594,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._prefill_eviction_callback = prefill_eviction_callback
 
         self._vlm_model = None
         self._processor = None
@@ -706,6 +770,7 @@ class VLMBatchedEngine(BaseEngine):
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
+
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
@@ -745,15 +810,6 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
-        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
-        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
-        # Class-level monkey-patch — no-op when target classes are absent
-        # or already fixed upstream.
-        apply_gated_delta_advance_patch()
-        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
-        # inputs. Preserves mRoPE for genuine multimodal positions.
-        apply_qwen3_5_attention_patch()
-
         # Create scheduler config
         scheduler_config = (
             copy.copy(self._scheduler_config)
@@ -766,6 +822,7 @@ class VLMBatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            prefill_eviction_callback=self._prefill_eviction_callback,
         )
 
         # Create engine with adapter as the "model"
@@ -998,8 +1055,9 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         num_images: int,
+        num_audios: int = 0,
     ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
-        """Format VLM messages with image tokens on image-bearing user turns."""
+        """Format VLM messages with image/audio tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
         model_type = self.model_type or getattr(
@@ -1009,14 +1067,23 @@ class VLMBatchedEngine(BaseEngine):
             raise ValueError("Missing VLM model_type for chat template formatting")
 
         image_part_types = {"image", "image_url", "input_image"}
+        audio_part_types = {"input_audio"}
         has_explicit_images = any(
             isinstance(msg, dict)
             and self._count_content_parts(msg.get("content"), image_part_types) > 0
             for msg in messages
         )
 
+        has_explicit_audio = any(
+            isinstance(msg, dict)
+            and self._count_content_parts(msg.get("content"), audio_part_types) > 0
+            for msg in messages
+        )
+
         remaining_images = num_images
+        remaining_audios = num_audios
         assigned_fallback_images = False
+        assigned_fallback_audios = False
         formatted_messages: list[dict[str, Any]] = []
         image_message_ranges: list[tuple[int, int]] = []
 
@@ -1029,9 +1096,13 @@ class VLMBatchedEngine(BaseEngine):
             content = extract_text_from_content(raw_content)
 
             msg_num_images = 0
+            msg_num_audios = 0
             if role == "user":
                 explicit_images = self._count_content_parts(
                     raw_content, image_part_types
+                )
+                explicit_audios = self._count_content_parts(
+                    raw_content, audio_part_types
                 )
                 if explicit_images > 0 and remaining_images > 0:
                     msg_num_images = min(explicit_images, remaining_images)
@@ -1044,6 +1115,18 @@ class VLMBatchedEngine(BaseEngine):
                     msg_num_images = remaining_images
                     remaining_images = 0
                     assigned_fallback_images = True
+
+                if explicit_audios > 0 and remaining_audios > 0:
+                    msg_num_audios = min(explicit_audios, remaining_audios)
+                    remaining_audios -= msg_num_audios
+                elif (
+                    not has_explicit_audio
+                    and remaining_audios > 0
+                    and not assigned_fallback_audios
+                ):
+                    msg_num_audios = remaining_audios
+                    remaining_audios = 0
+                    assigned_fallback_audios = True
 
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
@@ -1069,9 +1152,9 @@ class VLMBatchedEngine(BaseEngine):
                     content,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
-                    skip_audio_token=True,
+                    skip_audio_token=role != "user" or msg_num_audios == 0,
                     num_images=msg_num_images,
-                    num_audios=0,
+                    num_audios=msg_num_audios,
                 )
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
@@ -1108,6 +1191,47 @@ class VLMBatchedEngine(BaseEngine):
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
+            image_position_ids = extra_model_inputs.get("image_position_ids")
+            if image_position_ids is not None:
+                try:
+                    signature = inspect.signature(model.encode_image)
+                except (TypeError, ValueError):
+                    signature = None
+
+                if signature is None:
+                    try:
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+                    except TypeError:
+                        logger.debug(
+                            "encode_image rejected image_position_ids; "
+                            "retrying without it",
+                            exc_info=True,
+                        )
+                else:
+                    parameters = signature.parameters
+                    accepts_kwargs = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in parameters.values()
+                    )
+                    if "image_position_ids" in parameters or accepts_kwargs:
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+
+                    positional_parameters = [
+                        p
+                        for p in parameters.values()
+                        if p.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+                    if len(positional_parameters) >= 2:
+                        return model.encode_image(pixel_values, image_position_ids)
+
             return model.encode_image(pixel_values)
 
         # Strategy 2: qwen-style (vision_tower + grid_thw)
@@ -1178,6 +1302,34 @@ class VLMBatchedEngine(BaseEngine):
         if features.ndim >= 3 and features.shape[0] == num_images:
             return [features[i : i + 1] for i in range(num_images)]
 
+        # Some mlx-vlm models, including Gemma4 unified, return compacted flat
+        # features after applying per-image position IDs.
+        if features.ndim == 2:
+            soft_tokens = self._as_int_list(
+                extra_model_inputs.get("num_soft_tokens_per_image")
+            )
+            if soft_tokens is not None:
+                if len(soft_tokens) != num_images:
+                    logger.debug(
+                        "Per-image soft token count mismatch: expected %d entries, got %d",
+                        num_images,
+                        len(soft_tokens),
+                    )
+                    return None
+                if sum(soft_tokens) != features.shape[0]:
+                    logger.debug(
+                        "Per-image soft token total mismatch: expected %d, got %d",
+                        sum(soft_tokens),
+                        features.shape[0],
+                    )
+                    return None
+                result = []
+                offset = 0
+                for count in soft_tokens:
+                    result.append(features[offset : offset + count])
+                    offset += count
+                return result
+
         # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
         if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
             grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -1207,10 +1359,100 @@ class VLMBatchedEngine(BaseEngine):
 
         return None
 
+    @staticmethod
+    def _as_int_list(value: Any) -> Optional[List[int]]:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (int, float)):
+            return [int(value)]
+        if not isinstance(value, (list, tuple)):
+            return None
+
+        result: List[int] = []
+        for item in value:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, (list, tuple)):
+                if len(item) != 1:
+                    return None
+                item = item[0]
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return result
+
+    @staticmethod
+    def _vision_feature_token_count(features: Any) -> Optional[int]:
+        if isinstance(features, (list, tuple)):
+            total = 0
+            for feature in features:
+                count = VLMBatchedEngine._vision_feature_token_count(feature)
+                if count is None:
+                    return None
+                total += count
+            return total
+
+        shape = getattr(features, "shape", None)
+        if not shape:
+            return None
+        if len(shape) == 1:
+            return 1
+
+        count = 1
+        for dim in shape[:-1]:
+            count *= int(dim)
+        return count
+
+    def _image_token_count(self, input_ids: Any) -> Optional[int]:
+        config = getattr(self._vlm_model, "config", None)
+        image_token_id = getattr(config, "image_token_id", None)
+        if image_token_id is None:
+            return None
+
+        try:
+            ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+            return int(mx.sum(ids == int(image_token_id)).item())
+        except Exception:
+            logger.debug("Failed to count VLM image tokens", exc_info=True)
+            return None
+
+    def _vision_features_match_image_tokens(
+        self, features: Any, image_token_count: Optional[int]
+    ) -> bool:
+        if image_token_count is None:
+            return True
+
+        feature_token_count = self._vision_feature_token_count(features)
+        if feature_token_count is None:
+            return True
+
+        if feature_token_count == image_token_count:
+            return True
+
+        logger.debug(
+            "Ignoring cached vision features: feature_tokens=%d, image_tokens=%d",
+            feature_token_count,
+            image_token_count,
+        )
+        return False
+
+    @staticmethod
+    def _language_prompt_kwargs(extra_model_inputs: dict[str, Any]) -> dict[str, Any]:
+        """Return processor kwargs that must survive into language prefill."""
+        return {
+            key: extra_model_inputs[key]
+            for key in VLM_LANGUAGE_PROMPT_KWARGS
+            if extra_model_inputs.get(key) is not None
+        }
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
         images: list[Any],
+        audio: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
     ) -> Tuple[
@@ -1229,8 +1471,9 @@ class VLMBatchedEngine(BaseEngine):
         4. Compute image hash for prefix cache
 
         Args:
-            messages: Chat messages (text-only, images already extracted)
+            messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
+            audio: List of audio data (BytesIO, file paths, or numpy arrays)
 
         Returns:
             Tuple of (
@@ -1250,9 +1493,28 @@ class VLMBatchedEngine(BaseEngine):
               cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
-        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.utils import load_audio as _load_audio, prepare_inputs
 
         num_images = len(images)
+        num_audios = len(audio) if audio else 0
+
+        # Normalize audio to numpy float32 arrays expected by processor.
+        # extract_images_from_messages produces BytesIO / file-path strings, but
+        # the processor's __call__ expects numpy arrays or (array, sample_rate)
+        # tuples. load_audio handles all three source types.
+        if audio:
+            if any(not isinstance(a, tuple) for a in audio):
+                from ..patches.mlx_audio_compat import (
+                    ensure_mlx_audio_resample_export,
+                )
+
+                ensure_mlx_audio_resample_export()
+            audio = [
+                _load_audio(a, 16000)
+                if not isinstance(a, tuple)
+                else a
+                for a in audio
+            ]
         model_type = self.model_type or ""
 
         # Validate multi-image support
@@ -1267,7 +1529,9 @@ class VLMBatchedEngine(BaseEngine):
         # receive image tokens, regardless of conversation history shape.
         try:
             formatted_messages, image_message_ranges = (
-                self._format_messages_for_vlm_template(messages, num_images=num_images)
+                self._format_messages_for_vlm_template(
+                    messages, num_images=num_images, num_audios=num_audios
+                )
             )
         except Exception as e:
             logger.debug(
@@ -1280,6 +1544,7 @@ class VLMBatchedEngine(BaseEngine):
                 self._vlm_model.config,
                 messages,
                 num_images=num_images,
+                num_audios=num_audios,
                 return_messages=True,
             )
             image_message_ranges = []
@@ -1345,10 +1610,11 @@ class VLMBatchedEngine(BaseEngine):
             else:
                 raise
 
-        # Tokenize text and preprocess images
+        # Tokenize text and preprocess images and audio
         inputs = prepare_inputs(
             self._processor,
             images=images if images else None,
+            audio=audio if audio else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
         )
 
@@ -1431,15 +1697,25 @@ class VLMBatchedEngine(BaseEngine):
             and v is not None
         }
 
-        if pixel_values is not None and num_images > 0:
-            # Compute whole-request image hash (used for KV prefix cache keying)
-            image_hash = compute_image_hash(images)
+        # Check for any multimodal inputs: images or audio
+        has_audio = "input_features" in extra_model_inputs
+        has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
-            # Build call kwargs from extra_model_inputs
+
+
+        if has_multimodal:
+            # Build call kwargs from extra_model_inputs (includes input_features
+            # for audio, image_grid_thw, etc.)
             call_kwargs = dict(extra_model_inputs)
 
-            # Try per-image vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled:
+            # Image-specific: compute hash and try vision feature cache
+            image_hash = None
+            image_token_count = None
+            if num_images > 0:
+                image_hash = compute_image_hash(images)
+                image_token_count = self._image_token_count(input_ids)
+
+            if num_images > 0 and self._vision_cache is not None and self._vision_cache_enabled:
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
@@ -1450,31 +1726,44 @@ class VLMBatchedEngine(BaseEngine):
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
-                    cached_whole = self._vision_cache.get(
-                        image_hash, self._model_name
-                    )
+                    cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
+                used_cached_features = False
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
-                    call_kwargs["cached_image_features"] = combined
-                    logger.debug(
-                        "Vision feature cache hit (per-image): all %d images cached",
-                        num_images,
-                    )
+                    if self._vision_features_match_image_tokens(
+                        combined, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = combined
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (per-image): all %d images cached",
+                            num_images,
+                        )
                 elif cached_whole is not None:
-                    call_kwargs["cached_image_features"] = cached_whole
-                    logger.debug(
-                        "Vision feature cache hit (whole-request): %s",
-                        image_hash[:16],
-                    )
-                else:
+                    if self._vision_features_match_image_tokens(
+                        cached_whole, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = cached_whole
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (whole-request): %s",
+                            image_hash[:16],
+                        )
+
+                if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
                             pixel_values, extra_model_inputs
                         )
-                        if features is not None:
+                        if (
+                            features is not None
+                            and self._vision_features_match_image_tokens(
+                                features, image_token_count
+                            )
+                        ):
                             mx.eval(features)
                             call_kwargs["cached_image_features"] = features
                             # Split and cache each image individually
@@ -1534,6 +1823,8 @@ class VLMBatchedEngine(BaseEngine):
                 for k, v in feat_dict.items():
                     if k != "inputs_embeds" and v is not None:
                         extra_kwargs[k] = v
+            for k, v in self._language_prompt_kwargs(extra_model_inputs).items():
+                extra_kwargs.setdefault(k, v)
 
             # Capture per-request mRoPE state set by
             # get_input_embeddings(). The language model stores these as
@@ -1989,7 +2280,7 @@ class VLMBatchedEngine(BaseEngine):
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
         # Extract images from messages
-        text_messages, images = extract_images_from_messages(messages)
+        text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
@@ -2008,16 +2299,13 @@ class VLMBatchedEngine(BaseEngine):
         ) = self._prepare_vision_inputs(
             vlm_messages,
             images,
+            audio=audio if audio else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
         )
 
         if images:
             # Free Metal intermediates from vision encoding.
-            # Vision tower + projector produce large intermediate buffers
-            # that stay in the Metal cache pool until explicitly cleared.
-            # Without this, repeated VLM requests accumulate memory and
-            # eventually trigger ProcessMemoryEnforcer aborts (see #667).
             mx.synchronize()
             mx.clear_cache()
 
@@ -2045,7 +2333,7 @@ class VLMBatchedEngine(BaseEngine):
         # Extract text-only version for token counting
         from ..utils.image import extract_images_from_messages
 
-        text_messages, _ = extract_images_from_messages(messages)
+        text_messages, _, _ = extract_images_from_messages(messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(

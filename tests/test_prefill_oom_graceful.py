@@ -21,7 +21,7 @@ import pytest
 from omlx import scheduler as sched_mod
 from omlx.memory_monitor import MemoryMonitor
 from omlx.prefill_transient_tracker import PrefillTransientTracker
-from omlx.scheduler import Scheduler
+from omlx.scheduler import Scheduler, _PrefillEvictionNeeded
 
 _GB = 1024**3
 
@@ -75,8 +75,18 @@ def test_chunk_transient_zero_when_model_info_missing():
 # --------------------------------------------------------------------------
 
 
-def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
-                  monitor=None, min_chunk=32, abort=None, reclaim_to=None):
+def _throttle_ctx(
+    *,
+    current,
+    hard,
+    soft_ratio=0.80,
+    samples_bpt=None,
+    monitor=None,
+    min_chunk=32,
+    abort=None,
+    reclaim_to=None,
+    abort_margin=Scheduler._PREFILL_ABORT_MARGIN,
+):
     """Build a minimal stand-in carrying the attributes / bound methods that
     _adaptive_chunk_size and _guard_prefill_chunk read. `_fake_current` is the
     value the patched memory probes report; `reclaim_to` (if set) is what a
@@ -86,11 +96,12 @@ def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
         # Seed with one observation: sets last_delta/last_n AND the EWMA.
         tracker.update(1, int(samples_bpt))
     ns = SimpleNamespace(
-        _memory_limit_bytes=int(hard * 0.85),       # soft = ceiling*0.85
+        _memory_limit_bytes=int(hard * 0.85),  # soft = ceiling*0.85
         _memory_hard_limit_bytes=int(hard),
         _memory_abort_limit_bytes=int(abort if abort is not None else hard),
         _prefill_safe_zone_ratio=soft_ratio,
         _prefill_min_chunk_tokens=min_chunk,
+        _prefill_abort_margin=abort_margin,
         _prefill_transient_tracker=tracker,
         memory_monitor=monitor,
         _PREFILL_STEP_TIERS=Scheduler._PREFILL_STEP_TIERS,
@@ -103,29 +114,63 @@ def _throttle_ctx(*, current, hard, soft_ratio=0.80, samples_bpt=None,
         ns, Scheduler
     )
     ns._prefill_abort_cap = Scheduler._prefill_abort_cap.__get__(ns, Scheduler)
+    ns._prefill_abort_description = Scheduler._prefill_abort_description.__get__(
+        ns, Scheduler
+    )
     ns._reclaim_to = reclaim_to
 
     def _reclaim():
         if ns._reclaim_to is not None:
             ns._fake_current = ns._reclaim_to
         return ns._fake_current
+
     ns._reclaim_prefill_headroom = _reclaim
     return ns
 
 
 def _call(ns, requested, kv_len=0):
-    with patch.object(sched_mod.mx, "get_active_memory", return_value=0), \
-         patch.object(sched_mod, "get_phys_footprint",
-                      return_value=ns._fake_current):
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
+    ):
         return Scheduler._adaptive_chunk_size(
             ns, requested, request_id="r", loop_label="test", kv_len=kv_len
         )
 
 
+def test_adaptive_throttle_requests_eviction_before_shrinking():
+    ns = _throttle_ctx(
+        current=50 * _GB,
+        hard=58 * _GB,
+        samples_bpt=2 * 1024**2,
+    )
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+
+    with pytest.raises(_PrefillEvictionNeeded) as exc:
+        _call(ns, 2048)
+
+    assert request.prefill_eviction_retries == 1
+    assert exc.value.request.request_id == "r"
+    assert exc.value.request.model_id == "model-b"
+    assert exc.value.request.requested_tokens == 2048
+    assert exc.value.request.reason == "adaptive_prefill_throttle"
+
+    # The same request does not loop on eviction; it falls back to throttling.
+    result = _call(ns, 2048)
+    assert result < 2048
+
+
 def _guard_call(ns, n, kv_len=0):
-    with patch.object(sched_mod.mx, "get_active_memory", return_value=0), \
-         patch.object(sched_mod, "get_phys_footprint",
-                      return_value=ns._fake_current):
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
+    ):
         return Scheduler._guard_prefill_chunk(
             ns, n, kv_len=kv_len, progress=0, loop_label="test"
         )
@@ -141,8 +186,7 @@ def test_throttle_noop_when_full_chunk_fits():
     even at a low baseline (gate is on predicted peak, not the watermark)."""
     hard = 40 * _GB
     # Small per-token transient (~1MB/tok): 2048 tokens ≈ 2.7GB, easily fits.
-    ns = _throttle_ctx(current=int(hard * 0.5), hard=hard,
-                       samples_bpt=1024 * 1024)
+    ns = _throttle_ctx(current=int(hard * 0.5), hard=hard, samples_bpt=1024 * 1024)
     ns._fake_current = int(hard * 0.5)
     assert _call(ns, 2048, kv_len=5000) == 2048
 
@@ -156,10 +200,12 @@ def test_throttle_shrinks_big_chunk_from_low_baseline():
     bpt = 18 * 1024 * 1024  # ~18 MB/token, matching the observed MoE prefill
     ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt)
     ns._fake_current = current
-    target = min(int(hard * Scheduler._PREFILL_HEADROOM_SAFETY),
-                 int(hard * Scheduler._PREFILL_ABORT_MARGIN))
+    target = min(
+        int(hard * Scheduler._PREFILL_HEADROOM_SAFETY),
+        int(hard * Scheduler._PREFILL_ABORT_MARGIN),
+    )
     n = _call(ns, 2048, kv_len=5000)
-    assert n < 2048                      # throttled despite low baseline
+    assert n < 2048  # throttled despite low baseline
     assert n >= ns._prefill_min_chunk_tokens
     # The chosen chunk's predicted peak must fit under the sizing target.
     assert current + _per_token(bpt) * n <= target + _per_token(bpt)
@@ -169,8 +215,9 @@ def test_throttle_floors_at_min_chunk_when_over_ceiling():
     """At/over the cap, the smallest step is returned (the guard handles the
     rest)."""
     hard = 40 * _GB
-    ns = _throttle_ctx(current=hard + _GB, hard=hard, samples_bpt=1_000_000,
-                       min_chunk=32)
+    ns = _throttle_ctx(
+        current=hard + _GB, hard=hard, samples_bpt=1_000_000, min_chunk=32
+    )
     ns._fake_current = hard + _GB
     assert _call(ns, 2048, kv_len=5000) == 32
 
@@ -213,8 +260,7 @@ def test_guard_shrinks_when_chunk_would_breach_cap():
     current = 30 * _GB
     bpt = 27 * 1024 * 1024
     # Reclaim doesn't free anything here (transient already cleared).
-    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt,
-                       reclaim_to=current)
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt, reclaim_to=current)
     ns._fake_current = current
     n = _guard_call(ns, 2048, kv_len=122_000)
     cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
@@ -230,21 +276,37 @@ def test_guard_raises_clean_error_when_even_floor_cannot_fit():
     hard = 42 * _GB
     current = 41 * _GB  # resident already above the margined cap
     bpt = 27 * 1024 * 1024
-    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt,
-                       reclaim_to=current)  # reclaim can't help
+    ns = _throttle_ctx(
+        current=current, hard=hard, samples_bpt=bpt, reclaim_to=current
+    )  # reclaim can't help
     ns._fake_current = current
     with pytest.raises(RuntimeError) as exc:
         _guard_call(ns, 256, kv_len=122_000)
     assert "too large for available memory" in str(exc.value)
     assert "Memory limit exceeded" not in str(exc.value)  # → fails fast, no requeue
+    assert "prefill safety cap" in str(exc.value)
+    assert "90% of effective ceiling 42.0GB" in str(exc.value)
+
+
+def test_guard_custom_margin_allows_95_percent_of_ceiling():
+    """Custom tier propagates a looser prefill safety margin."""
+    hard = 30 * _GB
+    ns = _throttle_ctx(
+        current=0,
+        hard=hard,
+        samples_bpt=1024 * 1024,
+        abort_margin=0.95,
+    )
+    assert ns._prefill_abort_cap() == int(30 * _GB * 0.95)
 
 
 def test_guard_recovers_after_reclaim_frees_memory():
     """If a reclaim drops resident back under the cap, the guard proceeds."""
     hard = 42 * _GB
     bpt = 1024 * 1024  # small per-token
-    ns = _throttle_ctx(current=41 * _GB, hard=hard, samples_bpt=bpt,
-                       reclaim_to=20 * _GB)
+    ns = _throttle_ctx(
+        current=41 * _GB, hard=hard, samples_bpt=bpt, reclaim_to=20 * _GB
+    )
     ns._fake_current = 41 * _GB
     n = _guard_call(ns, 512, kv_len=5000)
     assert n >= ns._prefill_min_chunk_tokens
@@ -259,8 +321,9 @@ def test_predicted_transient_takes_max_and_applies_safety():
     """The predictor takes the MAX of measured-last / EWMA / static and applies
     the safety factor — so it can't underestimate at growing kv_len."""
     monitor = _monitor(head_dim=192)
-    ns = _throttle_ctx(current=0, hard=40 * _GB, samples_bpt=5 * 1024 * 1024,
-                       monitor=monitor)
+    ns = _throttle_ctx(
+        current=0, hard=40 * _GB, samples_bpt=5 * 1024 * 1024, monitor=monitor
+    )
     # static per-token at this kv_len:
     static = monitor.estimate_chunk_transient_bytes(1, 100_001)
     measured = 5 * 1024 * 1024

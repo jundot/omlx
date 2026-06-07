@@ -552,7 +552,7 @@ final class IntegrationsScreenVM: ObservableObject {
     /// Composed `omlx launch claude` command. Claude tier selections are
     /// persisted in settings, so the launcher reads them without extra flags.
     var claudeLaunchCommand: String {
-        "\(cliPrefix) launch claude"
+        "\(cliCommandPrefix) launch claude"
     }
 
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
@@ -583,15 +583,15 @@ final class IntegrationsScreenVM: ObservableObject {
         return parts.joined(separator: " ")
     }
 
-    var codexCommand: String    { "\(cliPrefix) launch codex" }
-    var opencodeCommand: String { "\(cliPrefix) launch opencode" }
+    var codexCommand: String    { "\(cliCommandPrefix) launch codex" }
+    var opencodeCommand: String { "\(cliCommandPrefix) launch opencode" }
     var openclawCommand: String {
         let profile = openclawToolsProfile.isEmpty ? "coding" : openclawToolsProfile
-        return "\(cliPrefix) launch openclaw --tools-profile \(profile)"
+        return "\(cliCommandPrefix) launch openclaw --tools-profile \(profile)"
     }
-    var hermesCommand: String   { "\(cliPrefix) launch hermes" }
-    var piCommand: String       { "\(cliPrefix) launch pi" }
-    var copilotCommand: String  { "\(cliPrefix) launch copilot" }
+    var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
+    var piCommand: String       { "\(cliCommandPrefix) launch pi" }
+    var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
 
     var hasPendingMCPChanges: Bool {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
@@ -714,6 +714,10 @@ final class IntegrationsScreenVM: ObservableObject {
     }
 
     // MARK: - Shell helpers
+
+    private var cliCommandPrefix: String {
+        cliPrefix == "omlx" ? cliPrefix : Self.shellQuote(cliPrefix)
+    }
 
     /// POSIX single-quote escape — mirrors `shellQuote` in dashboard.js so
     /// the rendered command can be copy-pasted into bash/zsh as-is.

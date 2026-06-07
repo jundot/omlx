@@ -362,6 +362,11 @@ rsync -a \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
 
+log "Writing engine commit metadata..."
+"$PYTHON_BIN" "$PACKAGING_DIR/build.py" --write-engine-commits "$RESOURCES_DIR/omlx" \
+    || die "failed to write engine commit metadata."
+ok "  + _engine_commits.json"
+
 # --- Embed CLI wrapper ----------------------------------------------------
 
 log "Writing app-bundle CLI wrapper..."
@@ -370,7 +375,8 @@ cat > "$CLI_WRAPPER" <<'EOF'
 #!/bin/sh
 set -eu
 
-APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
 RESOURCES="$APP_ROOT/Resources"
 PYROOT="$RESOURCES/Python"
 CPYTHON="$PYROOT/cpython-3.11"

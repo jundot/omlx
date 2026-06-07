@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.utils.install import get_cli_prefix
+from omlx.utils.install import get_cli_command_prefix
 
 DEFAULT_GATEWAY_PORT = 18789
 
@@ -32,7 +32,7 @@ class OpenClawIntegration(Integration):
 
     def get_command(self, ctx: IntegrationContext) -> str:
         return (
-            f"{get_cli_prefix()} "
+            f"{get_cli_command_prefix()} "
             f"launch openclaw --model {ctx.model or 'select-a-model'}"
         )
 

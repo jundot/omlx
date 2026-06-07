@@ -271,6 +271,19 @@ class BaseNonStreamingEngine(ABC):
         with self._active_lock:
             return self._active_count > 0
 
+    def _reset_activity_tracking(self) -> None:
+        """Clear the in-flight activity counter + records on engine teardown.
+
+        #1595: the memory-enforcer's immediate-abort eviction stops the engine WITHOUT
+        running the normal per-request completion callbacks (_end_activity), so the
+        ``_active_count`` atomic counter can be left non-zero. That phantom 'busy' count
+        both corrupts the status API and (via has_active_requests()) can make a stale
+        engine look permanently non-evictable. Called from EnginePool._unload_engine().
+        """
+        with self._active_lock:
+            self._active_count = 0
+            self._activities.clear()
+
     _ACTIVITY_RESERVED_KEYS = {
         "request_id",
         "kind",

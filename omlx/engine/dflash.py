@@ -24,7 +24,9 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
+from ..utils.tokenizer import create_streaming_detokenizer
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,7 @@ class DFlashEngine(BaseEngine):
         self._fallback_lock = asyncio.Lock()
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
+        self._suppress_token_ids: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
         # the streaming detokenizer is used as-is (qwen, llama, etc.).
@@ -301,6 +304,18 @@ class DFlashEngine(BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
+
+        suppress_ref = (
+            getattr(self._executor_tokenizer, "name_or_path", None) or self._model_name
+        )
+        suppress_ids = load_generation_config_token_ids(suppress_ref, "suppress_tokens")
+        self._suppress_token_ids = suppress_ids or set()
+        if self._suppress_token_ids:
+            logger.info(
+                "DFlash loaded %d suppress token(s) from generation_config.json: %s",
+                len(self._suppress_token_ids),
+                self._suppress_token_ids,
+            )
 
         # Detect protocol-specific output parser (gemma4 channel markers,
         # harmony channels). Scheduler-driven engines apply this via
@@ -642,6 +657,9 @@ class DFlashEngine(BaseEngine):
             prompt="",
             max_new_tokens=max_tokens,
             stop_token_ids=stop_ids,
+            suppress_token_ids=(
+                sorted(self._suppress_token_ids) if self._suppress_token_ids else None
+            ),
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,
@@ -679,7 +697,7 @@ class DFlashEngine(BaseEngine):
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
-            # detokenization too, so the NaiveStreamingDetokenizer fallback is
+            # detokenization too, so the standard streaming detokenizer is
             # only created when no parser is available.
             parser_session = (
                 self._output_parser_factory.create_session(self._executor_tokenizer)
@@ -688,11 +706,12 @@ class DFlashEngine(BaseEngine):
             )
             detokenizer = None
             if parser_session is None:
-                try:
-                    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                    detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
-                except ImportError:
-                    pass
+                detokenizer = create_streaming_detokenizer(
+                    self._executor_tokenizer,
+                    model_path=self._model_name,
+                )
+                if detokenizer is not None:
+                    detokenizer.reset()
 
             for event in event_iter:
                 if stop_event.is_set():

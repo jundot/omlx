@@ -7,6 +7,7 @@ text completions, tool calling, and structured output.
 """
 
 import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -57,6 +58,20 @@ class TestContentPart:
 
         assert part.type == "text"
         assert part.text is None
+
+    def test_file_content_part(self):
+        """Test creating file content part for document preprocessing."""
+        part = ContentPart(
+            type="file",
+            file={
+                "filename": "sample.pdf",
+                "file_data": "data:application/pdf;base64,ZA==",
+            },
+        )
+
+        assert part.type == "file"
+        assert part.file.filename == "sample.pdf"
+        assert part.file.file_data.endswith("ZA==")
 
 
 class TestMessage:
@@ -173,7 +188,9 @@ class TestFunctionCallAndToolCall:
         tc = ToolCall(
             id="call_abc123",
             type="function",
-            function=FunctionCall(name="get_weather", arguments='{"location": "Tokyo"}'),
+            function=FunctionCall(
+                name="get_weather", arguments='{"location": "Tokyo"}'
+            ),
         )
 
         assert tc.id == "call_abc123"
@@ -755,6 +772,7 @@ class TestModelInfo:
 # =============================================================================
 # Stop Field Coercion
 # =============================================================================
+
 
 class TestStopCoercion:
     """Tests for stop field string-to-list coercion (OpenAI compat)."""

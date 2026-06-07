@@ -16,7 +16,7 @@ function interfaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar, cast
 
 from .engine_pool import EngineEntry
 from .model_settings import ModelSettings
@@ -100,11 +100,27 @@ class ConfiguredModel:
     @property
     def max_context_window(self) -> int | None:
         """Effective max context window limit."""
+        clamped = self.model_entry.model_context_length
+        if (clamped is not None
+                and self.sampling.max_context_window_policy is not None):
+            clamped = min(clamped, self.sampling.max_context_window_policy)
         return first_present(
             self.settings.max_context_window,
-            self.model_entry.model_context_length,
+            clamped,
             self.sampling.max_context_window
         )
+
+    def embedding_max_length(self, request_max_length: int | None = None) -> int:
+        """Get max token length for embedding requests."""
+        # The type annotation of ``first_present`` doesn't "understand" that if
+        # any item in the list is statically non-None, the entire call is
+        # statically non-None. But we know it works like that, so ``cast`` to
+        # silence the type error is safe.
+        return cast(int, first_present(
+            request_max_length,
+            self.max_context_window,
+            512
+        ))
 
     @property
     def max_tokens(self) -> int | None:

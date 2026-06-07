@@ -54,7 +54,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. Note that the macOS app does not install the `omlx` CLI command. For terminal usage, install via Homebrew or from source.
+Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
 
 ### Homebrew
 
@@ -66,7 +66,7 @@ brew install omlx
 brew update && brew upgrade omlx
 
 # Run as a background service (auto-restarts on crash)
-brew services start omlx
+omlx start
 
 # Optional: MCP (Model Context Protocol) support
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
@@ -97,6 +97,12 @@ Launch oMLX from your Applications folder. The Welcome screen guides you through
 ### CLI
 
 ```bash
+# Managed background server (macOS app or Homebrew install)
+omlx start
+omlx stop
+omlx restart
+
+# Foreground server attached to this terminal
 omlx serve --model-dir ~/models
 ```
 
@@ -107,13 +113,17 @@ The server discovers LLMs, VLMs, embedding models, and rerankers from subdirecto
 If you installed via Homebrew, you can run oMLX as a managed background service:
 
 ```bash
+omlx start                    # Start via brew services
+omlx stop                     # Stop
+omlx restart                  # Restart
+
 brew services start omlx    # Start (auto-restarts on crash)
 brew services stop omlx     # Stop
 brew services restart omlx  # Restart
 brew services info omlx     # Check status
 ```
 
-The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
+The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
 
 Logs are written to two locations:
 - **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -272,8 +282,19 @@ Models are auto-detected by type. You can also download models directly from the
 ## CLI Configuration
 
 ```bash
+# Managed background server (macOS app or Homebrew install)
+omlx start
+omlx stop
+omlx restart
+
 # Start with default settings (memory guard tier = balanced, manage via admin UI)
 omlx serve --model-dir ~/models
+
+# Choose a memory guard tier at startup
+omlx serve --model-dir ~/models --memory-guard safe
+
+# Set a custom memory guard ceiling in GB
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

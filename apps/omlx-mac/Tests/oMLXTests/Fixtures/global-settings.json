@@ -46,7 +46,8 @@
         "config_path": null
     },
     "huggingface": {
-        "endpoint": "https://hf-mirror.com"
+        "endpoint": "https://hf-mirror.com",
+        "hf_cache_enabled": true
     },
     "modelscope": {
         "endpoint": ""

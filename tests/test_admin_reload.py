@@ -2,6 +2,7 @@
 """Tests for admin reload models functionality."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -49,6 +50,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/path/to/models"]
         global_settings.model.model_dir = "/path/to/models"
+        global_settings.get_effective_model_dirs = MagicMock(
+            return_value=["/path/to/models"]
+        )
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 
@@ -124,6 +128,7 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = ["/bad/path"]
         global_settings.model.model_dir = "/bad/path"
+        global_settings.get_effective_model_dirs = MagicMock(return_value=["/bad/path"])
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 
@@ -155,6 +160,9 @@ class TestReloadModels:
         global_settings = MagicMock()
         global_settings.model.model_dirs = []
         global_settings.model.model_dir = "/fallback/path"
+        global_settings.get_effective_model_dirs = MagicMock(
+            return_value=["/fallback/path"]
+        )
 
         originals = _setup_mocks(pool, settings_manager, global_settings)
 
@@ -173,3 +181,98 @@ class TestReloadModels:
                     mock_apply.assert_called_once_with(["/fallback/path"])
         finally:
             _restore_mocks(originals)
+
+
+class TestApplyModelDirsRuntime:
+    """Tests for runtime model directory application."""
+
+    def test_rejects_unreadable_model_dir(self, tmp_path, monkeypatch):
+        """Unreadable model dirs should return a user-facing error."""
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == model_dir.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = MagicMock()
+        mock_server_state.settings_manager = None
+
+        with patch.object(omlx.server, "_server_state", mock_server_state):
+            success, msg = asyncio.run(
+                admin_routes._apply_model_dirs_runtime([str(model_dir)])
+            )
+
+        assert success is False
+        assert "not readable" in msg
+        mock_server_state.engine_pool.discover_models.assert_not_called()
+
+    def test_skips_unreadable_secondary_model_dir(self, tmp_path, monkeypatch):
+        """Unreadable secondary dirs should not block applying the primary dir."""
+        primary = tmp_path / "primary"
+        secondary = tmp_path / "secondary"
+        primary.mkdir()
+        secondary.mkdir()
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == secondary.resolve():
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        monkeypatch.setattr(admin_routes, "_hf_downloader", None)
+        monkeypatch.setattr(admin_routes, "_ms_downloader", None)
+        monkeypatch.setattr(admin_routes, "_oq_manager", None)
+        monkeypatch.setattr(admin_routes, "_hf_uploader", None)
+
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool.model_count = 0
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = pool
+        mock_server_state.settings_manager = None
+
+        with patch.object(omlx.server, "_server_state", mock_server_state):
+            success, msg = asyncio.run(
+                admin_routes._apply_model_dirs_runtime(
+                    [str(primary), str(secondary)]
+                )
+            )
+
+        assert success is True
+        assert "from 1 directory" in msg
+        pool.discover_models.assert_called_once_with([str(primary.resolve())], [])
+
+    def test_creates_missing_primary_model_dir(self, tmp_path, monkeypatch):
+        """The primary download target should be created if it is missing."""
+        primary = tmp_path / "new-primary"
+
+        monkeypatch.setattr(admin_routes, "_hf_downloader", None)
+        monkeypatch.setattr(admin_routes, "_ms_downloader", None)
+        monkeypatch.setattr(admin_routes, "_oq_manager", None)
+        monkeypatch.setattr(admin_routes, "_hf_uploader", None)
+
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool.model_count = 0
+        mock_server_state = MagicMock()
+        mock_server_state.engine_pool = pool
+        mock_server_state.settings_manager = None
+
+        with patch.object(omlx.server, "_server_state", mock_server_state):
+            success, msg = asyncio.run(
+                admin_routes._apply_model_dirs_runtime([str(primary)])
+            )
+
+        assert success is True
+        assert "from 1 directory" in msg
+        assert primary.is_dir()
+        pool.discover_models.assert_called_once_with([str(primary.resolve())], [])

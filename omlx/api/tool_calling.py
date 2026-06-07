@@ -16,6 +16,7 @@ Also includes structured output (JSON Schema) utilities:
 - validate_json_schema: Validate JSON against a schema
 """
 
+import ast
 import json
 import logging
 import re
@@ -89,7 +90,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         content = match.strip()
         try:
             # Try JSON format first: {"name": "func", "arguments": {...}}
-            parsed = json.loads(content)
+            parsed = json.loads(content, strict=False)
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
             tool_calls.append(
@@ -206,6 +207,96 @@ def _parse_namespaced_tool_calls(
                     arguments[key] = json.loads(val)
                 except (json.JSONDecodeError, ValueError):
                     arguments[key] = val
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=func_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+            )
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
+def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for Hermes-style tool call formats.
+
+    Handles outputs that use <|tool_call_start|>...<|tool_call_end|> markers
+    with bracket-style content inside:
+        <|tool_call_start|>[function_name(arg1=value1, arg2=value2)]<|tool_call_end|>
+
+    Also handles JSON variant:
+        <|tool_call_start|>{"name": "func", "arguments": {...}}<|tool_call_end|>
+
+    Some clients/agents emit tool calls using this Hermes-style wire format.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    tool_calls = []
+    pattern = r"<\|tool_call_start\|>(.*?)<\|tool_call_end\|>"
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    for match in matches:
+        content = match.strip()
+
+        # Try JSON format first: {"name": "func", "arguments": {...}}
+        try:
+            parsed = json.loads(content)
+            name = parsed.get("name", "")
+            arguments = parsed.get("arguments", {})
+            if name:
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=name,
+                            arguments=_serialize_tool_call_arguments(arguments),
+                        ),
+                    )
+                )
+                continue
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Hermes bracket format: [func_name(arg1=val1), other_tool(arg2=val2)]
+        # The payload is Python-expression-like; use ast so commas inside quoted
+        # strings or nested lists/dicts do not split calls incorrectly.
+        try:
+            parsed_expr = ast.parse(content, mode="eval").body
+        except SyntaxError:
+            parsed_expr = None
+
+        calls = parsed_expr.elts if isinstance(parsed_expr, ast.List) else [parsed_expr]
+        for call in calls:
+            if not isinstance(call, ast.Call):
+                continue
+
+            if isinstance(call.func, ast.Name):
+                func_name = call.func.id
+            elif isinstance(call.func, ast.Attribute):
+                func_name = ast.unparse(call.func)
+            else:
+                continue
+
+            arguments = {}
+            for kw in call.keywords:
+                if kw.arg is None:
+                    continue
+                try:
+                    arguments[kw.arg] = ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError):
+                    arguments[kw.arg] = ast.unparse(kw.value)
+
             tool_calls.append(
                 ToolCall(
                     id=f"call_{uuid.uuid4().hex[:8]}",
@@ -542,6 +633,12 @@ def parse_tool_calls(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
 
+    # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
+    if "<|tool_call_start|>" in cleaned_text:
+        hermes_result = _parse_hermes_tool_calls(cleaned_text)
+        if hermes_result[1] is not None:
+            return hermes_result
+
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
@@ -578,6 +675,15 @@ def parse_tool_calls(
                     cleaned_text[idx:],
                 )
                 cleaned_text = cleaned_text[:idx].strip()
+
+    # Strip Hermes markers if still present (models without has_tool_calling)
+    if "<|tool_call_start|>" in cleaned_text:
+        cleaned_text = re.sub(
+            r"<\|tool_call_start\|>.*?<\|tool_call_end\|>",
+            "",
+            cleaned_text,
+            flags=re.DOTALL,
+        ).strip()
 
     return cleaned_text, None
 
@@ -725,7 +831,10 @@ class ToolCallStreamFilter:
             marker = ""
         if marker_end is None:
             marker_end = ""
-        self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
+        self._marker_pairs: List[Tuple[str, str]] = [
+            ("<|tool_call_start|>", "<|tool_call_end|>"),
+            ("<tool_call>", "</tool_call>"),
+        ]
         self._suppress_after_markers: List[str] = []
         if marker:
             if marker_end:
@@ -734,6 +843,19 @@ class ToolCallStreamFilter:
                 # One-sided markers (e.g. Mistral "[TOOL_CALLS]" with no
                 # end marker): suppress everything after the start marker.
                 self._suppress_after_markers.append(marker)
+        # Gemma 4 can emit a bare close token outside a matched tool-call
+        # envelope. Do not apply this to XML-style closers like </tool_call>,
+        # which may appear as literal prose.
+        is_gemma4_tool_marker = (
+            marker == "<|tool_call>" and marker_end == "<tool_call|>"
+        )
+        self._stray_close_markers: List[str] = (
+            [marker_end] if is_gemma4_tool_marker else []
+        )
+        self._orphan_close_markers: List[str] = ["<|tool_call_end|>"]
+        if marker_end and not self._is_xml_close_marker(marker_end):
+            self._orphan_close_markers.append(marker_end)
+        self._orphan_close_markers = list(dict.fromkeys(self._orphan_close_markers))
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
         self._bracket_call_re = re.compile(
@@ -743,6 +865,10 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
+
+    @staticmethod
+    def _is_xml_close_marker(marker: str) -> bool:
+        return marker.startswith("</") and marker.endswith(">")
 
     @property
     def active(self) -> bool:
@@ -765,6 +891,11 @@ class ToolCallStreamFilter:
             idx = text.find(marker)
             if idx >= 0:
                 starts.append((idx, len(marker), close))
+
+        for close in self._orphan_close_markers:
+            close_idx = text.find(close)
+            if close_idx >= 0:
+                starts.append((close_idx, len(close), None))
 
         ns_match = self._namespaced_open_re.search(text)
         if ns_match:
@@ -842,6 +973,10 @@ class ToolCallStreamFilter:
         # Same for suppress-after markers (e.g. "[TOOL" for "[TOOL_CALLS]").
         for sa_marker in self._suppress_after_markers:
             keep = max(keep, self._partial_prefix_len(text, sa_marker))
+        # Hold partial prefix of a stray-close marker so it reassembles before
+        # the strip check — prevents the "hello<tool_call|" + ">" split leak.
+        for close_marker in self._orphan_close_markers:
+            keep = max(keep, self._partial_prefix_len(text, close_marker))
 
         bracket_idx = -1
         for bp in self._bracket_prefixes:
@@ -868,6 +1003,10 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                return True
+
+        for close_marker in self._orphan_close_markers:
+            if close_marker.startswith(tail):
                 return True
 
         # Drop unresolved bracket tool-call prefixes
@@ -984,7 +1123,11 @@ class ToolCallStreamFilter:
                 self._buffer = self._buffer[-keep:]
             break
 
-        return "".join(out)
+        result = "".join(out)
+        for close in self._stray_close_markers:
+            if close in result:
+                result = result.replace(close, "")
+        return result
 
     def finish(self) -> str:
         """Flush remaining safe buffer content.
@@ -1010,6 +1153,9 @@ class ToolCallStreamFilter:
         else:
             buf = self._buffer
         self._buffer = ""
+        for close in self._stray_close_markers:
+            if close in buf:
+                buf = buf.replace(close, "")
         return buf
 
 

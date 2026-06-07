@@ -3,7 +3,7 @@
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
-//   • Updates — release check status + auto-check/auto-download prefs
+//   • Updates — release check status + auto-check/auto-notify prefs
 //   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
@@ -669,16 +669,16 @@ private struct UpdatesSection: View {
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
-                              defaultValue: "Auto-download Updates",
-                              comment: "Row label for the auto-download updates toggle"),
+                              defaultValue: "Notify About Updates",
+                              comment: "Row label for the automatic update notification toggle"),
                 sublabel: String(localized: "status.updates.auto_download.sub",
-                                 defaultValue: "Download in the background, then show Install & Restart",
-                                 comment: "Sublabel for the auto-download toggle"),
+                                 defaultValue: "Show release notes before downloading in the background",
+                                 comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
                 Toggle("", isOn: Binding(
-                    get: { updates.autoDownload },
-                    set: { updates.autoDownload = $0 }
+                    get: { updates.autoNotify },
+                    set: { updates.autoNotify = $0 }
                 ))
                 .labelsHidden()
                 .toggleStyle(.switch)
@@ -759,9 +759,9 @@ private struct UpdatesSection: View {
         switch updates.state {
         case .available, .ready:
             Button(String(localized: "status.updates.install",
-                          defaultValue: "Install & Restart",
-                          comment: "Updates action button to install a downloaded update and restart")) {
-                updates.installAndRestart()
+                          defaultValue: "Review Update",
+                          comment: "Updates action button to review release notes before installing")) {
+                updates.requestUpdateConfirmation()
             }
                 .buttonStyle(.omlx(.primary, size: .small))
         case .downloading(let pct):

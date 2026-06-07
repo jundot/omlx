@@ -276,6 +276,7 @@ class TestParserBackedThinkingBudgetWiring:
         scheduler = MagicMock(spec=Scheduler)
         scheduler._output_parser_factory = factory
         scheduler._xtc_special_tokens = set()
+        scheduler._model_suppress_tokens = set()
         scheduler._get_think_token_id = Scheduler._get_think_token_id.__get__(
             scheduler, Scheduler
         )

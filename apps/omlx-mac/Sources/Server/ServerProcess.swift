@@ -146,6 +146,7 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     var pid: Int32? { process?.processIdentifier }
+    var serverLogURL: URL { logURL }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
     /// already up, or .portConflict if the port is busy. Throws only on

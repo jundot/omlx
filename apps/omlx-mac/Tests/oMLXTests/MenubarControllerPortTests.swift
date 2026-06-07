@@ -39,6 +39,11 @@ final class MenubarControllerPortTests: XCTestCase {
         )
     }
 
+    func testSpawnEnvironmentAdvertisesMenubarSupervisor() {
+        let env = makeRuntime().makeEnvironment()
+        XCTAssertEqual(env["OMLX_SUPERVISED"], "menubar")
+    }
+
     // MARK: - displayPort
 
     func testDisplayPortFallsBackToConfigWhenNoServer() {
@@ -152,5 +157,66 @@ final class MenubarControllerPortTests: XCTestCase {
             XCTAssertEqual(comps.queryItems?.first { $0.name == "redirect" }?.value,
                            "/admin/dashboard")
         }
+    }
+
+    // MARK: - menuAvailability
+
+    func testMenuAvailabilityKeepsSettingsEnabledWhenServerIsOffline() {
+        for state in [ServerProcess.State.stopped, .failed(message: "Port 8000 in use")] {
+            let availability = MenubarController.menuAvailability(for: state)
+            XCTAssertTrue(availability.settings)
+            XCTAssertFalse(availability.webDashboard)
+            XCTAssertFalse(availability.chat)
+        }
+    }
+
+    func testMenuAvailabilityEnablesBrowserItemsOnlyWhenRunning() {
+        let availability = MenubarController.menuAvailability(for: .running(pid: 123))
+        XCTAssertTrue(availability.settings)
+        XCTAssertTrue(availability.webDashboard)
+        XCTAssertTrue(availability.chat)
+    }
+
+    func testMenuAvailabilityKeepsBrowserItemsDisabledDuringTransitions() {
+        let states: [ServerProcess.State] = [
+            .starting,
+            .stopping,
+            .unresponsive(pid: 123),
+        ]
+
+        for state in states {
+            let availability = MenubarController.menuAvailability(for: state)
+            XCTAssertTrue(availability.settings)
+            XCTAssertFalse(availability.webDashboard)
+            XCTAssertFalse(availability.chat)
+        }
+    }
+
+    // MARK: - failure alerts
+
+    func testGenericFailureAlertSkipsPortConflictMessages() {
+        XCTAssertFalse(
+            MenubarController.shouldShowGenericFailureAlert(message: "Port 8000 in use")
+        )
+        XCTAssertTrue(
+            MenubarController.shouldShowGenericFailureAlert(
+                message: "Server exited with code 1 during startup"
+            )
+        )
+    }
+
+    func testAccessFailureHintDetectsPermissionErrors() {
+        XCTAssertNotNil(
+            MenubarController.accessFailureHint(
+                message: "Server exited with code 1 during startup",
+                logTail: "PermissionError: [Errno 1] Operation not permitted"
+            )
+        )
+        XCTAssertNil(
+            MenubarController.accessFailureHint(
+                message: "Server exited with code 1 during startup",
+                logTail: "ValueError: no models found"
+            )
+        )
     }
 }

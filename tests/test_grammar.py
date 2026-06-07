@@ -593,6 +593,190 @@ class TestCompileGrammarForRequest:
         })
         assert result is None
 
+    # ---- #1241: strict json_schema response_format is a hard constraint ----
+
+    @staticmethod
+    def _strict_rf(strict):
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "t",
+                "strict": strict,
+                "schema": {"type": "object", "properties": {"a": {"type": "string"}}},
+            },
+        }
+
+    def test_strict_response_format_no_compiler_degrades_not_raises(self):
+        """strict:true response_format degrades to None (warn) rather than 400.
+
+        Reporter on #1241 listed explicit rejection as acceptable, but to avoid
+        a breaking behavior change we warn-and-fall-back instead of rejecting.
+        """
+        engine = _make_engine(grammar_compiler=None)
+        assert self._call(engine, response_format=self._strict_rf(True)) is None
+
+    def test_returns_none_when_no_compiler_and_nonstrict_response_format(self):
+        """strict:false response_format also degrades gracefully to None."""
+        engine = _make_engine(grammar_compiler=None)
+        assert self._call(engine, response_format=self._strict_rf(False)) is None
+
+    def test_returns_none_when_no_compiler_and_response_format_strict_absent(self):
+        """response_format without a strict flag defaults to best-effort (None)."""
+        engine = _make_engine(grammar_compiler=None)
+        result = self._call(engine, response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {"type": "object"}},
+        })
+        assert result is None
+
+    def test_compilation_error_strict_response_format_degrades_not_raises(self):
+        """A compile failure under strict:true degrades to None, not 400.
+
+        Mirrors the no-compiler path: response_format never hard-fails, even
+        when strict was requested (structured_outputs is the one that 400s).
+        """
+        compiler = MagicMock()
+        compiler.compile_json_schema.side_effect = RuntimeError("bad schema")
+        engine = _make_engine(grammar_compiler=compiler)
+        assert self._call(engine, response_format=self._strict_rf(True)) is None
+
+
+class TestResponseFormatRequestsStrict:
+    """Tests for _response_format_requests_strict."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_requests_strict
+        return _response_format_requests_strict(response_format)
+
+    def test_none(self):
+        assert self._call(None) is False
+
+    def test_json_object_not_strict(self):
+        assert self._call({"type": "json_object"}) is False
+
+    def test_text_not_strict(self):
+        assert self._call({"type": "text"}) is False
+
+    def test_json_schema_strict_true(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": True, "schema": {}},
+        }) is True
+
+    def test_json_schema_strict_false(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": False, "schema": {}},
+        }) is False
+
+    def test_json_schema_strict_absent(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {}},
+        }) is False
+
+    def test_pydantic_model_strict_true(self):
+        from omlx.api.openai_models import ResponseFormat, ResponseFormatJsonSchema
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema=ResponseFormatJsonSchema(name="t", strict=True, schema={}),
+        )
+        assert self._call(rf) is True
+
+
+class TestResponseFormatRequestsGrammar:
+    """Tests for _response_format_requests_grammar — the gate that decides
+    whether an unenforced response_format earns a Warning header / fallback.
+    Only json_object and json_schema request grammar-constrained output; a
+    plain text format never asked for enforcement, so it must not warn
+    (#1241 review)."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_requests_grammar
+        return _response_format_requests_grammar(response_format)
+
+    def test_none(self):
+        assert self._call(None) is False
+
+    def test_text_does_not_request_grammar(self):
+        # The reviewer's case: type "text" must NOT emit a Warning header.
+        assert self._call({"type": "text"}) is False
+
+    def test_json_object(self):
+        assert self._call({"type": "json_object"}) is True
+
+    def test_json_schema(self):
+        assert self._call({
+            "type": "json_schema",
+            "json_schema": {"name": "t", "schema": {}},
+        }) is True
+
+    def test_json_schema_without_schema_maps_to_nothing(self):
+        # A json_schema that carries no schema compiles to no grammar, so it
+        # must not earn a Warning header claiming decoding was unavailable.
+        # Keeps the header in sync with what _build_format_element builds.
+        assert self._call({"type": "json_schema", "json_schema": {"name": "t"}}) is False
+        assert self._call({"type": "json_schema"}) is False
+
+    def test_unknown_type_does_not_request_grammar(self):
+        assert self._call({"type": "json"}) is False
+
+    def test_pydantic_text_model(self):
+        from omlx.api.openai_models import ResponseFormat
+        assert self._call(ResponseFormat(type="text")) is False
+
+    def test_pydantic_json_schema_model(self):
+        from omlx.api.openai_models import ResponseFormat, ResponseFormatJsonSchema
+        rf = ResponseFormat(
+            type="json_schema",
+            json_schema=ResponseFormatJsonSchema(name="t", schema={}),
+        )
+        assert self._call(rf) is True
+
+
+class TestResponseFormatWarningHeader:
+    """The unenforced-response_format degrade is surfaced to the caller as an
+    RFC 7234 Warning response header, not just a server-side log (#1241)."""
+
+    @staticmethod
+    def _call(response_format):
+        from omlx.server import _response_format_warning_header
+        return _response_format_warning_header(response_format)
+
+    @staticmethod
+    def _strict_rf(strict):
+        return {
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": strict, "schema": {}},
+        }
+
+    def test_strict_header_names_strict_intent(self):
+        header = self._call(self._strict_rf(True))
+        assert header.startswith('199 omlx "')
+        assert header.endswith('"')
+        assert "strict" in header
+        assert "NOT schema-enforced" in header
+
+    def test_non_strict_header_is_generic(self):
+        header = self._call(self._strict_rf(False))
+        assert header.startswith('199 omlx "')
+        assert "not enforced" in header
+        assert "strict" not in header
+
+    def test_json_object_header_is_generic(self):
+        header = self._call({"type": "json_object"})
+        assert header.startswith('199 omlx "')
+        assert "strict" not in header
+
+    def test_header_value_is_single_line_ascii(self):
+        # HTTP header values cannot contain CR/LF or non-ASCII bytes.
+        for rf in (self._strict_rf(True), {"type": "json_object"}):
+            header = self._call(rf)
+            header.encode("ascii")  # raises if non-ASCII
+            assert "\n" not in header and "\r" not in header
+
 
 # =========================================================================
 # GrammarConstraintProcessor

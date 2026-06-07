@@ -17,6 +17,8 @@ Supports:
 import contextlib
 import json
 import logging
+import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,7 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -90,7 +93,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -99,6 +101,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures
@@ -278,6 +281,17 @@ class DiscoveredModel:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"  # "local" or "hf_cache"
+    source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+
+
+@dataclass(frozen=True)
+class HfCacheEntry:
+    """Resolved HuggingFace Hub cache entry."""
+
+    snapshot_path: Path
+    model_id: str
+    source_repo_id: str
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -775,34 +789,194 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
-def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
-    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+def model_directory_access_error(path: Path) -> str | None:
+    """Return a user-facing error if a model directory cannot be scanned."""
+    try:
+        if not path.exists():
+            return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+        next(path.iterdir(), None)
+    except OSError as e:
+        return (
+            f"Model directory is not readable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+    return None
 
-    Returns (snapshot_path, model_name) or None if not a valid HF cache entry.
-    """
-    name = path.name
-    if not name.startswith("models--") or name.count("--") < 2:
-        return None
 
-    # "models--Org--Name" → "Name"
-    model_name = name.split("--", 2)[2]
+def model_directory_write_error(path: Path, *, create: bool = False) -> str | None:
+    """Return a user-facing error if a model directory cannot be written."""
+    try:
+        if not path.exists():
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    access_error = model_directory_access_error(path)
+    if access_error is not None:
+        return access_error
 
     try:
-        commit_hash = (path / "refs" / "main").read_text().strip()
-    except OSError:
+        with tempfile.NamedTemporaryFile(
+            prefix=".omlx-write-test-",
+            dir=path,
+            delete=True,
+        ) as f:
+            f.write(b"")
+            f.flush()
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    return None
+
+
+def _iter_readable_entries(path: Path, context: str) -> list[Path]:
+    """Return sorted directory entries, or an empty list when scanning fails."""
+    try:
+        return sorted(path.iterdir())
+    except OSError as e:
+        logger.warning(
+            "Skipping unreadable %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return []
+
+
+def _is_readable_dir(path: Path, context: str) -> bool:
+    try:
+        return path.is_dir()
+    except OSError as e:
+        logger.warning(
+            "Skipping inaccessible %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
+def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
+    """Decode models--org--repo into (route_safe_id, repo_id)."""
+    name = path.name
+    if not name.startswith("models--"):
         return None
 
-    snapshot = path / "snapshots" / commit_hash
-    if not snapshot.is_dir():
+    encoded = name[len("models--"):]
+    if not encoded:
         return None
 
-    return snapshot, model_name
+    parts = encoded.split("--")
+    if len(parts) == 1:
+        return parts[0], parts[0]
+
+    repo_name = "--".join(parts[1:])
+    return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
+
+
+def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
+    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+
+    Returns an HfCacheEntry or None if not a valid HF model cache entry.
+    """
+    decoded = _decode_hf_cache_model_id(path)
+    if decoded is None:
+        return None
+    model_id, source_repo_id = decoded
+
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    for ref_name in ("main", "master"):
+        try:
+            commit_hash = (path / "refs" / ref_name).read_text().strip()
+        except OSError:
+            continue
+        snapshot = snapshots_dir / commit_hash
+        if snapshot.is_dir():
+            return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    snapshots = [
+        p
+        for p in _iter_readable_entries(snapshots_dir, "HF cache snapshots")
+        if _is_readable_dir(p, "HF cache snapshot")
+    ]
+    if not snapshots:
+        return None
+    if len(snapshots) == 1:
+        return HfCacheEntry(snapshots[0], model_id, source_repo_id)
+
+    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+    return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+
+def _safetensors_has_mlx_metadata(path: Path) -> bool:
+    """Return True if any model safetensors shard declares MLX format."""
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        logger.debug(f"safetensors import failed while checking {path}: {e}")
+        return False
+
+    for shard in sorted(path.glob("model*.safetensors")):
+        try:
+            with safe_open(str(shard), framework="numpy") as f:
+                metadata = f.metadata() or {}
+        except Exception as e:
+            logger.debug(f"Could not read safetensors metadata from {shard}: {e}")
+            continue
+        if str(metadata.get("format", "")).lower() == "mlx":
+            return True
+    return False
+
+
+_MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
+
+
+def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+    """Heuristic for HF cache entries that can be loaded without conversion."""
+    if not _is_model_dir(model_dir):
+        return False
+    if not list(model_dir.glob("model*.safetensors")):
+        logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+        return False
+    if _safetensors_has_mlx_metadata(model_dir):
+        return True
+
+    repo_lower = source_repo_id.lower()
+    if repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(source_repo_id):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible by repo name: {source_repo_id}"
+        )
+        return True
+
+    logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
+    return False
 
 
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
     model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
     try:
@@ -850,6 +1024,8 @@ def _register_model(
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             model_context_length=model_context_length,
+            source_type=source_type,
+            source_repo_id=source_repo_id,
         )
 
         size_gb = estimated_size / (1024**3)
@@ -891,16 +1067,17 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
-    if not model_dir.exists():
-        raise ValueError(f"Model directory does not exist: {model_dir}")
-
-    if not model_dir.is_dir():
-        raise ValueError(f"Model directory is not a directory: {model_dir}")
+    access_error = model_directory_access_error(model_dir)
+    if access_error is not None:
+        if "not readable" in access_error:
+            logger.warning("Skipping directory %s: %s", model_dir, access_error)
+            return {}
+        raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
 
-    for subdir in sorted(model_dir.iterdir()):
-        if not subdir.is_dir() or subdir.name.startswith("."):
+    for subdir in _iter_readable_entries(model_dir, "model directory"):
+        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
 
         if _is_adapter_dir(subdir):
@@ -915,15 +1092,26 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                snapshot_path, model_name = hf_resolved
-                if _is_model_dir(snapshot_path):
-                    _register_model(models, snapshot_path, model_name)
+                if _is_hf_cache_mlx_compatible(
+                    hf_resolved.snapshot_path,
+                    hf_resolved.source_repo_id,
+                ):
+                    _register_model(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                 continue
 
             # Level 2: organization folder — scan children
             has_children = False
-            for child in sorted(subdir.iterdir()):
-                if not child.is_dir() or child.name.startswith("."):
+            for child in _iter_readable_entries(subdir, "model group"):
+                if (
+                    not _is_readable_dir(child, "model group entry")
+                    or child.name.startswith(".")
+                ):
                     continue
                 if _is_adapter_dir(child):
                     logger.info(
@@ -967,11 +1155,9 @@ def discover_models_from_dirs(
     merged: dict[str, DiscoveredModel] = {}
 
     for model_dir in model_dirs:
-        if not model_dir.exists():
-            logger.warning(f"Model directory does not exist, skipping: {model_dir}")
-            continue
-        if not model_dir.is_dir():
-            logger.warning(f"Not a directory, skipping: {model_dir}")
+        access_error = model_directory_access_error(model_dir)
+        if access_error is not None:
+            logger.warning(f"Skipping directory {model_dir}: {access_error}")
             continue
 
         try:

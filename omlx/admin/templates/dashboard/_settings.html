@@ -19,6 +19,15 @@
                 >
                     {{ t('settings.tab.models') }}
                 </button>
+                <button
+                    @click="setSettingsTab('integrations')"
+                    :class="activeTab === 'integrations'
+                        ? 'bg-neutral-900 text-white'
+                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
+                >
+                    {{ t('settings.tab.integrations') }}
+                </button>
             </div>
 
             <!-- Global Settings Tab -->
@@ -308,6 +317,22 @@
                                         </template>
                                     </div>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.hf_cache') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.hf_cache_desc') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-1 font-mono break-all"
+                                           x-show="globalSettings.huggingface.hf_cache_path"
+                                           x-text="globalSettings.huggingface.hf_cache_path"></p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.huggingface.hf_cache_enabled = !globalSettings.huggingface.hf_cache_enabled"
+                                            :class="globalSettings.huggingface.hf_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.huggingface.hf_cache_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                             </div>
                         </div>
 
@@ -564,6 +589,14 @@
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window') }}</label>
@@ -836,6 +869,104 @@
                 </div>
             </div>
 
+            <!-- Integration Settings Tab -->
+            <div x-show="activeTab === 'integrations'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.integrations.section_label') }}</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.integrations.heading') }}</h3>
+                        <p class="text-sm text-neutral-500 mt-2">{{ t('settings.integrations.description') }}</p>
+                    </div>
+
+                    <div class="space-y-4">
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="file-text" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.markitdown.section_label') }}</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">PDF · DOCX · PPTX</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.enabled') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.enabled_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.integrations.markitdown_enabled = !globalSettings.integrations.markitdown_enabled; saveIntegrationSettings().then(() => loadModels())"
+                                            :class="globalSettings.integrations.markitdown_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.markitdown_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.expose_model') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.expose_model_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.integrations.markitdown_expose_model = !globalSettings.integrations.markitdown_expose_model; saveIntegrationSettings().then(() => loadModels())"
+                                            :disabled="!globalSettings.integrations.markitdown_enabled"
+                                            :class="[
+                                                globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                !globalSettings.integrations.markitdown_enabled ? 'opacity-40 cursor-not-allowed' : ''
+                                            ]"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.markitdown_expose_model && globalSettings.integrations.markitdown_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.max_file_size') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.max_file_size_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number"
+                                               min="1"
+                                               x-model.number="globalSettings.integrations.markitdown_max_file_size_mb"
+                                               @change="saveIntegrationSettings()"
+                                               class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <span class="text-sm text-neutral-400">MB</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.max_files') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.max_files_hint') }}</p>
+                                    </div>
+                                    <input type="number"
+                                           min="1"
+                                           x-model.number="globalSettings.integrations.markitdown_max_files_per_request"
+                                           @change="saveIntegrationSettings()"
+                                           class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.pdf_processing_engine') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.pdf_processing_engine_hint') }}</p>
+                                        <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown'"
+                                           class="text-xs text-amber-600 mt-1">
+                                            {{ t('settings.integrations.markitdown.pdf_processing_markitdown_warning') }}
+                                        </p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.markitdown_pdf_processing_engine"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="markitdown">MarkItDown</option>
+                                        <template x-for="model in markitdownOcrModels" :key="model.id">
+                                            <option :value="model.id" x-text="model.id"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Model Settings Tab -->
             <div x-show="activeTab === 'models'" x-cloak>
                 <div class="animate-fade-in-up">
@@ -957,7 +1088,7 @@
                                                 </span>
                                             </template>
                                             <!-- Loaded state -->
-                                            <template x-if="!model.is_loading && model.loaded">
+                                            <template x-if="!model.virtual && !model.is_loading && model.loaded">
                                                 <button @click="unloadModel(model.id)"
                                                         :class="hover
                                                             ? 'bg-red-100 text-red-700 cursor-pointer'
@@ -967,8 +1098,14 @@
                                                     <span x-text="hover ? window.t('settings.models.table.status_unload') : window.t('settings.models.table.status_loaded')"></span>
                                                 </button>
                                             </template>
+                                            <template x-if="model.virtual && !model.is_loading && model.loaded">
+                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-neutral-900 text-white">
+                                                    <span class="w-1.5 h-1.5 rounded-full bg-white"></span>
+                                                    <span x-text="window.t('settings.models.table.status_loaded')"></span>
+                                                </span>
+                                            </template>
                                             <!-- Ready state -->
-                                            <template x-if="!model.is_loading && !model.loaded">
+                                            <template x-if="!model.virtual && !model.is_loading && !model.loaded">
                                                 <button @click="loadModel(model.id)"
                                                         :class="hover
                                                             ? 'bg-green-100 text-green-700 border-green-200 cursor-pointer'
@@ -982,21 +1119,26 @@
 
                                         <!-- Pin Toggle -->
                                         <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
-                                            <button
-                                                @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
-                                                :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
-                                                class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
-                                            >
-                                                <span
-                                                    :class="model.pinned ? 'translate-x-4' : 'translate-x-0'"
-                                                    class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
-                                                ></span>
-                                            </button>
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
+                                                    :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                >
+                                                    <span
+                                                        :class="model.pinned ? 'translate-x-4' : 'translate-x-0'"
+                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                    ></span>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <span class="text-xs text-neutral-300">—</span>
+                                            </template>
                                         </div>
 
                                         <!-- Default Radio (only for LLM models) -->
                                         <div class="hidden sm:flex w-14 justify-center flex-shrink-0">
-                                            <template x-if="model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type">
+                                            <template x-if="!model.virtual && (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type)">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
                                                     :class="model.is_default
@@ -1007,20 +1149,25 @@
                                                     <span x-show="model.is_default" class="w-1.5 h-1.5 bg-white rounded-full"></span>
                                                 </button>
                                             </template>
-                                            <template x-if="model.model_type && model.model_type !== 'llm' && model.model_type !== 'vlm'">
+                                            <template x-if="model.virtual || (model.model_type && model.model_type !== 'llm' && model.model_type !== 'vlm')">
                                                 <span class="text-xs text-neutral-300">—</span>
                                             </template>
                                         </div>
 
                                         <!-- Actions (icon only) -->
                                         <div class="w-10 flex justify-center flex-shrink-0">
-                                            <button
-                                                @click="openModelSettings(model)"
-                                                class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
-                                                :title="window.t('settings.models.table.sampling_settings_tooltip')"
-                                            >
-                                                <i data-lucide="settings" class="w-4 h-4"></i>
-                                            </button>
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="openModelSettings(model)"
+                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    :title="window.t('settings.models.table.sampling_settings_tooltip')"
+                                                >
+                                                    <i data-lucide="settings" class="w-4 h-4"></i>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <span class="text-xs text-neutral-300">—</span>
+                                            </template>
                                         </div>
                                     </div>
 

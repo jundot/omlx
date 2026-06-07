@@ -12,6 +12,7 @@ import pytest
 from omlx.cache.paged_ssd_cache import (
     PagedSSDBlockMetadata,
     PagedSSDCacheManager,
+    SharedHotCacheBudget,
     _extract_tensor_bytes,
 )
 
@@ -585,6 +586,84 @@ class TestHotCacheByteAccounting:
         finally:
             mgr.close()
 
+    def test_shared_budget_evicts_across_managers_by_global_lru(self, tmp_path):
+        """A shared hot cache budget should cap aggregate manager memory."""
+        entry, entry_size = self._make_raw_entry(tmp_path, b"budget_size_probe")
+        del entry
+        budget = SharedHotCacheBudget(entry_size * 2 + 1)
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_a",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_b",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+
+        try:
+            a0, _ = self._make_raw_entry(tmp_path, b"budget_a_0", model_name="model-a")
+            b0, _ = self._make_raw_entry(tmp_path, b"budget_b_0", model_name="model-b")
+            b1, _ = self._make_raw_entry(tmp_path, b"budget_b_1", model_name="model-b")
+
+            mgr_a._hot_cache_put(b"budget_a_0", a0)
+            mgr_b._hot_cache_put(b"budget_b_0", b0)
+            assert budget.total_bytes == entry_size * 2
+
+            # Refresh A, so B's first block is the global LRU victim.
+            assert mgr_a._hot_cache_get(b"budget_a_0") is not None
+            mgr_b._hot_cache_put(b"budget_b_1", b1)
+
+            assert budget.total_bytes == entry_size * 2
+            assert mgr_a._hot_cache_get(b"budget_a_0") is not None
+            assert mgr_b._hot_cache_get(b"budget_b_0") is None
+            assert mgr_b._hot_cache_get(b"budget_b_1") is not None
+            assert mgr_a.get_stats().hot_cache_max_bytes == budget.max_bytes
+            assert mgr_b.get_stats().hot_cache_max_bytes == budget.max_bytes
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
+    def test_shared_budget_forgets_owner_on_clear_and_close(self, tmp_path):
+        """Clearing or closing a manager must release shared budget bytes."""
+        _, entry_size = self._make_raw_entry(tmp_path, b"budget_clear_probe")
+        budget = SharedHotCacheBudget(entry_size * 4)
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_clear_a",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_clear_b",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+
+        try:
+            a0, _ = self._make_raw_entry(tmp_path, b"budget_clear_a_0")
+            b0, _ = self._make_raw_entry(tmp_path, b"budget_clear_b_0")
+            mgr_a._hot_cache_put(b"budget_clear_a_0", a0)
+            mgr_b._hot_cache_put(b"budget_clear_b_0", b0)
+
+            assert budget.total_bytes == entry_size * 2
+            assert mgr_a.clear_hot_cache() == 1
+            assert budget.total_bytes == entry_size
+
+            mgr_b.close()
+            assert budget.total_bytes == 0
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheStatsAccuracy:
@@ -1075,17 +1154,24 @@ class TestSSDWriteDrops:
         )
 
     def test_paged_ssd_cache_stats_default_and_reset(self):
-        """Dataclass: ssd_write_drops defaults to 0 and is zeroed by reset()."""
+        """Dataclass: drop/unlink counters default to 0 and reset to 0."""
         from omlx.cache.stats import PagedSSDCacheStats
 
         # Default is zero.
         stats = PagedSSDCacheStats()
         assert stats.ssd_write_drops == 0
+        assert stats.evict_unlink_failures == 0
 
         # reset() returns it to zero from a non-zero state.
-        stats = PagedSSDCacheStats(ssd_write_drops=5, saves=2, loads=3)
+        stats = PagedSSDCacheStats(
+            ssd_write_drops=5,
+            evict_unlink_failures=3,
+            saves=2,
+            loads=3,
+        )
         stats.reset()
         assert stats.ssd_write_drops == 0
+        assert stats.evict_unlink_failures == 0
         # Verify reset() didn't break the existing fields it already handled.
         assert stats.saves == 0
         assert stats.loads == 0
@@ -1124,6 +1210,23 @@ class TestSSDWriteDrops:
                 "get_stats_for_model() must pass _stats['ssd_write_drops'] "
                 "through to the dataclass field"
             )
+        finally:
+            mgr.close()
+
+    def test_evict_unlink_failures_round_trips_through_get_stats(self, tmp_path):
+        """evict_unlink_failures is visible through both stats accessors."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "unlink_failure_wiring_test",
+            max_size_bytes=100 * 1024**2,
+        )
+        try:
+            mgr._stats["evict_unlink_failures"] = 3
+
+            stats = mgr.get_stats()
+            assert stats.evict_unlink_failures == 3
+
+            model_stats = mgr.get_stats_for_model("any-model-name")
+            assert model_stats.evict_unlink_failures == 3
         finally:
             mgr.close()
 

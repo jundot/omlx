@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.utils.install import get_cli_prefix
+from omlx.utils.install import get_cli_command_prefix
 
 
 class CopilotIntegration(Integration):
@@ -22,7 +22,7 @@ class CopilotIntegration(Integration):
 
     def get_command(self, ctx: IntegrationContext) -> str:
         return (
-            f"{get_cli_prefix()} launch copilot "
+            f"{get_cli_command_prefix()} launch copilot "
             f"--model {ctx.model or 'select-a-model'}"
         )
 

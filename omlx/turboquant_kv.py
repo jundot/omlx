@@ -68,7 +68,9 @@ def _infer_head_dim(state, bits: int) -> int:
         packed_width = state.mse_indices.shape[-1]
         bits = max(bits - 1, 1)
     else:
-        raise TypeError(f"Cannot infer head_dim from state type: {type(state).__name__}")
+        raise TypeError(
+            f"Cannot infer head_dim from state type: {type(state).__name__}"
+        )
     return packed_width * 32 // bits
 
 
@@ -97,6 +99,7 @@ def _rebuild_codecs(tq_cache: TurboQuantKVCache, key_state, value_state) -> None
 # Batch-level state helpers (axis-0 operations)
 # ---------------------------------------------------------------------------
 
+
 def _filter_state(state, indices):
     """Index-select along batch dimension (axis 0)."""
     if state is None:
@@ -105,8 +108,10 @@ def _filter_state(state, indices):
         return TurboQuantMSEState(state.norms[indices], state.indices[indices])
     if isinstance(state, TurboQuantProdState):
         return TurboQuantProdState(
-            state.norms[indices], state.mse_indices[indices],
-            state.residual_norms[indices], state.qjl_signs[indices],
+            state.norms[indices],
+            state.mse_indices[indices],
+            state.residual_norms[indices],
+            state.qjl_signs[indices],
         )
     if isinstance(state, TurboQuantPolarState):
         return TurboQuantPolarState(
@@ -115,12 +120,15 @@ def _filter_state(state, indices):
         )
     if isinstance(state, TurboQuantPolarProdState):
         return TurboQuantPolarProdState(
-            state.norms[indices], _filter_state(state.polar_state, indices),
-            state.residual_norms[indices], state.qjl_signs[indices],
+            state.norms[indices],
+            _filter_state(state.polar_state, indices),
+            state.residual_norms[indices],
+            state.qjl_signs[indices],
         )
     if isinstance(state, TurboQuantSplitState):
         return TurboQuantSplitState(
-            _filter_state(state.low, indices), _filter_state(state.high, indices),
+            _filter_state(state.low, indices),
+            _filter_state(state.high, indices),
         )
     raise TypeError(f"Unsupported state type: {type(state)!r}")
 
@@ -146,7 +154,9 @@ def _concat_state_batch(states):
         return TurboQuantPolarState(
             mx.concatenate([s.radii for s in states], axis=0),
             tuple(
-                mx.concatenate([states[j].level_indices[i] for j in range(len(states))], axis=0)
+                mx.concatenate(
+                    [states[j].level_indices[i] for j in range(len(states))], axis=0
+                )
                 for i in range(len(first.level_indices))
             ),
         )
@@ -186,6 +196,7 @@ def _empty_state_batch_like(state, batch_size: int):
 # ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
+
 
 class BatchTurboQuantKVCache(TurboQuantKVCache):
     """TurboQuantKVCache with batch operations for continuous batching.
@@ -281,7 +292,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding if isinstance(self.offset, mx.array) else left_padding[0].item()
+            self.offset -= (
+                left_padding
+                if isinstance(self.offset, mx.array)
+                else left_padding[0].item()
+            )
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
 
@@ -296,7 +311,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.keys = self.key_codec.quantize(k_rolled)
             self.values = self.value_codec.quantize(v_rolled)
             mx.eval(self.keys, self.values)
-        self.offset -= padding if isinstance(self.offset, mx.array) else padding[0].item()
+        self.offset -= (
+            padding if isinstance(self.offset, mx.array) else padding[0].item()
+        )
         self.left_padding += padding
         self._right_padding = None
 
@@ -311,6 +328,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._cached_state_offset = -1
 
     def extend(self, other: "BatchTurboQuantKVCache"):
+        if not isinstance(other, BatchTurboQuantKVCache):
+            raise TypeError(
+                "BatchTurboQuantKVCache.extend expected BatchTurboQuantKVCache, "
+                f"got {type(other).__name__}"
+            )
         self._ensure_array_offset()
         other._ensure_array_offset()
         max_off = max(self.offset.max().item(), other.offset.max().item())
@@ -362,7 +384,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     def extract(self, idx: int) -> TurboQuantKVCache:
         padding = self.left_padding[idx].item()
-        total = self.offset[idx].item() if isinstance(self.offset, mx.array) else self.offset
+        total = (
+            self.offset[idx].item()
+            if isinstance(self.offset, mx.array)
+            else self.offset
+        )
         end = padding + total
 
         tq = TurboQuantKVCache(bits=self.bits, seed=self.seed)
@@ -378,6 +404,12 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     @classmethod
     def merge(cls, caches: List[TurboQuantKVCache]) -> "BatchTurboQuantKVCache":
+        for cache in caches:
+            if not isinstance(cache, TurboQuantKVCache):
+                raise TypeError(
+                    "BatchTurboQuantKVCache.merge expected TurboQuantKVCache "
+                    f"entries, got {type(cache).__name__}"
+                )
         bits = caches[0].bits
         seed = caches[0].seed
         lengths = [c.offset for c in caches]
@@ -411,7 +443,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             ks, vs = c.state
             if ks is None:
                 if max_length > 0 and reference_key_state is not None:
-                    key_states.append(_allocate_state_like(reference_key_state, max_length))
+                    key_states.append(
+                        _allocate_state_like(reference_key_state, max_length)
+                    )
                     value_states.append(
                         _allocate_state_like(reference_value_state, max_length)
                     )

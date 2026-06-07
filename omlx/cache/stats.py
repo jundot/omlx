@@ -192,6 +192,7 @@ class PagedSSDCacheStats(BaseCacheStats):
     loads: int = 0
     errors: int = 0
     ssd_write_drops: int = 0
+    evict_unlink_failures: int = 0
 
     # Storage capacity
     total_size_bytes: int = 0
@@ -235,6 +236,7 @@ class PagedSSDCacheStats(BaseCacheStats):
         self.loads = 0
         self.errors = 0
         self.ssd_write_drops = 0
+        self.evict_unlink_failures = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert stats to dictionary."""

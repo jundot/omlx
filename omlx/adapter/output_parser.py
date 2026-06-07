@@ -9,16 +9,16 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Protocol
 
-try:
-    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-except ImportError:
-    NaiveStreamingDetokenizer = None
-
+from ..utils.tokenizer import (
+    create_streaming_detokenizer,
+    is_gemma4_model,
+    is_harmony_model,
+)
 from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
-from ..utils.tokenizer import is_gemma4_model, is_harmony_model
 
 
 @dataclass
@@ -66,18 +66,12 @@ class OutputParserFactory:
 class HarmonyOutputParserSession:
     """Scheduler-facing wrapper around ``HarmonyStreamingParser``."""
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
         self._parser = HarmonyStreamingParser(tokenizer)
         self._raw_token_ids: list[int] = []
 
-        if hasattr(tokenizer, "detokenizer"):
-            self._detokenizer = tokenizer.detokenizer
-        elif NaiveStreamingDetokenizer is not None:
-            self._detokenizer = NaiveStreamingDetokenizer(tokenizer)
-        else:
-            self._detokenizer = None
-
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
             self._detokenizer.reset()
 
@@ -126,9 +120,7 @@ class HarmonyOutputParserSession:
                 if self._parser.current_channel == "final":
                     visible_text += final_text
 
-        _, analysis_text, tool_calls = parse_tool_calls_from_tokens(
-            self._raw_token_ids
-        )
+        _, analysis_text, tool_calls = parse_tool_calls_from_tokens(self._raw_token_ids)
         finish_reason = "tool_calls" if tool_calls else None
 
         output_text_prefix = (
@@ -147,7 +139,7 @@ class HarmonyOutputParserSession:
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
-    model_config: Optional[dict[str, Any]] = None,
+    model_config: dict[str, Any] | None = None,
 ) -> OutputParserFactory | None:
     """Detect a protocol-specific output parser for the model, if needed."""
 
@@ -155,7 +147,10 @@ def detect_output_parser(
         temp_parser = HarmonyStreamingParser(tokenizer)
         return OutputParserFactory(
             kind="harmony",
-            create_session=HarmonyOutputParserSession,
+            create_session=lambda session_tokenizer: HarmonyOutputParserSession(
+                session_tokenizer,
+                model_path=model_name,
+            ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
@@ -166,7 +161,10 @@ def detect_output_parser(
 
         return OutputParserFactory(
             kind="gemma4",
-            create_session=Gemma4OutputParserSession,
+            create_session=lambda session_tokenizer: Gemma4OutputParserSession(
+                session_tokenizer,
+                model_path=model_name,
+            ),
             stop_token_ids=set(),
             thinking_end_text="<channel|>",
         )
@@ -176,7 +174,7 @@ def detect_output_parser(
 
 def detect_message_extractor(
     model_name: str,
-    model_config: Optional[dict[str, Any]] = None,
+    model_config: dict[str, Any] | None = None,
 ) -> Callable:
     """Return the appropriate message extractor function for the model.
 
