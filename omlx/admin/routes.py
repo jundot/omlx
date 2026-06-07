@@ -4424,11 +4424,20 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
 
 @router.post("/api/hot-cache/clear")
 async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
-    """Clear the in-memory (hot) cache for all loaded models.
+    """Clear the in-memory hot cache and release the buffers it held.
 
-    No filesystem fallback needed — hot cache is in-memory only and does
-    not survive process restart.
+    Hot cache entries hold live mx.arrays, so clearing the dict only returns
+    their buffers to MLX's pool, which is capped at total RAM (cli.py) and only
+    released by clear_cache(). Run clear_cache() afterwards so the pool is
+    actually freed, including when no model is loaded.
     """
+    import gc
+
+    import mlx.core as mx
+
+    from ..engine_core import get_mlx_executor
+    from ..utils.proc_memory import get_phys_footprint
+
     total_cleared = 0
     for model_id, scheduler in _iter_loaded_schedulers():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
@@ -4444,7 +4453,23 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()
-    return {"status": "ok", "total_cleared": total_cleared}
+
+    # Return the pooled buffers to the OS. On the MLX executor behind a
+    # synchronize() barrier so we don't free buffers still in flight (#85,
+    # #300), and unconditionally so it still works after every model unload.
+    footprint_before = get_phys_footprint()
+    gc.collect()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+    )
+    bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
+
+    return {
+        "status": "ok",
+        "total_cleared": total_cleared,
+        "bytes_reclaimed": bytes_reclaimed,
+    }
 
 
 @router.post("/api/cache/probe")
