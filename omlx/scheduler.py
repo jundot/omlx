@@ -1227,7 +1227,8 @@ class Scheduler:
                 # serialized (matches the original synchronous order) and we
                 # never have two stores racing on the same paged_ssd index.
                 #
-                # OMLX_SYNC_STORE_CACHE=1 disables this executor so store_cache
+                # OMLX_SYNC_STORE_CACHE=1 (or true/yes/on) disables this executor
+                # so store_cache
                 # (including the cached_block_hash_to_block index registration)
                 # runs synchronously on the inference thread via the existing
                 # fallback path below. The prefix cache then becomes immediately
@@ -1237,10 +1238,11 @@ class Scheduler:
                 # async commit had not landed yet. The SSD write stays async via
                 # the background writer thread; only the cheap in-RAM register +
                 # hot-cache populate moves onto the inference thread.
-                if os.environ.get("OMLX_SYNC_STORE_CACHE") == "1":
+                _sync = os.environ.get("OMLX_SYNC_STORE_CACHE", "").strip().lower()
+                if _sync in {"1", "true", "yes", "on"}:
                     self._store_cache_executor = None
                     logger.info(
-                        "OMLX_SYNC_STORE_CACHE=1 -> synchronous store_cache "
+                        "OMLX_SYNC_STORE_CACHE enabled -> synchronous store_cache "
                         "(immediate prefix-cache consistency)"
                     )
                 else:

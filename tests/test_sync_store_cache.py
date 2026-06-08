@@ -20,15 +20,19 @@ def make_scheduler(mock_model, mock_tokenizer, tmp_path):
     (the default branch spins up a real ThreadPoolExecutor + SSD writer thread).
 
     Returned as a factory so the test can set OMLX_SYNC_STORE_CACHE *before*
-    construction.
+    construction. Each created scheduler gets its own cache subdirectory so
+    multiple instances cannot share on-disk state.
     """
     created = []
 
     def _make():
         if not scheduler_module.HAS_TIERED_CACHE:
             pytest.skip("tiered cache modules are unavailable")
-        config = SchedulerConfig(paged_ssd_cache_dir=str(tmp_path / "cache"))
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        cache_dir = tmp_path / f"cache-{len(created)}"
+        config = SchedulerConfig(paged_ssd_cache_dir=str(cache_dir))
+        scheduler = Scheduler(
+            model=mock_model, tokenizer=mock_tokenizer, config=config
+        )
         if scheduler.block_aware_cache is None:
             scheduler.shutdown()
             pytest.skip("paged SSD cache did not initialize in this environment")
@@ -56,8 +60,16 @@ class TestSyncStoreCacheFlag:
         assert scheduler._store_cache_executor is None
         assert scheduler.block_aware_cache is not None
 
-    def test_non_one_value_keeps_async(self, make_scheduler, monkeypatch):
-        """Only the exact value "1" enables sync mode; other values are async."""
-        monkeypatch.setenv("OMLX_SYNC_STORE_CACHE", "0")
+    @pytest.mark.parametrize("value", ["true", "True", "yes", "on", " 1 "])
+    def test_truthy_values_enable_sync(self, make_scheduler, monkeypatch, value):
+        """Truthy values (case/whitespace-insensitive) also enable sync mode."""
+        monkeypatch.setenv("OMLX_SYNC_STORE_CACHE", value)
+        scheduler = make_scheduler()
+        assert scheduler._store_cache_executor is None
+
+    @pytest.mark.parametrize("value", ["0", "false", "off", ""])
+    def test_falsy_values_keep_async(self, make_scheduler, monkeypatch, value):
+        """Falsy / unrecognized values keep the async executor."""
+        monkeypatch.setenv("OMLX_SYNC_STORE_CACHE", value)
         scheduler = make_scheduler()
         assert scheduler._store_cache_executor is not None
