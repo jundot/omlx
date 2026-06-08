@@ -272,6 +272,8 @@ class DFlashEngine(BaseEngine):
             # Idempotent — only wraps once per process.
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
             install_dflash_lifecycle_wrap()
+            from ..patches.dflash_qwen_compat import install_dflash_qwen_compat_patch
+            install_dflash_qwen_compat_patch()
 
             target_bundle = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
@@ -914,7 +916,7 @@ class DFlashEngine(BaseEngine):
             logger.info("DFlash generate cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("DFlash executor did not exit within 10s after abort")
             except Exception:
                 pass
@@ -1079,7 +1081,7 @@ class DFlashEngine(BaseEngine):
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "DFlash executor did not exit within 10s after abort; "
                     "next request may still be queued"

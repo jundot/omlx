@@ -671,6 +671,68 @@ class TestEnginePoolLRU:
         assert victim == "model-a"
 
 
+class TestEnginePoolDFlashIsolation:
+    """Tests for DFlash process-global runtime isolation."""
+
+    class DFlashEngine:
+        def __init__(self, *, active: bool = False):
+            self.active = active
+
+        def has_active_requests(self):
+            return self.active
+
+    class OtherEngine:
+        def has_active_requests(self):
+            return False
+
+    @staticmethod
+    def _entry(model_id: str, engine) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/models/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1024,
+            engine=engine,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unload_other_dflash_engines_unloads_idle_dflash_only(self):
+        pool = EnginePool()
+        pool._entries["old-dflash"] = self._entry(
+            "old-dflash", self.DFlashEngine()
+        )
+        pool._entries["other"] = self._entry("other", self.OtherEngine())
+        pool._entries["new-dflash"] = self._entry("new-dflash", None)
+
+        unloaded = []
+
+        async def fake_unload(model_id):
+            unloaded.append(model_id)
+            pool._entries[model_id].engine = None
+
+        pool._unload_engine = fake_unload
+
+        await pool._unload_other_dflash_engines("new-dflash")
+
+        assert unloaded == ["old-dflash"]
+        assert pool._entries["other"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_unload_other_dflash_engines_blocks_active_dflash(self):
+        pool = EnginePool()
+        pool._entries["active-dflash"] = self._entry(
+            "active-dflash", self.DFlashEngine(active=True)
+        )
+        pool._entries["new-dflash"] = self._entry("new-dflash", None)
+        pool._unload_engine = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="active-dflash"):
+            await pool._unload_other_dflash_engines("new-dflash")
+
+        pool._unload_engine.assert_not_awaited()
+
+
 class TestEnginePoolAsync:
     """Async tests for EnginePool (mocked)."""
 

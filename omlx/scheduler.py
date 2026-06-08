@@ -8041,6 +8041,41 @@ class Scheduler:
                 else 0
             )
 
+            # Pending-writes queue sizing depends on per-block bytes
+            # (block_size × per-token KV). Pass the *final* scheduler
+            # block size — possibly adjusted from the config default by
+            # RotatingKVCache / ArraysCache logic earlier in
+            # ``__init__`` — and a model-derived per-token KV estimate
+            # from the memory monitor.
+            #
+            # Gate on ``has_model_info()`` rather than just non-None:
+            # ``estimate_block_memory(1)`` silently substitutes a
+            # 7B-class fiction (32 layers × 8 KV heads × 128 head_dim
+            # ≈ 128 KB/token) when dims were never set, and feeding
+            # that "default" value into the writer-queue formula gives
+            # the wrong cap on real workloads. When dims are missing
+            # (test fixtures with skeletal model.config, unusual VLM
+            # packs the nested-config walk doesn't recognise), pass
+            # the PagedSSDCacheManager's 200 KB default explicitly so
+            # the cap math degrades to a known constant instead of a
+            # model-class fiction. The auto-init in ``Scheduler.__init__``
+            # paired with ``_set_model_info_for_monitor()`` means the
+            # happy path here is ``has_model_info() is True``; this
+            # else branch only fires for skeletal test fixtures.
+            if (
+                self.memory_monitor is not None
+                and self.memory_monitor.has_model_info()
+            ):
+                # ``estimate_block_memory(1)`` returns all-layers K+V
+                # bytes for a single token at the dtype the monitor was
+                # configured with — exactly the per-token cost the
+                # queue cap needs to weigh.
+                expected_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
+                )
+            else:
+                expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
+
             # Initialize paged SSD cache manager for SSD storage
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
@@ -8051,6 +8086,8 @@ class Scheduler:
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
                 expected_block_size=self.config.paged_cache_block_size,
+                expected_block_size_tokens=self.config.paged_cache_block_size,
+                expected_kv_bytes_per_token=expected_kv_bytes_per_token,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

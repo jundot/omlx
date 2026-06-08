@@ -328,6 +328,26 @@ class MemoryMonitor:
                 f"{format_bytes(sample_block_mem)}"
             )
 
+    def has_model_info(self) -> bool:
+        """Whether ``set_model_info`` has been called with real dims.
+
+        ``estimate_block_memory`` silently substitutes ``32 layers / 8 KV
+        heads / 128 head_dim`` (a 7B-class assumption) when dims are
+        unset, which means callers can't tell "real model" from
+        "estimator default" by inspecting the return value. Use this
+        accessor when the difference matters — e.g. the PagedSSDCache
+        writer-queue cap formula prefers its own 200 KB fallback over
+        the monitor's 128 KB default-fiction.
+        """
+        return (
+            self._num_layers is not None
+            and self._num_layers > 0
+            and self._num_kv_heads is not None
+            and self._num_kv_heads > 0
+            and self._head_dim is not None
+            and self._head_dim > 0
+        )
+
     def estimate_block_memory(
         self,
         block_size: int,
