@@ -43,6 +43,7 @@ class BenchmarkRequest(BaseModel):
     prompt_lengths: list[int]
     generation_length: int = 128
     batch_sizes: list[int] = []
+    should_upload_results: bool = True
     @field_validator("prompt_lengths")
     @classmethod
     def validate_prompt_lengths(cls, v: list[int]) -> list[int]:
@@ -888,21 +889,25 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         })
 
-        # Upload results to omlx.ai (failures don't affect benchmark status)
-        try:
-            await _upload_to_omlx_ai(run, engine_pool)
-        except Exception as e:
-            logger.warning(f"Benchmark upload to omlx.ai failed: {e}")
-            await _send_event(run, {
-                "type": "upload_done",
-                "data": {
-                    "owner_hash": None,
-                    "total": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "error": str(e),
-                },
-            })
+        # Upload results to omlx.ai (failures don't affect benchmark status).
+        # Skipped when the user opted out via the dashboard checkbox; the
+        # frontend's 'done' handler finalizes directly in that case, so no
+        # additional SSE event is needed here.
+        if run.request.should_upload_results:
+            try:
+                await _upload_to_omlx_ai(run, engine_pool)
+            except Exception as e:
+                logger.warning(f"Benchmark upload to omlx.ai failed: {e}")
+                await _send_event(run, {
+                    "type": "upload_done",
+                    "data": {
+                        "owner_hash": None,
+                        "total": 0,
+                        "success": 0,
+                        "failed": 0,
+                        "error": str(e),
+                    },
+                })
 
     except asyncio.CancelledError:
         run.status = "cancelled"

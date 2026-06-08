@@ -136,6 +136,18 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
                             </div>
 
+                            <!-- Share results consent -->
+                            <div>
+                                <label class="flex items-start gap-2 cursor-pointer">
+                                    <input type="checkbox"
+                                           x-model="benchShouldUploadResults"
+                                           :disabled="benchRunning"
+                                           class="w-4 h-4 mt-0.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                    <span class="text-sm text-neutral-700">{{ t('bench.config.share_results') }}</span>
+                                </label>
+                                <p class="text-xs text-neutral-400 mt-1.5 ml-6">{{ t('bench.config.share_results_hint') }}</p>
+                            </div>
+
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"

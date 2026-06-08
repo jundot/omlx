@@ -376,6 +376,7 @@
             benchModelId: '',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
+            benchShouldUploadResults: true,
             benchRunning: false,
             benchBenchId: null,
             benchProgress: null,
@@ -2539,6 +2540,7 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            should_upload_results: this.benchShouldUploadResults,
                         }),
                     });
 
@@ -2604,15 +2606,24 @@
                                 }
                             }
                         } else if (data.type === 'done') {
-                            // Benchmark tests done, uploading starts
-                            this.benchUploading = true;
-                            this.benchProgress = {
-                                phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
-                                current: 0,
-                                total: 0,
-                            };
+                            // Benchmark tests done. If the user opted in to
+                            // sharing results, the server follows up with
+                            // upload events; otherwise we finalize here.
                             this.loadModels();
+                            if (this.benchShouldUploadResults) {
+                                this.benchUploading = true;
+                                this.benchProgress = {
+                                    phase: 'upload',
+                                    message: window.t('bench.upload.in_progress'),
+                                    current: 0,
+                                    total: 0,
+                                };
+                            } else {
+                                this.benchRunning = false;
+                                this.benchProgress = null;
+                                es.close();
+                                this.benchEventSource = null;
+                            }
                         } else if (data.type === 'upload') {
                             // Dedupe on replay: upload entries are unique by context_length.
                             const exists = this.benchUploadResults.some(
