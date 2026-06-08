@@ -762,8 +762,13 @@ class TestValidateQuantizable:
             is True
         )
 
-    def test_qat_empty_quant_method_is_quantizable(self):
-        assert validate_quantizable({"quantization_config": {}}) is True
+    def test_empty_quantization_config_not_quantizable(self):
+        # Empty config has no quant_type — not a QAT config, not quantizable
+        assert validate_quantizable({"quantization_config": {}}) is False
+
+    def test_legacy_bits_config_not_quantizable(self):
+        # Legacy configs with only {"bits": N} lack quant_type and are not QAT
+        assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
 
     def test_awq_not_quantizable(self):
         assert (
@@ -809,6 +814,13 @@ class TestSensitivityLmConfigOverride:
             _sensitivity_lm_config_override(
                 {"quantization_config": {"quant_method": "gptq"}}
             )
+            is None
+        )
+
+    def test_non_qat_config_without_quant_method_no_override(self):
+        # Legacy bits-only config has no quant_type — not a QAT config, no override
+        assert (
+            _sensitivity_lm_config_override({"quantization_config": {"bits": 4}})
             is None
         )
 

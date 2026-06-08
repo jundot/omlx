@@ -1709,6 +1709,20 @@ class _DiscoveredPlan:
         )
 
 
+def _is_qat_unquantized_config(qc) -> bool:
+    """Return True if qc is a QAT training config with full-precision weights.
+
+    Gemma 4 QAT configs carry quant_type (e.g. "q4_0") recording the training
+    regime but store weights in bfloat16 — no quant_method means no actual
+    weight quantization has been applied.
+    """
+    return (
+        isinstance(qc, dict)
+        and qc.get("quant_type") == "q4_0"
+        and "quant_method" not in qc
+    )
+
+
 def validate_quantizable(config: dict) -> bool:
     """Check if a model config indicates it can be quantized.
 
@@ -1728,9 +1742,8 @@ def validate_quantizable(config: dict) -> bool:
             # FP8 models are full-precision weights stored in FP8 format
             if quant_method == "fp8":
                 return True
-            # QAT models carry quantization_config with no recognised
-            # weight-quantization method — weights are full-precision.
-            if not quant_method:
+            # QAT models record training-time quant_type but weights are fp16/bf16
+            if _is_qat_unquantized_config(qc):
                 return True
         return False
     return True
@@ -1749,9 +1762,7 @@ def _sensitivity_lm_config_override(config: dict) -> dict | None:
         config.get("quantization_config"),
         config.get("text_config", {}).get("quantization_config"),
     ):
-        # `and qc`: mlx-lm uses a walrus/truthiness guard so a falsy (empty)
-        # quantization_config never reaches the quant_method access — no override needed.
-        if isinstance(qc, dict) and qc and "quant_method" not in qc:
+        if _is_qat_unquantized_config(qc):
             return {"quantization_config": None}
     return None
 
