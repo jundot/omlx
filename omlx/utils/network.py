@@ -80,7 +80,13 @@ def is_valid_bind_host(value: str) -> bool:
         ipaddress.ip_address(value)
         return True
     except ValueError:
-        return is_valid_hostname(value)
+        pass
+    # Reject strings that look like IP addresses but fail to parse.
+    # Without this guard, "999.999.999.999" would slip through as a valid
+    # hostname because digit-only dotted labels match the RFC 1123 regex.
+    if re.match(r"^\d+(\.\d+)+$", value):
+        return False
+    return is_valid_hostname(value)
 
 
 def _local_ipv4_addresses() -> list[str]:
@@ -147,7 +153,10 @@ def detect_server_aliases(host: str = "127.0.0.1") -> list[str]:
     candidates: list[str] = []
 
     # Always offer loopback first when bound to localhost or all interfaces.
-    if host in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
+    # `host` may be a comma-separated list (e.g. "127.0.0.1, ::1"), so check
+    # each part individually to avoid dropping loopback aliases.
+    _bind_hosts = {h.strip() for h in host.split(",")}
+    if _bind_hosts & {"127.0.0.1", "localhost", "0.0.0.0", "::"}:
         candidates.append("localhost")
         candidates.append("127.0.0.1")
 
