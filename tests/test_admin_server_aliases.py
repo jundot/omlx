@@ -83,12 +83,26 @@ class TestNetworkValidation:
         assert is_valid_hostname("example.local")
         assert is_valid_hostname("my-mac")
         assert is_valid_hostname("a.b.c.d")
+        assert is_valid_hostname("web1.local")
 
     def test_rejects_invalid_hostname(self):
         assert not is_valid_hostname("")
         assert not is_valid_hostname("with space")
         assert not is_valid_hostname("-leading-dash")
         assert not is_valid_hostname("a" * 300)
+
+    def test_rejects_all_numeric_last_label_in_dotted_names(self):
+        # For dotted (multi-label) names: IANA never delegates numeric TLDs,
+        # so an all-digit rightmost label signals an IP-shaped string.
+        # Mirrors the approach used by the ``validators`` PyPI library.
+        assert not is_valid_hostname("999.999.999.999")
+        assert not is_valid_hostname("1.2.3.4")
+        assert not is_valid_hostname("host.123")
+
+    def test_accepts_single_label_without_letters(self):
+        # Single-label names (no dots) are local hostnames — no TLD constraint.
+        assert is_valid_hostname("192-168-1-1")
+        assert is_valid_hostname("web1")
 
     def test_alias_accepts_either(self):
         assert is_valid_alias("localhost")
