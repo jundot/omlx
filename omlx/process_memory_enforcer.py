@@ -501,6 +501,10 @@ class ProcessMemoryEnforcer:
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
 
+        Thin wrapper over ``_get_ceiling_breakdown`` that discards the
+        component breakdown. Hot callers that don't need to know which
+        ceiling is binding should keep using this helper.
+
         `metal_cap` is the effective Metal allocation cap (kernel
         iogpu.wired_limit_mb when set, otherwise Apple's
         max_recommended_working_set_size). Including it here means oMLX
@@ -515,17 +519,37 @@ class ProcessMemoryEnforcer:
         Returns 0 if the memory guard is disabled (callers treat 0 as
         "no limit").
         """
+        return self._get_ceiling_breakdown()["hard_limit"]
+
+    def _get_ceiling_breakdown(self) -> dict[str, int]:
+        """Compute the hard limit AND the three component ceilings.
+
+        Returns a dict with keys ``static``, ``dynamic``, ``metal_cap``,
+        ``hard_limit`` (= min of the three non-zero values, or 0 when
+        the guard is disabled). Used by ``_propagate_memory_limit`` to
+        push the breakdown to schedulers so the prefill-rejection error
+        message can identify which constraint is binding and suggest the
+        right remedy. Single computation so the subprocess to ``sysctl``
+        (inside ``get_effective_metal_cap_bytes``) only fires once per
+        call.
+        """
         if not self._prefill_memory_guard:
-            return 0
-        candidates = [self._get_static_ceiling()]
+            return {"static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0}
+        static_ceiling = self._get_static_ceiling()
         if self._memory_guard_tier == "custom":
-            candidates.append(max(0, self._memory_guard_custom_ceiling_bytes))
+            dynamic_ceiling = max(0, self._memory_guard_custom_ceiling_bytes)
         else:
-            candidates.append(self._get_dynamic_ceiling())
+            dynamic_ceiling = self._get_dynamic_ceiling()
         metal_cap = self._get_effective_metal_cap_bytes()
+        candidates = [static_ceiling, dynamic_ceiling]
         if metal_cap > 0:
             candidates.append(metal_cap)
-        return min(candidates)
+        return {
+            "static": static_ceiling,
+            "dynamic": dynamic_ceiling,
+            "metal_cap": metal_cap,
+            "hard_limit": min(candidates),
+        }
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
@@ -871,7 +895,8 @@ class ProcessMemoryEnforcer:
         Called on every enforcer tick so the dynamic ceiling reaches the
         schedulers as fast as the poll interval allows.
         """
-        ceiling = self._get_hard_limit_bytes()
+        breakdown = self._get_ceiling_breakdown()
+        ceiling = breakdown["hard_limit"]
         scheduler_ceiling = self._scheduler_limit_bytes(ceiling)
         soft_limit = (
             int(scheduler_ceiling * self._soft_threshold)
@@ -929,6 +954,19 @@ class ProcessMemoryEnforcer:
             scheduler._memory_hard_limit_bytes = scheduler_ceiling
             scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
+            # Propagate the component ceilings too so the rejection
+            # message in ``_preflight_memory_check`` can name the binding
+            # constraint and steer the user toward the right remedy
+            # (close apps for dynamic, raise sysctl for metal_cap, raise
+            # tier or reduce context for static).
+            scheduler._memory_static_ceiling_bytes = breakdown["static"]
+            scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
+            scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
+            # Tier name disambiguates dynamic = computed reclaimable
+            # (safe/balanced/aggressive) from dynamic = user-pinned
+            # custom_ceiling_bytes (custom). The advice ladder needs
+            # the distinction to point at the right knob.
+            scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
             scheduler._admission_paused = admission_paused
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio

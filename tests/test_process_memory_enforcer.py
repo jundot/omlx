@@ -20,14 +20,19 @@ def _make_enforcer(
     poll_interval: float = 0.1,
     soft_threshold: float = 1.0,
     hard_threshold: float = 1.0,
+    breakdown: dict | None = None,
     **kwargs,
 ) -> ProcessMemoryEnforcer:
     """Build an enforcer with a deterministic hard ceiling.
 
     The new enforcer derives its ceiling from system_memory + tier +
     live available memory, which is impractical to mock per
-    test. We replace `_get_hard_limit_bytes` with a constant so tests can
-    exercise the watermark logic without juggling system mocks.
+    test. We replace `_get_hard_limit_bytes` AND `_get_ceiling_breakdown`
+    with constants so tests can exercise the watermark logic without
+    juggling system mocks. Pass ``breakdown`` to distinguish the three
+    component ceilings (static/dynamic/metal_cap) for propagation tests;
+    omit to use the same ``ceiling`` for all three (equivalent old
+    behavior).
 
     Passing `ceiling=0` disables the limit.
     """
@@ -40,6 +45,14 @@ def _make_enforcer(
         **kwargs,
     )
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    if breakdown is None:
+        breakdown = {
+            "static": int(ceiling),
+            "dynamic": int(ceiling),
+            "metal_cap": int(ceiling),
+            "hard_limit": int(ceiling),
+        }
+    enforcer._get_ceiling_breakdown = lambda: dict(breakdown)
     return enforcer
 
 
@@ -524,7 +537,13 @@ class TestDisabledWhenCeilingZero:
     @pytest.mark.asyncio
     async def test_propagate_zero_disables_inline_prefill_check(self, mock_engine_pool):
         """Propagating ceiling=0 sets scheduler limit to 0 (disabled)."""
-        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=0,
+            breakdown={
+                "static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0,
+            },
+        )
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 999
         bg._memory_hard_limit_bytes = 999
@@ -543,6 +562,54 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_hard_limit_bytes == 0
         assert bg._memory_limit_bytes == 0
         assert bg._memory_hard_limit_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_propagate_ceiling_components_to_scheduler(
+        self, mock_engine_pool
+    ):
+        """All three component ceilings + the tier name must reach the
+        scheduler so the binding-aware rejection message has the inputs
+        it needs to identify which knob the operator should turn."""
+        static_b = 64 * 1024**3
+        dynamic_b = 16 * 1024**3
+        metal_b = 48 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            tier="custom",
+            ceiling=min(static_b, dynamic_b, metal_b),
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": min(static_b, dynamic_b, metal_b),
+            },
+        )
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_guard_tier = "balanced"
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_guard_tier == "custom", (
+            "tier name must reach the scheduler so the advice ladder can "
+            "distinguish dynamic-on-custom (raise custom_ceiling_bytes) "
+            "from dynamic-on-reclaim-tier (close other apps)"
+        )
+        assert scheduler._memory_hard_limit_bytes == dynamic_b, (
+            "hard limit must be min of the three components"
+        )
 
 
 class TestPrefillMemoryGuardToggle:
@@ -949,13 +1016,13 @@ class TestAbortLimitCalculation:
             # aggressive reserve = 4 GB → static = 44 GB
             assert enforcer._get_abort_limit_bytes() == 44 * 1024**3
 
-    def test_zero_when_guard_disabled(self, mock_engine_pool):
+    def test_abort_limit_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, prefill_memory_guard=False
         )
         assert enforcer._get_abort_limit_bytes() == 0
 
-    def test_zero_when_guard_disabled(self, mock_engine_pool):
+    def test_hard_limit_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
             memory_guard_tier="balanced",
@@ -1348,12 +1415,21 @@ class TestMemoryLimitPropagation:
         enforcer._engine_pool._entries = {"model-a": entry}
 
         enforcer._running = True
-        # Simulate the ceiling shrinking after the tier flip.
-        enforcer._get_hard_limit_bytes = lambda: 20 * 1024**3
+        # Simulate the ceiling shrinking after the tier flip. The new
+        # propagation path reads from ``_get_ceiling_breakdown``, not
+        # ``_get_hard_limit_bytes`` — patch both for completeness.
+        new_ceiling = 20 * 1024**3
+        enforcer._get_hard_limit_bytes = lambda: new_ceiling
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": new_ceiling,
+            "dynamic": new_ceiling,
+            "metal_cap": new_ceiling,
+            "hard_limit": new_ceiling,
+        }
         enforcer.memory_guard_tier = "safe"
 
-        assert scheduler._memory_limit_bytes == 20 * 1024**3
-        assert bg._memory_limit_bytes == 20 * 1024**3
+        assert scheduler._memory_limit_bytes == new_ceiling
+        assert bg._memory_limit_bytes == new_ceiling
 
     def test_skips_engine_without_scheduler(self, enforcer):
         """Gracefully skips engines without scheduler attribute."""

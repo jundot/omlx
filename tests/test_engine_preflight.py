@@ -656,3 +656,140 @@ def test_scheduler_add_request_cleans_block_table_on_rejection(monkeypatch):
     # The request must not have entered self.waiting.
     assert req not in scheduler.waiting
     assert req.request_id not in scheduler.requests
+
+
+# ---------------------------------------------------------------------------
+# Rejection message identifies the binding ceiling
+# ---------------------------------------------------------------------------
+
+
+class TestRejectionMessageNamesBindingCeiling:
+    """When a request is rejected, the message must name which of the
+    three component ceilings (static / dynamic / metal_cap) is binding
+    and steer the user to the right remedy.
+
+    Without this discrimination operators on Pi-class hosts spent hours
+    staring at a generic "reduce context length, free system memory, or
+    loosen memory_guard_tier" message that didn't tell them which of
+    their three knobs to actually turn. The most common confusion was a
+    metal_cap-bound 413 on hosts where ``iogpu.wired_limit_mb`` had
+    never been raised — the message told them to free system memory
+    when no amount of freeing system memory would help.
+    """
+
+    def _arm_ceilings(
+        self,
+        sched,
+        *,
+        static: int,
+        dynamic: int,
+        metal_cap: int,
+        tier: str = "balanced",
+    ) -> None:
+        """Set the four propagated ceiling fields directly.
+
+        Mirrors what ``ProcessMemoryEnforcer._propagate_memory_limit``
+        does on a real run; the binding-aware message reads only these
+        fields plus ``_memory_hard_limit_bytes``.
+        """
+        sched._prefill_memory_guard = True
+        sched._memory_hard_limit_bytes = min(
+            v for v in (static, dynamic, metal_cap) if v > 0
+        )
+        sched._memory_static_ceiling_bytes = static
+        sched._memory_dynamic_ceiling_bytes = dynamic
+        sched._memory_metal_cap_bytes = metal_cap
+        sched._memory_guard_tier = tier
+        # Set_model_info populated dims at scheduler construction; we
+        # only need a non-zero peak estimate to drive the rejection
+        # path, not exact bytes.
+
+    def _force_rejection(self, sched, monkeypatch):
+        """Mock the parts of the math we don't care about and call
+        ``_preflight_memory_check`` so we can inspect the message it
+        returns."""
+        # Peak chosen larger than any ceiling tested below so the
+        # rejection branch fires deterministically.
+        sched.memory_monitor = MagicMock()
+        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = (
+            512 * 1024**3
+        )
+
+        import omlx.scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+        monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+
+        req = MagicMock()
+        req.request_id = "binding-test"
+        req.num_prompt_tokens = 65536
+        req.cached_tokens = 0
+        # _preflight_memory_check tries an LRU eviction retry first; we
+        # don't want that path here.
+        monkeypatch.setattr(
+            sched,
+            "_raise_prefill_eviction_if_available",
+            lambda **kw: None,
+        )
+        rej = sched._preflight_memory_check(req)
+        assert rej is not None, "rejection branch must fire when peak > ceiling"
+        return rej
+
+    def test_metal_cap_binding_names_sysctl(self, monkeypatch):
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched, static=64 * 1024**3, dynamic=32 * 1024**3, metal_cap=16 * 1024**3
+        )
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "iogpu.wired_limit_mb" in rej.message, (
+            f"metal_cap binding must steer user to the sysctl knob; got: {rej.message}"
+        )
+        assert "metal_cap ceiling" in rej.message
+
+    def test_dynamic_binding_under_custom_names_admin_setting(self, monkeypatch):
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=16 * 1024**3,
+            metal_cap=48 * 1024**3,
+            tier="custom",
+        )
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "custom_ceiling_bytes" in rej.message, (
+            "dynamic binding under custom tier must point at the admin "
+            f"Memory setting, not 'close other apps'; got: {rej.message}"
+        )
+        assert "close other apps" not in rej.message.lower()
+
+    def test_dynamic_binding_under_reclaim_tier_names_apps(self, monkeypatch):
+        sched = _make_scheduler()
+        # Static > dynamic, balanced tier: closing apps and/or raising
+        # tier is what helps.
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=16 * 1024**3,
+            metal_cap=48 * 1024**3,
+            tier="balanced",
+        )
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "close other apps" in rej.message.lower(), (
+            "dynamic binding on a reclaim tier should suggest closing "
+            f"apps; got: {rej.message}"
+        )
+        assert "memory_guard_tier" in rej.message
+
+    def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
+        sched = _make_scheduler()
+        # Static is the smallest non-zero ceiling.
+        self._arm_ceilings(
+            sched,
+            static=16 * 1024**3,
+            dynamic=64 * 1024**3,
+            metal_cap=48 * 1024**3,
+        )
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "memory_guard_tier" in rej.message
+        assert "iogpu.wired_limit_mb" not in rej.message
+        assert "custom_ceiling_bytes" not in rej.message

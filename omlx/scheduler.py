@@ -1473,6 +1473,18 @@ class Scheduler:
         # executor thread. The background memory enforcer reads this cached
         # value during active decode instead of touching MLX/Metal directly.
         self._last_mlx_active_memory_bytes: int = 0
+        # Component ceilings — propagated alongside the hard limit so the
+        # rejection-path error message can identify which constraint is
+        # binding and suggest the right remedy (close apps / raise tier /
+        # raise iogpu.wired_limit_mb / reduce context). 0 = not set yet.
+        self._memory_static_ceiling_bytes: int = 0
+        self._memory_dynamic_ceiling_bytes: int = 0
+        self._memory_metal_cap_bytes: int = 0
+        # Tier name propagated alongside the breakdown. For ``custom`` the
+        # "dynamic" ceiling is the user-pinned ``custom_ceiling_bytes``
+        # rather than computed reclaimable memory, so the advice ladder
+        # must steer the user to that knob instead of "close other apps".
+        self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -6515,15 +6527,11 @@ class Scheduler:
             )
             from .utils.hardware import format_bytes
 
-            usage_gb = current / (1024**3)
-            ceiling_gb = hard_limit / (1024**3)
-            message = (
-                f"Prefill would require ~{format_bytes(estimated)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(hard_limit)} "
-                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length, free system memory, or loosen "
-                f"memory_guard_tier (safe → balanced → aggressive)."
+            message = self._format_rejection_message(
+                estimated=estimated,
+                current=current,
+                peak=peak,
+                hard_limit=hard_limit,
             )
             return _PreflightRejection(
                 message=message,
@@ -6549,6 +6557,86 @@ class Scheduler:
             )
             return safety_rejection
         return None
+
+    def _format_rejection_message(
+        self,
+        *,
+        estimated: int,
+        current: int,
+        peak: int,
+        hard_limit: int,
+    ) -> str:
+        """Build the prefill-rejection diagnostic.
+
+        Identifies which of static / dynamic / metal_cap is binding so the
+        message can steer the user to the right remedy (close apps for
+        dynamic, raise sysctl for metal_cap, raise tier or reduce context
+        for static). Component ceilings are propagated by
+        ``ProcessMemoryEnforcer._propagate_memory_limit``; if a caller
+        wired this scheduler outside that path the components stay 0 and
+        we fall back to a generic message.
+        """
+        from .utils.hardware import format_bytes
+
+        static = self._memory_static_ceiling_bytes
+        dynamic = self._memory_dynamic_ceiling_bytes
+        metal_cap = self._memory_metal_cap_bytes
+
+        binding: list[str] = []
+        if static and static == hard_limit:
+            binding.append("static")
+        if dynamic and dynamic == hard_limit:
+            binding.append("dynamic")
+        if metal_cap and metal_cap == hard_limit:
+            binding.append("metal_cap")
+        binding_str = "/".join(binding) if binding else "effective"
+
+        # Order remedies by likelihood of helping for the binding cause.
+        # Dynamic-bound on a reclaim tier (safe/balanced/aggressive) means
+        # reclaimable memory is low right now even though the static cap
+        # has room — closing apps raises ``free`` / ``inactive`` and a
+        # more aggressive ``memory_guard_tier`` raises the active-reclaim
+        # ratio. Dynamic-bound under ``custom`` means the user pinned the
+        # ceiling there; the only knob that helps is raising
+        # ``custom_ceiling_bytes`` itself. Metal-cap bound means the
+        # kernel sysctl is the ceiling, so raising ``iogpu.wired_limit_mb``
+        # is the only knob that helps. Static-bound (or no breakdown
+        # available) leaves ``memory_guard_tier`` / context length as the
+        # levers.
+        is_custom = self._memory_guard_tier == "custom"
+        if "dynamic" in binding and is_custom:
+            advice = (
+                f"raise custom_ceiling_bytes in admin Memory settings "
+                f"(currently pinned at {format_bytes(dynamic)}), "
+                f"or reduce context length"
+            )
+        elif "dynamic" in binding and static and static > dynamic:
+            headroom = max(0, dynamic - current)
+            advice = (
+                f"close other apps to free RAM "
+                f"(static cap is {format_bytes(static)} but only "
+                f"{format_bytes(headroom)} is reclaimable right now), "
+                f"raise memory_guard_tier (safe → balanced → aggressive), "
+                f"or reduce context length"
+            )
+        elif "metal_cap" in binding:
+            advice = (
+                f"raise kernel iogpu.wired_limit_mb in Terminal "
+                f"(currently caps Metal at {format_bytes(metal_cap)}), "
+                f"or reduce context length"
+            )
+        else:
+            advice = (
+                "reduce context length or raise memory_guard_tier "
+                "(safe → balanced → aggressive)"
+            )
+
+        return (
+            f"Prefill would require ~{format_bytes(estimated)} peak "
+            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+            f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
+            f"{advice.capitalize()}."
+        )
 
     def preflight_or_raise(
         self,
@@ -6593,17 +6681,11 @@ class Scheduler:
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
         if current + peak > self._memory_hard_limit_bytes:
-            from .utils.hardware import format_bytes
-
-            usage_gb = current / (1024**3)
-            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
-            message = (
-                f"Prefill would require ~{format_bytes(current + peak)} peak "
-                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
-                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                f"Reduce context length, free system memory, or loosen "
-                f"memory_guard_tier (safe → balanced → aggressive)."
+            message = self._format_rejection_message(
+                estimated=current + peak,
+                current=current,
+                peak=peak,
+                hard_limit=self._memory_hard_limit_bytes,
             )
 
             logger.warning(
