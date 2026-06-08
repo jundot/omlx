@@ -4116,6 +4116,9 @@ def _measure_sensitivity(
 
             _nn.Module.load_weights = _lenient_load_weights
             try:
+                # No QAT config override needed here: mlx_vlm.utils.load_model
+                # uses quantization_config.get("quant_method") rather than direct
+                # key access, so a missing quant_method falls through silently.
                 model = vlm_load_model(
                     Path(model_path),
                     lazy=True,
