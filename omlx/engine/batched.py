@@ -364,9 +364,24 @@ class BatchedEngine(BaseEngine):
         logger.info(f"BatchedEngine loaded: {self._model_name}")
 
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+        
+        Includes timeout protection to prevent indefinite hangs when the engine
+        is in a corrupted state (e.g., after MLX segfault or lock corruption).
+        See: https://github.com/jundot/omlx/issues/XXXX
+        """
         if self._engine:
-            await self._engine.stop()
+            try:
+                # Add timeout to prevent hang on corrupted engine state
+                await asyncio.wait_for(self._engine.stop(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Engine stop timed out after 30s, forcing cleanup. "
+                    "This may indicate a corrupted engine state."
+                )
+            except Exception as e:
+                logger.warning(f"Error stopping engine: {e}")
+            
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
                     self._engine.engine.close()

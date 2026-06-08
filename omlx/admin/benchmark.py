@@ -745,8 +745,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             })
             for model_id in loaded_ids:
                 try:
-                    await engine_pool._unload_engine(model_id)
+                    # Add timeout to prevent hang on corrupted engine state
+                    await asyncio.wait_for(
+                        engine_pool._unload_engine(model_id),
+                        timeout=60.0
+                    )
                     logger.info(f"Benchmark: unloaded {model_id}")
+                except asyncio.TimeoutError:
+                    logger.error(f"Benchmark: unload {model_id} timed out after 60s, skipping")
                 except Exception as e:
                     logger.warning(f"Benchmark: failed to unload {model_id}: {e}")
 
@@ -871,8 +877,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             "total": total_tests,
         })
         try:
-            await engine_pool._unload_engine(request.model_id)
+            # Add timeout to prevent hang on corrupted engine state
+            await asyncio.wait_for(
+                engine_pool._unload_engine(request.model_id),
+                timeout=60.0
+            )
             logger.info(f"Benchmark: unloaded {request.model_id} after benchmark")
+        except asyncio.TimeoutError:
+            logger.error(f"Benchmark: unload {request.model_id} timed out after 60s")
         except Exception as e:
             logger.warning(f"Benchmark: failed to unload {request.model_id}: {e}")
 
@@ -912,8 +924,11 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         })
         # Try to unload the model on cancellation
         try:
-            await engine_pool._unload_engine(request.model_id)
-        except Exception:
+            await asyncio.wait_for(
+                engine_pool._unload_engine(request.model_id),
+                timeout=60.0
+            )
+        except (asyncio.TimeoutError, Exception):
             pass
 
     except Exception as e:
@@ -926,6 +941,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         })
         # Try to unload the model on error
         try:
-            await engine_pool._unload_engine(request.model_id)
-        except Exception:
+            await asyncio.wait_for(
+                engine_pool._unload_engine(request.model_id),
+                timeout=60.0
+            )
+        except (asyncio.TimeoutError, Exception):
             pass

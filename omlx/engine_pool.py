@@ -640,7 +640,14 @@ class EnginePool:
         pre_unload_active = mx.get_active_memory()
 
         try:
-            await entry.engine.stop()
+            # Add timeout to prevent hang on corrupted engine state
+            # See: https://github.com/jundot/omlx/issues/XXXX
+            await asyncio.wait_for(entry.engine.stop(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Engine stop timed out after 30s for {model_id}, forcing cleanup. "
+                "This may indicate a corrupted engine state."
+            )
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
