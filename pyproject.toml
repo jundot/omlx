@@ -114,6 +114,11 @@ paroquant = [
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
     "paroquant==0.1.15; python_version >= '3.11'",
 ]
+compression = [
+    # Context compression via headroom-ai (ONNX-based, ~50MB).
+    # Reduces prompt token count by compressing messages before tokenization.
+    "headroom-ai[proxy]>=0.1.0",
+]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the
 # single source of truth so the layer-template venvstacks.toml stays

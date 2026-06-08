@@ -50,7 +50,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
@@ -188,6 +188,17 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+
+# Compression statistics (module-level for admin API access)
+_compression_stats: dict[str, Any] = {
+    "total_requests": 0,
+    "compressed_requests": 0,
+    "total_tokens_before": 0,
+    "total_tokens_after": 0,
+    "total_tokens_saved": 0,
+    "last_compression_ratio": 0.0,
+    "last_compression_time": None,
+}
 
 
 # =============================================================================
@@ -2617,6 +2628,45 @@ async def create_chat_completion(
     # before any chat template application.  The boolean result is forwarded
     # as an explicit parameter so the engine never has to re-derive it.
     is_partial = detect_and_strip_partial(messages)
+
+    # --- Context compression (headroom) ---
+    # Compress messages before tokenization to reduce prompt size.
+    # Only active when enabled in settings and prompt is above threshold.
+    try:
+        _gs = _server_state.global_settings
+        if _gs is not None and _gs.compression.enabled:
+            from headroom import compress, CompressConfig
+            # Quick estimate: skip if messages are obviously short
+            total_chars = sum(len(m.get("content", "")) if isinstance(m, dict) else 0 for m in messages)
+            _compression_stats["total_requests"] += 1
+            if total_chars >= _gs.compression.min_tokens_to_compress:
+                result = compress(
+                    messages,
+                    config=CompressConfig(
+                        min_tokens_to_compress=_gs.compression.min_tokens_to_compress,
+                    ),
+                )
+                if result.tokens_saved > 0:
+                    logger.info(
+                        "Context compression: %d -> %d tokens (%.1f%% reduction, %d transforms)",
+                        result.tokens_before,
+                        result.tokens_after,
+                        result.compression_ratio * 100,
+                        len(result.transforms_applied),
+                    )
+                    messages = result.messages
+                    _compression_stats["compressed_requests"] += 1
+                    _compression_stats["total_tokens_before"] += result.tokens_before
+                    _compression_stats["total_tokens_after"] += result.tokens_after
+                    _compression_stats["total_tokens_saved"] += result.tokens_saved
+                    _compression_stats["last_compression_ratio"] = result.compression_ratio
+                    _compression_stats["last_compression_time"] = time.time()
+    except ImportError:
+        # headroom-ai not installed — compression unavailable, pass through
+        pass
+    except Exception as e:
+        # headroom never throws in production, but guard anyway
+        logger.warning("Context compression failed, using original messages: %s", e)
 
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.

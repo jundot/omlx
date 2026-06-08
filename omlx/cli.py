@@ -68,6 +68,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
         return True
+    if hasattr(args, "disable_compression") and args.disable_compression:
+        return True
     return False
 
 
@@ -878,6 +880,14 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+
+    # Context compression options
+    serve_parser.add_argument(
+        "--disable-compression",
+        action="store_true",
+        default=False,
+        help="Disable context compression (enabled by default)",
     )
 
     # MCP options
