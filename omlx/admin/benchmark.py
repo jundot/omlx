@@ -879,6 +879,24 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Done
         overall_duration = time.perf_counter() - overall_start
         run.status = "completed"
+
+        # Save to local history
+        try:
+            from omlx.settings import get_settings
+            import datetime
+
+            save_path = get_settings().base_path / "bench_results_throughput.jsonl"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            run_data = {
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "model_id": request.model_id,
+                "total_time": round(overall_duration, 1),
+                "results": run.results
+            }
+            with open(save_path, "a") as f:
+                f.write(json.dumps(run_data) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to save throughput benchmark history: {e}")
         await _send_event(run, {
             "type": "done",
             "summary": {

@@ -134,14 +134,47 @@ def cleanup_old_runs() -> None:
 # --- Accumulated results ---
 
 
+def _get_save_path():
+    from omlx.settings import get_settings
+    path = get_settings().base_path / "bench_results_accuracy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_accumulated():
+    global _accumulated_results
+    if not getattr(_load_accumulated, "loaded", False):
+        try:
+            import json
+            path = _get_save_path()
+            if path.exists():
+                with open(path, "r") as f:
+                    _accumulated_results[:] = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load accuracy results: {e}")
+        _load_accumulated.loaded = True
+
+
+def _save_accumulated():
+    try:
+        import json
+        path = _get_save_path()
+        with open(path, "w") as f:
+            json.dump(_accumulated_results, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save accuracy results: {e}")
+
+
 def get_accumulated_results() -> list[dict]:
     """Get all accumulated benchmark results."""
+    _load_accumulated()
     return _accumulated_results
 
 
 def reset_accumulated_results() -> None:
     """Clear all accumulated results."""
     _accumulated_results.clear()
+    _save_accumulated()
 
 
 # --- Queue management ---
@@ -487,8 +520,12 @@ async def run_accuracy_benchmark(
                     k: round(v, 4) for k, v in result.category_scores.items()
                 }
 
-            # Accumulate persistently
+            # Accumulate persistently. Load any on-disk history first so this
+            # save merges with prior runs instead of clobbering them — the
+            # lazy load may not have been triggered by a poll yet this session.
+            _load_accumulated()
             _accumulated_results.append(result_data)
+            _save_accumulated()
 
             run.results.append(result_data)
             completed += 1
