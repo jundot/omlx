@@ -51,6 +51,10 @@ def client(tmp_path, monkeypatch):
     # Bypass auth
     async def _fake_require_admin():
         return True
+
+    async def _fake_require_admin_or_bearer(req):
+        return True
+
     from omlx.admin import auth as admin_auth
     monkeypatch.setattr(admin_auth, "require_admin", _fake_require_admin)
 
@@ -58,6 +62,7 @@ def client(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(admin_routes.router)
     app.dependency_overrides[admin_routes.require_admin] = _fake_require_admin
+    app.dependency_overrides[admin_routes._require_admin_or_bearer] = _fake_require_admin_or_bearer
     return TestClient(app), mgr
 
 

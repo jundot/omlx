@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..model_settings import ModelSettings
 from ..settings import SubKeyEntry
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
@@ -1633,159 +1634,15 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 
 
 # =============================================================================
-# Models API Routes
+
+
+# =============================================================================
+# Helper: admin session OR bearer token
 # =============================================================================
 
 
-@router.get("/api/models")
-async def list_models(is_admin: bool = Depends(require_admin)):
-    """
-    List all models with their settings.
 
-    Returns model information from the engine pool combined with
-    per-model settings from the settings manager.
-
-    Returns:
-        JSON list of models with their status and settings.
-
-    Raises:
-        HTTPException: 401 if not authenticated, 503 if server not initialized.
-    """
-    engine_pool = _get_engine_pool()
-    settings_manager = _get_settings_manager()
-    server_state = _get_server_state()
-
-    if engine_pool is None:
-        raise HTTPException(status_code=503, detail="Server not initialized")
-
-    # Get engine pool status
-    status = engine_pool.get_status()
-    models_status = status.get("models", [])
-
-    # Get all model settings
-    all_settings = settings_manager.get_all_settings() if settings_manager else {}
-
-    # SSD cache dir is set on the scheduler_config when the user enables paged
-    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
-    ssd_cache_dir = getattr(
-        getattr(engine_pool, "_scheduler_config", None),
-        "paged_ssd_cache_dir",
-        None,
-    )
-    dflash_ssd_cache_available = bool(ssd_cache_dir)
-
-    # Combine model info with settings
-    models = []
-    for model_info in models_status:
-        model_id = model_info["id"]
-        settings = all_settings.get(model_id)
-
-        is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
-        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
-
-        model_data = {
-            "id": model_id,
-            "model_path": model_info.get("model_path", ""),
-            "loaded": model_info.get("loaded", False),
-            "is_loading": model_info.get("is_loading", False),
-            "estimated_size": model_info.get("estimated_size", 0),
-            "estimated_size_formatted": format_size(
-                model_info.get("estimated_size", 0)
-            ),
-            "actual_size": model_info.get("actual_size") or 0,
-            "actual_size_formatted": (
-                format_size(model_info.get("actual_size", 0))
-                if model_info.get("actual_size")
-                else None
-            ),
-            "pinned": model_info.get("pinned", False),
-            "is_default": (
-                server_state.default_model == model_id if server_state else False
-            ),
-            "engine_type": model_info.get("engine_type", "batched"),
-            "model_type": model_info.get("model_type", "llm"),
-            "config_model_type": model_info.get("config_model_type", ""),
-            "thinking_default": model_info.get("thinking_default"),
-            "preserve_thinking_default": model_info.get("preserve_thinking_default"),
-            "source_type": model_info.get("source_type", "local"),
-            "source_repo_id": model_info.get("source_repo_id"),
-            "last_access": model_info.get("last_access"),
-            "dflash_compatible": compat_ok,
-            "dflash_compatibility_reason": compat_reason,
-            "dflash_ssd_cache_available": dflash_ssd_cache_available,
-            "mtp_compatible": mtp_compat_ok,
-            "mtp_compatibility_reason": mtp_compat_reason,
-            "is_paroquant": is_paroquant,
-            "paroquant_reason": paroquant_reason,
-        }
-
-        # Add settings if available
-        if settings:
-            model_data["settings"] = asdict(settings)
-
-        models.append(model_data)
-
-    global_settings = _get_global_settings() if _get_global_settings else None
-    if markitdown_model_visible(global_settings) and not any(
-        m.get("id") == MARKITDOWN_MODEL_ID for m in models
-    ):
-        models.append(
-            {
-                "id": MARKITDOWN_MODEL_ID,
-                "model_path": "builtin://markitdown",
-                "loaded": True,
-                "is_loading": False,
-                "estimated_size": 0,
-                "estimated_size_formatted": format_size(0),
-                "actual_size": 0,
-                "actual_size_formatted": None,
-                "pinned": False,
-                "is_default": False,
-                "engine_type": "markitdown",
-                "model_type": "markitdown",
-                "config_model_type": "markitdown",
-                "thinking_default": None,
-                "preserve_thinking_default": None,
-                "source_type": "builtin",
-                "source_repo_id": None,
-                "last_access": None,
-                "dflash_compatible": False,
-                "dflash_compatibility_reason": "",
-                "dflash_ssd_cache_available": False,
-                "mtp_compatible": False,
-                "mtp_compatibility_reason": "",
-                "is_paroquant": False,
-                "paroquant_reason": "",
-                "virtual": True,
-            }
-        )
-
-    return {"models": models}
-
-
-@router.post("/api/models/{model_id}/unload")
-async def unload_model(
-    model_id: str,
-    is_admin: bool = Depends(require_admin),
-):
-    """Manually unload a model from memory."""
-    engine_pool = _get_engine_pool()
-    if engine_pool is None:
-        raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    entry = engine_pool.get_entry(model_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
-    if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
-
-    await engine_pool._unload_engine(model_id)
-    logger.info(f"Manually unloaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
-
-
-async def _require_admin_or_bearer(request: Request) -> bool:
+async def _require_admin_or_bearer(req: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
 
@@ -1794,11 +1651,11 @@ async def _require_admin_or_bearer(request: Request) -> bool:
         return True
 
     # Valid admin session cookie
-    if verify_session(request):
+    if verify_session(req):
         return True
 
     # Bearer token matching the configured API key
-    auth_header = request.headers.get("Authorization", "")
+    auth_header = req.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and gs is not None:
         token = auth_header[7:]
         server_key = gs.auth.api_key or ""
@@ -1862,7 +1719,7 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
 async def update_model_settings(
     model_id: str,
     request: ModelSettingsRequest,
-    is_admin: bool = Depends(require_admin),
+    is_admin: bool = Depends(_require_admin_or_bearer),
 ):
     """
     Update settings for a specific model.
@@ -2366,6 +2223,279 @@ async def update_model_settings(
         "requires_reload": requires_reload,
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
+    }
+
+
+# Models API Routes
+# =============================================================================
+
+
+@router.get("/api/models")
+async def list_models(is_admin: bool = Depends(_require_admin_or_bearer)):
+    """
+    List all models with their settings.
+
+    Returns model information from the engine pool combined with
+    per-model settings from the settings manager.
+
+    Returns:
+        JSON list of models with their status and settings.
+
+    Raises:
+        HTTPException: 401 if not authenticated, 503 if server not initialized.
+    """
+    engine_pool = _get_engine_pool()
+    settings_manager = _get_settings_manager()
+    server_state = _get_server_state()
+
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Get engine pool status
+    status = engine_pool.get_status()
+    models_status = status.get("models", [])
+
+    # Get all model settings
+    all_settings = settings_manager.get_all_settings() if settings_manager else {}
+
+    # SSD cache dir is set on the scheduler_config when the user enables paged
+    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
+    ssd_cache_dir = getattr(
+        getattr(engine_pool, "_scheduler_config", None),
+        "paged_ssd_cache_dir",
+        None,
+    )
+    dflash_ssd_cache_available = bool(ssd_cache_dir)
+
+    # Combine model info with settings
+    models = []
+    for model_info in models_status:
+        model_id = model_info["id"]
+        settings = all_settings.get(model_id)
+
+        is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
+        compat_ok, compat_reason = _dflash_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+
+        model_data = {
+            "id": model_id,
+            "model_path": model_info.get("model_path", ""),
+            "loaded": model_info.get("loaded", False),
+            "is_loading": model_info.get("is_loading", False),
+            "estimated_size": model_info.get("estimated_size", 0),
+            "estimated_size_formatted": format_size(
+                model_info.get("estimated_size", 0)
+            ),
+            "actual_size": model_info.get("actual_size") or 0,
+            "actual_size_formatted": (
+                format_size(model_info.get("actual_size", 0))
+                if model_info.get("actual_size")
+                else None
+            ),
+            "pinned": model_info.get("pinned", False),
+            "is_default": (
+                server_state.default_model == model_id if server_state else False
+            ),
+            "engine_type": model_info.get("engine_type", "batched"),
+            "model_type": model_info.get("model_type", "llm"),
+            "config_model_type": model_info.get("config_model_type", ""),
+            "thinking_default": model_info.get("thinking_default"),
+            "preserve_thinking_default": model_info.get("preserve_thinking_default"),
+            "source_type": model_info.get("source_type", "local"),
+            "source_repo_id": model_info.get("source_repo_id"),
+            "last_access": model_info.get("last_access"),
+            "dflash_compatible": compat_ok,
+            "dflash_compatibility_reason": compat_reason,
+            "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "mtp_compatible": mtp_compat_ok,
+            "mtp_compatibility_reason": mtp_compat_reason,
+            "is_paroquant": is_paroquant,
+            "paroquant_reason": paroquant_reason,
+        }
+
+        # Add settings if available
+        if settings:
+            model_data["settings"] = asdict(settings)
+
+        models.append(model_data)
+
+    global_settings = _get_global_settings() if _get_global_settings else None
+    if markitdown_model_visible(global_settings) and not any(
+        m.get("id") == MARKITDOWN_MODEL_ID for m in models
+    ):
+        models.append(
+            {
+                "id": MARKITDOWN_MODEL_ID,
+                "model_path": "builtin://markitdown",
+                "loaded": True,
+                "is_loading": False,
+                "estimated_size": 0,
+                "estimated_size_formatted": format_size(0),
+                "actual_size": 0,
+                "actual_size_formatted": None,
+                "pinned": False,
+                "is_default": False,
+                "engine_type": "markitdown",
+                "model_type": "markitdown",
+                "config_model_type": "markitdown",
+                "thinking_default": None,
+                "preserve_thinking_default": None,
+                "source_type": "builtin",
+                "source_repo_id": None,
+                "last_access": None,
+                "dflash_compatible": False,
+                "dflash_compatibility_reason": "",
+                "dflash_ssd_cache_available": False,
+                "mtp_compatible": False,
+                "mtp_compatibility_reason": "",
+                "is_paroquant": False,
+                "paroquant_reason": "",
+                "virtual": True,
+            }
+        )
+
+    return {"models": models}
+
+
+@router.post("/api/models/{model_id}/unload")
+async def unload_model(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Manually unload a model from memory."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is None:
+        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+
+    await engine_pool._unload_engine(model_id)
+    logger.info(f"Manually unloaded model: {model_id}")
+    return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+
+
+
+class SwapAliasRequest(BaseModel):
+    """Request body for swapping aliases between two models."""
+
+    model_a: str
+    model_b: str
+    alias_a: str | None = None  # New alias for model_a (None = remove)
+    alias_b: str | None = None  # New alias for model_b (None = remove)
+
+
+@router.post("/api/models/swap-alias")
+async def swap_model_alias(
+    request: SwapAliasRequest,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Swap or transfer aliases between two models atomically.
+
+    This endpoint updates both models' settings in a single transaction,
+    persisting each change so the engine pool re-loads the affected models.
+
+    Args:
+        request: SwapAliasRequest with model identifiers and new aliases.
+
+    Returns:
+        JSON response with success status and per-model results.
+
+    Raises:
+        HTTPException: 400 if alias conflicts, 404 if model not found.
+    """
+    engine_pool = _get_engine_pool()
+    settings_manager = _get_settings_manager()
+
+    if engine_pool is None or settings_manager is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    model_a = request.model_a
+    model_b = request.model_b
+    new_alias_a = (request.alias_a or "").strip() or None
+    new_alias_b = (request.alias_b or "").strip() or None
+
+    # Validate both models exist
+    entry_a = engine_pool.get_entry(model_a)
+    if entry_a is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_a}")
+    entry_b = engine_pool.get_entry(model_b)
+    if entry_b is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_b}")
+
+    # Get current settings
+    settings_a = settings_manager.get_settings(model_a)
+    settings_b = settings_manager.get_settings(model_b)
+
+    # Check for conflicts before applying changes
+    all_settings = settings_manager.get_all_settings()
+
+    # If alias_a is being set, check it's not taken by a third model
+    if new_alias_a is not None:
+        for mid, ms in all_settings.items():
+            if mid not in (model_a, model_b) and ms.model_alias == new_alias_a:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Alias '{new_alias_a}' is already used by model '{mid}'",
+                )
+        # Check conflict with model directory name of model_b
+        if new_alias_a == model_b:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Alias '{new_alias_a}' conflicts with model directory name '{model_b}'",
+            )
+
+    # If alias_b is being set, check it's not taken by a third model
+    if new_alias_b is not None:
+        for mid, ms in all_settings.items():
+            if mid not in (model_a, model_b) and ms.model_alias == new_alias_b:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Alias '{new_alias_b}' is already used by model '{mid}'",
+                )
+        # Check conflict with model directory name of model_a
+        if new_alias_b == model_a:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Alias '{new_alias_b}' conflicts with model directory name '{model_a}'",
+            )
+
+    # Apply changes
+    result_a = {"model_id": model_a, "success": False, "old_alias": settings_a.model_alias, "new_alias": new_alias_a}
+    result_b = {"model_id": model_b, "success": False, "old_alias": settings_b.model_alias, "new_alias": new_alias_b}
+
+    # Snapshot for rollback
+    settings_snapshot_a = ModelSettings.from_dict(settings_a.to_dict())
+    settings_snapshot_b = ModelSettings.from_dict(settings_b.to_dict())
+
+    try:
+        # Apply alias_a
+        settings_a.model_alias = new_alias_a
+        settings_manager.set_settings(model_a, settings_a)
+        result_a["success"] = True
+    except Exception as e:
+        # Rollback model_a
+        settings_manager.set_settings(model_a, settings_snapshot_a)
+        raise HTTPException(status_code=500, detail=f"Failed to update alias for {model_a}: {e}")
+
+    try:
+        # Apply alias_b
+        settings_b.model_alias = new_alias_b
+        settings_manager.set_settings(model_b, settings_b)
+        result_b["success"] = True
+    except Exception as e:
+        # Rollback both
+        settings_manager.set_settings(model_a, settings_snapshot_a)
+        settings_manager.set_settings(model_b, settings_snapshot_b)
+        raise HTTPException(status_code=500, detail=f"Failed to update alias for {model_b}: {e}")
+
+    return {
+        "success": True,
+        "model_a": result_a,
+        "model_b": result_b,
     }
 
 

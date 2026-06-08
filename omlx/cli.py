@@ -571,6 +571,213 @@ def _run_brew_services(command: str) -> int:
     return result.returncode
 
 
+def alias_command(args) -> int:
+    """Manage model aliases via the running oMLX server."""
+    import requests
+
+    from .settings import GlobalSettings
+
+    alias_cmd = args.alias_command
+    if not alias_cmd:
+        print("Usage: omlx alias <set|swap|remove|list> [options]")
+        print("Run 'omlx alias --help' for more info.")
+        return 1
+
+    # Resolve server connection
+    settings = GlobalSettings.load()
+    host = "127.0.0.1"  # default
+    port = settings.server.port if settings else 8000
+    api_key = settings.auth.api_key if settings else ""
+
+    base_url = f"http://{host}:{port}"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    # Check server is running
+    try:
+        requests.get(f"{base_url}/health", timeout=3)
+    except Exception:
+        print(f"oMLX server is not running at {base_url}")
+        return 1
+
+    def api(method: str, path: str, **kwargs) -> dict:
+        url = f"{base_url}/admin{path}"
+        resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    if alias_cmd == "set":
+        model = args.model
+        alias = args.alias
+
+        # Check for conflicts with existing aliases
+        models_data = api("GET", "/api/models").get("models", [])
+        for m in models_data:
+            ms = m.get("settings", {})
+            if ms.get("model_alias") == alias and m["id"] != model:
+                other = m["id"]
+                print(
+                    f"Error: Alias '{alias}' is already used by model '{other}'. "
+                    f"Use 'omlx alias swap {other} {model}' to transfer it."
+                )
+                return 1
+            if m["id"] == alias and m["id"] != model:
+                print(
+                    f"Error: Alias '{alias}' conflicts with model directory name "
+                    f"'{m['id']}'."
+                )
+                return 1
+
+        # Check model exists
+        model_ids = [m["id"] for m in models_data]
+        if model not in model_ids:
+            print(f"Error: Model '{model}' not found.")
+            print(f"Available models: {', '.join(model_ids)}")
+            return 1
+
+        # Apply the alias
+        result = api(
+            "PUT",
+            f"/api/models/{model}/settings",
+            json={"model_alias": alias},
+        )
+        if result.get("success"):
+            print(f"Set alias '{alias}' on model '{model}'")
+            if result.get("auto_unloaded"):
+                print("Model was reloaded with the new alias.")
+        return 0
+
+    elif alias_cmd == "remove":
+        model = args.model
+
+        # Check model exists
+        models_data = api("GET", "/api/models").get("models", [])
+        model_ids = [m["id"] for m in models_data]
+        if model not in model_ids:
+            print(f"Error: Model '{model}' not found.")
+            print(f"Available models: {', '.join(model_ids)}")
+            return 1
+
+        # Apply the removal
+        result = api(
+            "PUT",
+            f"/api/models/{model}/settings",
+            json={"model_alias": None},
+        )
+        if result.get("success"):
+            print(f"Removed alias from model '{model}'")
+            if result.get("auto_unloaded"):
+                print("Model was reloaded.")
+        return 0
+
+    elif alias_cmd == "swap":
+        model_a = args.model_a
+        model_b = args.model_b
+        new_alias_a = args.alias_a
+        new_alias_b = args.alias_b
+
+        # Check models exist
+        models_data = api("GET", "/api/models").get("models", [])
+        model_ids = [m["id"] for m in models_data]
+        if model_a not in model_ids:
+            print(f"Error: Model '{model_a}' not found.")
+            print(f"Available models: {', '.join(model_ids)}")
+            return 1
+        if model_b not in model_ids:
+            print(f"Error: Model '{model_b}' not found.")
+            print(f"Available models: {', '.join(model_ids)}")
+            return 1
+
+        # If no explicit aliases given, auto-detect current aliases
+        if new_alias_a is None and new_alias_b is None:
+            for m in models_data:
+                if m["id"] == model_a:
+                    new_alias_a = m.get("settings", {}).get("model_alias")
+                if m["id"] == model_b:
+                    new_alias_b = m.get("settings", {}).get("model_alias")
+            if new_alias_a is None and new_alias_b is None:
+                print("Neither model has an alias. Nothing to swap.")
+                return 0
+        elif new_alias_a is None:
+            # Only alias_b provided, find a's current alias
+            for m in models_data:
+                if m["id"] == model_a:
+                    new_alias_a = m.get("settings", {}).get("model_alias")
+        elif new_alias_b is None:
+            # Only alias_a provided, find b's current alias
+            for m in models_data:
+                if m["id"] == model_b:
+                    new_alias_b = m.get("settings", {}).get("model_alias")
+
+        # Check for conflicts before swap
+        for m in models_data:
+            mid = m["id"]
+            if mid not in (model_a, model_b):
+                ms = m.get("settings", {})
+                if ms.get("model_alias") == new_alias_a:
+                    print(
+                        f"Error: Alias '{new_alias_a}' is already used by model "
+                        f"'{mid}'. Use 'omlx alias remove {mid}' first, "
+                        f"or specify a different alias."
+                    )
+                    return 1
+                if ms.get("model_alias") == new_alias_b:
+                    print(
+                        f"Error: Alias '{new_alias_b}' is already used by model "
+                        f"'{mid}'. Use 'omlx alias remove {mid}' first, "
+                        f"or specify a different alias."
+                    )
+                    return 1
+            if mid == new_alias_a and mid != model_a:
+                print(
+                    f"Error: Alias '{new_alias_a}' conflicts with model directory "
+                    f"name '{mid}'."
+                )
+                return 1
+            if mid == new_alias_b and mid != model_b:
+                print(
+                    f"Error: Alias '{new_alias_b}' conflicts with model directory "
+                    f"name '{mid}'."
+                )
+                return 1
+
+        # Use the swap endpoint (atomic operation)
+        result = api(
+            "POST",
+            "/api/models/swap-alias",
+            json={
+                "model_a": model_a,
+                "model_b": model_b,
+                "alias_a": new_alias_a,
+                "alias_b": new_alias_b,
+            },
+        )
+        if result.get("success"):
+            old_a = result["model_a"]["old_alias"] or "(none)"
+            new_a = result["model_a"]["new_alias"] or "(none)"
+            old_b = result["model_b"]["old_alias"] or "(none)"
+            new_b = result["model_b"]["new_alias"] or "(none)"
+            print(f"Swapped aliases:")
+            print(f"  {model_a}: '{old_a}' → '{new_a}'")
+            print(f"  {model_b}: '{old_b}' → '{new_b}'")
+        return 0
+
+    elif alias_cmd == "list":
+        models_data = api("GET", "/api/models").get("models", [])
+        print(f"{'Model ID':<35} {'Alias':<20} {'Pinned':<8} {'Default':<8} {'Loaded':<8}")
+        print("-" * 80)
+        for m in models_data:
+            mid = m["id"]
+            ms = m.get("settings", {})
+            alias = ms.get("model_alias", "") or "(none)"
+            pinned = "yes" if m.get("pinned") or ms.get("is_pinned") else "no"
+            default = "yes" if m.get("is_default") or ms.get("is_default") else "no"
+            loaded = "yes" if m.get("loaded") else "no"
+            print(f"{mid:<35} {alias:<20} {pinned:<8} {default:<8} {loaded:<8}")
+        return 0
+
+    return 0
+
+
 def lifecycle_command(args) -> int:
     """Run background lifecycle commands for the current installation."""
     from .utils.install import is_app_bundle, is_homebrew
@@ -1016,6 +1223,53 @@ Example directory structure:
         help="Claude Code Haiku tier model (Claude integration only)",
     )
 
+    # Alias command
+    alias_parser = subparsers.add_parser(
+        "alias",
+        help="Manage model aliases",
+        description="Set, swap, remove, or list model aliases on a running oMLX server.",
+    )
+    alias_subparsers = alias_parser.add_subparsers(
+        dest="alias_command", help="Alias operation"
+    )
+
+    # alias set <model> <alias>
+    alias_set_parser = alias_subparsers.add_parser(
+        "set", help="Set an alias for a model"
+    )
+    alias_set_parser.add_argument("model", type=str, help="Model ID to set the alias on")
+    alias_set_parser.add_argument("alias", type=str, help="Alias name to assign")
+
+    # alias swap <model_a> <model_b> [--alias-a <new_alias_a>] [--alias-b <new_alias_b>]
+    alias_swap_parser = alias_subparsers.add_parser(
+        "swap", help="Swap or transfer aliases between two models"
+    )
+    alias_swap_parser.add_argument("model_a", type=str, help="First model ID")
+    alias_swap_parser.add_argument("model_b", type=str, help="Second model ID")
+    alias_swap_parser.add_argument(
+        "--alias-a",
+        type=str,
+        default=None,
+        help="New alias for model_a (default: swap existing aliases)",
+    )
+    alias_swap_parser.add_argument(
+        "--alias-b",
+        type=str,
+        default=None,
+        help="New alias for model_b (default: swap existing aliases)",
+    )
+
+    # alias remove <model>
+    alias_remove_parser = alias_subparsers.add_parser(
+        "remove", help="Remove the alias from a model"
+    )
+    alias_remove_parser.add_argument(
+        "model", type=str, help="Model ID to remove the alias from"
+    )
+
+    # alias list
+    alias_subparsers.add_parser("list", help="List all models with their aliases")
+
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
         "diagnose",
@@ -1036,6 +1290,8 @@ Example directory structure:
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)
+    elif args.command == "alias":
+        sys.exit(alias_command(args))
     else:
         if extra_args:
             parser.error(f"unrecognized arguments: {' '.join(extra_args)}")

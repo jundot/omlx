@@ -532,3 +532,88 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+# =============================================================================
+# Alias management tests (CLI + API)
+# =============================================================================
+
+
+class TestModelSettingsAlias:
+    """Tests for model_alias field in ModelSettings."""
+
+    def test_model_alias_default_is_none(self):
+        """model_alias defaults to None."""
+        settings = ModelSettings()
+        assert settings.model_alias is None
+
+    def test_model_alias_can_be_set(self):
+        """model_alias can be set to a string."""
+        settings = ModelSettings(model_alias="my-alias")
+        assert settings.model_alias == "my-alias"
+
+    def test_model_alias_survives_roundtrip(self):
+        """model_alias survives to_dict/from_dict."""
+        original = ModelSettings(model_alias="my-alias")
+        restored = ModelSettings.from_dict(original.to_dict())
+        assert restored.model_alias == "my-alias"
+
+    def test_model_alias_survives_save_load(self, tmp_path):
+        """model_alias persists through save/load cycle."""
+        manager = ModelSettingsManager(Path(tmp_path))
+        manager.set_settings("model-a", ModelSettings(model_alias="alias-a"))
+        # Reload from file
+        manager2 = ModelSettingsManager(Path(tmp_path))
+        assert manager2.get_settings("model-a").model_alias == "alias-a"
+
+    def test_model_alias_clear(self, tmp_path):
+        """Setting model_alias=None clears the alias."""
+        manager = ModelSettingsManager(Path(tmp_path))
+        manager.set_settings("model-a", ModelSettings(model_alias="alias-a"))
+        assert manager.get_settings("model-a").model_alias == "alias-a"
+        # Clear
+        manager.set_settings("model-a", ModelSettings(model_alias=None))
+        assert manager.get_settings("model-a").model_alias is None
+
+    def test_model_alias_excluded_from_dict_when_none(self):
+        """model_alias is excluded from to_dict when None."""
+        settings = ModelSettings()
+        d = settings.to_dict()
+        assert "model_alias" not in d
+
+    def test_model_alias_included_in_dict_when_set(self):
+        """model_alias is included in to_dict when set."""
+        settings = ModelSettings(model_alias="test-alias")
+        d = settings.to_dict()
+        assert d.get("model_alias") == "test-alias"
+
+
+class TestModelSettingsManagerAlias:
+    """Tests for alias-related operations in ModelSettingsManager."""
+
+    def test_two_models_can_share_alias(self, tmp_path):
+        """Setting the same alias on two models — manager allows it
+        (uniqueness enforcement is done at the API layer)."""
+        mgr = ModelSettingsManager(Path(tmp_path))
+        mgr.set_settings("model-a", ModelSettings(model_alias="shared"))
+        mgr.set_settings("model-b", ModelSettings(model_alias="shared"))
+
+        assert mgr.get_settings("model-a").model_alias == "shared"
+        assert mgr.get_settings("model-b").model_alias == "shared"
+
+    def test_delete_settings_removes_alias(self, tmp_path):
+        """Deleting a model's settings releases its alias."""
+        mgr = ModelSettingsManager(Path(tmp_path))
+        mgr.set_settings("model-a", ModelSettings(model_alias="my-alias"))
+        mgr.delete_settings("model-a")
+        assert mgr.get_settings("model-a").model_alias is None
+
+    def test_get_all_settings_includes_alias(self, tmp_path):
+        """get_all_settings includes model_alias."""
+        mgr = ModelSettingsManager(Path(tmp_path))
+        mgr.set_settings("model-a", ModelSettings(model_alias="alias-a"))
+        mgr.set_settings("model-b", ModelSettings())
+
+        all_settings = mgr.get_all_settings()
+        assert all_settings["model-a"].model_alias == "alias-a"
+        assert all_settings["model-b"].model_alias is None
