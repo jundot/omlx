@@ -1226,10 +1226,28 @@ class Scheduler:
                 # Async store_cache executor: single worker so submissions are
                 # serialized (matches the original synchronous order) and we
                 # never have two stores racing on the same paged_ssd index.
-                self._store_cache_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="omlx-store-cache",
-                )
+                #
+                # OMLX_SYNC_STORE_CACHE=1 disables this executor so store_cache
+                # (including the cached_block_hash_to_block index registration)
+                # runs synchronously on the inference thread via the existing
+                # fallback path below. The prefix cache then becomes immediately
+                # consistent: a request arriving right after a prior one
+                # (back-to-back, an agentic loop, or a concurrent stream) reuses
+                # the just-computed prefix instead of re-prefilling because the
+                # async commit had not landed yet. The SSD write stays async via
+                # the background writer thread; only the cheap in-RAM register +
+                # hot-cache populate moves onto the inference thread.
+                if os.environ.get("OMLX_SYNC_STORE_CACHE") == "1":
+                    self._store_cache_executor = None
+                    logger.info(
+                        "OMLX_SYNC_STORE_CACHE=1 -> synchronous store_cache "
+                        "(immediate prefix-cache consistency)"
+                    )
+                else:
+                    self._store_cache_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="omlx-store-cache",
+                    )
                 # Gate caps the post-completion store-cache pipeline so a burst
                 # of finishes cannot pile up unbounded KV caches in memory while
                 # the single writer drains. Cap starts at max_concurrent_requests
