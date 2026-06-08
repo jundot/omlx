@@ -9,7 +9,7 @@ SECURITY NOTE: This benchmark executes model-generated code on the local
 machine. Mitigations: subprocess with timeout, memory limits, temp file cleanup.
 """
 
-import asyncio
+import ast
 import logging
 import os
 import re
@@ -17,10 +17,11 @@ import resource
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .base import BaseBenchmark, BenchmarkResult, QuestionResult
+from .base import BaseBenchmark, BenchmarkResult, EvalGenerated, QuestionResult
 from .datasets import deterministic_sample, load_jsonl
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,14 @@ DATA_DIR = Path(__file__).parent / "data"
 
 EXEC_TIMEOUT_SECONDS = 15
 EXEC_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024
+
+
+@dataclass
+class CodeCheckResult:
+    passed: bool
+    failure_type: str = ""
+    error: str = ""
+    pass_mode: str = ""
 
 
 def _extract_code(response: str) -> str:
@@ -61,19 +70,93 @@ def _extract_code(response: str) -> str:
 
 def _set_resource_limits():
     try:
-        resource.setrlimit(resource.RLIMIT_AS, (EXEC_MEMORY_LIMIT_BYTES, EXEC_MEMORY_LIMIT_BYTES))
+        resource.setrlimit(
+            resource.RLIMIT_AS, (EXEC_MEMORY_LIMIT_BYTES, EXEC_MEMORY_LIMIT_BYTES)
+        )
     except (ValueError, resource.error):
         pass
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (EXEC_TIMEOUT_SECONDS + 5, EXEC_TIMEOUT_SECONDS + 5))
+        resource.setrlimit(
+            resource.RLIMIT_CPU, (EXEC_TIMEOUT_SECONDS + 5, EXEC_TIMEOUT_SECONDS + 5)
+        )
     except (ValueError, resource.error):
         pass
 
 
-def _execute_with_tests(code: str, test_list: list[str], setup_code: str = "") -> tuple[bool, str]:
+def _classify_error(error: str) -> str:
+    if not error:
+        return "wrong_answer"
+    if "IndentationError" in error:
+        return "indentation_error"
+    if "SyntaxError" in error:
+        return "syntax_error"
+    if "NameError" in error and "is not defined" in error:
+        return "missing_entry_point"
+    if "AssertionError" in error:
+        return "wrong_answer"
+    if "timed out" in error.lower():
+        return "timeout"
+    return "runtime_error"
+
+
+_TOLERANT_ASSERT_HELPER = r"""
+import math as _omlx_math
+
+def _omlx_close_equal(a, b):
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return _omlx_math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_omlx_close_equal(x, y) for x, y in zip(a, b))
+    return a == b
+"""
+
+
+def _tolerant_assert_tests(test_list: list[str]) -> list[str]:
+    """Rewrite simple equality asserts to tolerate tiny numeric drift."""
+    rewritten = []
+    for test in test_list:
+        try:
+            module = ast.parse(test)
+        except SyntaxError:
+            rewritten.append(test)
+            continue
+        if (
+            len(module.body) == 1
+            and isinstance(module.body[0], ast.Assert)
+            and isinstance(module.body[0].test, ast.Compare)
+            and len(module.body[0].test.ops) == 1
+            and isinstance(module.body[0].test.ops[0], ast.Eq)
+            and len(module.body[0].test.comparators) == 1
+        ):
+            compare = module.body[0].test
+            left = ast.unparse(compare.left)
+            right = ast.unparse(compare.comparators[0])
+            rewritten.append(f"assert _omlx_close_equal({left}, {right})")
+        else:
+            rewritten.append(test)
+    return rewritten
+
+
+def _execute_with_tests(
+    code: str,
+    test_list: list[str],
+    setup_code: str = "",
+    tolerant_numeric_asserts: bool = False,
+    setup_after_code: bool = False,
+) -> tuple[bool, str]:
     """Execute generated code with assertion-based test cases."""
-    test_code = "\n".join(test_list)
-    script = f"{setup_code}\n{code}\n{test_code}\n"
+    setup = setup_code or ""
+    if tolerant_numeric_asserts:
+        test_code = "\n".join(_tolerant_assert_tests(test_list))
+        helper = _TOLERANT_ASSERT_HELPER
+    else:
+        test_code = "\n".join(test_list)
+        helper = ""
+
+    if setup_after_code:
+        script = f"{code}\n{setup}\n{helper}\n{test_code}\n"
+    else:
+        script = f"{setup}\n{code}\n{helper}\n{test_code}\n"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(script)
@@ -107,6 +190,73 @@ def _execute_with_tests(code: str, test_list: list[str], setup_code: str = "") -
             pass
 
 
+def _run_with_tests(
+    code: str, test_list: list[str], setup_code: str = ""
+) -> CodeCheckResult:
+    passed, error = _execute_with_tests(code, test_list, setup_code)
+    if passed:
+        return CodeCheckResult(
+            passed=True,
+            failure_type="passed",
+            pass_mode="standalone_code",
+        )
+
+    best_error = error
+    best_failure = _classify_error(error)
+
+    if setup_code.strip():
+        reordered_passed, reordered_error = _execute_with_tests(
+            code,
+            test_list,
+            setup_code,
+            setup_after_code=True,
+        )
+        if reordered_passed:
+            return CodeCheckResult(
+                passed=True,
+                failure_type="passed",
+                pass_mode="setup_after_code",
+            )
+        reordered_failure = _classify_error(reordered_error)
+        if best_failure in (
+            "syntax_error",
+            "indentation_error",
+            "missing_entry_point",
+        ) and (
+            reordered_failure
+            not in ("syntax_error", "indentation_error", "missing_entry_point")
+        ):
+            best_error = reordered_error
+            best_failure = reordered_failure
+
+    if best_failure == "wrong_answer":
+        for setup_after_code, pass_mode in (
+            (False, "tolerant_numeric_asserts"),
+            (True, "setup_after_code_tolerant_numeric_asserts"),
+        ):
+            if setup_after_code and not setup_code.strip():
+                continue
+            tolerant_passed, tolerant_error = _execute_with_tests(
+                code,
+                test_list,
+                setup_code,
+                tolerant_numeric_asserts=True,
+                setup_after_code=setup_after_code,
+            )
+            if tolerant_passed:
+                return CodeCheckResult(
+                    passed=True,
+                    failure_type="passed",
+                    pass_mode=pass_mode,
+                )
+            best_error = tolerant_error or best_error
+    return CodeCheckResult(
+        passed=False,
+        failure_type=_classify_error(best_error),
+        error=best_error,
+    )
+
+
 class MBPPBenchmark(BaseBenchmark):
     """MBPP: code generation with assertion-based test verification."""
 
@@ -122,13 +272,15 @@ class MBPPBenchmark(BaseBenchmark):
             test_list = item.get("test_list", [])
             if not test_list:
                 continue
-            normalized.append({
-                "id": str(item["task_id"]),
-                "prompt": item["prompt"],
-                "test_list": test_list,
-                "test_setup_code": item.get("test_setup_code", ""),
-                "question": item["prompt"],
-            })
+            normalized.append(
+                {
+                    "id": str(item["task_id"]),
+                    "prompt": item["prompt"],
+                    "test_list": test_list,
+                    "test_setup_code": item.get("test_setup_code", ""),
+                    "question": item["prompt"],
+                }
+            )
 
         logger.info(f"MBPP: loaded {len(normalized)} problems")
 
@@ -161,12 +313,12 @@ class MBPPBenchmark(BaseBenchmark):
         if not predicted.strip():
             return False
 
-        passed, error = _execute_with_tests(
+        check = _run_with_tests(
             predicted,
             item["test_list"],
             item.get("test_setup_code", ""),
         )
-        return passed
+        return check.passed
 
     async def run(
         self,
@@ -177,50 +329,46 @@ class MBPPBenchmark(BaseBenchmark):
         sampling_kwargs: Optional[dict] = None,
         enable_thinking: bool = False,
     ) -> BenchmarkResult:
-        """Override run: generation is batched, code execution is sequential."""
-        results: list[QuestionResult] = []
-        correct = 0
+        """Override run: generation is queued, code execution is sequential."""
         start_time = time.time()
-        completed = 0
 
-        for batch_start in range(0, len(items), batch_size):
-            batch_end = min(batch_start + batch_size, len(items))
-            batch = items[batch_start:batch_end]
-            batch_time = time.time()
+        def score_generated(generated: EvalGenerated) -> QuestionResult:
+            code = self.extract_answer(generated.response_text, generated.item)
+            check = _run_with_tests(
+                code,
+                generated.item["test_list"],
+                generated.item.get("test_setup_code", ""),
+            )
+            is_correct = check.passed
+            return QuestionResult(
+                question_id=str(generated.item.get("id", generated.index)),
+                correct=is_correct,
+                expected="(test cases)",
+                predicted=code[:200] + "..." if len(code) > 200 else code,
+                time_seconds=generated.generation_seconds,
+                question_text=generated.prompt_text,
+                raw_response=generated.response_text,
+                category=self.get_category(generated.item),
+                pass_mode=check.pass_mode if is_correct else None,
+                failure_type=check.failure_type,
+                error=check.error,
+            )
 
-            gen_tasks = [
-                self._eval_single(engine, item, batch_start + j, sampling_kwargs, enable_thinking)
-                for j, item in enumerate(batch)
-            ]
-            gen_results = await asyncio.gather(*gen_tasks)
-            gen_elapsed = time.time() - batch_time
-
-            for idx, item, response_text, prompt_text, _raw in sorted(gen_results, key=lambda x: x[0]):
-                code = self.extract_answer(response_text, item)
-                is_correct = self.check_answer(code, item)
-
-                if is_correct:
-                    correct += 1
-
-                results.append(
-                    QuestionResult(
-                        question_id=str(item.get("id", idx)),
-                        correct=is_correct,
-                        expected="(test cases)",
-                        predicted=code[:200] + "..." if len(code) > 200 else code,
-                        time_seconds=gen_elapsed / len(batch),
-                        question_text=prompt_text,
-                        raw_response=response_text,
-                        category=self.get_category(item),
-                    )
-                )
-
-            completed += len(batch)
-            if on_progress:
-                await on_progress(completed, len(items))
+        results, _ = await self._run_refill_queue(
+            engine,
+            list(enumerate(items)),
+            batch_size=batch_size,
+            sampling_kwargs=sampling_kwargs,
+            enable_thinking=enable_thinking,
+            score_generated=score_generated,
+            on_progress=on_progress,
+            total_items=len(items),
+            score_concurrency=1,
+        )
 
         total_time = time.time() - start_time
         total = len(items)
+        correct = sum(1 for result in results if result.correct)
 
         return BenchmarkResult(
             benchmark_name=self.name,

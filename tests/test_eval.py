@@ -7,9 +7,8 @@ from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
 from omlx.eval.livecodebench import _extract_code
-from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
+from omlx.eval.mmlu import MMLUBenchmark
 from omlx.eval.truthfulqa import TruthfulQABenchmark
-
 
 # --- MMLU Tests ---
 
@@ -29,7 +28,10 @@ class TestMMLU:
         assert self.bench.extract_answer("A. Abstract algebra", {}) == "A"
 
     def test_extract_answer_verbose(self):
-        assert self.bench.extract_answer("I think the correct answer is C because...", {}) == "C"
+        assert (
+            self.bench.extract_answer("I think the correct answer is C because...", {})
+            == "C"
+        )
 
     def test_extract_answer_empty(self):
         assert self.bench.extract_answer("", {}) == ""
@@ -43,8 +45,14 @@ class TestMMLU:
 
     def test_extract_answer_explanation_before_answer(self):
         """Model explains with wrong letters first, then gives correct answer."""
-        assert self.bench.extract_answer("B is wrong because... The answer is A", {}) == "A"
-        assert self.bench.extract_answer("I initially thought C but answer is D", {}) == "D"
+        assert (
+            self.bench.extract_answer("B is wrong because... The answer is A", {})
+            == "A"
+        )
+        assert (
+            self.bench.extract_answer("I initially thought C but answer is D", {})
+            == "D"
+        )
 
     def test_extract_answer_last_letter(self):
         """When no 'answer is' pattern, use last valid letter."""
@@ -110,7 +118,12 @@ class TestHellaSwag:
     def test_format_prompt(self):
         item = {
             "context": "A man walks into a bar.",
-            "endings": ["He orders a drink.", "He flies away.", "He disappears.", "He sings."],
+            "endings": [
+                "He orders a drink.",
+                "He flies away.",
+                "He disappears.",
+                "He sings.",
+            ],
             "answer": 0,
         }
         messages = self.bench.format_prompt(item)
@@ -152,7 +165,10 @@ class TestGSM8K:
 
     def test_extract_numeric_answer_fallback(self):
         assert _extract_numeric_answer("The answer is 42.") == "42"
-        assert _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.") == "35"
+        assert (
+            _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.")
+            == "35"
+        )
 
     def test_extract_numeric_answer_empty(self):
         assert _extract_numeric_answer("I don't know") == ""
@@ -191,7 +207,9 @@ class TestGSM8K:
 
 class TestLiveCodeBench:
     def test_extract_code_python_block(self):
-        response = "Here's my solution:\n```python\ndef solve():\n    print(42)\n```\nDone."
+        response = (
+            "Here's my solution:\n```python\ndef solve():\n    print(42)\n```\nDone."
+        )
         code = _extract_code(response)
         assert "def solve():" in code
         assert "print(42)" in code
@@ -217,6 +235,7 @@ class TestLiveCodeBench:
 class TestHumanEval:
     def test_extract_code_with_block(self):
         from omlx.eval.humaneval import _extract_code
+
         prompt = "def add(a, b):\n    "
         response = "```python\ndef add(a, b):\n    return a + b\n```"
         code = _extract_code(response, prompt)
@@ -224,6 +243,7 @@ class TestHumanEval:
 
     def test_extract_code_body_only(self):
         from omlx.eval.humaneval import _extract_code
+
         prompt = "def add(a, b):\n    "
         response = "return a + b"
         code = _extract_code(response, prompt)
@@ -233,6 +253,7 @@ class TestHumanEval:
     def test_extract_code_preserves_imports(self):
         """Model returns def only — imports from prompt must be prepended."""
         from omlx.eval.humaneval import _extract_code
+
         prompt = "from typing import List\n\ndef foo(x: List[int]) -> int:\n    "
         response = "def foo(x: List[int]) -> int:\n    return sum(x)"
         code = _extract_code(response, prompt)
@@ -241,6 +262,7 @@ class TestHumanEval:
 
     def test_execute_with_tests(self):
         from omlx.eval.humaneval import _execute_with_tests
+
         code = "def add(a, b):\n    return a + b"
         test = "def check(candidate):\n    assert candidate(1, 2) == 3\n    assert candidate(0, 0) == 0"
         passed, error = _execute_with_tests(code, test, "add")
@@ -248,10 +270,248 @@ class TestHumanEval:
 
     def test_execute_with_tests_fail(self):
         from omlx.eval.humaneval import _execute_with_tests
+
         code = "def add(a, b):\n    return a - b"  # wrong
         test = "def check(candidate):\n    assert candidate(1, 2) == 3"
         passed, error = _execute_with_tests(code, test, "add")
         assert passed is False
+
+    def test_body_only_without_indent_passes_after_repair(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        result = HumanEvalBenchmark().evaluate_response("return a + b", item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_indented"
+
+    def test_body_only_with_indent_passes_canonical_raw(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        result = HumanEvalBenchmark().evaluate_response("    return a + b", item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_raw"
+
+    def test_partially_stripped_body_indent_passes(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": (
+                "def has_close_elements(numbers, threshold):\n"
+                '    """Check close elements."""\n'
+            ),
+            "test": (
+                "def check(candidate):\n"
+                "    assert candidate([1.0, 2.8, 3.0], 0.3) is True\n"
+                "    assert candidate([1.0, 2.0, 3.0], 0.5) is False"
+            ),
+            "entry_point": "has_close_elements",
+        }
+        response = (
+            "for i in range(len(numbers)):\n"
+            "        for j in range(i + 1, len(numbers)):\n"
+            "            if abs(numbers[i] - numbers[j]) < threshold:\n"
+            "                return True\n"
+            "    return False"
+        )
+        result = HumanEvalBenchmark().evaluate_response(response, item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_top_level_indent"
+
+    def test_overindented_body_base_is_normalized(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": (
+                "def sort_even(l: list):\n" '    """Sort values at even indexes."""\n'
+            ),
+            "test": (
+                "def check(candidate):\n"
+                "    assert candidate([5, 6, 3, 4]) == [3, 6, 5, 4]\n"
+                "    assert candidate([1, 2, 3]) == [1, 2, 3]"
+            ),
+            "entry_point": "sort_even",
+        }
+        response = (
+            "even_indices = [l[i] for i in range(0, len(l), 2)]\n"
+            "        even_indices.sort()\n"
+            "        result = l[:]\n"
+            "        for i, val in enumerate(even_indices):\n"
+            "            result[i * 2] = val\n"
+            "        return result"
+        )
+        result = HumanEvalBenchmark().evaluate_response(response, item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_normalize_indent"
+
+    def test_overindented_nested_helper_is_normalized(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": (
+                "def prime_length(string):\n"
+                '    """Return whether the string length is prime."""\n'
+            ),
+            "test": (
+                "def check(candidate):\n"
+                "    assert candidate('abc') is True\n"
+                "    assert candidate('abcd') is False"
+            ),
+            "entry_point": "prime_length",
+        }
+        response = (
+            "def is_prime(n):\n"
+            "        if n < 2:\n"
+            "            return False\n"
+            "        for i in range(2, int(n ** 0.5) + 1):\n"
+            "            if n % i == 0:\n"
+            "                return False\n"
+            "        return True\n"
+            "    return is_prime(len(string))"
+        )
+        result = HumanEvalBenchmark().evaluate_response(response, item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_normalize_indent"
+
+    def test_overindented_import_body_is_normalized(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": (
+                "def fruit_distribution(s, n):\n" '    """Return missing fruits."""\n'
+            ),
+            "test": (
+                "def check(candidate):\n"
+                "    assert candidate('5 apples and 6 oranges', 19) == 8"
+            ),
+            "entry_point": "fruit_distribution",
+        }
+        response = (
+            "import re\n"
+            "        nums = re.findall(r'\\d+', s)\n"
+            "        apples = int(nums[0])\n"
+            "        oranges = int(nums[1])\n"
+            "        return n - apples - oranges"
+        )
+        result = HumanEvalBenchmark().evaluate_response(response, item)
+        assert result.passed is True
+        assert result.pass_mode == "canonical_normalize_indent"
+
+    def test_normalized_wrong_logic_still_fails(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": (
+                "def maximum(arr, k):\n" '    """Return k largest elements."""\n'
+            ),
+            "test": (
+                "def check(candidate):\n" "    assert candidate([1, 2, 3], 0) == []"
+            ),
+            "entry_point": "maximum",
+        }
+        result = HumanEvalBenchmark().evaluate_response("return sorted(arr)[-k:]", item)
+        assert result.passed is False
+        assert result.failure_type == "wrong_answer"
+
+    def test_full_function_response_gets_prompt_imports(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": 'from typing import List\n\n\ndef first(xs: List[int]) -> int:\n    """Return first."""\n',
+            "test": "def check(candidate):\n    assert candidate([3, 4]) == 3",
+            "entry_point": "first",
+        }
+        response = "def first(xs: List[int]) -> int:\n    return xs[0]"
+        result = HumanEvalBenchmark().evaluate_response(response, item)
+        assert result.passed is True
+        assert result.pass_mode == "standalone_function"
+
+    def test_malformed_long_python_fence_is_extracted(self):
+        from omlx.eval.humaneval import _extract_response_code
+
+        response = "``````python\n    return 1\n```"
+        assert _extract_response_code(response) == "    return 1"
+
+    def test_internal_name_error_is_not_missing_entry_point(self):
+        from omlx.eval.humaneval import _run_with_tests
+
+        code = "def f():\n    python\n"
+        test = "def check(candidate):\n    candidate()"
+        result = _run_with_tests(code, test, "f")
+        assert result.passed is False
+        assert result.failure_type == "runtime_error"
+
+    def test_syntax_error_is_categorized(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        result = HumanEvalBenchmark().evaluate_response("return a +", item)
+        assert result.passed is False
+        assert result.failure_type in {"syntax_error", "indentation_error"}
+
+
+class TestMBPPDiagnostics:
+    def test_failing_assertion_reports_wrong_answer(self):
+        from omlx.eval.mbpp import _run_with_tests
+
+        result = _run_with_tests(
+            "def add(a, b):\n    return a - b",
+            ["assert add(1, 2) == 3"],
+        )
+        assert result.passed is False
+        assert result.failure_type == "wrong_answer"
+
+    def test_tolerates_tiny_numeric_assert_drift(self):
+        from omlx.eval.mbpp import _run_with_tests
+
+        result = _run_with_tests(
+            "import math\n\ndef volume_cone(radius, height):\n    return (1/3) * math.pi * radius**2 * height",
+            ["assert volume_cone(19,17)==6426.651371693521"],
+        )
+        assert result.passed is True
+        assert result.pass_mode == "tolerant_numeric_asserts"
+
+    def test_setup_can_run_after_generated_code(self):
+        from omlx.eval.mbpp import _run_with_tests
+
+        code = (
+            "class Node:\n"
+            "    def __init__(self, value):\n"
+            "        self.value = value\n"
+            "        self.left = None\n"
+            "\n"
+            "def root_value(root):\n"
+            "    return root.value\n"
+        )
+        result = _run_with_tests(
+            code,
+            ["assert root_value(root) == 7"],
+            "root = Node(7)",
+        )
+        assert result.passed is True
+        assert result.pass_mode == "setup_after_code"
+
+
+class TestLiveCodeBenchDiagnostics:
+    def test_variant_evaluator_reports_wrong_answer(self):
+        from omlx.eval.livecodebench import LiveCodeBenchBenchmark
+
+        item = {"inputs": [""], "outputs": ["42"]}
+        result = LiveCodeBenchBenchmark().evaluate_code("print(41)", item)
+        assert result.passed is False
+        assert result.failure_type == "wrong_answer"
 
 
 # --- Think Tag Stripping Tests ---
@@ -260,21 +520,30 @@ class TestHumanEval:
 class TestStripThinkTags:
     def test_strip_think_block(self):
         from omlx.eval.base import BaseBenchmark
-        text = "<think>\nLet me think about this...\nThe answer should be A.\n</think>\nA"
+
+        text = (
+            "<think>\nLet me think about this...\nThe answer should be A.\n</think>\nA"
+        )
         assert BaseBenchmark._strip_think_tags(text) == "A"
 
     def test_strip_empty_think(self):
         from omlx.eval.base import BaseBenchmark
+
         assert BaseBenchmark._strip_think_tags("<think></think>B") == "B"
 
     def test_no_think_tags(self):
         from omlx.eval.base import BaseBenchmark
+
         assert BaseBenchmark._strip_think_tags("A") == "A"
 
     def test_incomplete_think_tag(self):
         from omlx.eval.base import BaseBenchmark
+
         # Incomplete think tag (no closing) — should be left as-is
-        assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
+        assert (
+            BaseBenchmark._strip_think_tags("<think>still thinking")
+            == "<think>still thinking"
+        )
 
 
 # --- Thinking Mode Tests ---
@@ -283,6 +552,7 @@ class TestStripThinkTags:
 class TestThinkingMode:
     def test_benchmark_result_thinking_used_default(self):
         from omlx.eval.base import BenchmarkResult
+
         result = BenchmarkResult(
             benchmark_name="test",
             accuracy=0.5,
@@ -294,6 +564,7 @@ class TestThinkingMode:
 
     def test_benchmark_result_thinking_used_true(self):
         from omlx.eval.base import BenchmarkResult
+
         result = BenchmarkResult(
             benchmark_name="test",
             accuracy=0.5,
@@ -305,7 +576,8 @@ class TestThinkingMode:
         assert result.thinking_used is True
 
     def test_thinking_token_constants(self):
-        from omlx.eval.base import THINKING_MIN_TOKENS, THINKING_MAX_TOKENS
+        from omlx.eval.base import THINKING_MAX_TOKENS, THINKING_MIN_TOKENS
+
         assert THINKING_MIN_TOKENS == 8192
         assert THINKING_MAX_TOKENS == 32768
         assert THINKING_MIN_TOKENS < THINKING_MAX_TOKENS
@@ -313,6 +585,7 @@ class TestThinkingMode:
     def test_strip_think_tags_with_answer(self):
         """Thinking content is stripped, leaving only the answer."""
         from omlx.eval.base import BaseBenchmark
+
         text = "<think>\nLet me analyze option A vs B.\nA seems correct.\n</think>\nThe answer is A"
         result = BaseBenchmark._strip_think_tags(text)
         assert "<think>" not in result
@@ -383,17 +656,20 @@ class TestBenchmarkRegistry:
         """BENCHMARKS dict and VALID_BENCHMARKS list must be in sync."""
         from omlx.admin.accuracy_benchmark import VALID_BENCHMARKS
         from omlx.eval import BENCHMARKS
+
         assert set(BENCHMARKS.keys()) == set(VALID_BENCHMARKS)
 
     def test_instantiate_all(self):
         """Every registered class instantiates without error."""
         from omlx.eval import BENCHMARKS
+
         for cls in BENCHMARKS.values():
             cls()
 
 
 def _registered_benchmark_names():
     from omlx.eval import BENCHMARKS
+
     return sorted(BENCHMARKS.keys())
 
 
@@ -401,6 +677,7 @@ def _registered_benchmark_names():
 async def test_load_sample_per_benchmark(name):
     """Each registered benchmark loads a 10-row sample without crashing."""
     from omlx.eval import BENCHMARKS
+
     items = await BENCHMARKS[name]().load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"

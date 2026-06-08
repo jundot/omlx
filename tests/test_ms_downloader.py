@@ -241,6 +241,44 @@ class TestMSDownloader:
 
             await downloader.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_download_records_catalog_with_discovered_model_id(self, model_dir):
+        model_dir.mkdir(parents=True, exist_ok=True)
+        catalog = MagicMock()
+        downloader = MSDownloader(model_dir=str(model_dir), catalog=catalog)
+
+        def fake_snapshot_download(**kwargs):
+            target = Path(kwargs["local_dir"])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "config.json").write_text("{}", encoding="utf-8")
+            return str(target)
+
+        with patch(
+            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+        ), patch(
+            "omlx.admin.ms_downloader._get_ms_api"
+        ) as mock_get_api, patch(
+            "omlx.admin.ms_downloader.ms_snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            mock_api = MagicMock()
+            mock_api.get_model.return_value = {"LastUpdatedAt": "2026-05-14T00:00:00Z"}
+            mock_api.get_model_files.return_value = []
+            mock_get_api.return_value = mock_api
+
+            task = await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
+            await asyncio.sleep(0.5)
+
+            assert task.status == DownloadStatus.COMPLETED
+            catalog.record_download.assert_called_once()
+            kwargs = catalog.record_download.call_args.kwargs
+            assert kwargs["model_id"] == "Qwen2.5-7B-Instruct-MLX"
+            assert kwargs["repo_id"] == "qwen/Qwen2.5-7B-Instruct-MLX"
+            assert kwargs["source"] == "modelscope"
+            assert kwargs["path"] == model_dir / "qwen" / "Qwen2.5-7B-Instruct-MLX"
+
+            await downloader.shutdown()
+
     # --- Cancel Download ---
 
     @pytest.mark.asyncio

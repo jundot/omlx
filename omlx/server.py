@@ -245,6 +245,7 @@ class ServerState:
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
+    model_catalog: Optional[object] = None  # ModelCatalog
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
     ms_downloader: Optional[object] = None  # MSDownloader
@@ -1377,6 +1378,7 @@ def init_server(
     """
     from pathlib import Path
 
+    from .model_catalog import ModelCatalog
     from .model_settings import ModelSettingsManager
 
     # Store API key
@@ -1421,6 +1423,7 @@ def init_server(
     # Initialize model settings manager
     base_path = Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
     _server_state.settings_manager = ModelSettingsManager(base_path)
+    _server_state.model_catalog = ModelCatalog(base_path)
 
     # Get pinned models from settings file only (managed via admin page)
     pinned_models = _server_state.settings_manager.get_pinned_model_ids()
@@ -1471,6 +1474,10 @@ def init_server(
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
     _server_state.engine_pool.discover_models(dir_list, pinned_models)
     _server_state.engine_pool.apply_settings_overrides(_server_state.settings_manager)
+    if _server_state.model_catalog is not None:
+        _server_state.model_catalog.reconcile(
+            _server_state.engine_pool.get_status().get("models", [])
+        )
 
     if _server_state.engine_pool.model_count == 0:
         logger.warning(
@@ -1496,6 +1503,11 @@ def init_server(
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
     reset_server_metrics(stats_path=stats_path)
+
+    from .admin.accuracy_benchmark import configure_accuracy_result_storage
+    configure_accuracy_result_storage(base_path, _server_state.model_catalog)
+    from .admin.benchmark import configure_performance_result_storage
+    configure_performance_result_storage(base_path, _server_state.model_catalog)
 
     logger.info(f"Server initialized with {_server_state.engine_pool.model_count} models")
     if _server_state.default_model:
@@ -1523,11 +1535,16 @@ def init_server(
             _server_state.engine_pool.apply_settings_overrides(
                 _server_state.settings_manager
             )
+            if _server_state.model_catalog is not None:
+                _server_state.model_catalog.reconcile(
+                    _server_state.engine_pool.get_status().get("models", [])
+                )
             logger.info("Model pool refreshed after download completion")
 
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        catalog=_server_state.model_catalog,
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -1542,6 +1559,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                catalog=_server_state.model_catalog,
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")

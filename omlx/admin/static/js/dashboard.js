@@ -113,6 +113,8 @@
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
                 trust_remote_code: false,
+                tags: [],
+                tagInput: '',
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
@@ -397,6 +399,7 @@
             // bench is running" banner + disables Start so the user doesn't
             // race a 409 on the server.
             benchOtherActive: null,
+            benchUploadToOmlx: true,
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -451,6 +454,7 @@
             ],
             accBatchSize: 1,
             accEnableThinking: false,
+            accSamplingProfile: 'deterministic',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -910,6 +914,10 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
+                        for (const local of this.hfModels) {
+                            const live = this.models.find(m => m.id === local.name);
+                            if (live?.catalog) local.catalog = live.catalog;
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -939,6 +947,152 @@
                 } finally {
                     this.reloading = false;
                 }
+            },
+
+            modelSourceLabel(model) {
+                const source = model?.catalog?.source || 'unknown';
+                if (source === 'hf') return 'HF';
+                if (source === 'modelscope') return 'MS';
+                if (source === 'local') return 'Local';
+                return 'Unknown';
+            },
+
+            modelUpdateLabel(model) {
+                const status = model?.catalog?.update_status || 'not_checked';
+                if (status === 'current') return 'Current';
+                if (status === 'update_available') return 'Update';
+                if (status === 'check_failed') return 'Check failed';
+                return 'Not checked';
+            },
+
+            modelPerfPp(model) {
+                const value = model?.catalog?.best_perf_summary?.pp_tps;
+                return value ? value.toFixed(1) : '';
+            },
+
+            modelPerfTg(model) {
+                const value = model?.catalog?.best_perf_summary?.tg_tps;
+                return value ? value.toFixed(1) : '';
+            },
+
+            modelPerfTooltip(model, kind) {
+                const summary = model?.catalog?.best_perf_summary || {};
+                const value = kind === 'pp' ? summary.pp_tps : summary.tg_tps;
+                if (!value) return '';
+                const label = kind === 'pp' ? 'Prompt processing' : 'Token generation';
+                return `${label}: ${value.toFixed(1)} tok/s`;
+            },
+
+            accuracyShortLabel(benchmark) {
+                const normalized = String(benchmark || '').toLowerCase();
+                if (normalized === 'humaneval') return 'HE';
+                if (normalized === 'mbpp') return 'MBPP';
+                if (normalized === 'livecodebench') return 'LCB';
+                return String(benchmark || '').toUpperCase();
+            },
+
+            modelAccuracyLabel(model) {
+                const summary = model?.catalog?.best_accuracy_summary || {};
+                if (!summary.benchmark || summary.accuracy == null) return '';
+                const pct = (summary.accuracy * 100).toFixed(1);
+                const thinking = summary.thinking_used ? ' think' : '';
+                return `${this.accuracyShortLabel(summary.benchmark)} ${pct}%${thinking}`;
+            },
+
+            modelAccuracyTooltip(model) {
+                const summary = model?.catalog?.best_accuracy_summary || {};
+                if (!summary.benchmark || summary.accuracy == null) return '';
+                const pct = (summary.accuracy * 100).toFixed(1);
+                const parts = [`${summary.benchmark}: ${pct}%`];
+                if (summary.correct != null && summary.total != null) {
+                    parts.push(`${summary.correct}/${summary.total}`);
+                }
+                parts.push(summary.thinking_used ? 'thinking enabled' : 'thinking disabled');
+                if (summary.sampling_profile) parts.push(`profile: ${summary.sampling_profile}`);
+                return parts.join(' | ');
+            },
+
+            modelTags(model) {
+                const id = model?.id || model?.name;
+                const live = id ? this.models.find(m => m.id === id) : null;
+                const tags = live?.settings?.tags || model?.settings?.tags || [];
+                return Array.isArray(tags) ? tags : [];
+            },
+
+            hasModelSettingsTag(tag) {
+                const needle = String(tag || '').trim().toLowerCase();
+                return (this.modelSettings.tags || []).some(t => String(t).trim().toLowerCase() === needle);
+            },
+
+            addModelSettingsTag(tag) {
+                const value = String(tag || this.modelSettings.tagInput || '').trim();
+                if (!value || this.hasModelSettingsTag(value)) {
+                    this.modelSettings.tagInput = '';
+                    return;
+                }
+                this.modelSettings.tags = [...(this.modelSettings.tags || []), value.slice(0, 64)];
+                this.modelSettings.tagInput = '';
+            },
+
+            removeModelSettingsTag(tag) {
+                const needle = String(tag || '').trim().toLowerCase();
+                this.modelSettings.tags = (this.modelSettings.tags || []).filter(
+                    current => String(current).trim().toLowerCase() !== needle
+                );
+            },
+
+            handleModelSettingsTagInput(event) {
+                if (event.key !== 'Enter' && event.key !== ',') return;
+                event.preventDefault();
+                this.addModelSettingsTag(this.modelSettings.tagInput);
+            },
+
+            async checkModelUpdate(model) {
+                if (!model?.name) return;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(model.name)}/check-update`, { method: 'POST' });
+                    if (response.ok) {
+                        const data = await response.json();
+                        model.catalog = data.catalog || model.catalog;
+                        const live = this.models.find(m => m.id === model.name);
+                        if (live) live.catalog = model.catalog;
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to check model update:', err);
+                }
+            },
+
+            async checkAllModelUpdates() {
+                try {
+                    const response = await fetch('/admin/api/models/check-updates', { method: 'POST' });
+                    if (response.ok) {
+                        const data = await response.json();
+                        for (const item of data.results || []) {
+                            const local = this.hfModels.find(m => m.name === item.model_id);
+                            if (local) local.catalog = item.catalog || local.catalog;
+                            const live = this.models.find(m => m.id === item.model_id);
+                            if (live) live.catalog = item.catalog || live.catalog;
+                        }
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to check model updates:', err);
+                }
+            },
+
+            openModelSettingsByName(modelName) {
+                const model = this.models.find(m => m.id === modelName);
+                if (model) this.openModelSettings(model);
+            },
+
+            benchModel(modelName) {
+                this.benchModelId = modelName;
+                this.mainTab = 'bench';
+                this.benchTab = 'throughput';
+                this.syncTabStateToUrl();
             },
 
             async updateModelSetting(modelId, field, value) {
@@ -1655,6 +1809,8 @@
                     vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
+                    tags: Array.isArray(settings.tags) ? [...settings.tags] : [],
+                    tagInput: '',
                 };
                 this.showModelSettingsModal = true;
             },
@@ -1788,6 +1944,7 @@
                                     ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
+                                tags: this.modelSettings.tags || [],
                             };
                         })()),
                     });
@@ -2539,6 +2696,7 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            upload_to_omlx: this.benchUploadToOmlx,
                         }),
                     });
 
@@ -2604,14 +2762,16 @@
                                 }
                             }
                         } else if (data.type === 'done') {
-                            // Benchmark tests done, uploading starts
-                            this.benchUploading = true;
-                            this.benchProgress = {
-                                phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
-                                current: 0,
-                                total: 0,
-                            };
+                            if (this.benchUploadToOmlx) {
+                                // Benchmark tests done, uploading starts
+                                this.benchUploading = true;
+                                this.benchProgress = {
+                                    phase: 'upload',
+                                    message: 'Uploading to community benchmarks...',
+                                    current: 0,
+                                    total: 0,
+                                };
+                            }
                             this.loadModels();
                         } else if (data.type === 'upload') {
                             // Dedupe on replay: upload entries are unique by context_length.
@@ -2948,6 +3108,7 @@
                             ),
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accEnableThinking,
+                            sampling_profile: this.accSamplingProfile,
                         }),
                     });
                     if (!resp.ok) {
@@ -3108,6 +3269,18 @@
                 }
             },
 
+            async deleteAccResult(result) {
+                if (!result?.result_id) return;
+                try {
+                    const resp = await fetch(`/admin/api/bench/accuracy/results/${result.result_id}`, { method: 'DELETE' });
+                    if (!resp.ok) throw new Error('Delete failed');
+                    this.accAllResults = this.accAllResults.filter(r => r.result_id !== result.result_id);
+                } catch (err) {
+                    console.error('Delete result error:', err);
+                    this.accError = err.message || 'Failed to delete result';
+                }
+            },
+
             accBuildText() {
                 if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
@@ -3170,8 +3343,8 @@
                 for (const m of models) {
                     lines.push('');
                     lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
-                    lines.push('-'.repeat(62));
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Batch', 8) + pad('Think', 8));
+                    lines.push('-'.repeat(70));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
@@ -3179,6 +3352,7 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
+                            pad((r.batch_size || 1) + 'x', 8) +
                             pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
                     }
@@ -3211,8 +3385,14 @@
 
                 if (format === 'json') {
                     content = JSON.stringify({
+                        result_id: r.result_id || null,
+                        created_at: r.created_at || null,
                         model_id: r.model_id,
                         benchmark: r.benchmark,
+                        benchmark_variant: r.benchmark_variant || null,
+                        batch_size: r.batch_size || 1,
+                        sampling_profile: r.sampling_profile || 'deterministic',
+                        effective_sampling: r.effective_sampling || null,
                         accuracy: r.accuracy,
                         correct: r.correct,
                         total: r.total,
@@ -3224,9 +3404,9 @@
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = ['result_id,batch_size,sampling_profile,temperature,id,category,correct,pass_mode,failure_type,error,expected,predicted,question,raw_response,time_s'];
                     for (const q of qr) {
-                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        lines.push([esc(r.result_id || ''), r.batch_size || 1, esc(r.sampling_profile || ''), r.effective_sampling?.temperature ?? '', q.id, esc(q.category || ''), q.correct, esc(q.pass_mode || ''), esc(q.failure_type || ''), esc(q.error || ''), esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
@@ -3234,16 +3414,24 @@
                     const lines = [
                         `Model: ${r.model_id}`,
                         `Benchmark: ${r.benchmark.toUpperCase()}`,
+                        r.created_at ? `Created: ${r.created_at}` : null,
+                        r.benchmark_variant ? `Variant: ${r.benchmark_variant}` : null,
+                        `Batch: ${r.batch_size || 1}x`,
+                        `Sampling: ${r.sampling_profile || 'deterministic'}`,
+                        r.effective_sampling ? `Temperature: ${r.effective_sampling.temperature}` : null,
                         `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
                         `Time: ${r.time_s}s`,
                         '',
-                    ];
+                    ].filter(x => x !== null);
                     for (const q of qr) {
                         lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
                         if (q.category) lines.push(`Category: ${q.category}`);
                         lines.push(`Question: ${q.question || ''}`);
                         lines.push(`Expected: ${q.expected}`);
                         lines.push(`Predicted: ${q.predicted}`);
+                        if (q.pass_mode) lines.push(`Pass mode: ${q.pass_mode}`);
+                        if (q.failure_type) lines.push(`Failure: ${q.failure_type}`);
+                        if (q.error) lines.push(`Error: ${q.error}`);
                         lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
                         lines.push(`Time: ${q.time_s}s`);
                         lines.push('');
@@ -3857,6 +4045,10 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.hfModels = data.models || [];
+                        for (const local of this.hfModels) {
+                            const live = this.models.find(m => m.id === local.name);
+                            if (live?.catalog) local.catalog = live.catalog;
+                        }
                         this.hfModelsLoaded = true;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';

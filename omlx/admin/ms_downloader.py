@@ -673,12 +673,14 @@ class MSDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        catalog: object | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
+        self._catalog = catalog
         self._cancelled: set[str] = set()
         self._download_sem = asyncio.Semaphore(1)
 
@@ -884,10 +886,25 @@ class MSDownloader:
                 # when sharing a model directory.
                 target_dir = self._model_dir / task.repo_id
 
+                remote_updated_at = ""
                 # Get total file size for progress estimation
                 try:
                     api = _get_ms_api()
                     if api:
+                        try:
+                            model_data = await asyncio.wait_for(
+                                asyncio.to_thread(api.get_model, task.repo_id),
+                                timeout=_MS_API_TIMEOUT,
+                            )
+                            if isinstance(model_data, dict):
+                                remote_updated_at = (
+                                    model_data.get("LastUpdatedAt")
+                                    or model_data.get("UpdatedAt")
+                                    or model_data.get("GmtModified")
+                                    or ""
+                                )
+                        except Exception:
+                            pass
                         file_list = await asyncio.wait_for(
                             asyncio.to_thread(api.get_model_files, task.repo_id),
                             timeout=_MS_API_TIMEOUT,
@@ -957,6 +974,20 @@ class MSDownloader:
                     target_dir
                 )
                 task.completed_at = time.time()
+
+                if self._catalog is not None:
+                    try:
+                        self._catalog.record_download(
+                            model_id=target_dir.name,
+                            path=target_dir,
+                            source="modelscope",
+                            repo_id=task.repo_id,
+                            remote_updated_at=str(remote_updated_at or ""),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to record ModelScope provenance for {task.repo_id}: {e}"
+                        )
 
                 logger.info(
                     f"MS Download completed: {task.repo_id} -> {target_dir} "

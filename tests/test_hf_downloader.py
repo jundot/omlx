@@ -201,6 +201,47 @@ class TestHFDownloader:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
+    async def test_download_records_catalog_with_discovered_model_id(self, model_dir):
+        model_dir.mkdir(parents=True, exist_ok=True)
+        catalog = MagicMock()
+        downloader = HFDownloader(model_dir=str(model_dir), catalog=catalog)
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            target = Path(kwargs["local_dir"])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "config.json").write_text("{}", encoding="utf-8")
+            return str(target)
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.sha = "abc123"
+            mock_info.last_modified = None
+            mock_info.safetensors = None
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download("google/gemma-4-31B-it")
+            await asyncio.sleep(0.5)
+
+            assert task.status == DownloadStatus.COMPLETED
+            catalog.record_download.assert_called_once()
+            kwargs = catalog.record_download.call_args.kwargs
+            assert kwargs["model_id"] == "gemma-4-31B-it"
+            assert kwargs["repo_id"] == "google/gemma-4-31B-it"
+            assert kwargs["source"] == "hf"
+            assert kwargs["path"] == model_dir / "google" / "gemma-4-31B-it"
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
     async def test_download_failure_sets_error(self, model_dir):
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))

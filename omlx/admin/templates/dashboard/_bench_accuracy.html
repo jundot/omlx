@@ -51,6 +51,26 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.thinking_hint') }}</p>
                             </div>
 
+                            <!-- Sampling Profile -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">Sampling Profile</label>
+                                <div class="inline-flex rounded-lg border border-neutral-200 bg-neutral-50 p-1">
+                                    <button type="button"
+                                            @click="accSamplingProfile = 'model_settings'"
+                                            :class="accSamplingProfile === 'model_settings' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
+                                            class="px-3 py-1.5 text-sm font-medium rounded-md transition-all">
+                                        Model Settings
+                                    </button>
+                                    <button type="button"
+                                            @click="accSamplingProfile = 'deterministic'"
+                                            :class="accSamplingProfile === 'deterministic' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
+                                            class="px-3 py-1.5 text-sm font-medium rounded-md transition-all">
+                                        Deterministic
+                                    </button>
+                                </div>
+                                <p class="text-xs text-neutral-400 mt-1.5" x-text="accSamplingProfile === 'model_settings' ? 'Uses saved model sampling settings such as temperature and penalties.' : 'Forces greedy neutral sampling for reproducibility.'"></p>
+                            </div>
+
                             <!-- Batch Size -->
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('acc_bench.config.batch_size') }}</label>
@@ -163,6 +183,7 @@
                                 <div class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-100 rounded-lg text-sm text-neutral-700">
                                     <span x-text="q.model_id"></span>
                                     <span class="text-neutral-400 text-xs" x-text="'(' + q.benchmarks.join(', ') + ')'"></span>
+                                    <span class="text-neutral-400 text-xs" x-text="q.sampling_profile === 'model_settings' ? 'model settings' : 'deterministic'"></span>
                                     <button @click="removeFromAccQueue(idx)"
                                             class="ml-1 text-neutral-500 hover:text-red-500 transition-colors">
                                         <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -235,6 +256,8 @@
                                             <div class="flex items-center gap-2">
                                                 <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
                                                 <span class="text-xs font-medium text-neutral-400 bg-neutral-100 px-1.5 py-0.5 rounded" x-text="r.model_id"></span>
+                                                <span class="text-xs font-medium text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" x-text="(r.batch_size || 1) + 'x batch'"></span>
+                                                <span class="text-xs font-medium text-neutral-500 bg-neutral-100 px-1.5 py-0.5 rounded" x-text="r.sampling_profile === 'model_settings' ? 'Model settings' : 'Deterministic'"></span>
                                                 <template x-if="r.thinking_used">
                                                     <span class="text-xs font-medium text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.thinking_badge') }}</span>
                                                 </template>
@@ -275,6 +298,12 @@
                                                     class="w-full px-3 py-1.5 text-xs text-left text-neutral-600 hover:bg-neutral-50">TXT</button>
                                         </div>
                                     </div>
+                                    <!-- Delete one saved result -->
+                                    <button @click="deleteAccResult(r)"
+                                            class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"
+                                            :title="window.t('acc_bench.results.delete_saved_tooltip')">
+                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                    </button>
                                 </div>
 
                                 <!-- Category breakdown table -->

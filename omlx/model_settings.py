@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Per-model settings management for oMLX.
 
 This module provides dataclasses and a manager for storing and retrieving
@@ -16,8 +17,8 @@ from typing import Any, Dict, Optional
 from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class ModelSettings:
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
+        tags: User-defined UI labels for grouping/filtering models.
         active_profile_name: Name of the currently-applied profile (None = no profile).
     """
 
@@ -111,27 +113,45 @@ class ModelSettings:
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
+    forced_ct_kwargs: Optional[list[str]] = (
+        None  # Keys that cannot be overridden by API requests
+    )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
-    model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
-    model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
-    index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
-    enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
-    preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    model_type_override: Optional[str] = (
+        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+    )
+    model_alias: Optional[str] = (
+        None  # API-visible name (alternative to directory name)
+    )
+    index_cache_freq: Optional[int] = (
+        None  # IndexCache: every Nth layer keeps indexer (DSA models only)
+    )
+    enable_thinking: Optional[bool] = (
+        None  # Explicit toggle for thinking/reasoning mode (None = auto)
+    )
+    preserve_thinking: Optional[bool] = (
+        None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
-    reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    reasoning_parser: Optional[str] = (
+        None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    )
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
-    turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    turboquant_skip_last: bool = (
+        True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    )
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
-    specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
+    specprefill_draft_model: Optional[str] = (
+        None  # Path to draft model (must share tokenizer)
+    )
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
@@ -142,13 +162,21 @@ class ModelSettings:
     dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
     dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    dflash_max_ctx: Optional[int] = (
+        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    )
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
     dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
-    dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_in_memory_cache_max_entries: int = (
+        4  # Matches dflash balanced profile default
+    )
+    dflash_in_memory_cache_max_bytes: int = (
+        8 * 1024 * 1024 * 1024
+    )  # 8 GiB (balanced profile default)
+    dflash_ssd_cache: bool = (
+        False  # Requires in-memory cache and an omlx paged SSD cache dir
+    )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
     # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
@@ -168,8 +196,12 @@ class ModelSettings:
     # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
     # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.
     vlm_mtp_enabled: bool = False
-    vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
-    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
+    vlm_mtp_draft_model: Optional[str] = (
+        None  # Path / model id of the assistant drafter
+    )
+    vlm_mtp_draft_block_size: Optional[int] = (
+        None  # Tokens per draft round (None = mlx-vlm default)
+    )
 
     # Model management flags
     is_pinned: bool = False
@@ -183,6 +215,7 @@ class ModelSettings:
     # Metadata
     display_name: Optional[str] = None
     description: Optional[str] = None
+    tags: list[str] = field(default_factory=list)
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
@@ -335,7 +368,7 @@ class ModelSettingsManager:
             "models": {
                 model_id: settings.to_dict()
                 for model_id, settings in self._settings.items()
-            }
+            },
         }
 
         try:
@@ -522,7 +555,9 @@ class ModelSettingsManager:
         with self._lock:
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
-                raise ValueError(f"Profile '{name}' already exists for model '{model_id}'")
+                raise ValueError(
+                    f"Profile '{name}' already exists for model '{model_id}'"
+                )
             now = utcnow().isoformat()
             per_model[name] = {
                 "name": name,

@@ -76,6 +76,7 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "is_default",
     "display_name",
     "description",
+    "tags",
     "model_alias",
     "model_type_override",
     "active_profile_name",

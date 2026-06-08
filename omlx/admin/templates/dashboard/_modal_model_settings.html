@@ -291,6 +291,55 @@
                                 </div>
                             </div>
 
+                            <!-- Tags -->
+                            <div>
+                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.tags.label') }}</label>
+                                <div class="rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-3">
+                                    <div class="flex flex-wrap items-center gap-2 mb-3">
+                                        <template x-for="tag in modelSettings.tags" :key="tag">
+                                            <span class="inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                                                <span x-text="tag"></span>
+                                                <button type="button"
+                                                        @click="removeModelSettingsTag(tag)"
+                                                        class="text-orange-400 hover:text-orange-700"
+                                                        :title="window.t('modal.model_settings.tags.remove') + ' ' + tag">
+                                                    x
+                                                </button>
+                                            </span>
+                                        </template>
+                                        <span x-show="!modelSettings.tags || modelSettings.tags.length === 0"
+                                              class="text-xs text-neutral-400">{{ t('modal.model_settings.tags.empty') }}</span>
+                                    </div>
+                                    <div class="flex flex-col sm:flex-row gap-2">
+                                        <input type="text"
+                                               x-model="modelSettings.tagInput"
+                                               @keydown="handleModelSettingsTagInput($event)"
+                                               placeholder="{{ t('modal.model_settings.tags.add') }}, e.g. Qwen3.6"
+                                               class="flex-1 px-3 py-2 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <button type="button"
+                                                @click="addModelSettingsTag(modelSettings.tagInput)"
+                                                class="px-3 py-2 text-xs font-medium text-neutral-700 bg-white hover:bg-neutral-100 rounded-lg border border-neutral-200 transition-all">
+                                            {{ t('modal.model_settings.tags.add') }}
+                                        </button>
+                                    </div>
+                                    <div class="flex flex-wrap items-center gap-2 mt-3">
+                                        <span class="text-[11px] uppercase tracking-wider text-neutral-400 font-semibold">{{ t('modal.model_settings.tags.suggested') }}</span>
+                                        <button type="button"
+                                                x-show="!hasModelSettingsTag('Dense')"
+                                                @click="addModelSettingsTag('Dense')"
+                                                class="px-2 py-1 text-xs font-medium rounded-full bg-white text-neutral-600 border border-neutral-200 hover:bg-neutral-100 transition-all">
+                                            Dense
+                                        </button>
+                                        <button type="button"
+                                                x-show="!hasModelSettingsTag('MoE')"
+                                                @click="addModelSettingsTag('MoE')"
+                                                class="px-2 py-1 text-xs font-medium rounded-full bg-white text-neutral-600 border border-neutral-200 hover:bg-neutral-100 transition-all">
+                                            MoE
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
                             <!-- Sampling settings (LLM/VLM only) -->
                             <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                 <div class="space-y-5">

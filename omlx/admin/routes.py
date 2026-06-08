@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -158,6 +158,7 @@ class ModelSettingsRequest(BaseModel):
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+    tags: list[str] | None = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -198,6 +199,23 @@ class UpdateTemplateRequest(BaseModel):
     display_name: str | None = None
     description: str | None = None
     settings: dict[str, Any] | None = None
+
+
+def _normalize_model_tags(tags: list[str] | None) -> list[str]:
+    """Trim, de-duplicate, and cap user model tags for UI metadata storage."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in tags or []:
+        tag = str(raw_tag).strip()
+        if not tag:
+            continue
+        tag = tag[:64]
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(tag)
+    return normalized
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -1009,6 +1027,11 @@ def set_admin_getters(
     _refresh_i18n_globals()
 
 
+def _get_model_catalog():
+    state = _get_server_state() if _get_server_state else None
+    return getattr(state, "model_catalog", None) if state is not None else None
+
+
 def set_hf_downloader(downloader):
     """Set the HFDownloader instance for admin routes.
 
@@ -1662,6 +1685,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get engine pool status
     status = engine_pool.get_status()
     models_status = status.get("models", [])
+    catalog = _get_model_catalog()
+    if catalog is not None:
+        catalog.reconcile(models_status)
 
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
@@ -1720,6 +1746,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
+        if catalog is not None:
+            model_data["catalog"] = catalog.get_public(model_id)
 
         # Add settings if available
         if settings:
@@ -1763,6 +1791,76 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         )
 
     return {"models": models}
+
+
+@router.post("/api/models/{model_id}/check-update")
+async def check_model_update(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Check remote update status for one cataloged model."""
+    catalog = _get_model_catalog()
+    if catalog is None:
+        raise HTTPException(status_code=503, detail="Model catalog not initialized")
+
+    entry = catalog.get(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if not entry.repo_id or entry.source not in ("hf", "modelscope"):
+        updated = catalog.update_remote_state(model_id, error="no remote source")
+        return {"model_id": model_id, "catalog": updated}
+
+    try:
+        if entry.source == "hf":
+            from .hf_downloader import _get_hf_api
+
+            api, _endpoint = _get_hf_api()
+            info = await asyncio.wait_for(
+                asyncio.to_thread(api.model_info, entry.repo_id),
+                timeout=10,
+            )
+            updated = catalog.update_remote_state(
+                model_id,
+                remote_revision=getattr(info, "sha", "") or "",
+                remote_updated_at=(
+                    info.last_modified.isoformat()
+                    if getattr(info, "last_modified", None)
+                    else ""
+                ),
+            )
+        else:
+            from .ms_downloader import MSDownloader
+
+            info = await MSDownloader.get_model_info(entry.repo_id)
+            updated = catalog.update_remote_state(
+                model_id,
+                remote_updated_at=info.get("updated_at", ""),
+            )
+    except Exception as e:
+        updated = catalog.update_remote_state(model_id, error=str(e))
+
+    return {"model_id": model_id, "catalog": updated}
+
+
+@router.post("/api/models/check-updates")
+async def check_model_updates(is_admin: bool = Depends(require_admin)):
+    """Check remote update status for all discovered remote-backed models."""
+    engine_pool = _get_engine_pool()
+    catalog = _get_model_catalog()
+    if engine_pool is None or catalog is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    results = []
+    for model_info in engine_pool.get_status().get("models", []):
+        model_id = model_info.get("id")
+        if not model_id:
+            continue
+        entry = catalog.get(model_id)
+        if entry is None or entry.source not in ("hf", "modelscope"):
+            continue
+        result = await check_model_update(model_id, is_admin=True)
+        results.append(result)
+    return {"results": results}
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -2269,6 +2367,8 @@ async def update_model_settings(
             server_state.default_model = model_id
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+    if "tags" in sent:
+        current_settings.tags = _normalize_model_tags(request.tags)
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
@@ -4519,7 +4619,9 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             rate_tracker.clear()
         executor = getattr(core, "_mlx_executor", None)
         if executor is not None:
-            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+            reclaim_targets.append(
+                (model_id, executor, getattr(scheduler, "_stream", None))
+            )
 
     # Also clear managers orphaned by an abnormal teardown: they hold live
     # hot cache but are no longer attached to a loaded scheduler, so the loop
@@ -4858,10 +4960,10 @@ async def search_hf_models(
     limit: int = 100,
     mlx_only: bool = True,
     # Filtering
-    min_params: Optional[int] = None,
-    max_params: Optional[int] = None,
-    min_size: Optional[int] = None,  # bytes
-    max_size: Optional[int] = None,  # bytes
+    min_params: int | None = None,
+    max_params: int | None = None,
+    min_size: int | None = None,  # bytes
+    max_size: int | None = None,  # bytes
     # Sorting
     sort_by_size: bool = False,
     sort_ascending: bool = False,
@@ -4951,19 +5053,27 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
+    catalog = _get_model_catalog()
+
     def _add_model(model_path: Path, model_name: str) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
         total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
-        models.append(
-            {
-                "name": model_name,
+        item = {
+            "name": model_name,
+            "path": str(model_path),
+            "size": total_size,
+            "size_formatted": format_size(total_size),
+        }
+        if catalog is not None:
+            item["catalog"] = catalog.get_public(model_name) or {
+                "model_id": model_name,
                 "path": str(model_path),
-                "size": total_size,
-                "size_formatted": format_size(total_size),
+                "source": "local",
+                "update_status": "not_checked",
             }
-        )
+        models.append(item)
 
     models = []
     seen_names: set[str] = set()
@@ -5406,6 +5516,20 @@ async def reset_accuracy_results(
     return {"status": "reset"}
 
 
+@router.delete("/api/bench/accuracy/results/{result_id}")
+async def delete_accuracy_result(
+    result_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete one accumulated accuracy benchmark result."""
+    from .accuracy_benchmark import delete_accumulated_result
+
+    if not delete_accumulated_result(result_id):
+        raise HTTPException(status_code=404, detail=f"Result {result_id} not found")
+
+    return {"status": "deleted", "result_id": result_id}
+
+
 @router.post("/api/bench/accuracy/cancel")
 async def cancel_accuracy_queue(
     is_admin: bool = Depends(require_admin),
@@ -5497,6 +5621,40 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
     }
+
+
+@router.get("/api/bench/results")
+async def get_performance_benchmark_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get saved performance benchmark results."""
+    from .benchmark import get_performance_results
+
+    return {"results": get_performance_results()}
+
+
+@router.post("/api/bench/results/reset")
+async def reset_performance_benchmark_results(
+    is_admin: bool = Depends(require_admin),
+):
+    """Clear saved performance benchmark results."""
+    from .benchmark import reset_performance_results
+
+    reset_performance_results()
+    return {"status": "reset"}
+
+
+@router.delete("/api/bench/results/{result_id}")
+async def delete_performance_benchmark_result(
+    result_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete one saved performance benchmark result."""
+    from .benchmark import delete_performance_result
+
+    if not delete_performance_result(result_id):
+        raise HTTPException(status_code=404, detail=f"Result {result_id} not found")
+    return {"status": "deleted", "result_id": result_id}
 
 
 @router.post("/api/bench/start")

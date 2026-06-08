@@ -136,6 +136,15 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
                             </div>
 
+                            <!-- Upload Config -->
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox"
+                                       x-model="benchUploadToOmlx"
+                                       :disabled="benchRunning"
+                                       class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                                <span class="text-sm text-neutral-600">{{ t('bench.config.upload_to_omlx') }}</span>
+                            </label>
+
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"

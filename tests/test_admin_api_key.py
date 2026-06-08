@@ -48,6 +48,7 @@ class TestListModelsSettings:
             is_default=False,
             display_name="Test Model",
             description="A test model",
+            tags=["Dense", "Qwen3.6"],
         )
 
         mock_settings_manager = MagicMock()
@@ -80,6 +81,7 @@ class TestListModelsSettings:
         assert settings_dict["max_context_window"] == 8192
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
+        assert settings_dict["tags"] == ["Dense", "Qwen3.6"]
 
 
 class TestValidateApiKey:

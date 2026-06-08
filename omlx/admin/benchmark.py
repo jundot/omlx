@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 # Module-level storage for active benchmark runs
 _benchmark_runs: dict[str, "BenchmarkRun"] = {}
+_perf_results: list[dict] = []
+_perf_result_storage_dir: Optional[Path] = None
+_perf_result_paths: dict[str, Path] = {}
+_model_catalog_ref: Any = None
 
 # Valid prompt lengths for single request tests
 VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
@@ -43,6 +48,8 @@ class BenchmarkRequest(BaseModel):
     prompt_lengths: list[int]
     generation_length: int = 128
     batch_sizes: list[int] = []
+    upload_to_omlx: bool = False
+
     @field_validator("prompt_lengths")
     @classmethod
     def validate_prompt_lengths(cls, v: list[int]) -> list[int]:
@@ -90,27 +97,201 @@ class BenchmarkRun:
     # the run's results are not uploaded to omlx.ai community benchmarks
     # because experimental features skew the numbers.
     experimental_features: list[str] = field(default_factory=list)
+    result_id: str = ""
     # Mirror of the upload SSE events so REST consumers (e.g. native Swift
     # app polling /results) can render leaderboard status without opening
     # the stream. Phases: "idle" → "uploading" → "done" | "skipped". The
     # browser HTML still consumes the SSE stream directly; this is purely
     # additive state that lives alongside it.
-    upload_state: dict = field(default_factory=lambda: {
-        "phase": "idle",
-        "results": [],          # per-context-length: {context_length, id?, url?, duplicate?, error?}
-        "total": 0,
-        "success_count": 0,
-        "failed_count": 0,
-        "owner_hash": None,     # display hash, populated on upload_done
-        "skipped_reason": None, # e.g. "experimental_features"
-        "skipped_features": [],
-    })
+    upload_state: dict = field(
+        default_factory=lambda: {
+            "phase": "idle",
+            "results": [],  # per-context-length: {context_length, id?, url?, duplicate?, error?}
+            "total": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "owner_hash": None,  # display hash, populated on upload_done
+            "skipped_reason": None,  # e.g. "experimental_features"
+            "skipped_features": [],
+        }
+    )
 
 
 # Event types that close the SSE stream for a bench run. `done` is NOT
 # terminal — it marks "tests finished, upload starting"; the real end of
 # stream is `upload_done` (or `error`).
 _BENCH_TERMINAL_TYPES = frozenset({"upload_done", "error"})
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def configure_performance_result_storage(
+    base_path: Optional[Path],
+    model_catalog: Any = None,
+) -> None:
+    """Configure saved performance benchmark result storage."""
+    global _perf_result_storage_dir, _model_catalog_ref
+
+    _perf_results.clear()
+    _perf_result_paths.clear()
+    _model_catalog_ref = model_catalog
+
+    if base_path is None:
+        _perf_result_storage_dir = None
+        return
+
+    _perf_result_storage_dir = (
+        Path(base_path) / "benchmarks" / "performance" / "results"
+    )
+    _load_perf_results()
+
+
+def _load_perf_results() -> None:
+    if _perf_result_storage_dir is None:
+        return
+    try:
+        _perf_result_storage_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Failed to create performance result directory: {e}")
+        return
+
+    for path in sorted(_perf_result_storage_dir.glob("*.json"), reverse=True):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+        except Exception as e:
+            logger.warning(f"Skipping invalid performance result {path}: {e}")
+            continue
+        if not isinstance(result, dict):
+            continue
+        result_id = result.get("result_id")
+        if not result_id:
+            result_id = path.stem.rsplit("-", 1)[-1] or f"perf-{uuid.uuid4().hex[:8]}"
+            result["result_id"] = result_id
+        _perf_results.append(result)
+        _perf_result_paths[result_id] = path
+
+
+def _perf_summary(result: dict) -> dict:
+    single = result.get("single_results") or []
+    canonical = next((r for r in single if r.get("pp") == 1024), None)
+    if canonical is None and single:
+        canonical = single[0]
+    if canonical is None:
+        return {}
+    return {
+        "result_id": result.get("result_id", ""),
+        "created_at": result.get("created_at", ""),
+        "pp": canonical.get("pp"),
+        "tg": canonical.get("tg"),
+        "pp_tps": canonical.get("processing_tps"),
+        "tg_tps": canonical.get("gen_tps"),
+    }
+
+
+def _build_perf_result(run: BenchmarkRun) -> dict:
+    result_id = run.result_id or f"perf-{uuid.uuid4().hex[:12]}"
+    run.result_id = result_id
+    return {
+        "result_id": result_id,
+        "created_at": _utc_now(),
+        "model_id": run.request.model_id,
+        "prompt_lengths": run.request.prompt_lengths,
+        "generation_length": run.request.generation_length,
+        "batch_sizes": run.request.batch_sizes,
+        "run_signature": _run_signature(run),
+        "single_results": [r for r in run.results if r.get("test_type") == "single"],
+        "batch_results": [r for r in run.results if r.get("test_type") == "batch"],
+        "effective_sampling": {
+            "sampling_profile": "deterministic",
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "generation_length": run.request.generation_length,
+        },
+        "experimental_features": list(run.experimental_features),
+        "upload_requested": run.request.upload_to_omlx,
+        "upload_state": dict(run.upload_state),
+    }
+
+
+def _run_signature(run: BenchmarkRun) -> str:
+    payload = {
+        "model_id": run.request.model_id,
+        "prompt_lengths": run.request.prompt_lengths,
+        "generation_length": run.request.generation_length,
+        "batch_sizes": run.request.batch_sizes,
+        "experimental_features": list(run.experimental_features),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _save_perf_result(result: dict) -> None:
+    if _perf_result_storage_dir is None:
+        return
+    try:
+        _perf_result_storage_dir.mkdir(parents=True, exist_ok=True)
+        result_id = result.get("result_id") or f"perf-{uuid.uuid4().hex[:12]}"
+        result["result_id"] = result_id
+        created_at = result.setdefault("created_at", _utc_now())
+        path = _perf_result_paths.get(result_id)
+        if path is None:
+            stamp = str(created_at).replace(":", "").replace("+", "").replace("/", "-")
+            path = _perf_result_storage_dir / f"{stamp}-{result_id}.json"
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        tmp.replace(path)
+        _perf_result_paths[result_id] = path
+    except Exception as e:
+        logger.error(f"Failed to persist performance benchmark result: {e}")
+
+
+def _append_or_update_perf_result(run: BenchmarkRun) -> dict:
+    result = _build_perf_result(run)
+    for idx, existing in enumerate(_perf_results):
+        if existing.get("result_id") == result["result_id"]:
+            result["created_at"] = existing.get("created_at", result["created_at"])
+            _perf_results[idx] = result
+            break
+    else:
+        _perf_results.insert(0, result)
+    _save_perf_result(result)
+    if _model_catalog_ref is not None:
+        try:
+            _model_catalog_ref.update_perf_summary(
+                run.request.model_id,
+                result["result_id"],
+                _perf_summary(result),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update performance summary: {e}")
+    return result
+
+
+def get_performance_results() -> list[dict]:
+    return _perf_results
+
+
+def delete_performance_result(result_id: str) -> bool:
+    for idx, result in enumerate(_perf_results):
+        if result.get("result_id") == result_id:
+            del _perf_results[idx]
+            path = _perf_result_paths.pop(result_id, None)
+            if path is not None:
+                path.unlink(missing_ok=True)
+            return True
+    return False
+
+
+def reset_performance_results() -> None:
+    _perf_results.clear()
+    if _perf_result_storage_dir is not None and _perf_result_storage_dir.exists():
+        for path in _perf_result_storage_dir.glob("*.json"):
+            path.unlink(missing_ok=True)
+    _perf_result_paths.clear()
 
 
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
@@ -150,7 +331,6 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
     if len(completed) > max_runs:
         for bid, _ in completed[:-max_runs]:
             del _benchmark_runs[bid]
-
 
 
 def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
@@ -253,7 +433,10 @@ async def _run_single_test(
         # Detect first generated token via completion_tokens count,
         # not new_text. Some models (e.g. Harmony/gpt-oss) produce
         # protocol tokens that don't yield visible new_text.
-        if first_token_time is None and output.completion_tokens > prev_completion_tokens:
+        if (
+            first_token_time is None
+            and output.completion_tokens > prev_completion_tokens
+        ):
             first_token_time = time.perf_counter()
         prev_completion_tokens = output.completion_tokens
         last_output = output
@@ -454,7 +637,11 @@ def _sanitize_upload_error(resp: Any) -> str:
     status = getattr(resp, "status_code", "?")
 
     body_head = body[:512].lower()
-    if cf_mitigated == "challenge" or "just a moment" in body_head or "cf-chl" in body_head:
+    if (
+        cf_mitigated == "challenge"
+        or "just a moment" in body_head
+        or "cf-chl" in body_head
+    ):
         return (
             f"Upload blocked by Cloudflare (HTTP {status}). "
             f"This is a server-side issue with omlx.ai — retry later or "
@@ -475,7 +662,7 @@ def _sanitize_upload_error(resp: Any) -> str:
     return text[:300] or f"HTTP {status}"
 
 
-async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
+async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> dict | None:
     """Upload benchmark results to omlx.ai community benchmarks.
 
     Sends each single-request result as a separate submission,
@@ -502,25 +689,31 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         run.upload_state["phase"] = "skipped"
         run.upload_state["skipped_reason"] = "experimental_features"
         run.upload_state["skipped_features"] = list(run.experimental_features)
-        await _send_event(run, {
-            "type": "upload_skipped",
-            "reason": "experimental_features",
-            "features": list(run.experimental_features),
-        })
+        await _send_event(
+            run,
+            {
+                "type": "upload_skipped",
+                "reason": "experimental_features",
+                "features": list(run.experimental_features),
+            },
+        )
         logger.info(
             f"Benchmark upload skipped: experimental features active: "
             f"{run.experimental_features}"
         )
-        return
+        return run.upload_state
 
     run.upload_state["phase"] = "uploading"
-    await _send_event(run, {
-        "type": "progress",
-        "phase": "upload",
-        "message": "Uploading to community benchmarks...",
-        "current": 0,
-        "total": 0,
-    })
+    await _send_event(
+        run,
+        {
+            "type": "progress",
+            "phase": "upload",
+            "message": "Uploading to community benchmarks...",
+            "current": 0,
+            "total": 0,
+        },
+    )
 
     # Collect hardware info
     chip_string = get_chip_name()
@@ -554,23 +747,25 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
 
     # Build batching_results from batch data
     batching_results = []
-    pp1024_single = next(
-        (r for r in single_results if r.get("pp") == 1024), None
-    )
+    pp1024_single = next((r for r in single_results if r.get("pp") == 1024), None)
     if pp1024_single and batch_results:
         baseline_tps = pp1024_single["gen_tps"]
-        batching_results.append({
-            "batch_size": 1,
-            "tg_tps": baseline_tps,
-            "speedup": 1.0,
-        })
+        batching_results.append(
+            {
+                "batch_size": 1,
+                "tg_tps": baseline_tps,
+                "speedup": 1.0,
+            }
+        )
         for br in batch_results:
             speedup = round(br["tg_tps"] / baseline_tps, 2) if baseline_tps > 0 else 1.0
-            batching_results.append({
-                "batch_size": br["batch_size"],
-                "tg_tps": br["tg_tps"],
-                "speedup": speedup,
-            })
+            batching_results.append(
+                {
+                    "batch_size": br["batch_size"],
+                    "tg_tps": br["tg_tps"],
+                    "speedup": speedup,
+                }
+            )
 
     success_count = 0
     failed_count = 0
@@ -621,11 +816,6 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                     "id": data.get("id"),
                     "url": data.get("url"),
                 }
-                run.upload_state["results"].append(result_dict)
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": result_dict,
-                })
             elif resp.status_code == 409:
                 data = resp.json()
                 success_count += 1  # Duplicate is still ok
@@ -635,11 +825,6 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                     "url": data.get("existing_url"),
                     "duplicate": True,
                 }
-                run.upload_state["results"].append(result_dict)
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": result_dict,
-                })
             else:
                 failed_count += 1
                 error_msg = _sanitize_upload_error(resp)
@@ -647,11 +832,6 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                     "context_length": context_length,
                     "error": error_msg,
                 }
-                run.upload_state["results"].append(result_dict)
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": result_dict,
-                })
                 # Surface the sanitized message to ops; the full body
                 # (truncated) goes to debug so it can still be retrieved
                 # from the log file if needed.
@@ -665,6 +845,9 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                         (resp.text or "")[:500],
                     )
 
+            run.upload_state["results"].append(result_dict)
+            await _send_event(run, {"type": "upload", "data": result_dict})
+
         except Exception as e:
             failed_count += 1
             result_dict = {
@@ -672,30 +855,26 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
                 "error": str(e),
             }
             run.upload_state["results"].append(result_dict)
-            await _send_event(run, {
-                "type": "upload",
-                "data": result_dict,
-            })
+            await _send_event(run, {"type": "upload", "data": result_dict})
             logger.warning(f"Benchmark upload error for pp{context_length}: {e}")
 
+    upload_done = {
+        "owner_hash": owner_hash_display,
+        "total": len(single_results),
+        "success": success_count,
+        "failed": failed_count,
+    }
     run.upload_state["phase"] = "done"
     run.upload_state["total"] = len(single_results)
     run.upload_state["success_count"] = success_count
     run.upload_state["failed_count"] = failed_count
     run.upload_state["owner_hash"] = owner_hash_display
-    await _send_event(run, {
-        "type": "upload_done",
-        "data": {
-            "owner_hash": owner_hash_display,
-            "total": len(single_results),
-            "success": success_count,
-            "failed": failed_count,
-        },
-    })
+    await _send_event(run, {"type": "upload_done", "data": upload_done})
 
     logger.info(
         f"Benchmark upload complete: {success_count}/{len(single_results)} succeeded"
     )
+    return run.upload_state
 
 
 async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
@@ -736,13 +915,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Phase 1: Unload all loaded models
         loaded_ids = engine_pool.get_loaded_model_ids()
         if loaded_ids:
-            await _send_event(run, {
-                "type": "progress",
-                "phase": "unload",
-                "message": f"Unloading {len(loaded_ids)} model(s)...",
-                "current": 0,
-                "total": total_tests,
-            })
+            await _send_event(
+                run,
+                {
+                    "type": "progress",
+                    "phase": "unload",
+                    "message": f"Unloading {len(loaded_ids)} model(s)...",
+                    "current": 0,
+                    "total": total_tests,
+                },
+            )
             for model_id in loaded_ids:
                 try:
                     await engine_pool._unload_engine(model_id)
@@ -751,13 +933,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     logger.warning(f"Benchmark: failed to unload {model_id}: {e}")
 
         # Phase 2: Load the target model
-        await _send_event(run, {
-            "type": "progress",
-            "phase": "load",
-            "message": f"Loading {request.model_id}...",
-            "current": 0,
-            "total": total_tests,
-        })
+        await _send_event(
+            run,
+            {
+                "type": "progress",
+                "phase": "load",
+                "message": f"Loading {request.model_id}...",
+                "current": 0,
+                "total": total_tests,
+            },
+        )
         engine = await engine_pool.get_engine(request.model_id, force_lm=True)
         logger.info(f"Benchmark: loaded {request.model_id}")
 
@@ -775,13 +960,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Metal shader compilation, and KV cache initialization.
         # Without this, the first real benchmark test absorbs all
         # one-time overhead and shows artificially low pp TPS.
-        await _send_event(run, {
-            "type": "progress",
-            "phase": "warmup",
-            "message": "Warming up (JIT compile)...",
-            "current": 0,
-            "total": total_tests,
-        })
+        await _send_event(
+            run,
+            {
+                "type": "progress",
+                "phase": "warmup",
+                "message": "Warming up (JIT compile)...",
+                "current": 0,
+                "total": total_tests,
+            },
+        )
         warmup_prompt = _generate_prompt(tokenizer, 32)
         async for _ in engine.stream_generate(
             prompt=warmup_prompt, max_tokens=8, temperature=0.0
@@ -790,17 +978,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         logger.info("Benchmark: warmup complete")
 
         # Phase 3: Single request tests
-        single_pp1024_gen_tps = None
-
         for pp_len in request.prompt_lengths:
             current_test += 1
-            await _send_event(run, {
-                "type": "progress",
-                "phase": "single",
-                "message": f"Single: pp{pp_len}/tg{request.generation_length}",
-                "current": current_test,
-                "total": total_tests,
-            })
+            await _send_event(
+                run,
+                {
+                    "type": "progress",
+                    "phase": "single",
+                    "message": f"Single: pp{pp_len}/tg{request.generation_length}",
+                    "current": current_test,
+                    "total": total_tests,
+                },
+            )
 
             metrics = await _run_single_test(
                 engine=engine,
@@ -819,10 +1008,6 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
             await _send_event(run, {"type": "result", "data": result})
 
-            # Store pp1024 gen_tps for speedup calculation
-            if pp_len == 1024:
-                single_pp1024_gen_tps = metrics["gen_tps"]
-
         # Phase 4: Batch tests
         # Each request has a unique UUID prefix (no cache hits)
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
@@ -837,13 +1022,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         for batch_size in request.batch_sizes if hasattr(engine, "_engine") else []:
             current_test += 1
-            await _send_event(run, {
-                "type": "progress",
-                "phase": "batch",
-                "message": f"Batch {batch_size}x: pp1024/tg{request.generation_length}",
-                "current": current_test,
-                "total": total_tests,
-            })
+            await _send_event(
+                run,
+                {
+                    "type": "progress",
+                    "phase": "batch",
+                    "message": f"Batch {batch_size}x: pp1024/tg{request.generation_length}",
+                    "current": current_test,
+                    "total": total_tests,
+                },
+            )
 
             batch_metrics = await _run_batch_test(
                 engine=engine,
@@ -863,13 +1051,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             await _send_event(run, {"type": "result", "data": result})
 
         # Phase 5: Unload benchmark model
-        await _send_event(run, {
-            "type": "progress",
-            "phase": "cleanup",
-            "message": f"Unloading {request.model_id}...",
-            "current": total_tests,
-            "total": total_tests,
-        })
+        await _send_event(
+            run,
+            {
+                "type": "progress",
+                "phase": "cleanup",
+                "message": f"Unloading {request.model_id}...",
+                "current": total_tests,
+                "total": total_tests,
+            },
+        )
         try:
             await engine_pool._unload_engine(request.model_id)
             logger.info(f"Benchmark: unloaded {request.model_id} after benchmark")
@@ -879,37 +1070,74 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Done
         overall_duration = time.perf_counter() - overall_start
         run.status = "completed"
-        await _send_event(run, {
-            "type": "done",
-            "summary": {
-                "model_id": request.model_id,
-                "total_time": round(overall_duration, 1),
-                "total_tests": total_tests,
+        await _send_event(
+            run,
+            {
+                "type": "done",
+                "summary": {
+                    "model_id": request.model_id,
+                    "total_time": round(overall_duration, 1),
+                    "total_tests": total_tests,
+                },
             },
-        })
+        )
+
+        _append_or_update_perf_result(run)
+
+        if not request.upload_to_omlx:
+            upload_done = {
+                "owner_hash": None,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": True,
+                "reason": "not_requested",
+            }
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "not_requested"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_done",
+                    "data": upload_done,
+                },
+            )
+            _append_or_update_perf_result(run)
+            return
 
         # Upload results to omlx.ai (failures don't affect benchmark status)
         try:
             await _upload_to_omlx_ai(run, engine_pool)
+            _append_or_update_perf_result(run)
         except Exception as e:
             logger.warning(f"Benchmark upload to omlx.ai failed: {e}")
-            await _send_event(run, {
-                "type": "upload_done",
-                "data": {
-                    "owner_hash": None,
-                    "total": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "error": str(e),
+            upload_done = {
+                "owner_hash": None,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "error": str(e),
+            }
+            run.upload_state["phase"] = "done"
+            run.upload_state["failed_count"] = 1
+            await _send_event(
+                run,
+                {
+                    "type": "upload_done",
+                    "data": upload_done,
                 },
-            })
+            )
+            _append_or_update_perf_result(run)
 
     except asyncio.CancelledError:
         run.status = "cancelled"
-        await _send_event(run, {
-            "type": "error",
-            "message": "Benchmark cancelled by user",
-        })
+        await _send_event(
+            run,
+            {
+                "type": "error",
+                "message": "Benchmark cancelled by user",
+            },
+        )
         # Try to unload the model on cancellation
         try:
             await engine_pool._unload_engine(request.model_id)
@@ -920,10 +1148,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         logger.error(f"Benchmark error: {e}", exc_info=True)
         run.status = "error"
         run.error_message = str(e)
-        await _send_event(run, {
-            "type": "error",
-            "message": str(e),
-        })
+        await _send_event(
+            run,
+            {
+                "type": "error",
+                "message": str(e),
+            },
+        )
         # Try to unload the model on error
         try:
             await engine_pool._unload_engine(request.model_id)

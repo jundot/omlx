@@ -69,6 +69,12 @@
                                     <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
                                     {{ t('models.manager.refresh') }}
                                 </button>
+                                <button @click="checkAllModelUpdates()"
+                                        class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
+                                               hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5">
+                                    <i data-lucide="cloud" class="w-3.5 h-3.5"></i>
+                                    {{ t('models.manager.check_updates') }}
+                                </button>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <template x-if="hfModels.length === 0">
@@ -81,11 +87,38 @@
                                     <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
                                         <div class="min-w-0 flex-1 flex items-center gap-2">
                                             <span class="text-sm font-medium text-neutral-900 truncate" x-text="model.name"></span>
+                                            <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded border"
+                                                  :class="{
+                                                      'bg-blue-50 text-blue-700 border-blue-200': model.catalog?.source === 'hf',
+                                                      'bg-purple-50 text-purple-700 border-purple-200': model.catalog?.source === 'modelscope',
+                                                      'bg-neutral-100 text-neutral-600 border-neutral-200': model.catalog?.source === 'local' || !model.catalog?.source,
+                                                  }"
+                                                  x-text="modelSourceLabel(model)"></span>
+                                            <span x-show="model.catalog?.repo_id" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded border"
+                                                  :class="{
+                                                      'bg-green-50 text-green-700 border-green-200': model.catalog?.update_status === 'current',
+                                                      'bg-amber-50 text-amber-700 border-amber-200': model.catalog?.update_status === 'update_available',
+                                                      'bg-red-50 text-red-700 border-red-200': model.catalog?.update_status === 'check_failed',
+                                                      'bg-neutral-100 text-neutral-500 border-neutral-200': !model.catalog?.update_status || model.catalog?.update_status === 'not_checked',
+                                                  }"
+                                                  x-text="modelUpdateLabel(model)"></span>
                                             <template x-if="models.find(m => m.id === model.name)?.settings?.model_alias">
                                                 <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                       x-text="models.find(m => m.id === model.name)?.settings?.model_alias"></span>
                                             </template>
                                             <span class="text-xs text-neutral-400 flex-shrink-0" x-text="'(' + model.size_formatted + ')'"></span>
+                                            <template x-for="tag in modelTags(model)" :key="tag">
+                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-200 truncate max-w-[96px]"
+                                                      x-text="tag"></span>
+                                            </template>
+                                            <a x-show="model.catalog?.repo_id" x-cloak
+                                               :href="model.catalog?.source === 'hf' ? 'https://huggingface.co/' + model.catalog.repo_id : 'https://modelscope.cn/models/' + model.catalog.repo_id"
+                                               target="_blank"
+                                               class="p-1 text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100 rounded-md transition-all"
+                                               title="Open source repository">
+                                                <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                                            </a>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(models.find(m => m.id === model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
@@ -96,6 +129,41 @@
                                             </button>
                                         </div>
                                         <div class="flex items-center gap-2 ml-4 shrink-0">
+                                            <div x-show="modelAccuracyLabel(model) || modelPerfPp(model) || modelPerfTg(model)" x-cloak
+                                                 class="flex items-center gap-1.5 mr-1 text-xs tabular-nums">
+                                                <span x-show="modelAccuracyLabel(model)" x-cloak
+                                                      class="px-1.5 py-0.5 rounded-md bg-green-50 text-green-700 font-medium"
+                                                      :title="modelAccuracyTooltip(model)"
+                                                      x-text="modelAccuracyLabel(model)"></span>
+                                                <span x-show="modelPerfPp(model)" x-cloak
+                                                      class="px-1.5 py-0.5 rounded-md bg-neutral-100 text-neutral-600 border border-neutral-200"
+                                                      :title="modelPerfTooltip(model, 'pp')">
+                                                    <span aria-hidden="true">↓</span>
+                                                    <span x-text="modelPerfPp(model)"></span>
+                                                </span>
+                                                <span x-show="modelPerfTg(model)" x-cloak
+                                                      class="px-1.5 py-0.5 rounded-md bg-neutral-100 text-neutral-600 border border-neutral-200"
+                                                      :title="modelPerfTooltip(model, 'tg')">
+                                                    <span aria-hidden="true">↑</span>
+                                                    <span x-text="modelPerfTg(model)"></span>
+                                                </span>
+                                            </div>
+                                            <button x-show="model.catalog?.repo_id" x-cloak
+                                                    @click="checkModelUpdate(model)"
+                                                    class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+                                                    title="Check remote update">
+                                                <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                                            </button>
+                                            <button @click="openModelSettingsByName(model.name)"
+                                                    class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    title="Model settings">
+                                                <i data-lucide="settings" class="w-4 h-4"></i>
+                                            </button>
+                                            <button @click="benchModel(model.name)"
+                                                    class="p-1.5 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    title="Benchmark model">
+                                                <i data-lucide="gauge" class="w-4 h-4"></i>
+                                            </button>
                                             <template x-if="hfDeleteConfirm !== model.name">
                                                 <button @click="hfDeleteConfirm = model.name"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"

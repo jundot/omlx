@@ -570,12 +570,14 @@ class HFDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        catalog: object | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
+        self._catalog = catalog
         self._cancelled: set[str] = set()
         self._download_sem = asyncio.Semaphore(1)
 
@@ -780,6 +782,8 @@ class HFDownloader:
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
+                model_revision = ""
+                model_updated_at = ""
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -790,6 +794,9 @@ class HFDownloader:
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
+                    model_revision = getattr(model_info, "sha", "") or ""
+                    last_modified = getattr(model_info, "last_modified", None)
+                    model_updated_at = last_modified.isoformat() if last_modified else ""
                     if model_info.safetensors and model_info.safetensors.get(
                         "parameters"
                     ):
@@ -859,6 +866,22 @@ class HFDownloader:
                     target_dir
                 )
                 task.completed_at = time.time()
+
+                if self._catalog is not None:
+                    try:
+                        self._catalog.record_download(
+                            model_id=target_dir.name,
+                            path=target_dir,
+                            source="hf",
+                            repo_id=task.repo_id,
+                            local_revision=model_revision,
+                            remote_revision=model_revision,
+                            remote_updated_at=model_updated_at,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to record HF provenance for {task.repo_id}: {e}"
+                        )
 
                 logger.info(
                     f"Download completed: {task.repo_id} -> {target_dir} "

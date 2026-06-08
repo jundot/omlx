@@ -28,6 +28,9 @@ class QuestionResult:
     question_text: str = ""
     raw_response: str = ""
     category: Optional[str] = None
+    pass_mode: Optional[str] = None
+    failure_type: Optional[str] = None
+    error: str = ""
 
 
 @dataclass
@@ -42,6 +45,23 @@ class BenchmarkResult:
     question_results: list[QuestionResult] = field(default_factory=list)
     category_scores: Optional[dict[str, float]] = None
     thinking_used: bool = False
+    benchmark_variant: Optional[str] = None
+
+
+@dataclass
+class EvalGenerated:
+    """Generated output for one indexed benchmark item."""
+
+    index: int
+    item: dict
+    response_text: str
+    prompt_text: str
+    raw_text: str
+    generation_seconds: float
+
+
+class _EvalProgressCancelledError(Exception):
+    """Internal bridge so worker-task cancellation reaches the caller."""
 
 
 class BaseBenchmark(ABC):
@@ -84,6 +104,17 @@ class BaseBenchmark(ABC):
     def get_max_tokens(self) -> int:
         """Max tokens to generate per question. Override for longer answers."""
         return 128
+
+    def resolve_max_tokens(self, engine: Any, enable_thinking: bool = False) -> int:
+        """Resolve benchmark-controlled generation budget for one question."""
+        max_tokens = self.get_max_tokens()
+        # Harmony models (gpt_oss) use analysis + final channels;
+        # analysis can consume the entire budget before final is emitted
+        if getattr(engine, "model_type", None) == "gpt_oss":
+            return max(max_tokens * 4, 8192)
+        if enable_thinking:
+            return min(max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS)
+        return max_tokens
 
     def get_category(self, item: dict) -> Optional[str]:
         """Return category/subject for per-category scoring. None if N/A."""
@@ -167,10 +198,15 @@ class BaseBenchmark(ABC):
     @staticmethod
     def _strip_think_tags(text: str) -> str:
         """Remove <think>...</think> blocks from model output."""
+        if "<think>" not in text:
+            return text
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     async def _eval_single(
-        self, engine: Any, item: dict, index: int,
+        self,
+        engine: Any,
+        item: dict,
+        index: int,
         sampling_kwargs: Optional[dict] = None,
         enable_thinking: bool = False,
     ) -> tuple[int, dict, str, str, str]:
@@ -182,20 +218,11 @@ class BaseBenchmark(ABC):
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
-        # Force benchmark-controlled params (override model settings)
-        max_tokens = self.get_max_tokens()
-        # Harmony models (gpt_oss) use analysis + final channels;
-        # analysis can consume the entire budget before final is emitted
-        if getattr(engine, "model_type", None) == "gpt_oss":
-            max_tokens = max(max_tokens * 4, 8192)
-        elif enable_thinking:
-            max_tokens = min(
-                max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
-            )
-        kwargs["max_tokens"] = max_tokens
-        kwargs["temperature"] = 0.0
-        kwargs["presence_penalty"] = 0.0
-        kwargs["repetition_penalty"] = 1.0
+        # Benchmark owns answer budget; sampling policy is supplied by caller.
+        kwargs["max_tokens"] = self.resolve_max_tokens(engine, enable_thinking)
+        kwargs.setdefault("temperature", 0.0)
+        kwargs.setdefault("presence_penalty", 0.0)
+        kwargs.setdefault("repetition_penalty", 1.0)
         # Merge enable_thinking into any existing chat_template_kwargs
         ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
         ct_kwargs["enable_thinking"] = enable_thinking
@@ -211,6 +238,157 @@ class BaseBenchmark(ABC):
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
             return index, item, "", prompt_text, ""
+
+    async def _eval_single_timed(
+        self,
+        engine: Any,
+        item: dict,
+        index: int,
+        sampling_kwargs: Optional[dict] = None,
+        enable_thinking: bool = False,
+    ) -> EvalGenerated:
+        start_time = time.time()
+        idx, eval_item, response_text, prompt_text, raw_text = await self._eval_single(
+            engine, item, index, sampling_kwargs, enable_thinking
+        )
+        return EvalGenerated(
+            index=idx,
+            item=eval_item,
+            response_text=response_text,
+            prompt_text=prompt_text,
+            raw_text=raw_text,
+            generation_seconds=time.time() - start_time,
+        )
+
+    async def _run_probe_batch(
+        self,
+        engine: Any,
+        indexed_items: list[tuple[int, dict]],
+        sampling_kwargs: Optional[dict],
+        enable_thinking: bool,
+    ) -> list[EvalGenerated]:
+        return await asyncio.gather(
+            *[
+                self._eval_single_timed(
+                    engine, item, index, sampling_kwargs, enable_thinking
+                )
+                for index, item in indexed_items
+            ]
+        )
+
+    async def _run_refill_queue(
+        self,
+        engine: Any,
+        indexed_items: list[tuple[int, dict]],
+        *,
+        batch_size: int,
+        sampling_kwargs: Optional[dict],
+        enable_thinking: bool,
+        score_generated: Callable[[EvalGenerated], QuestionResult],
+        on_progress: Optional[Callable[[int, int], Any]],
+        total_items: int,
+        completed: int = 0,
+        score_concurrency: int = 1,
+    ) -> tuple[list[QuestionResult], int]:
+        if not indexed_items:
+            return [], completed
+
+        max_in_flight = max(1, int(batch_size or 1))
+        scorer_count = max(1, int(score_concurrency or 1))
+        pending: asyncio.Queue[tuple[int, dict] | None] = asyncio.Queue()
+        generated: asyncio.Queue[EvalGenerated | None] = asyncio.Queue(
+            maxsize=max_in_flight * 2
+        )
+        scored: list[tuple[int, QuestionResult]] = []
+
+        for index, item in indexed_items:
+            pending.put_nowait((index, item))
+        for _ in range(max_in_flight):
+            pending.put_nowait(None)
+
+        async def generation_worker() -> None:
+            while True:
+                job = await pending.get()
+                try:
+                    if job is None:
+                        return
+                    index, item = job
+                    output = await self._eval_single_timed(
+                        engine, item, index, sampling_kwargs, enable_thinking
+                    )
+                    await generated.put(output)
+                finally:
+                    pending.task_done()
+
+        async def generation_coordinator() -> None:
+            await asyncio.gather(*[generation_worker() for _ in range(max_in_flight)])
+            for _ in range(scorer_count):
+                await generated.put(None)
+
+        async def scoring_worker() -> None:
+            nonlocal completed
+            while True:
+                output = await generated.get()
+                try:
+                    if output is None:
+                        return
+                    # Code benchmarks run subprocesses during scoring. Keep that
+                    # off the event loop so generation slots can refill promptly.
+                    question_result = await asyncio.to_thread(score_generated, output)
+                    scored.append((output.index, question_result))
+                    completed += 1
+                    if on_progress:
+                        try:
+                            await on_progress(completed, total_items)
+                        except asyncio.CancelledError as exc:
+                            raise _EvalProgressCancelledError from exc
+                finally:
+                    generated.task_done()
+
+        tasks = [
+            asyncio.create_task(generation_coordinator()),
+            *[asyncio.create_task(scoring_worker()) for _ in range(scorer_count)],
+        ]
+        try:
+            done, pending_tasks = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks)
+        except _EvalProgressCancelledError as exc:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise asyncio.CancelledError from exc.__cause__
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        scored.sort(key=lambda result: result[0])
+        return [result for _, result in scored], completed
+
+    def _score_generic_generated(self, generated: EvalGenerated) -> QuestionResult:
+        predicted = self.extract_answer(generated.response_text, generated.item)
+        is_correct = self.check_answer(predicted, generated.item)
+        cat = self.get_category(generated.item)
+        q_id = generated.item.get("id", str(generated.index))
+        expected = generated.item.get("answer", "")
+        return QuestionResult(
+            question_id=str(q_id),
+            correct=is_correct,
+            expected=str(expected),
+            predicted=predicted,
+            time_seconds=generated.generation_seconds,
+            question_text=generated.prompt_text,
+            raw_response=generated.response_text,
+            category=cat,
+        )
 
     async def run(
         self,
@@ -235,86 +413,72 @@ class BaseBenchmark(ABC):
         Returns:
             BenchmarkResult with accuracy and per-question details.
         """
-        results: list[QuestionResult] = []
-        correct = 0
-        category_correct: dict[str, int] = {}
-        category_total: dict[str, int] = {}
         start_time = time.time()
         completed = 0
 
         thinking_used = enable_thinking
-        auto_switched = False
+        results: list[QuestionResult] = []
 
-        # Process in batches
-        for batch_start in range(0, len(items), batch_size):
-            batch_end = min(batch_start + batch_size, len(items))
-            batch = items[batch_start:batch_end]
-            batch_start_time = time.time()
+        indexed_items = list(enumerate(items))
+        remaining_items = indexed_items
 
-            # Launch concurrent requests
-            tasks = [
-                self._eval_single(
-                    engine, item, batch_start + j, sampling_kwargs, thinking_used
+        # Keep current first-batch thinking auto-detection behavior before the
+        # queue starts. If thinking is detected, discard and rerun the probe.
+        if indexed_items and not thinking_used:
+            probe_size = min(max(1, int(batch_size or 1)), len(indexed_items))
+            probe_items = indexed_items[:probe_size]
+            probe_results = await self._run_probe_batch(
+                engine, probe_items, sampling_kwargs, False
+            )
+            has_think_tags = any(
+                "<think>" in result.raw_text for result in probe_results
+            )
+            if has_think_tags:
+                logger.warning(
+                    f"{self.name}: model outputs <think> tags with "
+                    "enable_thinking=False, auto-switching to thinking mode"
                 )
-                for j, item in enumerate(batch)
-            ]
-            batch_results = await asyncio.gather(*tasks)
-
-            # Auto-detection: check first batch for <think> tags
-            if not thinking_used and not auto_switched and batch_start == 0:
-                auto_switched = True
-                has_think_tags = any(
-                    "<think>" in raw for _, _, _, _, raw in batch_results
-                )
-                if has_think_tags:
-                    logger.warning(
-                        f"{self.name}: model outputs <think> tags with "
-                        "enable_thinking=False, auto-switching to thinking mode"
-                    )
-                    thinking_used = True
-                    # Re-run first batch with increased token budget
-                    tasks = [
-                        self._eval_single(
-                            engine, item, batch_start + j, sampling_kwargs, True
+                thinking_used = True
+            else:
+                for question_result in await asyncio.gather(
+                    *[
+                        asyncio.to_thread(self._score_generic_generated, result)
+                        for result in sorted(
+                            probe_results, key=lambda output: output.index
                         )
-                        for j, item in enumerate(batch)
                     ]
-                    batch_results = await asyncio.gather(*tasks)
+                ):
+                    results.append(question_result)
+                    completed += 1
+                    if on_progress:
+                        await on_progress(completed, len(items))
+                remaining_items = indexed_items[probe_size:]
 
-            batch_elapsed = time.time() - batch_start_time
+        queued_results, completed = await self._run_refill_queue(
+            engine,
+            remaining_items,
+            batch_size=batch_size,
+            sampling_kwargs=sampling_kwargs,
+            enable_thinking=thinking_used,
+            score_generated=self._score_generic_generated,
+            on_progress=on_progress,
+            total_items=len(items),
+            completed=completed,
+        )
+        results.extend(queued_results)
 
-            # Process results in order
-            for idx, item, response_text, prompt_text, _raw in sorted(batch_results, key=lambda x: x[0]):
-                predicted = self.extract_answer(response_text, item)
-                is_correct = self.check_answer(predicted, item)
-
-                if is_correct:
-                    correct += 1
-
-                cat = self.get_category(item)
-                if cat is not None:
-                    category_total[cat] = category_total.get(cat, 0) + 1
-                    if is_correct:
-                        category_correct[cat] = category_correct.get(cat, 0) + 1
-
-                q_id = item.get("id", str(idx))
-                expected = item.get("answer", "")
-                results.append(
-                    QuestionResult(
-                        question_id=str(q_id),
-                        correct=is_correct,
-                        expected=str(expected),
-                        predicted=predicted,
-                        time_seconds=batch_elapsed / len(batch),
-                        question_text=prompt_text,
-                        raw_response=response_text,
-                        category=cat,
-                    )
+        correct = sum(1 for result in results if result.correct)
+        category_correct: dict[str, int] = {}
+        category_total: dict[str, int] = {}
+        for result in results:
+            if result.category is not None:
+                category_total[result.category] = (
+                    category_total.get(result.category, 0) + 1
                 )
-
-            completed += len(batch)
-            if on_progress:
-                await on_progress(completed, len(items))
+                if result.correct:
+                    category_correct[result.category] = (
+                        category_correct.get(result.category, 0) + 1
+                    )
 
         total_time = time.time() - start_time
         total = len(items)
