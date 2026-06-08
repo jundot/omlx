@@ -2399,6 +2399,118 @@ class TestCacheCorruptionRecovery:
         assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
 
 
+class TestGenerationOverflowRecovery:
+    """Tests for MLX __next_prime overflow recovery."""
+
+    def _make_scheduler(self, mock_model, mock_tokenizer, count: int = 2):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = OverflowError(
+            "__next_prime overflow"
+        )
+        for i in range(count):
+            request = Request(
+                request_id=f"req-overflow-{i}",
+                prompt=f"prompt {i}",
+                sampling_params=SamplingParams(max_tokens=4),
+                prompt_token_ids=[1, 2, 3],
+                num_prompt_tokens=3,
+                status=RequestStatus.RUNNING,
+                batch_uid=i,
+                remaining_tokens=[1, 2, 3],
+            )
+            request.output_token_ids = [10, 11]
+            request.output_text = "partial"
+            request.num_computed_tokens = 2
+            scheduler.running[request.request_id] = request
+            scheduler.requests[request.request_id] = request
+            scheduler.request_id_to_uid[request.request_id] = i
+            scheduler.uid_to_request_id[i] = request.request_id
+        return scheduler
+
+    def test_generation_overflow_detection(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        assert scheduler._is_generation_overflow_error(
+            OverflowError("__next_prime overflow")
+        )
+        assert not scheduler._is_generation_overflow_error(
+            OverflowError("integer conversion overflow")
+        )
+        assert not scheduler._is_generation_overflow_error(
+            RuntimeError("__next_prime overflow")
+        )
+
+    def test_generation_overflow_reschedules_for_serial_retry(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer, count=3)
+        scheduler.config.max_num_seqs = 8
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            output = scheduler.step()
+
+        assert output.outputs == []
+        assert output.has_work is True
+        assert scheduler.batch_generator is None
+        assert scheduler.running == {}
+        assert list(scheduler.request_id_to_uid) == []
+        waiting_ids = [request.request_id for request in scheduler.waiting]
+        assert waiting_ids == [
+            "req-overflow-0",
+            "req-overflow-1",
+            "req-overflow-2",
+        ]
+        for request in scheduler.waiting:
+            assert request.generation_overflow_retries == 1
+            assert request.output_token_ids == []
+            assert request.output_text == ""
+            assert request.num_computed_tokens == 0
+        assert scheduler._effective_max_num_seqs() == 1
+
+    def test_generation_overflow_fails_after_serial_retry(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer, count=1)
+        request = next(iter(scheduler.running.values()))
+        request.generation_overflow_retries = 1
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            output = scheduler.step()
+
+        assert len(output.outputs) == 1
+        error_output = output.outputs[0]
+        assert error_output.request_id == request.request_id
+        assert error_output.finished is True
+        assert error_output.finish_reason == "error"
+        assert "Generation overflow not recoverable" in error_output.error
+        assert request.request_id in output.finished_request_ids
+        assert scheduler.running == {}
+        assert scheduler.waiting == deque()
+        assert request.request_id not in scheduler.requests
+        assert scheduler.has_requests() is False
+
+    def test_unrelated_overflow_still_raises(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = OverflowError(
+            "integer conversion overflow"
+        )
+        request = Request(
+            request_id="req-other-overflow",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        with pytest.raises(OverflowError, match="integer conversion overflow"):
+            scheduler.step()
+
+
 class TestStoreCacheAdmissionBackpressure:
     """Tests for store-cache admission backpressure (#1684)."""
 

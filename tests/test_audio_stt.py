@@ -109,17 +109,14 @@ class TestSTTEngineLanguageForwarding:
 
     @pytest.mark.asyncio
     async def test_transcribe_maps_iso_language_and_forwards_kwargs(self, tmp_path):
-        """OpenAI ISO language codes reach mlx-audio as lowercase full-names.
-
-        Lowercase is what both backends accept: Whisper's TO_LANGUAGE_CODE
-        normalizes "chinese" -> "zh" for the language token, and Qwen3-ASR
-        lowercases its supported-language list before matching.
-        """
+        """Qwen3-ASR-style models receive lowercase full language names."""
         from omlx.engine.stt import STTEngine
 
         generate_call = {}
 
         class FakeModel:
+            config = SimpleNamespace(support_languages=["Chinese", "English"])
+
             def generate(self, audio_path, **kwargs):
                 generate_call["audio_path"] = audio_path
                 generate_call["kwargs"] = kwargs
@@ -148,6 +145,38 @@ class TestSTTEngineLanguageForwarding:
             "temperature": 0.0,
         }
         assert result["language"] == "zh"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_preserves_iso_language_for_code_backends(self, tmp_path):
+        """Cohere-style models receive the original ISO language code."""
+        from omlx.engine.stt import STTEngine
+
+        generate_call = {}
+
+        class FakeModel:
+            config = SimpleNamespace(supported_languages=["en", "it"])
+
+            def generate(self, audio_path, **kwargs):
+                generate_call["audio_path"] = audio_path
+                generate_call["kwargs"] = kwargs
+                return SimpleNamespace(
+                    text="ciao",
+                    language="it",
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("cohere-transcribe")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(str(audio_path), language="it")
+
+        assert generate_call["audio_path"] == str(audio_path)
+        assert generate_call["kwargs"] == {"language": "it"}
+        assert result["language"] == "it"
 
     @pytest.mark.asyncio
     async def test_transcribe_passes_unknown_language_through(self, tmp_path):

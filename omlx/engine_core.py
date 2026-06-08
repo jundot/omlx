@@ -15,6 +15,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 import uuid
 from contextlib import suppress
@@ -114,6 +115,36 @@ class EngineConfig:
     step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
+    # Decode burst: run several scheduler.step() calls per run_in_executor
+    # hand-off instead of one. Each decode token otherwise bounces back to the
+    # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the
+    # main thread; bursting keeps the MLX thread holding the GIL continuously.
+    # scheduler.step() services aborts/admission/finish every step, so
+    # correctness is unchanged and memory is identical (same tokens decoded,
+    # same KV cache; only a small list of K SchedulerOutputs is held per
+    # burst). The budget is a TIME ceiling so the event-loop pause (and thus
+    # new-request admission / abort / HTTP latency) is bounded consistently
+    # across hardware, and a slow prefill-chunk step ends the burst.
+    #
+    # Adaptive: with a single active request (the common local/single-user
+    # case) there is no concurrent request to stay responsive to, so we burst
+    # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
+    # tight decode_burst_budget_s to keep admission/abort latency low.
+    # max_steps is a safety cap (bounds the host-side output list), NOT a
+    # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
+    decode_burst_max_steps: int = field(
+        default_factory=lambda: int(os.environ.get("OMLX_DECODE_BURST_MAX_STEPS", "64"))
+    )
+    decode_burst_budget_single_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S", "0.1")
+        )
+    )
+    decode_burst_budget_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_S", "0.03")
+        )
+    )
 
 
 class EngineCore:
@@ -239,6 +270,51 @@ class EngineCore:
         else:
             loop.call_soon_threadsafe(event.set)
 
+    def _step_burst(self) -> list:
+        """Run scheduler.step() several times in one executor hand-off.
+
+        Each decode token otherwise bounces back to the event loop, which
+        ping-pongs the GIL with the asyncio loop + uvicorn on the main thread
+        (~1ms/token of contention). Chaining a few steps lets the MLX thread
+        hold the GIL continuously (in-process sync loop hits ~80 tok/s vs ~74
+        through the per-token async hand-off).
+
+        scheduler.step() services aborts/admission/finish every step, so
+        correctness is unchanged; the only cost is event-loop responsiveness,
+        bounded by decode_burst_budget_s. Stops early when no work remains, a
+        prefill eviction needs the (async) callback, or the budget elapses —
+        the budget also ends the burst when a slow prefill-chunk step lands.
+
+        Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
+        """
+        max_steps = self.config.decode_burst_max_steps
+        outputs = [self.scheduler.step()]
+        if max_steps <= 1:
+            return outputs
+        # Adaptive budget: single active request -> aggressive (nothing else to
+        # stay responsive to); concurrent -> tight to keep admission/abort low.
+        running = getattr(self.scheduler, "running", None)
+        single = running is None or len(running) <= 1
+        budget = (
+            self.config.decode_burst_budget_single_s
+            if single
+            else self.config.decode_burst_budget_s
+        )
+        if budget <= 0:
+            return outputs
+        deadline = time.monotonic() + budget
+        while len(outputs) < max_steps:
+            last = outputs[-1]
+            if (
+                not last.has_work  # throttled/idle: stop and let the loop wait
+                or not self.scheduler.has_requests()
+                or last.prefill_eviction_request is not None
+                or time.monotonic() >= deadline
+            ):
+                break
+            outputs.append(self.scheduler.step())
+        return outputs
+
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
@@ -256,18 +332,32 @@ class EngineCore:
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    output = await loop.run_in_executor(
-                        self._mlx_executor, self.scheduler.step
+                    step_outputs = await loop.run_in_executor(
+                        self._mlx_executor, self._step_burst
                     )
-                    self._steps_executed += 1
-                    eviction_request = output.prefill_eviction_request
+                    self._steps_executed += len(step_outputs)
 
-                    # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
+                    # Distribute every step's outputs to collectors (one or
+                    # more decode tokens per burst). collector.put() runs on the
+                    # loop thread, keeping the asyncio.Event signalling
+                    # thread-safe and per-token streaming intact.
+                    collectors = self._output_collectors
+                    states = self._stream_states
+                    events = self._finished_events
+                    eviction_request = None
+                    distributed = False
+
+                    for output in step_outputs:
+                        if (
+                            eviction_request is None
+                            and output.prefill_eviction_request is not None
+                        ):
+                            eviction_request = output.prefill_eviction_request
+
+                        outputs = output.outputs
+                        if not outputs:
+                            continue
+                        distributed = True
 
                         for req_output in outputs:
                             rid = req_output.request_id
@@ -293,6 +383,7 @@ class EngineCore:
                                 # Note: cleanup is handled by stream_outputs() finally block
                                 # _delayed_cleanup() was causing double cleanup race condition
 
+                    if distributed:
                         # Always yield to prevent event loop starvation.
                         # Without this, orphaned requests (client disconnected but
                         # request still in scheduler) block the entire event loop,
@@ -325,7 +416,7 @@ class EngineCore:
                                 eviction_request.request_id,
                             )
                         continue
-                    if not output.has_work:
+                    if not step_outputs[-1].has_work:
                         # Requests may be queued while scheduler admission is
                         # intentionally throttled by async cache cleanup. Avoid
                         # spinning the engine loop, but still let new requests

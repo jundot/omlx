@@ -359,6 +359,30 @@ class TestSubKeyCRUD:
         finally:
             _restore_getter(original)
 
+    def test_delete_sub_key_lone_surrogate_returns_404(self):
+        """Regression for #1717: a lone-surrogate key must 404, not 500.
+
+        delete_sub_key compares request.key without a validate_api_key
+        gate, so the comparison itself must tolerate any str json.loads
+        can produce, including lone surrogates from escape sequences.
+        """
+        import json
+
+        from fastapi import HTTPException
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="real-sub-key")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key=json.loads('"\\ud800abcd"'))
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 404
+            assert len(mock_settings.auth.sub_keys) == 1
+        finally:
+            _restore_getter(original)
+
     def test_create_sub_key_rollback_on_save_failure(self):
         """Sub key should be rolled back if save() fails."""
         from fastapi import HTTPException

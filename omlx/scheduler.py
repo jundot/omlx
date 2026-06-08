@@ -792,6 +792,41 @@ def _cache_base_sizes(caches: list[Any]) -> int:
         return 0
 
 
+def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
+    """Collect concrete backing arrays from cache objects, not state slices."""
+    arrays: list[mx.array] = []
+
+    if isinstance(cache_obj, mx.array):
+        return [cache_obj]
+
+    sub_caches = getattr(cache_obj, "caches", None)
+    if isinstance(sub_caches, (list, tuple)):
+        for sub_cache in sub_caches:
+            arrays.extend(_collect_cache_storage_arrays(sub_cache))
+
+    array_cache = getattr(cache_obj, "cache", None)
+    if isinstance(array_cache, (list, tuple)):
+        for item in array_cache:
+            arrays.extend(_collect_cache_storage_arrays(item))
+
+    for attr in ("keys", "values", "left_padding", "lengths"):
+        value = getattr(cache_obj, attr, None)
+        if isinstance(value, mx.array):
+            arrays.append(value)
+
+    return arrays
+
+
+def _materialize_cache_storage(cache_list: list[Any]) -> None:
+    """Force restored cache backing arrays concrete before decode begins."""
+    arrays: list[mx.array] = []
+    for cache_obj in cache_list:
+        arrays.extend(_collect_cache_storage_arrays(cache_obj))
+    if arrays:
+        with _mx_buffer_access_lock:
+            mx.eval(*arrays)
+
+
 def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> None:
     """Seed zero mRoPE delta after clearing text-only cached-prefix state."""
     if getattr(request, "cached_tokens", 0) <= 0:
@@ -986,6 +1021,8 @@ class Scheduler:
     """
 
     _DEFERRED_CLEAR_DELAY: int = 8
+    _GENERATION_OVERFLOW_PATTERN = "__next_prime overflow"
+    _MAX_GENERATION_OVERFLOW_RETRIES = 1
 
     def __init__(
         self,
@@ -1048,6 +1085,7 @@ class Scheduler:
         self._prefill_states: dict[str, _PrefillState] = {}
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
+        self._generation_overflow_recovery_ids: set[str] = set()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -2546,6 +2584,10 @@ class Scheduler:
             prompt_cache
         ):
             self._apply_turboquant_kv_convert(prompt_cache)
+
+        if getattr(request, "cached_tokens", 0) > 0:
+            with mx.stream(self._stream):
+                _materialize_cache_storage(prompt_cache)
 
         return prompt_cache, last_token
 
@@ -5550,6 +5592,22 @@ class Scheduler:
             or self._deferred_clear_at is not None
         )
 
+    def _refresh_generation_overflow_recovery_ids(self) -> None:
+        """Drop serial-retry markers once the affected requests leave the scheduler."""
+        if not self._generation_overflow_recovery_ids:
+            return
+        active_ids = set(self.running)
+        active_ids.update(request.request_id for request in self.waiting)
+        active_ids.update(request.request_id for request in self.prefilling)
+        self._generation_overflow_recovery_ids.intersection_update(active_ids)
+
+    def _effective_max_num_seqs(self) -> int:
+        """Current admission cap, narrowed during generation-overflow retry."""
+        self._refresh_generation_overflow_recovery_ids()
+        if self._generation_overflow_recovery_ids:
+            return 1
+        return max(1, self.config.max_num_seqs)
+
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
 
@@ -5621,6 +5679,7 @@ class Scheduler:
             uid = self.request_id_to_uid.pop(rid, None)
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
+        self._generation_overflow_recovery_ids.difference_update(failed_ids)
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -5643,6 +5702,10 @@ class Scheduler:
     def get_num_running(self) -> int:
         """Get number of running requests."""
         return len(self.running)
+
+    def _num_admitted_requests(self) -> int:
+        """Return requests already occupying scheduler capacity."""
+        return len(self.running) + len(self.prefilling)
 
     def _preflight_memory_check(
         self, request: "Request"
@@ -5818,15 +5881,19 @@ class Scheduler:
         # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
         batch_specprefill_status: bool | None = None
 
-        while self.waiting and len(self.running) < self.config.max_num_seqs:
+        while (
+            self.waiting
+            and self._num_admitted_requests() < self._effective_max_num_seqs()
+        ):
             # Admission pause: set by ProcessMemoryEnforcer when phys
             # crosses soft_threshold. New prefills wait; in-flight requests
-            # continue. First request always passes (self.running is empty)
+            # continue. First request always passes (no admitted work yet)
             # so admission can recover by completing the current generation.
-            if self._admission_paused and self.running:
+            admitted = self._num_admitted_requests()
+            if self._admission_paused and admitted:
                 logger.debug(
-                    "Admission paused by memory pressure, %d running",
-                    len(self.running),
+                    "Admission paused by memory pressure, %d admitted",
+                    admitted,
                 )
                 break
 
@@ -5853,23 +5920,23 @@ class Scheduler:
                 )
                 break
 
-            # Generation memory guard: when requests are already running,
+            # Generation memory guard: when requests are already admitted,
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
-            # First request always passes (self.running is empty).
+            # First request always passes (no admitted work yet).
             if (
                 self._prefill_memory_guard
                 and self._memory_limit_bytes > 0
-                and self.running
+                and admitted
             ):
                 current = max(mx.get_active_memory(), get_phys_footprint())
                 if current > self._memory_limit_bytes:
                     logger.debug(
                         "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
+                        "(%s > %s), %d admitted",
                         current,
                         self._memory_limit_bytes,
-                        len(self.running),
+                        admitted,
                     )
                     break
 
@@ -7074,6 +7141,13 @@ class Scheduler:
         """Check if an error indicates cache corruption."""
         return is_cache_corruption_error(error)
 
+    def _is_generation_overflow_error(self, error: Exception) -> bool:
+        """Check for MLX/libc++ unordered-container overflow during decode."""
+        return (
+            isinstance(error, OverflowError)
+            and self._GENERATION_OVERFLOW_PATTERN in str(error)
+        )
+
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Clear batch generator (this is the source of the corruption)
@@ -7112,6 +7186,53 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
+    def _recover_from_generation_overflow_error(self) -> None:
+        """Reset decode state after MLX __next_prime overflow."""
+        self.batch_generator = None
+        self._current_sampler_params = None
+        self._boundary_snapshot_required = None
+
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
+        if hasattr(self.model, "clear_vlm_position_state"):
+            self.model.clear_vlm_position_state()
+        if hasattr(self.model, "clear_pending_embeddings"):
+            self.model.clear_pending_embeddings()
+
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+        self._deferred_clear_at = None
+        self._request_detokenizers.clear()
+        self._output_parser_sessions.clear()
+
+        try:
+            _sync_and_clear_cache(self._stream)
+        except Exception as e:
+            logger.warning(
+                "Metal cache clear failed during generation overflow recovery: %s",
+                e,
+            )
+
+        logger.info("Generation overflow recovery completed")
+
+    def _reset_request_for_reprefill(self, request: Request) -> None:
+        """Reset request-owned decode state so it can be prefilled again."""
+        request.status = RequestStatus.WAITING
+        request.batch_uid = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request.output_token_ids = []
+        request.output_text = ""
+        request.num_computed_tokens = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        request.think_prefix_sent = False
+
     def _reschedule_running_requests(
         self, is_corruption: bool = False, max_corruption_retries: int = 3
     ) -> list[str]:
@@ -7140,28 +7261,7 @@ class Scheduler:
                         req.prompt_cache = None
                     continue
 
-            # Reset scheduling state
-            request.status = RequestStatus.WAITING
-            request.batch_uid = None
-
-            # Reset cache state
-            request.prompt_cache = None
-            request.cached_tokens = 0
-            request.remaining_tokens = request.prompt_token_ids
-            request.block_table = None
-            request.shared_prefix_blocks = 0
-
-            # Reset generation output (prevent duplicate tokens on re-prefill)
-            request.output_token_ids = []
-            request.output_text = ""
-            request.num_computed_tokens = 0
-
-            # Reset extracted cache (prevent GPU memory leak)
-            request._extracted_cache = None
-            request._model_cache_config = None
-
-            # Reset reasoning model state
-            request.think_prefix_sent = False
+            self._reset_request_for_reprefill(request)
 
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
@@ -7170,6 +7270,81 @@ class Scheduler:
 
         if count > 0:
             logger.info(f"Rescheduled {count} requests for re-prefill")
+        return failed_ids
+
+    def _reschedule_generation_overflow_requests(
+        self,
+        max_generation_overflow_retries: int = _MAX_GENERATION_OVERFLOW_RETRIES,
+    ) -> list[str]:
+        """Retry active requests serially after MLX generation overflow."""
+        retry_candidates: list[Request] = []
+        seen: set[str] = set()
+        prefilling_ids = {request.request_id for request in self.prefilling}
+        waiting_ids = {request.request_id for request in self.waiting}
+
+        def collect(request: Request | None) -> None:
+            if request is None:
+                return
+            request_id = request.request_id
+            if request_id in seen or request_id in self._inflight_store_futures:
+                return
+            if request.is_finished():
+                return
+            seen.add(request_id)
+            retry_candidates.append(request)
+
+        for request in self.running.values():
+            collect(request)
+        for request in self.prefilling:
+            collect(request)
+        for request_id, request in self.requests.items():
+            if request_id in self.running or request_id in prefilling_ids:
+                continue
+            if request_id in waiting_ids:
+                continue
+            collect(request)
+
+        collected_ids = {request.request_id for request in retry_candidates}
+        for request_id in collected_ids:
+            self.running.pop(request_id, None)
+            self._prefill_states.pop(request_id, None)
+        if collected_ids:
+            self.prefilling = deque(
+                request
+                for request in self.prefilling
+                if request.request_id not in collected_ids
+            )
+
+        failed_ids: list[str] = []
+        retryable: list[Request] = []
+        self._generation_overflow_recovery_ids.clear()
+        for request in retry_candidates:
+            request.generation_overflow_retries += 1
+            request_id = request.request_id
+            self._boundary_cache_snapshots.pop(request_id, None)
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            get_prefill_tracker().remove(request_id)
+            if request.generation_overflow_retries > max_generation_overflow_retries:
+                failed_ids.append(request_id)
+                req = self.requests.pop(request_id, None)
+                if req is not None:
+                    req._extracted_cache = None
+                    req.prompt_cache = None
+                continue
+
+            self._reset_request_for_reprefill(request)
+            retryable.append(request)
+            self._generation_overflow_recovery_ids.add(request_id)
+
+        for request in reversed(retryable):
+            self.waiting.appendleft(request)
+
+        if retryable:
+            logger.info(
+                "Rescheduled %d request(s) for serial generation-overflow retry",
+                len(retryable),
+            )
         return failed_ids
 
     # Max times a single request is requeued after a prefill memory-pressure
@@ -7436,6 +7611,37 @@ class Scheduler:
             else:
                 raise
 
+        except OverflowError as e:
+            if self._is_generation_overflow_error(e):
+                import traceback
+
+                logger.warning(
+                    "Generation overflow detected: %s; resetting decode state "
+                    "and retrying affected requests serially",
+                    e,
+                )
+                logger.debug(
+                    "Generation overflow traceback:\n%s", traceback.format_exc()
+                )
+                self._recover_from_generation_overflow_error()
+                failed_ids = self._reschedule_generation_overflow_requests()
+                for rid in failed_ids:
+                    output.outputs.append(
+                        RequestOutput(
+                            request_id=rid,
+                            finished=True,
+                            finish_reason="error",
+                            error=(
+                                "Generation overflow not recoverable after "
+                                f"serial retry: {e}"
+                            ),
+                        )
+                    )
+                    output.finished_request_ids.add(rid)
+                output.has_work = True
+            else:
+                raise
+
         except Exception as e:
             import traceback
 
@@ -7446,6 +7652,7 @@ class Scheduler:
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
+        self._refresh_generation_overflow_recovery_ids()
 
         # Periodic Metal cache cleanup
         self._step_counter += 1
@@ -7537,6 +7744,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._generation_overflow_recovery_ids.clear()
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
         # or recovery paths) without leaking Request refs through stale futures.

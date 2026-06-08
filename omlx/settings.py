@@ -98,6 +98,38 @@ def get_ssd_capacity(path: str | Path) -> int:
         return 500 * 1024**3
 
 
+# Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
+# These mirror the OMLX_DECODE_BURST_* env vars read by EngineConfig
+# (engine_core.py). "off" fully disables bursting via max_steps=1; the on-levels
+# keep the default step cap and set the single-request time budget that controls
+# how many decode steps coalesce per event-loop hand-off (higher = faster, but
+# tokens stream in larger chunks).
+BURST_DECODE_MODES: dict[str, tuple[int, float]] = {
+    "off": (1, 0.0),
+    "light": (64, 0.05),
+    "balanced": (64, 0.1),
+    "aggressive": (64, 0.2),
+}
+DEFAULT_BURST_DECODE_MODE = "balanced"
+
+
+def burst_decode_env(mode: str) -> dict[str, str]:
+    """Map a Burst Decode mode to the OMLX_DECODE_BURST_* env vars.
+
+    EngineConfig reads these at construction, so seeding them lets engines
+    loaded later pick up the mode without a server restart. An unknown mode
+    falls back to the default so a stale settings.json never disables bursting
+    unexpectedly.
+    """
+    max_steps, single_s = BURST_DECODE_MODES.get(
+        mode, BURST_DECODE_MODES[DEFAULT_BURST_DECODE_MODE]
+    )
+    return {
+        "OMLX_DECODE_BURST_MAX_STEPS": str(max_steps),
+        "OMLX_DECODE_BURST_BUDGET_SINGLE_S": str(single_s),
+    }
+
+
 @dataclass
 class ServerSettings:
     """Server configuration settings."""
@@ -109,6 +141,7 @@ class ServerSettings:
     server_aliases: list[str] = field(default_factory=list)
     sse_keepalive_mode: str = "chunk"
     auto_start_on_launch: bool = True
+    burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -117,14 +150,16 @@ class ServerSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
+        _host = data.get("host", data.get("bind_address", "127.0.0.1"))
         return cls(
-            host=data.get("host", data.get("bind_address", "127.0.0.1")),
+            host=", ".join(_host) if isinstance(_host, list) else str(_host),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
             server_aliases=data.get("server_aliases", []),
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
             auto_start_on_launch=data.get("auto_start_on_launch", True),
+            burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
         )
 
 

@@ -79,7 +79,7 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
-    from .settings import init_settings, get_settings
+    from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     process_title.set_process_title()
@@ -161,6 +161,11 @@ def serve_command(args):
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
 
+    # Seed Burst Decode env vars so EngineConfig picks up the saved mode at
+    # engine construction (no restart needed when the mode changes later).
+    for _key, _value in burst_decode_env(settings.server.burst_decode_mode).items():
+        os.environ[_key] = _value
+
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
     errors = settings.validate()
@@ -197,7 +202,9 @@ def serve_command(args):
     # Bind the socket before importing/initializing the server. Uvicorn's
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
-    print(f"Binding server at http://{settings.server.host}:{settings.server.port}")
+    bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    for h in bind_hosts:
+        print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -206,12 +213,23 @@ def serve_command(args):
     show_access_log = settings.server.log_level == "trace"
     uvicorn_config = uvicorn.Config(
         "omlx.server:app",
-        host=settings.server.host,
+        host=bind_hosts[0],
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
-    serve_socket = uvicorn_config.bind_socket()
+    # Bind a socket per host so an occupied port fails fast before model preload.
+    # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
+    serve_sockets = [uvicorn_config.bind_socket()]
+    for h in bind_hosts[1:]:
+        extra_cfg = uvicorn.Config(
+            "omlx.server:app",
+            host=h,
+            port=settings.server.port,
+            log_level=uvicorn_level,
+            access_log=show_access_log,
+        )
+        serve_sockets.append(extra_cfg.bind_socket())
 
     try:
         # Import server and config after the port is known to be available.
@@ -315,17 +333,17 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        print(
-            f"Starting server at http://{settings.server.host}:{settings.server.port}"
-        )
+        for h in bind_hosts:
+            print(f"Starting server at http://{h}:{settings.server.port}")
         try:
-            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+            uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
             pass
     finally:
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
-        serve_socket.close()
+        for sock in serve_sockets:
+            sock.close()
 
 
 def launch_command(args, extra_args: list[str] | None = None):
@@ -362,10 +380,11 @@ def launch_command(args, extra_args: list[str] | None = None):
     host = args.host or settings.server.host
     port = args.port or settings.server.port
 
-    # 0.0.0.0 is a valid bind address but not a valid connect address.
-    # Fall back to localhost so launch can reach the server regardless
-    # of which interface it was bound to.
-    connect_host = host if host and host != "0.0.0.0" else "127.0.0.1"
+    # host may be a comma-separated list of bind addresses; pick the first one
+    # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
+    # but not connectable — fall back to localhost in that case.
+    first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
+    connect_host = first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
 
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"

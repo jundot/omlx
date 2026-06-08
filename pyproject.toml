@@ -77,11 +77,10 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (526c210, main) — includes Gemma4 unified audio prefill
-    # fixes (041f889), Qwen MTP batched target-verify drift fixes, Gemma4 rollback
-    # fixes, TurboQuant RHT L=1 value kernels, and eager evaluation of cached MRoPE
-    # arrays on model load.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@526c210b8ef841a2906beb2805e9c41b8b77f4e7",
+    # mlx-vlm from commit (54c9a11, main) — includes Gemma4 shared-KV/load fixes,
+    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask alignment,
+    # Phi 3.5 VL EOS fixes, and prior Gemma4 unified audio/MTP fixes.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@54c9a114ecf55f03facacd3684c5fa62403ef26d",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.9 (b7f192b) - bstnxbt repo. Apple G17 NAX verify
     # plus PR #37 prefix snapshot performance and hit-kind metrics.

@@ -1487,3 +1487,27 @@ class TestNativeEmbeddingLoading:
         emb = output.embeddings[0]
         norm = math.sqrt(sum(x * x for x in emb))
         assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"
+
+
+class TestGetEmbeddingMaxLength:
+    """The server helper that resolves the per-request embedding token cap."""
+
+    def test_request_override_wins(self):
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=32768):
+            assert server.get_embedding_max_length("m", 4096) == 4096
+
+    def test_uses_configured_context_window(self):
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=32768):
+            assert server.get_embedding_max_length("m", None) == 32768
+
+    def test_returns_none_without_window_so_model_resolves(self):
+        # No request override and no configured window: defer to the model's
+        # own context-length resolution instead of a hard 512 cap (#1687).
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=None):
+            assert server.get_embedding_max_length("m", None) is None

@@ -1249,3 +1249,184 @@ class TestEngineCoreCloseReleasesSSDManager:
 
             manager.close.assert_called_once()
             assert scheduler.paged_ssd_cache_manager is None
+
+
+class TestStepBurst:
+    """Tests for the decode-burst loop (_step_burst).
+
+    Bursting runs several scheduler.step() calls per executor hand-off so the
+    MLX thread holds the GIL continuously instead of ping-ponging the event
+    loop every decode token.
+    """
+
+    def _make_engine(self, mock_model, mock_tokenizer, max_steps, budget=0.2):
+        # Mocked scheduler has empty `running`, so the burst takes the
+        # single-stream budget; set both so tests are agnostic to the split.
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            config = EngineConfig(
+                decode_burst_max_steps=max_steps,
+                decode_burst_budget_single_s=budget,
+                decode_burst_budget_s=budget,
+            )
+            return EngineCore(
+                model=mock_model, tokenizer=mock_tokenizer, config=config
+            )
+
+    def test_max_steps_1_runs_single_step(self, mock_model, mock_tokenizer):
+        """max_steps=1 disables bursting -> exactly one scheduler.step()."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=1)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            outs = engine._step_burst()
+            assert len(outs) == 1
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_runs_up_to_max_steps(self, mock_model, mock_tokenizer):
+        """With work available and budget headroom, burst hits max_steps."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            outs = engine._step_burst()
+            assert len(outs) == 4
+            assert engine.scheduler.step.call_count == 4
+        finally:
+            engine.close()
+
+    def test_breaks_when_no_requests(self, mock_model, mock_tokenizer):
+        """Burst stops once the scheduler runs dry (e.g. only request finished)."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=False)
+            outs = engine._step_burst()
+            assert len(outs) == 1
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_breaks_on_no_work(self, mock_model, mock_tokenizer):
+        """A step that did no work (throttled/idle) ends the burst."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                side_effect=[
+                    SchedulerOutput(has_work=True),
+                    SchedulerOutput(has_work=False),
+                    SchedulerOutput(has_work=True),
+                ]
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            outs = engine._step_burst()
+            assert len(outs) == 2  # the no-work step ends bursting
+            assert engine.scheduler.step.call_count == 2
+        finally:
+            engine.close()
+
+    def test_breaks_on_eviction(self, mock_model, mock_tokenizer):
+        """A prefill-eviction request needs the async callback -> stop burst."""
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(
+                    has_work=True, prefill_eviction_request=MagicMock()
+                )
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            outs = engine._step_burst()
+            assert len(outs) == 1
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_breaks_on_budget(self, mock_model, mock_tokenizer):
+        """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
+        engine = self._make_engine(
+            mock_model, mock_tokenizer, max_steps=8, budget=0.05
+        )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
+            with patch(
+                "omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]
+            ):
+                outs = engine._step_burst()
+            assert len(outs) == 1
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_budget_zero_disables_bursting(self, mock_model, mock_tokenizer):
+        """budget<=0 (with max_steps>1) still runs a single step."""
+        engine = self._make_engine(
+            mock_model, mock_tokenizer, max_steps=8, budget=0.0
+        )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            outs = engine._step_burst()
+            assert len(outs) == 1
+            assert engine.scheduler.step.call_count == 1
+        finally:
+            engine.close()
+
+    def test_adaptive_single_budget_when_solo(self, mock_model, mock_tokenizer):
+        """One active request -> aggressive single-stream budget (bursts)."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            config = EngineConfig(
+                decode_burst_max_steps=4,
+                decode_burst_budget_single_s=10.0,  # large -> burst to cap
+                decode_burst_budget_s=0.0,  # would disable if used
+            )
+            engine = EngineCore(
+                model=mock_model, tokenizer=mock_tokenizer, config=config
+            )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            engine.scheduler.running = {"a": object()}  # solo
+            outs = engine._step_burst()
+            assert len(outs) == 4
+        finally:
+            engine.close()
+
+    def test_adaptive_concurrent_budget_when_busy(self, mock_model, mock_tokenizer):
+        """Multiple active requests -> tight concurrent budget (here 0 = none)."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            config = EngineConfig(
+                decode_burst_max_steps=8,
+                decode_burst_budget_single_s=10.0,  # would burst if used
+                decode_burst_budget_s=0.0,  # concurrent: no burst
+            )
+            engine = EngineCore(
+                model=mock_model, tokenizer=mock_tokenizer, config=config
+            )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            engine.scheduler.running = {"a": object(), "b": object()}  # concurrent
+            outs = engine._step_burst()
+            assert len(outs) == 1
+        finally:
+            engine.close()

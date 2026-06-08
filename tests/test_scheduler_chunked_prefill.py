@@ -473,6 +473,31 @@ class TestScheduleWaitingChunkedFork:
         assert req in sched.prefilling
         assert req.request_id not in sched.running
 
+    def test_prefilling_request_counts_against_concurrency_cap(self):
+        """A chunked prefill already in flight consumes a scheduler slot."""
+        sched = _make_scheduler(chunked_prefill=True, step_size=4)
+        sched.config.max_num_seqs = 1
+
+        inflight = _make_request("inflight", n_tokens=10)
+        sched.requests[inflight.request_id] = inflight
+        sched.prefilling.append(inflight)
+        sched._prefill_states[inflight.request_id] = _make_prefill_state(
+            sched,
+            inflight,
+        )
+
+        queued = _make_request("queued", n_tokens=10)
+        sched.add_request(queued)
+
+        with patch.object(sched, "_begin_prefill") as mock_begin:
+            scheduled, rejected = sched._schedule_waiting()
+
+        mock_begin.assert_not_called()
+        assert scheduled == []
+        assert rejected == []
+        assert queued in sched.waiting
+        assert inflight in sched.prefilling
+
     def test_long_prompt_completes_in_first_chunk_goes_to_running(self):
         """If the first chunk happens to finish the prefill, request goes to running."""
         sched, req = self._setup(n_tokens=10, step_size=4)
