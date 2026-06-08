@@ -25,8 +25,8 @@ from omlx.oq import (
     OQ_LEVELS,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
-    _build_streaming_proxy_for_sensitivity,
     _build_quant_plan,
+    _build_streaming_proxy_for_sensitivity,
     _discover_sanitize_plan,
     _DiscoveredPlan,
     _extract_layer_index,
@@ -1852,9 +1852,7 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [
-            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)
-        ]
+        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
@@ -1967,12 +1965,11 @@ class TestBuildProxyForSensitivity:
             str(src / "model.safetensors"),
         )
 
-        with patch("omlx.oq._build_model_sanitizer", return_value=None), patch(
-            "omlx.oq._build_non_quantizable_set", return_value=set()
+        with (
+            patch("omlx.oq._build_model_sanitizer", return_value=None),
+            patch("omlx.oq._build_non_quantizable_set", return_value=set()),
         ):
-            _build_streaming_proxy_for_sensitivity(
-                str(src), out, dtype="bfloat16"
-            )
+            _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
 
         config = json.loads((out / "config.json").read_text(encoding="utf-8"))
         assert config["quantization"]["bits"] == _PROXY_QUANT_BITS

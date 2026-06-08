@@ -1489,9 +1489,7 @@ class _DiscoveredPlan:
         if not sources:
             return None
         if recipe and not (
-            transform == "reshape"
-            and len(recipe) == 1
-            and recipe[0][0] == "reshape"
+            transform == "reshape" and len(recipe) == 1 and recipe[0][0] == "reshape"
         ):
             return None
         if transform not in ("passthrough", "stack") and not (
@@ -2393,6 +2391,7 @@ def _gs_for_mode(bits: int, default_gs: int) -> int:
 
 # --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
 import struct as _struct
+
 import numpy as _np
 
 
@@ -3090,9 +3089,9 @@ def quantize_oq_streaming(
             )
         elif _model_exceeds_ram and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
-                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
-                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
+                f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                f"({_system_ram / 1e9:.1f} GB). Auto-building a uniform "
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
@@ -3100,6 +3099,7 @@ def quantize_oq_streaming(
             try:
                 _proxy_dir = _build_proxy_for_sensitivity(
                     model_path,
+                    config=config,
                     dtype=dtype,
                     working_dir=str(output.parent),
                     trust_remote_code=trust_remote_code,
@@ -3128,7 +3128,7 @@ def quantize_oq_streaming(
                     logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
         elif _model_exceeds_ram:
             raise RuntimeError(
-                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
+                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
                 "of system RAM and auto_proxy_sensitivity is disabled. "
                 "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
                 "with a pre-quantized version of this model, or run on a "
@@ -3536,8 +3536,7 @@ def quantize_oq_streaming(
 
     cb("saving", 100.0)
     logger.info(
-        f"oQ{oq_level:g} streaming: completed -> {output_path} "
-        f"({total_shards} shards)"
+        f"oQ{oq_level:g} streaming: completed -> {output_path} ({total_shards} shards)"
     )
 
 
@@ -3583,7 +3582,7 @@ def _load_calibration_data(
             )
         except Exception as e:
             logger.warning(
-                f"Built-in calibration failed: {e}, " "falling back to mlx-lm default"
+                f"Built-in calibration failed: {e}, falling back to mlx-lm default"
             )
 
     if dataset == "default":
@@ -3642,9 +3641,7 @@ def _load_builtin_calibration(
         raise ValueError("No calibration text available")
 
     total_kb = sum(len(t) for t in texts) // 1024
-    logger.info(
-        f"Built-in calibration: {len(texts)} texts, " f"{total_kb} KB ({dataset})"
-    )
+    logger.info(f"Built-in calibration: {len(texts)} texts, {total_kb} KB ({dataset})")
 
     all_ids = []
     for text in texts:
@@ -3763,8 +3760,7 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         tokens = tokens[indices]
 
     logger.info(
-        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens "
-        f"from {dataset}"
+        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens from {dataset}"
     )
     return tokens
 
@@ -4021,10 +4017,7 @@ def _measure_sensitivity_from_model(
         saved = _temporary_quantize_block(
             block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
         )
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
         out_quant, _ = _forward_layer_result(block, inputs, layer_mask, position_ids)
         if out_quant is not None:
@@ -4036,10 +4029,7 @@ def _measure_sensitivity_from_model(
 
         _restore_saved_weights(block, saved)
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
         inputs = out_float
         mx.synchronize()
@@ -4181,6 +4171,7 @@ def _perturb_bits_for(bits: int):
 def _build_proxy_for_sensitivity(
     model_path: str,
     *,
+    config: dict | None = None,
     dtype: str,
     working_dir: str | None = None,
     trust_remote_code: bool = False,
@@ -4297,10 +4288,7 @@ def _build_streaming_proxy_for_sensitivity(
 
     for tensor_name in tensor_names:
         handled_packed = False
-        if (
-            hasattr(all_weights, "pop_packed")
-            and not _is_mtp_tensor(tensor_name)
-        ):
+        if hasattr(all_weights, "pop_packed") and not _is_mtp_tensor(tensor_name):
             src_info = all_weights.source_quant_info(tensor_name)
             if src_info is not None and _should_quantize_tensor(
                 tensor_name, all_weights.plan_shape(tensor_name)
@@ -4335,11 +4323,7 @@ def _build_streaming_proxy_for_sensitivity(
                 pred = universal_quant_predicate(
                     tensor_name, None, config, _PROXY_QUANT_BITS
                 )
-                if (
-                    pred is not False
-                    and len(shape) >= 2
-                    and shape[-1] % base_gs == 0
-                ):
+                if pred is not False and len(shape) >= 2 and shape[-1] % base_gs == 0:
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != target_dtype
@@ -4360,9 +4344,7 @@ def _build_streaming_proxy_for_sensitivity(
                     del qw, scales, biases
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(
-                            tensor_name, w_mx, target_dtype
-                        )
+                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
@@ -4579,12 +4561,11 @@ def _measure_sensitivity_from_quantized_model(
             else:
                 mx.eval(m.weight, m.scales)
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
-        out_perturbed, _ = _forward_layer_result(block, inputs, layer_mask, position_ids)
+        out_perturbed, _ = _forward_layer_result(
+            block, inputs, layer_mask, position_ids
+        )
 
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
@@ -4612,10 +4593,7 @@ def _measure_sensitivity_from_quantized_model(
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
 
-        if (
-            isinstance(position_ids, dict)
-            and position_ids.get("kind") == "glm_moe_dsa"
-        ):
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
         inputs = out_baseline
         mx.eval(inputs)
