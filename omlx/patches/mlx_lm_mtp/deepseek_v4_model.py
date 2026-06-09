@@ -268,7 +268,9 @@ def _patch_model(dsv4: Any) -> None:
         # mtp_enabled=False produces a model indistinguishable from stock.
         from . import is_mtp_active
 
-        if n_mtp > 0 and is_mtp_active():
+        mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
+        self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
 

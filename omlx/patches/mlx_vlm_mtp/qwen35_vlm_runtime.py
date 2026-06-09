@@ -190,6 +190,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
+        from ..mlx_lm_mtp import is_mtp_active
 
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads so mlx-vlm's
@@ -197,13 +198,14 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # checkpoints) can place the persisted mtp.* tensors. Whether MTP
         # speculative decode is actually invoked at inference time is gated
         # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
-        # which checks the process-wide ``is_mtp_active`` flag.
+        # which checks the per-instance ``_omlx_mtp_decode_enabled`` marker.
         #
         # Gated by ``is_mtp_attach_enabled()`` so checkpoints that declare
         # mtp_num_hidden_layers > 0 but ship no mtp.* weights (unsloth
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
+        self._omlx_mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         if n_mtp > 0 and is_mtp_attach_enabled():
             self.mtp = q35_lang.MTPModule(args)
 

@@ -42,6 +42,36 @@ class TestApplyOrchestrator:
         import omlx.patches.mlx_lm_mtp as mtp  # noqa: F401
 
 
+class TestBatchGeneratorMtpEligibility:
+    def test_decode_eligibility_uses_model_instance_flag(self):
+        """Later non-MTP model loads must not disable already-loaded MTP models.
+
+        ``set_mtp_active(False)`` is still used as a construction-time global
+        before each model load.  Decode eligibility must read the per-instance
+        marker captured during the MTP model's own load instead of the current
+        process-wide flag.
+        """
+        from omlx.patches.mlx_lm_mtp import set_mtp_active
+        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_common_eligible
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+        )
+
+        set_mtp_active(False)
+        assert _mtp_common_eligible(gen_batch) is True
+
+        model._omlx_mtp_decode_enabled = False
+        assert _mtp_common_eligible(gen_batch) is False
+
+
 class TestCacheRollback:
     def test_arrays_cache_gains_rollback_slot(self):
         from omlx.patches.mlx_lm_mtp import cache_rollback
