@@ -34,6 +34,13 @@ except ImportError:
     HAS_MLX_METAL = False
     mx = None
 
+# MLX fused SDPA (mx.fast.scaled_dot_product_attention) uses an O(n) tiled
+# kernel for all head_dim values as of MLX 0.22.  omlx 0.4.x requires
+# MLX >= 0.31, so the unfused fallback path (full attention-score matrix
+# in float32) never executes.  Set the threshold to infinity so the
+# estimator always uses the compact O(n) formula.
+_SDPA_FALLBACK_HEAD_DIM: float = float("inf")
+
 
 @dataclass
 class MemoryInfo:
@@ -483,14 +490,13 @@ class MemoryMonitor:
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
 
-        if hd > 128:
-            # Fallback: full attention matrix materialized in float32
-            # scores [B, n_q, eff_chunk, full_kv_len] + output
-            # [B, n_q, eff_chunk, hd]
+        if hd > _SDPA_FALLBACK_HEAD_DIM:
+            # Unfused fallback: full attention matrix materialized in float32.
+            # Not reached on MLX >= 0.22 (omlx 0.4.x requirement).
             attn = n_q * eff_chunk * full_kv_len * 4
             attn += n_q * eff_chunk * hd * 4  # output buffer (small)
         else:
-            # Fused kernel: tiled, only output buffer
+            # Fused kernel: tiled O(n), only output buffer allocated.
             attn = n_q * eff_chunk * hd * 4
 
         # KV growth attributable to this request: only the new tokens.
@@ -509,11 +515,11 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        head_dim > 128: MLX SDPA fallback materializes the full attention
-        matrix [B, n_q, n_tokens, kv_len] in float32, plus a small output
-        buffer — so the transient scales with ``n_tokens * kv_len``.
-        head_dim <= 128: fused kernel is tiled / O(n), so only the output
-        buffer is allocated and throttling is effectively a no-op (correct).
+        MLX fused SDPA is tiled O(n) for all head_dim values on MLX >= 0.22,
+        so only the output buffer is allocated.  The unfused fallback
+        (full scores matrix in float32, scaling with n_tokens * kv_len) is
+        guarded by ``_SDPA_FALLBACK_HEAD_DIM`` and is not reachable with the
+        current omlx MLX dependency.
 
         Returns 0 when model info is unavailable.
         """
@@ -521,7 +527,7 @@ class MemoryMonitor:
         n_q = self._num_attention_heads or 0
         if n_q == 0 or hd == 0 or n_tokens <= 0:
             return 0
-        if hd > 128:
+        if hd > _SDPA_FALLBACK_HEAD_DIM:
             return n_q * n_tokens * max(kv_len, 0) * 4 + n_q * n_tokens * hd * 4
         return n_q * n_tokens * hd * 4
 

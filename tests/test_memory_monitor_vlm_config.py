@@ -316,3 +316,79 @@ class TestSetModelInfoTurboQuantDtype:
 
         assert full_dtype_peak > headroom
         assert turboquant_peak < headroom
+
+
+class TestSdpaThreshold:
+    """MLX fused SDPA supports all head_dim values on MLX >= 0.22.
+
+    ``_SDPA_FALLBACK_HEAD_DIM`` must be infinity so ``estimate_prefill_peak_bytes``
+    and ``estimate_chunk_transient_bytes`` always use the compact O(n) formula
+    and never over-estimate SDPA memory for large head_dim models like
+    Qwen3.6-VL (head_dim=256).
+    """
+
+    def test_sdpa_fallback_threshold_is_infinite(self):
+        from omlx.memory_monitor import _SDPA_FALLBACK_HEAD_DIM
+        import math
+
+        assert math.isinf(_SDPA_FALLBACK_HEAD_DIM) and _SDPA_FALLBACK_HEAD_DIM > 0, (
+            "_SDPA_FALLBACK_HEAD_DIM must be +inf so large head_dim models "
+            "(e.g. head_dim=256) always use the fused O(n) formula"
+        )
+
+    def test_estimate_prefill_uses_fused_formula_for_large_head_dim(self):
+        """head_dim=256 must NOT trigger the full attention-score matrix path."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        chunk = 512
+        new_tokens = 327872
+        full_kv_len = new_tokens
+
+        # Fused O(n) formula: only output buffer (eff_chunk = min(chunk, new_tokens))
+        eff_chunk = min(chunk, new_tokens)
+        expected_attn = n_q * eff_chunk * hd * 4
+        kv = monitor.estimate_prompt_kv_bytes(new_tokens)
+        expected_peak = expected_attn + kv
+
+        actual = monitor.estimate_prefill_peak_bytes(new_tokens, chunk, cached_tokens=0)
+        assert actual == expected_peak, (
+            f"head_dim=256 should use fused formula ({expected_peak:,} bytes), "
+            f"got {actual:,} bytes"
+        )
+        # Sanity-check: the SDPA term alone should be orders of magnitude
+        # smaller than the unfused score-matrix would have been.
+        unfused_sdpa_approx = n_q * eff_chunk * full_kv_len * 4
+        assert expected_attn < unfused_sdpa_approx // 100, (
+            "fused SDPA term should be orders of magnitude smaller than the "
+            "unfused score-matrix estimate"
+        )
+
+    def test_estimate_chunk_transient_uses_fused_formula_for_large_head_dim(self):
+        """head_dim=256 chunk transient must use the O(n) output-buffer formula."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        n_tokens = 512
+        kv_len = 327872
+
+        expected = n_q * n_tokens * hd * 4
+        actual = monitor.estimate_chunk_transient_bytes(n_tokens, kv_len)
+        assert actual == expected, (
+            f"head_dim=256 chunk transient should be {expected:,} bytes "
+            f"(output buffer only), got {actual:,} bytes"
+        )
