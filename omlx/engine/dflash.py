@@ -143,6 +143,11 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else 8 * 1024**3
         )
+        self._max_snapshot_tokens = (
+            getattr(model_settings, "dflash_max_snapshot_tokens", None)
+            if model_settings
+            else None
+        )
         self._ssd_cache_requested = (
             bool(getattr(model_settings, "dflash_ssd_cache", False))
             if model_settings
@@ -170,7 +175,12 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else None
         )
-
+        # None → dflash-mlx uses its 8192-token floor; set to raise the floor further.
+        self._l2_frontier_stride = (
+            getattr(model_settings, "dflash_l2_frontier_stride", None)
+            if model_settings
+            else None
+        )
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -218,11 +228,36 @@ class DFlashEngine(BaseEngine):
         return self._omlx_ssd_cache_dir / "dflash_l2"
 
     def _build_runtime_context(self) -> Any:
+        import inspect
+
         from dflash_mlx.runtime.config import runtime_config_from_defaults
         from dflash_mlx.runtime.context import build_runtime_context
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
+        # Only forward knobs that are explicitly configured (non-None) AND supported by
+        # the installed dflash-mlx version.  Older installs don't accept these kwargs;
+        # passing them unconditionally would raise TypeError.
+        _sig = inspect.signature(runtime_config_from_defaults).parameters
+        optional_knobs: dict[str, Any] = {}
+        if self._l2_frontier_stride is not None:
+            if "prefix_cache_l2_frontier_stride" in _sig:
+                optional_knobs["prefix_cache_l2_frontier_stride"] = self._l2_frontier_stride
+            else:
+                logger.warning(
+                    "dflash_l2_frontier_stride=%d ignored: installed dflash-mlx does not "
+                    "support prefix_cache_l2_frontier_stride; upgrade dflash-mlx to apply",
+                    self._l2_frontier_stride,
+                )
+        if self._max_snapshot_tokens is not None:
+            if "max_snapshot_tokens" in _sig:
+                optional_knobs["max_snapshot_tokens"] = self._max_snapshot_tokens
+            else:
+                logger.warning(
+                    "dflash_max_snapshot_tokens=%d ignored: installed dflash-mlx does "
+                    "not support max_snapshot_tokens; upgrade dflash-mlx to apply",
+                    self._max_snapshot_tokens,
+                )
         cfg = runtime_config_from_defaults(
             prefix_cache=self._in_memory_cache_enabled,
             prefix_cache_max_entries=self._in_memory_cache_max_entries,
@@ -237,6 +272,7 @@ class DFlashEngine(BaseEngine):
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
+            **optional_knobs,
         )
         return build_runtime_context(cfg)
 
@@ -666,6 +702,7 @@ class DFlashEngine(BaseEngine):
             stable_prefix_len=prefix_flow.stable_prefix_len,
             prefix_cache_active=prefix_flow.cache_active,
             publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
+            prefix_hit_kind=getattr(prefix_flow, "hit_kind", None),
             runtime_context=self._runtime_context,
         )
         return event_iter, prefix_flow, stop_ids
@@ -686,10 +723,17 @@ class DFlashEngine(BaseEngine):
         return promptly so the single MLX executor thread is freed for the
         next request.
         """
-        from dflash_mlx.engine.events import SummaryEvent, TokenEvent
+        from dflash_mlx.engine.events import (
+            PrefillCompleteEvent,
+            SummaryEvent,
+            TokenEvent,
+        )
 
         event_iter = None
+        prefill_restored = 0
+        prefill_computed = len(prompt_tokens)
         try:
+            mx.reset_peak_memory()
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
@@ -718,7 +762,11 @@ class DFlashEngine(BaseEngine):
                     logger.info("DFlash generation aborted by client")
                     break
 
-                if isinstance(event, TokenEvent):
+                if isinstance(event, PrefillCompleteEvent):
+                    prefill_restored = int(event.prefill_tokens_restored)
+                    prefill_computed = int(event.prefill_tokens_computed)
+
+                elif isinstance(event, TokenEvent):
                     token_id = int(event.token_id)
                     # Skip EOS/stop tokens from output
                     if token_id in stop_ids:
@@ -772,6 +820,10 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "cache_hit_kind": str(event.hit_kind),
+                        "peak_memory_gb": event.peak_memory_gb,
+                        "prefill_tokens_restored": prefill_restored,
+                        "prefill_tokens_computed": prefill_computed,
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -866,6 +918,7 @@ class DFlashEngine(BaseEngine):
                 else None
             )
             try:
+                mx.reset_peak_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
@@ -948,12 +1001,21 @@ class DFlashEngine(BaseEngine):
         completion_token_count = (
             int(summary.generation_tokens) if summary is not None else len(generated)
         )
+        metrics = {}
+        if summary is not None:
+            metrics = {
+                "cache_hit_kind": str(summary.hit_kind),
+                "acceptance_ratio": float(summary.acceptance_ratio),
+                "cycles_completed": int(summary.cycles_completed),
+                "peak_memory_gb": summary.peak_memory_gb,
+            }
         return GenerationOutput(
             text=text,
             tokens=generated,
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             finish_reason="stop",
+            metrics=metrics,
         )
 
     async def stream_generate(
@@ -1065,6 +1127,7 @@ class DFlashEngine(BaseEngine):
                     completion_tokens=total_completion,
                     finished=finished,
                     finish_reason=finish_reason,
+                    metrics=metrics or {},
                 )
 
                 if finished:
@@ -1233,7 +1296,9 @@ class DFlashEngine(BaseEngine):
             "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
             "in_memory_cache": self._in_memory_cache_enabled,
+            "max_snapshot_tokens": self._max_snapshot_tokens,
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
+            "l2_frontier_stride": self._l2_frontier_stride,
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:

@@ -26,6 +26,7 @@ class MockGenerationOutput:
     finished: bool = False
     tool_calls: Optional[List[Dict[str, Any]]] = None
     cached_tokens: int = 0
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 class MockTokenizer:
@@ -551,6 +552,51 @@ class TestStreamingHelperFunctions:
         json_str = first_event[6:-2]
         data = json.loads(json_str)
         assert data["choices"][0]["delta"].get("role") == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_includes_dflash_metrics(self):
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Done",
+                new_text="Done",
+                prompt_tokens=8192,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+                metrics={
+                    "cache_hit_kind": "l1_exact",
+                    "acceptance_ratio": 0.75,
+                    "cycles_completed": 16,
+                },
+            ),
+        ])
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        events = []
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "Hello"}],
+            request,
+            max_tokens=128,
+            temperature=0,
+            top_p=1,
+            top_k=0,
+        ):
+            events.extend(parse_sse_events(event))
+
+        usage = next(event["usage"] for event in events if event.get("usage"))
+        assert usage["cache_hit_kind"] == "l1_exact"
+        assert usage["dflash_acceptance_ratio"] == 0.75
+        assert usage["dflash_cycles_completed"] == 16
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_streams_content_incrementally(self):

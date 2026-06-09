@@ -72,6 +72,8 @@ class ModelSettings:
         dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
         dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
+        dflash_max_snapshot_tokens: Maximum prompt tokens admitted to DFlash L1
+            (None = dflash default; 0 disables the token cap).
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
         dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
@@ -81,6 +83,10 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_l2_frontier_stride: Token stride at which L2 frontier snapshots are written
+            during cold prefill (None = dflash 8192-token floor, rounded to prefill-step
+            multiple). Values below 8192 are silently raised. Larger strides reduce
+            sync SSD writes on long-context prompts.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -148,6 +154,7 @@ class ModelSettings:
     dflash_in_memory_cache: bool = True
     dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
     dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
+    dflash_max_snapshot_tokens: Optional[int] = None  # None = dflash default (currently 32k)
     dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
@@ -156,6 +163,7 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_l2_frontier_stride: Optional[int] = None  # Token stride for L2 frontier snapshots (None = 8192 floor)
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.

@@ -140,11 +140,13 @@ class ModelSettingsRequest(BaseModel):
     dflash_in_memory_cache: bool | None = None
     dflash_in_memory_cache_max_entries: int | None = None
     dflash_in_memory_cache_max_bytes: int | None = None
+    dflash_max_snapshot_tokens: int | None = None
     dflash_ssd_cache: bool | None = None
     dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_l2_frontier_stride: int | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -2079,6 +2081,11 @@ async def update_model_settings(
         current_settings.dflash_in_memory_cache_max_bytes = int(
             request.dflash_in_memory_cache_max_bytes
         )
+    if "dflash_max_snapshot_tokens" in sent:
+        value = request.dflash_max_snapshot_tokens
+        current_settings.dflash_max_snapshot_tokens = (
+            int(value) if value is not None and value >= 0 else None
+        )
     if "dflash_ssd_cache" in sent:
         ssd_requested = bool(request.dflash_ssd_cache)
         if ssd_requested:
@@ -2128,6 +2135,11 @@ async def update_model_settings(
         # Anything else (including empty string) → revert to dflash default.
         current_settings.dflash_verify_mode = (
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
+    if "dflash_l2_frontier_stride" in sent:
+        value = request.dflash_l2_frontier_stride
+        current_settings.dflash_l2_frontier_stride = (
+            int(value) if value is not None and value >= 0 else None
         )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
@@ -2332,8 +2344,13 @@ async def update_model_settings(
         or "dflash_in_memory_cache" in sent
         or "dflash_in_memory_cache_max_entries" in sent
         or "dflash_in_memory_cache_max_bytes" in sent
+        or "dflash_max_snapshot_tokens" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
+        or "dflash_draft_window_size" in sent
+        or "dflash_draft_sink_size" in sent
+        or "dflash_verify_mode" in sent
+        or "dflash_l2_frontier_stride" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent

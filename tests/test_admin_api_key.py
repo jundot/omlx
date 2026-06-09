@@ -82,6 +82,102 @@ class TestListModelsSettings:
         assert settings_dict["temperature"] == 0.7
 
 
+class TestDFlashAdminSettings:
+    """Tests for DFlash cache controls in the admin settings API."""
+
+    def test_request_accepts_supported_cache_controls(self):
+        request = admin_routes.ModelSettingsRequest(
+            dflash_max_snapshot_tokens=65536,
+            dflash_l2_frontier_stride=32768,
+        )
+
+        assert request.dflash_max_snapshot_tokens == 65536
+        assert request.dflash_l2_frontier_stride == 32768
+        assert request.model_fields_set == {
+            "dflash_max_snapshot_tokens",
+            "dflash_l2_frontier_stride",
+        }
+
+    def test_update_persists_supported_cache_controls(self):
+        entry = SimpleNamespace(
+            engine=None,
+            engine_type="dflash",
+            model_type="llm",
+            model_path="/tmp/test-model",
+            is_pinned=False,
+        )
+        engine_pool = MagicMock()
+        engine_pool.get_entry.return_value = entry
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings()
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=settings_manager,
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        ):
+            result = asyncio.run(
+                admin_routes.update_model_settings(
+                    "test-model",
+                    admin_routes.ModelSettingsRequest(
+                        dflash_max_snapshot_tokens=65536,
+                        dflash_l2_frontier_stride=32768,
+                    ),
+                    is_admin=True,
+                )
+            )
+
+        saved = settings_manager.set_settings.call_args.args[1]
+        assert saved.dflash_max_snapshot_tokens == 65536
+        assert saved.dflash_l2_frontier_stride == 32768
+        assert result["settings"]["dflash_max_snapshot_tokens"] == 65536
+        assert result["settings"]["dflash_l2_frontier_stride"] == 32768
+
+    def test_null_clears_supported_cache_controls(self):
+        entry = SimpleNamespace(
+            engine=None,
+            engine_type="dflash",
+            model_type="llm",
+            model_path="/tmp/test-model",
+            is_pinned=False,
+        )
+        engine_pool = MagicMock()
+        engine_pool.get_entry.return_value = entry
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings(
+            dflash_max_snapshot_tokens=65536,
+            dflash_l2_frontier_stride=32768,
+        )
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=settings_manager,
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        ):
+            asyncio.run(
+                admin_routes.update_model_settings(
+                    "test-model",
+                    admin_routes.ModelSettingsRequest(
+                        dflash_max_snapshot_tokens=None,
+                        dflash_l2_frontier_stride=None,
+                    ),
+                    is_admin=True,
+                )
+            )
+
+        saved = settings_manager.set_settings.call_args.args[1]
+        assert saved.dflash_max_snapshot_tokens is None
+        assert saved.dflash_l2_frontier_stride is None
+
+
 class TestValidateApiKey:
     """Tests for validate_api_key() format validation."""
 

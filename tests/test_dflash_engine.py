@@ -24,11 +24,13 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_ssd_cache is False
         # New long-context tuning knobs (issue #1276). None → dflash-mlx default.
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size is None
         assert settings.dflash_verify_mode is None
+        assert settings.dflash_l2_frontier_stride is None
 
     def test_no_speculative_tokens_field(self):
         """dflash_speculative_tokens was removed in v2 and stays removed."""
@@ -57,6 +59,7 @@ class TestDFlashModelSettings:
         assert "dflash_draft_window_size" not in d
         assert "dflash_draft_sink_size" not in d
         assert "dflash_verify_mode" not in d
+        assert "dflash_l2_frontier_stride" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
@@ -70,6 +73,7 @@ class TestDFlashModelSettings:
             "dflash_in_memory_cache": False,
             "dflash_in_memory_cache_max_entries": 16,
             "dflash_in_memory_cache_max_bytes": 4 * 1024 * 1024 * 1024,
+            "dflash_max_snapshot_tokens": 65536,
             "dflash_ssd_cache": True,
         }
         settings = ModelSettings.from_dict(data)
@@ -83,6 +87,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is False
         assert settings.dflash_in_memory_cache_max_entries == 16
         assert settings.dflash_in_memory_cache_max_bytes == 4 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens == 65536
         assert settings.dflash_ssd_cache is True
 
     def test_from_dict_missing_new_fields_uses_defaults(self):
@@ -96,6 +101,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache is True
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
+        assert settings.dflash_max_snapshot_tokens is None
         assert settings.dflash_ssd_cache is False
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
@@ -131,6 +137,7 @@ class TestDFlashModelSettings:
             dflash_draft_quant_group_size=64,
             dflash_max_ctx=16384,
             dflash_in_memory_cache=False,
+            dflash_max_snapshot_tokens=65536,
             dflash_ssd_cache=False,
             dflash_ssd_cache_max_bytes=30 * 1024**3,
         )
@@ -144,6 +151,7 @@ class TestDFlashModelSettings:
         assert restored.dflash_draft_quant_group_size == original.dflash_draft_quant_group_size
         assert restored.dflash_max_ctx == original.dflash_max_ctx
         assert restored.dflash_in_memory_cache == original.dflash_in_memory_cache
+        assert restored.dflash_max_snapshot_tokens == original.dflash_max_snapshot_tokens
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
         assert restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
 
@@ -229,6 +237,63 @@ class TestDFlashEngineInit:
         assert engine._draft_quant_activation_bits == 32
         assert engine._draft_quant_group_size == 128
 
+    def test_stream_events_forward_prefix_cache_hit_kind(self, monkeypatch):
+        """The adapter must preserve DFlash's live cache classification."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import dflash_mlx.runtime as dflash_runtime
+        from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._executor_tokenizer = MagicMock()
+        engine._draft_model = object()
+        engine._target_model = object()
+        engine._target_ops = object()
+        engine._draft_backend = object()
+        engine._runtime_context = object()
+
+        flow = SimpleNamespace(
+            snapshot=object(),
+            snapshot_service=object(),
+            stable_prefix_len=128,
+            cache_active=True,
+            publish_generation_snapshot=True,
+            hit_kind="l1_exact",
+        )
+        monkeypatch.setattr(
+            PrefixCacheFlow,
+            "for_request",
+            staticmethod(lambda **_kwargs: flow),
+        )
+        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda _tokenizer: [2])
+
+        captured = {}
+
+        def fake_stream_dflash_generate(**kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        monkeypatch.setattr(
+            dflash_runtime,
+            "stream_dflash_generate",
+            fake_stream_dflash_generate,
+        )
+
+        event_iter, returned_flow, stop_ids = engine._stream_dflash_events(
+            prompt_tokens=[1, 2, 3],
+            max_tokens=16,
+        )
+
+        assert list(event_iter) == []
+        assert returned_flow is flow
+        assert stop_ids == [2]
+        assert captured["prefix_hit_kind"] == "l1_exact"
+
 
     def test_get_stats_no_verify_mode(self):
         """Stats should not include verify_mode (removed in v2)."""
@@ -246,6 +311,7 @@ class TestDFlashEngineInit:
         assert stats["model_name"] == "test-model"
         assert stats["draft_model"] == "test-draft"
         assert stats["loaded"] is False
+        assert stats["max_snapshot_tokens"] is None
         assert "verify_mode" not in stats
 
     def test_cache_stats_returns_none(self):
@@ -532,6 +598,115 @@ class TestDFlashEngineInit:
         ctx = engine._build_runtime_context()
         runtime = getattr(ctx, "runtime")
         assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
+
+
+    def test_prefix_cache_knob_defaults_to_none(self):
+        """No settings → engine stores None → dflash-mlx fills its own defaults."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        assert engine._l2_frontier_stride is None
+
+    def test_prefix_cache_knob_read_from_settings(self):
+        """DFlashEngine picks up l2_frontier_stride from ModelSettings."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+            ),
+        )
+        assert engine._l2_frontier_stride == 16384
+
+    def test_build_runtime_context_passes_prefix_cache_knob(self):
+        """l2_frontier_stride reaches dflash-mlx RuntimeContext.
+
+        When the installed dflash-mlx predates the setting, the engine must
+        ignore it (logging a warning) rather than raising TypeError.
+        """
+        import inspect
+
+        try:
+            from omlx.engine.dflash import DFlashEngine
+            from dflash_mlx.runtime.config import runtime_config_from_defaults
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+            ),
+        )
+        # Must not raise TypeError regardless of installed dflash-mlx version.
+        ctx = engine._build_runtime_context()
+        runtime = getattr(ctx, "runtime")
+
+        sig = inspect.signature(runtime_config_from_defaults).parameters
+        if "prefix_cache_l2_frontier_stride" in sig:
+            assert runtime.prefix_cache_l2_frontier_stride == 16384
+
+    def test_build_runtime_context_passes_max_snapshot_tokens(self):
+        """Long-context L1 admission must be configurable through oMLX."""
+        import inspect
+
+        try:
+            from omlx.engine.dflash import DFlashEngine
+            from dflash_mlx.runtime.config import runtime_config_from_defaults
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_max_snapshot_tokens=65536),
+        )
+        runtime = engine._build_runtime_context().runtime
+
+        if "max_snapshot_tokens" in inspect.signature(
+            runtime_config_from_defaults
+        ).parameters:
+            assert runtime.max_snapshot_tokens == 65536
+
+    def test_get_stats_exposes_prefix_cache_knob(self):
+        """get_stats() should include l2_frontier_stride."""
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_l2_frontier_stride=16384,
+            ),
+        )
+        stats = engine.get_stats()
+        assert stats["l2_frontier_stride"] == 16384
+
+    def test_get_stats_exposes_max_snapshot_tokens(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_max_snapshot_tokens=65536),
+        )
+
+        assert engine.get_stats()["max_snapshot_tokens"] == 65536
 
 
 class TestDFlashCompatibility:
