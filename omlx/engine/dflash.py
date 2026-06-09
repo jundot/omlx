@@ -1202,6 +1202,18 @@ class DFlashEngine(BaseEngine):
         ):
             yield output
 
+    def scheduler(self):
+        """The scheduler of the fallback engine, or None when running in
+        speculative-decoding mode (no fallback engine instantiated yet).
+
+        DFlash bypasses the oMLX scheduler in normal speculative-decoding
+        mode; when it falls back to BatchedEngine/VLMBatchedEngine the fallback
+        engine's scheduler is the one that needs memory-limit propagation.
+        """
+        if self._fallback_engine is not None:
+            return getattr(self._fallback_engine, "scheduler", None)
+        return None
+
     def has_active_requests(self) -> bool:
         if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
             return True
