@@ -149,7 +149,7 @@ def get_max_working_set_bytes() -> int:
 
         total_ram = psutil.virtual_memory().total
         return int(total_ram * 0.75)
-    except ImportError:
+    except Exception:
         pass
 
     # Last resort: default

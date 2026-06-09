@@ -56,7 +56,7 @@ def get_system_memory() -> int:
         import psutil
 
         return psutil.virtual_memory().total
-    except ImportError:
+    except Exception:
         pass
 
     # Fallback for Unix systems

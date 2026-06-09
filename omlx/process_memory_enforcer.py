@@ -31,6 +31,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import logging
+import struct
 import subprocess
 import sys
 import time
@@ -163,19 +164,24 @@ def get_macos_vm_stats() -> dict[str, int] | None:
     if _libc is None or _MACH_HOST is None:
         return None
     try:
-        stats = _VMStats64()
-        count = ctypes.c_uint(ctypes.sizeof(_VMStats64) // 4)
+        # Use a generous buffer (512 ints = 2048 bytes) so the kernel
+        # can write whatever vm_statistics64_data_t layout it has.
+        # Only read the first 4 fields (free / active / inactive / wired)
+        # which are uint32 at fixed offsets in every macOS version.
+        count = ctypes.c_uint(512)
+        buf = (ctypes.c_uint8 * 2048)()
         rc = _libc.host_statistics64(
-            _MACH_HOST, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)
+            _MACH_HOST, _HOST_VM_INFO64, ctypes.byref(buf), ctypes.byref(count)
         )
         if rc != 0:
             return None
+        raw = bytes(buf)
         ps = _VM_PAGE_SIZE
         return {
-            "free": stats.free_count * ps,
-            "active": stats.active_count * ps,
-            "inactive": stats.inactive_count * ps,
-            "wired": stats.wire_count * ps,
+            "free": struct.unpack_from("<I", raw, 0)[0] * ps,
+            "active": struct.unpack_from("<I", raw, 4)[0] * ps,
+            "inactive": struct.unpack_from("<I", raw, 8)[0] * ps,
+            "wired": struct.unpack_from("<I", raw, 12)[0] * ps,
         }
     except Exception:  # noqa: BLE001
         return None
