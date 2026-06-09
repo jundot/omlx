@@ -138,7 +138,6 @@ class MLXRerankerModel:
         """Load XLMRoberta model using omlx native implementation."""
         import mlx.core as mx
         from mlx.utils import tree_unflatten
-        from safetensors import safe_open
         from transformers import AutoTokenizer
 
         from .xlm_roberta import Model, ModelArgs
@@ -157,13 +156,15 @@ class MLXRerankerModel:
         # Create model
         model = Model(config)
 
-        # Load weights
+        # Load weights. Use mx.load (not safetensors.safe_open + get_tensor),
+        # which reads safetensors directly into MLX arrays and supports the
+        # bfloat16 dtype. safe_open(framework="mlx").get_tensor() routes bf16
+        # through numpy, which has no bfloat16 dtype and raises
+        # "TypeError: data type 'bfloat16' not understood".
         weights = {}
         weight_files = list(model_path.glob("*.safetensors"))
         for wf in weight_files:
-            with safe_open(wf, framework="mlx") as f:
-                for key in f.keys():
-                    weights[key] = f.get_tensor(key)
+            weights.update(mx.load(str(wf)))
 
         # Sanitize weights (remove "roberta." prefix, etc.)
         weights = model.sanitize(weights)
@@ -457,12 +458,10 @@ class MLXRerankerModel:
                 "Expected projector.safetensors for JinaForRanking models."
             )
 
-        from safetensors import safe_open
-
-        weights = {}
-        with safe_open(projector_path, framework="mlx") as f:
-            for key in f.keys():
-                weights[key] = f.get_tensor(key)
+        # mx.load reads safetensors into MLX arrays with bfloat16 support;
+        # safe_open(framework="mlx").get_tensor() routes bf16 through numpy and
+        # raises "TypeError: data type 'bfloat16' not understood".
+        weights = mx.load(str(projector_path))
 
         required_keys = ("linear1.weight", "linear2.weight")
         missing_keys = [key for key in required_keys if key not in weights]
