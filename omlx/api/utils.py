@@ -6,10 +6,70 @@ Utility functions for text processing.
 
 import json
 import re
-from typing import Any, List
+from typing import Any, List, Optional
 
 from ..exceptions import InvalidRequestError
-from .openai_models import Message
+from ..request import TokenLogprob
+from .openai_models import (
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
+    Message,
+    TopLogprob,
+)
+
+
+def _decode_token_text_bytes(tokenizer, token_id: int):
+    """Decode one token and return bytes only when they are faithful.
+
+    Byte-fallback tokens may decode in isolation as U+FFFD; encoding that
+    replacement would falsely report ``EF BF BD`` instead of the original
+    byte.  Preserve OpenAI's nullable field in that ambiguous case.
+    """
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        text = ""
+    token_bytes = None
+    if "\ufffd" not in text:
+        try:
+            token_bytes = list(text.encode("utf-8"))
+        except Exception:
+            pass
+    return text, token_bytes
+
+
+def build_choice_logprobs(
+    token_logprobs: Optional[List[TokenLogprob]], tokenizer
+) -> Optional[ChoiceLogprobs]:
+    if not token_logprobs:
+        return None
+    content = []
+    for entry in token_logprobs:
+        text, token_bytes = _decode_token_text_bytes(tokenizer, entry.token_id)
+        top = []
+        for token_id, logprob in zip(entry.top_ids, entry.top_logprobs):
+            candidate, candidate_bytes = _decode_token_text_bytes(tokenizer, token_id)
+            top.append(TopLogprob(token=candidate, logprob=float(logprob), bytes=candidate_bytes))
+        content.append(ChatCompletionTokenLogprob(
+            token=text, logprob=float(entry.logprob), bytes=token_bytes, top_logprobs=top
+        ))
+    return ChoiceLogprobs(content=content)
+
+
+def logprobs_match_text(
+    token_logprobs: Optional[List[TokenLogprob]], text: str
+) -> bool:
+    """Whether every visible character has an ordered token logprob entry.
+
+    A collector may aggregate supported and unsupported outputs.  Returning a
+    partial logprob list would silently mislabel the response, so callers only
+    serialize when the entry text reconstructs the exact pre-filter text.
+    """
+    return bool(token_logprobs) and all(
+        isinstance(entry, TokenLogprob) for entry in token_logprobs
+    ) and "".join(
+        entry.text for entry in token_logprobs
+    ) == text
 
 # Model families whose chat templates consume message.reasoning_content directly.
 _NATIVE_REASONING_MODEL_TYPES = {

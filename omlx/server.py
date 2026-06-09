@@ -169,11 +169,13 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.utils import (
+    build_choice_logprobs,
     clean_special_tokens,
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
     has_nonleading_system_message,
+    logprobs_match_text,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     cache_reasoning_output,
@@ -4150,6 +4152,19 @@ async def create_chat_completion(
         if request.seed is not None:
             chat_kwargs["seed"] = request.seed
 
+        if request.logprobs:
+            chat_kwargs["logprobs"] = True
+            server_cap = getattr(
+                getattr(_server_state.global_settings, "sampling", None),
+                "top_logprobs_k",
+                20,
+            )
+            chat_kwargs["top_logprobs"] = (
+                min(request.top_logprobs, int(server_cap))
+                if request.top_logprobs is not None
+                else None
+            )
+
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
@@ -4362,6 +4377,23 @@ async def create_chat_completion(
                             pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            visible_content = cleaned_text.strip() if cleaned_text else None
+            # Tool, reasoning, JSON, and special-token cleanup can remove or
+            # rewrite generated text.  Only return logprobs when the final
+            # visible content is byte-for-byte the decoded token sequence.
+            choice_logprobs = None
+            if (
+                getattr(request, "logprobs", False)
+                and visible_content is not None
+                and not tool_calls
+                and not cleaned_thinking
+                and response_format is None
+                and raw_text == visible_content
+                and logprobs_match_text(output.logprobs, raw_text)
+            ):
+                choice_logprobs = build_choice_logprobs(
+                    output.logprobs, engine.tokenizer
+                )
 
             return ChatCompletionResponse(
                 model=request.model,
@@ -4375,6 +4407,7 @@ async def create_chat_completion(
                             tool_calls=tool_calls,
                         ),
                         finish_reason=finish_reason,
+                        logprobs=choice_logprobs,
                     )
                 ],
                 usage=Usage(
@@ -5250,6 +5283,9 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    # Tool filtering can buffer or remove markup, so its output cannot retain
+    # a sound token-to-logprob alignment. Omit logprobs for that path.
+    want_logprobs = bool(getattr(request, "logprobs", False) and tool_filter is None)
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
         async for output in engine_stream:
@@ -5274,7 +5310,21 @@ async def stream_chat_completion(
                 accumulated_text += output.new_text
 
             if stream_content and output.new_text:
-                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+                if want_logprobs and logprobs_match_text(
+                    output.logprobs, output.new_text
+                ):
+                    thinking_parts, content_parts, content_lps = [], [], []
+                    for entry in output.logprobs:
+                        thinking_part, content_part, emitted_lps = (
+                            thinking_parser.feed_with_logprob(entry.text, entry)
+                        )
+                        thinking_parts.append(thinking_part)
+                        content_parts.append(content_part)
+                        content_lps.extend(emitted_lps)
+                    thinking_delta, content_delta = "".join(thinking_parts), "".join(content_parts)
+                else:
+                    thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+                    content_lps = None
 
                 # Emit reasoning_content delta
                 if thinking_delta:
@@ -5347,6 +5397,15 @@ async def stream_chat_completion(
                                             content=segment.text
                                         ),
                                         finish_reason=None,
+                                        logprobs=(
+                                            build_choice_logprobs(
+                                                content_lps, engine.tokenizer
+                                            )
+                                            if logprobs_match_text(
+                                                content_lps, segment.text
+                                            )
+                                            else None
+                                        ),
                                     )
                                 ],
                             )
@@ -5424,7 +5483,11 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        if want_logprobs:
+            thinking_delta, content_delta, content_lps = thinking_parser.finish_with_logprob()
+        else:
+            thinking_delta, content_delta = thinking_parser.finish()
+            content_lps = None
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5473,6 +5536,11 @@ async def stream_chat_completion(
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(content=content_delta),
                             finish_reason=None,
+                            logprobs=(
+                                build_choice_logprobs(content_lps, engine.tokenizer)
+                                if logprobs_match_text(content_lps, content_delta)
+                                else None
+                            ),
                         )
                     ],
                 )

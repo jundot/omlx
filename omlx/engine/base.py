@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from omlx.request import TokenLogprob
+
 import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
@@ -195,6 +197,7 @@ class GenerationOutput:
     benchmark_requested_steps: List[int] = field(default_factory=list)
     benchmark_boundary_enabled: bool = False
     benchmark_cache_block_size: int = 0
+    logprobs: Optional[List[TokenLogprob]] = None
 
 
 class BaseEngine(ABC):
