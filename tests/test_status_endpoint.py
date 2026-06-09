@@ -76,6 +76,53 @@ class TestStatusEndpoint:
         assert "GB" in data["model_memory_used_formatted"]
         assert "GB" in data["model_memory_max_formatted"]
 
+    def test_status_ignores_memory_ceiling_error(self, client):
+        """Memory telemetry failures should not break status polling."""
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "get_loaded_model_ids",
+            "current_model_memory", "_entries",
+        ])
+        pool.model_count = 1
+        pool.loaded_model_count = 1
+        pool.get_loaded_model_ids.return_value = ["model-a"]
+        pool.current_model_memory = 16 * 1024**3
+        pool._entries = {}
+        enforcer = MagicMock(spec=["get_final_ceiling"])
+        enforcer.get_final_ceiling.side_effect = RuntimeError(
+            "host_statistics64 failed"
+        )
+        self._state.engine_pool = pool
+        self._state.process_memory_enforcer = enforcer
+
+        resp = client.get("/api/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model_memory_max"] is None
+        assert data["model_memory_max_formatted"] == "unlimited"
+
+    def test_health_ignores_memory_ceiling_error(self, client):
+        """Health should stay healthy when optional memory telemetry fails."""
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "current_model_memory",
+        ])
+        pool.model_count = 1
+        pool.loaded_model_count = 1
+        pool.current_model_memory = 16 * 1024**3
+        enforcer = MagicMock(spec=["get_final_ceiling"])
+        enforcer.get_final_ceiling.side_effect = RuntimeError(
+            "host_statistics64 failed"
+        )
+        self._state.engine_pool = pool
+        self._state.process_memory_enforcer = enforcer
+
+        resp = client.get("/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["engine_pool"]["final_ceiling"] == 0
+
     def test_aggregates_active_waiting_requests(self, client):
         """Active/waiting request counts are summed across loaded engines."""
         # Build a mock engine with scheduler

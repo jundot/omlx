@@ -609,6 +609,8 @@
   "bench.upload_skipped.features.dflash": "DFlash (speculative decoding)",
   "bench.upload_skipped.features.specprefill": "SpecPrefill (sparse prefill)",
   "bench.upload_skipped.features.turboquant": "TurboQuant KV 캐시",
+  "bench.upload_skipped.features.mtp": "Native MTP",
+  "bench.upload_skipped.features.vlm_mtp": "VLM MTP",
   "bench.metrics.section_label": "지표 참고",
   "bench.metrics.ttft.name": "TTFT",
   "bench.metrics.ttft.full_name": "(첫 토큰 생성 시간)",

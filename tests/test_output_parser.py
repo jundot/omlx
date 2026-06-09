@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import json
 
-from openai_harmony import load_harmony_encoding
-
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
+from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.adapter.output_parser import detect_output_parser
 
 
@@ -311,7 +310,7 @@ class TestOutputParserFactory:
         assert factory.kind == "gemma4"
 
     def test_harmony_wrapper_regression(self):
-        encoding = load_harmony_encoding("HarmonyGptOss")
+        encoding = load_harmony_gpt_oss_encoding()
         tokenizer = HarmonyTokenizer(encoding)
         factory = detect_output_parser(
             "gpt-oss-20b",
@@ -350,7 +349,7 @@ class TestOutputParserFactory:
         """Non-streaming output_text retains analysis-channel reasoning."""
         from omlx.api.thinking import extract_thinking
 
-        encoding = load_harmony_encoding("HarmonyGptOss")
+        encoding = load_harmony_gpt_oss_encoding()
         tokenizer = HarmonyTokenizer(encoding)
         factory = detect_output_parser(
             "gpt-oss-20b",

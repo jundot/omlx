@@ -13,12 +13,13 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch, AsyncMock
+import concurrent.futures
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.engine_core import EngineCore, AsyncEngineCore, EngineConfig
-from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
+from omlx.engine_core import AsyncEngineCore, EngineConfig, EngineCore
+from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
@@ -605,6 +606,61 @@ class TestEngineCoreClose:
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
             engine.close()
             engine.close()  # Should not raise
+
+    def test_close_fatal_exits_when_teardown_future_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck scheduler teardown is fatal so a supervisor can restart."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine._mlx_executor.shutdown(wait=False)
+
+            future = MagicMock()
+            future.result.side_effect = concurrent.futures.TimeoutError
+            executor = MagicMock()
+            executor.submit.return_value = future
+            engine._mlx_executor = executor
+
+            with (
+                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
+                pytest.raises(SystemExit),
+            ):
+                engine.close()
+
+            future.result.assert_called_once_with(timeout=60.0)
+            assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
+
+    def test_close_fatal_exits_when_compile_cache_clear_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck MLX compile-cache clear is also fatal."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine._mlx_executor.shutdown(wait=False)
+
+            ok_future = MagicMock()
+            ok_future.result.return_value = None
+            timeout_future = MagicMock()
+            timeout_future.result.side_effect = concurrent.futures.TimeoutError
+            executor = MagicMock()
+            executor.submit.side_effect = [ok_future, ok_future, timeout_future]
+            engine._mlx_executor = executor
+
+            with (
+                patch(
+                    "omlx.engine_core.compile_cache_clear_available", return_value=True
+                ),
+                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
+                pytest.raises(SystemExit),
+            ):
+                engine.close()
+
+            timeout_future.result.assert_called_once_with(timeout=60.0)
+            assert "MLX compile cache" in fatal.call_args.args[0]
 
 
 class TestEngineCoreGetCacheStats:

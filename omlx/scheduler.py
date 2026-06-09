@@ -50,6 +50,7 @@ from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
+from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -384,6 +385,13 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
 
+    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
+    # and `for p in self.logits_processors[e]`, both of which crash when
+    # logits_processors is None.  Normalise to [] so the original code path
+    # works without modification.  See #934.
+    if self.logits_processors is None:
+        self.logits_processors = []
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
@@ -570,7 +578,9 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        new_batch.logits_processors = self.logits_processors
+        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
+        lps = self.logits_processors if self.logits_processors is not None else []
+        new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
 
@@ -872,6 +882,43 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
     return advanced
 
 
+def _get_attr_or_key(obj: Any, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return None
+    if type(value).__module__.startswith("unittest.mock"):
+        return None
+    return value
+
+
+def _model_declares_llama4(model: Any) -> bool:
+    """Return True if the loaded model/config tree declares Llama 4."""
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _get_attr_or_key(obj, "model_type") == "llama4":
+            return True
+
+        for attr in ("config", "args", "text_config", "language_config", "llm_config"):
+            child = _get_attr_or_key(obj, attr)
+            if child is not None and not isinstance(
+                child, (str, bytes, int, float, bool)
+            ):
+                stack.append(child)
+    return False
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -1051,6 +1098,12 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        self._serialize_llama4_requests = _model_declares_llama4(model)
+        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
+            logger.info(
+                "Llama 4 detected; serializing requests because ChunkedKVCache "
+                "does not support multi-row batching yet"
+            )
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -2029,7 +2082,7 @@ class Scheduler:
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens_seq,
             sampler=sampler,
-            logits_processors=logits_processors if logits_processors else None,
+            logits_processors=logits_processors if logits_processors else [],
             prefill_batch_size=1,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
@@ -5602,9 +5655,9 @@ class Scheduler:
         self._generation_overflow_recovery_ids.intersection_update(active_ids)
 
     def _effective_max_num_seqs(self) -> int:
-        """Current admission cap, narrowed during generation-overflow retry."""
+        """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
-        if self._generation_overflow_recovery_ids:
+        if self._serialize_llama4_requests or self._generation_overflow_recovery_ids:
             return 1
         return max(1, self.config.max_num_seqs)
 
@@ -7821,7 +7874,7 @@ class Scheduler:
         logger.info("Scheduler shutdown initiated...")
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
-        # below before the executor is joined.
+        # below before the executor is asked to shut down.
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
@@ -7833,15 +7886,21 @@ class Scheduler:
                         "Waiting for %d inflight async store_cache future(s)...",
                         len(inflight),
                     )
-                    concurrent.futures.wait(inflight, timeout=30.0)
+                    _done, not_done = concurrent.futures.wait(
+                        inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+                    )
+                    if not_done:
+                        fatal_exit(
+                            "Scheduler shutdown timed out after "
+                            f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
+                            f"{len(not_done)} async store_cache future(s)"
+                        )
                 self._drain_pending_async_removes()
-                self._store_cache_executor.shutdown(wait=True)
-                # Final drain after executor join. All workers are now done,
-                # so any entries still in _pending_async_removes (skipped by
-                # the first drain because their future hadn't completed yet)
-                # are guaranteed drainable here. Without this, slow worker
-                # finishes between the 30s wait timeout and shutdown(wait=True)
-                # would leave KV cache references pinned on Request objects.
+                self._store_cache_executor.shutdown(wait=False)
+                # Final drain after the bounded wait. If all workers finished
+                # before the timeout, skipped entries are now drainable. If not,
+                # fatal_exit() above terminates the process instead of leaving
+                # a partially torn-down engine alive.
                 self._drain_pending_async_removes()
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")

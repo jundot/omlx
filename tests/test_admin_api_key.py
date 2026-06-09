@@ -600,6 +600,28 @@ class TestStatsSecurity:
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
 
+    def test_active_models_data_ignores_enforcer_status_error(self):
+        """Admin stats should not fail when memory telemetry is unavailable."""
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [],
+            "current_model_memory": 123,
+            "final_ceiling": 456,
+        }
+        enforcer = MagicMock(spec=["get_status"])
+        enforcer.get_status.side_effect = RuntimeError("host_statistics64 failed")
+        state = SimpleNamespace(process_memory_enforcer=enforcer)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+        ):
+            result = admin_routes._build_active_models_data()
+
+        assert result["model_memory_used"] == 123
+        assert result["model_memory_max"] == 456
+        assert result["memory_pressure"]["enabled"] is False
+
     def test_stats_resolves_alias_on_read(self):
         """Per-model dropdown ID may be an alias; stats endpoint should resolve
         before querying the metrics store so per-model counters aren't zeroed."""

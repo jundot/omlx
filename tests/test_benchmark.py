@@ -2,6 +2,7 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from omlx.admin.benchmark import (
     BenchmarkRun,
     _clean_model_name,
     _compute_single_metrics,
+    _detect_experimental_features,
     _detect_quantization,
     _generate_prompt,
     cleanup_old_runs,
@@ -229,6 +231,33 @@ class TestBenchmarkRunLifecycle:
 
         completed = [r for r in _benchmark_runs.values() if r.status == "completed"]
         assert len(completed) <= 5
+
+
+# =============================================================================
+# Experimental feature detection tests
+# =============================================================================
+
+
+class TestExperimentalFeatureDetection:
+    def test_detects_all_upload_skipping_features(self):
+        settings = SimpleNamespace(
+            dflash_enabled=True,
+            specprefill_enabled=True,
+            turboquant_kv_enabled=True,
+            mtp_enabled=True,
+            vlm_mtp_enabled=True,
+        )
+
+        assert _detect_experimental_features(settings) == [
+            "dflash",
+            "specprefill",
+            "turboquant",
+            "mtp",
+            "vlm_mtp",
+        ]
+
+    def test_missing_flags_are_treated_as_disabled(self):
+        assert _detect_experimental_features(SimpleNamespace()) == []
 
 
 # =============================================================================

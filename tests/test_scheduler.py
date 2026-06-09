@@ -266,6 +266,17 @@ class TestSchedulerInitialization:
 
         assert scheduler.config.max_num_seqs == 64
 
+    def test_llama4_effective_cap_is_serial(self, mock_model, mock_tokenizer):
+        """Llama 4 uses ChunkedKVCache layers that are serialized for now."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=8),
+        )
+
+        assert scheduler._effective_max_num_seqs() == 1
+
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
     ):
@@ -937,14 +948,11 @@ class TestSchedulerReset:
     ):
         """reset() must drop _pending_async_removes and _inflight_store_futures.
 
-        Regression for #1459: when a slow async store_cache worker finishes
-        between scheduler.shutdown()'s 30s wait timeout and the subsequent
-        executor.shutdown(wait=True), the deferred _drain_pending_async_removes
-        step that nulls req._extracted_cache never runs again. If reset()
-        leaves these two containers populated, the futures keep Request
-        references alive and the KV cache stays pinned for the rest of the
-        process lifetime. Clearing them in reset() is the second line of
-        defense after shutdown()'s final drain.
+        Regression for #1459: a slow async store_cache worker can leave the
+        deferred _drain_pending_async_removes step that nulls req._extracted_cache
+        pending. If reset() leaves these two containers populated, the futures
+        keep Request references alive and the KV cache stays pinned for the rest
+        of the process lifetime.
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
@@ -957,17 +965,15 @@ class TestSchedulerReset:
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
 
-    def test_shutdown_drains_after_executor_join(self, mock_model, mock_tokenizer):
-        """shutdown() must drain pending removes again after executor join.
+    def test_shutdown_drains_after_bounded_wait(self, mock_model, mock_tokenizer):
+        """shutdown() must drain pending removes after the bounded wait.
 
-        Regression for #1459. When the 30s `wait()` times out, the first
-        drain skips not-yet-done futures (deque break on `not future.done()`).
-        `executor.shutdown(wait=True)` then joins all workers — by the time
-        it returns, every future is done — but without a second drain those
-        skipped entries stay pinned, keeping the request's KV cache alive
-        for the rest of the process lifetime.
+        Regression for #1459. If the bounded wait completes, every future is
+        done and the second drain releases skipped entries. If it does not
+        complete, shutdown takes the fatal-exit path instead of leaving a
+        partially torn-down engine alive.
 
-        Asserts: drain runs both before and after executor.shutdown.
+        Asserts: drain runs both before and after executor.shutdown(wait=False).
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
@@ -991,7 +997,7 @@ class TestSchedulerReset:
         fake_executor.shutdown.side_effect = record_executor_shutdown
         scheduler._drain_pending_async_removes = record_drain
 
-        with patch("concurrent.futures.wait"):
+        with patch("concurrent.futures.wait", return_value=({object()}, set())):
             scheduler.shutdown()
 
         assert call_order == [
@@ -999,6 +1005,29 @@ class TestSchedulerReset:
             "executor_shutdown",
             "drain",
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        fake_executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_shutdown_fatal_exits_when_store_cache_worker_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store-cache worker is fatal during scheduler shutdown."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        future = MagicMock()
+        scheduler._inflight_store_futures["req-stuck"] = future
+
+        with (
+            patch("concurrent.futures.wait", return_value=(set(), {future})),
+            patch("omlx.scheduler.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.shutdown()
+
+        assert "Scheduler shutdown timed out after 60s" in fatal.call_args.args[0]
+        fake_executor.shutdown.assert_not_called()
 
 
 class TestSchedulerStopTokens:
@@ -2577,6 +2606,39 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._ensure_batch_generator.assert_called_once_with(
             request.sampling_params
         )
+
+    def test_llama4_admission_serializes_waiting_requests(
+        self, mock_model, mock_tokenizer
+    ):
+        """A second Llama 4 request stays queued instead of forming a batch."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=4),
+        )
+        first = self._make_request("req-llama4-1")
+        second = self._make_request("req-llama4-2")
+        self._queue_request(scheduler, first)
+        self._queue_request(scheduler, second)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert rejected == []
+        assert scheduled == [first]
+        assert list(scheduler.waiting) == [second]
+        assert list(scheduler.running) == [first.request_id]
+        assert batch_generator.insert.call_count == 1
 
     def test_schedule_waiting_defers_when_pending_cleanups_reach_cap(
         self, mock_model, mock_tokenizer

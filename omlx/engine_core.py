@@ -28,21 +28,21 @@ from typing import (
     Dict,
     List,
     Optional,
-    Set,
     Tuple,
     Union,
 )
 
 import mlx.core as mx
 
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .request import Request, RequestOutput, SamplingParams
+from .scheduler import Scheduler, SchedulerConfig
 from .utils.compile_cache import (
     clear_thread_compile_cache,
     compile_cache_clear_available,
 )
+from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ def _init_mlx_thread() -> None:
     ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
     """
     import sys
+
     import mlx.core as mx
 
     stream = mx.new_thread_local_stream(mx.default_device())
@@ -918,8 +919,17 @@ class EngineCore:
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+            fn_name = getattr(fn, "__name__", repr(fn))
             try:
-                self._mlx_executor.submit(fn).result()
+                self._mlx_executor.submit(fn).result(
+                    timeout=FATAL_TEARDOWN_TIMEOUT_S
+                )
+            except concurrent.futures.TimeoutError:
+                fatal_exit(
+                    f"Engine teardown timed out after "
+                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while running "
+                    f"{fn_name} for engine {self._engine_id}"
+                )
             except RuntimeError:
                 try:
                     fn()
@@ -966,13 +976,22 @@ class EngineCore:
             # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
             # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
             # held) before the thread is torn down so the destructor runs on an
-            # empty cache, then shut down normally. See utils/compile_cache.py.
+            # empty cache, then request shutdown without waiting indefinitely.
+            # See utils/compile_cache.py.
             if compile_cache_clear_available():
                 try:
-                    self._mlx_executor.submit(clear_thread_compile_cache).result()
+                    self._mlx_executor.submit(clear_thread_compile_cache).result(
+                        timeout=FATAL_TEARDOWN_TIMEOUT_S
+                    )
+                except concurrent.futures.TimeoutError:
+                    fatal_exit(
+                        f"Engine teardown timed out after "
+                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while clearing "
+                        f"MLX compile cache for engine {self._engine_id}"
+                    )
                 except RuntimeError:
                     pass
-                self._mlx_executor.shutdown(wait=True)
+                self._mlx_executor.shutdown(wait=False)
             else:
                 # Fallback: the clear symbol is unavailable, so do NOT exit the
                 # worker thread (that would run the unsafe destructor). Keep it

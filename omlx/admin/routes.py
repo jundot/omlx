@@ -4150,7 +4150,12 @@ def _build_active_models_data() -> dict:
         if server_state is not None
         else None
     )
-    enforcer_status = enforcer.get_status() if enforcer is not None else None
+    enforcer_status = None
+    if enforcer is not None:
+        try:
+            enforcer_status = enforcer.get_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory enforcer status unavailable: %s", exc)
     models = []
     total_active = 0
     total_waiting = 0

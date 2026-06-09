@@ -507,10 +507,7 @@ def _status_to_error_type(status_code: int) -> str:
     if status_code == 404:
         return "not_found_error"
     if status_code == 413:
-        # Prefill-memory-guard rejection. OpenAI uses
-        # invalid_request_error for context-window-exceeded as well; we
-        # use the finer-grained 413 status but the same type so existing
-        # clients that branch on type still recognise the failure mode.
+        # Body-size rejections are still request-shape errors.
         return "invalid_request_error"
     if status_code == 429:
         return "rate_limit_error"
@@ -626,27 +623,31 @@ async def scheduler_queue_full_handler(
 async def prefill_memory_exceeded_handler(
     request: FastAPIRequest, exc: PrefillMemoryExceededError
 ):
-    """Map prefill peak overshoot to HTTP 413 with a clean JSON body.
+    """Map prefill peak overshoot to HTTP 400 with a clear JSON body.
 
     The synchronous prefill memory guard in ``Scheduler.add_request`` raises
     this when the estimated KV+SDPA peak for a request would push memory
-    past the user-configured ``max_process_memory``. The caller's prompt
+    past the user-configured memory guard ceiling. The caller's prompt
     fits in the model's context window but is too large for the host's
-    headroom, so 413 (Payload Too Large) is the right code.
+    headroom.
 
-    Code vs status trade-off: 413 (Payload Too Large) is a request-shape
-    error; 507 (Insufficient Storage) more accurately describes "host
-    can't service it right now". We use 413 because it maps cleanly to
-    the OpenAI SDK retry-with-smaller-input flow that most clients
-    already implement, and the ``error.code`` field gives consumers a
-    machine-readable discriminator (``"prefill_memory_exceeded"``)
-    distinct from genuine context-window-exceeded rejections.
+    This is an actionable request rejection, not an HTTP body-size
+    rejection. HTTP 400 also prevents Anthropic clients from collapsing
+    this oMLX memory-guard failure into Anthropic's generic
+    "Request too large (max 32MB)" body-size error.
     """
-    detail = str(exc)
+    detail = (
+        "oMLX prefill memory guard rejected this prompt: "
+        f"{str(exc)} "
+        "To continue, set Memory Guard to aggressive, raise the custom "
+        "memory guard ceiling, free system memory, or compact/reduce context."
+    )
+    status_code = 400
     logger.warning(
-        "%s %s → 413: %s",
+        "%s %s → %d: %s",
         request.method,
         request.url.path,
+        status_code,
         detail,
     )
     if _is_api_route(request):
@@ -655,25 +656,30 @@ async def prefill_memory_exceeded_handler(
         # and "host has no memory headroom" both surface as
         # invalid_request_error with code=None and clients can only
         # tell the user "shorten your prompt" — which is wrong when
-        # the actual fix is to raise --max-process-memory.
+        # the actual fix is to loosen the memory guard.
         content = _openai_error_body(
-            detail, 413, code="prefill_memory_exceeded"
+            detail, status_code, code="prefill_memory_exceeded"
         )
         # Surface the structured fields so clients can branch on
         # numeric values instead of regex-matching the human message.
         # OpenAI clients ignore unknown error fields so this is a
         # forward-compatible extension.
+        content["type"] = "error"
+        content["error"]["omlx_code"] = "prefill_memory_exceeded"
         if exc.estimated_bytes is not None:
             content["error"]["estimated_bytes"] = exc.estimated_bytes
         if exc.limit_bytes is not None:
             content["error"]["limit_bytes"] = exc.limit_bytes
     else:
-        content = {"detail": detail}
+        content = {
+            "detail": detail,
+            "omlx_code": "prefill_memory_exceeded",
+        }
         if exc.estimated_bytes is not None:
             content["estimated_bytes"] = exc.estimated_bytes
         if exc.limit_bytes is not None:
             content["limit_bytes"] = exc.limit_bytes
-    return JSONResponse(status_code=413, content=content)
+    return JSONResponse(status_code=status_code, content=content)
 
 
 @app.exception_handler(Exception)
@@ -1831,7 +1837,12 @@ async def health():
     pool_status = None
     if _server_state.engine_pool is not None:
         enforcer = _server_state.process_memory_enforcer
-        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
+        ceiling = 0
+        if enforcer is not None:
+            try:
+                ceiling = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Health memory ceiling unavailable: %s", exc)
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
@@ -1871,9 +1882,11 @@ async def server_status(_: bool = Depends(verify_api_key)):
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
         enforcer = _server_state.process_memory_enforcer
-        model_memory_max = (
-            enforcer.get_final_ceiling() if enforcer is not None else None
-        )
+        if enforcer is not None:
+            try:
+                model_memory_max = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Status memory ceiling unavailable: %s", exc)
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -1975,6 +1988,7 @@ async def _preprocess_markitdown_files_for_llm(
             settings_manager=_server_state.settings_manager,
             get_sampling_params=get_sampling_params,
             fail_when_disabled=True,
+            allow_missing_historical_files=True,
         )
     except MarkItDownRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -2489,7 +2503,7 @@ async def create_completion(
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
-    # Thread the client-provided X-Request-ID when present so the 413
+    # Thread the client-provided X-Request-ID when present so the 400
     # log line and the FastAPI handler trace correlate with whatever
     # the client is using on its side.
     upstream_request_id = http_request.headers.get("x-request-id")
@@ -2871,7 +2885,7 @@ async def create_chat_completion(
     # so a typed exception thrown later by add_request lands as "Caught
     # handled exception, but response already started" and the client sees
     # an incomplete chunked read. Running the check here lets
-    # prefill_memory_exceeded_handler return a clean HTTP 413.
+    # prefill_memory_exceeded_handler return a clean HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),
@@ -4348,7 +4362,7 @@ async def create_anthropic_message(
         chat_kwargs["stop"] = request.stop_sequences
 
     # Pre-flight prefill memory guard — must precede any StreamingResponse
-    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    # return so PrefillMemoryExceededError can be mapped to HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),
@@ -4763,7 +4777,7 @@ async def create_response(
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
     # Pre-flight prefill memory guard — must precede any StreamingResponse
-    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    # return so PrefillMemoryExceededError can be mapped to HTTP 400.
     await engine.preflight_chat(
         messages,
         request_id=http_request.headers.get("x-request-id"),

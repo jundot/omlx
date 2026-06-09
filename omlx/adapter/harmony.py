@@ -22,7 +22,9 @@ Channels:
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from openai_harmony import (
@@ -51,6 +53,31 @@ _HARMONY_SPECIAL_TOKENS = [
     "<|call|>",
     "<|constrain|>",
 ]
+
+
+@lru_cache(maxsize=1)
+def load_harmony_gpt_oss_encoding() -> HarmonyEncoding:
+    """Load the Harmony gpt-oss encoding with a small retry window."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return load_harmony_encoding("HarmonyGptOss")
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            delay = 0.5 * (2**attempt)
+            logger.warning(
+                "Failed to load HarmonyGptOss encoding "
+                "(attempt %d/3): %s; retrying in %.1fs",
+                attempt + 1,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    assert last_error is not None
+    raise last_error
 
 
 def preprocess_harmony_messages(
@@ -172,7 +199,7 @@ class HarmonyStreamingParser:
 
     def __post_init__(self):
         """Initialize the official Harmony parser."""
-        self._encoding = load_harmony_encoding("HarmonyGptOss")
+        self._encoding = load_harmony_gpt_oss_encoding()
         # role=None allows the parser to handle tool-call headers
         # (e.g. "assistant to=functions.Write") which Role.ASSISTANT rejects.
         self._parser = StreamableParser(self._encoding, None, strict=False)
@@ -377,7 +404,7 @@ def parse_tool_calls_from_tokens(
         return "", "", []
 
     try:
-        encoding = load_harmony_encoding("HarmonyGptOss")
+        encoding = load_harmony_gpt_oss_encoding()
 
         start_tokens = encoding.encode("<|start|>assistant", allowed_special="all")
         has_start = list(token_ids[: len(start_tokens)]) == start_tokens

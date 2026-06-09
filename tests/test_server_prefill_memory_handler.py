@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify PrefillMemoryExceededError maps to HTTP 413 in server.py.
+"""Verify PrefillMemoryExceededError maps to HTTP 400 in server.py.
 
 Regression-arming test for the actual prefill-guard chain validated
 end-to-end on 2026-05-15: the message string format matches what the
@@ -47,16 +47,17 @@ def _build_test_app():
 
 
 class TestPrefillMemoryHandler:
-    def test_returns_413(self):
+    def test_returns_400(self):
         with TestClient(_build_test_app()) as client:
             resp = client.get("/v1/raise")
-        assert resp.status_code == 413
+        assert resp.status_code == 400
 
     def test_api_route_uses_openai_error_body(self):
         """/v1/* routes get the OpenAI-style {"error": {"message": ...}} wrapper."""
         with TestClient(_build_test_app()) as client:
             resp = client.get("/v1/raise")
         body = resp.json()
+        assert body["type"] == "error"
         assert "error" in body
         msg = body["error"]["message"]
         # The guard's diagnostic format is part of the public contract — the
@@ -64,6 +65,10 @@ class TestPrefillMemoryHandler:
         assert "Prefill would require" in msg
         assert "KV+SDPA" in msg
         assert "--max-process-memory" in msg
+        assert "Memory Guard to aggressive" in msg
+        assert "custom memory guard ceiling" in msg
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
 
     def test_api_route_body_carries_estimated_and_limit_bytes(self):
         """Clients branch on the numeric ``estimated_bytes`` /
@@ -86,9 +91,10 @@ class TestPrefillMemoryHandler:
         body = resp.json()
         assert "detail" in body
         assert "Prefill would require" in body["detail"]
+        assert body["omlx_code"] == "prefill_memory_exceeded"
 
 
-class TestResponsesEndpointReaches413:
+class TestResponsesEndpointReaches400:
     """End-to-end regression for ``/v1/responses``. The handler-shape tests
     above use a synthetic ``/v1/raise`` route, which proves the handler
     body but NOT the wiring of every prompt-bearing endpoint to the
@@ -96,7 +102,7 @@ class TestResponsesEndpointReaches413:
     silently regress because it shares the StreamingResponse pattern
     with ``/v1/chat/completions`` and reaches preflight via the same
     code path. This test forces the preflight to raise and asserts
-    the route returns 413 instead of 200/500.
+    the route returns 400 instead of 200/500.
     """
 
     def _make_app_with_failing_preflight(self):
@@ -113,7 +119,7 @@ class TestResponsesEndpointReaches413:
         # Build an engine mock whose preflight_chat raises. The
         # production handler awaits this BEFORE constructing
         # StreamingResponse, so the raise propagates to the
-        # exception handler and the route can still emit 413.
+        # exception handler and the route can still emit 400.
         async def _raising_preflight(*args, **kwargs):
             raise PrefillMemoryExceededError(
                 message=(
@@ -146,7 +152,7 @@ class TestResponsesEndpointReaches413:
 
         return srv.app
 
-    def test_v1_responses_returns_413_when_preflight_rejects(self):
+    def test_v1_responses_returns_400_when_preflight_rejects(self):
         from unittest.mock import MagicMock, patch
 
         import omlx.server as srv
@@ -181,8 +187,8 @@ class TestResponsesEndpointReaches413:
                             "stream": False,
                         },
                     )
-            assert resp.status_code == 413, (
-                f"expected 413, got {resp.status_code}: {resp.text}"
+            assert resp.status_code == 400, (
+                f"expected 400, got {resp.status_code}: {resp.text}"
             )
             body = resp.json()
             assert "error" in body, body

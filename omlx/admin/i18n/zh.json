@@ -609,6 +609,8 @@
   "bench.upload_skipped.features.dflash": "DFlash (speculative decoding)",
   "bench.upload_skipped.features.specprefill": "SpecPrefill (sparse prefill)",
   "bench.upload_skipped.features.turboquant": "TurboQuant KV cache",
+  "bench.upload_skipped.features.mtp": "Native MTP",
+  "bench.upload_skipped.features.vlm_mtp": "VLM MTP",
   "bench.metrics.section_label": "指标参考",
   "bench.metrics.ttft.name": "TTFT",
   "bench.metrics.ttft.full_name": "（首 Token 时间）",

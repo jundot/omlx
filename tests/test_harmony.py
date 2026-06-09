@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Harmony streaming parser (omlx.adapter.harmony)."""
 
-import pytest
 from unittest.mock import MagicMock
 
-from openai_harmony import load_harmony_encoding, StreamableParser
+import pytest
 
 from omlx.adapter.harmony import (
     HarmonyStreamingParser,
+    load_harmony_gpt_oss_encoding,
     parse_tool_calls_from_tokens,
     preprocess_harmony_messages,
 )
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def encoding():
     """Load HarmonyGptOss encoding."""
-    return load_harmony_encoding("HarmonyGptOss")
+    return load_harmony_gpt_oss_encoding()
 
 
 @pytest.fixture

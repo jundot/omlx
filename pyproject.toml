@@ -29,9 +29,9 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.2",
-    # mlx-lm from commit (bdb77da, v0.31.3) - Gemma4 unified LLM remap,
-    # Qwen3.5 pipeline support, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@bdb77dae5389d193dcc333bed891d33f6b668285",
+    # mlx-lm from commit (39c4019, v0.31.3) - short-prompt think-token fix,
+    # Mellum support, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -54,7 +54,7 @@ dependencies = [
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
     "jinja2>=3.0",
-    # mlx-lm bdb77da imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
+    # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
     "rich>=13.0.0",
     "sentencepiece",
     "tiktoken",
@@ -77,14 +77,14 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (54c9a11, main) — includes Gemma4 shared-KV/load fixes,
-    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask alignment,
-    # Phi 3.5 VL EOS fixes, and prior Gemma4 unified audio/MTP fixes.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@54c9a114ecf55f03facacd3684c5fa62403ef26d",
+    # mlx-vlm from commit (c9a6743, main) — includes Gemma4 shared-KV/load fixes,
+    # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask/deepstack
+    # chunked-prefill fixes, Phi 3.5 VL EOS fixes, and speculative prefill fixes.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@c9a6743e5f059be36362d8e4a78171bbf91f18bc",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.9 (b7f192b) - bstnxbt repo. Apple G17 NAX verify
-    # plus PR #37 prefix snapshot performance and hit-kind metrics.
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@b7f192b62bc5a59cad41fda888c1118c60fc58b1",
+    # dflash-mlx v0.1.9 (5d70fae) - bstnxbt repo. Apple G17 NAX verify,
+    # PR #37 prefix snapshot metrics, CopySpec mode, and Qwen text wrapper fix.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@5d70faebe3d0af0a3dae76fcc15cc731f7ba46da",
     "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
@@ -199,7 +199,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@bdb77dae5389d193dcc333bed891d33f6b668285",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
 ]
 
 [tool.black]

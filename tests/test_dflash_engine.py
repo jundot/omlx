@@ -173,6 +173,27 @@ class TestDFlashEngineInit:
         assert engine.tokenizer is None
         assert engine.model_type is None
         assert engine.has_active_requests() is False
+        assert engine.scheduler is None
+
+    def test_scheduler_resolves_nested_fallback_scheduler(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        scheduler = object()
+        fallback = SimpleNamespace(
+            _engine=SimpleNamespace(
+                engine=SimpleNamespace(scheduler=scheduler)
+            )
+        )
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._fallback_engine = fallback
+
+        assert engine.scheduler is scheduler
 
     def test_quant_disabled_keeps_none(self):
         try:

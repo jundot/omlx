@@ -272,8 +272,6 @@ class DFlashEngine(BaseEngine):
             # Idempotent — only wraps once per process.
             from ..patches.dflash_lifecycle import install_dflash_lifecycle_wrap
             install_dflash_lifecycle_wrap()
-            from ..patches.dflash_qwen_compat import install_dflash_qwen_compat_patch
-            install_dflash_qwen_compat_patch()
 
             target_bundle = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
@@ -1201,6 +1199,24 @@ class DFlashEngine(BaseEngine):
             presence_penalty=presence_penalty, **kwargs,
         ):
             yield output
+
+    @property
+    def scheduler(self) -> Any | None:
+        fallback = self._fallback_engine
+        if fallback is None:
+            return None
+
+        scheduler = getattr(fallback, "scheduler", None)
+        if scheduler is not None:
+            return scheduler
+
+        inner = getattr(fallback, "_engine", None)
+        if inner is None:
+            return None
+        inner_engine = getattr(inner, "engine", None)
+        if inner_engine is None:
+            return None
+        return getattr(inner_engine, "scheduler", None)
 
     def has_active_requests(self) -> bool:
         if self._fallback_engine is not None and self._fallback_engine.has_active_requests():

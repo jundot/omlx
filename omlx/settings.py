@@ -58,6 +58,8 @@ def get_system_memory() -> int:
         return psutil.virtual_memory().total
     except ImportError:
         pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("psutil failed to detect system memory: %s", exc)
 
     # Fallback for Unix systems
     try:
