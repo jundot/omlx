@@ -147,6 +147,11 @@ class MLXEmbeddingModel:
             self._validate_native_weights(model_instance, weights)
             model_instance.load_weights(list(weights.items()), strict=False)
             mx.eval(model_instance.parameters())
+            # Embedding inference must be deterministic: put the model in eval
+            # mode so dropout (p>0 in XLM-RoBERTa/BERT) is disabled. Without this
+            # every /v1/embeddings call applies random dropout, producing
+            # non-deterministic, corrupted vectors.
+            model_instance.train(False)
 
             try:
                 tokenizer = AutoTokenizer.from_pretrained(
