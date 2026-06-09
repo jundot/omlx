@@ -52,6 +52,7 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import PrefillMemoryExceededError, is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
+from .logprobs import extract_token_logprob
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
@@ -8245,13 +8246,29 @@ class Scheduler:
                             request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
 
-            # Immediately discard logprobs if not requested to free memory (~800KB per response)
-            # This prevents accumulation of large MLX arrays during streaming
-            if (
-                hasattr(response, "logprobs")
-                and response.logprobs is not None
-                and not request.sampling_params.logprobs
-            ):
+            # Logprobs: extract the compact per-token entry when requested, then
+            # drop the full-vocab array either way to free memory (~800KB per
+            # response). The disabled path stays a plain discard — no extra work.
+            token_logprobs = None
+            if hasattr(response, "logprobs") and response.logprobs is not None:
+                if request.sampling_params.logprobs and not is_stop:
+                    # Speculative/MTP paths report the proposing head's
+                    # distribution, not the target model's — suppress logprobs
+                    # there for now (#1549 v1; tracked for true support).
+                    mtp_logprobs_unsafe = (
+                        isinstance(response, _VLMMTPResponse)
+                        or getattr(self.model, "mtp", None) is not None
+                    )
+                    if not mtp_logprobs_unsafe:
+                        tl = extract_token_logprob(
+                            response.logprobs,
+                            response.token,
+                            request.sampling_params.top_logprobs or 0,
+                        )
+                        # Carry the token's decoded text so the API layer can
+                        # keep streaming logprobs aligned to content tokens.
+                        tl.text = new_text
+                        token_logprobs = [tl]
                 response.logprobs = None
 
             # Create output
@@ -8270,6 +8287,7 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
+                logprobs=token_logprobs,
             )
 
             if not is_finished:

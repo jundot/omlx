@@ -596,6 +596,13 @@ class SamplingSettings:
     top_p: float = 0.95
     top_k: int = 0
     repetition_penalty: float = 1.0
+    # Launch-side cap for OpenAI per-token top_logprobs, clamped to OpenAI's
+    # 0-20 range (#1549). 0 disables the top list; the per-request `logprobs`
+    # flag remains the cost gate.
+    top_logprobs_k: int = 20
+
+    def __post_init__(self):
+        self.top_logprobs_k = max(0, min(int(self.top_logprobs_k), 20))
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -607,6 +614,7 @@ class SamplingSettings:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "repetition_penalty": self.repetition_penalty,
+            "top_logprobs_k": self.top_logprobs_k,
         }
 
     @classmethod
@@ -620,6 +628,7 @@ class SamplingSettings:
             top_p=data.get("top_p", 0.95),
             top_k=data.get("top_k", 0),
             repetition_penalty=data.get("repetition_penalty", 1.0),
+            top_logprobs_k=data.get("top_logprobs_k", 20),
         )
 
 

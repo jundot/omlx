@@ -257,6 +257,25 @@ class Request:
 
 
 @dataclass
+class TokenLogprob:
+    """Compact per-token logprob info carried from engine to API layer (#1549).
+
+    Holds the chosen token's logprob plus the top-K candidates (ids + logprobs,
+    sorted descending). Token-string / bytes decoding is deferred to the API
+    layer where the tokenizer lives.
+    """
+
+    token_id: int
+    logprob: float
+    top_ids: List[int] = field(default_factory=list)
+    top_logprobs: List[float] = field(default_factory=list)
+    # Decoded text of this token (set by the scheduler), used to keep
+    # streaming logprobs aligned to content tokens through the thinking/tool
+    # text routing. Empty when not needed.
+    text: str = ""
+
+
+@dataclass
 class RequestOutput:
     """
     Output for a single request after a generation step.
@@ -289,6 +308,9 @@ class RequestOutput:
     tool_calls: Optional[List[Dict[str, str]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Per-token logprobs for tokens generated in this step (None unless the
+    # request opted in via sampling_params.logprobs). One entry per new token.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Error message (set when engine encounters an unrecoverable error)
     error: Optional[str] = None
     # Structured internal error classification for API-layer mapping.

@@ -31,6 +31,9 @@ from omlx.api.openai_models import (
     ResponseFormatJsonSchema,
     ToolCall,
     ToolDefinition,
+    TopLogprob,
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
     Usage,
 )
 
@@ -845,3 +848,87 @@ class TestStopCoercion:
             stop=["a"],
         )
         assert req.stop == ["a"]
+
+
+class TestChatCompletionLogprobs:
+    """OpenAI-style logprobs request params and response models (#1549)."""
+
+    def _msgs(self):
+        return [Message(role="user", content="hi")]
+
+    def test_request_accepts_logprobs_fields(self):
+        req = ChatCompletionRequest(
+            model="m", messages=self._msgs(), logprobs=True, top_logprobs=5
+        )
+        assert req.logprobs is True
+        assert req.top_logprobs == 5
+
+    def test_request_defaults_logprobs_off(self):
+        req = ChatCompletionRequest(model="m", messages=self._msgs())
+        assert req.logprobs is False
+        assert req.top_logprobs is None
+
+    def test_top_logprobs_requires_logprobs_true(self):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(model="m", messages=self._msgs(), top_logprobs=5)
+
+    def test_top_logprobs_rejects_above_20(self):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="m", messages=self._msgs(), logprobs=True, top_logprobs=21
+            )
+
+    def test_top_logprobs_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="m", messages=self._msgs(), logprobs=True, top_logprobs=-1
+            )
+
+    def test_top_logprobs_zero_allowed_with_logprobs(self):
+        req = ChatCompletionRequest(
+            model="m", messages=self._msgs(), logprobs=True, top_logprobs=0
+        )
+        assert req.top_logprobs == 0
+
+    def test_logprobs_true_without_top_logprobs_ok(self):
+        req = ChatCompletionRequest(model="m", messages=self._msgs(), logprobs=True)
+        assert req.logprobs is True
+        assert req.top_logprobs is None
+
+    def test_response_models_openai_shape(self):
+        lp = ChoiceLogprobs(
+            content=[
+                ChatCompletionTokenLogprob(
+                    token="Hi",
+                    logprob=-0.12,
+                    bytes=[72, 105],
+                    top_logprobs=[
+                        TopLogprob(token="Hi", logprob=-0.12, bytes=[72, 105]),
+                        TopLogprob(
+                            token="Hello",
+                            logprob=-1.8,
+                            bytes=[72, 101, 108, 108, 111],
+                        ),
+                    ],
+                )
+            ]
+        )
+        choice = ChatCompletionChoice(
+            message=AssistantMessage(content="Hi"), logprobs=lp
+        )
+        dumped = json.loads(choice.model_dump_json(exclude_none=True))
+        entry = dumped["logprobs"]["content"][0]
+        assert entry["token"] == "Hi"
+        assert entry["bytes"] == [72, 105]
+        assert entry["top_logprobs"][1]["token"] == "Hello"
+
+    def test_choice_logprobs_absent_by_default(self):
+        choice = ChatCompletionChoice(message=AssistantMessage(content="Hi"))
+        dumped = json.loads(choice.model_dump_json(exclude_none=True))
+        assert "logprobs" not in dumped
+
+    def test_chunk_choice_has_logprobs_field(self):
+        chunk_choice = ChatCompletionChunkChoice(
+            delta=ChatCompletionChunkDelta(content="Hi")
+        )
+        assert chunk_choice.logprobs is None

@@ -6,9 +6,65 @@ Utility functions for text processing.
 
 import json
 import re
-from typing import Any, List
+from typing import Any, List, Optional
 
-from .openai_models import Message
+from ..request import TokenLogprob
+from .openai_models import (
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
+    Message,
+    TopLogprob,
+)
+
+
+# =============================================================================
+# Logprobs formatting (#1549)
+# =============================================================================
+
+
+def _decode_token_text_bytes(tokenizer, token_id: int):
+    """Decode a single token id to (text, utf-8 byte list). Best-effort."""
+    try:
+        text = tokenizer.decode([int(token_id)])
+    except Exception:
+        text = ""
+    try:
+        token_bytes = list(text.encode("utf-8"))
+    except Exception:
+        token_bytes = None
+    return text, token_bytes
+
+
+def token_logprob_to_openai(
+    token_logprob: TokenLogprob, tokenizer
+) -> ChatCompletionTokenLogprob:
+    """Convert an engine ``TokenLogprob`` to the OpenAI response shape."""
+    text, token_bytes = _decode_token_text_bytes(tokenizer, token_logprob.token_id)
+    top = []
+    for tid, lp in zip(token_logprob.top_ids, token_logprob.top_logprobs):
+        t_text, t_bytes = _decode_token_text_bytes(tokenizer, tid)
+        top.append(TopLogprob(token=t_text, logprob=float(lp), bytes=t_bytes))
+    return ChatCompletionTokenLogprob(
+        token=text,
+        logprob=float(token_logprob.logprob),
+        bytes=token_bytes,
+        top_logprobs=top,
+    )
+
+
+def build_choice_logprobs(
+    token_logprobs: Optional[List[TokenLogprob]], tokenizer
+) -> Optional[ChoiceLogprobs]:
+    """Build an OpenAI ``ChoiceLogprobs`` from engine ``TokenLogprob`` entries.
+
+    Returns ``None`` when there are no entries so the field is omitted from the
+    response (callers use ``exclude_none=True``).
+    """
+    if not token_logprobs:
+        return None
+    return ChoiceLogprobs(
+        content=[token_logprob_to_openai(tl, tokenizer) for tl in token_logprobs]
+    )
 
 # Model families whose chat templates consume message.reasoning_content directly.
 _NATIVE_REASONING_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}

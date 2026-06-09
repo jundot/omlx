@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
+from omlx.request import TokenLogprob
 
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
@@ -79,6 +80,10 @@ class GenerationOutput:
     diffusion_work_tps: float = 0.0
     generated_at: Optional[float] = None
     generated_until: Optional[float] = None
+    # Per-token logprobs (None unless the request opted in). For streaming,
+    # carries the entries for this chunk's new tokens; for non-streaming, the
+    # full sequence accumulated across steps.
+    logprobs: Optional[List[TokenLogprob]] = None
 
 
 class BaseEngine(ABC):
