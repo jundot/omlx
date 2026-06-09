@@ -349,6 +349,21 @@ class ModelSettings:
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
             )
+        if self.mtp_enabled and self.turboquant_kv_enabled:
+            raise ValueError(
+                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
+                "TurboQuant patches the attention path that MTP relies on"
+            )
+        # SpecPrefill's prefill-TPS boost is wired only inside BatchedEngine
+        # (scheduler.set_specprefill_draft_model). DFlashEngine has no scheduler
+        # and silently discards the specprefill kwargs, so the combination is a
+        # no-op for prefill. Reject it at construction so the conflict surfaces
+        # in the admin UI / API rather than as silent lost performance (#1233).
+        if self.dflash_enabled and self.specprefill_enabled:
+            raise ValueError(
+                "dflash_enabled and specprefill_enabled cannot both be True; "
+                "specprefill has no effect when DFlash is the active engine"
+            )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
         # or with TurboQuant (which mutates the same cache objects).
