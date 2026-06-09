@@ -670,6 +670,18 @@ class DFlashEngine(BaseEngine):
         )
         return event_iter, prefix_flow, stop_ids
 
+    @staticmethod
+    def _cached_tokens_from_flow(prefix_flow) -> int:
+        """Prompt tokens served from the DFlash prefix snapshot (prefill skipped).
+
+        On a hit ``PrefixCacheFlow.hit_tokens`` is the number of matched prompt
+        tokens; surfacing it as ``cached_tokens`` makes DFlash report prefix-cache
+        hits like the batched engine does instead of always reporting 0 (#1441).
+        """
+        if prefix_flow is None:
+            return 0
+        return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
+
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
@@ -772,6 +784,9 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        # Prefix-snapshot hit count, surfaced on the final
+                        # (usage) chunk so the API reports cached_tokens (#1441).
+                        "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -892,7 +907,7 @@ class DFlashEngine(BaseEngine):
                     final = parser_session.finalize()
                     if final.visible_text:
                         parsed_visible_parts.append(final.visible_text)
-                return summary, tokens, parser_session, parsed_visible_parts
+                return summary, tokens, parser_session, parsed_visible_parts, prefix_flow
             finally:
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
@@ -906,7 +921,7 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated, parser_session, parsed_visible_parts = (
+            summary, generated, parser_session, parsed_visible_parts, prefix_flow = (
                 await asyncio.shield(asyncio.wrap_future(future))
             )
         except asyncio.CancelledError:
@@ -953,6 +968,7 @@ class DFlashEngine(BaseEngine):
             tokens=generated,
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
+            cached_tokens=self._cached_tokens_from_flow(prefix_flow),
             finish_reason="stop",
         )
 
@@ -1063,6 +1079,9 @@ class DFlashEngine(BaseEngine):
                     tokens=new_tokens,
                     prompt_tokens=prompt_len,
                     completion_tokens=total_completion,
+                    # Carried only on the final (usage) chunk's metrics; 0 on
+                    # token deltas so the server's per-chunk sum isn't inflated.
+                    cached_tokens=(metrics or {}).get("cached_tokens", 0),
                     finished=finished,
                     finish_reason=finish_reason,
                 )
