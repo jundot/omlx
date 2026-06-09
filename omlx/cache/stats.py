@@ -90,6 +90,8 @@ class PrefixCacheStats(BaseCacheStats):
     last_tokens_to_next_block: int = 0
     tokens_matched_total: int = 0
     tokens_requested_total: int = 0
+    retained_restore_walkbacks: int = 0
+    placeholder_full_rejects: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -115,6 +117,8 @@ class PrefixCacheStats(BaseCacheStats):
         self.last_tokens_to_next_block = 0
         self.tokens_matched_total = 0
         self.tokens_requested_total = 0
+        self.retained_restore_walkbacks = 0
+        self.placeholder_full_rejects = 0
         self._total_queries = 0
 
 

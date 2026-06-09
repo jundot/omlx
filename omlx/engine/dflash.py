@@ -17,6 +17,7 @@ import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -624,6 +625,8 @@ class DFlashEngine(BaseEngine):
         self,
         prompt_tokens: list[int],
         max_tokens: int,
+        prefix_cache_request: Any | None = None,
+        prefix_cache_chat_template_kwargs: dict[str, Any] | None = None,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
@@ -635,18 +638,20 @@ class DFlashEngine(BaseEngine):
         # ``model_key`` is consumed as a tuple where index 0 = target id and
         # index 2 = draft id; the middle slot is unused on the dflash side.
         # ``tokenizer`` and ``cli_args`` are required since dflash-mlx 1ba6713 —
-        # build_prefix_key hashes the chat template / policy. cli_args=None
-        # makes chat_template_args fall back to {}.
+        # build_prefix_key hashes the chat template / policy.
         class _ModelProviderShim:
             model_key = (self._model_name, None, self._draft_model_path)
             tokenizer = self._executor_tokenizer
-            cli_args = None
+            cli_args = SimpleNamespace(
+                chat_template_args=prefix_cache_chat_template_kwargs or {}
+            )
 
         prefix_flow = PrefixCacheFlow.for_request(
             model_provider=_ModelProviderShim(),
             draft_model=self._draft_model,
             tokenizer=self._executor_tokenizer,
             prompt=prompt_tokens,
+            request=prefix_cache_request,
             runtime_context=self._runtime_context,
         )
 
@@ -680,6 +685,8 @@ class DFlashEngine(BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        prefix_cache_request: Any | None = None,
+        prefix_cache_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -695,7 +702,10 @@ class DFlashEngine(BaseEngine):
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
+                prefix_cache_request=prefix_cache_request,
+                prefix_cache_chat_template_kwargs=prefix_cache_chat_template_kwargs,
             )
+            prefix_hit_tokens = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
@@ -774,6 +784,7 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        "cached_tokens": prefix_hit_tokens,
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -822,6 +833,10 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prefix_cache_request = kwargs.pop("prefix_cache_request", None)
+        prefix_cache_chat_template_kwargs = kwargs.pop(
+            "prefix_cache_chat_template_kwargs", None
+        )
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
@@ -871,7 +886,10 @@ class DFlashEngine(BaseEngine):
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
+                    prefix_cache_request=prefix_cache_request,
+                    prefix_cache_chat_template_kwargs=prefix_cache_chat_template_kwargs,
                 )
+                prefix_hit_tokens = int(getattr(prefix_flow, "hit_tokens", 0) or 0)
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
@@ -894,7 +912,7 @@ class DFlashEngine(BaseEngine):
                     final = parser_session.finalize()
                     if final.visible_text:
                         parsed_visible_parts.append(final.visible_text)
-                return summary, tokens, parser_session, parsed_visible_parts
+                return summary, tokens, parser_session, parsed_visible_parts, prefix_hit_tokens
             finally:
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
@@ -908,7 +926,7 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated, parser_session, parsed_visible_parts = (
+            summary, generated, parser_session, parsed_visible_parts, prefix_hit_tokens = (
                 await asyncio.shield(asyncio.wrap_future(future))
             )
         except asyncio.CancelledError:
@@ -956,6 +974,7 @@ class DFlashEngine(BaseEngine):
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
             finish_reason="stop",
+            cached_tokens=prefix_hit_tokens,
         )
 
     async def stream_generate(
@@ -974,6 +993,10 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prefix_cache_request = kwargs.pop("prefix_cache_request", None)
+        prefix_cache_chat_template_kwargs = kwargs.pop(
+            "prefix_cache_chat_template_kwargs", None
+        )
         prompt_tokens = self._tokenizer_obj.encode(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
@@ -1035,6 +1058,8 @@ class DFlashEngine(BaseEngine):
             queue,
             loop,
             stop_event,
+            prefix_cache_request,
+            prefix_cache_chat_template_kwargs,
         )
 
         total_text = ""
@@ -1059,6 +1084,7 @@ class DFlashEngine(BaseEngine):
                         finish_reason = "error"
                     finished_normally = True
 
+                cached_tokens = int(metrics.get("cached_tokens", 0)) if metrics else 0
                 yield GenerationOutput(
                     text=total_text,
                     new_text=new_text,
@@ -1067,6 +1093,7 @@ class DFlashEngine(BaseEngine):
                     completion_tokens=total_completion,
                     finished=finished,
                     finish_reason=finish_reason,
+                    cached_tokens=cached_tokens,
                 )
 
                 if finished:
@@ -1136,11 +1163,15 @@ class DFlashEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )
 
+        prefix_cache_request = SimpleNamespace(request_type="chat", messages=messages)
         return await self.generate(
             prompt=prompt, max_tokens=max_tokens, temperature=temperature,
             top_p=top_p, top_k=top_k, min_p=min_p,
             repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty, **kwargs,
+            presence_penalty=presence_penalty,
+            prefix_cache_request=prefix_cache_request,
+            prefix_cache_chat_template_kwargs=ct_kwargs,
+            **kwargs,
         )
 
     async def stream_chat(
@@ -1194,11 +1225,15 @@ class DFlashEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )
 
+        prefix_cache_request = SimpleNamespace(request_type="chat", messages=messages)
         async for output in self.stream_generate(
             prompt=prompt, max_tokens=max_tokens, temperature=temperature,
             top_p=top_p, top_k=top_k, min_p=min_p,
             repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty, **kwargs,
+            presence_penalty=presence_penalty,
+            prefix_cache_request=prefix_cache_request,
+            prefix_cache_chat_template_kwargs=ct_kwargs,
+            **kwargs,
         ):
             yield output
 
