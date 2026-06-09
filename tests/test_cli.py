@@ -685,7 +685,9 @@ class TestServeCommandFunctions:
         log_dir = tmp_path / "logs"
         settings = SimpleNamespace()
         settings.base_path = tmp_path
-        settings.server = SimpleNamespace(host=host, port=port, log_level="info")
+        settings.server = SimpleNamespace(
+            host=host, port=port, log_level="info", burst_decode_mode="balanced"
+        )
         settings.huggingface = SimpleNamespace(endpoint=None, hf_cache_enabled=True)
         settings.modelscope = SimpleNamespace(endpoint=None)
         settings.network = SimpleNamespace(

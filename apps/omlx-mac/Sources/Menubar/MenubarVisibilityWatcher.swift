@@ -537,7 +537,8 @@ final class MenubarVisibilityWatcher {
         let bundleIDs = [
             "com.surteesstudios.Bartender",
             "com.jordanbaird.Ice",
-            "com.jordanbaird.ice"
+            "com.jordanbaird.ice",
+            "com.stonerl.Thaw"
         ]
         return bundleIDs.contains { bundleID in
             !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty

@@ -126,6 +126,12 @@ class CacheFactory:
             max_size_bytes=config.max_paged_ssd_cache_size,
             expected_model_name=config.model_name or "",
             expected_block_size=config.block_size,
+            expected_block_size_tokens=config.block_size,
+            # No memory monitor available here, so leave
+            # ``expected_kv_bytes_per_token`` at its 200 KB default.
+            # The Scheduler construction path is the one that benefits
+            # from the model-derived value; this factory is used mostly
+            # by direct/test callers.
         )
 
     @staticmethod

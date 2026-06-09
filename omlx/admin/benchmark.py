@@ -113,6 +113,24 @@ class BenchmarkRun:
 _BENCH_TERMINAL_TYPES = frozenset({"upload_done", "error"})
 
 
+_EXPERIMENTAL_FEATURE_FLAGS = (
+    ("dflash_enabled", "dflash"),
+    ("specprefill_enabled", "specprefill"),
+    ("turboquant_kv_enabled", "turboquant"),
+    ("mtp_enabled", "mtp"),
+    ("vlm_mtp_enabled", "vlm_mtp"),
+)
+
+
+def _detect_experimental_features(model_settings: Any) -> list[str]:
+    """Return benchmark-skewing model features enabled in settings."""
+    return [
+        feature
+        for attr, feature in _EXPERIMENTAL_FEATURE_FLAGS
+        if getattr(model_settings, attr, False)
+    ]
+
+
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
     """Get a benchmark run by ID."""
     return _benchmark_runs.get(bench_id)
@@ -496,8 +514,8 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     )
 
     # Skip upload when experimental features were active during the run.
-    # These features (DFlash, SpecPrefill, TurboQuant KV) skew throughput
-    # and would pollute the community leaderboard if mixed in unmarked.
+    # These features skew throughput and would pollute the community
+    # leaderboard if mixed in unmarked.
     if run.experimental_features:
         run.upload_state["phase"] = "skipped"
         run.upload_state["skipped_reason"] = "experimental_features"
@@ -714,19 +732,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     overall_start = time.perf_counter()
 
     try:
-        # Snapshot experimental flags at run start. Settings can change mid-run
-        # (user toggling DFlash/SpecPrefill/TurboQuant), and the produced
-        # numbers are tied to whatever was active when generation actually ran.
+        # Snapshot experimental flags at run start. Settings can change mid-run,
+        # and the produced numbers are tied to whatever was active when
+        # generation actually ran.
         sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
             try:
                 s = sm.get_settings(request.model_id)
-                if getattr(s, "dflash_enabled", False):
-                    run.experimental_features.append("dflash")
-                if getattr(s, "specprefill_enabled", False):
-                    run.experimental_features.append("specprefill")
-                if getattr(s, "turboquant_kv_enabled", False):
-                    run.experimental_features.append("turboquant")
+                run.experimental_features.extend(_detect_experimental_features(s))
             except Exception as e:
                 logger.warning(
                     f"Benchmark: failed to read experimental flags for "

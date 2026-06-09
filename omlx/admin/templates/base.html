@@ -32,7 +32,11 @@
     <script>
         // Apply theme immediately to prevent flash of wrong theme
         (function() {
-            var theme = localStorage.getItem('omlx-chat-theme') || 'light';
+            var stored = localStorage.getItem('omlx-chat-theme');
+            var theme = stored || 'auto';
+            if (theme === 'auto') {
+                theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
             document.documentElement.setAttribute('data-theme', theme);
         })();
     </script>

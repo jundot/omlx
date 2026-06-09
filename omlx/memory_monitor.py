@@ -68,23 +68,40 @@ class MemoryMonitor:
 
     def __init__(
         self,
-        max_kv_cache_memory: int,
+        max_kv_cache_memory: int | None,
         check_interval: float = 1.0,
+        *,
+        eviction_enabled: bool = True,
     ):
         """
         Initialize the memory monitor.
 
         Args:
-            max_kv_cache_memory: Maximum memory for KV cache in bytes (required).
-                This is the absolute limit for KV cache memory usage.
+            max_kv_cache_memory: Maximum memory for KV cache in bytes.
+                Required when ``eviction_enabled=True``. May be ``None``
+                (or 0) when the monitor is used only for prefill-peak
+                estimation and no eviction/pressure decisions are made
+                against this limit.
             check_interval: Minimum seconds between memory checks (for throttling).
+            eviction_enabled: When False, ``max_kv_cache_memory`` is not
+                consulted and estimation methods that depend on it raise.
+                Set False on schedulers in paged-SSD-only mode where the
+                monitor exists solely for prefill-peak estimation.
         """
-        if max_kv_cache_memory <= 0:
+        if eviction_enabled and (
+            max_kv_cache_memory is None or max_kv_cache_memory <= 0
+        ):
             raise ValueError(
-                f"max_kv_cache_memory must be positive, got {max_kv_cache_memory}"
+                "max_kv_cache_memory must be positive when "
+                f"eviction_enabled=True, got {max_kv_cache_memory}"
             )
 
-        self._max_kv_cache_memory = max_kv_cache_memory
+        self._max_kv_cache_memory = max_kv_cache_memory or 0
+        self._eviction_enabled = eviction_enabled
+        # Public accessor — callers (Scheduler._evict_blocks_*) need a way
+        # to skip the eviction code path without reaching into a private
+        # attribute and without triggering a RuntimeError from
+        # estimate_blocks_to_free().
         self._check_interval = check_interval
         self._max_memory = self._get_max_memory()
 
@@ -111,9 +128,15 @@ class MemoryMonitor:
         self._running_requests: int = 0
         self._waiting_requests: int = 0
 
-        logger.info(
-            f"MemoryMonitor initialized: max_kv_cache={format_bytes(max_kv_cache_memory)}"
-        )
+        if self._eviction_enabled:
+            logger.info(
+                "MemoryMonitor initialized: max_kv_cache=%s",
+                format_bytes(self._max_kv_cache_memory),
+            )
+        else:
+            logger.info(
+                "MemoryMonitor initialized (estimator-only, eviction disabled)"
+            )
 
     def _get_max_memory(self) -> int:
         """
@@ -305,6 +328,26 @@ class MemoryMonitor:
                 f"{format_bytes(sample_block_mem)}"
             )
 
+    def has_model_info(self) -> bool:
+        """Whether ``set_model_info`` has been called with real dims.
+
+        ``estimate_block_memory`` silently substitutes ``32 layers / 8 KV
+        heads / 128 head_dim`` (a 7B-class assumption) when dims are
+        unset, which means callers can't tell "real model" from
+        "estimator default" by inspecting the return value. Use this
+        accessor when the difference matters — e.g. the PagedSSDCache
+        writer-queue cap formula prefers its own 200 KB fallback over
+        the monitor's 128 KB default-fiction.
+        """
+        return (
+            self._num_layers is not None
+            and self._num_layers > 0
+            and self._num_kv_heads is not None
+            and self._num_kv_heads > 0
+            and self._head_dim is not None
+            and self._head_dim > 0
+        )
+
     def estimate_block_memory(
         self,
         block_size: int,
@@ -370,9 +413,10 @@ class MemoryMonitor:
         Estimate per-request prefill peak memory contribution (KV + SDPA).
 
         Returns only the part directly attributable to this request's prefill:
-        newly allocated KV cache + SDPA attention activation peak for the last
-        chunk. Does NOT include model weights (already in active baseline) or
-        MLX cache pool / python heap overhead (absorbed by enforcer's hard
+        KV cache for the new tokens being added + SDPA attention activation
+        peak for the last chunk. Does NOT include model weights (already in
+        active baseline), prefix-cached KV that is already resident, or MLX
+        cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
         MLX SDPA internals (C++ fallback path, head_dim > 128):
@@ -380,6 +424,15 @@ class MemoryMonitor:
           2. softmax(scores) → in-place (already float32)
           3. out = scores @ V → [B, n_q, chunk, head_dim] float32
           GQA: K/V broadcast, no extra allocation.
+
+        Critical: ``kv_len`` for the last chunk is the full prompt
+        (``new_tokens + cached_tokens``), NOT just ``new_tokens``. Even
+        when most of the prompt is served from prefix cache, the SDPA
+        scores tensor spans the entire prompt because attention is
+        computed against the reconstructed KV. Passing only
+        ``new_tokens`` here silently under-counts the panic-prone path
+        — exactly the case where prefix cache hits make long-context
+        prefill possible at all.
 
         MLX SDPA fused kernel (head_dim <= 128):
           Tiled computation, O(n) memory. Only output buffer allocated.
@@ -392,12 +445,19 @@ class MemoryMonitor:
         overflows the MetalAllocator slips past the preflight guard.
 
         Args:
-            new_tokens: Tokens to be prefilled (prompt minus cached prefix).
-                Drives newly allocated KV. Also the last chunk's query length.
-            chunk_size: Prefill step size (default 2048).
-            cached_tokens: Tokens already resident in the prompt cache. Adds to
-                the SDPA kv_len span but not to newly allocated KV (cached KV is
-                already counted in the caller's `current` baseline).
+            new_tokens: Tokens being prefilled this request (prompt minus
+                what the prefix cache already covers). Drives newly
+                allocated KV and the last chunk's query length.
+            chunk_size: Prefill step size (default 2048). Effective chunk
+                is ``min(chunk_size, new_tokens)`` since the last chunk
+                cannot be larger than the remaining new tokens.
+            cached_tokens: Tokens served from prefix cache. Added to
+                ``new_tokens`` for the SDPA scores K-dim because those
+                positions still participate in attention. Keyword-only with
+                a default of 0 so callers that don't know the cache state
+                still typecheck — but they get the under-counting behavior
+                this method was designed to fix, so always pass it when the
+                value is available.
 
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
@@ -411,20 +471,30 @@ class MemoryMonitor:
         if n_q == 0 or hd == 0:
             return 0  # can't estimate
 
-        # Last chunk attends over the full context; query length is the last
-        # chunk size (capped at the new-token count for short suffixes).
-        attn_span = new_tokens + cached_tokens
-        query_len = min(chunk_size, new_tokens)
+        if new_tokens <= 0:
+            return 0
+
+        # Effective chunk: bounded by the remaining new tokens. Short
+        # prompts (smaller than chunk_size) would otherwise be charged the
+        # full chunk_size width in the scores tensor, over-estimating by
+        # chunk_size / new_tokens — a constant-factor over-count that
+        # raised false-positive 413s on small prompts.
+        eff_chunk = min(chunk_size, new_tokens)
+        full_kv_len = new_tokens + max(cached_tokens, 0)
 
         if hd > 128:
             # Fallback: full attention matrix materialized in float32
-            # scores [B, n_q, query_len, attn_span] + output [B, n_q, query_len, hd]
-            attn = n_q * query_len * attn_span * 4
-            attn += n_q * query_len * hd * 4  # output buffer (small)
+            # scores [B, n_q, eff_chunk, full_kv_len] + output
+            # [B, n_q, eff_chunk, hd]
+            attn = n_q * eff_chunk * full_kv_len * 4
+            attn += n_q * eff_chunk * hd * 4  # output buffer (small)
         else:
             # Fused kernel: tiled, only output buffer
-            attn = n_q * query_len * hd * 4
+            attn = n_q * eff_chunk * hd * 4
 
+        # KV growth attributable to this request: only the new tokens.
+        # The cached portion is already counted via the baseline
+        # mx.get_active_memory() reading on the caller side.
         kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
@@ -465,6 +535,11 @@ class MemoryMonitor:
         Returns:
             Number of blocks to evict.
         """
+        if not self._eviction_enabled:
+            raise RuntimeError(
+                "estimate_blocks_to_free called on a MemoryMonitor "
+                "constructed with eviction_enabled=False"
+            )
         block_mem = self.estimate_block_memory(block_size)
         if block_mem <= 0:
             return 0
@@ -482,6 +557,18 @@ class MemoryMonitor:
     def max_kv_cache_memory(self) -> int:
         """Get maximum KV cache memory limit."""
         return self._max_kv_cache_memory
+
+    @property
+    def eviction_enabled(self) -> bool:
+        """Whether this monitor was built with eviction wiring.
+
+        Paged-SSD-only mode passes ``eviction_enabled=False`` because
+        the SDPA-peak / prefill-admission paths don't need KV eviction
+        math. Callers (Scheduler._evict_blocks_*) check this before
+        calling ``estimate_blocks_to_free``, which would otherwise
+        raise ``RuntimeError``.
+        """
+        return self._eviction_enabled
 
     def get_stats(self) -> dict:
         """

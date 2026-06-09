@@ -55,6 +55,22 @@ class TestMemoryMonitor:
         with pytest.raises(ValueError, match="max_kv_cache_memory"):
             MemoryMonitor(max_kv_cache_memory=-1)
 
+    def test_eviction_enabled_property_default_true(self):
+        """The default ``eviction_enabled=True`` makes the
+        public-facing predicate True so the existing tiered-cache
+        path keeps working without changes."""
+        monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+        assert monitor.eviction_enabled is True
+
+    def test_eviction_enabled_property_false_in_ssd_only_mode(self):
+        """Paged-SSD-only mode passes ``eviction_enabled=False``; the
+        public predicate must surface that so Scheduler can branch on
+        it (avoiding the RuntimeError from estimate_blocks_to_free)."""
+        monitor = MemoryMonitor(
+            max_kv_cache_memory=None, eviction_enabled=False
+        )
+        assert monitor.eviction_enabled is False
+
     def test_get_memory_info(self):
         """Test get_memory_info returns valid data."""
         monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
@@ -284,6 +300,11 @@ class TestEstimatePrefillPeakBytes:
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
         assert m.estimate_prefill_peak_bytes(32768, 2048) == 0
 
+    def test_returns_zero_when_no_new_tokens(self):
+        # Fully-prefix-cached request: nothing to prefill, peak is 0.
+        m = self._make_monitor()
+        assert m.estimate_prefill_peak_bytes(0, 2048, cached_tokens=32768) == 0
+
     def test_fused_kernel_below_head_dim_128(self):
         # head_dim<=128 → fused tiled kernel, SDPA peak is just output buffer
         m = self._make_monitor(head_dim=128, n_attn=32, n_kv=4, n_layers=62)
@@ -302,6 +323,35 @@ class TestEstimatePrefillPeakBytes:
         # KV: 48 * 4 * 256 * 2 * 2 * 32768 ≈ 6 GB
         # Total ≈ 8 GB
         assert 7 * 1024**3 < peak < 9 * 1024**3
+
+    def test_sdpa_fallback_accounts_for_cached_kv_in_scores_kdim(self):
+        """Regression for M3: the SDPA scores K-dim spans the FULL prompt
+        (cached + new), not just new_tokens. A heavily-cached long-context
+        request previously slipped through with under-counted peak — the
+        exact Qwen3.6-VL panic scenario this guard is supposed to catch.
+        """
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # Same total prompt (100k), different cache split:
+        # - All-new: cached=0, new=100k
+        # - Heavy cache: cached=99k, new=1k
+        all_new = m.estimate_prefill_peak_bytes(100 * 1024, 2048)
+        heavy_cache = m.estimate_prefill_peak_bytes(
+            1024, 2048, cached_tokens=99 * 1024
+        )
+        # The heavy-cache case must still report a substantial SDPA peak:
+        # n_attn * eff_chunk(=1024) * full_kv(=100k) * 4 bytes ≈ 3 GB.
+        # The KV addition for 1k new tokens is small (~50 MB), so the
+        # estimate is dominated by SDPA scores. The earlier (buggy)
+        # estimator passed only new_tokens to the scores formula and
+        # would have returned ~30 MB for this case — three orders of
+        # magnitude under-count.
+        assert heavy_cache > 1 * 1024**3, (
+            f"heavy-cache peak under-counted: {heavy_cache / 1024**2:.0f} MB"
+        )
+        # And the all-new case (larger eff_chunk = 2048 but same kv_len)
+        # should be larger overall because both KV growth and scores
+        # widen with new_tokens.
+        assert all_new > heavy_cache
 
     def test_scales_linearly_with_token_count(self):
         m = self._make_monitor()
@@ -322,6 +372,23 @@ class TestEstimatePrefillPeakBytes:
         p32k = m.estimate_prefill_peak_bytes(32 * 1024, 2048)
         ratio = p32k / p16k
         assert 1.8 < ratio < 2.2
+
+    def test_eff_chunk_capped_at_new_tokens(self):
+        """Short prompts (smaller than chunk_size) must not be charged
+        the full chunk_size width — the effective chunk is bounded by
+        the number of remaining new tokens. Regression for the constant-
+        factor over-count on small prompts.
+        """
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        # 100-token prompt; chunk_size=2048. eff_chunk should be 100,
+        # not 2048 — so SDPA scores ≈ 8 * 100 * 100 * 4 = 320 KB, not
+        # 8 * 2048 * 100 * 4 = 6.5 MB.
+        peak = m.estimate_prefill_peak_bytes(100, 2048)
+        # KV: 48*4*256*2*2*100 ≈ 19 MB. SDPA ≪ KV here. Total < 25 MB.
+        assert peak < 25 * 1024**2, (
+            f"short-prompt peak suggests chunk wasn't clamped: "
+            f"{peak / 1024**2:.0f} MB"
+        )
 
     def test_no_python_overhead_constant(self):
         # estimator must NOT include cache_pool_overhead or python_overhead

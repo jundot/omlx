@@ -232,17 +232,21 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
                                         <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
-                                    <div class="flex items-center gap-2">
-                                        <select :value="hostMode"
-                                                @change="setHostMode($event.target.value)"
-                                                class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                            <option value="localhost">{{ t('settings.server.host_localhost') }}</option>
-                                            <option value="public">{{ t('settings.server.host_public') }}</option>
-                                            <option value="custom">{{ t('settings.server.host_custom') }}</option>
-                                        </select>
-                                        <input x-show="hostMode === 'custom'" x-cloak
-                                               type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
-                                               class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <div class="flex flex-col items-end gap-1">
+                                        <div class="flex items-center gap-2">
+                                            <select :value="hostMode"
+                                                    @change="setHostMode($event.target.value)"
+                                                    class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <option value="localhost">{{ t('settings.server.host_localhost') }}</option>
+                                                <option value="public">{{ t('settings.server.host_public') }}</option>
+                                                <option value="custom">{{ t('settings.server.host_custom') }}</option>
+                                            </select>
+                                            <input x-show="hostMode === 'custom'" x-cloak
+                                                   type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
+                                                   class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <p x-show="hostMode === 'custom'" x-cloak
+                                           class="text-xs text-neutral-400">{{ t('settings.server.host_multi_hint') }}</p>
                                     </div>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -745,6 +749,29 @@
                             </button>
                             <div x-show="advancedOpen" x-collapse x-cloak>
                                 <div class="border-t border-neutral-200">
+                                    <!-- Performance subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="zap" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.burst_decode') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.burst_decode_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.server.burst_decode_mode"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <option value="off">{{ t('settings.advanced.burst_decode_off') }}</option>
+                                                <option value="light">{{ t('settings.advanced.burst_decode_light') }}</option>
+                                                <option value="balanced">{{ t('settings.advanced.burst_decode_balanced') }}</option>
+                                                <option value="aggressive">{{ t('settings.advanced.burst_decode_aggressive') }}</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
                                     <!-- Cache subsection -->
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">

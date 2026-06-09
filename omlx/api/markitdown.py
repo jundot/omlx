@@ -293,6 +293,7 @@ def preprocess_markitdown_file_parts(
     *,
     global_settings: Any | None = None,
     fail_when_disabled: bool = True,
+    allow_missing_historical_files: bool = False,
 ) -> list[Message]:
     """Replace file content parts with Markdown text parts."""
     if not request_has_file_parts(messages):
@@ -310,7 +311,9 @@ def preprocess_markitdown_file_parts(
     files_seen = 0
     processed: list[Message] = []
 
-    for msg in messages:
+    latest_user_index = _latest_user_index(messages)
+
+    for msg_index, msg in enumerate(messages):
         content = msg.content
         if not isinstance(content, list):
             processed.append(msg)
@@ -322,6 +325,21 @@ def preprocess_markitdown_file_parts(
             part_dict = _part_to_dict(part)
             if part_dict.get("type") != "file":
                 new_parts.append(ContentPart.model_validate(part_dict))
+                continue
+
+            if allow_missing_historical_files and _is_missing_historical_file_part(
+                part_dict,
+                msg=msg,
+                msg_index=msg_index,
+                latest_user_index=latest_user_index,
+            ):
+                new_parts.append(
+                    ContentPart(
+                        type="text",
+                        text=_format_missing_attachment(part_dict),
+                    )
+                )
+                changed = True
                 continue
 
             files_seen += 1
@@ -359,6 +377,7 @@ async def preprocess_markitdown_file_parts_async(
     settings_manager: Any | None = None,
     get_sampling_params: Any | None = None,
     fail_when_disabled: bool = True,
+    allow_missing_historical_files: bool = False,
 ) -> list[Message]:
     """Replace file content parts with Markdown text parts asynchronously."""
     if not request_has_file_parts(messages):
@@ -376,7 +395,9 @@ async def preprocess_markitdown_file_parts_async(
     files_seen = 0
     processed: list[Message] = []
 
-    for msg in messages:
+    latest_user_index = _latest_user_index(messages)
+
+    for msg_index, msg in enumerate(messages):
         content = msg.content
         if not isinstance(content, list):
             processed.append(msg)
@@ -388,6 +409,21 @@ async def preprocess_markitdown_file_parts_async(
             part_dict = _part_to_dict(part)
             if part_dict.get("type") != "file":
                 new_parts.append(ContentPart.model_validate(part_dict))
+                continue
+
+            if allow_missing_historical_files and _is_missing_historical_file_part(
+                part_dict,
+                msg=msg,
+                msg_index=msg_index,
+                latest_user_index=latest_user_index,
+            ):
+                new_parts.append(
+                    ContentPart(
+                        type="text",
+                        text=_format_missing_attachment(part_dict),
+                    )
+                )
+                changed = True
                 continue
 
             files_seen += 1
@@ -468,6 +504,35 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
         mime_type = _mime_type_for_extension(extension)
 
     return MarkItDownFile(filename=filename, mime_type=mime_type, data=data)
+
+
+def _latest_user_index(messages: list[Message]) -> int:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            return index
+    return -1
+
+
+def _is_missing_historical_file_part(
+    part: dict[str, Any],
+    *,
+    msg: Message,
+    msg_index: int,
+    latest_user_index: int,
+) -> bool:
+    if msg.role != "user" or msg_index >= latest_user_index:
+        return False
+    file_obj = part.get("file")
+    if not isinstance(file_obj, dict):
+        return False
+    data_value = file_obj.get("file_data") or file_obj.get("data")
+    return not isinstance(data_value, str) or not data_value.strip()
+
+
+def _format_missing_attachment(part: dict[str, Any]) -> str:
+    file_obj = part.get("file") if isinstance(part.get("file"), dict) else {}
+    filename = str(file_obj.get("filename") or "attachment").strip()
+    return f"## Attached file unavailable: {filename}"
 
 
 def convert_attachment_to_markdown(

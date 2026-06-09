@@ -169,6 +169,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
 from .api.markitdown import (
@@ -527,6 +528,12 @@ def _status_to_error_type(status_code: int) -> str:
         return "authentication_error"
     if status_code == 404:
         return "not_found_error"
+    if status_code == 413:
+        # Prefill-memory-guard rejection. OpenAI uses
+        # invalid_request_error for context-window-exceeded as well; we
+        # use the finer-grained 413 status but the same type so existing
+        # clients that branch on type still recognise the failure mode.
+        return "invalid_request_error"
     if status_code == 429:
         return "rate_limit_error"
     if status_code >= 500:
@@ -535,7 +542,16 @@ def _status_to_error_type(status_code: int) -> str:
 
 
 def _is_api_route(request: FastAPIRequest) -> bool:
-    """Check if request targets an OpenAI-compatible API route."""
+    """Check if request targets an OpenAI-compatible API route.
+
+    Path-prefix only. This assumes the FastAPI app is mounted at root
+    (the oMLX deployment shape) and that route paths are case-sensitive
+    — both true today. If a future deployment mounts this app under a
+    prefix (``app.mount("/api", ...)``), ``request.url.path`` returns
+    the full mounted path and every ``/v1/...`` route would be
+    classified as non-API. Switch to ``request.scope.get("route")``
+    matching at that point.
+    """
     return request.url.path.startswith("/v1/")
 
 
@@ -626,6 +642,60 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(PrefillMemoryExceededError)
+async def prefill_memory_exceeded_handler(
+    request: FastAPIRequest, exc: PrefillMemoryExceededError
+):
+    """Map prefill peak overshoot to HTTP 413 with a clean JSON body.
+
+    The synchronous prefill memory guard in ``Scheduler.add_request`` raises
+    this when the estimated KV+SDPA peak for a request would push memory
+    past the user-configured ``max_process_memory``. The caller's prompt
+    fits in the model's context window but is too large for the host's
+    headroom, so 413 (Payload Too Large) is the right code.
+
+    Code vs status trade-off: 413 (Payload Too Large) is a request-shape
+    error; 507 (Insufficient Storage) more accurately describes "host
+    can't service it right now". We use 413 because it maps cleanly to
+    the OpenAI SDK retry-with-smaller-input flow that most clients
+    already implement, and the ``error.code`` field gives consumers a
+    machine-readable discriminator (``"prefill_memory_exceeded"``)
+    distinct from genuine context-window-exceeded rejections.
+    """
+    detail = str(exc)
+    logger.warning(
+        "%s %s → 413: %s",
+        request.method,
+        request.url.path,
+        detail,
+    )
+    if _is_api_route(request):
+        # code="prefill_memory_exceeded" lets OpenAI-SDK clients branch
+        # on the failure mode. Without it, "context window too small"
+        # and "host has no memory headroom" both surface as
+        # invalid_request_error with code=None and clients can only
+        # tell the user "shorten your prompt" — which is wrong when
+        # the actual fix is to raise --max-process-memory.
+        content = _openai_error_body(
+            detail, 413, code="prefill_memory_exceeded"
+        )
+        # Surface the structured fields so clients can branch on
+        # numeric values instead of regex-matching the human message.
+        # OpenAI clients ignore unknown error fields so this is a
+        # forward-compatible extension.
+        if exc.estimated_bytes is not None:
+            content["error"]["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["error"]["limit_bytes"] = exc.limit_bytes
+    else:
+        content = {"detail": detail}
+        if exc.estimated_bytes is not None:
+            content["estimated_bytes"] = exc.estimated_bytes
+        if exc.limit_bytes is not None:
+            content["limit_bytes"] = exc.limit_bytes
+    return JSONResponse(status_code=413, content=content)
 
 
 @app.exception_handler(Exception)
@@ -1177,6 +1247,65 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
         return OCR_MODEL_GENERATION_DEFAULTS.get(cmt)
     return None
 
+
+def get_max_context_window(model_id: str | None = None) -> int | None:
+    """
+    Get effective max context window limit.
+
+    Resolution:
+        1. **Per-model override** (admin UI / settings.json) — always
+           wins. An operator who has set a per-model number knows what
+           they want; ``max_context_window_policy`` does not clamp it.
+        2. **Model-config-discovered native context length** (#1308),
+           optionally clamped by the operator policy: if
+           ``sampling.max_context_window_policy`` is set, return
+           ``min(native, policy)``; otherwise return ``native`` as-is.
+        3. **Fallback default** from ``SamplingSettings.max_context_window``
+           — only used when neither tier 1 nor tier 2 yields a value.
+           Treated as a default, NOT capped by the policy; existing
+           ``settings.json`` files carrying the historical ``32768``
+           default keep working unchanged after upgrade.
+
+    The policy field is intentionally nullable and unset by default so
+    no existing install behavior shifts. Setting it engages
+    ``min(native, policy)`` across every model whose native context is
+    discoverable; per-model overrides remain the operator's escape
+    hatch for individual models that should exceed the policy.
+
+    Returns:
+        Max context window token count, or ``None`` if no tier resolves
+        (only possible when neither the model nor the global default
+        provides a value, which shouldn't happen in practice).
+    """
+    # Resolve alias so per-model settings are found by real model ID
+    model_id = resolve_model_id(model_id)
+
+    model_settings = None
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+    # Priority 1: explicit per-model override (not capped by policy)
+    if model_settings and model_settings.max_context_window is not None:
+        return model_settings.max_context_window
+
+    # Priority 2: model-native context, optionally clamped by policy
+    pool = _server_state.engine_pool
+    if model_id and pool is not None:
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.model_context_length is not None:
+            native = entry.model_context_length
+            policy = getattr(
+                _server_state.sampling, "max_context_window_policy", None
+            )
+            if policy is not None and policy > 0:
+                return min(native, policy)
+            return native
+
+    # Priority 3: fallback default (not capped — preserves legacy
+    # settings.json behavior).
+    return _server_state.sampling.max_context_window
+
+
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
     """
     Scale token count for Anthropic API response if context scaling is enabled.
@@ -1706,7 +1835,12 @@ async def health():
     pool_status = None
     if _server_state.engine_pool is not None:
         enforcer = _server_state.process_memory_enforcer
-        ceiling = enforcer.get_final_ceiling() if enforcer is not None else 0
+        ceiling = 0
+        if enforcer is not None:
+            try:
+                ceiling = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Health memory ceiling unavailable: %s", exc)
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
@@ -1746,9 +1880,11 @@ async def server_status(_: bool = Depends(verify_api_key)):
         loaded_models = pool.get_loaded_model_ids()
         model_memory_used = pool.current_model_memory
         enforcer = _server_state.process_memory_enforcer
-        model_memory_max = (
-            enforcer.get_final_ceiling() if enforcer is not None else None
-        )
+        if enforcer is not None:
+            try:
+                model_memory_max = enforcer.get_final_ceiling()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Status memory ceiling unavailable: %s", exc)
         for entry in pool._entries.values():
             if entry.is_loading:
                 models_loading += 1
@@ -1850,6 +1986,7 @@ async def _preprocess_markitdown_files_for_llm(
             settings_manager=_server_state.settings_manager,
             get_sampling_params=get_sampling_params,
             fail_when_disabled=True,
+            allow_missing_historical_files=True,
         )
     except MarkItDownRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -2355,6 +2492,17 @@ async def create_completion(
         num_tokens = len(engine.tokenizer.encode(prompt))
         validate_context_window(num_tokens, request.model)
 
+    # Pre-flight prefill memory guard — see create_chat_completion for
+    # the reason this must precede any StreamingResponse return.
+    # Thread the client-provided X-Request-ID when present so the 413
+    # log line and the FastAPI handler trace correlate with whatever
+    # the client is using on its side.
+    upstream_request_id = http_request.headers.get("x-request-id")
+    for prompt in prompts:
+        await engine.preflight_completion(
+            prompt, request_id=upstream_request_id
+        )
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -2724,6 +2872,19 @@ async def create_chat_completion(
 
     if request.stop:
         chat_kwargs["stop"] = request.stop
+
+    # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
+    # the response in a StreamingResponse — starlette emits
+    # http.response.start (status 200) before iterating the body generator,
+    # so a typed exception thrown later by add_request lands as "Caught
+    # handled exception, but response already started" and the client sees
+    # an incomplete chunked read. Running the check here lets
+    # prefill_memory_exceeded_handler return a clean HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
 
     if request.stream:
         # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -3121,16 +3282,19 @@ def _compile_grammar_for_request(
             from omlx.utils.install import get_install_method
 
             method = get_install_method()
-            if method == "dmg":
-                detail = (
-                    "Structured output is not available in the DMG version. "
-                    "xgrammar requires torch which significantly increases app size. "
-                    "Use the pip or Homebrew version for structured output support."
-                )
-            elif method == "homebrew":
+            if method == "homebrew":
                 detail = (
                     "Structured output requires xgrammar. "
                     "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            elif method == "dmg":
+                # DMG bundles xgrammar with a torch stub; reaching this
+                # branch means the bundled load failed (e.g. native binding
+                # incompatibility). Surface it instead of pointing users to
+                # a different install method.
+                detail = (
+                    "Structured output is unavailable: xgrammar failed to "
+                    "load in this build. Please report this issue."
                 )
             else:
                 detail = (
@@ -4188,6 +4352,14 @@ async def create_anthropic_message(
     if request.stop_sequences:
         chat_kwargs["stop"] = request.stop_sequences
 
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
+
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
@@ -4591,6 +4763,14 @@ async def create_response(
         chat_kwargs["tools"] = tools_for_template
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Pre-flight prefill memory guard — must precede any StreamingResponse
+    # return so PrefillMemoryExceededError can be mapped to HTTP 413.
+    await engine.preflight_chat(
+        messages,
+        request_id=http_request.headers.get("x-request-id"),
+        **chat_kwargs,
+    )
 
     if request.stream:
         return StreamingResponse(

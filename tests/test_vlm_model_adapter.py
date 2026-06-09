@@ -426,6 +426,27 @@ class TestPerRequestMRoPEDecode:
         assert pos_ids[0, 0, 0].item() == 50.0
         assert pos_ids[0, 1, 0].item() == 80.0
 
+    def test_mrope_decode_scalar_cache_offset_uses_position_ids(self):
+        """Singleton KVCache offset should not rely on stale language-model state."""
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_batch_rope_deltas(mx.array([0.0]))
+
+        input_ids = mx.zeros((1, 1), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = 16384
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        pos_ids = call_kwargs["position_ids"]
+        assert pos_ids.shape == (3, 1, 1)
+        assert pos_ids[0, 0, 0].item() == 16384.0
+
     def test_get_last_rope_deltas(self):
         """get_last_rope_deltas extracts value from language model."""
         import mlx.core as mx
@@ -485,6 +506,5 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
-
 
 

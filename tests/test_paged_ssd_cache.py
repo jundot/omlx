@@ -9,7 +9,9 @@ enabling larger effective cache sizes than GPU memory allows.
 import errno
 import json
 import logging
+import queue
 import shutil
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -2413,6 +2415,336 @@ class TestPreloadBlocks:
         ssd_manager2.close()
 
 
+class TestComputeMaxPendingWrites:
+    """Pin the block-size-aware cap formula.
+
+    The pending-writes queue holds raw KV bytes that the background
+    SSD writer hasn't drained yet — so the cap must scale by bytes per
+    slot, not just host RAM. Cap should shrink when each block is
+    expensive (large block_size or fat KV) and grow when each block is
+    cheap, while the hard byte budget bounds the soft floor.
+    """
+
+    def test_soft_floor_applies_when_hard_budget_allows(self):
+        """The soft floor gives large-block workloads burst headroom
+        when the byte hard cap still has room."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                return 4096
+            if name == "SC_PHYS_PAGES":
+                return (64 * 1024**3) // 4096
+            raise ValueError(name)
+
+        with patch("omlx.cache.paged_ssd_cache.os.sysconf", side_effect=fake_sysconf):
+            cap = _compute_max_pending_writes(
+                block_size_tokens=2048,
+                kv_bytes_per_token=200_000,
+            )
+        assert cap == 24
+
+    def test_hard_budget_bounds_soft_floor(self):
+        """The soft floor must not force the pending pool above 30%
+        of host RAM for very expensive blocks."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                return 4096
+            if name == "SC_PHYS_PAGES":
+                return (64 * 1024**3) // 4096
+            raise ValueError(name)
+
+        with patch("omlx.cache.paged_ssd_cache.os.sysconf", side_effect=fake_sysconf):
+            cap = _compute_max_pending_writes(
+                block_size_tokens=2048,
+                kv_bytes_per_token=500_000,
+            )
+        assert cap == 20
+
+    def test_ceiling_clamps_high_end(self):
+        """A 512 GB host with tiny blocks still tops out at 256
+        rather than pinning thousands of in-flight writes."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # Tiny per-slot cost → math would produce a huge number;
+        # the ceiling must hold at 256.
+        cap = _compute_max_pending_writes(
+            block_size_tokens=1,
+            kv_bytes_per_token=1,
+        )
+        assert cap == 256
+
+    def test_larger_block_shrinks_cap(self):
+        """Doubling block_size_tokens halves the cap target (until
+        floor/ceiling clamp)."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap_256 = _compute_max_pending_writes(block_size_tokens=256)
+        cap_1024 = _compute_max_pending_writes(block_size_tokens=1024)
+
+        # 4× block size → ¼ the target. Both should be in the
+        # in-band range (above floor, below ceiling) for typical
+        # Macs; if the smaller one is at the ceiling the test
+        # degenerates but the ordering still holds.
+        assert cap_1024 <= cap_256, (
+            "Larger blocks must yield smaller cap so worst-case "
+            "pinned bytes stay bounded"
+        )
+
+    def test_larger_kv_bytes_shrinks_cap(self):
+        """Heavier per-token KV (bigger model) shrinks the cap so
+        the byte budget is preserved across model sizes."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap_small = _compute_max_pending_writes(kv_bytes_per_token=50_000)
+        cap_large = _compute_max_pending_writes(kv_bytes_per_token=400_000)
+
+        assert cap_large <= cap_small
+
+    def test_default_args_produce_sensible_cap(self):
+        """The default-args path used by static callers must produce
+        a cap inside the bounded range."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        cap = _compute_max_pending_writes()
+        assert 1 <= cap <= 256
+
+    def test_manager_picks_up_per_instance_cap(self, tmp_path):
+        """The PagedSSDCacheManager must recompute the cap from its
+        constructor args, not just inherit the module-level constant.
+        Otherwise a non-default block size silently uses a cap sized
+        for the default block size."""
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDCacheManager,
+            _compute_max_pending_writes,
+        )
+
+        mgr_small = PagedSSDCacheManager(
+            cache_dir=tmp_path / "small",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=256,
+            expected_kv_bytes_per_token=200_000,
+        )
+        mgr_large = PagedSSDCacheManager(
+            cache_dir=tmp_path / "large",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=2048,
+            expected_kv_bytes_per_token=200_000,
+        )
+
+        # Large blocks must produce a cap no larger than small blocks.
+        # Both should equal what the standalone function computes for
+        # the same inputs (no surprise rescaling inside __init__).
+        assert mgr_small._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=256, kv_bytes_per_token=200_000
+        )
+        assert mgr_large._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=2048, kv_bytes_per_token=200_000
+        )
+        assert mgr_large._max_pending_writes <= mgr_small._max_pending_writes
+
+        # The write queue must use the instance cap, not the module
+        # default — otherwise the formula change is ineffective.
+        assert mgr_small._write_queue.maxsize == mgr_small._max_pending_writes
+        assert mgr_large._write_queue.maxsize == mgr_large._max_pending_writes
+
+        mgr_small.close()
+        mgr_large.close()
+
+
+class TestSchedulerPlumbsBlockSizeToSSDCache:
+    """The Scheduler construction path must plumb its final
+    ``paged_cache_block_size`` and a model-derived KV bytes-per-token
+    estimate into ``PagedSSDCacheManager.__init__`` — otherwise the
+    block-size-aware queue cap silently falls back to defaults sized
+    for the wrong workload.
+
+    Regression guard for jundot's review on PR #1627:
+
+      > PagedSSDCacheManager now accepts ``expected_block_size_tokens``
+      > / ``expected_kv_bytes_per_token``, but the real scheduler
+      > construction path still does not pass them.
+    """
+
+    def _make_scheduler(self, tmp_path, block_size_tokens, model_layers):
+        """Build a Scheduler with paged SSD cache enabled at the given
+        block size and a model whose config exposes ``model_layers``
+        layers (so the memory monitor produces a real per-token KV
+        estimate rather than its default)."""
+        from unittest.mock import MagicMock
+
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        # Real numbers so MemoryMonitor.set_model_info accepts them.
+        class _Config:
+            num_hidden_layers = model_layers
+            num_key_value_heads = 8
+            num_attention_heads = 32
+            head_dim = 192
+            hidden_size = 6144
+
+        model = MagicMock()
+        model.layers = []
+        model.config = _Config()
+
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+
+        config = SchedulerConfig(
+            max_num_seqs=4,
+            prefill_step_size=2048,
+            paged_cache_block_size=block_size_tokens,
+            paged_ssd_cache_dir=str(tmp_path),
+            paged_ssd_cache_max_size=1 << 30,
+            hot_cache_max_size=0,
+            model_name="test-model",
+        )
+        return Scheduler(model=model, tokenizer=tokenizer, config=config)
+
+    def test_block_size_plumbed_to_ssd_manager(self, tmp_path):
+        """Final scheduler block size must reach the SSD cache manager
+        — not the 256-token default."""
+        model_layers = 32
+        sched = self._make_scheduler(
+            tmp_path / "blk1024",
+            block_size_tokens=1024,
+            model_layers=model_layers,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+
+        # The manager stashes the constructor inputs as
+        # ``_expected_block_size_tokens`` / ``_expected_kv_bytes_per_token``
+        # so the plumbing-regression check is bulletproof regardless
+        # of the test host's RAM tier (where the cap math might clamp
+        # both default and plumbed inputs to the same floor/ceiling).
+        assert mgr._expected_block_size_tokens == 1024, (
+            "Scheduler must plumb its final paged_cache_block_size "
+            "into PagedSSDCacheManager"
+        )
+
+        # The auto-init in ``Scheduler.__init__`` (paired with
+        # ``_set_model_info_for_monitor()``) must populate dims from
+        # the fixture's model.config so the writer-queue cap formula
+        # weighs a real per-token cost. If either step regresses the
+        # SSD manager would silently fall back to either the monitor's
+        # ~128 KB 7B-class fiction or the manager's own 200 KB default
+        # — both miscalibrate the cap on the real model. Assert the
+        # construction order didn't regress.
+        assert sched.memory_monitor is not None, (
+            "Scheduler.__init__ must auto-init MemoryMonitor before "
+            "_init_tiered_cache; if this regresses the SSD manager "
+            "silently uses its 200 KB default and the cap math is "
+            "miscalibrated on every workload"
+        )
+        assert sched.memory_monitor.has_model_info(), (
+            "_set_model_info_for_monitor must populate dims from "
+            "model.config BEFORE _init_tiered_cache constructs the "
+            "PagedSSDCacheManager; otherwise estimate_block_memory(1) "
+            "returns its 7B-class default fiction"
+        )
+
+        # The model-derived per-token KV is what should reach the
+        # manager. Compute it inline from the fixture's known dims so
+        # this assertion can't be satisfied by a tautological pass-
+        # through of whatever ``estimate_block_memory`` happens to
+        # return — and so it doesn't equal the 200 KB manager default,
+        # making a silent fallback to the default visible as a numeric
+        # diff in the failure message.
+        per_token_bytes = (
+            1  # block_size token
+            * 8  # num_kv_heads in _make_scheduler fixture
+            * 192  # head_dim
+            * 2  # dtype_size (float16)
+            * 2  # keys + values
+        ) * model_layers
+        assert mgr._expected_kv_bytes_per_token == per_token_bytes, (
+            f"PagedSSDCacheManager received "
+            f"expected_kv_bytes_per_token={mgr._expected_kv_bytes_per_token} "
+            f"but the model-derived value is {per_token_bytes}; "
+            f"a value of 200000 indicates a silent fallback to the "
+            f"manager default"
+        )
+        # And the value the manager received must match
+        # ``memory_monitor.estimate_block_memory(1)`` — the documented
+        # source. Keep both checks: the inline calc above catches
+        # tautological pass-throughs, this one catches drift between
+        # the monitor's calc and the scheduler's wiring.
+        assert mgr._expected_kv_bytes_per_token == (
+            sched.memory_monitor.estimate_block_memory(1)
+        ), (
+            "Scheduler must plumb memory_monitor.estimate_block_memory"
+            "(1) as expected_kv_bytes_per_token"
+        )
+
+        # And the cap computed from those plumbed inputs must drive the
+        # write queue's maxsize — the cap is only useful if the queue
+        # actually enforces it.
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        expected_cap = _compute_max_pending_writes(
+            block_size_tokens=mgr._expected_block_size_tokens,
+            kv_bytes_per_token=mgr._expected_kv_bytes_per_token,
+        )
+        assert mgr._max_pending_writes == expected_cap
+        assert mgr._write_queue.maxsize == mgr._max_pending_writes
+
+        mgr.close()
+
+    def test_larger_block_size_shrinks_scheduler_cap(self, tmp_path):
+        """The same model on the same Mac with a bigger block size
+        must produce a smaller pending-writes cap — proves the wiring
+        is not stuck at the default for every scheduler instance."""
+        sched_small = self._make_scheduler(
+            tmp_path / "blk256",
+            block_size_tokens=256,
+            model_layers=32,
+        )
+        sched_large = self._make_scheduler(
+            tmp_path / "blk2048",
+            block_size_tokens=2048,
+            model_layers=32,
+        )
+
+        cap_small = sched_small.paged_ssd_cache_manager._max_pending_writes
+        cap_large = sched_large.paged_ssd_cache_manager._max_pending_writes
+        assert cap_large <= cap_small, (
+            f"Larger blocks must shrink the cap; got "
+            f"cap(2048)={cap_large} > cap(256)={cap_small}"
+        )
+
+        sched_small.paged_ssd_cache_manager.close()
+        sched_large.paged_ssd_cache_manager.close()
+
+    def test_factory_path_also_plumbs_block_size(self, tmp_path):
+        """The cache factory path (used by direct/test callers) must
+        also pass ``config.block_size`` through — otherwise direct
+        callers silently get the 256-token default regardless of what
+        they configured."""
+        from omlx.cache.factory import CacheConfig, CacheFactory
+
+        cfg = CacheConfig(
+            block_size=1024,
+            paged_ssd_cache_dir=tmp_path,
+            max_paged_ssd_cache_size=1 << 30,
+        )
+        mgr = CacheFactory.create_paged_ssd_cache(cfg, model_name="m")
+        assert mgr is not None
+
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        # Factory has no memory monitor, so it leaves
+        # ``kv_bytes_per_token`` at the 200 KB default — that's the
+        # documented contract for non-Scheduler callers.
+        expected = _compute_max_pending_writes(
+            block_size_tokens=1024, kv_bytes_per_token=200_000
+        )
+        assert mgr._max_pending_writes == expected
+        mgr.close()
+
+
 class TestInlineLRUUnlinks:
     """LRU eviction must unlink inline on the calling thread, not enqueue
     ``("unlink", path)`` tasks onto ``_write_queue``.
@@ -2450,6 +2782,37 @@ class TestInlineLRUUnlinks:
             model_name="test-model",
             layer_cache_types=["KVCache"] * num_layers,
         )
+
+    def test_save_waits_on_full_queue_before_drop(self, tmp_path, mx):
+        """A full queue must not short-circuit before tensor extraction.
+
+        The bounded wait gives the writer a chance to drain transient bursts;
+        only sustained saturation should drop the block.
+        """
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "full_queue_wait",
+            max_size_bytes=1 << 30,
+        )
+        original_put = mgr._write_queue.put
+        original_full = mgr._write_queue.full
+        calls: list[float | None] = []
+
+        def fake_put(item, timeout=None, *args, **kwargs):
+            calls.append(timeout)
+            raise queue.Full
+
+        try:
+            mgr._write_queue.full = lambda: True  # type: ignore[method-assign]
+            mgr._write_queue.put = fake_put  # type: ignore[method-assign]
+
+            assert self._save_block(mgr, mx, b"full_queue_wait") is False
+
+            assert calls == [1.0]
+            assert mgr.get_stats().ssd_write_drops == 1
+        finally:
+            mgr._write_queue.put = original_put  # type: ignore[method-assign]
+            mgr._write_queue.full = original_full  # type: ignore[method-assign]
+            mgr.close()
 
     def test_eviction_does_not_enqueue_unlink_tasks(self, tmp_path, mx):
         """Force eviction; assert no ``("unlink", ...)`` items ever enter
@@ -2632,3 +2995,35 @@ class TestInlineLRUUnlinks:
             assert mgr._stats["evict_unlink_failures"] >= 1
         finally:
             mgr.close()
+
+
+class TestSharedHotCacheBudgetClearAllOwners:
+    """clear_all_owners reaches managers the budget still pins (orphaned)."""
+
+    class _FakeOwner:
+        def __init__(self, budget, n):
+            self._budget = budget
+            self._n = n
+            self.cleared = False
+
+        def clear_hot_cache(self):
+            self._budget.forget_owner(self)
+            self.cleared = True
+            return self._n
+
+    def test_clears_every_tracked_owner(self):
+        budget = SharedHotCacheBudget(1 << 20)
+        o1 = self._FakeOwner(budget, 3)
+        o2 = self._FakeOwner(budget, 4)
+        budget.put(o1, b"h1", 100)
+        budget.put(o1, b"h2", 100)
+        budget.put(o2, b"h3", 200)
+
+        cleared = budget.clear_all_owners()
+
+        assert cleared == 7
+        assert o1.cleared and o2.cleared
+        assert len(budget._entries) == 0
+
+    def test_empty_budget_is_noop(self):
+        assert SharedHotCacheBudget(1 << 20).clear_all_owners() == 0

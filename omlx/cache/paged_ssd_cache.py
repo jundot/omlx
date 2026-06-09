@@ -52,23 +52,83 @@ except ImportError:
 
 
 # --- Async I/O constants ---
-def _compute_max_pending_writes() -> int:
-    """Compute max pending writes queue depth based on system memory.
+# Fraction of host RAM the pending-write queue targets at saturation.
+# The queue holds raw-byte copies of KV blocks that the background
+# writer hasn't drained yet (see ``_extract_tensor_bytes`` in
+# ``save_block``). The hard fraction below bounds the soft floor so
+# large-block workloads cannot silently reserve an unsafe amount of RAM.
+_PENDING_WRITES_TARGET_RAM_FRACTION = 0.10
+_PENDING_WRITES_HARD_RAM_FRACTION = 0.30
+_PENDING_WRITES_SOFT_FLOOR = 24
+_PENDING_WRITES_CEILING = 256
+_PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 
-    The background writer now handles full safetensors file writes (not just
-    renames), so the queue needs to be deeper to absorb burst saves from
-    large requests (e.g., 64 blocks per 4096-token request).
+# Conservative defaults for the per-block cost estimator. The actual
+# bytes-per-block depends on the model (num_layers × num_kv_heads ×
+# head_dim × dtype_size × block_size_tokens × 2). At construction time
+# the PagedSSDCacheManager doesn't always know these — see __init__'s
+# ``expected_kv_bytes_per_token`` parameter — so the module-level
+# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB
+# spread across all layers. Smaller models will be over-conservative
+# (fine), larger models or larger blocks should pass an explicit value.
+_DEFAULT_BLOCK_SIZE_TOKENS = 256
+_DEFAULT_KV_BYTES_PER_TOKEN = 200_000
 
-    Scales proportionally: 512GB = 256, 32GB = 32, minimum 32.
+
+def _compute_max_pending_writes(
+    block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
+    kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
+    target_fraction: float = _PENDING_WRITES_TARGET_RAM_FRACTION,
+    hard_fraction: float = _PENDING_WRITES_HARD_RAM_FRACTION,
+) -> int:
+    """Compute max pending writes queue depth.
+
+    Scales by *block bytes* so the target pending pool stays near
+    ``target_fraction`` of host RAM regardless of how big each block is,
+    while ``hard_fraction`` bounds the soft floor:
+
+        worst_case_bytes = cap × block_size_tokens × kv_bytes_per_token
+        cap = (total_ram × target_fraction) / (block_size × kv_bytes_per_token)
+
+    Bounded by a soft floor, a byte hard cap, and a ceiling:
+      - Soft floor at 24 so even small systems with large blocks retain
+        burst headroom for a few in-flight writes — dropping to zero
+        means every save serializes against the disk and the writer
+        thread becomes a hard bottleneck on the inference loop.
+      - Hard cap at 30% of host RAM so the soft floor cannot turn very
+        large blocks into an unsafe memory reservation.
+      - Ceiling at 256 so 512 GB+ systems don't pin gigabytes against
+        a writer that's already keeping up at lower caps.
+
+    Workload sizing: long-context coding workloads snapshot ~73 blocks
+    per turn at 150 K tokens (block_size=2048), and at the default
+    block size of 256 tokens that's ~586 blocks per snapshot. The
+    queue is a *burst ceiling*, not steady state — a healthy writer
+    drains it continuously and the cap only matters when the writer
+    is fighting memory pressure or slow disk. Saturated drops are
+    strictly more expensive in peak memory than slot retention (a
+    dropped block forces re-prefill, which re-allocates the GPU-side
+    KV that the slot would have held in host bytes only).
+
+    Defaults target a 35B-class bf16 model at the default
+    ``paged_cache_block_size=256``; pass an explicit
+    ``kv_bytes_per_token`` for larger models or quantized configs.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        total_gb = total_bytes / (1024**3)
-        return max(32, min(256, int(total_gb / 2)))
+        block_bytes = max(1, block_size_tokens * kv_bytes_per_token)
+        target = int(total_bytes * target_fraction / block_bytes)
+        hard_cap = max(1, int(total_bytes * hard_fraction / block_bytes))
+        soft_target = max(_PENDING_WRITES_SOFT_FLOOR, target)
+        return max(1, min(_PENDING_WRITES_CEILING, soft_target, hard_cap))
     except (ValueError, OSError):
-        return 32  # Safe default
+        return 64  # Safe default
 
 
+# Module-level constant for static callers that don't have model
+# config. The PagedSSDCacheManager recomputes per-instance from its
+# ``__init__`` parameters so a non-default block size or model
+# generation can plumb through.
 _MAX_PENDING_WRITES = _compute_max_pending_writes()
 
 # Cap on the number of LRU blocks ``_enforce_size_limit_for_new_block`` is
@@ -571,19 +631,42 @@ class PagedSSDCacheIndex:
                     result.append(self._index[block_hash])
             return result
 
-    def evict_until_size(self, target_size: int) -> list[PagedSSDBlockMetadata]:
+    def evict_until_size(
+        self,
+        target_size: int,
+        max_count: int | None = None,
+    ) -> list[PagedSSDBlockMetadata]:
         """
         Evict LRU entries until total size is below target.
 
         Args:
             target_size: Target total size in bytes.
+            max_count: Optional cap on the number of entries removed in
+                one call. When the cap is hit before ``total_size`` drops
+                below ``target_size`` the call returns the partial slice
+                and leaves the remaining LRU entries in the index; the
+                caller is expected to retry on the next save. The cap is
+                pushed down here (rather than the caller popping a
+                surplus and reinserting it) so the index never exposes a
+                transient "evicted but not yet unlinked" gap that a
+                concurrent writer's ``contains()`` check could observe
+                as a deleted block.
 
         Returns:
             List of evicted metadata (files need to be deleted by caller).
+
+        Note:
+            Loop termination depends on ``remove()`` decrementing
+            ``_total_size`` for every popped entry. If a future refactor
+            moves the decrement to "after the on-disk unlink succeeds",
+            this loop must also gain a "skip entries already pulled this
+            pass" guard or it can spin forever when unlinks fail.
         """
         with self._lock:
             evicted = []
             while self._total_size > target_size and self._lru:
+                if max_count is not None and len(evicted) >= max_count:
+                    break
                 # Get LRU entry (first in OrderedDict)
                 block_hash = next(iter(self._lru))
                 metadata = self.remove(block_hash)
@@ -693,6 +776,38 @@ class SharedHotCacheBudget:
                 entry = self._entries.pop(key)
                 self._total_bytes = max(0, self._total_bytes - entry.size_bytes)
 
+    def clear_all_owners(self) -> int:
+        """Clear the hot cache of every manager the budget still references.
+
+        The budget keeps a strong reference to each owning manager, so a
+        manager orphaned by an abnormal teardown stays reachable here even
+        when it is no longer attached to a loaded scheduler. Snapshot the
+        owners under the lock, then clear outside it (clear_hot_cache calls
+        forget_owner, which re-takes the lock).
+        """
+        with self._lock:
+            owners = []
+            seen = set()
+            for entry in self._entries.values():
+                if id(entry.owner) not in seen:
+                    seen.add(id(entry.owner))
+                    owners.append(entry.owner)
+        cleared = 0
+        for owner in owners:
+            fn = getattr(owner, "clear_hot_cache", None)
+            if callable(fn):
+                try:
+                    cleared += fn()
+                except Exception:
+                    # Keep going for the other owners, but do not hide the
+                    # failure: a silently-swallowed error makes admin recovery
+                    # look successful while memory is still pinned.
+                    logger.warning(
+                        "clear_hot_cache failed for an orphaned owner",
+                        exc_info=True,
+                    )
+        return cleared
+
     def put(
         self, owner: Any, block_hash: bytes, size_bytes: int
     ) -> list[tuple[Any, bytes]]:
@@ -757,6 +872,8 @@ class PagedSSDCacheManager(CacheManager):
         expected_model_name: str = "",
         expected_num_layers: int = 0,
         expected_block_size: int = 0,
+        expected_block_size_tokens: int = _DEFAULT_BLOCK_SIZE_TOKENS,
+        expected_kv_bytes_per_token: int = _DEFAULT_KV_BYTES_PER_TOKEN,
         expected_layer_cache_types: list[str] | None = None,
     ):
         """
@@ -783,6 +900,19 @@ class PagedSSDCacheManager(CacheManager):
             expected_block_size: Current paged cache block size. Blocks saved
                 with another block size are skipped at startup. 0 disables this
                 check for backwards compatibility.
+            expected_block_size_tokens: Paged-cache block size in tokens used to
+                size the pending-writes queue. Separate from ``expected_block_size``
+                so the writer-queue formula keeps a real value (default 256)
+                even when the cache-compat check is disabled (0). Passing a
+                larger value shrinks the cap so small Macs with large blocks
+                don't pin gigabytes at saturation; passing a smaller value lets
+                the cap grow to give workloads with many tiny blocks enough
+                burst headroom.
+            expected_kv_bytes_per_token: Per-token KV byte estimate (all
+                layers, K + V, dtype). Together with ``expected_block_size_tokens``
+                this drives the bytes-aware queue cap. Defaults to a
+                35B-class bf16 estimate; pass an explicit value for
+                quantized models or unusually wide/narrow architectures.
             expected_layer_cache_types: Optional current cache layout. When
                 provided, blocks with a different per-layer type list are
                 skipped at startup.
@@ -805,6 +935,7 @@ class PagedSSDCacheManager(CacheManager):
         # Statistics
         self._stats = {
             "saves": 0,
+            "saves_persisted": 0,
             "loads": 0,
             "hits": 0,
             "misses": 0,
@@ -839,7 +970,22 @@ class PagedSSDCacheManager(CacheManager):
             self._scan_existing_files()
 
         # --- Background writer for non-blocking saves ---
-        self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
+        # Recompute the pending-writes cap from THIS cache's block/model
+        # parameters so a non-default block size shrinks (or grows) the
+        # cap appropriately. Falls back to the module-level constant
+        # when no override is supplied.
+        #
+        # Stash the inputs the constructor was called with so callers
+        # (and the plumbing-regression test) can verify what reached
+        # the manager without depending on the cap math landing in a
+        # particular floor/ceiling band on the test host.
+        self._expected_block_size_tokens = expected_block_size_tokens
+        self._expected_kv_bytes_per_token = expected_kv_bytes_per_token
+        self._max_pending_writes = _compute_max_pending_writes(
+            block_size_tokens=expected_block_size_tokens,
+            kv_bytes_per_token=expected_kv_bytes_per_token,
+        )
+        self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
@@ -992,16 +1138,16 @@ class PagedSSDCacheManager(CacheManager):
 
         # 2. Index second — makes the block discoverable in has_block/contains.
         if not self._index.contains(block_hash):
-            self._enforce_size_limit_for_new_block()
+            self._enforce_size_limit_for_new_block(blk_meta.file_size)
             self._index.add(blk_meta)
 
         # 3. Queue third — enqueue for background writer.
         try:
             item = (block_hash, tensors_raw, metadata, file_path)
-            if blocking:
-                self._write_queue.put(item, timeout=0.5)
-            else:
-                self._write_queue.put_nowait(item)
+            # Non-blocking callers (hot-cache LRU spill) also wait so a
+            # transient writer backlog doesn't silently drop blocks. Blocking
+            # callers (shutdown flush) use the same bounded wait.
+            self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -1010,8 +1156,9 @@ class PagedSSDCacheManager(CacheManager):
         except queue.Full:
             self._stats["ssd_write_drops"] += 1
             logger.warning(
-                f"SSD write queue full, dropping evicted block "
-                f"{block_hash.hex()[:16]}"
+                f"SSD write queue saturated (cap={self._max_pending_writes}); "
+                f"dropping evicted block {block_hash.hex()[:16]} — writer is "
+                f"falling behind"
             )
             self._index.remove(block_hash)
             with self._pending_write_hashes_lock:
@@ -1303,6 +1450,12 @@ class PagedSSDCacheManager(CacheManager):
                 # Atomic rename to final path
                 os.rename(str(temp_path), str(file_path))
 
+                # The block is now durable on disk; bump the persist counter
+                # before any cleanup so ``saves_persisted`` reflects rename
+                # success even if the post-rename eviction check below
+                # unlinks the file again.
+                self._stats["saves_persisted"] += 1
+
                 # Update index with actual file size
                 self._index.update_file_size(block_hash, actual_size)
 
@@ -1322,10 +1475,33 @@ class PagedSSDCacheManager(CacheManager):
                     errno.ENOSPC,
                     errno.EDQUOT,
                 ):
-                    logger.warning(
-                        f"SSD cache disk full, cannot write block "
-                        f"{block_hash.hex()[:16]}: {e}"
+                    # ENOSPC after save_block already returned True and
+                    # incremented _stats["saves"] — the slot is silently
+                    # lost (no retry) and the caller treats the save as
+                    # committed. Combined with eviction having already
+                    # fired, the cache may lose both the evicted blocks
+                    # AND the new block. Surface this at ERROR level so
+                    # operators see it; a follow-up could expose a
+                    # save-failure callback to let callers re-issue.
+                    logger.error(
+                        "SSD cache disk full, cannot write block %s: %s "
+                        "(slot lost, subsequent saves will recompute disk "
+                        "pressure)",
+                        block_hash.hex()[:16],
+                        e,
                     )
+                    # Invalidate the 30s disk-usage snapshot so the next
+                    # save sees the true (now-critical) free space and
+                    # evicts aggressively rather than trusting a stale
+                    # inflated limit. In-flight saves that already passed
+                    # _enforce_size_limit_for_new_block are still queued
+                    # and may ENOSPC again — invalidation only protects
+                    # the NEXT round of save_block calls. Take the lock so
+                    # the inference thread's _get_effective_max_size
+                    # doesn't observe a half-updated (value, timestamp)
+                    # pair.
+                    with self._lock:
+                        self._disk_usage_cache = None
                 else:
                     logger.error(
                         f"Background write failed for " f"{block_hash.hex()[:16]}: {e}"
@@ -1396,22 +1572,9 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["hits"] += 1
                 return True
 
-        # Check queue capacity before doing expensive GPU/disk work
-        # (not needed for hot cache write-back mode)
-        if not self._hot_cache_enabled and self._write_queue.full():
-            self._stats["ssd_write_drops"] += 1
-            logger.warning(
-                f"SSD cache write queue full, skipping save for "
-                f"{block_hash.hex()[:16]}"
-            )
-            return False
-
         file_path = self._get_file_path(block_hash)
 
         try:
-            # Enforce size limit before saving (only for SSD path)
-            if not self._hot_cache_enabled:
-                self._enforce_size_limit_for_new_block()
 
             # Prepare arrays for safetensors. Three layer_data shapes are
             # accepted:
@@ -1583,8 +1746,21 @@ class PagedSSDCacheManager(CacheManager):
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
 
-            # Estimate file size from raw bytes (actual size set by background writer)
-            estimated_size = sum(len(raw) for raw, _, _ in tensors_raw.values()) + 1024
+            # Estimate file size: raw tensor bytes + safetensors header.
+            # The header is JSON-encoded per tensor (name + dtype + shape +
+            # data_offsets, typically ~85 bytes) plus an 8-byte length prefix
+            # and the user metadata block. Compute the metadata-JSON length
+            # exactly (large `layer_meta_states` JSON on deep-layer models
+            # can exceed a fixed 1 KiB constant) and keep 128 B/tensor as an
+            # upper bound on the per-tensor header. The 256 B margin covers
+            # the JSON separators / `__metadata__` key envelope safetensors
+            # adds at write time.
+            try:
+                metadata_json_len = len(json.dumps(metadata).encode("utf-8"))
+            except (TypeError, ValueError):
+                metadata_json_len = 1024
+            header_overhead = metadata_json_len + 256 + 128 * len(tensors_raw)
+            estimated_size = sum(len(raw) for raw, _, _ in tensors_raw.values()) + header_overhead
 
             now = time.time()
             block_metadata = PagedSSDBlockMetadata(
@@ -1630,6 +1806,11 @@ class PagedSSDCacheManager(CacheManager):
                 # Hot cache disabled but hot_cache_only set: block is not retained.
                 return False
 
+            # Evict LRU blocks to make room for the new block. Done here
+            # (post-tensor-build) so the actual block size is known and the
+            # cache doesn't oscillate around the configured limit.
+            self._enforce_size_limit_for_new_block(estimated_size)
+
             # SSD path: add to index for SSD file tracking
             self._index.add(block_metadata)
 
@@ -1641,16 +1822,20 @@ class PagedSSDCacheManager(CacheManager):
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.add(block_hash)
 
-            # Enqueue full file write for background thread
+            # Enqueue full file write for background thread. Wait on Full so
+            # transient bursts (faster than the writer can drain) don't
+            # immediately punch holes in the cache chain.
             try:
-                self._write_queue.put_nowait(
-                    (block_hash, tensors_raw, metadata, file_path)
+                self._write_queue.put(
+                    (block_hash, tensors_raw, metadata, file_path),
+                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
                 )
             except queue.Full:
                 self._stats["ssd_write_drops"] += 1
                 logger.warning(
-                    f"SSD cache write queue full, dropping write for "
-                    f"{block_hash.hex()[:16]}"
+                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
+                    f"dropping write for {block_hash.hex()[:16]} — writer is "
+                    f"falling behind"
                 )
                 self._index.remove(block_hash)
                 self._hot_cache_remove(block_hash)
@@ -1969,7 +2154,17 @@ class PagedSSDCacheManager(CacheManager):
             # Previous executor-based approach caused deadlocks when
             # mx.load() in a worker thread contested Metal GPU resources
             # with the main inference thread.
-            arrays, file_metadata = mx.load(str(file_path), return_metadata=True)
+            try:
+                arrays, file_metadata = mx.load(
+                    str(file_path), return_metadata=True
+                )
+            except FileNotFoundError:
+                # Concurrent evictor unlinked the file between the
+                # exists() check above and this load. Treat as a miss
+                # and prune the stale index entry.
+                self._index.remove(block_hash)
+                self._stats["misses"] += 1
+                return None
 
             # Defensive: even if the index is stale (e.g. from a previous
             # run that pre-dates the format version field), reject blocks
@@ -2422,27 +2617,38 @@ class PagedSSDCacheManager(CacheManager):
         if self._cache_dir is None:
             return self._max_size
 
+        # Take the lock so a concurrent writer-thread invalidation
+        # (sets _disk_usage_cache=None on ENOSPC) can't interleave with
+        # this read-check-write and let one save see a fresh value paired
+        # with a stale timestamp (or vice versa).
         now = time.monotonic()
-        if self._disk_usage_cache is None or now - self._disk_usage_cache_time > 30.0:
-            try:
-                self._disk_usage_cache = shutil.disk_usage(self._cache_dir)
-            except OSError as e:
-                logger.warning(
-                    f"Failed to check disk usage for SSD cache dir "
-                    f"{self._cache_dir}: {e}"
-                )
-                return self._max_size
-            self._disk_usage_cache_time = now
+        with self._lock:
+            if self._disk_usage_cache is None or now - self._disk_usage_cache_time > 30.0:
+                try:
+                    self._disk_usage_cache = shutil.disk_usage(self._cache_dir)
+                except OSError as e:
+                    logger.warning(
+                        f"Failed to check disk usage for SSD cache dir "
+                        f"{self._cache_dir}: {e}"
+                    )
+                    return self._max_size
+                self._disk_usage_cache_time = now
+            disk_free = self._disk_usage_cache.free
 
-        disk_available = self._index.total_size + self._disk_usage_cache.free
+        disk_available = self._index.total_size + disk_free
         disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
         return min(self._max_size, disk_limit)
 
-    def _enforce_size_limit_for_new_block(self) -> None:
-        """Enforce size limit before adding a new block."""
-        # Estimate average block size (use 1MB as conservative estimate)
-        estimated_new_size = 1 * 1024 * 1024
+    def _enforce_size_limit_for_new_block(
+        self, estimated_new_size: int = 1 * 1024 * 1024
+    ) -> None:
+        """Enforce size limit before adding a new block.
 
+        ``estimated_new_size`` should be the actual byte size of the block
+        about to be inserted. The 1 MiB default is for callers that don't
+        yet know the size at the time eviction is needed; passing the
+        actual size avoids cache oscillation around the configured limit.
+        """
         effective_max = self._get_effective_max_size()
 
         # Warn when disk pressure shrinks effective limit well below configured
@@ -2529,6 +2735,12 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             Number of bytes freed.
         """
+        # Decide what to evict under the lock, but perform unlinks outside
+        # it: a single unlink on a slow disk (NFS / encrypted FS / ENOSPC
+        # retry path) can block tens to hundreds of ms, and every
+        # _get_effective_max_size() / writer-thread cache-invalidation
+        # contends on self._lock. The index has its own internal lock
+        # protecting the LRU/size accounting.
         with self._lock:
             initial_size = self._index.total_size
             effective_max = self._get_effective_max_size()
@@ -2539,21 +2751,40 @@ class PagedSSDCacheManager(CacheManager):
             target_size = int(effective_max * 0.9)  # 90% of effective max
             evicted = self._index.evict_until_size(target_size)
 
-            for metadata in evicted:
-                # Do NOT remove from hot cache — see _enforce_size_limit_for_new_block
-                try:
-                    if metadata.file_path.exists():
-                        metadata.file_path.unlink()
-                        self._stats["evictions"] += 1
-                except Exception as e:
-                    logger.warning(f"Failed to delete evicted file: {e}")
+        # Do NOT remove from hot cache — see _enforce_size_limit_for_new_block
+        for metadata in evicted:
+            self._unlink_evicted(metadata)
 
-            freed = initial_size - self._index.total_size
-            logger.info(
-                f"SSD cache size enforcement: freed {format_bytes(freed)}, "
-                f"evicted {len(evicted)} files"
+        freed = initial_size - self._index.total_size
+        logger.info(
+            f"SSD cache size enforcement: freed {format_bytes(freed)}, "
+            f"evicted {len(evicted)} files"
+        )
+        return freed
+
+    def _unlink_evicted(self, metadata: PagedSSDBlockMetadata) -> None:
+        """Delete an evicted block file from disk.
+
+        On unlink failure other than FileNotFoundError, re-add the
+        metadata to the index so ``total_size`` keeps reflecting actual
+        on-disk bytes; without this, accumulated failures would let the
+        cache silently exceed ``max_size`` (the index would report free
+        space that does not exist on disk).
+        """
+        try:
+            metadata.file_path.unlink(missing_ok=True)
+            self._stats["evictions"] += 1
+        except OSError as e:
+            # Restore the index entry so total_size matches disk reality.
+            # The re-added entry lands at the LRU tail (most-recently
+            # touched), which deprioritises immediate re-eviction.
+            self._index.add(metadata)
+            self._stats["evict_unlink_failures"] += 1
+            logger.exception(
+                "Failed to delete evicted SSD cache file %s: %s",
+                metadata.file_path,
+                e,
             )
-            return freed
 
     def clear_hot_cache(self) -> int:
         """Clear all in-memory (hot) cache entries.
@@ -2603,6 +2834,7 @@ class PagedSSDCacheManager(CacheManager):
                 misses=self._stats["misses"],
                 evictions=self._stats["evictions"],
                 saves=self._stats["saves"],
+                saves_persisted=self._stats["saves_persisted"],
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
                 evict_unlink_failures=self._stats["evict_unlink_failures"],
@@ -2663,6 +2895,7 @@ class PagedSSDCacheManager(CacheManager):
                 misses=self._stats["misses"],
                 evictions=self._stats["evictions"],
                 saves=self._stats["saves"],
+                saves_persisted=self._stats["saves_persisted"],
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
                 evict_unlink_failures=self._stats["evict_unlink_failures"],

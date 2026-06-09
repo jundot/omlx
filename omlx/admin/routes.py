@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import signal
 import subprocess
@@ -34,11 +33,12 @@ from pydantic import BaseModel, Field
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import SubKeyEntry
+from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
@@ -210,6 +210,7 @@ class GlobalSettingsRequest(BaseModel):
     server_aliases: list[str] | None = None
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
+    burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -1490,7 +1491,7 @@ async def create_sub_key(
         raise HTTPException(status_code=400, detail=error_msg)
 
     # Check for duplicate (against main key and existing sub keys)
-    if global_settings.auth.api_key and secrets.compare_digest(
+    if global_settings.auth.api_key and compare_keys(
         request.key, global_settings.auth.api_key
     ):
         raise HTTPException(
@@ -1498,7 +1499,7 @@ async def create_sub_key(
         )
 
     for sk in global_settings.auth.sub_keys:
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             raise HTTPException(status_code=400, detail="This key already exists")
 
     entry = SubKeyEntry(
@@ -1540,7 +1541,7 @@ async def delete_sub_key(
 
     # Find and remove the key
     for i, sk in enumerate(global_settings.auth.sub_keys):
-        if sk.key and secrets.compare_digest(request.key, sk.key):
+        if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
                 global_settings.save()
@@ -2853,6 +2854,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "server_aliases": list(global_settings.server.server_aliases),
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
+            "burst_decode_mode": global_settings.server.burst_decode_mode,
         },
         "model": {
             "model_dirs": [
@@ -3005,6 +3007,17 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
+        from ..utils.network import is_valid_bind_host
+
+        parts = [h.strip() for h in request.host.split(",") if h.strip()]
+        if not parts:
+            raise HTTPException(status_code=400, detail="Host cannot be empty")
+        for part in parts:
+            if not is_valid_bind_host(part):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
+                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
@@ -3023,6 +3036,41 @@ async def update_global_settings(
             )
         global_settings.server.sse_keepalive_mode = request.sse_keepalive_mode
         runtime_applied.append("sse_keepalive_mode")
+    if request.burst_decode_mode is not None:
+        if request.burst_decode_mode not in BURST_DECODE_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid burst_decode_mode: {request.burst_decode_mode} "
+                f"(must be one of {sorted(BURST_DECODE_MODES)})",
+            )
+        mode = request.burst_decode_mode
+        global_settings.server.burst_decode_mode = mode
+        # Seed env so models loaded later pick up the mode without a restart.
+        for _key, _value in burst_decode_env(mode).items():
+            os.environ[_key] = _value
+        # Hot-apply to every loaded engine. EngineConfig is a mutable dataclass
+        # and its burst fields are read fresh each decode burst
+        # (EngineCore._step_burst), so this takes effect on the next token.
+        max_steps, single_s = BURST_DECODE_MODES[mode]
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            for _mid, entry in pool._entries.items():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = (
+                    getattr(async_core, "engine", None)
+                    if async_core is not None
+                    else None
+                )
+                cfg = getattr(core, "config", None) if core is not None else None
+                if cfg is not None and hasattr(cfg, "decode_burst_budget_single_s"):
+                    cfg.decode_burst_max_steps = max_steps
+                    cfg.decode_burst_budget_single_s = single_s
+        runtime_applied.append("burst_decode_mode")
+        logger.info(f"Burst Decode mode set to '{mode}'")
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
@@ -4102,7 +4150,12 @@ def _build_active_models_data() -> dict:
         if server_state is not None
         else None
     )
-    enforcer_status = enforcer.get_status() if enforcer is not None else None
+    enforcer_status = None
+    if enforcer is not None:
+        try:
+            enforcer_status = enforcer.get_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory enforcer status unavailable: %s", exc)
     models = []
     total_active = 0
     total_waiting = 0
@@ -4115,12 +4168,14 @@ def _build_active_models_data() -> dict:
         active_requests = 0
         waiting_requests = 0
         running_by_id = {}
+        has_scheduler_snapshot = False
         waiting_ids = set()
         waiting = []
         activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        collector_request_ids: set = set()
         active_request_ids: set = set()
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
@@ -4130,18 +4185,17 @@ def _build_active_models_data() -> dict:
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
                     try:
-                        active_request_ids = set(collectors.keys())
-                        active_requests = len(collectors)
+                        collector_request_ids = set(collectors.keys())
                     except RuntimeError:
                         # Scheduler state is mutated from the engine executor;
                         # keep the dashboard endpoint best-effort rather than
                         # failing on a concurrent dict resize.
-                        active_request_ids = set()
-                        active_requests = len(collectors)
+                        collector_request_ids = set()
 
                     sched = getattr(core, "scheduler", None)
                     if sched is not None and hasattr(sched, "snapshot_for_admin"):
                         snap = sched.snapshot_for_admin()
+                        has_scheduler_snapshot = True
                         running_by_id = snap["running_by_id"]
                         waiting_queue = snap["waiting"]
                         waiting_requests = len(waiting_queue)
@@ -4162,6 +4216,12 @@ def _build_active_models_data() -> dict:
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
+        if has_scheduler_snapshot:
+            active_request_ids = set(running_by_id) | prefilling_ids
+        elif collector_request_ids:
+            active_request_ids = collector_request_ids - waiting_ids
+        if has_scheduler_snapshot or collector_request_ids:
+            active_requests = len(active_request_ids)
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -4352,12 +4412,11 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
-def _iter_loaded_schedulers():
-    """Yield (model_id, scheduler) for each loaded model.
+def _iter_loaded_scheduler_records():
+    """Yield (model_id, scheduler, core) for each loaded model.
 
     Traverses the internal engine hierarchy: pool entry → async engine →
-    core engine → scheduler.  Both ``clear_ssd_cache`` and
-    ``clear_hot_cache`` share this traversal.
+    core engine → scheduler.
     """
     engine_pool = _get_engine_pool()
     if engine_pool is None:
@@ -4373,7 +4432,16 @@ def _iter_loaded_schedulers():
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if scheduler is not None:
-            yield model_id, scheduler
+            yield model_id, scheduler, core
+
+
+def _iter_loaded_schedulers():
+    """Yield (model_id, scheduler) for each loaded model.
+
+    Both ``clear_ssd_cache`` and ``clear_hot_cache`` share this traversal.
+    """
+    for model_id, scheduler, _core in _iter_loaded_scheduler_records():
+        yield model_id, scheduler
 
 
 @router.post("/api/ssd-cache/clear")
@@ -4424,13 +4492,23 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
 
 @router.post("/api/hot-cache/clear")
 async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
-    """Clear the in-memory (hot) cache for all loaded models.
+    """Clear the in-memory hot cache and release the buffers it held.
 
-    No filesystem fallback needed — hot cache is in-memory only and does
-    not survive process restart.
+    Dropping hot cache entries releases Python references, but MLX may keep
+    now-unused buffers in its allocator pool. Reclaim through the scheduler's
+    synchronized clear path so active engine streams and async store-cache
+    workers keep the same Metal safety barriers used by generation.
     """
+    import gc
+
+    from ..engine_core import get_mlx_executor
+    from ..scheduler import _sync_and_clear_cache
+    from ..utils.proc_memory import get_phys_footprint
+
+    footprint_before = get_phys_footprint()
     total_cleared = 0
-    for model_id, scheduler in _iter_loaded_schedulers():
+    reclaim_targets = []
+    for model_id, scheduler, core in _iter_loaded_scheduler_records():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
             try:
@@ -4444,7 +4522,51 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         rate_tracker = getattr(scheduler, "_cache_rate_tracker", None)
         if rate_tracker is not None:
             rate_tracker.clear()
-    return {"status": "ok", "total_cleared": total_cleared}
+        executor = getattr(core, "_mlx_executor", None)
+        if executor is not None:
+            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+
+    # Also clear managers orphaned by an abnormal teardown: they hold live
+    # hot cache but are no longer attached to a loaded scheduler, so the loop
+    # above cannot reach them. The shared budget still references them.
+    pool = _get_engine_pool()
+    budget = getattr(getattr(pool, "_scheduler_config", None), "hot_cache_budget", None)
+    if budget is not None and hasattr(budget, "clear_all_owners"):
+        try:
+            total_cleared += budget.clear_all_owners()
+        except Exception as exc:
+            logger.warning("Failed to clear orphaned hot caches: %s", exc)
+
+    # Return pooled buffers to the OS using scheduler._sync_and_clear_cache(),
+    # the same lock/synchronize/clear helper used by generation. Run on each
+    # loaded engine's executor so its thread-local stream is present. If every
+    # model has been unloaded, still run one reclaim on the fallback executor so
+    # orphaned/no-loaded hot cache cleanup can release MLX's allocator pool.
+    gc.collect()
+    loop = asyncio.get_running_loop()
+    if reclaim_targets:
+        for model_id, executor, stream in reclaim_targets:
+            try:
+                await loop.run_in_executor(executor, _sync_and_clear_cache, stream)
+            except RuntimeError as exc:
+                if "cannot schedule new futures after shutdown" not in str(exc):
+                    raise
+                logger.warning(
+                    "Engine executor unavailable while reclaiming MLX buffers "
+                    "for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    else:
+        await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
+
+    return {
+        "status": "ok",
+        "total_cleared": total_cleared,
+        "bytes_reclaimed": bytes_reclaimed,
+    }
 
 
 @router.post("/api/cache/probe")

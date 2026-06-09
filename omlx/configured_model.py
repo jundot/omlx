@@ -16,7 +16,7 @@ function interfaces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Optional, TypeVar
 
 from .engine_pool import EngineEntry
 from .model_settings import ModelSettings
@@ -110,17 +110,20 @@ class ConfiguredModel:
             self.sampling.max_context_window
         )
 
-    def embedding_max_length(self, request_max_length: int | None = None) -> int:
-        """Get max token length for embedding requests."""
-        # The type annotation of ``first_present`` doesn't "understand" that if
-        # any item in the list is statically non-None, the entire call is
-        # statically non-None. But we know it works like that, so ``cast`` to
-        # silence the type error is safe.
-        return cast(int, first_present(
+    def embedding_max_length(self, request_max_length: int | None = None) -> int | None:
+        """Get max token length for embedding requests.
+
+        Returns ``None`` when neither the request nor the model's
+        ``max_context_window`` pins a limit, so the embedding model resolves its
+        own configured context length (``max_position_embeddings`` / tokenizer
+        ``model_max_length`` in ``MLXEmbeddingModel._resolve_max_length``)
+        instead of re-truncating long-context models at the legacy 512-token cap
+        (#1687).
+        """
+        return first_present(
             request_max_length,
             self.max_context_window,
-            512
-        ))
+        )
 
     @property
     def max_tokens(self) -> int | None:

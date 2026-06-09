@@ -187,8 +187,16 @@ class PagedSSDCacheStats(BaseCacheStats):
     Extends base stats with storage-specific and hot cache metrics.
     """
 
-    # Operation counters
+    # ``saves`` counts blocks that PASSED the quota gate and were enqueued
+    # for the writer thread — it is incremented on the inference thread in
+    # ``save_block`` BEFORE the writer fsyncs the file, so a block whose
+    # background write later fails (ENOSPC, EDQUOT, OSError) still
+    # contributes 1 to ``saves`` and 1 to ``errors``. Use
+    # ``saves_persisted`` for the count of writes that actually landed on
+    # disk (incremented after the atomic rename in ``_writer_loop``);
+    # ``saves - saves_persisted`` is the steady-state in-flight depth.
     saves: int = 0
+    saves_persisted: int = 0
     loads: int = 0
     errors: int = 0
     ssd_write_drops: int = 0
@@ -233,6 +241,7 @@ class PagedSSDCacheStats(BaseCacheStats):
         """Reset runtime statistics."""
         super().reset()
         self.saves = 0
+        self.saves_persisted = 0
         self.loads = 0
         self.errors = 0
         self.ssd_write_drops = 0

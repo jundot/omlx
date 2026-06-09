@@ -14,7 +14,7 @@ from typing import Any
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput
+from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +151,12 @@ class BatchedEngine(BaseEngine):
 
             method = get_install_method()
             if method == "dmg":
-                logger.info(
-                    "Structured output is not available in the DMG version "
-                    "(xgrammar requires torch which significantly increases app size). "
-                    "Use the pip or Homebrew version for structured output support."
+                logger.warning(
+                    "GrammarCompiler initialization failed for %s on the "
+                    "DMG build. The bundle ships xgrammar against a torch "
+                    "stub; this usually means the bundled xgrammar / tvm-"
+                    "ffi version drifted past what the stub covers.",
+                    self._model_name,
                 )
             elif method == "homebrew":
                 logger.info(
@@ -714,6 +716,95 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             **kwargs,
+        )
+
+    async def preflight_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for chat completions.
+
+        Tokenizes the templated prompt and asks the scheduler whether the
+        request would exceed the configured memory ceiling. Raises
+        ``PrefillMemoryExceededError`` (with the caller's ``request_id``
+        attached) if it would. Designed to be called from the FastAPI
+        route handler BEFORE the response is wrapped in a
+        ``StreamingResponse``, so the exception can be mapped to HTTP
+        413 by ``prefill_memory_exceeded_handler``.
+
+        Cheap enough to run as a precondition: tokenization of even a
+        100k-token chat takes tens of milliseconds compared to the many
+        seconds the prefill it gates would consume.
+        """
+        if not self._loaded:
+            await self.start()
+        messages = self._preprocess_messages(messages)
+        template_tools = convert_tools_for_template(tools) if tools else None
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=partial,
+        )
+        # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
+        # malformed input) are normally surfaced by the real chat path's
+        # add_request → tokenize call as a 500 — there's no path-specific
+        # 400 handler today. Don't introduce a NEW failure mode here: if
+        # tokenization fails during preflight, log it and skip the memory
+        # check. The actual chat path will hit the same error and raise it
+        # through the existing handler chain so the response shape stays
+        # consistent.
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
+                "skipping prefill memory check, real chat path will surface "
+                "the error",
+                type(e).__name__,
+            )
+            return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_chat")
+            return
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
+        )
+
+    async def preflight_completion(
+        self,
+        prompt: str,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for plain /v1/completions calls.
+
+        See ``preflight_chat`` for the rationale.
+        """
+        if not self._loaded:
+            await self.start()
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "BatchedEngine.preflight_completion: tokenizer.encode raised "
+                "%s; skipping prefill memory check, real completion path "
+                "will surface the error",
+                type(e).__name__,
+            )
+            return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_completion")
+            return
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def stream_chat(

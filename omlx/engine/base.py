@@ -4,6 +4,7 @@ Base engine interface for oMLX inference.
 """
 
 import asyncio
+import logging
 import threading
 import time
 import uuid
@@ -14,6 +15,37 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
+
+_preflight_logger = logging.getLogger("omlx.engine.preflight")
+
+# Per-process record of (engine_class_name, method) pairs that have
+# already logged a "scheduler unreachable" warning. The warning marks a
+# wrapper-chain misconfiguration — a deployment bug rather than a
+# runtime condition — so once-per-pair is enough to alert oncall
+# without flooding the journal at request rate.
+_PREFLIGHT_UNREACHABLE_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_scheduler_unreachable_once(
+    engine: object, method: str, detail: str = ""
+) -> None:
+    """Emit a one-shot WARNING when the wrapper chain doesn't expose a
+    scheduler. Subsequent calls with the same (engine type, method) pair
+    are silent so a misconfigured engine doesn't spam logs at request
+    rate.
+    """
+    key = (type(engine).__name__, method)
+    if key in _PREFLIGHT_UNREACHABLE_WARNED:
+        return
+    _PREFLIGHT_UNREACHABLE_WARNED.add(key)
+    suffix = f" — {detail}" if detail else ""
+    _preflight_logger.warning(
+        "%s.%s: scheduler unreachable via _engine.engine.scheduler"
+        "%s; preflight check skipped (further occurrences suppressed)",
+        type(engine).__name__,
+        method,
+        suffix,
+    )
 
 
 @dataclass
@@ -252,6 +284,35 @@ class BaseEngine(ABC):
             Dictionary containing cache statistics, or None if not applicable.
         """
         pass
+
+    async def preflight_chat(
+        self,
+        messages: list,
+        tools: Optional[list] = None,
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """Optional prefill-memory preflight check for chat requests.
+
+        Default no-op; engines that implement the prefill memory guard
+        (``BatchedEngine``, ``VLMBatchedEngine``) override this with the
+        actual estimation logic. The base no-op lets simpler engines
+        (SimpleEngine, embedding/reranker engines, test stubs) be
+        invoked from the server endpoints without additional wrapping.
+        """
+        return None
+
+    async def preflight_completion(
+        self,
+        prompt: str,
+        request_id: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """Optional prefill-memory preflight check for completion requests.
+
+        See :meth:`preflight_chat` for the rationale.
+        """
+        return None
 
 
 class BaseNonStreamingEngine(ABC):

@@ -46,7 +46,7 @@ from ..utils.image import (
     extract_images_from_messages,
 )
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput
+from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
 
@@ -569,6 +569,79 @@ _QWEN_VISION_MODELS = {
 }
 
 
+# Conservative fallback upper bound on image-placeholder tokens per image
+# content part. Used by ``preflight_chat`` only when the actual
+# ``max_pixels`` cannot be derived from the loaded processor config.
+# Qwen-VL / Gemma-Vision typically expand each image to 256–1280 tokens
+# at default settings, but a deployment that lifts ``max_pixels`` can
+# legitimately exceed this — relying on a hard-coded 1280 in that case
+# silently under-counts and re-opens the panic-prone MLX prefill path.
+# Prefer ``_derive_image_token_upper_bound(processor)`` when the
+# processor is loaded.
+_IMAGE_TOKEN_UPPER_BOUND_FALLBACK = 1280
+
+
+def _derive_image_token_upper_bound(processor: Any) -> int:
+    """Derive the per-image token upper bound from the processor config.
+
+    Qwen-style image processors expose ``max_pixels`` (an *area*) and
+    pack pixels into ``patch_size`` × ``patch_size`` patches, then merge
+    ``merge_size`` × ``merge_size`` patches into one model token. The
+    per-image token bound is therefore::
+
+        max_tokens = max_pixels / (patch_size**2 * merge_size**2)
+
+    Falls back to the conservative module-level constant when the
+    processor doesn't expose the expected attributes (other model
+    families) so we never *under*-count.
+    """
+    if processor is None:
+        return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+    ip = getattr(processor, "image_processor", None) or processor
+    max_pixels = getattr(ip, "max_pixels", None)
+    patch_size = getattr(ip, "patch_size", None)
+    merge_size = getattr(ip, "merge_size", None)
+    if (
+        isinstance(max_pixels, int)
+        and max_pixels > 0
+        and isinstance(patch_size, int)
+        and patch_size > 0
+        and isinstance(merge_size, int)
+        and merge_size > 0
+    ):
+        derived = max_pixels // (patch_size * patch_size * merge_size * merge_size)
+        # Never go *below* the conservative fallback — a model whose
+        # processor reports a tiny max_pixels (e.g. test fixtures) should
+        # not weaken the guard.
+        return max(derived, _IMAGE_TOKEN_UPPER_BOUND_FALLBACK)
+    return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+
+
+def _count_image_tokens(
+    messages: list[dict[str, Any]],
+    per_image_upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+) -> int:
+    """Count image-bearing content parts in OpenAI-style messages and
+    return the conservative token-budget contribution.
+
+    Supports both the OpenAI ``image_url`` / ``image`` part types and the
+    Anthropic ``image`` block shape that gets adapted into the same
+    message-list before reaching the engine layer.
+    """
+    image_parts = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype in ("image_url", "image", "input_image"):
+                image_parts += 1
+    return image_parts * per_image_upper_bound
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -661,10 +734,12 @@ class VLMBatchedEngine(BaseEngine):
 
             method = get_install_method()
             if method == "dmg":
-                logger.info(
-                    "Structured output is not available in the DMG version "
-                    "(xgrammar requires torch which significantly increases app size). "
-                    "Use the pip or Homebrew version for structured output support."
+                logger.warning(
+                    "GrammarCompiler initialization failed for %s on the "
+                    "DMG build. The bundle ships xgrammar against a torch "
+                    "stub; this usually means the bundled xgrammar / tvm-"
+                    "ffi version drifted past what the stub covers.",
+                    self._model_name,
                 )
             elif method == "homebrew":
                 logger.info(
@@ -2126,6 +2201,127 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
             **kwargs,
+        )
+
+    async def preflight_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for chat completions (VLM path).
+
+        The actual VLM prompt is built by ``_process_chat_messages`` →
+        ``_prepare_vision_inputs``, which expands each image content-part
+        into 256–1280 model-specific image-placeholder tokens before the
+        chat template runs. Doing that work here would require image
+        decoding + the heavy preprocessor pipeline; for preflight we only
+        need a conservative upper bound on the prompt size, so we instead:
+
+          1. Apply the *text-only* chat template (cheap).
+          2. Count its tokens.
+          3. Add a per-image upper-bound budget (``_IMAGE_TOKEN_UPPER_BOUND``)
+             for each image-bearing content part — over-counts somewhat
+             on small images (false-positive 413s for borderline-and-image
+             cases) but never under-counts, which is the property the
+             guard needs to stay safe against the Apple IOGPUFamily
+             panic path.
+
+        Tools (when supplied as Pydantic ``ToolDefinition`` objects by
+        direct API callers) must be converted to dict form for the
+        template — ``BatchedEngine.preflight_chat`` does this and we
+        mirror it here. Without conversion the template's ``TypeError``
+        retry path silently drops tools entirely, which not only
+        miscalibrates the token count but also bypasses the actual
+        tool-prompt rendering on the real chat path.
+
+        Raises ``PrefillMemoryExceededError`` if the conservative estimate
+        would exceed the configured memory ceiling. See
+        ``BatchedEngine.preflight_chat`` for the upstream rationale
+        (avoiding the ``StreamingResponse`` 200 commit so HTTP 413
+        actually reaches the client).
+        """
+        if not self._loaded:
+            await self.start()
+        template_tools = convert_tools_for_template(tools) if tools else None
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
+        # Strip image content-parts BEFORE templating. Modern HF chat
+        # templates (Qwen2.5-VL, Gemma-Vision, Llama-3.2-Vision) render
+        # ``image_url`` / ``image`` content parts as literal placeholder
+        # strings inline with the text; if we leave them in, the
+        # tokenized prompt already contains some image-placeholder
+        # tokens AND we then add the per-image budget on top — a double
+        # count that 413's borderline image-bearing prompts the real
+        # chat path would have handled. The real ``chat`` flow itself
+        # strips images first via ``extract_images_from_messages`` (see
+        # ``_process_chat_messages``), so mirroring that here keeps
+        # preflight and execution on the same template input.
+        text_messages, _, _ = extract_images_from_messages(messages)
+        prompt = self._apply_chat_template(
+            text_messages,
+            template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=partial,
+        )
+        # Tokenizer errors propagate as 500 today regardless of where they
+        # fire; the real chat path's add_request → tokenize call has no
+        # path-specific 400 handler. Don't introduce a NEW failure mode
+        # in preflight: skip the memory check on tokenizer error and let
+        # the real chat path surface the same error through the existing
+        # handler chain.
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
+                "%s; skipping prefill memory check, real chat path will "
+                "surface the error",
+                type(e).__name__,
+            )
+            return
+        # Count images from the ORIGINAL messages (the stripped
+        # ``text_messages`` no longer has the image content-parts).
+        num_tokens += _count_image_tokens(
+            messages,
+            per_image_upper_bound=_derive_image_token_upper_bound(
+                getattr(self, "_processor", None)
+            ),
+        )
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_chat")
+            return
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
+        )
+
+    async def preflight_completion(
+        self,
+        prompt: str,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for plain /v1/completions calls (VLM)."""
+        if not self._loaded:
+            await self.start()
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "VLMBatchedEngine.preflight_completion: tokenizer.encode "
+                "raised %s; skipping prefill memory check, real completion "
+                "path will surface the error",
+                type(e).__name__,
+            )
+            return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_completion")
+            return
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def stream_chat(

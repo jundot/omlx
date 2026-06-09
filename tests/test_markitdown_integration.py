@@ -426,6 +426,145 @@ def test_preprocess_file_parts_does_not_create_mixed_content_warning(monkeypatch
     ]
 
 
+def test_preprocess_allows_missing_historical_file_parts(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("missing historical files should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    processed = preprocess_markitdown_file_parts(
+        [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Summarize this."},
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "mime_type": "application/pdf",
+                            "data": "",
+                        },
+                    },
+                ],
+            ),
+            Message(role="assistant", content="Done."),
+            Message(role="user", content="Continue."),
+        ],
+        global_settings=GlobalSettings(),
+        allow_missing_historical_files=True,
+    )
+
+    parts = processed[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert parts[1].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[1].text or "")
+    assert processed[2].content == "Continue."
+
+
+def test_preprocess_still_rejects_missing_latest_file_part():
+    with pytest.raises(MarkItDownRequestError, match="file_data"):
+        preprocess_markitdown_file_parts(
+            [
+                Message(
+                    role="user",
+                    content=[
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "paper.pdf",
+                                "mime_type": "application/pdf",
+                                "data": "",
+                            },
+                        }
+                    ],
+                )
+            ],
+            global_settings=GlobalSettings(),
+            allow_missing_historical_files=True,
+        )
+
+
+def test_async_preprocess_allows_missing_historical_file_parts(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("missing historical files should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    async def exercise():
+        return await preprocess_markitdown_file_parts_async(
+            [
+                Message(
+                    role="user",
+                    content=[
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "paper.pdf",
+                                "mime_type": "application/pdf",
+                                "data": "",
+                            },
+                        }
+                    ],
+                ),
+                Message(role="assistant", content="Done."),
+                Message(role="user", content="Continue."),
+            ],
+            global_settings=GlobalSettings(),
+            allow_missing_historical_files=True,
+        )
+
+    processed = asyncio.run(exercise())
+
+    parts = processed[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[0].text or "")
+
+
+def test_server_llm_preprocess_allows_stored_document_placeholders(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("stored document placeholders should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    state = ServerState()
+    state.engine_pool = _EmptyPool()
+    state.global_settings = GlobalSettings()
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "mime_type": "application/pdf",
+                            "data": "",
+                        },
+                    }
+                ],
+            ),
+            Message(role="assistant", content="Done."),
+            Message(role="user", content="Continue."),
+        ],
+    )
+
+    async def exercise():
+        with patch("omlx.server._server_state", state):
+            return await server_module._preprocess_markitdown_files_for_llm(request)
+
+    processed = asyncio.run(exercise())
+
+    parts = processed.messages[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[0].text or "")
+
+
 def test_preprocess_file_parts_rejects_when_disabled():
     settings = GlobalSettings()
     settings.integrations.markitdown_enabled = False
@@ -515,9 +654,7 @@ def test_empty_pdf_conversion_logs_warning(monkeypatch, caplog):
 
 def test_pdf_parser_debug_loggers_are_quieted():
     logger_names = ("pdfminer", "pdfminer.psparser", "pdfminer.pdfinterp")
-    original_levels = {
-        name: logging.getLogger(name).level for name in logger_names
-    }
+    original_levels = {name: logging.getLogger(name).level for name in logger_names}
     try:
         for name in logger_names:
             logging.getLogger(name).setLevel(logging.DEBUG)
@@ -550,12 +687,13 @@ def test_ocr_pdf_engine_converts_pages_in_order_limits_concurrency_and_unloads(
 
         def acquire(self, model_id):
             assert model_id == "OCR-Model"
+            pool = self
 
             class Lease:
-                async def __aenter__(lease_self):
-                    return self.engine
+                async def __aenter__(self):
+                    return pool.engine
 
-                async def __aexit__(lease_self, exc_type, exc, tb):
+                async def __aexit__(self, exc_type, exc, tb):
                     return None
 
             return Lease()
@@ -636,11 +774,13 @@ def test_ocr_pdf_engine_streams_ready_prefix_in_page_order(monkeypatch):
             )
 
         def acquire(self, model_id):
-            class Lease:
-                async def __aenter__(lease_self):
-                    return self.engine
+            pool = self
 
-                async def __aexit__(lease_self, exc_type, exc, tb):
+            class Lease:
+                async def __aenter__(self):
+                    return pool.engine
+
+                async def __aexit__(self, exc_type, exc, tb):
                     return None
 
             return Lease()

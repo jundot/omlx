@@ -914,7 +914,7 @@ class DFlashEngine(BaseEngine):
             logger.info("DFlash generate cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("DFlash executor did not exit within 10s after abort")
             except Exception:
                 pass
@@ -1079,7 +1079,7 @@ class DFlashEngine(BaseEngine):
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "DFlash executor did not exit within 10s after abort; "
                     "next request may still be queued"

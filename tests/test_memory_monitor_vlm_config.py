@@ -90,8 +90,10 @@ class TestSetModelInfoForMonitorVLMWalk:
 
     def test_picks_text_config_over_top_level_vision_dims(self):
         sched = _make_scheduler()
-        assert sched.memory_monitor is None  # init path is paged-SSD-only mode
-        # Inject a memory monitor so the method has somewhere to write.
+        # Scheduler.__init__ now constructs a MemoryMonitor in
+        # estimator-only mode (eviction_enabled=False) so preflight
+        # estimation works without prior set_model_info. Replace with
+        # a MagicMock so we can inspect the set_model_info call.
         sched.memory_monitor = MagicMock()
         sched.model = MagicMock()
         sched.model.config = _VLMConfigWithTextConfig()

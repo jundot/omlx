@@ -529,6 +529,50 @@ class EnginePool:
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
 
+    async def _unload_other_dflash_engines(self, model_id: str) -> None:
+        """Unload other idle DFlash engines before starting a new one.
+
+        dflash-mlx installs target hooks on shared Python classes and owns a
+        process-global runtime cache manager, so multiple loaded DFlash engines
+        can leak state across model switches.
+        """
+        victims: list[str] = []
+        blocked: list[str] = []
+        for mid, e in self._entries.items():
+            if mid == model_id or e.engine is None:
+                continue
+            if type(e.engine).__name__ != "DFlashEngine":
+                continue
+            if e.is_loading or e.in_use > 0:
+                blocked.append(mid)
+                continue
+            try:
+                if e.engine.has_active_requests():
+                    blocked.append(mid)
+                    continue
+            except AttributeError:
+                pass
+            if e.is_pinned:
+                blocked.append(f"{mid} (pinned)")
+                continue
+            victims.append(mid)
+
+        if blocked:
+            raise RuntimeError(
+                "Cannot load DFlash model "
+                f"'{model_id}' while another DFlash engine is active: "
+                f"{', '.join(blocked)}"
+            )
+
+        for victim in victims:
+            logger.info(
+                "Unloading DFlash model '%s' before loading '%s' because "
+                "dflash runtime hooks/cache are process-global",
+                victim,
+                model_id,
+            )
+            await self._unload_engine(victim)
+
     @staticmethod
     def _resolve_scheduler_from_engine(engine: object) -> object | None:
         scheduler = getattr(engine, "scheduler", None)
@@ -920,6 +964,8 @@ class EnginePool:
             _is_dflash_engine = (
                 engine is not None and type(engine).__name__ == "DFlashEngine"
             )
+            if _is_dflash_engine:
+                await self._unload_other_dflash_engines(model_id)
 
             try:
                 await engine.start()

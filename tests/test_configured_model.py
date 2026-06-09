@@ -233,7 +233,7 @@ class TestMaxContextWindow:
 
 class TestEmbeddingMaxLength:
     """embedding_max_length precedence: explicit request length > the resolved
-    context window > a defensive 512 floor."""
+    context window > ``None`` (let the embedding model resolve its own length)."""
 
     def test_request_length_wins(self):
         cm = new_configured_model(
@@ -264,15 +264,16 @@ class TestEmbeddingMaxLength:
         )
         assert cm.embedding_max_length() == 128_000
 
-    def test_floor_when_no_context_known(self):
+    def test_none_when_no_context_known(self):
         # Degenerate config: no per-model setting, no native context, and no
-        # sampling default either -> the defensive 512 floor applies.
+        # sampling default either -> return None so the embedding model resolves
+        # its own configured context length instead of a hard 512 cap (#1687).
         cm = new_configured_model(
             ModelSettings(),
             entry(model_context_length=None),
             SamplingDefaults(max_context_window=None),
         )
-        assert cm.embedding_max_length() == 512
+        assert cm.embedding_max_length() is None
 
 
 class TestMaxTokens:
