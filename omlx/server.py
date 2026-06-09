@@ -284,7 +284,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import verify_any_api_key
+    from .admin.auth import fingerprint_key, verify_any_api_key
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -313,7 +313,7 @@ async def verify_api_key(
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
-        logger.warning("Rejected API key: %r", api_key_value)
+        logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
