@@ -416,7 +416,18 @@ class EnginePool:
             ceiling = self._current_ceiling()
             if ceiling > 0:
                 while True:
-                    current = max(mx.get_active_memory(), get_phys_footprint())
+                    # Consult the tracked accumulator alongside live memory:
+                    # after a model settles or idles, mx.get_active_memory() and
+                    # the process footprint can read well below the model's true
+                    # resident size, while _current_model_memory still reflects
+                    # the committed total. Using only live memory lets a second
+                    # large model load without evicting the first, over-
+                    # committing past the ceiling (#1623).
+                    current = max(
+                        mx.get_active_memory(),
+                        get_phys_footprint(),
+                        self._current_model_memory,
+                    )
                     projected = current + entry.estimated_size
                     if projected <= ceiling:
                         break

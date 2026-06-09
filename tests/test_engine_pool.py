@@ -982,6 +982,63 @@ class TestEnginePoolEviction:
         assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
 
+    @pytest.fixture
+    def undercounting_memory_pool(self, small_mock_model_dir, monkeypatch):
+        """Pool where live Metal memory under-reports the committed footprint.
+
+        The #1623 condition: after a model settles/idles, both
+        `mx.get_active_memory()` and `get_phys_footprint()` can read well below
+        the model's true resident size, while the tracked accumulator
+        (`_current_model_memory`) still reflects it. Unlike `tight_memory_pool`,
+        this fixture does NOT proxy phys_footprint to the accumulator — it leaves
+        live memory at 0 so admission has to consult the accumulator itself.
+        """
+        pool = _make_pool(ceiling=2500)  # each model fits alone, not both
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_eviction_when_live_memory_undercounts(
+        self, undercounting_memory_pool
+    ):
+        """#1623: a second model must still evict the first when live memory
+        under-reports but the tracked accumulator shows the pair over-commits.
+
+        Without consulting `_current_model_memory`, admission sees
+        `current = max(0, 0) = 0`, projects `0 + model-b` under the ceiling, and
+        loads model-b alongside model-a — over-committing past the ceiling.
+        """
+        pool = undercounting_memory_pool
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
+
+        def create_engine(*args, **kwargs):
+            if "model-a" in str(kwargs.get("model_name", args[0] if args else "")):
+                return mock_engine_a
+            return mock_engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            assert pool.loaded_model_count == 1
+
+            # Load model-b: the pair exceeds the ceiling, so model-a must be
+            # evicted first even though live memory reads 0.
+            await pool.get_engine("model-b")
+
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert pool.loaded_model_count == 1
+
     @pytest.mark.asyncio
     async def test_insufficient_memory_all_pinned(self, tight_memory_pool):
         """Test InsufficientMemoryError when all models are pinned."""
