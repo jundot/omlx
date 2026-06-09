@@ -372,6 +372,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Per-token logprobs (OpenAI-compatible).
+    logprobs: bool | None = False
+    top_logprobs: int | None = None
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -397,6 +400,15 @@ class ChatCompletionRequest(BaseModel):
         self.chat_template_kwargs = template_kwargs
         return self
 
+    @model_validator(mode="after")
+    def validate_logprobs(self):
+        if self.top_logprobs is not None:
+            if not self.logprobs:
+                raise ValueError("`top_logprobs` requires `logprobs` to be true")
+            if not 0 <= self.top_logprobs <= 20:
+                raise ValueError("`top_logprobs` must be between 0 and 20")
+        return self
+
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""
@@ -407,12 +419,30 @@ class AssistantMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
 
 
+class TopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class ChatCompletionTokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    content: list[ChatCompletionTokenLogprob] | None = None
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
 
     index: int = 0
     message: AssistantMessage
     finish_reason: Optional[str] = "stop"
+    logprobs: ChoiceLogprobs | None = None
 
 
 class PromptTokensDetails(BaseModel):
@@ -613,6 +643,7 @@ class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: Optional[str] = None
+    logprobs: ChoiceLogprobs | None = None
 
 
 class ChatCompletionChunk(BaseModel):
