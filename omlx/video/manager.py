@@ -300,6 +300,19 @@ class VideoJobManager:
     def get(self, job_id: str) -> VideoJob | None:
         return self._jobs.get(job_id)
 
+    def active_model_id(self) -> str | None:
+        """Model id of the currently running job (None when idle).
+
+        Consumed by the model-status endpoints so a video model shows as
+        active while its worker is generating, even though it is never
+        pool-loaded.
+        """
+        if self._current_job_id:
+            job = self._jobs.get(self._current_job_id)
+            if job is not None:
+                return job.model_id
+        return None
+
     def list_jobs(
         self, limit: int = 20, after: str | None = None, order: str = "desc"
     ) -> tuple[list[VideoJob], bool]:

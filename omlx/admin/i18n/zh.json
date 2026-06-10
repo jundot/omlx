@@ -786,7 +786,9 @@
   "chat": {
     "video": {
       "generating": "视频生成中...",
-      "need_prompt": "输入一句提示词，用这个模型生成视频。"
+      "need_prompt": "输入一句提示词，用这个模型生成视频。",
+      "cancel": "取消",
+      "cancelled": "已取消视频生成。"
     }
   }
 }
