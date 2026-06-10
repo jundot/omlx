@@ -278,6 +278,7 @@
                                         <option value="audio_tts">Audio TTS</option>
                                         <option value="audio_sts">Audio STS</option>
                                         <option value="video">Video</option>
+                                        <option value="video_upscaler">Video Upscaler</option>
                                     </select>
                                 </div>
                                 <div x-show="reasoningParsers.length > 0">
@@ -336,6 +337,19 @@
                                                 <option :value="2160">2160p (4K)</option>
                                             </select>
                                         </div>
+                                    </div>
+                                    <!-- Companion models: resolved live from the model list -->
+                                    <div class="text-xs space-y-1 p-3 rounded-xl bg-neutral-50 border border-neutral-100">
+                                        <div class="font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.video_companions') }}</div>
+                                        <div class="text-neutral-500">
+                                            <span class="text-neutral-400">SeedVR2:</span>
+                                            <span x-text="models.find(m => m.model_type === 'video_upscaler')?.id || window.t('modal.model_settings.video_companion_missing')"></span>
+                                        </div>
+                                        <div class="text-neutral-500" x-show="selectedModel?.video_pipeline === 't2v'">
+                                            <span class="text-neutral-400">I2V:</span>
+                                            <span x-text="models.find(m => m.model_type === 'video' && (m.video_pipeline === 'i2v' || m.video_pipeline === 'ti2v'))?.id || window.t('modal.model_settings.video_companion_missing')"></span>
+                                        </div>
+                                        <p class="text-neutral-400">{{ t('modal.model_settings.video_companions_hint') }}</p>
                                     </div>
                                 </div>
                             </template>

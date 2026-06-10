@@ -18,6 +18,7 @@ from omlx.model_discovery import (
     detect_model_type,
     discover_models,
     estimate_model_size,
+    is_video_upscaler_dir,
     read_model_index_pipeline_class,
     read_video_pipeline_kind,
 )
@@ -520,3 +521,48 @@ class TestLLMRegressionGuard:
         assert models["llama-3b"].engine_type == "batched"
         assert models["Wan2.2-T2V-A14B"].model_type == "video"
         assert models["Wan2.2-T2V-A14B"].engine_type == "video"
+
+
+class TestVideoUpscalerDiscovery:
+    """SeedVR2-style upscaler dirs: listed as model_type "video_upscaler"
+    (visible, sized, deletable) but never standalone-invocable."""
+
+    @staticmethod
+    def _make_upscaler_dir(root, name="seedvr2-3b-8bit"):
+        d = root / "AbstractFramework" / name
+        for component in ("transformer", "vae"):
+            (d / component).mkdir(parents=True)
+            (d / component / "model.safetensors.index.json").write_text("{}")
+            (d / component / "0.safetensors").write_bytes(b"\0" * 64)
+        return d
+
+    def test_detects_upscaler_layout(self, tmp_path):
+        d = self._make_upscaler_dir(tmp_path)
+        assert is_video_upscaler_dir(d)
+        assert detect_model_type(d) == "video_upscaler"
+
+    def test_wan_layout_is_not_upscaler(self, tmp_path):
+        # A Wan diffusers dir has model_index.json and text_encoder/
+        d = make_diffusers_dir(tmp_path, "Wan2.2-T2V-A14B")
+        assert not is_video_upscaler_dir(d)
+
+    def test_discovered_with_type_and_size(self, tmp_path):
+        self._make_upscaler_dir(tmp_path)
+        models = discover_models(tmp_path)
+        assert "seedvr2-3b-8bit" in models
+        entry = models["seedvr2-3b-8bit"]
+        assert entry.model_type == "video_upscaler"
+        assert entry.engine_type == "video_upscaler"
+        assert entry.estimated_size > 0
+        assert entry.video_pipeline == ""
+
+    def test_is_model_dir_accepts_upscaler_root(self, tmp_path):
+        d = self._make_upscaler_dir(tmp_path)
+        assert _is_model_dir(d)
+
+    def test_bare_transformer_dir_not_upscaler(self, tmp_path):
+        # Aborted download: transformer/ exists but no index files
+        d = tmp_path / "AbstractFramework" / "seedvr2-partial"
+        (d / "transformer").mkdir(parents=True)
+        assert not is_video_upscaler_dir(d)
+        assert not _is_model_dir(d)

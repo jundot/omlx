@@ -363,3 +363,24 @@ class TestDynamicCeilingWorkerAddBack:
 
         enforcer.release_video_lease()
         assert enforcer.get_final_ceiling() == base
+
+
+class TestUpscalerPoolRejection:
+    """video_upscaler entries are registry-visible but never loadable."""
+
+    def test_type_engine_map_has_upscaler(self):
+        assert EnginePool._MODEL_TYPE_TO_ENGINE["video_upscaler"] == "video_upscaler"
+
+    async def test_get_engine_rejects_upscaler(self):
+        pool, _ = _make_pool_with_video_and_llm()
+        pool._entries["seedvr2-3b-8bit"] = EngineEntry(
+            model_id="seedvr2-3b-8bit",
+            model_path="/nonexistent/seedvr2",
+            model_type="video_upscaler",
+            engine_type="video_upscaler",
+            estimated_size=5 * GB,
+        )
+        with pytest.raises(ModelTypeNotLoadableError) as exc_info:
+            await pool.get_engine("seedvr2-3b-8bit")
+        # The hint must point at the parameter, not POST /v1/videos alone
+        assert "upscale_resolution" in str(exc_info.value)

@@ -439,9 +439,16 @@ class ModelTypeNotLoadableError(EnginePoolError):
     def __init__(self, model_id: str, model_type: str):
         self.model_id = model_id
         self.model_type = model_type
+        if model_type == "video_upscaler":
+            hint = (
+                "It is an auxiliary upscaling stage, used automatically via "
+                "the upscale_resolution parameter of POST /v1/videos."
+            )
+        else:
+            hint = "Use POST /v1/videos."
         super().__init__(
-            f"Model '{model_id}' is a {model_type} generation model and "
-            "cannot be loaded as an inference engine. Use POST /v1/videos."
+            f"Model '{model_id}' is a {model_type} model and "
+            f"cannot be loaded as an inference engine. {hint}"
         )
 
 

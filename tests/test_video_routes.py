@@ -1024,3 +1024,35 @@ class TestModelDefaults:
         job = manager.test_submitted[0]
         assert job.params["width"] == 480 and job.params["height"] == 272
         assert job.params["steps"] == 20
+
+
+class TestUpscalerModelRejection:
+    """An upscaler entry is visible in the registry but POST /v1/videos
+    must reject it as the generation model with a pointer to how it is
+    actually used."""
+
+    def test_post_with_upscaler_model_400(self, video_env, monkeypatch):
+        client, manager = video_env()
+        # Register an upscaler entry alongside the existing fixtures
+        pool_entries = {
+            "seedvr2-3b-8bit": SimpleNamespace(
+                model_path="/nonexistent/seedvr2",
+                model_type="video_upscaler",
+            ),
+        }
+        original = video_routes._get_engine_pool
+        pool = original()
+        monkeypatch.setattr(
+            video_routes, "_get_engine_pool",
+            lambda: SimpleNamespace(
+                get_entry=lambda mid: pool_entries.get(mid) or pool.get_entry(mid)
+            ),
+        )
+        resp = client.post(
+            "/v1/videos",
+            json={"model": "seedvr2-3b-8bit", "prompt": "a cat"},
+        )
+        assert resp.status_code == 400
+        assert "not a video generation model" in resp.json()["detail"]["message"] \
+            if isinstance(resp.json().get("detail"), dict) \
+            else "not a video generation model" in str(resp.json())

@@ -54,8 +54,8 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
@@ -212,6 +212,7 @@ class EnginePool:
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
         "video": "video",
+        "video_upscaler": "video_upscaler",
     }
 
     def apply_settings_overrides(
@@ -345,7 +346,7 @@ class EnginePool:
             # a 42GB video entry into admission would evict resident LLM
             # engines before failing (docs/video-generation-engine-spec.md
             # section 3).
-            if entry.model_type == "video":
+            if entry.model_type in ("video", "video_upscaler"):
                 raise ModelTypeNotLoadableError(model_id, entry.model_type)
 
             # Already loaded - just update access time
@@ -673,7 +674,7 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
-                elif entry.engine_type == "video":
+                elif entry.engine_type in ("video", "video_upscaler"):
                     # Defense in depth: get_engine rejects video entries
                     # before admission; this arm catches any other caller
                     # so a diffusers dir never falls into BatchedEngine.
