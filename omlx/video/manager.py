@@ -336,6 +336,21 @@ class VideoJobManager:
                 return job.model_id
         return None
 
+    def current_worker_memory_bytes(self) -> int:
+        """Live phys footprint of the running worker (0 when idle).
+
+        The Active Models card sums pool-loaded engine memory, which a
+        video worker never appears in -- without this the card shows
+        0 GB used while a generation occupies tens of GB.
+        """
+        proc = self._current_proc
+        if proc is None or proc.returncode is not None:
+            return 0
+        try:
+            return max(0, int(get_phys_footprint(proc.pid)))
+        except Exception:
+            return 0
+
     def list_jobs(
         self, limit: int = 20, after: str | None = None, order: str = "desc"
     ) -> tuple[list[VideoJob], bool]:

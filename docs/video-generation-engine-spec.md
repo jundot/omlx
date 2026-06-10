@@ -668,11 +668,14 @@ upscaling (释放 Wan 权重后加载 SeedVR2, 同租约内两者绝不共驻; �
 output_raw.mp4 (超分前的可续片版本) -- 否则下一次续片只能在超分后分辨率
 上生成 (720p+ 在本硬件上数小时/段, 不可接受).
 
-### 12.4 内存
+### 12.4 内存 (m5max 实测, 2026-06-10)
 
 生成段峰值仍由 §4.3 预测器把守 (i2v 与 t2v 同 A14B 架构, 同公式).
-SeedVR2 3B q8 权重 ~4.7GB, 在 Wan 释放后加载, 不抬峰值上限; 超分阶段
-实测峰值待真机数据回填. worker wired 自缚与 watchdog 语义不变.
+SeedVR2 3B q8 权重 ~4.7GB, 在 Wan 释放后加载, 不抬峰值上限. 关键实测:
+mflux 初始化器默认关闭 VAE tiling, 480x272 -> 1080p 单帧超分物理峰值
+72.06GB (会被 lease watchdog 杀); worker 显式启用 TilingConfig() +
+1GB cache limit 后同负载峰值 9.98GB, 15.1s/帧 (49 帧约 12 分钟).
+worker wired 自缚与 watchdog 语义不变.
 
 ### 12.5 chat UI
 

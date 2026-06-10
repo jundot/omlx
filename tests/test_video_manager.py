@@ -760,3 +760,14 @@ def test_to_dict_includes_extension_fields():
     assert plain["extend_source_id"] is None
     assert plain["upscale_resolution"] is None
     assert plain["has_input_reference"] is False
+
+
+# ---------------------------------------------------------------------------
+# (20) Active Models card: live worker memory (0 when idle)
+# ---------------------------------------------------------------------------
+
+
+async def test_current_worker_memory_zero_when_idle(tmp_path):
+    manager, _enf = _make_manager(tmp_path, "pass")
+    assert manager.current_worker_memory_bytes() == 0
+    await manager.shutdown()

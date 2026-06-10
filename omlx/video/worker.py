@@ -130,6 +130,7 @@ def _upscale_frames(frames: list, spec: dict) -> list:
     import tempfile
 
     from mflux.models.common.config.model_config import ModelConfig
+    from mflux.models.common.vae.tiling_config import TilingConfig
     from mflux.models.seedvr2.variants.upscale.seedvr2 import SeedVR2
 
     total = len(frames)
@@ -138,6 +139,11 @@ def _upscale_frames(frames: list, spec: dict) -> list:
         model_path=spec["upscaler_model_dir"],
         model_config=ModelConfig.seedvr2_3b(),
     )
+    # The initializer disables VAE tiling; without it a 1080p decode
+    # materializes tens of GB of activations (measured 72GB phys for
+    # 480x272 -> 1080p) and the lease watchdog kills the worker. The CLI's
+    # --vae-tiling default config keeps the footprint inside the lease.
+    upscaler.tiling_config = TilingConfig()
     target = int(spec["upscale_resolution"])
     seed = int(spec["seed"])
     out = []
