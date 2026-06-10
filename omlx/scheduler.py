@@ -386,11 +386,27 @@ def _patched_generation_batch_step(self):
         model.set_batch_rope_deltas(mx.array(deltas))
 
     # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
-    # and `for p in self.logits_processors[e]`, both of which crash when
-    # logits_processors is None.  Normalise to [] so the original code path
-    # works without modification.  See #934.
+    # and `for p in self.logits_processors[e]`, both of which crash when a row
+    # slot is None.  Normalise the whole list AND every per-row slot to [] here,
+    # at the single consumption chokepoint, so the original step and the
+    # grammar-accept loop below are both safe regardless of slot origin.
+    #
+    # The insert call sites already wrap each request's processors as a list,
+    # but that is not enough: on a heterogeneous continuous-batch merge,
+    # mlx-lm's GenerationBatch.extend() re-introduces None slots via
+    # `if not any(self.logits_processors): self.logits_processors =
+    # [None] * len(self.uids)`.  `any([[], []])` is False, so empty-list slots
+    # collapse back to None whenever a batch with no *active* processor merges
+    # with a grammar-constrained one (e.g. a plain chat request joining a batch
+    # that is serving a structured json_schema request).  Per-row normalisation
+    # at this chokepoint is the only place that covers both insert and merge.
+    # See #934 / #1747.
     if self.logits_processors is None:
         self.logits_processors = []
+    else:
+        self.logits_processors = [
+            procs if procs is not None else [] for procs in self.logits_processors
+        ]
 
     result = _original_generation_batch_step(self)
 

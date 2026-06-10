@@ -12,15 +12,28 @@ doesn't match it, and presents to users as a request hang. See
 ``vllm-mlx-patched`` commit ``8d4052b`` for the same root cause in a
 sibling project.
 
-Two levels of defense:
+The caller-side wrap is necessary but **not sufficient**: on a heterogeneous
+continuous-batch merge, mlx-lm's ``GenerationBatch.extend()`` re-introduces
+None slots via ``if not any(self.logits_processors): self.logits_processors =
+[None] * len(self.uids)``. Because ``any([[], []])`` is False, the empty-list
+slots written at insert time collapse back to None whenever a batch with no
+*active* processor merges with a grammar-constrained one (a plain chat request
+joining a batch that is already serving a structured ``json_schema`` request).
+The crash then fires from the merge path, not the insert path, and only
+reproduces under request concurrency.
 
-1. **Caller-side**: ``omlx/scheduler.py`` always wraps
-   ``logits_processors`` as a list (possibly empty), never None.
-2. **Pattern matcher**: ``CACHE_CORRUPTION_PATTERNS`` includes
+Three levels of defense:
+
+1. **Chokepoint**: ``_patched_generation_batch_step`` normalises the whole
+   list AND every per-row slot to ``[]`` before each step, covering both the
+   insert and the ``extend()`` merge origins. This is the load-bearing guard.
+2. **Caller-side**: ``omlx/scheduler.py`` always wraps ``logits_processors``
+   as a list (possibly empty), never None, at the insert call site.
+3. **Pattern matcher**: ``CACHE_CORRUPTION_PATTERNS`` includes
    ``"'NoneType' object is not iterable"`` so the scheduler recovers
    gracefully if a None slot ever sneaks through.
 
-These tests pin both invariants.
+These tests pin all three invariants.
 """
 
 from __future__ import annotations
@@ -54,6 +67,68 @@ class TestLogitsProcessorsCallShape:
         assert "logits_processors=[per_row_lps]" in scheduler_src, (
             "scheduler.py must pass logits_processors=[per_row_lps] "
             "(per-row list, never None) to BatchGenerator.insert. See #934."
+        )
+
+
+class TestChokepointNormalisation:
+    """Pin the load-bearing guard: per-row None slots are normalised to []
+    before the original step runs, covering the extend() merge origin."""
+
+    def test_patched_step_normalises_none_row_slots(self, monkeypatch):
+        """A None per-row slot (as extend() produces it) must be normalised
+        to [] at the chokepoint, before the wrapped mlx-lm step is called.
+
+        Fails before the fix: the raw None slot reaches the wrapped step (or
+        crashes omlx's own grammar-accept loop). Passes after: the slot is [].
+        No model required — the rope branch is skipped without ``_uses_mrope``
+        and the grammar branch is skipped without GrammarConstraintProcessor.
+        """
+        import omlx.scheduler as scheduler
+
+        captured = {}
+
+        def fake_original_step(self):
+            captured["logits_processors"] = list(self.logits_processors)
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        def identity_processor(token_context, logits):
+            return logits
+
+        class FakeModel:
+            pass
+
+        class FakeBatch:
+            model = FakeModel()
+            uids = [0, 1]
+            # Row 0 has a real processor; row 1 is the None slot extend() leaves.
+            logits_processors = [[identity_processor], None]
+            _next_tokens = None
+
+        batch = FakeBatch()
+        result = scheduler._patched_generation_batch_step(batch)
+
+        assert result == "stepped"
+        # The wrapped step must never see a None slot.
+        assert captured["logits_processors"][1] == []
+        assert all(slot is not None for slot in batch.logits_processors)
+
+    def test_scheduler_source_normalises_per_row_slots(self):
+        """Source-level guard against silent removal of the per-row
+        normalisation. Cheap; runs without a model in CI."""
+        from pathlib import Path
+
+        scheduler_src = (
+            Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
+        ).read_text()
+        assert "procs if procs is not None else []" in scheduler_src, (
+            "scheduler.py must normalise every per-row logits_processors slot "
+            "to [] at the _patched_generation_batch_step chokepoint, because "
+            "GenerationBatch.extend() re-introduces None slots on a "
+            "heterogeneous merge. See #934 / #1747."
         )
 
 
@@ -150,6 +225,42 @@ class TestHeterogeneousMergeReproduction:
         bg.insert([tok_b], logits_processors=[[]])  # ← the fix shape
 
         # Should not raise.
+        for _ in range(8):
+            bg.next_generated()
+
+        bg.close()
+
+    def test_extend_renones_empty_slots_but_chokepoint_survives(self, small_model):
+        """The actual gap: extend() turns insert-time [] slots back into None.
+
+        Importing ``omlx.scheduler`` installs ``_patched_generation_batch_step``
+        on ``GenerationBatch._step``. With the per-row normalisation in place,
+        a grammar batch merged with a no-active-processor batch (the empty-list
+        shape #1747 ships) must decode without raising, even though extend()
+        re-None-ifies the empty slots. Drop the chokepoint normalisation and
+        this test raises ``TypeError: 'NoneType' object is not iterable``.
+        """
+        from mlx_lm.generate import BatchGenerator
+
+        import omlx.scheduler  # noqa: F401  (installs the _step chokepoint patch)
+
+        model, tokenizer = small_model
+        bg = BatchGenerator(model, max_tokens=6)
+
+        def identity_processor(token_context, logits):
+            return logits
+
+        tok_a = tokenizer.encode("Hi ", add_special_tokens=False)
+        tok_b = tokenizer.encode("There ", add_special_tokens=False)
+
+        # Start a grammar-constrained row decoding, then join a plain row
+        # carrying the empty-list "fix shape" — the join routes through
+        # GenerationBatch.extend(), which collapses [] back to None.
+        bg.insert([tok_a], logits_processors=[[identity_processor]])
+        bg.next_generated()
+        bg.insert([tok_b], logits_processors=[[]])
+
+        # Must not raise with the chokepoint normalisation in place.
         for _ in range(8):
             bg.next_generated()
 
