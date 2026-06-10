@@ -965,6 +965,63 @@ class TestStoreCacheCapWalk:
         scheduler.adjust_store_cache_cap.assert_called_with("soft")
 
 
+class TestRecentPeakTracking:
+    """Tests for recent-peak high-water tracking across poll ticks."""
+
+    @pytest.mark.asyncio
+    async def test_recent_peak_is_window_max(self, enforcer):
+        """After several poll ticks, recent_peak == max over the window.
+
+        The window update lives after the ceiling > 0 early return in
+        _check_and_enforce, so the fixture's positive ceiling (10 GB) is
+        required for the update to run at all.
+        """
+        readings = [3 * 1024**3, 5 * 1024**3, 2 * 1024**3, 4 * 1024**3]
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        ):
+            mock_mx.get_active_memory.side_effect = _cycling(readings)
+            for _ in readings:
+                await enforcer._check_and_enforce()
+
+        assert enforcer.recent_peak_bytes() == 5 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_recent_peak_drops_after_window_slides(self, enforcer):
+        """Old high readings age out once they leave the maxlen=5 window."""
+        # Feed one big reading, then enough small ones to push it out of the
+        # 5-slot window.
+        big = 9 * 1024**3
+        small = 1 * 1024**3
+        readings = [big, small, small, small, small, small]
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        ):
+            mock_mx.get_active_memory.side_effect = _cycling(readings)
+            for _ in readings:
+                await enforcer._check_and_enforce()
+
+        # After 6 ticks the first (big) reading has slid out of the window,
+        # leaving only small readings.
+        assert enforcer.recent_peak_bytes() == small
+
+    def test_propagates_recent_peak_to_scheduler(self, enforcer):
+        """_propagate_memory_limit pushes recent_peak onto each scheduler."""
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_recent_peak_bytes = 0
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        enforcer._recent_peak_bytes = 7 * 1024**3
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_recent_peak_bytes == 7 * 1024**3
+
+
 class TestProperties:
     """Tests for enforcer properties."""
 

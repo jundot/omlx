@@ -44,6 +44,7 @@
                 integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
+                video: { enabled: false, worker_python: '', memory_lease_gb: 36, max_queued_jobs: 4, job_timeout_seconds: 7200, progress_stall_timeout_seconds: 600, default_steps: 20, default_fps: 16, max_frames: 121, max_steps: 50, max_pixels_per_frame: 921600, artifacts_max_count: 50, artifacts_max_gb: 50 },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -781,6 +782,7 @@
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
+                            video: { ...this.globalSettings.video, ...data.video },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
@@ -884,6 +886,14 @@
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
+                            video_enabled: this.globalSettings.video?.enabled ?? null,
+                            video_worker_python: this.globalSettings.video?.worker_python || null,
+                            video_memory_lease_gb: this.globalSettings.video?.memory_lease_gb ?? null,
+                            video_max_queued_jobs: this.globalSettings.video?.max_queued_jobs ?? null,
+                            video_job_timeout_seconds: this.globalSettings.video?.job_timeout_seconds ?? null,
+                            video_default_steps: this.globalSettings.video?.default_steps ?? null,
+                            video_default_fps: this.globalSettings.video?.default_fps ?? null,
+                            video_artifacts_max_gb: this.globalSettings.video?.artifacts_max_gb ?? null,
                         }),
                     });
 

@@ -413,6 +413,10 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=get_unix_timestamp)
     owned_by: str = "omlx"
+    # fmlx extension (additive; OpenAI clients ignore unknown fields).
+    # Lets clients filter non-chat models (video/embedding/audio) out of
+    # chat pickers; the CLI's llm/vlm filter consumes it.
+    model_type: str = "llm"
 
 
 class ModelsResponse(BaseModel):

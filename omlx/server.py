@@ -165,6 +165,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelTypeNotLoadableError,
     SchedulerQueueFullError,
 )
 from .model_discovery import format_size
@@ -227,6 +228,7 @@ class ServerState:
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
+    video_job_manager: Optional[object] = None  # VideoJobManager
 
 
 # Global server state instance
@@ -359,11 +361,28 @@ async def lifespan(app: FastAPI):
             hard_threshold=mem_cfg.hard_threshold,
             prefill_safe_zone_ratio=mem_cfg.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=mem_cfg.prefill_min_chunk_tokens,
+            prefill_transient_margin_gb=mem_cfg.prefill_transient_margin_gb,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
         enforcer.start()
+
+    # Video job manager -- constructed AFTER the enforcer so the memory
+    # lease can be constructor-injected (testability seam, spec 4.2).
+    # Cheap when video is disabled: no worker spawns until a job arrives.
+    if _server_state.global_settings is not None:
+        from .video.manager import VideoJobManager
+
+        try:
+            _server_state.video_job_manager = VideoJobManager(
+                settings=_server_state.global_settings.video,
+                base_path=_server_state.global_settings.base_path,
+                enforcer=_server_state.process_memory_enforcer,
+            )
+        except Exception as e:  # noqa: BLE001 -- never block serving on video
+            logger.warning(f"Video job manager unavailable: {e}")
+            _server_state.video_job_manager = None
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -398,6 +417,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
     get_server_metrics().save_alltime()
+    # isinstance (not None-check): tests patch _server_state wholesale and
+    # auto-created mock attributes are not awaitable.
+    from .video.manager import VideoJobManager as _VideoJobManager
+    if isinstance(_server_state.video_job_manager, _VideoJobManager):
+        await _server_state.video_job_manager.shutdown()
+        _server_state.video_job_manager = None
+        logger.info("Video job manager stopped")
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -445,6 +471,13 @@ try:
     del _
 except ImportError:
     pass
+
+# Video routes are mounted unconditionally -- a settings-driven gate cannot
+# live here because settings are not initialized at import time (the audio
+# gate above only works because it tests import availability). Each handler
+# gates on settings.video.enabled / manager presence / worker venv instead.
+from .api.video_routes import router as video_router
+app.include_router(video_router, dependencies=[Depends(verify_api_key)])
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -690,15 +723,41 @@ async def get_engine(
     # Resolve alias to real model_id
     model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
 
+    # Video models are job-managed; reject BEFORE pool.get_engine so the
+    # 42GB entry never enters the admission/eviction loop (a misrouted
+    # chat request must not evict resident LLMs). Spec section 3.
+    _entry = pool.get_entry(model_id)
+    if _entry is not None and getattr(_entry, "model_type", "") == "video":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_id}' is a video generation model. "
+                "Use POST /v1/videos."
+            ),
+        )
+
     try:
         engine = await pool.get_engine(model_id)
     except ModelNotFoundError as e:
-        # Fallback to default model if enabled (LLM only)
+        # Fallback to default model if enabled (LLM only). The default can
+        # still be set to a non-chat model via admin/settings; verify its
+        # type before retrying (spec 4.1 fallback hygiene).
+        _default_entry = (
+            pool.get_entry(_server_state.default_model)
+            if _server_state.default_model
+            else None
+        )
+        _default_type = getattr(_default_entry, "model_type", None)
         if (
             engine_type == EngineType.LLM
             and _server_state.global_settings
             and _server_state.global_settings.model.model_fallback
             and _server_state.default_model
+            # Block fallback only onto a KNOWN non-chat type; unknown
+            # entries (or non-string types from test doubles) preserve
+            # the old fallback behavior.
+            and (not isinstance(_default_type, str)
+                 or _default_type in ("llm", "vlm"))
         ):
             logger.info(
                 f"Model '{model_id}' not found, falling back to "
@@ -729,6 +788,9 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except ModelTypeNotLoadableError as e:
+        # Defense in depth: the pre-pool check above normally catches this
+        raise HTTPException(status_code=400, detail=str(e))
     except EnginePoolError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1274,8 +1336,16 @@ def init_server(
             f"No models found in {', '.join(dir_list)}. Add models to serve them."
         )
 
-    # Set default model (from settings file, fallback to first model)
+    # Set default model (from settings file, fallback to first model).
+    # Implicit selection filters to chat-capable types so a video (or
+    # embedding/audio) model that sorts first never becomes the target of
+    # model-less chat requests (spec 4.1 default-model hygiene).
     available_models = _server_state.engine_pool.get_model_ids()
+
+    def _chat_capable(mid: str) -> bool:
+        entry = _server_state.engine_pool.get_entry(mid)
+        return entry is not None and entry.model_type in ("llm", "vlm")
+
     if available_models:
         if settings_default:
             if settings_default in available_models:
@@ -1284,9 +1354,13 @@ def init_server(
                 logger.warning(
                     f"Default model '{settings_default}' not found, using first model"
                 )
-                _server_state.default_model = available_models[0]
+                _server_state.default_model = next(
+                    (m for m in available_models if _chat_capable(m)), None
+                )
         else:
-            _server_state.default_model = available_models[0]
+            _server_state.default_model = next(
+                (m for m in available_models if _chat_capable(m)), None
+            )
     else:
         _server_state.default_model = None
 
@@ -1717,6 +1791,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
+                    model_type=m.get("model_type", "llm"),
                 )
             )
 
@@ -1773,6 +1848,16 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     entry = _server_state.engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.model_type == "video":
+        # Pre-pool check: the blanket except below would swallow the typed
+        # rejection into a 500 (spec 4.1).
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_id}' is a video generation model and is "
+                "not pool-loaded. Use POST /v1/videos."
+            ),
+        )
     if entry.engine is not None:
         return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
 

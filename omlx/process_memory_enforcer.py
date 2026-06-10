@@ -33,6 +33,7 @@ import ctypes.util
 import logging
 import subprocess
 import sys
+from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -291,6 +292,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.80,
         prefill_min_chunk_tokens: int = 32,
+        prefill_transient_margin_gb: float = 0.0,
     ):
         """
         Initialize the process memory enforcer.
@@ -317,6 +319,11 @@ class ProcessMemoryEnforcer:
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
+            prefill_transient_margin_gb: Conservative margin added to the
+                modelled per-chunk prefill peak by the scheduler's
+                forward-front gate, covering the MoE expert-dequant activation
+                spike that estimate_prefill_peak_bytes does not model.
+                Propagated to each scheduler. 0 = no extra margin.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -331,6 +338,9 @@ class ProcessMemoryEnforcer:
         self._hard_threshold = hard_threshold
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._prefill_transient_margin_bytes = max(
+            0, int(prefill_transient_margin_gb * 1024**3)
+        )
         self._task: asyncio.Task | None = None
         self._running = False
         # Most recently observed pressure level, consumed by scheduler /
@@ -340,6 +350,21 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
+        # Rolling window of recent usage readings + their high-water mark.
+        # Prefill memory dips into a trough between chunks, so the instant
+        # reading can read low mid-prefill; preflight admission consults this
+        # peak instead so it does not wave through a request that will wall
+        # the next chunk. Updated on every poll iteration.
+        self._usage_window: deque[int] = deque(maxlen=5)
+        self._recent_peak_bytes: int = 0
+        # Video job memory lease (docs/video-generation-engine-spec.md 4.4).
+        # While held, the lease is subtracted from the final ceiling so pool
+        # admission, watermarks and the prefill gate all tighten coherently.
+        # The worker pid lets the dynamic ceiling count the subprocess
+        # exactly once (its real usage drains system free pages, which
+        # would otherwise stack on top of the explicit lease).
+        self._video_lease_bytes: int = 0
+        self._video_worker_pid: int | None = None
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -463,17 +488,31 @@ class ProcessMemoryEnforcer:
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
 
+        # Video worker correction: the worker's real usage drains system
+        # free pages, shrinking this ceiling -- but the lease is ALREADY
+        # subtracted in _get_hard_limit_bytes. Add the worker's footprint
+        # back (clamped to the lease) so it is counted exactly once. A
+        # footprint read of 0 (failure) degrades to double-counting, which
+        # is fail-conservative.
+        worker_extra = 0
+        if self._video_worker_pid is not None and self._video_lease_bytes > 0:
+            worker = get_phys_footprint(self._video_worker_pid)
+            if worker > 0:
+                worker_extra = min(worker, self._video_lease_bytes)
+
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            return max(0, omlx_usage + psutil.virtual_memory().available)
+            return max(
+                0, omlx_usage + worker_extra + psutil.virtual_memory().available
+            )
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
         reclaimable = (
             stats["free"]
             + stats["inactive"]
             + int(stats["active"] * ratio)
         )
-        return max(0, omlx_usage + reclaimable)
+        return max(0, omlx_usage + worker_extra + reclaimable)
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
@@ -497,11 +536,84 @@ class ProcessMemoryEnforcer:
         metal_cap = get_effective_metal_cap_bytes()
         if metal_cap > 0:
             candidates.append(metal_cap)
-        return min(candidates)
+        ceiling = min(candidates)
+        if self._video_lease_bytes > 0:
+            # Clamp to >= 1, never 0: every consumer treats ceiling 0 as
+            # "guard disabled", which would drop all protection exactly
+            # while a video job holds memory. A 1-byte ceiling instead
+            # pauses admission and trips the gate -- the safe direction.
+            return max(1, ceiling - self._video_lease_bytes)
+        return ceiling
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
+
+    def recent_peak_bytes(self) -> int:
+        """Recent high-water memory usage over the last few poll ticks."""
+        return self._recent_peak_bytes
+
+    @property
+    def video_lease_bytes(self) -> int:
+        """Currently held video memory lease (0 when none)."""
+        return self._video_lease_bytes
+
+    def acquire_video_lease(self, lease_bytes: int) -> None:
+        """Reserve memory for a video worker job.
+
+        Subtracts the lease from the final ceiling (single choke point:
+        pool admission, soft/hard watermarks, admission_paused and the
+        prefill gate cap all derive from it) and lowers this process's
+        Metal wired limit so parent + worker wired sets cannot stack
+        toward the machine cap. One lease at a time -- the VideoJobManager
+        serializes jobs (docs/video-generation-engine-spec.md 4.4).
+
+        Raises:
+            RuntimeError: If a lease is already held.
+            ValueError: If lease_bytes is not positive.
+        """
+        if lease_bytes <= 0:
+            raise ValueError(f"lease_bytes must be positive, got {lease_bytes}")
+        if self._video_lease_bytes > 0:
+            raise RuntimeError(
+                "A video memory lease is already held "
+                f"({_format_gb(self._video_lease_bytes)})"
+            )
+        self._video_lease_bytes = int(lease_bytes)
+        if self._prefill_memory_guard:
+            target = max(1, self._get_static_ceiling() - self._video_lease_bytes)
+            _apply_metal_wired_limit(target)
+            self._metal_wired_limit_request = target
+        if self._running:
+            self._propagate_memory_limit()
+        logger.info(
+            "[videolease] acquired %s (ceiling now %s)",
+            _format_gb(self._video_lease_bytes),
+            _format_gb(self._get_hard_limit_bytes()),
+        )
+
+    def set_video_worker_pid(self, pid: int | None) -> None:
+        """Bind the running video worker pid for dynamic-ceiling correction."""
+        self._video_worker_pid = pid
+
+    def release_video_lease(self) -> None:
+        """Release the video memory lease and restore the Metal wired limit."""
+        if self._video_lease_bytes <= 0:
+            return
+        released = self._video_lease_bytes
+        self._video_lease_bytes = 0
+        self._video_worker_pid = None
+        if self._prefill_memory_guard:
+            static_ceiling = self._get_static_ceiling()
+            _apply_metal_wired_limit(static_ceiling)
+            self._metal_wired_limit_request = static_ceiling
+        if self._running:
+            self._propagate_memory_limit()
+        logger.info(
+            "[videolease] released %s (ceiling now %s)",
+            _format_gb(released),
+            _format_gb(self._get_hard_limit_bytes()),
+        )
 
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""
@@ -589,6 +701,10 @@ class ProcessMemoryEnforcer:
                 scheduler._admission_paused = admission_paused
                 scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
                 scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
+                scheduler._prefill_transient_margin_bytes = (
+                    self._prefill_transient_margin_bytes
+                )
+                scheduler._memory_recent_peak_bytes = self._recent_peak_bytes
                 bg = getattr(scheduler, "batch_generator", None)
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                     bg._memory_limit_bytes = soft_limit
@@ -671,6 +787,8 @@ class ProcessMemoryEnforcer:
             return
 
         current = self._current_usage_bytes()
+        self._usage_window.append(current)
+        self._recent_peak_bytes = max(self._usage_window) if self._usage_window else current
         soft = int(ceiling * self._soft_threshold)
         hard = int(ceiling * self._hard_threshold)
         prev_level = self._pressure_level

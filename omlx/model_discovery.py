@@ -23,8 +23,15 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]
+
+# Diffusers pipeline classes (model_index.json "_class_name") that fmlx can
+# serve via the video engine (docs/video-generation-engine-spec.md). Unknown
+# pipeline classes are skipped at discovery -- registering them would produce
+# unloadable entries, and historically the org-folder descent turned their
+# component subdirs into phantom "llm" models.
+VIDEO_PIPELINE_CLASSES = {"WanPipeline"}
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -401,6 +408,14 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
+    # Diffusers-layout video models: model_index.json at the root, no root
+    # config.json. Must run before the missing-config.json fallback below.
+    # Unknown pipeline classes never reach this point for registration --
+    # _register_model skips them outright.
+    pipeline_class = read_model_index_pipeline_class(model_path)
+    if pipeline_class in VIDEO_PIPELINE_CLASSES:
+        return "video"
+
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -694,9 +709,35 @@ def _is_adapter_dir(path: Path) -> bool:
     return (path / "adapter_config.json").exists()
 
 
+def read_model_index_pipeline_class(path: Path) -> str | None:
+    """Return the "_class_name" from a diffusers model_index.json, else None.
+
+    Diffusers-layout models (e.g. Wan2.2 T2V) have model_index.json at the
+    root and no root config.json.
+    """
+    index_path = path / "model_index.json"
+    if not index_path.exists():
+        return None
+    try:
+        with open(index_path) as f:
+            value = json.load(f).get("_class_name")
+        return value if isinstance(value, str) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model.
+
+    A model root has either config.json (transformers layout) or
+    model_index.json (diffusers layout). The model_index.json check must
+    live here -- it is what stops the org-folder descent in
+    discover_models() from registering diffusers component subdirs
+    (transformer/, vae/, ...) as phantom standalone models.
+    """
+    if _is_adapter_dir(path):
+        return False
+    return (path / "config.json").exists() or (path / "model_index.json").exists()
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
@@ -734,6 +775,24 @@ def _register_model(
             logger.info(f"Skipping unsupported model: {model_id}")
             return
 
+        # Diffusers-layout dirs whose pipeline class fmlx cannot serve are
+        # skipped outright -- registering them would produce unloadable
+        # entries (docs/video-generation-engine-spec.md section 4.1). This
+        # includes model_index.json files with a missing/unreadable
+        # _class_name (pipeline_class None): without a root config.json
+        # such a dir would otherwise register as an unloadable llm entry.
+        pipeline_class = read_model_index_pipeline_class(model_dir)
+        if (
+            (model_dir / "model_index.json").exists()
+            and not (model_dir / "config.json").exists()
+            and pipeline_class not in VIDEO_PIPELINE_CLASSES
+        ):
+            logger.warning(
+                f"Skipping unsupported diffusers pipeline "
+                f"'{pipeline_class}': {model_id}"
+            )
+            return
+
         model_type = detect_model_type(model_dir)
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
@@ -747,18 +806,25 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "video":
+            engine_type = "video"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
 
-        # Read raw config model_type for sub-type detection (e.g., OCR models)
+        # Read raw config model_type for sub-type detection (e.g., OCR models).
+        # Video models have no root config.json; surface the diffusers
+        # pipeline class instead so the admin UI shows something meaningful.
         config_model_type = ""
-        try:
-            import json
-            with open(model_dir / "config.json") as f:
-                config_model_type = json.load(f).get("model_type", "")
-        except Exception:
-            pass
+        if model_type == "video":
+            config_model_type = pipeline_class or ""
+        else:
+            try:
+                import json
+                with open(model_dir / "config.json") as f:
+                    config_model_type = json.load(f).get("model_type", "")
+            except Exception:
+                pass
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)

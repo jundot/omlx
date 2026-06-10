@@ -391,6 +391,33 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Conservative transient margin used by the scheduler's forward-FRONT memory
+    # gate (_prefill_forward_gate). The gate is PHYS-based: it refuses a prefill
+    # chunk before its forward when current(max active/phys/recent_peak) + this
+    # margin would breach the hard cap, so the transient never lands on the Metal
+    # ceiling (which would kernel-panic the whole machine -- an after-the-fact
+    # Python check cannot catch it). The model-dim estimate is optional and, in
+    # production, absent (scheduler.memory_monitor is never wired), so this margin
+    # IS the safety mechanism -- it is propagated from the ENFORCER (live), unlike
+    # the dead monitor.
+    #
+    # The load-bearing guarantee: margin >= the worst-case single-step transient.
+    # That transient (chiefly MoE expert-dequant on glm4.5-air) is SUB-POLL --
+    # faster than the enforcer's 1s sample -- so it is invisible to every memory
+    # read and MUST be carried here, not by reading the footprint more cleverly.
+    # On 2026-06-06 m5max a single glm4.5-air-106b prefill peaked at 110.4GB vs a
+    # 107.5GB cap, an effective transient up to ~10.6GB above the pre-step
+    # baseline; margin 10 was too small. 12 = ceil(10.6) padded. Extra cushion:
+    # the box only actually panics nearer ~110, so an admitted chunk needs a
+    # transient > ~14.5GB above the trip point to crash -- margin 12 clears that.
+    #
+    # Trip point: gate fires once current > cap - margin. Functional residual: a
+    # model that fills most of the cap (85GB on 128GB) gets long prompts refused
+    # cleanly (503-class) -- correct (refuse the request, do not crash the box);
+    # fit longer contexts with a smaller quant. Watch [memgate]/[memcheck] on
+    # hardware. Set to 0 only to disable the margin (gate degrades to the bare cap
+    # check; logged as a WARNING at startup).
+    prefill_transient_margin_gb: float = 12.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -402,6 +429,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "prefill_transient_margin_gb": self.prefill_transient_margin_gb,
         }
 
     @classmethod
@@ -439,6 +467,9 @@ class MemorySettings:
             ),
             prefill_min_chunk_tokens=int(
                 data.get("prefill_min_chunk_tokens", 32)
+            ),
+            prefill_transient_margin_gb=float(
+                data.get("prefill_transient_margin_gb", 12.0)
             ),
         )
 
@@ -539,15 +570,24 @@ class HuggingFaceSettings:
     """HuggingFace Hub configuration settings."""
 
     endpoint: str = ""  # Empty string = use HF default (https://huggingface.co)
+    # Disable the Xet chunk-CAS transfer backend (cas-bridge.xethub.hf.co).
+    # huggingface_hub freezes HF_HUB_DISABLE_XET at import time, so this can
+    # only be applied process-wide at serve startup (cli.py env block) --
+    # never per-download. Xet is unreachable from some networks (observed:
+    # mainland China); the plain LFS path works.
+    disable_xet: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"endpoint": self.endpoint}
+        return {"endpoint": self.endpoint, "disable_xet": self.disable_xet}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HuggingFaceSettings:
         """Create from dictionary."""
-        return cls(endpoint=data.get("endpoint", ""))
+        return cls(
+            endpoint=data.get("endpoint", ""),
+            disable_xet=bool(data.get("disable_xet", False)),
+        )
 
 
 @dataclass
@@ -564,6 +604,77 @@ class ModelScopeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ModelScopeSettings:
         """Create from dictionary."""
         return cls(endpoint=data.get("endpoint", ""))
+
+
+@dataclass
+class VideoSettings:
+    """Video generation engine settings (docs/video-generation-engine-spec.md).
+
+    The video engine runs mlx-gen in a subprocess worker from its own venv
+    ({base_path}/venvs/video by default); these settings gate the /v1/videos
+    API and bound its resource use. memory_lease_gb is reserved against the
+    process memory enforcer ceiling for the duration of a job so co-resident
+    LLM serving throttles instead of stacking toward the Metal cap.
+    """
+
+    enabled: bool = False  # Master switch; handlers return 503 when off
+    worker_python: str = ""  # Empty = {base_path}/venvs/video/bin/python
+    memory_lease_gb: float = 36.0  # Reserved against the enforcer ceiling per job (P0-calibrated)
+    max_queued_jobs: int = 4  # Submissions beyond this 503
+    job_timeout_seconds: int = 7200  # Per-run clock, starts at worker spawn
+    progress_stall_timeout_seconds: int = 600  # Kill when worker JSONL goes silent
+    default_steps: int = 20
+    default_fps: int = 16
+    max_frames: int = 121  # UX bound; memory bound is the peak predictor
+    max_steps: int = 50
+    max_pixels_per_frame: int = 1280 * 720
+    artifacts_max_count: int = 50  # LRU-purge artifact blobs beyond this
+    artifacts_max_gb: float = 50.0
+
+    def get_worker_python(self, base_path: Path) -> Path:
+        """Resolve the worker venv python path."""
+        if self.worker_python:
+            return Path(self.worker_python).expanduser()
+        return base_path / "venvs" / "video" / "bin" / "python"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "worker_python": self.worker_python,
+            "memory_lease_gb": self.memory_lease_gb,
+            "max_queued_jobs": self.max_queued_jobs,
+            "job_timeout_seconds": self.job_timeout_seconds,
+            "progress_stall_timeout_seconds": self.progress_stall_timeout_seconds,
+            "default_steps": self.default_steps,
+            "default_fps": self.default_fps,
+            "max_frames": self.max_frames,
+            "max_steps": self.max_steps,
+            "max_pixels_per_frame": self.max_pixels_per_frame,
+            "artifacts_max_count": self.artifacts_max_count,
+            "artifacts_max_gb": self.artifacts_max_gb,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> VideoSettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            worker_python=data.get("worker_python", ""),
+            memory_lease_gb=float(data.get("memory_lease_gb", 36.0)),
+            max_queued_jobs=int(data.get("max_queued_jobs", 4)),
+            job_timeout_seconds=int(data.get("job_timeout_seconds", 7200)),
+            progress_stall_timeout_seconds=int(
+                data.get("progress_stall_timeout_seconds", 600)
+            ),
+            default_steps=int(data.get("default_steps", 20)),
+            default_fps=int(data.get("default_fps", 16)),
+            max_frames=int(data.get("max_frames", 121)),
+            max_steps=int(data.get("max_steps", 50)),
+            max_pixels_per_frame=int(data.get("max_pixels_per_frame", 1280 * 720)),
+            artifacts_max_count=int(data.get("artifacts_max_count", 50)),
+            artifacts_max_gb=float(data.get("artifacts_max_gb", 50.0)),
+        )
 
 
 @dataclass
@@ -784,6 +895,7 @@ class GlobalSettings:
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
     idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+    video: VideoSettings = field(default_factory=VideoSettings)
 
     @classmethod
     def load(
@@ -879,6 +991,8 @@ class GlobalSettings:
                 self.ui = UISettings.from_dict(data["ui"])
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
+            if "video" in data:
+                self.video = VideoSettings.from_dict(data["video"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -1120,6 +1234,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "video": self.video.to_dict(),
         }
 
         try:
@@ -1363,6 +1478,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "video": self.video.to_dict(),
         }
 
 

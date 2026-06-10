@@ -2,12 +2,14 @@
 """Tests for scheduler admission control (queue depth cap + admission_paused)."""
 
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from omlx.exceptions import SchedulerQueueFullError
 from omlx.scheduler import Scheduler
+
+GB = 1024**3
 
 
 @pytest.fixture
@@ -100,3 +102,77 @@ class TestAdmissionPausedField:
         s._prefill_memory_guard = False
         s._admission_paused = False
         assert s._admission_paused is False
+
+
+def _preflight_scheduler(hard_limit: int, recent_peak: int, peak: int):
+    """Build a bare Scheduler wired for _preflight_memory_check.
+
+    `peak` is the value the (mocked) memory_monitor estimates for the
+    prefill chunk; `recent_peak` is the propagated high-water mark.
+    """
+    s = Scheduler.__new__(Scheduler)
+    s._prefill_memory_guard = True
+    s._memory_hard_limit_bytes = hard_limit
+    s._memory_recent_peak_bytes = recent_peak
+    s.config = MagicMock(prefill_step_size=2048)
+    s.memory_monitor = MagicMock()
+    s.memory_monitor.estimate_prefill_peak_bytes = MagicMock(return_value=peak)
+    return s
+
+
+def _preflight_request():
+    r = MagicMock()
+    r.num_prompt_tokens = 8192
+    r.cached_tokens = 0
+    return r
+
+
+class TestPreflightRecentPeak:
+    """_preflight_memory_check uses the recent high-water mark, not just the
+    instant reading, so it does not wave through a request during a prefill
+    trough that would wall the next chunk."""
+
+    def test_rejects_on_recent_peak_when_instant_is_low(self):
+        """Instant active/phys low but recent_peak high -> reject.
+
+        Picks numbers so that low + peak fits (pre-change behaviour would
+        admit) but recent_peak + peak exceeds the hard limit. This pins the
+        fix.
+        """
+        hard_limit = 100 * GB
+        peak = 20 * GB
+        low = 10 * GB
+        high = 85 * GB
+        # Sanity: old code (low + peak) would have passed.
+        assert low + peak <= hard_limit
+        # New code (high + peak) must exceed the limit.
+        assert high + peak > hard_limit
+
+        s = _preflight_scheduler(
+            hard_limit=hard_limit, recent_peak=high, peak=peak
+        )
+        with patch("omlx.scheduler.mx") as mock_mx, patch(
+            "omlx.scheduler.get_phys_footprint", return_value=low
+        ):
+            mock_mx.get_active_memory.return_value = low
+            result = s._preflight_memory_check(_preflight_request())
+
+        assert result is not None
+        assert "Prefill would require" in result
+
+    def test_admits_when_recent_peak_also_low(self):
+        """Control: when recent_peak is low too, the request passes."""
+        hard_limit = 100 * GB
+        peak = 20 * GB
+        low = 10 * GB
+
+        s = _preflight_scheduler(
+            hard_limit=hard_limit, recent_peak=low, peak=peak
+        )
+        with patch("omlx.scheduler.mx") as mock_mx, patch(
+            "omlx.scheduler.get_phys_footprint", return_value=low
+        ):
+            mock_mx.get_active_memory.return_value = low
+            result = s._preflight_memory_check(_preflight_request())
+
+        assert result is None

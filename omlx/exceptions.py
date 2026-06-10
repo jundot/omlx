@@ -426,6 +426,25 @@ class ModelLoadingError(EnginePoolError):
         super().__init__(f"Model '{model_id}' is already being loaded")
 
 
+class ModelTypeNotLoadableError(EnginePoolError):
+    """Raised when a model type is not pool-loadable (e.g. video models).
+
+    Video generation models are job-managed by the VideoJobManager and are
+    never loaded into the engine pool. Raised by EnginePool.get_engine
+    BEFORE the memory-admission loop so a misrouted request cannot evict
+    resident LLM engines (docs/video-generation-engine-spec.md section 3).
+    The server layer maps this to HTTP 400 with an endpoint hint.
+    """
+
+    def __init__(self, model_id: str, model_type: str):
+        self.model_id = model_id
+        self.model_type = model_type
+        super().__init__(
+            f"Model '{model_id}' is a {model_type} generation model and "
+            "cannot be loaded as an inference engine. Use POST /v1/videos."
+        )
+
+
 # =============================================================================
 # MCP Errors
 # =============================================================================

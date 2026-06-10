@@ -444,13 +444,13 @@ class TestHuggingFaceSettings:
         """Test conversion to dictionary."""
         settings = HuggingFaceSettings(endpoint="https://hf-mirror.com")
         result = settings.to_dict()
-        assert result == {"endpoint": "https://hf-mirror.com"}
+        assert result == {"endpoint": "https://hf-mirror.com", "disable_xet": False}
 
     def test_to_dict_empty(self):
         """Test conversion to dictionary with empty endpoint."""
         settings = HuggingFaceSettings()
         result = settings.to_dict()
-        assert result == {"endpoint": ""}
+        assert result == {"endpoint": "", "disable_xet": False}
 
     def test_from_dict(self):
         """Test creation from dictionary."""

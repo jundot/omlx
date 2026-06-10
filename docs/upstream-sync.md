@@ -427,3 +427,29 @@ Qwen-Gemma / oQ)的相关度。
   破坏部分 HTTP 客户端 / Copilot CLI
 
 > 下次 review 上游 open PR 时,把结论(引入 / 跳过)回填到对应小节。
+
+---
+
+## 2026-06-11 分化标记: 视频生成引擎 (fmlx 自有, 永不回流)
+
+feat/video-engine 引入文生视频引擎 (Wan2.2 T2V A14B via mlx-gen, 设计
+docs/video-generation-engine-spec.md). 这是 fmlx 与上游的有意分化,
+不向上游 PR. 对上游同源文件的补丁面 (cherry-pick 撞冲突时参考):
+
+- model_discovery.py: ModelType/EngineType Literal + model_index.json
+  识别分支 + _register_model 视频臂与跳过过滤
+- engine_pool.py: Literal + 映射 + get_engine 入口 video 拒绝臂 +
+  _load_engine 防御臂
+- server.py: video 路由挂载 / pre-pool 400 / 默认模型 chat-capable 过滤 /
+  ModelInfo.model_type / lifespan 构造与关停 VideoJobManager
+- process_memory_enforcer.py: 视频内存租约 (acquire/set pid/release +
+  ceiling 扣减 + 动态 ceiling 加回)
+- settings.py: VideoSettings section + huggingface.disable_xet
+- admin/routes.py: valid_types/type_to_engine + 列表与删除门放宽 +
+  global-settings video 字段
+- cli.py: HF_HUB_DISABLE_XET 注入
+- exceptions.py: ModelTypeNotLoadableError
+
+全新文件 (无冲突面): omlx/video/*, omlx/api/video_models.py,
+omlx/api/video_routes.py, tests/test_video_*.py,
+scripts/video_p0_measure.py.

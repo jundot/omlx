@@ -38,6 +38,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelTypeNotLoadableError,
 )
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
@@ -53,8 +54,8 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
@@ -208,6 +209,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "video": "video",
     }
 
     def apply_settings_overrides(
@@ -335,6 +337,14 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+
+            # Video models are job-managed (POST /v1/videos) and never
+            # pool-loaded. Reject BEFORE the admission loop below -- letting
+            # a 42GB video entry into admission would evict resident LLM
+            # engines before failing (docs/video-generation-engine-spec.md
+            # section 3).
+            if entry.model_type == "video":
+                raise ModelTypeNotLoadableError(model_id, entry.model_type)
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -661,6 +671,11 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
+                elif entry.engine_type == "video":
+                    # Defense in depth: get_engine rejects video entries
+                    # before admission; this arm catches any other caller
+                    # so a diffusers dir never falls into BatchedEngine.
+                    raise ModelTypeNotLoadableError(model_id, entry.model_type)
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,

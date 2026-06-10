@@ -281,6 +281,21 @@ class GlobalSettingsRequest(BaseModel):
     # Idle timeout settings. null disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
 
+    # Video generation settings (docs/video-generation-engine-spec.md 4.5)
+    video_enabled: bool | None = None
+    video_worker_python: str | None = None
+    video_memory_lease_gb: float | None = Field(default=None, gt=0)
+    video_max_queued_jobs: int | None = Field(default=None, ge=1)
+    video_job_timeout_seconds: int | None = Field(default=None, ge=60)
+    video_progress_stall_timeout_seconds: int | None = Field(default=None, ge=30)
+    video_default_steps: int | None = Field(default=None, ge=1)
+    video_default_fps: int | None = Field(default=None, ge=1)
+    video_max_frames: int | None = Field(default=None, ge=5)
+    video_max_steps: int | None = Field(default=None, ge=1)
+    video_max_pixels_per_frame: int | None = Field(default=None, ge=256)
+    video_artifacts_max_count: int | None = Field(default=None, ge=1)
+    video_artifacts_max_gb: float | None = Field(default=None, gt=0)
+
     # Auth settings
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
@@ -1857,7 +1872,7 @@ async def update_model_settings(
                     )
         current_settings.model_alias = alias_value
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1875,6 +1890,7 @@ async def update_model_settings(
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
+            "video": "video",
         }
         if override_value:
             entry.model_type = override_value
@@ -2849,6 +2865,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
+        "video": global_settings.video.to_dict(),
     }
 
 
@@ -3267,6 +3284,30 @@ async def update_global_settings(
             logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
         else:
             logger.info("Idle timeout disabled")
+
+    # Apply video settings (Live for caps/timeouts; enabled flips per-request
+    # gating immediately because handlers read settings.video each call.
+    # worker_python/memory_lease affect the NEXT job dispatch.)
+    _video_fields = {
+        "video_enabled": "enabled",
+        "video_worker_python": "worker_python",
+        "video_memory_lease_gb": "memory_lease_gb",
+        "video_max_queued_jobs": "max_queued_jobs",
+        "video_job_timeout_seconds": "job_timeout_seconds",
+        "video_progress_stall_timeout_seconds": "progress_stall_timeout_seconds",
+        "video_default_steps": "default_steps",
+        "video_default_fps": "default_fps",
+        "video_max_frames": "max_frames",
+        "video_max_steps": "max_steps",
+        "video_max_pixels_per_frame": "max_pixels_per_frame",
+        "video_artifacts_max_count": "artifacts_max_count",
+        "video_artifacts_max_gb": "artifacts_max_gb",
+    }
+    for req_field, attr in _video_fields.items():
+        value = getattr(request, req_field, None)
+        if value is not None:
+            setattr(global_settings.video, attr, value)
+            runtime_applied.append(req_field)
 
     # Apply auth settings (API key change)
     if request.api_key is not None:
@@ -4465,7 +4506,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
-    from ..model_discovery import _resolve_hf_cache_entry
+    from ..model_discovery import _is_model_dir, _resolve_hf_cache_entry
 
     def _add_model(model_path: Path, model_name: str) -> None:
         if model_name in seen_names:
@@ -4492,7 +4533,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if (subdir / "config.json").exists():
+            # _is_model_dir accepts config.json or model_index.json roots
+            # (diffusers-layout video models) and excludes adapters.
+            if _is_model_dir(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
@@ -4500,7 +4543,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
                     snapshot_path, model_name = hf_resolved
-                    if (snapshot_path / "config.json").exists():
+                    if _is_model_dir(snapshot_path):
                         _add_model(snapshot_path, model_name)
                     continue
 
@@ -4508,7 +4551,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if (child / "config.json").exists():
+                    if _is_model_dir(child):
                         _add_model(child, child.name)
 
     return {"models": models}
@@ -4528,14 +4571,18 @@ async def delete_hf_model(
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
-    # Search for model across all directories in both flat and org-folder layouts
+    # Search for model across all directories in both flat and org-folder
+    # layouts. _is_model_dir accepts config.json or model_index.json roots
+    # (diffusers-layout video models must be deletable too).
+    from ..model_discovery import _is_model_dir
+
     model_path = None
     parent_model_dir = None
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
         candidate = model_dir / model_name
-        if candidate.is_dir() and (candidate / "config.json").exists():
+        if candidate.is_dir() and _is_model_dir(candidate):
             model_path = candidate
             parent_model_dir = model_dir
             break
@@ -4544,7 +4591,7 @@ async def delete_hf_model(
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
             candidate = subdir / model_name
-            if candidate.is_dir() and (candidate / "config.json").exists():
+            if candidate.is_dir() and _is_model_dir(candidate):
                 model_path = candidate
                 parent_model_dir = model_dir
                 break
