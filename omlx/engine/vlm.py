@@ -996,11 +996,12 @@ class VLMBatchedEngine(BaseEngine):
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
-        """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
+        """Attach a loaded MTP drafter for VLM MTP decoding.
 
         Passes the drafter (and the configured draft-block size) down to
         the scheduler so eligible requests get routed to mlx-vlm's MTP
-        round loop at decode time.
+        round loop at decode time.  Supports gemma4_assistant and
+        qwen3_5_mtp drafter types.
         """
         self._vlm_mtp_drafter = drafter
         block_size = None

@@ -939,7 +939,7 @@
                                         <select x-model="modelSettings.vlm_mtp_draft_model"
                                                 class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
                                             <option value="">{{ t('modal.model_settings.vlm_mtp_draft_model_placeholder') }}</option>
-                                            <template x-for="m in models.filter(m => /assistant/i.test(m.id))" :key="m.id">
+                                            <template x-for="m in models.filter(m => /assistant|mtp/i.test(m.id))" :key="m.id">
                                                 <option :value="m.id" x-text="m.id"></option>
                                             </template>
                                         </select>

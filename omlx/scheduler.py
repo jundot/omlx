@@ -4987,10 +4987,12 @@ class Scheduler:
         drafter: VLMMTPDrafter | None,
         draft_block_size: int | None = None,
     ) -> None:
-        """Attach a gemma4_assistant drafter for VLM MTP speculative decode.
+        """Attach an MTP drafter for VLM MTP speculative decode.
 
-        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the assistant
-        artifact is loaded. ``None`` clears the toggle.
+        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the drafter
+        artifact is loaded.  Supports any drafter that mlx-vlm's
+        ``load_drafter()`` resolves to ``kind="mtp"`` (gemma4_assistant,
+        qwen3_5_mtp, etc.).  ``None`` clears the toggle.
         """
         self._vlm_mtp_drafter = drafter
         self._vlm_mtp_draft_block_size = draft_block_size
@@ -5085,15 +5087,22 @@ class Scheduler:
             )
             return None
 
-        logits = out.logits[:, -1, :]
+        # Handle both LanguageModelOutput (dense models) and 3-tuple
+        # (logits, hidden, gdn_states) returned by the MoE MTP runtime patch.
+        if isinstance(out, tuple):
+            logits = out[0][:, -1, :]
+            hidden_raw = out[1]
+        else:
+            logits = out.logits[:, -1, :]
+            hidden_raw = out.hidden_states
+
         first_bonus_arr = mtp_sampler(logits)  # mx.array shape [1]
         mx.eval(first_bonus_arr)
 
-        hidden_states = out.hidden_states
-        if isinstance(hidden_states, list):
-            hidden = hidden_states[-1]
+        if isinstance(hidden_raw, list):
+            hidden = hidden_raw[-1]
         else:
-            hidden = hidden_states
+            hidden = hidden_raw
         # Slice to last position so the drafter sees a [B, 1, H] tensor
         # regardless of how many tokens this forward processed.
         if hidden.shape[1] > 1:
@@ -5111,7 +5120,7 @@ class Scheduler:
                 drafter=drafter,
                 prompt_cache=prefilled_cache,
                 hidden=hidden,
-                shared_kv_states=out.shared_kv_states,
+                shared_kv_states=getattr(out, "shared_kv_states", {}) if not isinstance(out, tuple) else {},
                 first_bonus=int(first_bonus_arr.item()),
                 max_tokens=request.sampling_params.max_tokens,
                 sampler=mtp_sampler,

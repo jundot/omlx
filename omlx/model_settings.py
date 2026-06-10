@@ -163,10 +163,11 @@ class ModelSettings:
     # with dflash and turboquant.
     mtp_enabled: bool = False
 
-    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
-    # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
-    # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
-    # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.
+    # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
+    # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
+    # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
+    # Mutually exclusive with all other speculative paths because the wrapper
+    # bypasses mlx-lm BatchGenerator at decode time.
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
     vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)

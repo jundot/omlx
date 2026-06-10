@@ -1177,7 +1177,7 @@ class EnginePool:
             self._current_model_memory += entry.estimated_size
             load_completed = True
 
-            # VLM MTP: load gemma4_assistant drafter and attach to engine.
+            # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
             if (
                 model_settings is not None
