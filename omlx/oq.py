@@ -1073,6 +1073,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "synchronize": mx.synchronize,
         "moveaxis": mx.moveaxis,
         "transpose": mx.transpose,
+        "swapaxes": getattr(mx, "swapaxes", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
     }
@@ -1165,7 +1166,12 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "transpose_" + "_".join(str(a) for a in axes),
             )
         return _orig["transpose"](tensor, axes=axes)
-
+    
+    def _fake_swapaxes(tensor, axis1, axis2):
+        if isinstance(tensor, _TrackedTensor):
+            return tensor.swapaxes(axis1, axis2)
+        return _orig["swapaxes"](tensor, axis1, axis2) if _orig["swapaxes"] else tensor.swapaxes(axis1, axis2)
+    
     def _noop(*a, **kw):
         pass
 
@@ -1177,6 +1183,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
+    
+    if _orig["swapaxes"] is not None:    # <--- 추가
+        mx.swapaxes = _fake_swapaxes     # <--- 추가
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
