@@ -809,5 +809,9 @@
   "modal.model_settings.video_upscale_off": "Off",
   "modal.model_settings.video_companions": "Companion models",
   "modal.model_settings.video_companion_missing": "not installed",
-  "modal.model_settings.video_companions_hint": "Used automatically: SeedVR2 via upscale_resolution / auto-upscale, the i2v model for continuations. Neither is invoked standalone."
+  "modal.model_settings.video_companions_hint": "Used automatically: SeedVR2 via upscale_resolution / auto-upscale, the i2v model for continuations. Neither is invoked standalone.",
+  "chat.video.badge_t2v": "text→video",
+  "chat.video.badge_i2v": "image→video",
+  "chat.video.badge_ti2v": "text/image→video",
+  "chat.video.no_i2v_model": "No image-to-video model is installed."
 }

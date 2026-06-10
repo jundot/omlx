@@ -835,8 +835,9 @@
                             style="color: var(--text-primary);">
                             <span x-text="model.id"></span>
                             <span x-show="isVideoModelId(model.id)"
-                                  class="ml-2 px-1.5 py-0.5 text-[10px] rounded uppercase tracking-wide"
-                                  style="background: var(--bg-secondary); color: var(--text-tertiary);">video</span>
+                                  class="ml-2 px-1.5 py-0.5 text-[10px] rounded tracking-wide"
+                                  style="background: var(--bg-secondary); color: var(--text-tertiary);"
+                                  x-text="videoBadge(model.id)"></span>
                         </button>
                     </template>
                     <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm"
@@ -1203,8 +1204,9 @@
                     </div>
 
                     <div class="flex items-end">
-                        <!-- Image upload button (VLM models + i2v video models) -->
-                        <button x-show="hasVisionSupport() || videoAcceptsImage()" @click="$refs.imageInput.click()"
+                        <!-- Image upload button (VLM models + any video model
+                             when an i2v-capable one exists: auto-routed) -->
+                        <button x-show="hasVisionSupport() || videoCanUseImage()" @click="$refs.imageInput.click()"
                             :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= (isVideoModel() ? 1 : 10)"
                             class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
@@ -1516,13 +1518,48 @@
         return null;
     },
 
-    // Extend button on a completed video bubble: arm the continuation and
-    // switch to an i2v-capable model (the server pins the new segment to
-    // the source's frame geometry, so no size controls needed).
+    // Whether the chat can take a conditioning image for video right now:
+    // any video model selected, as long as an i2v-capable model exists
+    // (generateVideo auto-routes to it).
+    videoCanUseImage() {
+        return this.isVideoModel() && !!this.findExtendModel();
+    },
+
+    // Route between the wan checkpoints by request shape: an attached
+    // image or an armed continuation needs an i2v-capable model, plain
+    // text prefers a t2v-capable one. Wan2.2 ships T2V and I2V as
+    // separate models; the user should not have to know which is which.
+    // Returns null when no installed model can serve the request shape.
+    resolveVideoModel(needsImage) {
+        const p = this.videoPipelineMap[this.currentModel];
+        if (needsImage) {
+            if (p === 'i2v' || p === 'ti2v') return this.currentModel;
+            return this.findExtendModel();
+        }
+        if (p !== 'i2v') return this.currentModel;
+        for (const [id, t] of Object.entries(this.modelTypeMap)) {
+            const pp = this.videoPipelineMap[id];
+            if (t === 'video' && (pp === 't2v' || pp === 'ti2v')) return id;
+        }
+        return null;
+    },
+
+    // Picker badge: surface the pipeline so the two wan checkpoints stop
+    // looking interchangeable ("video" told the user nothing).
+    videoBadge(modelId) {
+        const p = this.videoPipelineMap[modelId];
+        if (p === 'i2v') return this.tVideo('chat.video.badge_i2v', 'image→video');
+        if (p === 'ti2v') return this.tVideo('chat.video.badge_ti2v', 'text/image→video');
+        if (p === 't2v') return this.tVideo('chat.video.badge_t2v', 'text→video');
+        return 'video';
+    },
+
+    // Extend button on a completed video bubble: arm the continuation.
+    // No model switch needed -- generateVideo auto-routes continuations
+    // to an i2v-capable model, and the server pins the new segment to
+    // the source's frame geometry.
     startVideoExtend(msg) {
-        const target = this.findExtendModel();
-        if (!target || !msg._video?.job_id) return;
-        if (target !== this.currentModel) this.selectModel(target);
+        if (!this.findExtendModel() || !msg._video?.job_id) return;
         this.videoExtendFrom = { jobId: msg._video.job_id };
         this.$nextTick(() => this.$refs.messageInput?.focus());
     },
@@ -1623,7 +1660,7 @@
     // ===== Image Upload Functions =====
 
     handleDrop(event) {
-        if (!this.hasVisionSupport() && !this.videoAcceptsImage()) return;
+        if (!this.hasVisionSupport() && !this.videoCanUseImage()) return;
         const files = event.dataTransfer?.files;
         if (files) {
             Array.from(files).forEach(f => this.loadImageFile(f));
@@ -1680,7 +1717,7 @@
     },
 
     handlePaste(event) {
-        if (!this.hasVisionSupport() && !this.videoAcceptsImage()) return;
+        if (!this.hasVisionSupport() && !this.videoCanUseImage()) return;
         const items = event.clipboardData?.items;
         if (!items) return;
 
@@ -1840,9 +1877,9 @@
 
     selectModel(modelId) {
         this.currentModel = modelId;
-        // An armed continuation needs an image-capable video model; keep
-        // it only when the new selection can actually run it.
-        if (this.videoExtendFrom && !this.videoAcceptsImage()) {
+        // An armed continuation survives switches between video models
+        // (generateVideo auto-routes), but not a switch to an LLM/VLM.
+        if (this.videoExtendFrom && !this.isVideoModel()) {
             this.videoExtendFrom = null;
         }
         // Video models take a single conditioning image; drop extras
@@ -2046,15 +2083,24 @@
             });
             return;
         }
-        if (this.videoRequiresImage() && !this.videoExtendFrom && imageUrls.length === 0) {
+        // Auto-route between the installed wan checkpoints by request
+        // shape (image/continuation -> i2v, plain text -> t2v); the
+        // bubble shows which model actually ran.
+        const needsImage = !!this.videoExtendFrom || imageUrls.length > 0;
+        const routedModel = this.resolveVideoModel(needsImage);
+        if (!routedModel) {
             this.messages.push({
                 role: 'assistant',
-                content: this.tVideo('chat.video.need_image',
-                    'This model is image-to-video: attach an image (or use Continue on a finished video).'),
+                content: needsImage
+                    ? this.tVideo('chat.video.no_i2v_model',
+                        'No image-to-video model is installed.')
+                    : this.tVideo('chat.video.need_image',
+                        'This model is image-to-video: attach an image (or use Continue on a finished video).'),
                 model: this.currentModel,
             });
             return;
         }
+        const routedPipeline = this.videoPipelineMap[routedModel];
         // Deliberately NOT isStreaming: that flag drives the global
         // streaming placeholder bubble and disables the input. Video jobs
         // run server-side and queue, so the user may submit more prompts
@@ -2063,7 +2109,7 @@
         this.messages.push({
             role: 'assistant',
             content: '',
-            model: this.currentModel,
+            model: routedModel,
             _video: { status: 'queued', progress: 0, phase: '', url: null, error: null, job_id: null, cancelled: false },
         });
         // CRITICAL: mutate through the reactive proxy, not the raw object.
@@ -2084,7 +2130,7 @@
             // extends pin the source geometry -- both make this a no-op.
             const portrait = this.videoOrientation === 'portrait';
             const body = {
-                model: this.currentModel,
+                model: routedModel,
                 prompt,
                 seconds: this.videoSeconds || 3,
             };
@@ -2102,7 +2148,8 @@
             if (this.videoExtendFrom) {
                 body.extend_video_id = this.videoExtendFrom.jobId;
                 delete body.size;
-            } else if (imageUrls.length > 0 && this.videoAcceptsImage()) {
+            } else if (imageUrls.length > 0
+                       && (routedPipeline === 'i2v' || routedPipeline === 'ti2v')) {
                 body.input_reference = imageUrls[0];
             }
             if (this.videoUpscale) {

@@ -807,5 +807,9 @@
   "modal.model_settings.video_upscale_off": "关闭",
   "modal.model_settings.video_companions": "配套模型",
   "modal.model_settings.video_companion_missing": "未安装",
-  "modal.model_settings.video_companions_hint": "自动调用：SeedVR2 经 upscale_resolution / 自动超分触发，i2v 模型用于续写。两者都不能单独调用。"
+  "modal.model_settings.video_companions_hint": "自动调用：SeedVR2 经 upscale_resolution / 自动超分触发，i2v 模型用于续写。两者都不能单独调用。",
+  "chat.video.badge_t2v": "文生视频",
+  "chat.video.badge_i2v": "图生视频",
+  "chat.video.badge_ti2v": "文图生视频",
+  "chat.video.no_i2v_model": "未安装图生视频模型。"
 }
