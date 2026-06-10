@@ -1027,9 +1027,18 @@
                             <template x-if="msg._video">
                                 <div class="my-2">
                                     <template x-if="msg._video.url">
-                                        <video controls :src="msg._video.url"
-                                               class="rounded-xl max-w-full"
-                                               style="max-height: 320px;"></video>
+                                        <div>
+                                            <video controls :src="msg._video.url"
+                                                   class="rounded-xl max-w-full"
+                                                   style="max-height: 320px;"></video>
+                                            <div class="mt-1.5" x-show="msg._video.job_id && findExtendModel()">
+                                                <button @click="startVideoExtend(msg)"
+                                                        class="px-1.5 py-0.5 text-xs rounded border hover:bg-surface-muted cursor-pointer"
+                                                        style="border-color: var(--border-faint); color: var(--text-tertiary);"
+                                                        :title="tVideo('chat.video.extend_tooltip', 'Generate a continuation from the last frame')"
+                                                        x-text="tVideo('chat.video.extend', 'Continue')"></button>
+                                            </div>
+                                        </div>
                                     </template>
                                     <template x-if="!msg._video.url && !msg._video.error">
                                         <div class="text-sm" style="color: var(--text-tertiary);">
@@ -1167,6 +1176,18 @@
                     <input type="file" id="imageInput" accept="image/*" multiple x-ref="imageInput"
                         @change="handleImageSelect($event)" class="hidden">
 
+                    <!-- Video continuation chip (armed by the extend button) -->
+                    <div x-show="videoExtendFrom" class="flex items-center gap-2 px-2 pt-2" x-cloak>
+                        <span class="inline-flex items-center gap-1.5 px-2 py-1 text-xs rounded-lg border"
+                              style="border-color: var(--border-faint); color: var(--text-secondary);">
+                            <i data-lucide="film" class="w-3.5 h-3.5"></i>
+                            <span x-text="tVideo('chat.video.extend_chip', 'Continuing previous video')"></span>
+                            <button @click="videoExtendFrom = null"
+                                    class="ml-0.5 hover:text-fg cursor-pointer"
+                                    style="color: var(--text-tertiary);">&times;</button>
+                        </span>
+                    </div>
+
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
                         <template x-for="(img, idx) in uploadImages" :key="img.id">
@@ -1182,9 +1203,9 @@
                     </div>
 
                     <div class="flex items-end">
-                        <!-- Image upload button (only for VLM models) -->
-                        <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= 10"
+                        <!-- Image upload button (VLM models + i2v video models) -->
+                        <button x-show="hasVisionSupport() || videoAcceptsImage()" @click="$refs.imageInput.click()"
+                            :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= (isVideoModel() ? 1 : 10)"
                             class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
@@ -1205,6 +1226,12 @@
                                 <option value="3">3s</option>
                                 <option value="5">5s</option>
                             </select>
+                            <label class="flex items-center gap-1 px-1 text-xs cursor-pointer select-none"
+                                   style="color: var(--text-secondary);"
+                                   :title="tVideo('chat.video.upscale_tooltip', 'SeedVR2 per-frame upscale after generation')">
+                                <input type="checkbox" x-model="videoUpscale" class="accent-current">
+                                <span x-text="tVideo('chat.video.upscale', '1080p')"></span>
+                            </label>
                         </div>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -1330,6 +1357,8 @@
             videoSubmitting: false,
             videoQuality: 'standard',
             videoSeconds: 3,
+            videoUpscale: false,         // SeedVR2 1080p upscale toggle
+            videoExtendFrom: null,       // { jobId } set by the extend button
             streamingContent: '',
             abortController: null,
 
@@ -1377,6 +1406,7 @@
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+            videoPipelineMap: {},        // { modelId: "t2v"|"i2v"|"ti2v" } for video models
 
             // System Prompt
             systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
@@ -1432,10 +1462,13 @@
             if (!resp.ok) return;
             const data = await resp.json();
             const map = {};
+            const pipelines = {};
             for (const m of (data.models || [])) {
                 map[m.id] = m.model_type || 'llm';
+                if (m.video_pipeline) pipelines[m.id] = m.video_pipeline;
             }
             this.modelTypeMap = map;
+            this.videoPipelineMap = pipelines;
         } catch (e) {
             // Model status endpoint unavailable
         }
@@ -1451,6 +1484,39 @@
 
     isVideoModel() {
         return this.isVideoModelId(this.currentModel);
+    },
+
+    // i2v models REQUIRE an input image, ti2v models accept one, t2v
+    // models reject one (server-enforced; mirrored here for the UI gates).
+    videoAcceptsImage() {
+        const p = this.videoPipelineMap[this.currentModel];
+        return this.isVideoModel() && (p === 'i2v' || p === 'ti2v');
+    },
+
+    videoRequiresImage() {
+        return this.videoPipelineMap[this.currentModel] === 'i2v';
+    },
+
+    // The model an extend (video continuation) should run on: the current
+    // model when image-capable, else the first image-capable video model.
+    findExtendModel() {
+        if (this.videoAcceptsImage()) return this.currentModel;
+        for (const [id, t] of Object.entries(this.modelTypeMap)) {
+            const p = this.videoPipelineMap[id];
+            if (t === 'video' && (p === 'i2v' || p === 'ti2v')) return id;
+        }
+        return null;
+    },
+
+    // Extend button on a completed video bubble: arm the continuation and
+    // switch to an i2v-capable model (the server pins the new segment to
+    // the source's frame geometry, so no size controls needed).
+    startVideoExtend(msg) {
+        const target = this.findExtendModel();
+        if (!target || !msg._video?.job_id) return;
+        if (target !== this.currentModel) this.selectModel(target);
+        this.videoExtendFrom = { jobId: msg._video.job_id };
+        this.$nextTick(() => this.$refs.messageInput?.focus());
     },
 
     // i18n with literal fallback: if the loaded bundle predates a key
@@ -1549,7 +1615,7 @@
     // ===== Image Upload Functions =====
 
     handleDrop(event) {
-        if (!this.hasVisionSupport()) return;
+        if (!this.hasVisionSupport() && !this.videoAcceptsImage()) return;
         const files = event.dataTransfer?.files;
         if (files) {
             Array.from(files).forEach(f => this.loadImageFile(f));
@@ -1575,7 +1641,9 @@
             return;
         }
 
-        if (this.uploadImages.length >= 10) return;
+        // Video models take a single conditioning image (input_reference)
+        const cap = this.isVideoModel() ? 1 : 10;
+        if (this.uploadImages.length >= cap) return;
 
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -1595,7 +1663,7 @@
     },
 
     handlePaste(event) {
-        if (!this.hasVisionSupport()) return;
+        if (!this.hasVisionSupport() && !this.videoAcceptsImage()) return;
         const items = event.clipboardData?.items;
         if (!items) return;
 
@@ -1928,7 +1996,7 @@
         this.messages.push({ role: 'user', content });
         this.forceScrollToBottom();
         if (this.isVideoModel()) {
-            await this.generateVideo(userText);
+            await this.generateVideo(userText, images.map(i => i.base64));
         } else {
             await this.streamResponse();
         }
@@ -1936,12 +2004,21 @@
 
             // ===== In-chat video generation (video models route to /v1/videos) =====
 
-            async generateVideo(prompt) {
+            async generateVideo(prompt, imageUrls = []) {
         if (!prompt) {
             this.messages.push({
                 role: 'assistant',
                 content: this.tVideo('chat.video.need_prompt',
                     'Type a prompt to generate a video with this model.'),
+                model: this.currentModel,
+            });
+            return;
+        }
+        if (this.videoRequiresImage() && !this.videoExtendFrom && imageUrls.length === 0) {
+            this.messages.push({
+                role: 'assistant',
+                content: this.tVideo('chat.video.need_image',
+                    'This model is image-to-video: attach an image (or use Continue on a finished video).'),
                 model: this.currentModel,
             });
             return;
@@ -1978,6 +2055,18 @@
                 body.size = '384x224';
                 body.steps = 8;
             }
+            // Continuation wins over a fresh conditioning image (the server
+            // rejects both together); size/fps are pinned server-side to
+            // the source video's geometry.
+            if (this.videoExtendFrom) {
+                body.extend_video_id = this.videoExtendFrom.jobId;
+                delete body.size;
+            } else if (imageUrls.length > 0 && this.videoAcceptsImage()) {
+                body.input_reference = imageUrls[0];
+            }
+            if (this.videoUpscale) {
+                body.upscale_resolution = 1080;
+            }
             const resp = await fetch('/v1/videos', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...auth },
@@ -1992,6 +2081,7 @@
             }
             const job = await resp.json();
             msg._video.job_id = job.id;
+            this.videoExtendFrom = null;
             this.videoSubmitting = false;
             await this.pollVideo(msg);
         } catch (e) {
@@ -2481,7 +2571,8 @@
         if (this.isVideoModel()) {
             const lastUser = [...this.messages].reverse().find(m => m.role === 'user');
             const prompt = lastUser ? this.getTextContent(lastUser.content).trim() : '';
-            await this.generateVideo(prompt);
+            const images = lastUser ? this.getImageUrls(lastUser.content) : [];
+            await this.generateVideo(prompt, images);
         } else {
             await this.streamResponse();
         }
@@ -2562,7 +2653,8 @@
             content
         });
 
-        // Reset edit state
+        // Reset edit state (capture the images first for the video branch)
+        const editedImages = this.editImages.slice();
         this.editingIndex = null;
         this.editContent = '';
         this.editImages = [];
@@ -2571,7 +2663,7 @@
         // /v1/videos, not chat completions (same branch as sendMessage).
         this.scrollToBottom();
         if (this.isVideoModel()) {
-            await this.generateVideo(newContent);
+            await this.generateVideo(newContent, editedImages);
         } else {
             await this.streamResponse();
         }

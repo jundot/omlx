@@ -38,6 +38,7 @@ ERR_LEASE_EXCEEDED = "memory_lease_exceeded"
 ERR_MONITOR_FAILED = "monitor_failed"
 ERR_SERVER_RESTARTED = "server_restarted"
 ERR_OUTPUT_INVALID = "output_invalid"
+ERR_EXTEND_SOURCE_MISSING = "extend_source_missing"
 
 _WATCHDOG_INTERVAL_S = 2.0
 _ADMISSION_RECHECK_S = 5.0
@@ -86,6 +87,10 @@ class VideoJob:
             "steps": self.params.get("steps"),
             "seed": self.params.get("seed"),
             "wall_seconds": self.wall_seconds,
+            "pipeline": self.params.get("pipeline") or None,
+            "extend_source_id": self.params.get("extend_source_id"),
+            "upscale_resolution": self.params.get("upscale_resolution"),
+            "has_input_reference": bool(self.params.get("image_path")),
         }
 
     def to_persist(self) -> dict[str, Any]:
@@ -174,6 +179,24 @@ class VideoJobManager:
 
     def worker_python(self) -> Path:
         return self._settings.get_worker_python(self._base_path)
+
+    def upscaler_dir(self) -> Path:
+        return self._settings.get_upscaler_dir(self._base_path)
+
+    def extend_source_path(self, job: VideoJob) -> Path | None:
+        """Resolve the mp4 a continuation should grow from.
+
+        Upscaled jobs keep their pre-upscale stitchable video at
+        output_raw.mp4 -- extending from the upscaled frames would force
+        generating the new segment at the upscaled resolution (the 720p+
+        multi-hour trap). Falls back to the artifact itself.
+        """
+        raw = self.artifacts_dir / job.id / "output_raw.mp4"
+        if raw.exists():
+            return raw
+        if job.artifact_path and Path(job.artifact_path).exists():
+            return Path(job.artifact_path)
+        return None
 
     # -- persistence ---------------------------------------------------------
 
@@ -334,13 +357,28 @@ class VideoJobManager:
     def queue_depth(self) -> int:
         return len(self._queue)
 
-    async def submit(self, job: VideoJob) -> VideoJob:
-        """Accept a job into the queue (caller validates params + caps)."""
+    async def submit(
+        self,
+        job: VideoJob,
+        input_reference: tuple[bytes, str] | None = None,
+    ) -> VideoJob:
+        """Accept a job into the queue (caller validates params + caps).
+
+        input_reference is (bytes, suffix) of the I2V conditioning image;
+        it lands in the job's blob dir so the worker reads it from disk.
+        """
         if len(self._queue) >= int(self._settings.max_queued_jobs):
             raise QueueFullError(
                 f"Video queue is full ({len(self._queue)}/"
                 f"{self._settings.max_queued_jobs})"
             )
+        if input_reference is not None:
+            data, suffix = input_reference
+            blob_dir = self.artifacts_dir / job.id
+            blob_dir.mkdir(parents=True, exist_ok=True)
+            ref_path = blob_dir / f"input_reference{suffix or '.png'}"
+            ref_path.write_bytes(data)
+            job.params["image_path"] = str(ref_path)
         self._jobs[job.id] = job
         self._queue.append(job.id)
         self._persist(job)
@@ -482,6 +520,22 @@ class VideoJobManager:
             manifest_path=str(manifest_path),
             lease_bytes=lease,
         )
+
+        # Extend sources resolve at dispatch, not submit -- the source may
+        # be deleted or retention-purged while this job queues. Retention
+        # skips sources referenced by pending jobs, but DELETE does not.
+        src_id = spec.get("extend_source_id")
+        if src_id:
+            src_job = self._jobs.get(str(src_id))
+            src_path = self.extend_source_path(src_job) if src_job else None
+            if src_path is None:
+                self._finish(
+                    job, "failed", ERR_EXTEND_SOURCE_MISSING,
+                    f"source video '{src_id}' no longer has an artifact",
+                )
+                return
+            spec["extend_from"] = str(src_path)
+
         with open(spec_path, "w") as f:
             json.dump(spec, f, indent=1)
 
@@ -599,14 +653,22 @@ class VideoJobManager:
             job.progress = max(job.progress, 2)
         elif phase == "loaded":
             job.progress = max(job.progress, 5)
+        elif phase == "upscaling":
+            # Post-generation stage: denoise already drove progress to ~95
+            if total > 0:
+                job.progress = max(job.progress, 95 + int(2 * step / total))
+            else:
+                job.progress = max(job.progress, 95)
+        elif phase == "stitching":
+            job.progress = max(job.progress, 95)
         elif total > 0 and step > 0:
             job.progress = max(job.progress, 5 + int(90 * step / total))
         elif phase == "saving":
             job.progress = max(job.progress, 97)
         # Persist sparsely: every phase change and ~every 5 progress points
-        if phase in ("loading", "loaded", "saving", "done", "failed") or (
-            job.progress % 5 == 0
-        ):
+        if phase in (
+            "loading", "loaded", "stitching", "saving", "done", "failed"
+        ) or (job.progress % 5 == 0):
             self._persist(job)
 
     def _conclude(
@@ -651,9 +713,18 @@ class VideoJobManager:
         expires_at marks the purge time (spec 4.2)."""
         max_count = int(self._settings.artifacts_max_count)
         max_bytes = int(float(self._settings.artifacts_max_gb) * GB)
+        # Artifacts referenced by pending extend jobs must survive until
+        # those jobs dispatch (they read the source's last frame + frames).
+        protected = {
+            str(j.params.get("extend_source_id"))
+            for j in self._jobs.values()
+            if j.status in ("queued", "in_progress")
+            and j.params.get("extend_source_id")
+        }
         holders = [
             j for j in self._jobs.values()
             if j.artifact_path and j.expires_at is None
+            and j.id not in protected
             and Path(j.artifact_path).exists()
         ]
         holders.sort(key=lambda j: j.completed_at or j.created_at)  # oldest first

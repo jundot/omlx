@@ -295,6 +295,8 @@ class GlobalSettingsRequest(BaseModel):
     video_max_pixels_per_frame: int | None = Field(default=None, ge=256)
     video_artifacts_max_count: int | None = Field(default=None, ge=1)
     video_artifacts_max_gb: float | None = Field(default=None, gt=0)
+    video_upscaler_model_path: str | None = None
+    video_max_upscale_resolution: int | None = Field(default=None, ge=480)
 
     # Auth settings
     api_key: str | None = None
@@ -3308,6 +3310,8 @@ async def update_global_settings(
         "video_max_pixels_per_frame": "max_pixels_per_frame",
         "video_artifacts_max_count": "artifacts_max_count",
         "video_artifacts_max_gb": "artifacts_max_gb",
+        "video_upscaler_model_path": "upscaler_model_path",
+        "video_max_upscale_resolution": "max_upscale_resolution",
     }
     for req_field, attr in _video_fields.items():
         value = getattr(request, req_field, None)

@@ -782,7 +782,9 @@
       "artifacts_max_gb": "Artifact storage cap (GB)",
       "artifacts_max_gb_desc": "Oldest video files are purged beyond this; job records are kept.",
       "worker_python": "Worker python path",
-      "worker_python_desc": "Python of the isolated video venv. Empty = default path."
+      "worker_python_desc": "Python of the isolated video venv. Empty = default path.",
+      "upscaler_path": "SeedVR2 upscaler weights",
+      "upscaler_path_desc": "Directory with the SeedVR2 weights used by upscale_resolution. Empty = models/AbstractFramework/seedvr2-3b-8bit."
     }
   },
   "chat": {
@@ -792,7 +794,13 @@
       "cancel": "Cancel",
       "cancelled": "Video generation cancelled.",
       "quality_draft": "Draft (fast)",
-      "quality_standard": "Standard (slow)"
+      "quality_standard": "Standard (slow)",
+      "extend": "Continue",
+      "extend_tooltip": "Generate a continuation from the last frame",
+      "extend_chip": "Continuing previous video",
+      "upscale": "1080p",
+      "upscale_tooltip": "SeedVR2 per-frame upscale after generation",
+      "need_image": "This model is image-to-video: attach an image (or use Continue on a finished video)."
     }
   }
 }

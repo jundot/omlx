@@ -630,12 +630,22 @@ class VideoSettings:
     max_pixels_per_frame: int = 1280 * 720
     artifacts_max_count: int = 50  # LRU-purge artifact blobs beyond this
     artifacts_max_gb: float = 50.0
+    # SeedVR2 video upscaler (per-frame, runs in the same worker venv).
+    # Empty path = {models_dir}/AbstractFramework/seedvr2-3b-8bit convention.
+    upscaler_model_path: str = ""
+    max_upscale_resolution: int = 2160  # Target short side cap (4K)
 
     def get_worker_python(self, base_path: Path) -> Path:
         """Resolve the worker venv python path."""
         if self.worker_python:
             return Path(self.worker_python).expanduser()
         return base_path / "venvs" / "video" / "bin" / "python"
+
+    def get_upscaler_dir(self, base_path: Path) -> Path:
+        """Resolve the SeedVR2 weights dir (existence is the caller's check)."""
+        if self.upscaler_model_path:
+            return Path(self.upscaler_model_path).expanduser()
+        return base_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -653,6 +663,8 @@ class VideoSettings:
             "max_pixels_per_frame": self.max_pixels_per_frame,
             "artifacts_max_count": self.artifacts_max_count,
             "artifacts_max_gb": self.artifacts_max_gb,
+            "upscaler_model_path": self.upscaler_model_path,
+            "max_upscale_resolution": self.max_upscale_resolution,
         }
 
     @classmethod
@@ -674,6 +686,8 @@ class VideoSettings:
             max_pixels_per_frame=int(data.get("max_pixels_per_frame", 1280 * 720)),
             artifacts_max_count=int(data.get("artifacts_max_count", 50)),
             artifacts_max_gb=float(data.get("artifacts_max_gb", 50.0)),
+            upscaler_model_path=data.get("upscaler_model_path", ""),
+            max_upscale_resolution=int(data.get("max_upscale_resolution", 2160)),
         )
 
 

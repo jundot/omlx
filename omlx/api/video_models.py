@@ -19,10 +19,16 @@ class VideoCreateParams(BaseModel):
     """Normalized create-video parameters (JSON or multipart source).
 
     OpenAI-compatible core: model, prompt, size ("WxH"), seconds (the SDK
-    sends string literals like "4"). fmlx extensions: negative_prompt,
-    frames/steps/fps/seed/guidance/guidance_2. Extension collision policy:
-    if OpenAI later claims an extension name, fmlx semantics yield and the
-    extension moves to an fmlx_ prefix (spec 4.3).
+    sends string literals like "4"), input_reference (the I2V conditioning
+    image; multipart file field from the SDK, or a base64/data-URL string in
+    JSON bodies -- the route extracts either form into raw bytes before
+    validation, so this model never carries it). fmlx extensions:
+    negative_prompt, frames/steps/fps/seed/guidance/guidance_2,
+    extend_video_id (continue a completed job's video from its last frame;
+    needs an i2v-capable model), upscale_resolution (SeedVR2 per-frame
+    upscale of the final video to this short-side resolution). Extension
+    collision policy: if OpenAI later claims an extension name, fmlx
+    semantics yield and the extension moves to an fmlx_ prefix (spec 4.3).
     """
 
     model: str
@@ -38,3 +44,5 @@ class VideoCreateParams(BaseModel):
     seed: Optional[int] = None
     guidance: Optional[float] = None
     guidance_2: Optional[float] = None
+    extend_video_id: Optional[str] = None  # Continue this completed job
+    upscale_resolution: Optional[int] = None  # SeedVR2 target short side

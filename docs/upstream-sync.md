@@ -453,3 +453,13 @@ docs/video-generation-engine-spec.md). 这是 fmlx 与上游的有意分化,
 全新文件 (无冲突面): omlx/video/*, omlx/api/video_models.py,
 omlx/api/video_routes.py, tests/test_video_*.py,
 scripts/video_p0_measure.py.
+
+2026-06-10 增量 (feat/video-i2v-extend-upscale): I2V 图生视频 +
+extend_video_id 视频续片 + SeedVR2 upscale_resolution 逐帧超分
+(spec §12). 补丁面增量: model_discovery.py (WanImageToVideoPipeline
+allowlist + read_video_pipeline_kind + DiscoveredModel.video_pipeline),
+engine_pool.py (EngineEntry.video_pipeline + get_status 透传),
+settings.py (VideoSettings.upscaler_model_path / max_upscale_resolution),
+admin/routes.py (两个 video_* 设置字段), admin chat.html / dashboard
+模板与 i18n (en/zh). worker/manager/video_routes/video_models 是
+fmlx 自有文件, 无上游冲突面.

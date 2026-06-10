@@ -894,6 +894,7 @@
                             video_default_steps: this.globalSettings.video?.default_steps ?? null,
                             video_default_fps: this.globalSettings.video?.default_fps ?? null,
                             video_artifacts_max_gb: this.globalSettings.video?.artifacts_max_gb ?? null,
+                            video_upscaler_model_path: this.globalSettings.video?.upscaler_model_path || null,
                         }),
                     });
 

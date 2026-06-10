@@ -90,6 +90,72 @@ def _write_manifest(path: str, payload: dict) -> None:
         pass
 
 
+def _decode_frames(path: str) -> list:
+    """Decode every frame of an mp4 into PIL RGB images (PyAV ships with
+    mlx-gen). Used to stitch a continuation onto its source video."""
+    import av
+    import PIL.Image
+
+    frames = []
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"no video stream in {path}")
+        for frame in container.decode(container.streams.video[0]):
+            frames.append(PIL.Image.fromarray(frame.to_ndarray(format="rgb24")))
+    if not frames:
+        raise RuntimeError(f"no frames decoded from {path}")
+    return frames
+
+
+def _model_config_for(pipeline: str):
+    """Map the registry's pipeline kind to mlx-gen's ModelConfig. The
+    initializer cross-validates the local dir's model_index.json against
+    this config and hard-refuses on mismatch, so a wrong kind cannot load
+    the wrong architecture silently."""
+    from mflux.models.common.config.model_config import ModelConfig
+
+    if pipeline == "i2v":
+        return ModelConfig.wan2_2_i2v_a14b()
+    if pipeline == "ti2v":
+        return ModelConfig.wan2_2_ti2v_5b()
+    return ModelConfig.wan2_2_t2v_a14b()
+
+
+def _upscale_frames(frames: list, spec: dict) -> list:
+    """SeedVR2 per-frame upscale to spec["upscale_resolution"] (target short
+    side). The caller must have dropped its Wan model references first --
+    the two are never Metal-co-resident inside the lease. A fixed seed
+    across frames keeps the single-step diffusion temporally stable."""
+    import shutil as _shutil
+    import tempfile
+
+    from mflux.models.common.config.model_config import ModelConfig
+    from mflux.models.seedvr2.variants.upscale.seedvr2 import SeedVR2
+
+    total = len(frames)
+    _emit(phase="upscaling", step=0, total_steps=total)
+    upscaler = SeedVR2(
+        model_path=spec["upscaler_model_dir"],
+        model_config=ModelConfig.seedvr2_3b(),
+    )
+    target = int(spec["upscale_resolution"])
+    seed = int(spec["seed"])
+    out = []
+    tmp_dir = tempfile.mkdtemp(prefix="fmlx_upscale_")
+    try:
+        for i, frame in enumerate(frames):
+            frame_path = os.path.join(tmp_dir, f"f{i:05d}.png")
+            frame.save(frame_path)
+            generated = upscaler.generate_image(
+                seed=seed, image_path=frame_path, resolution=target
+            )
+            out.append(generated.image)
+            _emit(phase="upscaling", step=i + 1, total_steps=total)
+    finally:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out
+
+
 def run(spec: dict) -> int:
     manifest_path = spec["manifest_path"]
     output_path = spec["output_path"]
@@ -123,12 +189,25 @@ def run(spec: dict) -> int:
         except Exception:
             pass
 
+    # Continuations condition on the source video's last frame and stitch
+    # the decoded source frames in front of the new segment.
+    extend_from = spec.get("extend_from")
+    image_path = spec.get("image_path")
+    prior_frames: list = []
+    if extend_from:
+        _emit(phase="extracting_reference")
+        prior_frames = _decode_frames(extend_from)
+        image_path = os.path.join(
+            os.path.dirname(output_path), "extend_reference.png"
+        )
+        prior_frames[-1].save(image_path)
+
     _emit(phase="loading")
-    from mflux.models.common.config.model_config import ModelConfig
     from mflux.models.wan.variants import Wan2_2_TI2V
 
+    pipeline = str(spec.get("pipeline") or "t2v")
     model = Wan2_2_TI2V(
-        model_config=ModelConfig.wan2_2_t2v_a14b(),
+        model_config=_model_config_for(pipeline),
         model_path=spec["model_dir"],
     )
     _emit(phase="loaded")
@@ -150,6 +229,8 @@ def run(spec: dict) -> int:
         fps=int(spec["fps"]),
         progress_callback=cb,
     )
+    if image_path:
+        kwargs["image_path"] = image_path
     if low_ram:
         kwargs["release_inactive_denoiser"] = True
         kwargs["release_denoisers_before_decode"] = True
@@ -163,9 +244,47 @@ def run(spec: dict) -> int:
 
     video = model.generate_video(**kwargs)
 
-    _emit(phase="saving")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    video.save(output_path)
+    fps = int(spec["fps"])
+    frames = list(video.frames)
+    if prior_frames:
+        _emit(phase="stitching")
+        # I2V reproduces its conditioning image as the first output frame;
+        # drop it so the seam does not stutter on a duplicate.
+        frames = prior_frames + frames[1:]
+
+    upscale_res = spec.get("upscale_resolution")
+    stitched_or_upscaled = bool(prior_frames) or bool(upscale_res)
+    if upscale_res:
+        from mflux.utils.video_util import VideoUtil
+
+        # Keep the pre-upscale video for future continuations: extending
+        # from upscaled frames would force generating the next segment at
+        # the upscaled resolution (hours per segment on this hardware).
+        raw_path = os.path.join(os.path.dirname(output_path), "output_raw.mp4")
+        VideoUtil.save_video(frames=frames, path=raw_path, fps=fps)
+        # Release the Wan weights before SeedVR2 loads -- never co-resident
+        # inside the lease.
+        import gc
+
+        model = None  # noqa: F841 -- drop the only strong reference
+        video = None  # noqa: F841
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+        frames = _upscale_frames(frames, spec)
+
+    _emit(phase="saving")
+    if stitched_or_upscaled:
+        from mflux.utils.video_util import VideoUtil
+
+        VideoUtil.save_video(frames=frames, path=output_path, fps=fps)
+    else:
+        video.save(output_path)
 
     wall = round(time.time() - _T0, 1)
     _write_manifest(
@@ -177,6 +296,9 @@ def run(spec: dict) -> int:
             "output_bytes": (
                 os.path.getsize(output_path) if os.path.exists(output_path) else 0
             ),
+            "frames_total": len(frames),
+            "extended_from": extend_from or None,
+            "upscale_resolution": upscale_res or None,
         },
     )
     _emit(phase="done", wall_seconds=wall)

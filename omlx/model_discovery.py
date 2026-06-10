@@ -31,7 +31,7 @@ EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "au
 # pipeline classes are skipped at discovery -- registering them would produce
 # unloadable entries, and historically the org-folder descent turned their
 # component subdirs into phantom "llm" models.
-VIDEO_PIPELINE_CLASSES = {"WanPipeline"}
+VIDEO_PIPELINE_CLASSES = {"WanPipeline", "WanImageToVideoPipeline"}
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -294,6 +294,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -726,6 +727,37 @@ def read_model_index_pipeline_class(path: Path) -> str | None:
         return None
 
 
+def read_video_pipeline_kind(path: Path) -> str:
+    """Classify a diffusers video model dir as "t2v" | "i2v" | "ti2v" ("" if
+    not a video dir).
+
+    Mirrors how mlx-gen's WanInitializer validates a local dir against its
+    ModelConfig: the I2V A14B repo declares _class_name
+    "WanImageToVideoPipeline"; T2V A14B and TI2V-5B both declare
+    "WanPipeline" and differ by the presence of a transformer_2 component.
+    The kind selects the worker's ModelConfig and gates the input image:
+    i2v REQUIRES one, ti2v accepts one, t2v rejects one.
+    """
+    index_path = path / "model_index.json"
+    if not index_path.exists():
+        return ""
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ""
+    class_name = index.get("_class_name")
+    if class_name == "WanImageToVideoPipeline":
+        return "i2v"
+    if class_name == "WanPipeline":
+        transformer_2 = index.get("transformer_2")
+        has_t2 = isinstance(transformer_2, list) and any(
+            v is not None for v in transformer_2
+        )
+        return "t2v" if has_t2 else "ti2v"
+    return ""
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model.
 
@@ -838,6 +870,9 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            video_pipeline=(
+                read_video_pipeline_kind(model_dir) if model_type == "video" else ""
+            ),
         )
 
         size_gb = estimated_size / (1024**3)

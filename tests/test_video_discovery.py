@@ -19,6 +19,7 @@ from omlx.model_discovery import (
     discover_models,
     estimate_model_size,
     read_model_index_pipeline_class,
+    read_video_pipeline_kind,
 )
 
 # Component subdirs of a Wan2.2-style diffusers repo. Each carries its own
@@ -32,6 +33,7 @@ def make_diffusers_dir(
     name: str = "Wan2.2-T2V-A14B",
     class_name: str | None = "WanPipeline",
     component_weight_bytes: int = 1024,
+    index_extra: dict | None = None,
 ) -> Path:
     """Create a diffusers-layout model dir with fake component weights."""
     model_dir = parent / name
@@ -40,6 +42,8 @@ def make_diffusers_dir(
     index: dict = {"_diffusers_version": "0.35.0"}
     if class_name is not None:
         index["_class_name"] = class_name
+    if index_extra:
+        index.update(index_extra)
     (model_dir / "model_index.json").write_text(json.dumps(index))
 
     for comp in _WAN_COMPONENTS:
@@ -102,12 +106,65 @@ class TestReadModelIndexPipelineClass:
     def test_wan_pipeline_in_allowlist(self):
         assert "WanPipeline" in VIDEO_PIPELINE_CLASSES
 
+    def test_wan_image_to_video_pipeline_in_allowlist(self):
+        assert "WanImageToVideoPipeline" in VIDEO_PIPELINE_CLASSES
+
+
+class TestReadVideoPipelineKind:
+    """Unit tests for read_video_pipeline_kind (t2v / i2v / ti2v)."""
+
+    @staticmethod
+    def _write_index(path: Path, payload: dict) -> None:
+        (path / "model_index.json").write_text(json.dumps(payload))
+
+    def test_image_to_video_pipeline_is_i2v(self, tmp_path):
+        self._write_index(tmp_path, {"_class_name": "WanImageToVideoPipeline"})
+        assert read_video_pipeline_kind(tmp_path) == "i2v"
+
+    def test_wan_pipeline_with_transformer_2_is_t2v(self, tmp_path):
+        # T2V-A14B declares a real transformer_2 component entry
+        self._write_index(tmp_path, {
+            "_class_name": "WanPipeline",
+            "transformer_2": ["diffusers", "WanTransformer3DModel"],
+        })
+        assert read_video_pipeline_kind(tmp_path) == "t2v"
+
+    def test_wan_pipeline_without_transformer_2_is_ti2v(self, tmp_path):
+        self._write_index(tmp_path, {"_class_name": "WanPipeline"})
+        assert read_video_pipeline_kind(tmp_path) == "ti2v"
+
+    def test_wan_pipeline_with_null_transformer_2_is_ti2v(self, tmp_path):
+        # TI2V-5B declares "transformer_2": [null, null]
+        self._write_index(tmp_path, {
+            "_class_name": "WanPipeline",
+            "transformer_2": [None, None],
+        })
+        assert read_video_pipeline_kind(tmp_path) == "ti2v"
+
+    def test_missing_model_index_is_empty(self, tmp_path):
+        assert read_video_pipeline_kind(tmp_path) == ""
+
+    def test_unknown_class_is_empty(self, tmp_path):
+        self._write_index(tmp_path, {"_class_name": "FluxPipeline"})
+        assert read_video_pipeline_kind(tmp_path) == ""
+
+    def test_invalid_json_is_empty(self, tmp_path):
+        (tmp_path / "model_index.json").write_text("{not valid json")
+        assert read_video_pipeline_kind(tmp_path) == ""
+
 
 class TestDetectModelTypeVideo:
     """Tests for detect_model_type video branch + LLM regression."""
 
     def test_wan_pipeline_dir_is_video(self, tmp_path):
         model_dir = make_diffusers_dir(tmp_path)
+        assert detect_model_type(model_dir) == "video"
+
+    def test_wan_image_to_video_pipeline_dir_is_video(self, tmp_path):
+        model_dir = make_diffusers_dir(
+            tmp_path, name="Wan2.2-I2V-A14B",
+            class_name="WanImageToVideoPipeline",
+        )
         assert detect_model_type(model_dir) == "video"
 
     def test_wan_pipeline_index_alone_is_video(self, tmp_path):
@@ -240,12 +297,68 @@ class TestDiscoverVideoFlatLayout:
             )
 
 
+class TestVideoPipelineKindViaDiscovery:
+    """DiscoveredModel.video_pipeline is set at registration for video
+    models (i2v / t2v / ti2v) and stays empty for everything else."""
+
+    def test_i2v_repo_discovers_with_i2v_kind(self, tmp_path):
+        make_diffusers_dir(
+            tmp_path, name="Wan2.2-I2V-A14B",
+            class_name="WanImageToVideoPipeline",
+        )
+
+        models = discover_models(tmp_path)
+
+        assert set(models.keys()) == {"Wan2.2-I2V-A14B"}
+        entry = models["Wan2.2-I2V-A14B"]
+        assert entry.model_type == "video"
+        assert entry.engine_type == "video"
+        assert entry.config_model_type == "WanImageToVideoPipeline"
+        assert entry.video_pipeline == "i2v"
+
+    def test_t2v_repo_discovers_with_t2v_kind(self, tmp_path):
+        make_diffusers_dir(
+            tmp_path,
+            name="Wan2.2-T2V-A14B",
+            index_extra={
+                "transformer_2": ["diffusers", "WanTransformer3DModel"]
+            },
+        )
+
+        models = discover_models(tmp_path)
+        assert models["Wan2.2-T2V-A14B"].video_pipeline == "t2v"
+
+    def test_ti2v_repo_discovers_with_ti2v_kind(self, tmp_path):
+        # No transformer_2 entry in model_index.json -> TI2V-5B shape
+        make_diffusers_dir(tmp_path, name="Wan2.2-TI2V-5B")
+
+        models = discover_models(tmp_path)
+        assert models["Wan2.2-TI2V-5B"].video_pipeline == "ti2v"
+
+    def test_llm_entry_has_empty_video_pipeline(self, tmp_path):
+        make_llm_dir(tmp_path)
+
+        models = discover_models(tmp_path)
+        assert models["llama-3b"].video_pipeline == ""
+
+
 class TestUnknownPipelineSkipped:
     """Unknown diffusers pipelines are skipped at registration -- no entry,
     no phantom component entries."""
 
     def test_flux_pipeline_flat_not_registered(self, tmp_path):
         make_diffusers_dir(tmp_path, name="FLUX.2-dev", class_name="FluxPipeline")
+
+        models = discover_models(tmp_path)
+        assert models == {}
+
+    def test_unknown_i2v_pipeline_still_not_registered(self, tmp_path):
+        """Regression: widening the allowlist to WanImageToVideoPipeline must
+        not let other image-to-video pipelines through."""
+        make_diffusers_dir(
+            tmp_path, name="CogVideoX1.5-5B-I2V",
+            class_name="CogVideoXImageToVideoPipeline",
+        )
 
         models = discover_models(tmp_path)
         assert models == {}

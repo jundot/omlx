@@ -649,6 +649,15 @@
                                            placeholder="{base_path}/venvs/video/bin/python"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.video.upscaler_path') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.video.upscaler_path_desc') }}</p>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.video.upscaler_model_path"
+                                           placeholder="{models}/AbstractFramework/seedvr2-3b-8bit"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
                             </div>
                         </div>
 

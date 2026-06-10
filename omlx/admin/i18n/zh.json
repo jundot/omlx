@@ -780,7 +780,9 @@
       "artifacts_max_gb": "产物存储上限 (GB)",
       "artifacts_max_gb_desc": "超限时清除最旧的视频文件;任务记录保留。",
       "worker_python": "Worker python 路径",
-      "worker_python_desc": "独立视频 venv 的 python。留空用默认路径。"
+      "worker_python_desc": "独立视频 venv 的 python。留空用默认路径。",
+      "upscaler_path": "SeedVR2 超分权重",
+      "upscaler_path_desc": "upscale_resolution 使用的 SeedVR2 权重目录;留空 = models/AbstractFramework/seedvr2-3b-8bit。"
     }
   },
   "chat": {
@@ -790,7 +792,13 @@
       "cancel": "取消",
       "cancelled": "已取消视频生成。",
       "quality_draft": "草稿（快）",
-      "quality_standard": "标准（慢）"
+      "quality_standard": "标准（慢）",
+      "extend": "续写",
+      "extend_tooltip": "取末帧续生成一段视频",
+      "extend_chip": "续写上一段视频",
+      "upscale": "1080p",
+      "upscale_tooltip": "生成后用 SeedVR2 逐帧超分",
+      "need_image": "该模型为图生视频：请附加一张图片，或在已完成的视频上点「续写」。"
     }
   }
 }

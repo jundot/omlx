@@ -1,6 +1,7 @@
 # fmlx 视频生成引擎 spec (Wan2.2 T2V, mlx-gen 运行时)
 
-状态: 设计稿 v2 (2026-06-10), 未实现, 待拍板.
+状态: v2 已实装并双机部署 (PR #53-#59); P2 的 I2V / 续片 / SeedVR2 超分
+已实装, 见 §12 (2026-06-10).
 v2 = v1 经 6 视角对抗评审修订: 22 条 blocker/major 发现全部确认并吸收
 (拒绝臂位置, OpenAI SDK multipart 兼容, Metal wired 双进程治理, 租约双重
 计数, venv 污染, A/B 协议算术错误等). 评审记录见会话工单.
@@ -625,3 +626,66 @@ docs/upstream-sync.md 记一条分化标记.
    倾向拆.
 4. 真共驻适用域的产品表述: 文档要不要给出 "128GB 机建议 <=50GB LLM 与
    视频并用" 的明确指引 -- 倾向给, 写进 README 视频章节.
+
+## 12. P2 实装: I2V / 视频续片 / SeedVR2 超分 (2026-06-10)
+
+P2 清单中的三项 (图生视频, 自动接片, 视频超分) 实装记录. 设计原则不变:
+业务集中在 omlx/video/ 与 api/video_*, 对上游同源文件只加小补丁.
+
+### 12.1 管线细分类 (discovery)
+
+- VIDEO_PIPELINE_CLASSES 扩为 {WanPipeline, WanImageToVideoPipeline}.
+- 新 read_video_pipeline_kind(): WanImageToVideoPipeline -> "i2v";
+  WanPipeline 带 transformer_2 -> "t2v", 不带 -> "ti2v" (TI2V-5B). 与
+  mlx-gen WanInitializer._validate_model_index 的判别维度一致, kind 选错
+  时 worker 加载会被 mflux 硬拒, 不会静默错配.
+- DiscoveredModel / EngineEntry 增 video_pipeline 字段, get_status 与
+  /v1/models/status 透传, chat UI 据此做 i2v 能力门控.
+
+### 12.2 API 扩展 (POST /v1/videos)
+
+- input_reference: I2V 条件图. multipart 文件域 (openai SDK 形态, 原先被
+  丢弃的文件域现在被消费) 或 JSON 里的 data URL / base64 字符串. 魔数
+  校验 PNG/JPEG/WebP, 16MB 上限. 落盘到 job blob 目录, worker 经
+  spec.image_path 读取.
+- extend_video_id: 续片. 源 job 必须 completed 且产物仍在 (retention 已
+  清 -> 409 artifact_expired). 新段的 width/height/fps 钉死为源 job 的
+  几何参数 (保证无缝拼接), 用户传的 size/fps 被覆盖. 与 input_reference
+  互斥 (续片永远以源末帧为条件图).
+- upscale_resolution: SeedVR2 逐帧超分目标短边 (480..max_upscale_
+  resolution, 默认上限 2160). 权重目录缺失 -> 400 带下载指引 (不是 503,
+  引擎其余部分健康).
+- 类型门控: i2v 模型必须给图 (input_reference 或 extend), t2v 模型给图
+  -> 400, ti2v 可给可不给.
+
+### 12.3 worker 阶段扩展
+
+顺序: extracting_reference (续片时解码源 mp4 全帧 + 末帧存为条件图) ->
+loading (按 pipeline kind 选 ModelConfig) -> denoise -> stitching (源帧 +
+新段帧, 丢弃新段首帧 -- I2V 首帧复刻条件图, 不丢会在接缝处卡顿) ->
+upscaling (释放 Wan 权重后加载 SeedVR2, 同租约内两者绝不共驻; 固定 seed
+逐帧超分, step/total 进度) -> saving. 超分任务在 output.mp4 旁保留
+output_raw.mp4 (超分前的可续片版本) -- 否则下一次续片只能在超分后分辨率
+上生成 (720p+ 在本硬件上数小时/段, 不可接受).
+
+### 12.4 内存
+
+生成段峰值仍由 §4.3 预测器把守 (i2v 与 t2v 同 A14B 架构, 同公式).
+SeedVR2 3B q8 权重 ~4.7GB, 在 Wan 释放后加载, 不抬峰值上限; 超分阶段
+实测峰值待真机数据回填. worker wired 自缚与 watchdog 语义不变.
+
+### 12.5 chat UI
+
+- i2v 能力模型开放图片上传 (上限 1 张, 即 input_reference).
+- 完成的视频气泡有"续写"按钮: 装载续片状态 (chip 可取消), 自动切到
+  i2v 能力模型, 提交时带 extend_video_id.
+- 视频控件行加 1080p 超分开关 (upscale_resolution=1080).
+
+### 12.6 已知取舍
+
+- 逐帧超分无时序模块, 理论上有闪烁风险; 固定 seed + 单步扩散实测可接受
+  程度待真机评估 (mflux 没有 SeedVR2 视频模式, 这是当前运行时的上限).
+- I2V 按条件图长宽比自适应输出尺寸 (请求尺寸按目标面积解释), 续片场景
+  源帧长宽比与请求一致, 无漂移.
+- 续片排队期间源产物受 retention 保护; 但 DELETE 源 job 不受保护, 续片
+  job 调度时发现源缺失 -> failed (code=extend_source_missing).

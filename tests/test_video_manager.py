@@ -9,6 +9,7 @@ is needed. Spec reference: docs/video-generation-engine-spec.md section 4.2.
 
 import asyncio
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -511,3 +512,251 @@ async def test_watchdog_kills_worker_when_monitor_fails(tmp_path, monkeypatch):
         enforcer.assert_lease_cycle(lease_bytes=1 * GB)
     finally:
         await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (13) submit with input_reference (I2V conditioning image)
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_writes_input_reference_and_image_path(tmp_path):
+    manager, _ = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+        job = await manager.submit(
+            _make_job("video_ref1"), input_reference=(png, ".png")
+        )
+
+        # The reference lands in the job's blob dir synchronously at submit
+        ref = manager.artifacts_dir / job.id / "input_reference.png"
+        assert ref.exists()
+        assert ref.read_bytes() == png
+        assert job.params["image_path"] == str(ref)
+
+        # The reference does not disturb the normal run; the worker spec
+        # carries image_path through
+        await _wait_terminal(job)
+        assert job.status == "completed"
+        with open(manager.artifacts_dir / job.id / "spec.json") as f:
+            spec = json.load(f)
+        assert spec["image_path"] == str(ref)
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (14) extend: dispatch resolves the source artifact into the spec
+# ---------------------------------------------------------------------------
+
+
+async def test_extend_job_writes_extend_from_into_spec(tmp_path):
+    manager, _ = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        src = await manager.submit(_make_job("video_src1"))
+        await _wait_terminal(src)
+        assert src.status == "completed"
+        assert src.artifact_path is not None
+
+        job = await manager.submit(
+            _make_job("video_ext1", extend_source_id=src.id)
+        )
+        await _wait_terminal(job)
+        assert job.status == "completed"
+
+        with open(manager.artifacts_dir / job.id / "spec.json") as f:
+            spec = json.load(f)
+        # No output_raw.mp4 in the source blob dir -> falls back to the
+        # artifact itself
+        assert spec["extend_from"] == src.artifact_path
+        assert spec["extend_source_id"] == src.id
+        assert Path(spec["extend_from"]).exists()
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (15) extend: missing source fails before lease/spawn
+# ---------------------------------------------------------------------------
+
+
+async def test_extend_missing_source_fails_without_lease_or_spawn(tmp_path):
+    manager, enforcer = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        job = await manager.submit(
+            _make_job("video_ext_orphan", extend_source_id="video_gone")
+        )
+        await _wait_terminal(job)
+
+        assert job.status == "failed"
+        assert job.error is not None
+        assert job.error["code"] == vm.ERR_EXTEND_SOURCE_MISSING
+        # Failed before lease acquisition: no acquire/set_pid/release at all
+        assert enforcer.calls == []
+        # _run_job bails before writing the spec, so no worker was spawned
+        assert not (manager.artifacts_dir / job.id / "spec.json").exists()
+        assert not (manager.artifacts_dir / job.id / "output.mp4").exists()
+    finally:
+        await manager.shutdown()
+
+
+async def test_extend_source_artifact_deleted_fails_before_dispatch(tmp_path):
+    manager, enforcer = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        src = await manager.submit(_make_job("video_src2"))
+        await _wait_terminal(src)
+        assert src.status == "completed"
+        acquires_before = enforcer.call_names().count("acquire")
+        # Source record survives but its artifact blob is gone
+        shutil.rmtree(manager.artifacts_dir / src.id)
+
+        job = await manager.submit(
+            _make_job("video_ext2", extend_source_id=src.id)
+        )
+        await _wait_terminal(job)
+
+        assert job.status == "failed"
+        assert job.error is not None
+        assert job.error["code"] == vm.ERR_EXTEND_SOURCE_MISSING
+        # No second lease cycle for the failed extend job
+        assert enforcer.call_names().count("acquire") == acquires_before
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (16) extend_source_path: output_raw.mp4 preferred over artifact_path
+# ---------------------------------------------------------------------------
+
+
+async def test_extend_source_path_prefers_raw_then_artifact(tmp_path):
+    manager, _ = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        job = _make_job("video_srcsel")
+        blob_dir = manager.artifacts_dir / job.id
+        blob_dir.mkdir(parents=True)
+        artifact = blob_dir / "output.mp4"
+        artifact.write_bytes(b"upscaled")
+        job.artifact_path = str(artifact)
+        raw = blob_dir / "output_raw.mp4"
+        raw.write_bytes(b"raw")
+
+        # The pre-upscale stitchable video wins over the artifact
+        assert manager.extend_source_path(job) == raw
+
+        raw.unlink()
+        assert manager.extend_source_path(job) == artifact
+
+        artifact.unlink()
+        assert manager.extend_source_path(job) is None
+
+        # No artifact_path recorded at all -> None as well
+        job.artifact_path = None
+        assert manager.extend_source_path(job) is None
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (17) retention: pending extend jobs protect their source artifact
+# ---------------------------------------------------------------------------
+
+
+async def test_retention_protects_pending_extend_source(tmp_path):
+    settings = _make_settings(artifacts_max_count=1)
+    manager, _ = _make_manager(tmp_path, _SUCCESS_BODY, settings=settings)
+    try:
+        src = await manager.submit(_make_job("video_prot_src"))
+        await _wait_terminal(src)
+        assert src.status == "completed"
+
+        # A queued job extending src; injected directly (not enqueued) so it
+        # stays "queued" while later jobs run their retention sweeps
+        pending = _make_job("video_prot_pending", extend_source_id=src.id)
+        manager._jobs[pending.id] = pending
+
+        job_b = await manager.submit(_make_job("video_prot_b"))
+        await _wait_terminal(job_b)
+        job_c = await manager.submit(_make_job("video_prot_c"))
+        await _wait_terminal(job_c)
+
+        # cap=1 over three artifacts: the oldest UNPROTECTED one (job_b)
+        # purges
+        ok = await _wait_until(lambda: job_b.artifact_path is None)
+        assert ok, "unprotected artifact was not purged"
+        # ...while the protected source survives despite being oldest of all
+        assert src.artifact_path is not None
+        assert Path(src.artifact_path).exists()
+        assert src.expires_at is None
+        # newest artifact survives as usual
+        assert job_c.artifact_path is not None
+        assert Path(job_c.artifact_path).exists()
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (18) progress mapping for post-generation phases
+# ---------------------------------------------------------------------------
+
+
+async def test_apply_progress_upscaling_and_stitching_mapping(tmp_path):
+    manager, _ = _make_manager(tmp_path, _SUCCESS_BODY)
+    try:
+        job = _make_job("video_prog1")
+        # Denoise mapping unchanged: 5 + 90 * step / total
+        manager._apply_progress(
+            job, {"phase": "denoise", "step": 1, "total_steps": 2}
+        )
+        assert job.progress == 50
+        manager._apply_progress(
+            job, {"phase": "denoise", "step": 2, "total_steps": 2}
+        )
+        assert job.progress == 95
+        # Stitching pins the post-generation floor
+        manager._apply_progress(job, {"phase": "stitching"})
+        assert job.progress == 95
+        assert job.phase == "stitching"
+        # Upscaling: 95 + int(2 * step / total)
+        manager._apply_progress(
+            job, {"phase": "upscaling", "step": 5, "total_steps": 10}
+        )
+        assert job.progress == 96
+        assert job.phase == "upscaling"
+        manager._apply_progress(
+            job, {"phase": "upscaling", "step": 10, "total_steps": 10}
+        )
+        assert job.progress == 97
+
+        # Upscaling without step totals holds the 95 floor
+        floor_job = _make_job("video_prog2")
+        manager._apply_progress(floor_job, {"phase": "upscaling"})
+        assert floor_job.progress == 95
+    finally:
+        await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# (19) wire shape: i2v / extend / upscale extension fields
+# ---------------------------------------------------------------------------
+
+
+def test_to_dict_includes_extension_fields():
+    job = _make_job(
+        "video_wire1",
+        pipeline="i2v",
+        extend_source_id="video_src9",
+        upscale_resolution=1080,
+        image_path="/tmp/ref.png",
+    )
+    wire = job.to_dict()
+    assert wire["pipeline"] == "i2v"
+    assert wire["extend_source_id"] == "video_src9"
+    assert wire["upscale_resolution"] == 1080
+    assert wire["has_input_reference"] is True
+
+    # Plain t2v job: fields present, null/false defaults
+    plain = _make_job("video_wire2").to_dict()
+    assert plain["pipeline"] is None
+    assert plain["extend_source_id"] is None
+    assert plain["upscale_resolution"] is None
+    assert plain["has_input_reference"] is False
