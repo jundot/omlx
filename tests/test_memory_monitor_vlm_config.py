@@ -14,6 +14,12 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
+from omlx.memory_monitor import (
+    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
+    _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD,
+    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    MemoryMonitor,
+)
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 
@@ -166,6 +172,7 @@ class TestSetModelInfoForMonitorVLMWalk:
     def test_n_layer_alias_also_triggers_subconfig_selection(self):
         """GPT-style configs use ``n_layer`` instead of ``num_hidden_layers``.
         The walking helper must recognize both."""
+
         class _GPTStyleLM:
             n_layer = 24
             n_head = 16
@@ -184,6 +191,242 @@ class TestSetModelInfoForMonitorVLMWalk:
         sched._set_model_info_for_monitor()
 
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
-        assert kwargs["num_layers"] == 24, (
-            "GPT-style ``n_layer`` in the sub-config should be recognized"
+        assert (
+            kwargs["num_layers"] == 24
+        ), "GPT-style ``n_layer`` in the sub-config should be recognized"
+
+
+class TestSetModelInfoTurboQuantDtype:
+    def _make_sched_with_config(self, config) -> Scheduler:
+        from mlx_lm.models.cache import KVCache
+
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = config
+        sched.model.make_cache.return_value = [KVCache() for _ in range(40)]
+        del sched.model.args
+        return sched
+
+    def test_no_turboquant_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = None
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_4bit_without_skip_last_uses_quantized_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        expected = 4.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        expected = (39 * quantized + 2.0) / 40
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_8bit_without_skip_last_uses_quantized_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 8.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        expected = 8.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_dtype_with_vlm_nested_config(self):
+        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["num_layers"] == 40
+        expected = 4.0 / 8.0 + 2.0 / 128
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_hybrid_arrays_cache_counts_only_kv_layers(self):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        sched = self._make_sched_with_config(_VLMConfigWithTextConfig())
+        sched.model.make_cache.return_value = [
+            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(40)
+        ]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        expected = (9 * quantized + 2.0) / 10
+        assert kwargs["num_kv_cache_layers"] == 10
+        assert abs(kwargs["dtype_size"] - expected) < 1e-9
+
+    def test_turboquant_arrays_cache_only_uses_full_dtype(self):
+        from mlx_lm.models.cache import ArraysCache
+
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.make_cache.return_value = [ArraysCache(size=2) for _ in range(40)]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_ineligible_cache_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.make_cache.return_value = [object()]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_mla_model_uses_full_dtype(self):
+        class _MLAConfig(_PlainLMConfig):
+            kv_lora_rank = 512
+
+        sched = self._make_sched_with_config(_MLAConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_reported_scale_fits_after_turboquant_skip_last_accounting(self):
+        tokens = 327_872
+        ceiling = 44.0 * 1024**3
+        current = 27.17 * 1024**3
+        headroom = ceiling - current
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=32,
+            num_kv_cache_layers=40,
         )
+        full_dtype_peak = monitor.estimate_prefill_peak_bytes(
+            tokens, 2048, cached_tokens=0
+        )
+
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        skip_last_dtype = (39 * quantized + 2.0) / 40
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=skip_last_dtype,
+            num_attention_heads=32,
+            num_kv_cache_layers=40,
+        )
+        turboquant_peak = monitor.estimate_prefill_peak_bytes(
+            tokens, 2048, cached_tokens=0
+        )
+
+        assert full_dtype_peak > headroom
+        assert turboquant_peak < headroom
+
+
+class TestSdpaTiledScratch:
+    """MLX >= 0.31 avoids the old full fp32 scores allocation for head_dim > 128,
+    but local peak measurements still show a bounded tiled scratch term."""
+
+    def test_tiled_scratch_constants_match_mlx_031_observation(self):
+        assert _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD == 128
+        assert _SDPA_TILED_SCRATCH_QUERY_TOKENS == 512
+        assert _SDPA_TILED_SCRATCH_DTYPE_SIZE == 2
+
+    def test_estimate_prefill_uses_tiled_scratch_for_large_head_dim(self):
+        """head_dim=256 must not use the old full fp32 score-matrix path."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        chunk = 512
+        new_tokens = 327872
+        full_kv_len = new_tokens
+
+        eff_chunk = min(chunk, new_tokens)
+        output_only = n_q * eff_chunk * hd * 4
+        old_full_scores = n_q * eff_chunk * full_kv_len * 4 + output_only
+        expected_attn = (
+            n_q
+            * min(eff_chunk, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+            * full_kv_len
+            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        )
+        expected_attn += output_only
+        kv = monitor.estimate_prompt_kv_bytes(new_tokens)
+        expected_peak = expected_attn + kv
+
+        actual = monitor.estimate_prefill_peak_bytes(new_tokens, chunk, cached_tokens=0)
+        assert actual == expected_peak, (
+            f"head_dim=256 should use tiled scratch formula "
+            f"({expected_peak:,} bytes), "
+            f"got {actual:,} bytes"
+        )
+        assert output_only < expected_attn < old_full_scores
+
+    def test_estimate_chunk_transient_uses_tiled_scratch_for_large_head_dim(self):
+        """head_dim=256 chunk transient must include the tiled scratch term."""
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=28,
+            num_kv_heads=4,
+            num_attention_heads=28,
+            head_dim=256,
+            dtype_size=2,
+        )
+        n_q = 28
+        hd = 256
+        n_tokens = 512
+        kv_len = 327872
+
+        output_only = n_q * n_tokens * hd * 4
+        expected = (
+            n_q
+            * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+            * kv_len
+            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        )
+        expected += output_only
+        actual = monitor.estimate_chunk_transient_bytes(n_tokens, kv_len)
+        assert actual == expected, (
+            f"head_dim=256 chunk transient should be {expected:,} bytes, "
+            f"got {actual:,} bytes"
+        )
+        assert actual > output_only

@@ -924,6 +924,7 @@ class VLMBatchedEngine(BaseEngine):
                 self._engine.engine.scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
+                self._engine.engine.scheduler._set_model_info_for_monitor()
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler

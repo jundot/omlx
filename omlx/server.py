@@ -284,7 +284,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import verify_any_api_key
+    from .admin.auth import fingerprint_key, verify_any_api_key
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -313,7 +313,7 @@ async def verify_api_key(
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
-        logger.warning("Rejected API key: %r", api_key_value)
+        logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
@@ -2920,7 +2920,12 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
+        logger.info(
+            f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}, "
+            f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
+            f"request_max_tokens={request.max_tokens}"
+        )
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -3773,7 +3778,13 @@ async def stream_chat_completion(
             model_id=resolved_model or request.model,
         )
         tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
+        logger.info(
+            f"Chat completion: {last_output.completion_tokens} tokens in "
+            f"{end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), "
+            f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
+            f"max_tokens={kwargs.get('max_tokens')}, "
+            f"request_max_tokens={request.max_tokens}"
+        )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:

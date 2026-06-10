@@ -444,7 +444,7 @@ def test_ssd_type_map_completeness():
 
 
 def test_turboquant_eligible_gate():
-    """Only dense KVCache (and CacheList of KVCache) is batch-convertible.
+    """Only dense KVCache and state-array caches are batch-convertible.
 
     Chunked/rotating/quantized caches must gate OFF so chunked-attention
     models (Llama-4) and sliding-window models stay fp16 instead of crashing
@@ -453,6 +453,7 @@ def test_turboquant_eligible_gate():
     from types import SimpleNamespace
 
     from mlx_lm.models.cache import (
+        ArraysCache,
         CacheList,
         ChunkedKVCache,
         KVCache,
@@ -475,6 +476,8 @@ def test_turboquant_eligible_gate():
     assert elig([KVCache(), RotatingKVCache(32)]) is False
     assert elig([QuantizedKVCache()]) is False
     assert elig([CacheList(KVCache(), KVCache())]) is True
+    assert elig([ArraysCache(size=2), KVCache()]) is True
+    assert elig([CacheList(ArraysCache(size=2), KVCache())]) is True
     assert elig([CacheList(KVCache(), RotatingKVCache(32))]) is False
 
 

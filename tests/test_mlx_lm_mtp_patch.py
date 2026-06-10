@@ -535,6 +535,64 @@ class TestBatchGeneratorDispatch:
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
         assert hasattr(BatchGenerator, "_omlx_mtp_patched")
 
+    def test_decode_eligibility_reads_model_instance_flag_not_global(self):
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            set_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+        )
+
+        prior_active = is_mtp_active()
+        try:
+            # Simulate a later non-MTP model load resetting the construction
+            # global. The already-loaded MTP model must stay eligible.
+            set_mtp_active(False)
+            assert batch_generator._mtp_common_eligible(gen_batch) is True
+
+            model._omlx_mtp_decode_enabled = False
+            assert batch_generator._mtp_common_eligible(gen_batch) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_decode_marker_is_found_on_wrapped_language_model(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        inner = SimpleNamespace(_omlx_mtp_decode_enabled=True)
+
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(language_model=inner)
+            )
+            is True
+        )
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(_language_model=inner)
+            )
+            is True
+        )
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(
+                    language_model=SimpleNamespace(
+                        _omlx_mtp_decode_enabled=False
+                    )
+                )
+            )
+            is False
+        )
+
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
         from omlx.patches.mlx_lm_mtp import (
             is_mtp_active,
@@ -558,8 +616,9 @@ class TestBatchGeneratorDispatch:
             """Has both the method and the attached head — i.e. the model
             class was patched and the head was attached at load time."""
 
-            def __init__(self):
+            def __init__(self, decode_enabled=True):
                 self.mtp = object()  # placeholder for an actual MTPModule
+                self._omlx_mtp_decode_enabled = decode_enabled
 
             def mtp_forward(self, *_):
                 pass
@@ -578,13 +637,18 @@ class TestBatchGeneratorDispatch:
             assert (
                 _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
             )
-            # Head attached but the per-load mtp_active flag is off
+            # Head attached but the per-load decode marker is off
             # (e.g. VLM runtime patches attach unconditionally so weight
             # load matches, while inference-time MTP stays disabled).
-            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+            assert (
+                _is_mtp_eligible(
+                    _GenBatch(_MtpModel(decode_enabled=False), uids=[1])
+                )
+                is False
+            )
 
-            set_mtp_active(True)
-            # Has both method and head + batch=1 + flag on → triggers the path.
+            # Has method, head, and per-instance marker + batch=1. The current
+            # process-wide construction flag no longer controls decode.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
             # MTP model with batch=2 falls back to standard step.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
@@ -608,6 +672,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -635,6 +700,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -691,6 +757,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -731,6 +798,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -799,6 +867,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -825,6 +894,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass

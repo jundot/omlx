@@ -19,7 +19,11 @@ from unittest.mock import patch
 import pytest
 
 from omlx import scheduler as sched_mod
-from omlx.memory_monitor import MemoryMonitor
+from omlx.memory_monitor import (
+    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
+    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    MemoryMonitor,
+)
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 from omlx.scheduler import Scheduler, _PrefillEvictionNeeded
 
@@ -44,11 +48,17 @@ def _monitor(head_dim):
 
 
 def test_chunk_transient_head_dim_gt_128_scales_with_kv_len():
-    """head_dim > 128 → SDPA fallback materializes n_q*n*kv_len*4 (+ output)."""
+    """head_dim > 128 → SDPA uses tiled scratch plus output buffer."""
     m = _monitor(head_dim=192)
     n_q, hd = 32, 192
     n_tokens, kv_len = 4, 10_000
-    expected = n_q * n_tokens * kv_len * 4 + n_q * n_tokens * hd * 4
+    expected = (
+        n_q
+        * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+        * kv_len
+        * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+    )
+    expected += n_q * n_tokens * hd * 4
     assert m.estimate_chunk_transient_bytes(n_tokens, kv_len) == expected
     # Doubling kv_len roughly doubles the transient (kv term dominates).
     bigger = m.estimate_chunk_transient_bytes(n_tokens, kv_len * 2)
@@ -108,8 +118,10 @@ def _throttle_ctx(
         _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        _last_mlx_active_memory_bytes=0,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
+    ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )

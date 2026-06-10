@@ -914,3 +914,90 @@ class TestDFlashOutputParserWiring:
             {"model_type": "qwen3"},
         )
         assert factory is None
+
+
+class TestDFlashCachedTokens:
+    """#1441: DFlash must surface prefix-cache hits as cached_tokens.
+
+    When a DFlash prefix snapshot hits, prefill is skipped for the matched
+    tokens (PrefixCacheFlow.hit_tokens). The engine previously never set
+    cached_tokens on its GenerationOutput, so the API always reported 0 with
+    DFlash enabled (restored when disabled). These cover the pure mapping; the
+    end-to-end wiring is exercised by the CI-gated integration test below.
+    """
+
+    def test_hit_reports_matched_tokens(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        flow = SimpleNamespace(hit_tokens=4273)
+        assert DFlashEngine._cached_tokens_from_flow(flow) == 4273
+
+    def test_miss_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(SimpleNamespace(hit_tokens=0)) == 0
+
+    def test_none_flow_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(None) == 0
+
+    def test_missing_attr_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(SimpleNamespace()) == 0
+
+    def test_negative_is_clamped(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(SimpleNamespace(hit_tokens=-5)) == 0
+
+
+class TestDFlashCachedTokensWiring:
+    """End-to-end: a prefix hit reaches GenerationOutput.cached_tokens.
+
+    Requires dflash-mlx (for SummaryEvent / the inner event loop); skipped where
+    it is unavailable, runs in CI.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generate_sets_cached_tokens_from_hit(self, monkeypatch):
+        try:
+            from dflash_mlx.engine.events import SummaryEvent
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda s: [1, 2, 3],
+            decode=lambda toks, **kw: "hi",
+        )
+        engine._output_parser_factory = None
+        engine._should_fallback = lambda toks: False
+        engine._detect_needs_think_prefix = lambda toks: False
+
+        summary = SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=4273,
+            generated_token_ids=(5,),
+            generation_tokens=1,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+        fake_flow = SimpleNamespace(hit_tokens=4273)
+
+        def fake_stream_events(*, prompt_tokens, max_tokens):
+            return iter([summary]), fake_flow, [2]
+
+        monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)
+
+        out = await engine.generate("hello", max_tokens=4)
+        assert out.cached_tokens == 4273

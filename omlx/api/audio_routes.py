@@ -263,14 +263,15 @@ async def _stream_speech_response(
             and hasattr(engine, "stream_synthesize_pcm")
         ):
             logger.info(
-                "TTS native streaming start: model=%s, text_len=%d, voice=%s",
-                request.model, len(request.input), request.voice,
+                "TTS native streaming start: model=%s, text_len=%d, voice=%s, language=%s",
+                request.model, len(request.input), request.voice, request.language or "auto",
             )
             stream_format: Optional[tuple[int, int, int]] = None
             try:
                 async for sample_rate, channels, sample_width, pcm_bytes in engine.stream_synthesize_pcm(
                     request.input,
                     voice=request.voice,
+                    language=request.language,
                     speed=request.speed,
                     instructions=request.instructions,
                     ref_audio=ref_audio_path,
@@ -310,8 +311,8 @@ async def _stream_speech_response(
 
         segments = _split_tts_text(request.input)
         logger.info(
-            "TTS streaming start: model=%s, text_len=%d, segments=%d, voice=%s",
-            request.model, len(request.input), len(segments), request.voice,
+            "TTS streaming start: model=%s, text_len=%d, segments=%d, voice=%s, language=%s",
+            request.model, len(request.input), len(segments), request.voice, request.language or "auto",
         )
 
         stream_format: Optional[tuple[int, int, int]] = None
@@ -319,6 +320,7 @@ async def _stream_speech_response(
             wav_bytes = await engine.synthesize(
                 segment,
                 voice=request.voice,
+                language=request.language,
                 speed=request.speed,
                 instructions=request.instructions,
                 ref_audio=ref_audio_path,
@@ -546,6 +548,7 @@ async def create_speech(request: AudioSpeechRequest):
         wav_bytes = await engine.synthesize(
             request.input,
             voice=request.voice,
+            language=request.language,
             speed=request.speed,
             instructions=request.instructions,
             ref_audio=ref_audio_path,

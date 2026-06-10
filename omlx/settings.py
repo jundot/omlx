@@ -47,11 +47,21 @@ def get_system_memory() -> int:
     """
     Return total system RAM in bytes.
 
-    Uses psutil if available, falls back to os.sysconf on Unix.
+    Uses os.sysconf first so macOS does not depend on psutil's VM stats
+    adapter, which can lag new HOST_VM_INFO64 layouts.
 
     Returns:
         Total RAM in bytes.
     """
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        memory = int(pages) * int(page_size)
+        if memory > 0:
+            return memory
+    except (AttributeError, ValueError, OSError):
+        pass
+
     try:
         import psutil
 
@@ -60,14 +70,6 @@ def get_system_memory() -> int:
         pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("psutil failed to detect system memory: %s", exc)
-
-    # Fallback for Unix systems
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        return pages * page_size
-    except (AttributeError, ValueError):
-        pass
 
     # Default to 16GB if detection fails
     logger.warning("Could not detect system memory, defaulting to 16GB")

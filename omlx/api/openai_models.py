@@ -275,7 +275,10 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     repetition_penalty: float | None = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+    )
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
     stop: Optional[List[str]] = None

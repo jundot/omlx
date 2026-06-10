@@ -5,6 +5,7 @@ This module provides session-based authentication using signed tokens
 and API key verification for admin panel access.
 """
 
+import hashlib
 import os
 import secrets
 from typing import Optional
@@ -132,6 +133,25 @@ def compare_keys(provided_key: str, expected_key: str) -> bool:
         provided_key.encode("utf-8", "surrogatepass"),
         expected_key.encode("utf-8", "surrogatepass"),
     )
+
+
+def fingerprint_key(api_key: str) -> str:
+    """Return a short, non-reversible fingerprint of an API key for logging.
+
+    Logging a rejected key verbatim leaks the client's secret into the server
+    log. A truncated SHA-256 digest lets operators correlate repeated
+    rejections of the same key without exposing the key itself. surrogatepass
+    matches compare_keys() so any str the auth path accepts can be
+    fingerprinted, including lone surrogates from json escape sequences.
+
+    Args:
+        api_key: The (untrusted) key to fingerprint. Empty string is allowed.
+
+    Returns:
+        The first 8 hex characters of the SHA-256 digest of the UTF-8 bytes.
+    """
+    digest = hashlib.sha256(api_key.encode("utf-8", "surrogatepass")).hexdigest()
+    return digest[:8]
 
 
 def verify_api_key(api_key: str, server_api_key: str) -> bool:

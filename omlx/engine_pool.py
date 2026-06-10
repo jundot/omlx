@@ -416,7 +416,18 @@ class EnginePool:
             ceiling = self._current_ceiling()
             if ceiling > 0:
                 while True:
-                    current = max(mx.get_active_memory(), get_phys_footprint())
+                    # Consult the tracked accumulator alongside live memory:
+                    # after a model settles or idles, mx.get_active_memory() and
+                    # the process footprint can read well below the model's true
+                    # resident size, while _current_model_memory still reflects
+                    # the committed total. Using only live memory lets a second
+                    # large model load without evicting the first, over-
+                    # committing past the ceiling (#1623).
+                    current = max(
+                        mx.get_active_memory(),
+                        get_phys_footprint(),
+                        self._current_model_memory,
+                    )
                     projected = current + entry.estimated_size
                     if projected <= ceiling:
                         break
@@ -665,6 +676,28 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
 
+    def _other_entries_serving(self, model_id: str) -> bool:
+        """True when any loaded entry other than ``model_id`` is serving.
+
+        Used by the settle barrier in ``_unload_engine``: the barrier's
+        freed-memory check is a delta of the process-global
+        ``mx.get_active_memory()`` gauge, which only measures THIS unload
+        while no other engine is allocating concurrently.
+        """
+        # Snapshot the items: admin unload routes call _unload_engine without
+        # the pool lock, so discover_models() can mutate _entries mid-iteration.
+        for mid, e in list(self._entries.items()):
+            if mid == model_id or e.engine is None:
+                continue
+            if e.in_use > 0:
+                return True
+            try:
+                if e.engine.has_active_requests():
+                    return True
+            except AttributeError:
+                pass
+        return False
+
     async def _unload_engine(self, model_id: str) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
@@ -748,6 +781,7 @@ class EnginePool:
         settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
         min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
         settled = False
+        settle_indeterminate = False
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -757,6 +791,23 @@ class EnginePool:
                     f"Settle round {_settle_round + 1} for '{model_id}': "
                     f"freed={format_size(actual_freed)} "
                     f"(need>={format_size(min_expected_freed)}) - settled"
+                )
+                break
+            if self._other_entries_serving(model_id):
+                # actual_freed is a delta of the process-global MLX gauge,
+                # so while another engine allocates (prefill/KV growth) the
+                # amount freed by THIS unload is unmeasurable — the delta can
+                # even read negative. Burning settle rounds here serializes
+                # gc/synchronize/clear_cache against live decode for seconds,
+                # under memory pressure, with the enforcer holding the pool
+                # lock. Bail out instead: pre-load admission re-reads the
+                # live gauge, so nothing downstream trusts this sample.
+                settle_indeterminate = True
+                logger.info(
+                    f"Settle for '{model_id}' indeterminate under concurrent "
+                    f"activity (freed={format_size(actual_freed)}, "
+                    f"need>={format_size(min_expected_freed)}); skipping "
+                    f"settle wait"
                 )
                 break
             logger.debug(
@@ -780,6 +831,16 @@ class EnginePool:
                 f"(expected>={format_size(min_expected_freed)}), "
                 f"active_memory: {format_size(active_now)} (settled)"
             )
+        elif settle_indeterminate:
+            # Settle wait skipped (logged above). Emergency reclaim is
+            # deliberately skipped too: its gc + synchronize + clear_cache
+            # rounds would stall the live engines that made the measurement
+            # indeterminate in the first place. Recovery is not lost:
+            # _wake_process_memory_enforcer() below triggers an immediate
+            # enforcer re-poll, and pre-load admission re-reads the live gauge
+            # alongside the tracked accumulator (the #1623 max() in
+            # get_engine), so any unreleased memory stays visible to both.
+            pass
         else:
             # Barrier timed out - try emergency reclaim
             logger.warning(

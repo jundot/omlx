@@ -108,7 +108,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 logger.warning(
                     "Strict weight loading failed for %s (likely quantized "
                     "model with mlx-audio compatibility issue), retrying "
-                    "with strict=False: %s", model_name, exc,
+                    "with strict=False: %s",
+                    model_name,
+                    exc,
                 )
                 return _load_model(model_name, strict=False)
 
@@ -144,6 +146,7 @@ class TTSEngine(BaseNonStreamingEngine):
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        language: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -161,6 +164,7 @@ class TTSEngine(BaseNonStreamingEngine):
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty for generation
             max_tokens: Maximum number of tokens to generate
+            language: Optional language hint for multilingual TTS models
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -172,8 +176,12 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
-            self._model_name, len(text), voice, speed,
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, language=%s, speed=%.1f, ref_audio=%s",
+            self._model_name,
+            len(text),
+            voice,
+            language or "auto",
+            speed,
             "yes" if ref_audio else "no",
         )
 
@@ -186,6 +194,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 "verbose": False,
             }
             import inspect
+
             gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
                 # Route voice to the correct generate() kwarg.
@@ -198,6 +207,8 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if language and "lang_code" in gen_params:
+                gen_kwargs["lang_code"] = language
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -247,14 +258,14 @@ class TTSEngine(BaseNonStreamingEngine):
         )
         try:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                get_mlx_executor(), _synthesize_sync
-            )
+            result = await loop.run_in_executor(get_mlx_executor(), _synthesize_sync)
 
             elapsed = time.monotonic() - t0
             logger.info(
                 "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result),
+                self._model_name,
+                elapsed,
+                len(result),
             )
             return result
         finally:
@@ -274,20 +285,27 @@ class TTSEngine(BaseNonStreamingEngine):
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
         streaming_interval: float = 0.4,
+        language: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[tuple[int, int, int, bytes]]:
         """Stream synthesized PCM chunks from models that natively support it."""
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         if not self.supports_native_tts_streaming():
-            raise NotImplementedError("Loaded TTS model does not expose native streaming")
+            raise NotImplementedError(
+                "Loaded TTS model does not expose native streaming"
+            )
 
         import inspect
         import time
 
         logger.info(
-            "TTS native stream start: model=%s, text_len=%d, voice=%s, interval=%.2fs",
-            self._model_name, len(text), voice, streaming_interval,
+            "TTS native stream start: model=%s, text_len=%d, voice=%s, language=%s, interval=%.2fs",
+            self._model_name,
+            len(text),
+            voice,
+            language or "auto",
+            streaming_interval,
         )
 
         model = self._model
@@ -309,6 +327,8 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if language and "lang_code" in gen_params:
+                gen_kwargs["lang_code"] = language
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -344,7 +364,11 @@ class TTSEngine(BaseNonStreamingEngine):
             if audio is None:
                 return None
             sample_rate = int(
-                getattr(result, "sample_rate", getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE))
+                getattr(
+                    result,
+                    "sample_rate",
+                    getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE),
+                )
             )
             return sample_rate, 1, 2, self._audio_array_to_pcm_bytes(audio)
 
@@ -376,7 +400,10 @@ class TTSEngine(BaseNonStreamingEngine):
             await self._finish_activity(activity_id)
             logger.info(
                 "TTS native stream done: model=%s, %.2fs, chunks=%d, pcm_bytes=%d",
-                self._model_name, time.monotonic() - t0, chunk_count, total_bytes,
+                self._model_name,
+                time.monotonic() - t0,
+                chunk_count,
+                total_bytes,
             )
 
     def get_stats(self) -> Dict[str, Any]:

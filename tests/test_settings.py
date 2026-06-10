@@ -1601,8 +1601,8 @@ class TestHelperFunctions:
         memory = get_system_memory()
         assert isinstance(memory, int)
 
-    def test_get_system_memory_falls_back_when_psutil_fails(self):
-        """psutil may fail if macOS changes HOST_VM_INFO64 sizing."""
+    def test_get_system_memory_uses_sysconf_before_psutil(self):
+        """macOS should not depend on psutil's HOST_VM_INFO64 adapter."""
 
         class BrokenPsutil:
             @staticmethod
@@ -1620,6 +1620,20 @@ class TestHelperFunctions:
             "omlx.settings.os.sysconf", side_effect=fake_sysconf
         ):
             assert get_system_memory() == 123 * 4096
+
+    def test_get_system_memory_falls_back_to_psutil_when_sysconf_fails(self):
+        class FakeVirtualMemory:
+            total = 32 * 1024**3
+
+        class FakePsutil:
+            @staticmethod
+            def virtual_memory():
+                return FakeVirtualMemory()
+
+        with patch.dict("sys.modules", {"psutil": FakePsutil}), patch(
+            "omlx.settings.os.sysconf", side_effect=ValueError("unsupported")
+        ):
+            assert get_system_memory() == 32 * 1024**3
 
     def test_get_ssd_capacity(self):
         """Test SSD capacity detection."""

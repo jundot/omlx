@@ -311,6 +311,7 @@ class BatchedEngine(BaseEngine):
                 self._engine.engine.scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
+                self._engine.engine.scheduler._set_model_info_for_monitor()
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

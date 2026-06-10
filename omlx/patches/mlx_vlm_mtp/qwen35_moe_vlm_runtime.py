@@ -6,8 +6,8 @@ It adds:
 
 * a Multi-Token Prediction head (``MTPModule``) to
   ``mlx_vlm.models.qwen3_5_moe.language.LanguageModel`` when the model
-  config declares ``mtp_num_hidden_layers > 0`` and the process-wide MTP
-  active flag is on;
+  config declares ``mtp_num_hidden_layers > 0`` and the checkpoint has MTP
+  weights to bind;
 * a ``return_hidden=True`` mode on ``LanguageModel.__call__`` that returns
   ``(logits, pre_norm_hidden, gdn_states)`` — everything the MTP
   draft/verify cycle needs without touching the forward path of any
@@ -203,20 +203,26 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
+        from ..mlx_lm_mtp import is_mtp_active
 
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads, so mlx-vlm's
         # load_weights (which skips Model.sanitize for is_mlx_format
         # checkpoints) can place the persisted mtp.* tensors. MTP speculative
         # decode invocation is gated downstream by
-        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via ``is_mtp_active``.
+        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via the per-instance
+        # ``_omlx_mtp_decode_enabled`` marker.
         #
         # Gated by ``is_mtp_attach_enabled()`` so checkpoints that declare
         # mtp_num_hidden_layers > 0 but ship no mtp.* weights (unsloth
         # Qwen3.6 UD MLX builds, issue #1426) don't trip strict load_weights
         # with "Missing N parameters" and silently fall back to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0 and is_mtp_attach_enabled():
+        attach_enabled = bool(is_mtp_attach_enabled())
+        self._omlx_mtp_decode_enabled = bool(
+            n_mtp > 0 and attach_enabled and is_mtp_active()
+        )
+        if n_mtp > 0 and attach_enabled:
             self.mtp = q35moe_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):

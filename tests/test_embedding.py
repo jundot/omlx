@@ -1345,6 +1345,54 @@ class TestNativeEmbeddingLoading:
         mock_validate_weights.assert_called_once()
         assert mock_load_weights.call_args.kwargs["strict"] is False
 
+    def test_load_native_supports_bfloat16_safetensors(self, tmp_path):
+        """Native embedding load must not route bf16 safetensors through NumPy."""
+        import mlx.core as mx
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "vocab_size": 16,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "max_position_embeddings": 8,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {
+                "embeddings.word_embeddings.weight": mx.ones(
+                    (16, 4), dtype=mx.bfloat16
+                )
+            },
+        )
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ), patch(
+            "omlx.models.embedding.MLXEmbeddingModel._validate_native_weights",
+            return_value=None,
+        ) as mock_validate_weights, patch(
+            "omlx.models.xlm_roberta.Model.load_weights",
+            return_value=None,
+        ) as mock_load_weights:
+            result = model._load_native()
+
+        assert result is True
+        mock_validate_weights.assert_called_once()
+        loaded_weights = dict(mock_load_weights.call_args.args[0])
+        assert loaded_weights["embeddings.word_embeddings.weight"].dtype == mx.bfloat16
+
     def test_load_native_rejects_missing_required_weights(self, tmp_path):
         """Native loading must fail when core transformer weights are missing."""
         from safetensors.numpy import save_file

@@ -24,7 +24,7 @@ class _ModelConfig:
         num_hidden_layers: int | None = 32,
         num_key_value_heads: int = 8,
         num_attention_heads: int = 32,
-        head_dim: int = 192,  # > 128 → SDPA fallback path (the panic-prone one)
+        head_dim: int = 192,  # > 128 → high-head-dim tiled SDPA scratch
     ) -> None:
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
@@ -93,8 +93,9 @@ def test_preflight_positive_control_passes_normal_request():
     scheduler._prefill_memory_guard = True
     # Huge limit — even a multi-GB peak fits comfortably.
     scheduler._memory_hard_limit_bytes = 10**18
-    with patch("omlx.scheduler.mx.get_active_memory", return_value=0), patch(
-        "omlx.scheduler.get_phys_footprint", return_value=0
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
     ):
         assert scheduler._preflight_memory_check(_make_request(32768)) is None
 
@@ -104,8 +105,9 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     scheduler._prefill_memory_guard = True
     scheduler._memory_hard_limit_bytes = 1  # any allocation exceeds
 
-    with patch("omlx.scheduler.mx.get_active_memory", return_value=0), patch(
-        "omlx.scheduler.get_phys_footprint", return_value=0
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
     ):
         rejection = scheduler._preflight_memory_check(_make_request(65536))
 
@@ -136,9 +138,9 @@ def test_preflight_returns_none_when_request_fully_cached():
 def test_preflight_rejects_heavily_cached_long_context():
     """Regression for M3: a request whose suffix is small but whose
     *full* prompt is long must still trip the guard, because the SDPA
-    scores tensor spans the full prompt (cached + new), not just the
-    new tokens. Previously the estimator passed only new_tokens to the
-    scores formula and the heavily-cached path slipped through.
+    tiled scratch spans the full prompt (cached + new), not just the new
+    tokens. Previously the estimator passed only new_tokens to the
+    scratch formula and the heavily-cached path slipped through.
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -146,8 +148,9 @@ def test_preflight_rejects_heavily_cached_long_context():
     scheduler._memory_hard_limit_bytes = 100 * 1024**2  # 100 MB
     req = _make_request(100_000)
     req.cached_tokens = 99_000  # only 1k new tokens but kv_len = 100k
-    with patch("omlx.scheduler.mx.get_active_memory", return_value=0), patch(
-        "omlx.scheduler.get_phys_footprint", return_value=0
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
     ):
         error = scheduler._preflight_memory_check(req)
     assert error is not None, (
@@ -159,7 +162,7 @@ def test_preflight_rejects_heavily_cached_long_context():
 def test_preflight_rejects_uncached_long_context():
     """Symmetric to test_preflight_rejects_heavily_cached_long_context:
     a request with mostly NEW tokens (no cache) at a 100k prompt must
-    also trip the guard. This locks in the SDPA-fallback K-dim formula
+    also trip the guard. This locks in the high-head-dim SDPA span formula
     in both directions; if a future refactor regressed the cached path
     OR the uncached path, only one of these two tests would fail.
     """
@@ -168,13 +171,12 @@ def test_preflight_rejects_uncached_long_context():
     scheduler._memory_hard_limit_bytes = 100 * 1024**2  # 100 MB
     req = _make_request(100_000)
     req.cached_tokens = 1_000  # almost everything is new
-    with patch("omlx.scheduler.mx.get_active_memory", return_value=0), patch(
-        "omlx.scheduler.get_phys_footprint", return_value=0
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
     ):
         error = scheduler._preflight_memory_check(req)
-    assert error is not None, (
-        "guard must trip on uncached long-context too"
-    )
+    assert error is not None, "guard must trip on uncached long-context too"
 
 
 class _VLMConfig:
@@ -189,7 +191,7 @@ class _VLMConfig:
             num_hidden_layers=40,
             num_key_value_heads=2,
             num_attention_heads=16,
-            head_dim=256,  # > 128 → SDPA fallback (the panic-prone path)
+            head_dim=256,  # > 128 → high-head-dim tiled SDPA scratch
         )
 
 
@@ -226,10 +228,10 @@ def test_vlm_nested_config_populates_estimator_dims():
 def test_vlm_estimator_produces_nonzero_peak():
     scheduler = _make_vlm_scheduler()
     assert scheduler.memory_monitor is not None
-    # 90k tokens at head_dim=256 / n_q=16 should yield a multi-GiB peak via
-    # the SDPA-fallback branch.
+    # 90k tokens at head_dim=256 / n_q=16 should yield a multi-GiB peak:
+    # KV growth plus a bounded tiled SDPA scratch term.
     peak = scheduler.memory_monitor.estimate_prefill_peak_bytes(90000, 2048)
-    assert peak > 10 * 1024 * 1024 * 1024  # > 10 GiB
+    assert peak > 7 * 1024 * 1024 * 1024  # > 7 GiB
 
 
 def test_rejection_releases_block_aware_cache_when_present():
@@ -328,12 +330,10 @@ def test_preflight_rejection_path_invokes_release_helper():
             limit_bytes=1,
         )
 
-    with patch.object(
-        scheduler, "_release_paged_cache_for_request"
-    ) as release_spy, patch.object(
-        scheduler, "_preflight_memory_check", side_effect=_force_reject
-    ), patch.object(
-        scheduler, "_ensure_batch_generator", return_value=None
+    with (
+        patch.object(scheduler, "_release_paged_cache_for_request") as release_spy,
+        patch.object(scheduler, "_preflight_memory_check", side_effect=_force_reject),
+        patch.object(scheduler, "_ensure_batch_generator", return_value=None),
     ):
         # Pretend a batch_generator exists so the loop continues past
         # the ``if self.batch_generator is None: break`` guard.
@@ -347,13 +347,14 @@ def test_preflight_rejection_path_invokes_release_helper():
 def test_vlm_preflight_rejects_oversize_request():
     scheduler = _make_vlm_scheduler()
     scheduler._prefill_memory_guard = True
-    scheduler._memory_hard_limit_bytes = 40 * 1024 * 1024 * 1024  # 40 GiB hard limit
+    scheduler._memory_hard_limit_bytes = 36 * 1024 * 1024 * 1024  # 36 GiB hard limit
 
-    with patch("omlx.scheduler.mx.get_active_memory", return_value=28 * 1024 ** 3), patch(
-        "omlx.scheduler.get_phys_footprint", return_value=28 * 1024 ** 3
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=28 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=28 * 1024**3),
     ):
         # 100k tokens at head_dim=256 should push (28 GiB baseline + KV+SDPA
-        # peak) past the 40 GiB limit.
+        # peak) past the 36 GiB limit.
         rejection = scheduler._preflight_memory_check(_make_request(100000))
 
     assert rejection is not None
@@ -398,7 +399,9 @@ def test_vlm_descent_prefers_text_config_over_top_level_vision_field():
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     cfg = SchedulerConfig(
-        max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+        max_num_seqs=8,
+        prefill_step_size=2048,
+        paged_cache_block_size=0,
     )
     sched = Scheduler(model=model, tokenizer=tokenizer, config=cfg)
 
@@ -435,7 +438,9 @@ def test_vlm_descent_handles_language_config_alias():
         model=model,
         tokenizer=tokenizer,
         config=SchedulerConfig(
-            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
         ),
     )
     assert sched.memory_monitor._num_layers == 24
@@ -453,7 +458,9 @@ def test_vlm_descent_handles_llm_config_alias():
         model=model,
         tokenizer=tokenizer,
         config=SchedulerConfig(
-            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
         ),
     )
     assert sched.memory_monitor._num_layers == 24
@@ -482,7 +489,9 @@ def test_legacy_n_layer_fallback_path():
         model=model,
         tokenizer=tokenizer,
         config=SchedulerConfig(
-            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
         ),
     )
     monitor = sched.memory_monitor
@@ -544,7 +553,9 @@ def test_vlm_descent_prefers_text_config_via_legacy_n_layer():
         model=model,
         tokenizer=tokenizer,
         config=SchedulerConfig(
-            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
         ),
     )
     monitor = sched.memory_monitor
@@ -568,7 +579,9 @@ def test_exception_during_descent_is_swallowed():
         model=model,
         tokenizer=tokenizer,
         config=SchedulerConfig(
-            max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
         ),
     )
     # Monitor exists but dims stayed None — estimator returns 0 / guard skips.

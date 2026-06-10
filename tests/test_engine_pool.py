@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -982,6 +983,63 @@ class TestEnginePoolEviction:
         assert pool._entries["model-a"].engine is None
         assert pool._entries["model-b"].engine is not None
 
+    @pytest.fixture
+    def undercounting_memory_pool(self, small_mock_model_dir, monkeypatch):
+        """Pool where live Metal memory under-reports the committed footprint.
+
+        The #1623 condition: after a model settles/idles, both
+        `mx.get_active_memory()` and `get_phys_footprint()` can read well below
+        the model's true resident size, while the tracked accumulator
+        (`_current_model_memory`) still reflects it. Unlike `tight_memory_pool`,
+        this fixture does NOT proxy phys_footprint to the accumulator — it leaves
+        live memory at 0 so admission has to consult the accumulator itself.
+        """
+        pool = _make_pool(ceiling=2500)  # each model fits alone, not both
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_eviction_when_live_memory_undercounts(
+        self, undercounting_memory_pool
+    ):
+        """#1623: a second model must still evict the first when live memory
+        under-reports but the tracked accumulator shows the pair over-commits.
+
+        Without consulting `_current_model_memory`, admission sees
+        `current = max(0, 0) = 0`, projects `0 + model-b` under the ceiling, and
+        loads model-b alongside model-a — over-committing past the ceiling.
+        """
+        pool = undercounting_memory_pool
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+        mock_engine_a.has_active_requests.return_value = False
+
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests.return_value = False
+
+        def create_engine(*args, **kwargs):
+            if "model-a" in str(kwargs.get("model_name", args[0] if args else "")):
+                return mock_engine_a
+            return mock_engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            assert pool.loaded_model_count == 1
+
+            # Load model-b: the pair exceeds the ceiling, so model-a must be
+            # evicted first even though live memory reads 0.
+            await pool.get_engine("model-b")
+
+        mock_engine_a.stop.assert_called_once()
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert pool.loaded_model_count == 1
+
     @pytest.mark.asyncio
     async def test_insufficient_memory_all_pinned(self, tight_memory_pool):
         """Test InsufficientMemoryError when all models are pinned."""
@@ -1771,6 +1829,115 @@ class TestMemorySettleBarrier:
 
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_bails_out_under_concurrent_activity(
+        self, pool_with_loaded_model, caplog
+    ):
+        """1774 regression: with another engine serving, the global freed
+        delta is unmeasurable (it can read negative as the other engine
+        allocates). The barrier must bail after one sample instead of burning
+        10 settle rounds + emergency reclaim — ~8s of gc/synchronize/
+        clear_cache serialized against live decode, under the pool lock.
+        """
+        pool = pool_with_loaded_model
+
+        # Second entry actively serving.
+        other_engine = MagicMock()
+        other_engine.has_active_requests = MagicMock(return_value=True)
+        pool._entries["model-b"].engine = other_engine
+
+        # Global gauge RISES during settle (concurrent prefill/KV growth),
+        # so freed = pre_unload - active_now is negative every round.
+        call_idx = [0]
+
+        def rising_gauge():
+            val = (10 + call_idx[0]) * 1024**3
+            call_idx[0] += 1
+            return val
+
+        sleep_calls: list[float] = []
+
+        async def record_sleep(duration, *args, **kwargs):
+            sleep_calls.append(duration)
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=record_sleep),
+            caplog.at_level(logging.DEBUG, logger="omlx.engine_pool"),
+        ):
+            mock_mx.get_active_memory = rising_gauge
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert "indeterminate under concurrent activity" in caplog.text
+        # No settle-round burn, no timeout warning, no emergency reclaim.
+        assert sleep_calls.count(0.5) == 0
+        assert "Settle barrier timed out" not in caplog.text
+        assert "Emergency reclaim" not in caplog.text
+        # Only the initial pre-barrier release cycle touched the executor.
+        assert mock_mx.synchronize.call_count == 1
+        assert mock_mx.clear_cache.call_count == 1
+        # The unload itself still completes and is accounted.
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == 0
+
+    @pytest.mark.asyncio
+    async def test_settle_still_waits_when_pool_otherwise_idle(
+        self, pool_with_loaded_model, caplog
+    ):
+        """Idle-pool behavior is unchanged (#768 protection): with no other
+        entry serving, an unsatisfied barrier still burns its settle rounds
+        and escalates to emergency reclaim.
+        """
+        pool = pool_with_loaded_model
+
+        call_idx = [0]
+
+        def rising_gauge():
+            val = (10 + call_idx[0]) * 1024**3
+            call_idx[0] += 1
+            return val
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            caplog.at_level(logging.DEBUG, logger="omlx.engine_pool"),
+        ):
+            mock_mx.get_active_memory = rising_gauge
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert "indeterminate under concurrent activity" not in caplog.text
+        assert "Settle barrier timed out" in caplog.text
+        # Full barrier behavior preserved: 1 initial release cycle + 10 settle
+        # rounds + 3 emergency-reclaim rounds on the executor.
+        assert mock_mx.synchronize.call_count == 14
+        assert mock_mx.clear_cache.call_count == 14
+
+    def test_other_entries_serving_in_use_lease_counts(
+        self, pool_with_loaded_model
+    ):
+        """The in-use lease (acquired but not yet active) also marks the pool
+        as serving — eviction paths already treat it as activity (#1667).
+        """
+        pool = pool_with_loaded_model
+        entry_b = pool._entries["model-b"]
+
+        assert pool._other_entries_serving("model-a") is False
+
+        entry_b.engine = MagicMock()
+        entry_b.engine.has_active_requests = MagicMock(return_value=False)
+        assert pool._other_entries_serving("model-a") is False
+
+        entry_b.in_use = 1
+        assert pool._other_entries_serving("model-a") is True
 
 
 class TestEnginePoolInUseLease:

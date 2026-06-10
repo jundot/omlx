@@ -453,3 +453,92 @@ class TestNonAsciiApiKeys:
             assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
+
+
+class TestRejectedKeyFingerprint:
+    """Regression tests for #1440 (item 4): a rejected API key must never be
+    logged verbatim. The auth path logs a short, non-reversible SHA-256
+    fingerprint instead, so operators can correlate repeated bad keys without
+    the secret landing in server.log.
+    """
+
+    def test_fingerprint_key_short_hex(self):
+        """fingerprint_key returns 8 lowercase hex characters."""
+        from omlx.admin.auth import fingerprint_key
+
+        fp = fingerprint_key("super-secret-key")
+        assert len(fp) == 8
+        assert all(c in "0123456789abcdef" for c in fp)
+
+    def test_fingerprint_key_deterministic(self):
+        """The same key always fingerprints to the same value."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("abc123") == fingerprint_key("abc123")
+
+    def test_fingerprint_key_does_not_contain_secret(self):
+        """The fingerprint never leaks the raw key material."""
+        from omlx.admin.auth import fingerprint_key
+
+        secret = "sk-live-0123456789abcdef"
+        fp = fingerprint_key(secret)
+        assert secret not in fp
+        assert fp not in secret
+
+    def test_fingerprint_key_distinguishes_keys(self):
+        """Different keys produce different fingerprints."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("key-a") != fingerprint_key("key-b")
+
+    def test_fingerprint_key_non_ascii_and_surrogate(self):
+        """fingerprint_key tolerates any str the auth path accepts (no raise).
+
+        Mirrors compare_keys: non-ASCII and lone surrogates (which json.loads
+        can produce) must fingerprint without a UnicodeEncodeError.
+        """
+        import json
+
+        from omlx.admin.auth import fingerprint_key
+
+        assert len(fingerprint_key("clé-secrète-héhé")) == 8
+        assert len(fingerprint_key("")) == 8
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert len(fingerprint_key(surrogate_key)) == 8
+
+    def test_rejected_key_logged_as_fingerprint_not_verbatim(self, caplog):
+        """The auth dependency logs the fingerprint, not the raw rejected key."""
+        import asyncio
+        import logging
+
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from omlx.admin.auth import fingerprint_key
+        from omlx.server import verify_api_key, _server_state
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+        bad_key = "sk-leaky-supersecret-0xCAFE"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials=bad_key
+            )
+            with caplog.at_level(logging.WARNING, logger="omlx.server"):
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        verify_api_key(request=_mock_request(), credentials=credentials)
+                    )
+            assert exc_info.value.status_code == 401
+
+            rejection_logs = "\n".join(
+                r.getMessage()
+                for r in caplog.records
+                if "Rejected API key" in r.getMessage()
+            )
+            assert rejection_logs, "expected a rejection log line"
+            assert bad_key not in rejection_logs
+            assert fingerprint_key(bad_key) in rejection_logs
+        finally:
+            _server_state.api_key = original_key

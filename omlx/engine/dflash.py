@@ -24,10 +24,16 @@ import mlx.core as mx
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..memory_monitor import (
+    MemoryMonitor,
+    raise_if_prefill_exceeds,
+    set_model_info_from_model,
+)
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
+from ..utils.proc_memory import get_phys_footprint
 from ..utils.tokenizer import create_streaming_detokenizer
-from .base import BaseEngine, GenerationOutput
+from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,53 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
             f"(model_type='{cfg.get('model_type', '')}')"
         )
     return True, ""
+
+
+class _DFlashPrefillGuard:
+    """Prefill-memory guard target for DFlash's primary (speculative) path,
+    which bypasses the Scheduler entirely.
+
+    Holds a ``MemoryMonitor`` (built from the target model's dims) plus the two
+    watermark attrs the ``ProcessMemoryEnforcer`` writes on schedulers each tick
+    (``_prefill_memory_guard``, ``_memory_hard_limit_bytes``). The enforcer
+    resolves this object via ``_resolve_scheduler`` so DFlash receives the same
+    ceiling as scheduler-driven engines, and ``preflight_or_raise`` delegates to
+    the shared ``raise_if_prefill_exceeds`` so the estimate + HTTP-400 mapping
+    match ``Scheduler.preflight_or_raise`` exactly.
+    """
+
+    def __init__(self, memory_monitor: MemoryMonitor, prefill_step_size: int):
+        self.memory_monitor = memory_monitor
+        self._prefill_step_size = prefill_step_size
+        self._last_mlx_active_memory_bytes: int = 0
+        # Written by ProcessMemoryEnforcer._propagate_memory_limit each tick.
+        self._prefill_memory_guard: bool = False
+        self._memory_hard_limit_bytes: int = 0
+
+    def record_mlx_active_memory(self, active_bytes: int) -> None:
+        self._last_mlx_active_memory_bytes = max(0, int(active_bytes))
+
+    def _current_usage_bytes(self) -> int:
+        return max(self._last_mlx_active_memory_bytes, get_phys_footprint())
+
+    def preflight_or_raise(
+        self,
+        *,
+        num_prompt_tokens: int,
+        request_id: str | None = None,
+    ) -> None:
+        # Deliberately no cached_tokens parameter: a DFlash prefix-cache hit
+        # reconstructs the matched KV into active memory, so the full prompt
+        # must always be charged (see DFlashEngine.preflight_chat).
+        raise_if_prefill_exceeds(
+            self.memory_monitor,
+            prefill_memory_guard=self._prefill_memory_guard,
+            hard_limit_bytes=self._memory_hard_limit_bytes,
+            current_usage_bytes=self._current_usage_bytes(),
+            prefill_step_size=self._prefill_step_size,
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
 
 
 class DFlashEngine(BaseEngine):
@@ -117,6 +170,10 @@ class DFlashEngine(BaseEngine):
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
         self._fallback_lock = asyncio.Lock()
+        # Primary-mode prefill memory guard. DFlash bypasses the scheduler, so
+        # it can't receive the enforcer's watermarks through one; this holder
+        # stands in (built in start(), resolved by the enforcer).
+        self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
         self._dflash_prefix_cache: Any | None = None
         self._suppress_token_ids: set[int] = set()
@@ -332,6 +389,27 @@ class DFlashEngine(BaseEngine):
 
         self._runtime_context = self._build_runtime_context()
 
+        # Build the primary-mode prefill memory guard from the target model's
+        # dims (same estimation Scheduler uses). Best-effort: on failure the
+        # guard stays None and preflight degrades to a no-op — the request runs
+        # unguarded rather than being falsely rejected.
+        self._prefill_guard = None
+        if self._target_model is not None:
+            try:
+                monitor = MemoryMonitor(
+                    max_kv_cache_memory=None, eviction_enabled=False
+                )
+                set_model_info_from_model(monitor, self._target_model)
+                step = (
+                    getattr(self._scheduler_config, "prefill_step_size", 2048) or 2048
+                )
+                self._prefill_guard = _DFlashPrefillGuard(monitor, step)
+            except Exception as exc:
+                # Warn (not debug): a missing guard silently disables the
+                # prefill OOM protection this engine relies on.
+                logger.warning(f"DFlash prefill guard init failed: {exc}")
+                self._prefill_guard = None
+
         self._loaded = True
         self._in_fallback_mode = False
         max_ctx_display = "unlimited" if self._max_dflash_ctx is None else self._max_dflash_ctx
@@ -349,6 +427,15 @@ class DFlashEngine(BaseEngine):
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
             f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
         )
+
+    def _record_prefill_guard_active_memory(self) -> None:
+        guard = self._prefill_guard
+        if guard is None:
+            return
+        try:
+            guard.record_mlx_active_memory(mx.get_active_memory())
+        except Exception as exc:
+            logger.debug(f"DFlash active-memory sample failed: {exc}")
 
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
@@ -369,6 +456,14 @@ class DFlashEngine(BaseEngine):
         self._draft_backend = None
         self._executor_tokenizer = None
         self._output_parser_factory = None
+        # Deliberately keep self._prefill_guard alive across the transition.
+        # Its MemoryMonitor holds only dims (no model ref), so it stays valid
+        # and cheap. Nulling it here would open a window — guard gone, fallback
+        # scheduler not yet started — where _resolve_scheduler returns None
+        # (spurious "scheduler unreachable" warning + an unguarded admission
+        # gap). The enforcer prefers the fallback scheduler once it is up, and
+        # fallback-mode preflight delegates to the fallback engine, so the
+        # stale guard is simply never consulted. Cleared in stop().
         # The fallback engine (BatchedEngine / VLMBatchedEngine) starts next.
         # Revert dflash's class patches now so the fallback's model loads
         # onto clean linear_attn / self_attn classes (issue #1388).
@@ -444,6 +539,7 @@ class DFlashEngine(BaseEngine):
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._output_parser_factory = None
+        self._prefill_guard = None
         self._in_fallback_mode = False
         self._loaded = False
         # Revert class-level __call__ patches dflash installed during start().
@@ -536,6 +632,96 @@ class DFlashEngine(BaseEngine):
             is_partial=is_partial,
         )
         return len(self._tokenizer_obj.encode(prompt))
+
+    async def preflight_chat(
+        self,
+        messages: list,
+        tools: list | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Prefill-memory preflight for chat requests.
+
+        DFlash bypasses the scheduler, so it implements the front-door guard
+        itself (BaseEngine's no-op would leave primary-mode prefills
+        unprotected). In fallback mode it delegates to the fallback engine,
+        whose scheduler runs the full guard. Raises ``PrefillMemoryExceededError``
+        (→ HTTP 400) when the prompt's prefill peak would exceed the ceiling.
+        Mirrors ``BatchedEngine.preflight_chat``.
+        """
+        if not self._loaded:
+            await self.start()
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            await self._fallback_engine.preflight_chat(
+                messages, tools=tools, request_id=request_id, **kwargs
+            )
+            return
+        if self._prefill_guard is None:
+            _warn_scheduler_unreachable_once(
+                self, "preflight_chat", "primary-mode prefill guard unavailable"
+            )
+            return
+        try:
+            num_tokens = self.count_chat_tokens(
+                messages,
+                tools,
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+                is_partial=kwargs.get("is_partial"),
+            )
+        except Exception as e:
+            logger.warning(
+                "DFlashEngine.preflight_chat: token count raised %s; skipping "
+                "prefill memory check, real chat path will surface the error",
+                type(e).__name__,
+            )
+            return
+        # Deliberately no cached_tokens: a DFlash prefix-cache hit
+        # *reconstructs* the matched KV into active memory (dflash_mlx
+        # ``hydrate_target_cache`` clones every array), so the full prompt's
+        # KV is allocated this request — unlike the scheduler's resident
+        # paged cache. Subtracting hit tokens here would under-count and
+        # defeat the OOM guard.
+        self._prefill_guard.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
+        )
+
+    async def preflight_completion(
+        self,
+        prompt: str,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Prefill-memory preflight for plain completions. See ``preflight_chat``."""
+        if not self._loaded:
+            await self.start()
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            await self._fallback_engine.preflight_completion(
+                prompt, request_id=request_id, **kwargs
+            )
+            return
+        if self._prefill_guard is None:
+            _warn_scheduler_unreachable_once(
+                self,
+                "preflight_completion",
+                "primary-mode prefill guard unavailable",
+            )
+            return
+        try:
+            num_tokens = len(self._tokenizer_obj.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "DFlashEngine.preflight_completion: tokenizer.encode raised %s; "
+                "skipping prefill memory check, real completion path will "
+                "surface the error",
+                type(e).__name__,
+            )
+            return
+        # Deliberately no cached_tokens — see preflight_chat: a prefix-cache
+        # hit reconstructs KV into active memory, so the full prompt is
+        # charged.
+        self._prefill_guard.preflight_or_raise(
+            num_prompt_tokens=num_tokens, request_id=request_id
+        )
 
     @property
     def supports_multimodal_fallback(self) -> bool:
@@ -670,6 +856,18 @@ class DFlashEngine(BaseEngine):
         )
         return event_iter, prefix_flow, stop_ids
 
+    @staticmethod
+    def _cached_tokens_from_flow(prefix_flow) -> int:
+        """Prompt tokens served from the DFlash prefix snapshot (prefill skipped).
+
+        On a hit ``PrefixCacheFlow.hit_tokens`` is the number of matched prompt
+        tokens; surfacing it as ``cached_tokens`` makes DFlash report prefix-cache
+        hits like the batched engine does instead of always reporting 0 (#1441).
+        """
+        if prefix_flow is None:
+            return 0
+        return max(0, int(getattr(prefix_flow, "hit_tokens", 0) or 0))
+
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
@@ -690,10 +888,12 @@ class DFlashEngine(BaseEngine):
 
         event_iter = None
         try:
+            self._record_prefill_guard_active_memory()
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
                 max_tokens=max_tokens,
             )
+            self._record_prefill_guard_active_memory()
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
@@ -772,6 +972,9 @@ class DFlashEngine(BaseEngine):
                         "completion_tokens": gen_tokens,
                         "acceptance_ratio": accept_ratio,
                         "cycles_completed": cycles,
+                        # Prefix-snapshot hit count, surfaced on the final
+                        # (usage) chunk so the API reports cached_tokens (#1441).
+                        "cached_tokens": self._cached_tokens_from_flow(prefix_flow),
                     }
                     asyncio.run_coroutine_threadsafe(
                         queue.put(("", [], True, metrics)), loop
@@ -789,6 +992,7 @@ class DFlashEngine(BaseEngine):
         finally:
             # Closing the dflash generator throws GeneratorExit on its next
             # yield, releasing kernel state and any draft cache it holds.
+            self._record_prefill_guard_active_memory()
             if event_iter is not None:
                 close = getattr(event_iter, "close", None)
                 if close is not None:
@@ -866,10 +1070,12 @@ class DFlashEngine(BaseEngine):
                 else None
             )
             try:
+                self._record_prefill_guard_active_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
                 )
+                self._record_prefill_guard_active_memory()
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
@@ -892,8 +1098,9 @@ class DFlashEngine(BaseEngine):
                     final = parser_session.finalize()
                     if final.visible_text:
                         parsed_visible_parts.append(final.visible_text)
-                return summary, tokens, parser_session, parsed_visible_parts
+                return summary, tokens, parser_session, parsed_visible_parts, prefix_flow
             finally:
+                self._record_prefill_guard_active_memory()
                 if event_iter is not None:
                     close = getattr(event_iter, "close", None)
                     if close is not None:
@@ -906,7 +1113,7 @@ class DFlashEngine(BaseEngine):
         self._active_request = True
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
-            summary, generated, parser_session, parsed_visible_parts = (
+            summary, generated, parser_session, parsed_visible_parts, prefix_flow = (
                 await asyncio.shield(asyncio.wrap_future(future))
             )
         except asyncio.CancelledError:
@@ -953,6 +1160,7 @@ class DFlashEngine(BaseEngine):
             tokens=generated,
             prompt_tokens=prompt_token_count,
             completion_tokens=completion_token_count,
+            cached_tokens=self._cached_tokens_from_flow(prefix_flow),
             finish_reason="stop",
         )
 
@@ -1063,6 +1271,9 @@ class DFlashEngine(BaseEngine):
                     tokens=new_tokens,
                     prompt_tokens=prompt_len,
                     completion_tokens=total_completion,
+                    # Carried only on the final (usage) chunk's metrics; 0 on
+                    # token deltas so the server's per-chunk sum isn't inflated.
+                    cached_tokens=(metrics or {}).get("cached_tokens", 0),
                     finished=finished,
                     finish_reason=finish_reason,
                 )

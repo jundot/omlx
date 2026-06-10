@@ -2083,6 +2083,36 @@ class TestPreloadMatchedBlocks:
 
         manager2.close()
 
+    def test_clean_promoted_block_eviction_skips_ssd_write(self, tmp_path, mx):
+        """Blocks loaded from SSD are clean and should not be re-written."""
+        entry_size = 2 * 2 * 1 * 4 * 64 * 64 * 4
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(
+            manager,
+            mx,
+            count=2,
+            hot_cache_max_bytes=entry_size + 1024,
+        )
+
+        try:
+            assert manager2.load_block(hashes[0]) is not None
+            first_entry = manager2._hot_cache_get(hashes[0])
+            assert first_entry is not None
+            assert first_entry["dirty"] is False
+
+            with patch.object(manager2, "_enqueue_ssd_write") as enqueue_write:
+                assert manager2.load_block(hashes[1]) is not None
+                enqueue_write.assert_not_called()
+
+            assert manager2._hot_cache_get(hashes[0]) is None
+            assert manager2._hot_cache_get(hashes[1]) is not None
+        finally:
+            manager2.close()
+
     def test_preload_partial_failure(self, tmp_path, mx):
         """If one block file is missing, others still load."""
         manager = PagedSSDCacheManager(
@@ -2442,7 +2472,7 @@ class TestComputeMaxPendingWrites:
                 block_size_tokens=2048,
                 kv_bytes_per_token=200_000,
             )
-        assert cap == 24
+        assert cap == 32
 
     def test_hard_budget_bounds_soft_floor(self):
         """The soft floor must not force the pending pool above 30%
@@ -2783,11 +2813,11 @@ class TestInlineLRUUnlinks:
             layer_cache_types=["KVCache"] * num_layers,
         )
 
-    def test_save_waits_on_full_queue_before_drop(self, tmp_path, mx):
+    def test_save_waits_on_full_queue_before_inline_fallback(self, tmp_path, mx):
         """A full queue must not short-circuit before tensor extraction.
 
         The bounded wait gives the writer a chance to drain transient bursts;
-        only sustained saturation should drop the block.
+        sustained saturation writes the block inline.
         """
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "full_queue_wait",
@@ -2805,10 +2835,16 @@ class TestInlineLRUUnlinks:
             mgr._write_queue.full = lambda: True  # type: ignore[method-assign]
             mgr._write_queue.put = fake_put  # type: ignore[method-assign]
 
-            assert self._save_block(mgr, mx, b"full_queue_wait") is False
+            block_hash = b"full_queue_wait"
+            assert self._save_block(mgr, mx, block_hash) is True
 
             assert calls == [1.0]
-            assert mgr.get_stats().ssd_write_drops == 1
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 0
+            assert stats.ssd_inline_write_fallbacks == 1
+            assert stats.saves == 1
+            assert stats.saves_persisted == 1
+            assert mgr.load_block(block_hash) is not None
         finally:
             mgr._write_queue.put = original_put  # type: ignore[method-assign]
             mgr._write_queue.full = original_full  # type: ignore[method-assign]
