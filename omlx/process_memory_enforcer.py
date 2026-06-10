@@ -357,6 +357,14 @@ class ProcessMemoryEnforcer:
         # the next chunk. Updated on every poll iteration.
         self._usage_window: deque[int] = deque(maxlen=5)
         self._recent_peak_bytes: int = 0
+        # Video job memory lease (docs/video-generation-engine-spec.md 4.4).
+        # While held, the lease is subtracted from the final ceiling so pool
+        # admission, watermarks and the prefill gate all tighten coherently.
+        # The worker pid lets the dynamic ceiling count the subprocess
+        # exactly once (its real usage drains system free pages, which
+        # would otherwise stack on top of the explicit lease).
+        self._video_lease_bytes: int = 0
+        self._video_worker_pid: int | None = None
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -480,17 +488,31 @@ class ProcessMemoryEnforcer:
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
 
+        # Video worker correction: the worker's real usage drains system
+        # free pages, shrinking this ceiling -- but the lease is ALREADY
+        # subtracted in _get_hard_limit_bytes. Add the worker's footprint
+        # back (clamped to the lease) so it is counted exactly once. A
+        # footprint read of 0 (failure) degrades to double-counting, which
+        # is fail-conservative.
+        worker_extra = 0
+        if self._video_worker_pid is not None and self._video_lease_bytes > 0:
+            worker = get_phys_footprint(self._video_worker_pid)
+            if worker > 0:
+                worker_extra = min(worker, self._video_lease_bytes)
+
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
         if stats is None:
-            return max(0, omlx_usage + psutil.virtual_memory().available)
+            return max(
+                0, omlx_usage + worker_extra + psutil.virtual_memory().available
+            )
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
         reclaimable = (
             stats["free"]
             + stats["inactive"]
             + int(stats["active"] * ratio)
         )
-        return max(0, omlx_usage + reclaimable)
+        return max(0, omlx_usage + worker_extra + reclaimable)
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
@@ -514,7 +536,14 @@ class ProcessMemoryEnforcer:
         metal_cap = get_effective_metal_cap_bytes()
         if metal_cap > 0:
             candidates.append(metal_cap)
-        return min(candidates)
+        ceiling = min(candidates)
+        if self._video_lease_bytes > 0:
+            # Clamp to >= 1, never 0: every consumer treats ceiling 0 as
+            # "guard disabled", which would drop all protection exactly
+            # while a video job holds memory. A 1-byte ceiling instead
+            # pauses admission and trips the gate -- the safe direction.
+            return max(1, ceiling - self._video_lease_bytes)
+        return ceiling
 
     def get_final_ceiling(self) -> int:
         """Public accessor used by engine_pool pre-load admission."""
@@ -523,6 +552,68 @@ class ProcessMemoryEnforcer:
     def recent_peak_bytes(self) -> int:
         """Recent high-water memory usage over the last few poll ticks."""
         return self._recent_peak_bytes
+
+    @property
+    def video_lease_bytes(self) -> int:
+        """Currently held video memory lease (0 when none)."""
+        return self._video_lease_bytes
+
+    def acquire_video_lease(self, lease_bytes: int) -> None:
+        """Reserve memory for a video worker job.
+
+        Subtracts the lease from the final ceiling (single choke point:
+        pool admission, soft/hard watermarks, admission_paused and the
+        prefill gate cap all derive from it) and lowers this process's
+        Metal wired limit so parent + worker wired sets cannot stack
+        toward the machine cap. One lease at a time -- the VideoJobManager
+        serializes jobs (docs/video-generation-engine-spec.md 4.4).
+
+        Raises:
+            RuntimeError: If a lease is already held.
+            ValueError: If lease_bytes is not positive.
+        """
+        if lease_bytes <= 0:
+            raise ValueError(f"lease_bytes must be positive, got {lease_bytes}")
+        if self._video_lease_bytes > 0:
+            raise RuntimeError(
+                "A video memory lease is already held "
+                f"({_format_gb(self._video_lease_bytes)})"
+            )
+        self._video_lease_bytes = int(lease_bytes)
+        if self._prefill_memory_guard:
+            target = max(1, self._get_static_ceiling() - self._video_lease_bytes)
+            _apply_metal_wired_limit(target)
+            self._metal_wired_limit_request = target
+        if self._running:
+            self._propagate_memory_limit()
+        logger.info(
+            "[videolease] acquired %s (ceiling now %s)",
+            _format_gb(self._video_lease_bytes),
+            _format_gb(self._get_hard_limit_bytes()),
+        )
+
+    def set_video_worker_pid(self, pid: int | None) -> None:
+        """Bind the running video worker pid for dynamic-ceiling correction."""
+        self._video_worker_pid = pid
+
+    def release_video_lease(self) -> None:
+        """Release the video memory lease and restore the Metal wired limit."""
+        if self._video_lease_bytes <= 0:
+            return
+        released = self._video_lease_bytes
+        self._video_lease_bytes = 0
+        self._video_worker_pid = None
+        if self._prefill_memory_guard:
+            static_ceiling = self._get_static_ceiling()
+            _apply_metal_wired_limit(static_ceiling)
+            self._metal_wired_limit_request = static_ceiling
+        if self._running:
+            self._propagate_memory_limit()
+        logger.info(
+            "[videolease] released %s (ceiling now %s)",
+            _format_gb(released),
+            _format_gb(self._get_hard_limit_bytes()),
+        )
 
     def _soft_bytes(self) -> int:
         """Soft watermark: ceiling * soft_threshold."""

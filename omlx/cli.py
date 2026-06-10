@@ -116,6 +116,14 @@ def serve_command(args):
     if settings.huggingface.endpoint:
         os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
 
+    # Disable the Xet transfer backend if configured. huggingface_hub reads
+    # HF_HUB_DISABLE_XET into constants at import time, so it must be set
+    # here -- before any huggingface_hub import -- and cannot be toggled
+    # per-download. Xet (cas-bridge.xethub.hf.co) is unreachable from some
+    # networks (observed: mainland China); the plain LFS path works.
+    if settings.huggingface.disable_xet:
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+
     # Apply ModelScope endpoint if configured. The modelscope SDK builds its URL
     # as https://<MODELSCOPE_DOMAIN>, so this must be a BARE host -- a full URL
     # like "https://modelscope.cn" becomes "https://https://modelscope.cn" and

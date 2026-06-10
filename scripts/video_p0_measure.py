@@ -112,11 +112,24 @@ PROMPT = "A red fox running through a snowy forest at dawn, cinematic, soft ligh
 SEED = 42
 
 PROFILES: dict[str, dict] = {
-    # name: width height frames steps fps (frames must be 4n+1, dims /16)
+    # name: width height frames steps fps (frames must be 4n+1, dims /16).
+    # lowram=True mirrors the production worker defaults (mx cache limit
+    # 1GB + release denoisers + clear cache per step) -- the numbers that
+    # calibrate the shipped lease/predictor. Natural-mode profiles measure
+    # the unconstrained envelope.
     "default": dict(width=480, height=272, frames=49, steps=20, fps=16),
     "steps40": dict(width=480, height=272, frames=49, steps=40, fps=16),
     "mid_spatial": dict(width=832, height=480, frames=49, steps=20, fps=16),
     "frames101": dict(width=480, height=272, frames=101, steps=20, fps=16),
+    "default_lowram": dict(
+        width=480, height=272, frames=49, steps=20, fps=16, lowram=True
+    ),
+    "mid_spatial_lowram": dict(
+        width=832, height=480, frames=49, steps=20, fps=16, lowram=True
+    ),
+    "frames101_lowram": dict(
+        width=480, height=272, frames=101, steps=20, fps=16, lowram=True
+    ),
 }
 
 GB = 1024**3
@@ -130,10 +143,19 @@ GB = 1024**3
 def run_single(model_dir: str, out_dir: str, name: str) -> int:
     p = PROFILES[name]
     t0 = time.time()
+    lowram = bool(p.get("lowram", False))
 
     def emit(**kw):
         kw["t"] = round(time.time() - t0, 1)
         print(json.dumps(kw), flush=True)
+
+    if lowram:
+        import mlx.core as mx
+
+        try:
+            mx.set_cache_limit(1 * GB)
+        except Exception:
+            pass
 
     emit(phase="loading")
     from mflux.models.common.config.model_config import ModelConfig
@@ -151,7 +173,7 @@ def run_single(model_dir: str, out_dir: str, name: str) -> int:
             total_steps=getattr(ev, "total_steps", 0),
         )
 
-    video = model.generate_video(
+    gen_kwargs = dict(
         seed=SEED,
         prompt=PROMPT,
         num_inference_steps=p["steps"],
@@ -161,6 +183,13 @@ def run_single(model_dir: str, out_dir: str, name: str) -> int:
         fps=p["fps"],
         progress_callback=cb,
     )
+    if lowram:
+        gen_kwargs.update(
+            release_inactive_denoiser=True,
+            release_denoisers_before_decode=True,
+            clear_cache_each_step=True,
+        )
+    video = model.generate_video(**gen_kwargs)
     emit(phase="saving")
     out_mp4 = os.path.join(out_dir, f"{name}.mp4")
     video.save(out_mp4)
