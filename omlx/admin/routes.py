@@ -1611,6 +1611,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     status = engine_pool.get_status()
     models_status = status.get("models", [])
 
+    # Video models are never pool-loaded; overlay the job manager's live
+    # state so an actively generating model shows as loaded in the UI.
+    from ..server import overlay_video_activity
+
+    overlay_video_activity(models_status)
+
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 

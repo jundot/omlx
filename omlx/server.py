@@ -1809,6 +1809,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     status = _server_state.engine_pool.get_status()
+    overlay_video_activity(status["models"])
     for m in status["models"]:
         model_id = m["id"]
         m["max_context_window"] = get_max_context_window(model_id)
@@ -1821,6 +1822,29 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
                 max_tokens = ms.max_tokens
         m["max_tokens"] = max_tokens
     return status
+
+
+def overlay_video_activity(models: list) -> None:
+    """Mark the video model whose worker is currently generating as loaded.
+
+    Video models are never pool-loaded (entry.engine stays None), so
+    get_status() reports them unloaded even mid-generation. The status
+    surfaces (and the admin UI fed by them) overlay the job manager's
+    live state instead. Also used by admin /api/models.
+    """
+    manager = _server_state.video_job_manager
+    if manager is None:
+        return
+    try:
+        active = manager.active_model_id()
+    except Exception:  # noqa: BLE001 -- status display must never fail
+        return
+    if not active:
+        return
+    for m in models:
+        if m.get("id") == active and m.get("model_type") == "video":
+            m["loaded"] = True
+            m["video_generating"] = True
 
 
 @app.post("/v1/models/{model_id}/unload")

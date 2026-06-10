@@ -1033,7 +1033,13 @@
                                     </template>
                                     <template x-if="!msg._video.url && !msg._video.error">
                                         <div class="text-sm" style="color: var(--text-tertiary);">
-                                            <div x-text="`${window.t('chat.video.generating')} ${msg._video.progress || 0}%` + (msg._video.phase ? ` (${msg._video.phase})` : '')"></div>
+                                            <div class="flex items-center gap-3">
+                                                <span x-text="`${tVideo('chat.video.generating', 'Generating video...')} ${msg._video.progress || 0}%` + (msg._video.phase ? ` (${msg._video.phase})` : '')"></span>
+                                                <button @click="cancelVideo(msg)"
+                                                        class="px-1.5 py-0.5 text-xs rounded border hover:bg-surface-muted"
+                                                        style="border-color: var(--border-faint); color: var(--text-tertiary);"
+                                                        x-text="tVideo('chat.video.cancel', 'Cancel')"></button>
+                                            </div>
                                             <div class="w-56 h-1.5 rounded-full mt-2" style="background: var(--bg-secondary);">
                                                 <div class="h-1.5 rounded-full transition-all duration-500"
                                                      style="background: var(--text-primary);"
@@ -1304,6 +1310,7 @@
 
             // Streaming State
             isStreaming: false,
+            videoSubmitting: false,
             streamingContent: '',
             abortController: null,
 
@@ -1425,6 +1432,14 @@
 
     isVideoModel() {
         return this.isVideoModelId(this.currentModel);
+    },
+
+    // i18n with literal fallback: if the loaded bundle predates a key
+    // (cached i18n JSON), window.t returns the key itself -- show the
+    // English fallback instead of a raw dotted key.
+    tVideo(key, fallback) {
+        const v = window.t(key);
+        return v === key ? fallback : v;
     },
 
             // ===== MCP Tools =====
@@ -1752,7 +1767,18 @@
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (chat) {
             this.currentChatId = chatId;
-            this.messages = chat.messages || [];
+            // In-flight video bubbles cannot survive a reload (the polling
+            // closure and blob URL are gone); mark them interrupted so the
+            // progress UI does not spin forever.
+            this.messages = (chat.messages || []).map(m => {
+                if (m && m._video && !m._video.url && !m._video.error) {
+                    m._video.error = 'interrupted';
+                    if (!m.content) {
+                        m.content = `\`${m._video.job_id || 'video job'}\` interrupted (page reloaded; the file is still on the server)`;
+                    }
+                }
+                return m;
+            });
             this.systemPrompt = chat.systemPrompt || '';
             if (chat.model) {
                 this.currentModel = chat.model;
@@ -1835,7 +1861,7 @@
         const images = [...this.uploadImages];
 
         if (!userText && images.length === 0) return;
-        if (!this.currentModel || this.isStreaming) return;
+        if (!this.currentModel || this.isStreaming || this.videoSubmitting) return;
 
         // Clear input state
         this.inputMessage = '';
@@ -1879,17 +1905,22 @@
         if (!prompt) {
             this.messages.push({
                 role: 'assistant',
-                content: window.t('chat.video.need_prompt'),
+                content: this.tVideo('chat.video.need_prompt',
+                    'Type a prompt to generate a video with this model.'),
                 model: this.currentModel,
             });
             return;
         }
-        this.isStreaming = true;
+        // Deliberately NOT isStreaming: that flag drives the global
+        // streaming placeholder bubble and disables the input. Video jobs
+        // run server-side and queue, so the user may submit more prompts
+        // while one renders; videoSubmitting only debounces the POST.
+        this.videoSubmitting = true;
         const msg = {
             role: 'assistant',
             content: '',
             model: this.currentModel,
-            _video: { status: 'queued', progress: 0, phase: '', url: null, error: null, job_id: null },
+            _video: { status: 'queued', progress: 0, phase: '', url: null, error: null, job_id: null, cancelled: false },
         };
         this.messages.push(msg);
         this.forceScrollToBottom();
@@ -1917,12 +1948,15 @@
             }
             const job = await resp.json();
             msg._video.job_id = job.id;
-            // Poll until terminal
+            this.videoSubmitting = false;
+            // Poll until terminal (or cancelled via the bubble button)
             for (;;) {
                 await new Promise(r => setTimeout(r, 4000));
+                if (msg._video.cancelled) return;
                 const s = await fetch(`/v1/videos/${job.id}`, { headers: auth });
                 if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
                 const j = await s.json();
+                if (msg._video.cancelled) return;
                 msg._video.status = j.status;
                 msg._video.progress = j.progress || 0;
                 msg._video.phase = j.phase || '';
@@ -1944,10 +1978,26 @@
             msg._video.error = String(e.message || e);
             msg.content = `Error: ${msg._video.error}`;
         } finally {
-            this.isStreaming = false;
+            this.videoSubmitting = false;
             this.saveCurrentChat();
             this.forceScrollToBottom();
         }
+    },
+
+            async cancelVideo(msg) {
+        if (!msg._video || msg._video.url || msg._video.error) return;
+        msg._video.cancelled = true;
+        msg._video.error = 'cancelled';
+        msg.content = this.tVideo('chat.video.cancelled', 'Video generation cancelled.');
+        if (msg._video.job_id) {
+            try {
+                await fetch(`/v1/videos/${msg._video.job_id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                });
+            } catch (e) { /* best effort */ }
+        }
+        this.saveCurrentChat();
     },
 
             async streamResponse(depth = 0) {

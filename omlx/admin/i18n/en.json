@@ -788,7 +788,9 @@
   "chat": {
     "video": {
       "generating": "Generating video...",
-      "need_prompt": "Type a prompt to generate a video with this model."
+      "need_prompt": "Type a prompt to generate a video with this model.",
+      "cancel": "Cancel",
+      "cancelled": "Video generation cancelled."
     }
   }
 }
