@@ -14,6 +14,7 @@ No real model dirs, no ~/.fmlx, no worker subprocess is ever spawned.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +33,13 @@ from omlx.video.manager import QueueFullError, VideoJob, VideoJobManager
 # ---------------------------------------------------------------------------
 
 VIDEO_MODEL = "wan-t2v"
+I2V_MODEL = "wan-i2v-a14b"
+TI2V_MODEL = "wan-ti2v-5b"
 LLM_MODEL = "llama-llm"
+
+# Full 8-byte PNG signature + padding; passes the _sniff_image magic check
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode()
 
 
 def _video_settings(**overrides) -> VideoSettings:
@@ -61,16 +68,29 @@ def _make_manager(
 
     if stub_submit:
         submitted: list[VideoJob] = []
+        submitted_refs: list[tuple[bytes, str] | None] = []
 
-        async def _submit(job: VideoJob) -> VideoJob:
+        async def _submit(
+            job: VideoJob,
+            input_reference: tuple[bytes, str] | None = None,
+        ) -> VideoJob:
             # Record without waking the real dispatcher (no admission loop,
-            # no subprocess)
+            # no subprocess); mirror the real submit's reference handling
+            if input_reference is not None:
+                data, suffix = input_reference
+                blob_dir = manager.artifacts_dir / job.id
+                blob_dir.mkdir(parents=True, exist_ok=True)
+                ref_path = blob_dir / f"input_reference{suffix or '.png'}"
+                ref_path.write_bytes(data)
+                job.params["image_path"] = str(ref_path)
             manager._jobs[job.id] = job
             submitted.append(job)
+            submitted_refs.append(input_reference)
             return job
 
         manager.submit = _submit  # type: ignore[method-assign]
         manager.test_submitted = submitted  # type: ignore[attr-defined]
+        manager.test_submitted_refs = submitted_refs  # type: ignore[attr-defined]
     return manager
 
 
@@ -117,7 +137,19 @@ def video_env(monkeypatch, tmp_path):
 
         entries = {
             VIDEO_MODEL: SimpleNamespace(
-                model_path=tmp_path / "models" / "wan", model_type="video"
+                model_path=tmp_path / "models" / "wan",
+                model_type="video",
+                video_pipeline="t2v",
+            ),
+            I2V_MODEL: SimpleNamespace(
+                model_path=tmp_path / "models" / "wan-i2v",
+                model_type="video",
+                video_pipeline="i2v",
+            ),
+            TI2V_MODEL: SimpleNamespace(
+                model_path=tmp_path / "models" / "wan-ti2v",
+                model_type="video",
+                video_pipeline="ti2v",
             ),
             LLM_MODEL: SimpleNamespace(
                 model_path=tmp_path / "models" / "llama", model_type="llm"
@@ -178,19 +210,19 @@ class TestCreateVideo:
         assert len(manager.test_submitted) == 1
 
     def test_post_multipart_all_string_fields(self, video_env):
-        """openai SDK shape: multipart/form-data, every field a string."""
+        """openai SDK shape: multipart/form-data, every field a string,
+        no file part."""
         client, manager = video_env()
         r = client.post(
             "/v1/videos",
-            data={
-                "model": VIDEO_MODEL,
-                "prompt": "a cat",
-                "seconds": "4",
-                "steps": "10",
+            # (None, value) tuples force multipart encoding with plain
+            # string fields and no file part
+            files={
+                "model": (None, VIDEO_MODEL),
+                "prompt": (None, "a cat"),
+                "seconds": (None, "4"),
+                "steps": (None, "10"),
             },
-            # File part forces multipart encoding; non-str form values are
-            # filtered out by the handler
-            files={"input_reference": ("ref.png", b"\x89PNG", "image/png")},
         )
         assert r.status_code == 200
         body = r.json()
@@ -201,6 +233,18 @@ class TestCreateVideo:
         assert body["seconds"] == str(round(65 / 16, 2))
         # Defaults applied when size omitted
         assert body["size"] == "480x272"
+
+    def test_post_multipart_file_to_t2v_400(self, video_env):
+        """A conditioning image to a text-to-video model is rejected (the
+        old behavior of silently dropping the file part is gone)."""
+        client, _ = video_env()
+        r = client.post(
+            "/v1/videos",
+            data={"model": VIDEO_MODEL, "prompt": "a cat"},
+            files={"input_reference": ("ref.png", PNG_BYTES, "image/png")},
+        )
+        assert r.status_code == 400
+        assert "text-to-video only" in r.json()["detail"]
 
     def test_seed_and_explicit_params_pass_through(self, video_env):
         client, manager = video_env()
@@ -343,6 +387,243 @@ class TestCapsAndPredictor:
         client, _ = video_env(settings=_video_settings())
         r = _post(client, width=1280, height=720)
         assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/videos -- input_reference (I2V conditioning image)
+# ---------------------------------------------------------------------------
+
+
+class TestInputReference:
+    def test_json_data_url_to_i2v(self, video_env):
+        client, manager = video_env()
+        r = _post(client, model=I2V_MODEL, input_reference=PNG_DATA_URL)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["pipeline"] == "i2v"
+        assert body["has_input_reference"] is True
+        job = manager.get(body["id"])
+        image_path = Path(job.params["image_path"])
+        assert image_path.suffix == ".png"
+        assert image_path.read_bytes() == PNG_BYTES
+        # The route handed (bytes, suffix) through to submit
+        assert manager.test_submitted_refs == [(PNG_BYTES, ".png")]
+
+    def test_json_raw_base64_to_i2v(self, video_env):
+        client, manager = video_env()
+        raw_b64 = base64.b64encode(PNG_BYTES).decode()
+        r = _post(client, model=I2V_MODEL, input_reference=raw_b64)
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert Path(job.params["image_path"]).read_bytes() == PNG_BYTES
+
+    def test_multipart_file_to_i2v(self, video_env):
+        client, manager = video_env()
+        r = client.post(
+            "/v1/videos",
+            data={"model": I2V_MODEL, "prompt": "a cat"},
+            files={"input_reference": ("ref.png", PNG_BYTES, "image/png")},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_input_reference"] is True
+        job = manager.get(body["id"])
+        assert Path(job.params["image_path"]).read_bytes() == PNG_BYTES
+
+    def test_invalid_base64_400(self, video_env):
+        client, _ = video_env()
+        r = _post(client, model=I2V_MODEL, input_reference="%%%not-base64%%%")
+        assert r.status_code == 400
+        assert "base64" in r.json()["detail"]
+
+    def test_bad_magic_400(self, video_env):
+        # Valid base64 of bytes that are not PNG/JPEG/WebP
+        client, _ = video_env()
+        gif = base64.b64encode(b"GIF89a" + b"\x00" * 32).decode()
+        r = _post(client, model=I2V_MODEL, input_reference=gif)
+        assert r.status_code == 400
+        assert "PNG, JPEG or WebP" in r.json()["detail"]
+
+    def test_oversize_400(self, video_env, monkeypatch):
+        client, _ = video_env()
+        monkeypatch.setattr(video_routes, "_MAX_REFERENCE_BYTES", 32)
+        r = _post(client, model=I2V_MODEL, input_reference=PNG_DATA_URL)
+        assert r.status_code == 400
+        assert "exceeds" in r.json()["detail"]
+
+    def test_i2v_without_reference_or_extend_400(self, video_env):
+        client, _ = video_env()
+        r = _post(client, model=I2V_MODEL)
+        assert r.status_code == 400
+        assert "requires" in r.json()["detail"]
+
+    def test_reference_and_extend_mutually_exclusive_400(self, video_env):
+        # The exclusion fires before extend resolution, so the id can be
+        # anything
+        client, _ = video_env()
+        r = _post(
+            client,
+            model=I2V_MODEL,
+            input_reference=PNG_DATA_URL,
+            extend_video_id="video_whatever",
+        )
+        assert r.status_code == 400
+        assert "mutually exclusive" in r.json()["detail"]
+
+    def test_ti2v_with_reference_ok(self, video_env):
+        client, manager = video_env()
+        r = _post(client, model=TI2V_MODEL, input_reference=PNG_DATA_URL)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["pipeline"] == "ti2v"
+        assert body["has_input_reference"] is True
+        job = manager.get(body["id"])
+        assert Path(job.params["image_path"]).read_bytes() == PNG_BYTES
+
+    def test_ti2v_without_reference_ok(self, video_env):
+        # ti2v accepts an image but does not require one
+        client, manager = video_env()
+        r = _post(client, model=TI2V_MODEL)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["pipeline"] == "ti2v"
+        assert body["has_input_reference"] is False
+        assert "image_path" not in manager.get(body["id"]).params
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/videos -- extend_video_id (video continuation)
+# ---------------------------------------------------------------------------
+
+
+def _seed_completed_source(
+    manager: VideoJobManager, job_id: str = "video_src"
+) -> VideoJob:
+    """Completed source job with a real mp4 in its blob dir."""
+    job = _seed_job(manager, job_id, status="completed")
+    blob_dir = manager.artifacts_dir / job_id
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    mp4 = blob_dir / "output.mp4"
+    mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+    job.artifact_path = str(mp4)
+    return job
+
+
+class TestExtend:
+    def test_extend_pins_source_geometry(self, video_env):
+        # No input image: extending alone satisfies the i2v image
+        # requirement (the worker conditions on the source's last frame)
+        client, manager = video_env()
+        _seed_completed_source(manager)
+        r = _post(
+            client,
+            model=I2V_MODEL,
+            extend_video_id="video_src",
+            size="640x368",
+            fps=8,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Source geometry wins over the user-supplied size/fps
+        assert body["size"] == "480x272"
+        assert body["fps"] == 16
+        assert body["pipeline"] == "i2v"
+        assert body["extend_source_id"] == "video_src"
+        job = manager.get(body["id"])
+        assert job.params["width"] == 480
+        assert job.params["height"] == 272
+        assert job.params["fps"] == 16
+        assert job.params["extend_source_id"] == "video_src"
+        assert job.params["pipeline"] == "i2v"
+
+    def test_extend_unknown_source_404(self, video_env):
+        client, _ = video_env()
+        r = _post(client, model=I2V_MODEL, extend_video_id="video_ghost")
+        assert r.status_code == 404
+        assert "not found" in r.json()["detail"]
+
+    @pytest.mark.parametrize("status", ["queued", "in_progress"])
+    def test_extend_source_not_completed_409(self, video_env, status):
+        client, manager = video_env()
+        _seed_job(manager, "video_pending", status=status)
+        r = _post(client, model=I2V_MODEL, extend_video_id="video_pending")
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert status in detail
+        assert "completed" in detail
+
+    def test_extend_source_artifact_purged_409(self, video_env):
+        client, manager = video_env()
+        src = _seed_completed_source(manager)
+        Path(src.artifact_path).unlink()
+        r = _post(client, model=I2V_MODEL, extend_video_id="video_src")
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert isinstance(detail, dict)
+        assert detail["code"] == "artifact_expired"
+        assert "purged" in detail["message"]
+
+    def test_extend_with_t2v_model_400(self, video_env):
+        # The pipeline gate fires before extend resolution
+        client, manager = video_env()
+        _seed_completed_source(manager)
+        r = _post(client, model=VIDEO_MODEL, extend_video_id="video_src")
+        assert r.status_code == 400
+        assert "text-to-video only" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/videos -- upscale_resolution (SeedVR2)
+# ---------------------------------------------------------------------------
+
+
+class TestUpscale:
+    @pytest.mark.parametrize("target", [479, 2161])
+    def test_upscale_resolution_out_of_range_400(self, video_env, target):
+        # Below the 480 floor or above the default max_upscale_resolution
+        # 2160 cap; the range check fires before the weights check
+        client, _ = video_env()
+        r = _post(client, upscale_resolution=target)
+        assert r.status_code == 400
+        assert "out of range" in r.json()["detail"]
+
+    def test_upscale_weights_missing_400(self, video_env, tmp_path):
+        client, _ = video_env()
+        r = _post(client, upscale_resolution=1080)
+        assert r.status_code == 400
+        detail = r.json()["detail"]
+        expected_dir = (
+            tmp_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
+        )
+        assert str(expected_dir) in detail
+        assert "Download" in detail
+
+    def test_upscale_weights_present_ok(self, video_env, tmp_path):
+        weights = tmp_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
+        (weights / "transformer").mkdir(parents=True)
+        # The route requires the safetensors index, not just the dir --
+        # a bare transformer/ from an aborted download must not pass
+        (weights / "transformer" / "model.safetensors.index.json").write_text("{}")
+        client, manager = video_env()
+        r = _post(client, upscale_resolution=1080)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["upscale_resolution"] == 1080
+        job = manager.get(body["id"])
+        assert job.params["upscale_resolution"] == 1080
+        assert job.params["upscaler_model_dir"] == str(weights)
+
+    def test_upscale_custom_model_path_honored(self, video_env, tmp_path):
+        custom = tmp_path / "custom-seedvr2"
+        (custom / "transformer").mkdir(parents=True)
+        (custom / "transformer" / "model.safetensors.index.json").write_text("{}")
+        client, manager = video_env(
+            settings=_video_settings(upscaler_model_path=str(custom))
+        )
+        r = _post(client, upscale_resolution=720)
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert job.params["upscaler_model_dir"] == str(custom)
 
 
 # ---------------------------------------------------------------------------

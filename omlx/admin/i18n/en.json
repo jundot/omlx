@@ -768,31 +768,32 @@
   "cluster.healthy.yes": "yes",
   "cluster.healthy.no": "no",
   "cluster.save.failed": "Save failed",
-  "settings": {
-    "video": {
-      "title": "Video Generation",
-      "enabled": "Enable video generation",
-      "enabled_desc": "Serve POST /v1/videos via the subprocess worker. Requires the video worker venv.",
-      "memory_lease": "Memory lease (GB)",
-      "memory_lease_desc": "Reserved against the memory ceiling while a job runs; co-resident LLMs throttle accordingly.",
-      "default_steps": "Default denoise steps",
-      "default_fps": "Default FPS",
-      "max_queued_jobs": "Max queued jobs",
-      "job_timeout": "Job timeout (seconds)",
-      "artifacts_max_gb": "Artifact storage cap (GB)",
-      "artifacts_max_gb_desc": "Oldest video files are purged beyond this; job records are kept.",
-      "worker_python": "Worker python path",
-      "worker_python_desc": "Python of the isolated video venv. Empty = default path."
-    }
-  },
-  "chat": {
-    "video": {
-      "generating": "Generating video...",
-      "need_prompt": "Type a prompt to generate a video with this model.",
-      "cancel": "Cancel",
-      "cancelled": "Video generation cancelled.",
-      "quality_draft": "Draft (fast)",
-      "quality_standard": "Standard (slow)"
-    }
-  }
+  "settings.video.title": "Video Generation",
+  "settings.video.enabled": "Enable video generation",
+  "settings.video.enabled_desc": "Serve POST /v1/videos via the subprocess worker. Requires the video worker venv.",
+  "settings.video.memory_lease": "Memory lease (GB)",
+  "settings.video.memory_lease_desc": "Reserved against the memory ceiling while a job runs; co-resident LLMs throttle accordingly.",
+  "settings.video.default_steps": "Default denoise steps",
+  "settings.video.default_fps": "Default FPS",
+  "settings.video.max_queued_jobs": "Max queued jobs",
+  "settings.video.job_timeout": "Job timeout (seconds)",
+  "settings.video.artifacts_max_gb": "Artifact storage cap (GB)",
+  "settings.video.artifacts_max_gb_desc": "Oldest video files are purged beyond this; job records are kept.",
+  "settings.video.worker_python": "Worker python path",
+  "settings.video.worker_python_desc": "Python of the isolated video venv. Empty = default path.",
+  "settings.video.upscaler_path": "SeedVR2 upscaler weights",
+  "settings.video.upscaler_path_desc": "Directory with the SeedVR2 weights used by upscale_resolution. Empty = models/AbstractFramework/seedvr2-3b-8bit.",
+  "chat.video.generating": "Generating video...",
+  "chat.video.need_prompt": "Type a prompt to generate a video with this model.",
+  "chat.video.cancel": "Cancel",
+  "chat.video.cancelled": "Video generation cancelled.",
+  "chat.video.quality_draft": "Draft (fast)",
+  "chat.video.quality_standard": "Standard (slow)",
+  "chat.video.extend": "Continue",
+  "chat.video.extend_tooltip": "Generate a continuation from the last frame",
+  "chat.video.extend_chip": "Continuing previous video",
+  "chat.video.upscale": "1080p",
+  "chat.video.upscale_tooltip": "SeedVR2 per-frame upscale after generation",
+  "chat.video.need_image": "This model is image-to-video: attach an image (or use Continue on a finished video).",
+  "chat.video.bad_reference_type": "Video models accept PNG, JPEG or WebP reference images."
 }

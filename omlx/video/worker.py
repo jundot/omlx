@@ -90,6 +90,103 @@ def _write_manifest(path: str, payload: dict) -> None:
         pass
 
 
+def _decode_frames(path: str) -> list:
+    """Decode every frame of an mp4 into PIL RGB images (PyAV ships with
+    mlx-gen). Used to stitch a continuation onto its source video."""
+    import av
+    import PIL.Image
+
+    frames = []
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"no video stream in {path}")
+        for frame in container.decode(container.streams.video[0]):
+            frames.append(PIL.Image.fromarray(frame.to_ndarray(format="rgb24")))
+    if not frames:
+        raise RuntimeError(f"no frames decoded from {path}")
+    return frames
+
+
+def _model_config_for(pipeline: str):
+    """Map the registry's pipeline kind to mlx-gen's ModelConfig. The
+    initializer cross-validates the local dir's model_index.json against
+    this config and hard-refuses on mismatch, so a wrong kind cannot load
+    the wrong architecture silently."""
+    from mflux.models.common.config.model_config import ModelConfig
+
+    if pipeline == "i2v":
+        return ModelConfig.wan2_2_i2v_a14b()
+    if pipeline == "ti2v":
+        return ModelConfig.wan2_2_ti2v_5b()
+    return ModelConfig.wan2_2_t2v_a14b()
+
+
+def _preflight_upscaler(upscaler_dir: str) -> None:
+    """Verify the SeedVR2 weights are complete BEFORE the multi-minute Wan
+    generation runs -- a partial download must fail in seconds, not after
+    the whole denoise. Checks every shard listed in the safetensors
+    indexes actually exists."""
+    for component in ("transformer", "vae"):
+        index_path = os.path.join(
+            upscaler_dir, component, "model.safetensors.index.json"
+        )
+        with open(index_path) as f:
+            index = json.load(f)
+        shards = set((index.get("weight_map") or {}).values())
+        if not shards:
+            raise RuntimeError(f"upscaler {component} index lists no shards")
+        for shard in shards:
+            shard_path = os.path.join(upscaler_dir, component, shard)
+            if not os.path.isfile(shard_path) or os.path.getsize(shard_path) == 0:
+                raise RuntimeError(
+                    f"upscaler weights incomplete: missing {component}/{shard}"
+                )
+
+
+def _upscale_frames(frames: list, spec: dict) -> list:
+    """SeedVR2 per-frame upscale to spec["upscale_resolution"] (target short
+    side). The caller must have dropped its Wan model references first --
+    the two are never Metal-co-resident inside the lease. A fixed seed
+    across frames keeps the single-step diffusion temporally stable."""
+    import shutil as _shutil
+    import tempfile
+
+    from mflux.models.common.config.model_config import ModelConfig
+    from mflux.models.common.vae.tiling_config import TilingConfig
+    from mflux.models.seedvr2.variants.upscale.seedvr2 import SeedVR2
+
+    total = len(frames)
+    _emit(phase="upscaling", step=0, total_steps=total)
+    upscaler = SeedVR2(
+        model_path=spec["upscaler_model_dir"],
+        model_config=ModelConfig.seedvr2_3b(),
+    )
+    # The initializer disables VAE tiling; without it a 1080p decode
+    # materializes tens of GB of activations (measured 72GB phys for
+    # 480x272 -> 1080p) and the lease watchdog kills the worker. The CLI's
+    # --vae-tiling default config keeps the footprint inside the lease.
+    upscaler.tiling_config = TilingConfig()
+    target = int(spec["upscale_resolution"])
+    seed = int(spec["seed"])
+    out = []
+    tmp_dir = tempfile.mkdtemp(prefix="fmlx_upscale_")
+    try:
+        for i in range(total):
+            frame_path = os.path.join(tmp_dir, f"f{i:05d}.png")
+            frames[i].save(frame_path)
+            # Release the input frame as we go: holding both full frame
+            # lists at once costs ~25MB/frame at 4K over long chains.
+            frames[i] = None
+            generated = upscaler.generate_image(
+                seed=seed, image_path=frame_path, resolution=target
+            )
+            out.append(generated.image)
+            _emit(phase="upscaling", step=i + 1, total_steps=total)
+    finally:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out
+
+
 def run(spec: dict) -> int:
     manifest_path = spec["manifest_path"]
     output_path = spec["output_path"]
@@ -123,12 +220,31 @@ def run(spec: dict) -> int:
         except Exception:
             pass
 
+    # Fail fast on incomplete upscaler weights -- BEFORE the multi-minute
+    # Wan load + denoise, not after.
+    upscale_res = spec.get("upscale_resolution")
+    if upscale_res:
+        _preflight_upscaler(spec["upscaler_model_dir"])
+
+    # Continuations condition on the source video's last frame and stitch
+    # the decoded source frames in front of the new segment.
+    extend_from = spec.get("extend_from")
+    image_path = spec.get("image_path")
+    prior_frames: list = []
+    if extend_from:
+        _emit(phase="extracting_reference")
+        prior_frames = _decode_frames(extend_from)
+        image_path = os.path.join(
+            os.path.dirname(output_path), "extend_reference.png"
+        )
+        prior_frames[-1].save(image_path)
+
     _emit(phase="loading")
-    from mflux.models.common.config.model_config import ModelConfig
     from mflux.models.wan.variants import Wan2_2_TI2V
 
+    pipeline = str(spec.get("pipeline") or "t2v")
     model = Wan2_2_TI2V(
-        model_config=ModelConfig.wan2_2_t2v_a14b(),
+        model_config=_model_config_for(pipeline),
         model_path=spec["model_dir"],
     )
     _emit(phase="loaded")
@@ -150,6 +266,8 @@ def run(spec: dict) -> int:
         fps=int(spec["fps"]),
         progress_callback=cb,
     )
+    if image_path:
+        kwargs["image_path"] = image_path
     if low_ram:
         kwargs["release_inactive_denoiser"] = True
         kwargs["release_denoisers_before_decode"] = True
@@ -163,9 +281,72 @@ def run(spec: dict) -> int:
 
     video = model.generate_video(**kwargs)
 
-    _emit(phase="saving")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    video.save(output_path)
+    fps = int(spec["fps"])
+    frames = list(video.frames)
+    if prior_frames:
+        _emit(phase="stitching")
+        # mlx-gen re-derives the I2V output size from the conditioning
+        # image on the LOADED model's spatial grid (32px for TI2V-5B vs
+        # 16px for A14B), so a cross-model extend can come back at a
+        # slightly different size than the source -- snap it back or the
+        # stitched save fails frame-health validation after the whole
+        # denoise has run.
+        import PIL.Image
+
+        target_size = prior_frames[0].size
+        if frames and frames[0].size != target_size:
+            _emit(
+                phase="stitching",
+                note=f"resampling {frames[0].size} -> {target_size}",
+            )
+            frames = [
+                f.resize(target_size, PIL.Image.Resampling.LANCZOS)
+                for f in frames
+            ]
+        # I2V reproduces its conditioning image as the first output frame;
+        # drop it so the seam does not stutter on a duplicate.
+        frames = prior_frames + frames[1:]
+
+    upscale_error = None
+    if upscale_res:
+        from mflux.utils.video_util import VideoUtil
+
+        # Keep the pre-upscale video for future continuations: extending
+        # from upscaled frames would force generating the next segment at
+        # the upscaled resolution (hours per segment on this hardware).
+        raw_path = os.path.join(os.path.dirname(output_path), "output_raw.mp4")
+        VideoUtil.save_video(frames=frames, path=raw_path, fps=fps)
+        # Release the Wan weights before SeedVR2 loads -- never co-resident
+        # inside the lease.
+        import gc
+
+        model = None  # noqa: F841 -- drop the only strong reference
+        video = None  # noqa: F841
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+        try:
+            frames = _upscale_frames(list(frames), spec)
+        except Exception as e:  # noqa: BLE001 -- degrade, don't burn the run
+            # The generation itself succeeded and is sitting in raw_path;
+            # failing the whole job would throw away the render and every
+            # retry would burn it again. Ship the raw video and report.
+            upscale_error = f"{type(e).__name__}: {e}"
+            _emit(phase="upscale_failed", error=upscale_error)
+            frames = _decode_frames(raw_path)
+
+    _emit(phase="saving")
+    if prior_frames or upscale_res:
+        from mflux.utils.video_util import VideoUtil
+
+        VideoUtil.save_video(frames=frames, path=output_path, fps=fps)
+    else:
+        video.save(output_path)
 
     wall = round(time.time() - _T0, 1)
     _write_manifest(
@@ -177,6 +358,10 @@ def run(spec: dict) -> int:
             "output_bytes": (
                 os.path.getsize(output_path) if os.path.exists(output_path) else 0
             ),
+            "frames_total": len(frames),
+            "extended_from": extend_from or None,
+            "upscale_resolution": upscale_res or None,
+            "upscale_error": upscale_error,
         },
     )
     _emit(phase="done", wall_seconds=wall)

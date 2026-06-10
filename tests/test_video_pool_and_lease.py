@@ -13,6 +13,7 @@ exactly once, and acquire/release move the Metal wired-limit request.
 """
 
 import asyncio
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -66,6 +67,7 @@ def _make_pool_with_video_and_llm():
         model_type="video",
         engine_type="video",
         estimated_size=42 * GB,
+        video_pipeline="i2v",
     )
     return pool, fake_engine
 
@@ -105,6 +107,37 @@ class TestVideoPoolRejection:
         # unloaded.
         assert pool._entries["llm-id"].engine is fake_engine
         assert fake_engine.stop_called is False
+
+
+class TestVideoPoolStatus:
+    """get_status() emits video_pipeline so /v1/models/status consumers
+    (chat UI capability gating) can tell i2v / ti2v / t2v apart."""
+
+    def test_get_status_emits_video_pipeline(self):
+        pool, _ = _make_pool_with_video_and_llm()
+
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+
+        assert models["video-id"]["video_pipeline"] == "i2v"
+        # Non-video entries carry the empty default
+        assert models["llm-id"]["video_pipeline"] == ""
+
+    def test_discover_propagates_video_pipeline_to_status(self, tmp_path):
+        """End to end: DiscoveredModel.video_pipeline -> EngineEntry ->
+        get_status() wire field."""
+        model_dir = tmp_path / "Wan2.2-I2V-A14B"
+        (model_dir / "transformer").mkdir(parents=True)
+        (model_dir / "model_index.json").write_text(
+            json.dumps({"_class_name": "WanImageToVideoPipeline"})
+        )
+        (model_dir / "transformer" / "model.safetensors").write_bytes(b"\0" * 64)
+
+        pool = EnginePool(scheduler_config=None)
+        pool.discover_models(str(tmp_path))
+
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+        assert models["Wan2.2-I2V-A14B"]["model_type"] == "video"
+        assert models["Wan2.2-I2V-A14B"]["video_pipeline"] == "i2v"
 
 
 # =========================================================================

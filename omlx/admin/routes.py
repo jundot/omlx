@@ -295,6 +295,8 @@ class GlobalSettingsRequest(BaseModel):
     video_max_pixels_per_frame: int | None = Field(default=None, ge=256)
     video_artifacts_max_count: int | None = Field(default=None, ge=1)
     video_artifacts_max_gb: float | None = Field(default=None, gt=0)
+    video_upscaler_model_path: str | None = None
+    video_max_upscale_resolution: int | None = Field(default=None, ge=480)
 
     # Auth settings
     api_key: str | None = None
@@ -3308,6 +3310,8 @@ async def update_global_settings(
         "video_max_pixels_per_frame": "max_pixels_per_frame",
         "video_artifacts_max_count": "artifacts_max_count",
         "video_artifacts_max_gb": "artifacts_max_gb",
+        "video_upscaler_model_path": "upscaler_model_path",
+        "video_max_upscale_resolution": "max_upscale_resolution",
     }
     for req_field, attr in _video_fields.items():
         value = getattr(request, req_field, None)
@@ -4058,9 +4062,20 @@ def _build_active_models_data() -> dict:
         total_active += active_requests
         total_waiting += waiting_requests
 
+    # Pool memory only counts loaded engines; a generating video worker
+    # lives in a subprocess, so without it the card reads 0 GB used while
+    # a job occupies tens of GB.
+    memory_used = status.get("current_model_memory", 0)
+    video_manager = getattr(_server_state, "video_job_manager", None)
+    if video_manager is not None:
+        try:
+            memory_used += video_manager.current_worker_memory_bytes()
+        except Exception:  # noqa: BLE001 -- status display must never fail
+            pass
+
     return {
         "models": models,
-        "model_memory_used": status.get("current_model_memory", 0),
+        "model_memory_used": memory_used,
         "model_memory_max": status.get("final_ceiling", 0),
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,

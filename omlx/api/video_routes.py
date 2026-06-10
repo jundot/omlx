@@ -195,20 +195,99 @@ def _normalize_params(
     return normalized
 
 
-async def _parse_create_body(request: Request) -> VideoCreateParams:
-    """Accept JSON or multipart (openai SDK sends multipart, all-string
-    fields; pydantic lax coercion converts them)."""
+# I2V conditioning image limits. The magic sniff keeps obviously-wrong
+# uploads out of the worker; PIL in the worker venv is the real decoder.
+_MAX_REFERENCE_BYTES = 16 * 1024 * 1024
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+)
+
+
+def _sniff_image(data: bytes) -> str:
+    """Return a file suffix for supported image bytes, raise 400 otherwise."""
+    if len(data) > _MAX_REFERENCE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"input_reference exceeds {_MAX_REFERENCE_BYTES // (1024*1024)}MB"
+            ),
+        )
+    for magic, suffix in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return suffix
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    raise HTTPException(
+        status_code=400,
+        detail="input_reference must be a PNG, JPEG or WebP image",
+    )
+
+
+def _decode_reference_string(value: str) -> bytes:
+    """Decode a JSON-body input_reference: data URL or raw base64."""
+    import base64
+
+    payload = value
+    if value.startswith("data:"):
+        _, _, payload = value.partition(",")
+    try:
+        return base64.b64decode(payload, validate=True)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "input_reference must be a data URL or base64-encoded image "
+                "in JSON bodies (or a multipart file field)"
+            ),
+        )
+
+
+async def _parse_create_body(
+    request: Request,
+) -> tuple[VideoCreateParams, bytes | None, str]:
+    """Accept JSON or multipart (openai SDK sends multipart with
+    input_reference as a file field; pydantic lax coercion converts the
+    all-string form values). Returns (params, reference_bytes, suffix)."""
     content_type = (request.headers.get("content-type") or "").lower()
+    ref_bytes: bytes | None = None
     try:
         if "multipart/form-data" in content_type:
             form = await request.form()
             data = {k: v for k, v in form.items() if isinstance(v, str)}
+            upload = form.get("input_reference")
+            if upload is not None and not isinstance(upload, str):
+                # Bounded read: an unbounded read() would materialize an
+                # arbitrarily large upload in RAM before the size check
+                # (the sniff rejects anything past the cap either way).
+                ref_bytes = await upload.read(_MAX_REFERENCE_BYTES + 1)
+            elif isinstance(upload, str) and upload:
+                # Symmetric with the JSON body: a string form field holds a
+                # data URL / base64 image instead of a file part.
+                data.pop("input_reference", None)
+                ref_bytes = _decode_reference_string(upload)
         else:
             data = await request.json()
+            ref_value = data.pop("input_reference", None) if isinstance(
+                data, dict
+            ) else None
+            if isinstance(ref_value, str) and ref_value:
+                ref_bytes = _decode_reference_string(ref_value)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed request body")
+    if ref_bytes is not None and not ref_bytes:
+        # b"" would slip past the is-None pipeline gates yet submit no
+        # image -- an i2v job would then load 40GB of weights only for
+        # mflux to refuse generation.
+        raise HTTPException(
+            status_code=400,
+            detail="input_reference is empty (zero-byte upload)",
+        )
+    suffix = _sniff_image(ref_bytes) if ref_bytes else ""
     try:
-        return VideoCreateParams.model_validate(data)
+        return VideoCreateParams.model_validate(data), ref_bytes, suffix
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -216,7 +295,7 @@ async def _parse_create_body(request: Request) -> VideoCreateParams:
 @router.post("/v1/videos")
 async def create_video(request: Request):
     manager = _get_video_manager()
-    params = await _parse_create_body(request)
+    params, ref_bytes, ref_suffix = await _parse_create_body(request)
 
     pool = _get_engine_pool()
     resolved = _resolve_model(params.model)
@@ -235,6 +314,36 @@ async def create_video(request: Request):
             ),
         )
 
+    # Pipeline kind gates the conditioning image: i2v REQUIRES one (mflux
+    # hard-refuses without), ti2v accepts one, t2v rejects one. Entries
+    # discovered before this field existed default to t2v.
+    pipeline = getattr(entry, "video_pipeline", "") or "t2v"
+    extend_id = (params.extend_video_id or "").strip() or None
+    if ref_bytes is not None and extend_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "input_reference and extend_video_id are mutually exclusive "
+                "(extending always conditions on the source's last frame)"
+            ),
+        )
+    if (ref_bytes is not None or extend_id) and pipeline == "t2v":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{params.model}' is text-to-video only and does not "
+                "accept an input image; use an image-to-video (i2v) model"
+            ),
+        )
+    if pipeline == "i2v" and ref_bytes is None and not extend_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{params.model}' is image-to-video and requires "
+                "input_reference (an image) or extend_video_id"
+            ),
+        )
+
     ok, reason = manager.guard_available()
     if not ok:
         raise HTTPException(status_code=503, detail=reason)
@@ -245,7 +354,83 @@ async def create_video(request: Request):
     from omlx.server import _server_state
 
     video_settings = _server_state.global_settings.video
+
+    # Extending pins the new segment to the source's frame geometry so the
+    # stitch is seamless; user-supplied size/fps are overridden.
+    src_job = None
+    if extend_id:
+        src_job = manager.get(extend_id)
+        if src_job is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"extend_video_id '{extend_id}' not found",
+            )
+        if src_job.status != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"extend_video_id '{extend_id}' is {src_job.status}; "
+                    "only completed videos can be extended"
+                ),
+            )
+        if manager.extend_source_path(src_job) is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "artifact_expired",
+                    "message": (
+                        f"The artifact for '{extend_id}' was purged by the "
+                        "retention policy and cannot be extended"
+                    ),
+                },
+            )
+        sp = src_job.params
+        if not (sp.get("width") and sp.get("height") and sp.get("fps")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{extend_id}' lacks frame geometry; cannot extend",
+            )
+        params.width = int(sp["width"])
+        params.height = int(sp["height"])
+        params.fps = int(sp["fps"])
+        params.size = None
+
     normalized = _normalize_params(params, video_settings)
+    normalized["pipeline"] = pipeline
+    if src_job is not None:
+        normalized["extend_source_id"] = src_job.id
+
+    # SeedVR2 upscale stage: per-frame, runs in the worker after generation
+    # (and after the stitch, for extends). Weights are a separate download;
+    # missing weights are a 400 with the fetch hint, not a 503 -- the rest
+    # of the video engine is healthy.
+    if params.upscale_resolution is not None:
+        target = int(params.upscale_resolution)
+        max_res = int(getattr(video_settings, "max_upscale_resolution", 2160))
+        if not (480 <= target <= max_res):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"upscale_resolution {target} out of range "
+                    f"(480..{max_res})"
+                ),
+            )
+        upscaler_dir = manager.upscaler_dir()
+        # The index file is how the mflux CLI detects this layout; a bare
+        # transformer/ dir from an aborted download must not pass.
+        if not (
+            upscaler_dir / "transformer" / "model.safetensors.index.json"
+        ).is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"SeedVR2 upscaler weights not found at {upscaler_dir}. "
+                    "Download AbstractFramework/seedvr2-3b-8bit there or set "
+                    "settings.video.upscaler_model_path."
+                ),
+            )
+        normalized["upscale_resolution"] = target
+        normalized["upscaler_model_dir"] = str(upscaler_dir)
 
     from omlx.video.manager import QueueFullError, VideoJob
 
@@ -256,7 +441,10 @@ async def create_video(request: Request):
         params=normalized,
     )
     try:
-        await manager.submit(job)
+        await manager.submit(
+            job,
+            input_reference=(ref_bytes, ref_suffix) if ref_bytes else None,
+        )
     except QueueFullError as e:
         raise HTTPException(status_code=503, detail=str(e))
     _record_video_request(resolved)

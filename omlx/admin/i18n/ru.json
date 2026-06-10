@@ -743,31 +743,23 @@
   "cluster.healthy.yes": "да",
   "cluster.healthy.no": "нет",
   "cluster.save.failed": "Не удалось сохранить",
-  "settings": {
-    "video": {
-      "title": "Генерация видео",
-      "enabled": "Включить генерацию видео",
-      "enabled_desc": "Обслуживать POST /v1/videos через подпроцесс-воркер. Требуется venv видео-воркера.",
-      "memory_lease": "Резерв памяти (ГБ)",
-      "memory_lease_desc": "Резервируется из лимита памяти на время задачи; LLM соответственно замедляются.",
-      "default_steps": "Шаги диффузии по умолчанию",
-      "default_fps": "FPS по умолчанию",
-      "max_queued_jobs": "Макс. задач в очереди",
-      "job_timeout": "Таймаут задачи (сек)",
-      "artifacts_max_gb": "Лимит хранения (ГБ)",
-      "artifacts_max_gb_desc": "Старые видеофайлы удаляются сверх лимита; записи задач сохраняются.",
-      "worker_python": "Путь к python воркера",
-      "worker_python_desc": "Python изолированного видео-venv. Пусто = путь по умолчанию."
-    }
-  },
-  "chat": {
-    "video": {
-      "generating": "Генерация видео...",
-      "need_prompt": "Введите промпт для генерации видео этой моделью.",
-      "cancel": "Отмена",
-      "cancelled": "Генерация видео отменена.",
-      "quality_draft": "Черновик (быстро)",
-      "quality_standard": "Стандарт (медленно)"
-    }
-  }
+  "settings.video.title": "Генерация видео",
+  "settings.video.enabled": "Включить генерацию видео",
+  "settings.video.enabled_desc": "Обслуживать POST /v1/videos через подпроцесс-воркер. Требуется venv видео-воркера.",
+  "settings.video.memory_lease": "Резерв памяти (ГБ)",
+  "settings.video.memory_lease_desc": "Резервируется из лимита памяти на время задачи; LLM соответственно замедляются.",
+  "settings.video.default_steps": "Шаги диффузии по умолчанию",
+  "settings.video.default_fps": "FPS по умолчанию",
+  "settings.video.max_queued_jobs": "Макс. задач в очереди",
+  "settings.video.job_timeout": "Таймаут задачи (сек)",
+  "settings.video.artifacts_max_gb": "Лимит хранения (ГБ)",
+  "settings.video.artifacts_max_gb_desc": "Старые видеофайлы удаляются сверх лимита; записи задач сохраняются.",
+  "settings.video.worker_python": "Путь к python воркера",
+  "settings.video.worker_python_desc": "Python изолированного видео-venv. Пусто = путь по умолчанию.",
+  "chat.video.generating": "Генерация видео...",
+  "chat.video.need_prompt": "Введите промпт для генерации видео этой моделью.",
+  "chat.video.cancel": "Отмена",
+  "chat.video.cancelled": "Генерация видео отменена.",
+  "chat.video.quality_draft": "Черновик (быстро)",
+  "chat.video.quality_standard": "Стандарт (медленно)"
 }

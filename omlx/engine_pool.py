@@ -60,6 +60,7 @@ class EngineEntry:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -177,6 +178,7 @@ class EnginePool:
                     config_model_type=getattr(info, "config_model_type", ""),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
+                    video_pipeline=getattr(info, "video_pipeline", ""),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -960,6 +962,7 @@ class EnginePool:
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
+                    "video_pipeline": e.video_pipeline,
                     "config_model_type": e.config_model_type,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
