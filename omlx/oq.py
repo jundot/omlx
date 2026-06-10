@@ -953,6 +953,18 @@ class _TrackedTensor:
             new_shape, self.dtype, list(self.sources), f"moveaxis_{src_ax}_{dst_ax}"
         )
 
+    def swapaxes(self, axis1, axis2):
+        axis1 = axis1 % self.ndim if axis1 < 0 else axis1
+        axis2 = axis2 % self.ndim if axis2 < 0 else axis2
+        new_shape = list(self.shape)
+        new_shape[axis1], new_shape[axis2] = new_shape[axis2], new_shape[axis1]
+        return _TrackedTensor(
+            tuple(new_shape),
+            self.dtype,
+            list(self.sources),
+            f"swapaxes_{axis1}_{axis2}"
+        )
+
     def transpose(self, *axes):
         if not axes:
             axes_list = list(reversed(range(self.ndim)))

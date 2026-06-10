@@ -2837,3 +2837,30 @@ class TestPrecomputedSensitivityMap:
 
         with pytest.raises(expected_exc, match=expected_match or ".*"):
             quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+class TestTrackedTensorMethods:
+    """Regression tests for _TrackedTensor methods including swapaxes (Issue #1706)."""
+
+    def test_swapaxes_basic(self):
+        tensor = _TrackedTensor(shape=(2, 3, 4), dtype="float32")
+        
+        swapped = tensor.swapaxes(0, 2)
+        
+        assert swapped.shape == (4, 3, 2)
+        assert swapped.dtype == "float32"
+        assert swapped.transform == "swapaxes_0_2"
+
+    def test_swapaxes_negative_index(self):
+        tensor = _TrackedTensor(shape=(2, 3, 4), dtype="float16")
+        
+        swapped = tensor.swapaxes(0, -1)
+        
+        assert swapped.shape == (4, 3, 2)
+        assert swapped.transform == "swapaxes_0_2"
+
+    def test_swapaxes_same_axis(self):
+        tensor = _TrackedTensor(shape=(5, 10), dtype="float32")
+        swapped = tensor.swapaxes(1, 1)
+        
+        assert swapped.shape == (5, 10)
+        assert swapped.transform == "swapaxes_1_1"
