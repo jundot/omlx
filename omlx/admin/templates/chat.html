@@ -1451,6 +1451,14 @@
             this.apiKeySet = true;
             await this.loadModels();
             this.loadChatHistory();
+            // Restore the last-open chat across reloads. Without this a
+            // refresh blanks the view while video jobs keep running
+            // server-side -- the bubbles look "lost" even though loadChat
+            // would rehydrate and resume polling them.
+            const lastChatId = localStorage.getItem('omlx_chat_current_id');
+            if (lastChatId && this.chatHistory.some(c => c.id === lastChatId)) {
+                this.loadChat(lastChatId);
+            }
             this.fetchMcpTools();
         }
 
@@ -1907,6 +1915,7 @@
 
     startNewChat() {
         this.currentChatId = 'chat_' + Date.now();
+        localStorage.setItem('omlx_chat_current_id', this.currentChatId);
         this.messages = [];
         this.uploadImages = [];
         // An armed continuation is scoped to the chat it was armed in --
@@ -1922,6 +1931,7 @@
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (chat) {
             this.currentChatId = chatId;
+            localStorage.setItem('omlx_chat_current_id', chatId);
             this.videoExtendFrom = null;  // chat-scoped, see startNewChat
             this.messages = chat.messages || [];
             // Re-attach video bubbles. Persisted blob: URLs are DEAD links
@@ -2046,6 +2056,7 @@
 
         if (!this.currentChatId) {
             this.currentChatId = 'chat_' + Date.now();
+            localStorage.setItem('omlx_chat_current_id', this.currentChatId);
         }
 
         // Build message content (OpenAI content array for images, string for text-only)
