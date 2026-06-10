@@ -211,6 +211,14 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
     - Minimum 4 characters
     - No whitespace characters (space, tab, newline, etc.)
     - Printable characters only (no control characters)
+    - ASCII characters only
+
+    The ASCII-only rule is not cosmetic: HTTP request headers are decoded as
+    latin-1 by the ASGI layer, so a client cannot transmit a non-ASCII key
+    intact. A configured key such as "café" therefore starts the server
+    fine but can never be matched over the wire, yielding silent 401s on every
+    authenticated request. Rejecting it at configuration time surfaces the
+    misconfiguration immediately instead.
 
     Args:
         api_key: The API key string to validate.
@@ -224,6 +232,8 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
         return False, "API key must not contain whitespace"
     if not api_key.isprintable():
         return False, "API key must contain only printable characters"
+    if not api_key.isascii():
+        return False, "API key must contain only ASCII characters"
     return True, ""
 
 
