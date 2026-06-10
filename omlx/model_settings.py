@@ -96,6 +96,13 @@ class ModelSettings:
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
+        video_default_steps: Video models: default denoise steps (None = global).
+        video_default_fps: Video models: default frames per second (None = global).
+        video_default_size: Video models: default frame size "WxH" (None = global).
+        video_default_seconds: Video models: default clip duration (None = 3.0).
+        video_default_upscale_resolution: Video models: auto-upscale completed
+            videos to this short-side resolution via SeedVR2 (None/0 = off;
+            requests sending upscale_resolution explicitly always win).
         active_profile_name: Name of the currently-applied profile (None = no profile).
     """
 
@@ -115,6 +122,13 @@ class ModelSettings:
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
+
+    # Video generation defaults (video models only; None = global default)
+    video_default_steps: Optional[int] = None
+    video_default_fps: Optional[int] = None
+    video_default_size: Optional[str] = None  # "WxH"
+    video_default_seconds: Optional[float] = None
+    video_default_upscale_resolution: Optional[int] = None  # SeedVR2 short side, 0/None = off
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
     preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)

@@ -148,6 +148,12 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
     reasoning_parser: str | None = None
+    # Video generation defaults (video models)
+    video_default_steps: int | None = Field(default=None, ge=1)
+    video_default_fps: int | None = Field(default=None, ge=1)
+    video_default_size: str | None = None
+    video_default_seconds: float | None = Field(default=None, gt=0)
+    video_default_upscale_resolution: int | None = Field(default=None, ge=0)
     # ForcedAligner companion for STT models. When set on an ASR (e.g.
     # Qwen3-ASR-*), a /v1/audio/transcriptions call with word_timestamps=true
     # auto-chains this aligner on the (audio, ASR transcript) pair and
@@ -1690,6 +1696,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "forced_ct_kwargs": settings.forced_ct_kwargs,
                 "ttl_seconds": settings.ttl_seconds,
                 "index_cache_freq": settings.index_cache_freq,
+                "video_default_steps": settings.video_default_steps,
+                "video_default_fps": settings.video_default_fps,
+                "video_default_size": settings.video_default_size,
+                "video_default_seconds": settings.video_default_seconds,
+                "video_default_upscale_resolution": settings.video_default_upscale_resolution,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
                 "turboquant_skip_last": settings.turboquant_skip_last,
@@ -1947,6 +1958,35 @@ async def update_model_settings(
         current_settings.chat_template_kwargs = request.chat_template_kwargs
     if "forced_ct_kwargs" in sent:
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
+    # Video generation defaults: plain passthrough except size, which must
+    # parse as WxH so the video route never has to re-validate it.
+    if "video_default_size" in sent:
+        size_value = (request.video_default_size or "").strip() or None
+        if size_value is not None:
+            try:
+                w_str, h_str = size_value.lower().split("x", 1)
+                if int(w_str) <= 0 or int(h_str) <= 0:
+                    raise ValueError
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid video_default_size '{size_value}', expected 'WxH'",
+                )
+        current_settings.video_default_size = size_value
+    for _vfield in (
+        "video_default_steps",
+        "video_default_fps",
+        "video_default_seconds",
+        "video_default_upscale_resolution",
+    ):
+        if _vfield in sent:
+            _vvalue = getattr(request, _vfield)
+            # 0 clears the auto-upscale default (matches the route's
+            # explicit-off sentinel); other fields treat 0/None as unset.
+            if not _vvalue:
+                _vvalue = None
+            setattr(current_settings, _vfield, _vvalue)
+
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
     if "index_cache_freq" in sent:
@@ -4040,12 +4080,24 @@ def _build_active_models_data() -> dict:
                         0.0, loading_estimated_seconds - loading_elapsed_seconds
                     )
 
+        # A generating video model row must show what the worker actually
+        # occupies, not the on-disk weights estimate -- the subprocess runs
+        # low-RAM mode (~10-18GB) while estimated_size says ~42GB, which
+        # contradicts the live aggregate in the card header.
+        row_size = model_info.get("estimated_size", 0)
+        if model_info.get("video_generating"):
+            manager = getattr(_server_state, "video_job_manager", None)
+            try:
+                live = manager.current_worker_memory_bytes() if manager else 0
+            except Exception:  # noqa: BLE001 -- display must never fail
+                live = 0
+            if live > 0:
+                row_size = live
+
         models.append({
             "id": model_id,
-            "estimated_size": model_info.get("estimated_size", 0),
-            "estimated_size_formatted": format_size(
-                model_info.get("estimated_size", 0)
-            ),
+            "estimated_size": row_size,
+            "estimated_size_formatted": format_size(row_size),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
             "loading_elapsed_seconds": loading_elapsed_seconds,

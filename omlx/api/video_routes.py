@@ -106,10 +106,14 @@ def _round_up(value: int, multiple: int) -> int:
 
 
 def _normalize_params(
-    params: VideoCreateParams, video_settings: Any
+    params: VideoCreateParams, video_settings: Any, model_settings: Any = None
 ) -> dict[str, Any]:
     """Apply defaults, dimension rules (W/H multiples of 16, frames 4n+1)
-    and UX caps. Raises HTTPException 400 on violations."""
+    and UX caps. Raises HTTPException 400 on violations.
+
+    Default resolution order: explicit request value > per-model settings
+    (video_default_*) > global video settings."""
+    ms = model_settings
     width = params.width
     height = params.height
     if (width is None or height is None) and params.size:
@@ -122,6 +126,15 @@ def _normalize_params(
                 status_code=400,
                 detail=f"Invalid size '{params.size}', expected 'WxH'",
             )
+    if (width is None or height is None) and ms is not None:
+        default_size = getattr(ms, "video_default_size", None)
+        if default_size:
+            try:
+                w_str, h_str = default_size.lower().split("x", 1)
+                width = width or int(w_str)
+                height = height or int(h_str)
+            except ValueError:
+                pass  # validated at save time; never block the request
     width = width or 480
     height = height or 272
     if width <= 0 or height <= 0:
@@ -129,12 +142,24 @@ def _normalize_params(
     width = _round_up(width, 16)
     height = _round_up(height, 16)
 
-    fps = params.fps or int(video_settings.default_fps)
-    steps = params.steps or int(video_settings.default_steps)
+    fps = (
+        params.fps
+        or (getattr(ms, "video_default_fps", None) if ms else None)
+        or int(video_settings.default_fps)
+    )
+    steps = (
+        params.steps
+        or (getattr(ms, "video_default_steps", None) if ms else None)
+        or int(video_settings.default_steps)
+    )
 
     frames = params.frames
     if frames is None:
-        seconds = params.seconds if params.seconds is not None else 3.0
+        seconds = params.seconds
+        if seconds is None and ms is not None:
+            seconds = getattr(ms, "video_default_seconds", None)
+        if seconds is None:
+            seconds = 3.0
         if seconds <= 0:
             raise HTTPException(status_code=400, detail="seconds must be positive")
         frames = int(round(seconds * fps))
@@ -354,6 +379,10 @@ async def create_video(request: Request):
     from omlx.server import _server_state
 
     video_settings = _server_state.global_settings.video
+    settings_manager = getattr(_server_state, "settings_manager", None)
+    model_settings = (
+        settings_manager.get_settings(resolved) if settings_manager else None
+    )
 
     # Extending pins the new segment to the source's frame geometry so the
     # stitch is seamless; user-supplied size/fps are overridden.
@@ -395,7 +424,7 @@ async def create_video(request: Request):
         params.fps = int(sp["fps"])
         params.size = None
 
-    normalized = _normalize_params(params, video_settings)
+    normalized = _normalize_params(params, video_settings, model_settings)
     normalized["pipeline"] = pipeline
     if src_job is not None:
         normalized["extend_source_id"] = src_job.id
@@ -404,8 +433,28 @@ async def create_video(request: Request):
     # (and after the stitch, for extends). Weights are a separate download;
     # missing weights are a 400 with the fetch hint, not a 503 -- the rest
     # of the video engine is healthy.
-    if params.upscale_resolution is not None:
-        target = int(params.upscale_resolution)
+    # Resolution order: explicit request (0 = explicitly off) > per-model
+    # video_default_upscale_resolution > off. A model default with missing
+    # weights is skipped with a warning rather than failing every request.
+    upscale_resolution = params.upscale_resolution
+    if upscale_resolution is None and model_settings is not None:
+        default_upscale = getattr(
+            model_settings, "video_default_upscale_resolution", None
+        )
+        if default_upscale:
+            upscaler_dir = manager.upscaler_dir()
+            if (
+                upscaler_dir / "transformer" / "model.safetensors.index.json"
+            ).is_file():
+                upscale_resolution = int(default_upscale)
+            else:
+                logger.warning(
+                    "Model %s sets video_default_upscale_resolution=%s but "
+                    "the SeedVR2 weights are missing at %s; skipping",
+                    resolved, default_upscale, upscaler_dir,
+                )
+    if upscale_resolution is not None and int(upscale_resolution) > 0:
+        target = int(upscale_resolution)
         max_res = int(getattr(video_settings, "max_upscale_resolution", 2160))
         if not (480 <= target <= max_res):
             raise HTTPException(

@@ -70,6 +70,12 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "aligner_max_audio_seconds",
     "default_aligner_overflow",
     "default_diarize_quality",
+    # Video generation defaults (video models only)
+    "video_default_steps",
+    "video_default_fps",
+    "video_default_size",
+    "video_default_seconds",
+    "video_default_upscale_resolution",
 )
 
 # Excluded — never stored in a profile or template.

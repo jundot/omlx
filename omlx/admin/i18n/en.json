@@ -798,5 +798,13 @@
   "chat.video.bad_reference_type": "Video models accept PNG, JPEG or WebP reference images.",
   "chat.video.orient_landscape": "Landscape",
   "chat.video.orient_portrait": "Portrait",
-  "chat.video.orient_tooltip": "Composition; a reference image or continuation overrides it"
+  "chat.video.orient_tooltip": "Composition; a reference image or continuation overrides it",
+  "modal.model_settings.video_section": "Video generation defaults",
+  "modal.model_settings.video_hint": "Per-model defaults for /v1/videos and in-chat generation. Empty fields fall back to the global video settings. Explicit request parameters always win.",
+  "modal.model_settings.video_steps": "Default steps",
+  "modal.model_settings.video_fps": "Default FPS",
+  "modal.model_settings.video_seconds": "Default duration (s)",
+  "modal.model_settings.video_size": "Default size (WxH)",
+  "modal.model_settings.video_upscale": "Auto-upscale (SeedVR2)",
+  "modal.model_settings.video_upscale_off": "Off"
 }
