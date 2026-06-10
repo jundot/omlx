@@ -782,5 +782,11 @@
       "worker_python": "Worker python 路径",
       "worker_python_desc": "独立视频 venv 的 python。留空用默认路径。"
     }
+  },
+  "chat": {
+    "video": {
+      "generating": "视频生成中...",
+      "need_prompt": "输入一句提示词，用这个模型生成视频。"
+    }
   }
 }

@@ -834,6 +834,9 @@
                             :class="{ 'bg-surface-muted': currentModel === model.id }"
                             style="color: var(--text-primary);">
                             <span x-text="model.id"></span>
+                            <span x-show="isVideoModelId(model.id)"
+                                  class="ml-2 px-1.5 py-0.5 text-[10px] rounded uppercase tracking-wide"
+                                  style="background: var(--bg-secondary); color: var(--text-tertiary);">video</span>
                         </button>
                     </template>
                     <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm"
@@ -1019,6 +1022,25 @@
                                         :class="{ collapsed: !msg._thinkingOpen }" data-math-pending="true"
                                         :data-math-version="msg._thinking ? String(msg._thinking.length) : '0'"
                                         x-html="renderMarkdown(msg._thinking)"></div>
+                                </div>
+                            </template>
+                            <template x-if="msg._video">
+                                <div class="my-2">
+                                    <template x-if="msg._video.url">
+                                        <video controls :src="msg._video.url"
+                                               class="rounded-xl max-w-full"
+                                               style="max-height: 320px;"></video>
+                                    </template>
+                                    <template x-if="!msg._video.url && !msg._video.error">
+                                        <div class="text-sm" style="color: var(--text-tertiary);">
+                                            <div x-text="`${window.t('chat.video.generating')} ${msg._video.progress || 0}%` + (msg._video.phase ? ` (${msg._video.phase})` : '')"></div>
+                                            <div class="w-56 h-1.5 rounded-full mt-2" style="background: var(--bg-secondary);">
+                                                <div class="h-1.5 rounded-full transition-all duration-500"
+                                                     style="background: var(--text-primary);"
+                                                     :style="`width:${msg._video.progress || 0}%`"></div>
+                                            </div>
+                                        </div>
+                                    </template>
                                 </div>
                             </template>
                             <div class="message-body markdown-content" data-math-pending="true"
@@ -1397,6 +1419,14 @@
         return this.modelTypeMap[this.currentModel] === 'vlm';
     },
 
+    isVideoModelId(modelId) {
+        return this.modelTypeMap[modelId] === 'video';
+    },
+
+    isVideoModel() {
+        return this.isVideoModelId(this.currentModel);
+    },
+
             // ===== MCP Tools =====
 
             async fetchMcpTools() {
@@ -1661,12 +1691,13 @@
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
 
-            // Allowlist: chat only works with LLM/VLM. Any other type
-            // (audio_*, embedding, reranker, video, future ones) has its
-            // own endpoint and must not appear in the picker.
+            // Allowlist: the picker offers LLM/VLM (chat completions) and
+            // video models (sendMessage routes those to POST /v1/videos).
+            // Anything else (audio_*, embedding, reranker, future types)
+            // has its own endpoint and must not appear here.
             this.availableModels = allModels.filter(m => {
                 const t = (this.modelTypeMap[m.id] || m.model_type || 'llm').toLowerCase();
-                return t === 'llm' || t === 'vlm';
+                return t === 'llm' || t === 'vlm' || t === 'video';
             });
             // Get default model from health endpoint
             let defaultModel = null;
@@ -1835,7 +1866,88 @@
 
         this.messages.push({ role: 'user', content });
         this.forceScrollToBottom();
-        await this.streamResponse();
+        if (this.isVideoModel()) {
+            await this.generateVideo(userText);
+        } else {
+            await this.streamResponse();
+        }
+    },
+
+            // ===== In-chat video generation (video models route to /v1/videos) =====
+
+            async generateVideo(prompt) {
+        if (!prompt) {
+            this.messages.push({
+                role: 'assistant',
+                content: window.t('chat.video.need_prompt'),
+                model: this.currentModel,
+            });
+            return;
+        }
+        this.isStreaming = true;
+        const msg = {
+            role: 'assistant',
+            content: '',
+            model: this.currentModel,
+            _video: { status: 'queued', progress: 0, phase: '', url: null, error: null, job_id: null },
+        };
+        this.messages.push(msg);
+        this.forceScrollToBottom();
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        try {
+            // Draft preset keeps in-chat latency in the ~2 minute range;
+            // full-quality renders go through the API / future video page.
+            const resp = await fetch('/v1/videos', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...auth },
+                body: JSON.stringify({
+                    model: this.currentModel,
+                    prompt,
+                    size: '384x224',
+                    seconds: 2,
+                    steps: 8,
+                }),
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                const detail = err.detail;
+                throw new Error(
+                    (detail && (detail.message || detail)) || `HTTP ${resp.status}`
+                );
+            }
+            const job = await resp.json();
+            msg._video.job_id = job.id;
+            // Poll until terminal
+            for (;;) {
+                await new Promise(r => setTimeout(r, 4000));
+                const s = await fetch(`/v1/videos/${job.id}`, { headers: auth });
+                if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
+                const j = await s.json();
+                msg._video.status = j.status;
+                msg._video.progress = j.progress || 0;
+                msg._video.phase = j.phase || '';
+                if (j.status === 'completed') {
+                    const c = await fetch(`/v1/videos/${job.id}/content`, { headers: auth });
+                    if (!c.ok) throw new Error(`content HTTP ${c.status}`);
+                    const blob = await c.blob();
+                    msg._video.url = URL.createObjectURL(blob);
+                    // Text record survives reloads (the blob URL does not)
+                    msg.content = `\`${job.id}\` (${j.wall_seconds || '?'}s, ${j.size}, seed ${j.seed})`;
+                    break;
+                }
+                if (j.status === 'failed') {
+                    const e = j.error || {};
+                    throw new Error(e.code ? `${e.code}: ${e.message}` : 'generation failed');
+                }
+            }
+        } catch (e) {
+            msg._video.error = String(e.message || e);
+            msg.content = `Error: ${msg._video.error}`;
+        } finally {
+            this.isStreaming = false;
+            this.saveCurrentChat();
+            this.forceScrollToBottom();
+        }
     },
 
             async streamResponse(depth = 0) {
