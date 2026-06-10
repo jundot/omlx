@@ -702,35 +702,48 @@ async def test_retention_protects_pending_extend_source(tmp_path):
 async def test_apply_progress_upscaling_and_stitching_mapping(tmp_path):
     manager, _ = _make_manager(tmp_path, _SUCCESS_BODY)
     try:
-        job = _make_job("video_prog1")
-        # Denoise mapping unchanged: 5 + 90 * step / total
+        # Plain job (no upscale): denoise keeps the full 5-95 band
+        plain = _make_job("video_prog0")
+        manager._apply_progress(
+            plain, {"phase": "denoise", "step": 1, "total_steps": 2}
+        )
+        assert plain.progress == 50
+        manager._apply_progress(
+            plain, {"phase": "denoise", "step": 2, "total_steps": 2}
+        )
+        assert plain.progress == 95
+
+        # Upscale job: denoise compresses to 5-65 so the minutes-long
+        # SeedVR2 pass owns 65-97 and the bar never looks hung
+        job = _make_job("video_prog1", upscale_resolution=1080)
         manager._apply_progress(
             job, {"phase": "denoise", "step": 1, "total_steps": 2}
         )
-        assert job.progress == 50
+        assert job.progress == 35
         manager._apply_progress(
             job, {"phase": "denoise", "step": 2, "total_steps": 2}
         )
-        assert job.progress == 95
-        # Stitching pins the post-generation floor
+        assert job.progress == 65
+        # Stitching pins the post-generation floor (denoise band top)
         manager._apply_progress(job, {"phase": "stitching"})
-        assert job.progress == 95
+        assert job.progress == 65
         assert job.phase == "stitching"
-        # Upscaling: 95 + int(2 * step / total)
+        # Upscaling: 65 + int(32 * step / total), per-frame phase text
         manager._apply_progress(
             job, {"phase": "upscaling", "step": 5, "total_steps": 10}
         )
-        assert job.progress == 96
-        assert job.phase == "upscaling"
+        assert job.progress == 81
+        assert job.phase == "upscaling 5/10"
         manager._apply_progress(
             job, {"phase": "upscaling", "step": 10, "total_steps": 10}
         )
         assert job.progress == 97
+        assert job.phase == "upscaling 10/10"
 
-        # Upscaling without step totals holds the 95 floor
-        floor_job = _make_job("video_prog2")
+        # Upscaling without step totals holds the 65 floor
+        floor_job = _make_job("video_prog2", upscale_resolution=1080)
         manager._apply_progress(floor_job, {"phase": "upscaling"})
-        assert floor_job.progress == 95
+        assert floor_job.progress == 65
     finally:
         await manager.shutdown()
 

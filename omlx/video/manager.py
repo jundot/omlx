@@ -668,20 +668,29 @@ class VideoJobManager:
             job.phase = phase
         total = int(ev.get("total_steps") or 0)
         step = int(ev.get("step") or 0)
+        # Upscaling takes minutes (~15s/frame); jobs that include it give
+        # denoise a 5-65 band and upscaling 65-97, so the bar keeps moving
+        # instead of sitting at 96% for the whole SeedVR2 pass (which
+        # reads as a hung server). Plain jobs keep the 5-95 denoise band.
+        has_upscale = bool(job.params.get("upscale_resolution"))
+        denoise_top = 65 if has_upscale else 95
         if phase == "loading":
             job.progress = max(job.progress, 2)
         elif phase == "loaded":
             job.progress = max(job.progress, 5)
         elif phase == "upscaling":
-            # Post-generation stage: denoise already drove progress to ~95
             if total > 0:
-                job.progress = max(job.progress, 95 + int(2 * step / total))
+                # Per-frame liveness in the phase text as well
+                job.phase = f"upscaling {step}/{total}"
+                job.progress = max(job.progress, 65 + int(32 * step / total))
             else:
-                job.progress = max(job.progress, 95)
+                job.progress = max(job.progress, 65)
         elif phase == "stitching":
-            job.progress = max(job.progress, 95)
+            job.progress = max(job.progress, denoise_top)
         elif total > 0 and step > 0:
-            job.progress = max(job.progress, 5 + int(90 * step / total))
+            job.progress = max(
+                job.progress, 5 + int((denoise_top - 5) * step / total)
+            )
         elif phase == "saving":
             job.progress = max(job.progress, 97)
         # Persist sparsely: every phase change and ~every 5 progress points
