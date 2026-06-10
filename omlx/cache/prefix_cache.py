@@ -1884,59 +1884,79 @@ class BlockAwarePrefixCache(CacheManager):
                         _state_length,
                     )
 
-                    key_states, value_states = [], []
+                    current_tq_ks, current_tq_vs = [], []
+                    valid_fp16_ks, valid_fp16_vs = [], []
+                    
+                    tq_bits, tq_seed = 4.0, 0
+                    if first_block_meta_states and layer_idx < len(first_block_meta_states):
+                        ms = first_block_meta_states[layer_idx]
+                        if isinstance(ms, (list, tuple)) and len(ms) >= 3:
+                            tq_bits = float(ms[1])
+                            tq_seed = int(ms[2])
+
                     for block_data in all_block_data:
                         if layer_idx >= len(block_data):
                             continue
                         bd = block_data[layer_idx]
                         if isinstance(bd, tuple) and len(bd) == 2:
                             if isinstance(bd[0], str) and bd[0] == "__turboquant_v2__":
-                                ks, vs = bd[1]
+                                current_tq_ks.append(bd[1][0])
+                                current_tq_vs.append(bd[1][1])
                             else:
                                 ks, vs = bd
-                            key_states.append(ks)
-                            value_states.append(vs)
-                    if not key_states:
-                        logger.debug(f"TQ layer {layer_idx}: no block data")
-                        return None
-                    # Concatenate along token dimension
-                    cat_ks = key_states[0]
-                    for s in key_states[1:]:
-                        cat_ks = _concat_state(cat_ks, s)
-                    cat_vs = value_states[0]
-                    for s in value_states[1:]:
-                        cat_vs = _concat_state(cat_vs, s)
-                    try:
-                        from mlx_lm.models.cache import KVCache
-                        from mlx_vlm.turboquant import TurboQuantKVCache
+                                if hasattr(ks, "shape") and ks.shape == (1,):
+                                    continue  # Skip placeholder
+                                valid_fp16_ks.append(ks)
+                                valid_fp16_vs.append(vs)
 
-                        tq_bits = 4.0
-                        tq_seed = 0
-                        ms = None
-                        if first_block_meta_states and layer_idx < len(
-                            first_block_meta_states
-                        ):
-                            ms = first_block_meta_states[layer_idx]
-                        if isinstance(ms, (list, tuple)) and len(ms) >= 3:
-                            tq_bits = float(ms[1])
-                            tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
-                        # TQ will be re-applied at decode start (lazy quantization).
-                        tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
-                        tq.keys = cat_ks
-                        tq.values = cat_vs
-                        tq.offset = _state_length(cat_ks)
-                        _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+                    try:
+                        from mlx_vlm.turboquant import TurboQuantKVCache, _concat_state, _state_length
+                        from mlx_lm.models.cache import KVCache
+                        from omlx.turboquant_kv import _rebuild_codecs
+
+                        # If we have TQ states, concatenate them
+                        tq = None
+                        if current_tq_ks:
+                            cat_ks = current_tq_ks[0]
+                            for s in current_tq_ks[1:]:
+                                cat_ks = _concat_state(cat_ks, s)
+                            cat_vs = current_tq_vs[0]
+                            for s in current_tq_vs[1:]:
+                                cat_vs = _concat_state(cat_vs, s)
+                            
+                            tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                            tq.keys = cat_ks
+                            tq.values = cat_vs
+                            tq.offset = _state_length(cat_ks)
+                            _rebuild_codecs(tq, cat_ks, cat_vs)
+
+                        if valid_fp16_ks:
+                            # Mixed state fallback: dequantize TQ and concatenate with fp16
+                            fp16_ks_list, fp16_vs_list = [], []
+                            if tq is not None:
+                                k, v = tq.dequantize()
+                                fp16_ks_list.append(k)
+                                fp16_vs_list.append(v)
+                            fp16_ks_list.extend(valid_fp16_ks)
+                            fp16_vs_list.extend(valid_fp16_vs)
+                            
+                            cat_ks = mx.concatenate(fp16_ks_list, axis=2) if len(fp16_ks_list) > 1 else fp16_ks_list[0]
+                            cat_vs = mx.concatenate(fp16_vs_list, axis=2) if len(fp16_vs_list) > 1 else fp16_vs_list[0]
+                            cache = KVCache()
+                            cache.keys = cat_ks
+                            cache.values = cat_vs
+                            cache.offset = cat_ks.shape[2]
+                            reconstructed_caches.append(cache)
+                        elif tq is not None:
+                            # Pure TQ state: return TurboQuantKVCache directly!
+                            # This completely avoids dequantize -> requantize overhead.
+                            reconstructed_caches.append(tq)
+                        else:
+                            # No valid data for this layer
+                            return None
+
                     except Exception as e:
-                        logger.error(
-                            f"TQ layer {layer_idx}: reconstruction failed: {e}"
-                        )
+                        logger.error(f"TQ layer {layer_idx}: reconstruction failed: {e}")
                         return None
                     continue
 
@@ -2093,10 +2113,11 @@ class BlockAwarePrefixCache(CacheManager):
             return reconstructed_caches
 
         except Exception as e:
-            logger.warning(f"Failed to reconstruct cache: {e}")
             import traceback
 
-            logger.debug(traceback.format_exc())
+            logger.warning(
+                f"Failed to reconstruct cache: {e}\n{traceback.format_exc()}"
+            )
             return None
 
     def _fallback_reconstruct_layer(
