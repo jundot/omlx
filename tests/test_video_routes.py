@@ -601,6 +601,9 @@ class TestUpscale:
     def test_upscale_weights_present_ok(self, video_env, tmp_path):
         weights = tmp_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
         (weights / "transformer").mkdir(parents=True)
+        # The route requires the safetensors index, not just the dir --
+        # a bare transformer/ from an aborted download must not pass
+        (weights / "transformer" / "model.safetensors.index.json").write_text("{}")
         client, manager = video_env()
         r = _post(client, upscale_resolution=1080)
         assert r.status_code == 200
@@ -613,6 +616,7 @@ class TestUpscale:
     def test_upscale_custom_model_path_honored(self, video_env, tmp_path):
         custom = tmp_path / "custom-seedvr2"
         (custom / "transformer").mkdir(parents=True)
+        (custom / "transformer" / "model.safetensors.index.json").write_text("{}")
         client, manager = video_env(
             settings=_video_settings(upscaler_model_path=str(custom))
         )

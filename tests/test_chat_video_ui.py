@@ -165,12 +165,25 @@ class TestVideoImageToVideoUI:
 class TestVideoI18nKeys:
     """The template references these keys via tVideo(); a missing key
     falls back to the inline English string, but both shipped bundles
-    must still define them so localized UIs stay localized."""
+    must still define them so localized UIs stay localized.
+
+    Keys MUST be flat dotted strings: both lookups are flat dict gets
+    (routes.py _make_t server-side, window.t in base.html client-side).
+    Nested {"chat": {"video": {...}}} blocks are unreachable dead data --
+    that exact bug shipped once and made settings labels render as raw
+    dotted keys."""
 
     @pytest.mark.parametrize("lang", ["en", "zh"])
     @pytest.mark.parametrize("key", ["extend", "extend_chip", "upscale", "need_image"])
     def test_chat_video_key_present(self, lang, key):
         data = json.loads((I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
-        video = data["chat"]["video"]
-        assert key in video, f"{lang}.json missing chat.video.{key}"
-        assert isinstance(video[key], str) and video[key].strip()
+        flat_key = f"chat.video.{key}"
+        assert flat_key in data, f"{lang}.json missing flat key {flat_key}"
+        assert isinstance(data[flat_key], str) and data[flat_key].strip()
+
+    @pytest.mark.parametrize("path", sorted(I18N_DIR.glob("*.json")))
+    def test_bundle_is_flat(self, path):
+        """Every bundle value must be a string; nested dicts never resolve."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        nested = [k for k, v in data.items() if not isinstance(v, str)]
+        assert not nested, f"{path.name} has unreachable nested blocks: {nested}"

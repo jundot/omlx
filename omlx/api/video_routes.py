@@ -257,7 +257,10 @@ async def _parse_create_body(
             data = {k: v for k, v in form.items() if isinstance(v, str)}
             upload = form.get("input_reference")
             if upload is not None and not isinstance(upload, str):
-                ref_bytes = await upload.read()
+                # Bounded read: an unbounded read() would materialize an
+                # arbitrarily large upload in RAM before the size check
+                # (the sniff rejects anything past the cap either way).
+                ref_bytes = await upload.read(_MAX_REFERENCE_BYTES + 1)
             elif isinstance(upload, str) and upload:
                 # Symmetric with the JSON body: a string form field holds a
                 # data URL / base64 image instead of a file part.
@@ -274,6 +277,14 @@ async def _parse_create_body(
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed request body")
+    if ref_bytes is not None and not ref_bytes:
+        # b"" would slip past the is-None pipeline gates yet submit no
+        # image -- an i2v job would then load 40GB of weights only for
+        # mflux to refuse generation.
+        raise HTTPException(
+            status_code=400,
+            detail="input_reference is empty (zero-byte upload)",
+        )
     suffix = _sniff_image(ref_bytes) if ref_bytes else ""
     try:
         return VideoCreateParams.model_validate(data), ref_bytes, suffix
@@ -405,7 +416,11 @@ async def create_video(request: Request):
                 ),
             )
         upscaler_dir = manager.upscaler_dir()
-        if not (upscaler_dir / "transformer").is_dir():
+        # The index file is how the mflux CLI detects this layout; a bare
+        # transformer/ dir from an aborted download must not pass.
+        if not (
+            upscaler_dir / "transformer" / "model.safetensors.index.json"
+        ).is_file():
             raise HTTPException(
                 status_code=400,
                 detail=(

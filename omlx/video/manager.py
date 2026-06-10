@@ -64,6 +64,7 @@ class VideoJob:
     artifact_path: Optional[str] = None
     wall_seconds: Optional[float] = None
     peak_memory_gb: Optional[float] = None  # Worker lifetime-max, for records
+    upscale_error: Optional[str] = None  # Upscale degraded to raw output
 
     def to_dict(self) -> dict[str, Any]:
         """Wire shape: OpenAI video object fields + fmlx extensions."""
@@ -91,6 +92,7 @@ class VideoJob:
             "extend_source_id": self.params.get("extend_source_id"),
             "upscale_resolution": self.params.get("upscale_resolution"),
             "has_input_reference": bool(self.params.get("image_path")),
+            "upscale_error": self.upscale_error,
         }
 
     def to_persist(self) -> dict[str, Any]:
@@ -110,6 +112,7 @@ class VideoJob:
             "artifact_path": self.artifact_path,
             "wall_seconds": self.wall_seconds,
             "peak_memory_gb": self.peak_memory_gb,
+            "upscale_error": self.upscale_error,
         }
 
     @classmethod
@@ -130,6 +133,7 @@ class VideoJob:
             artifact_path=data.get("artifact_path"),
             wall_seconds=data.get("wall_seconds"),
             peak_memory_gb=data.get("peak_memory_gb"),
+            upscale_error=data.get("upscale_error"),
         )
 
 
@@ -719,6 +723,10 @@ class VideoJobManager:
         job.artifact_path = str(output_path)
         if isinstance(manifest.get("lifetime_max_phys_gb"), (int, float)):
             job.peak_memory_gb = float(manifest["lifetime_max_phys_gb"])
+        if manifest.get("upscale_error"):
+            # The worker shipped the raw render instead of failing the
+            # whole job; surface why so clients see the degradation.
+            job.upscale_error = str(manifest["upscale_error"])
         self._finish(job, "completed")
 
     # -- retention -----------------------------------------------------------
@@ -743,16 +751,28 @@ class VideoJobManager:
             and Path(j.artifact_path).exists()
         ]
         holders.sort(key=lambda j: j.completed_at or j.created_at)  # oldest first
-        total = sum(
-            Path(j.artifact_path).stat().st_size for j in holders  # type: ignore[arg-type]
-        )
+
+        def _blob_bytes(job_id: str) -> int:
+            # Count the whole blob dir: upscaled jobs carry output_raw.mp4
+            # and extend/i2v jobs carry reference images alongside the
+            # artifact, so artifact-only accounting undercounts ~2x.
+            total = 0
+            blob_dir = self.artifacts_dir / job_id
+            try:
+                for f in blob_dir.iterdir():
+                    try:
+                        total += f.stat().st_size
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            return total
+
+        total = sum(_blob_bytes(j.id) for j in holders)
         while holders and (len(holders) > max_count or total > max_bytes):
             victim = holders.pop(0)
             blob_dir = self.artifacts_dir / victim.id
-            try:
-                size = Path(victim.artifact_path).stat().st_size  # type: ignore[arg-type]
-            except OSError:
-                size = 0
+            size = _blob_bytes(victim.id)
             shutil.rmtree(blob_dir, ignore_errors=True)
             victim.artifact_path = None
             victim.expires_at = time.time()

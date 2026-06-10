@@ -887,14 +887,16 @@
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                             video_enabled: this.globalSettings.video?.enabled ?? null,
-                            video_worker_python: this.globalSettings.video?.worker_python || null,
+                            video_worker_python: this.globalSettings.video?.worker_python ?? null,
                             video_memory_lease_gb: this.globalSettings.video?.memory_lease_gb ?? null,
                             video_max_queued_jobs: this.globalSettings.video?.max_queued_jobs ?? null,
                             video_job_timeout_seconds: this.globalSettings.video?.job_timeout_seconds ?? null,
                             video_default_steps: this.globalSettings.video?.default_steps ?? null,
                             video_default_fps: this.globalSettings.video?.default_fps ?? null,
                             video_artifacts_max_gb: this.globalSettings.video?.artifacts_max_gb ?? null,
-                            video_upscaler_model_path: this.globalSettings.video?.upscaler_model_path || null,
+                            // ?? not ||: clearing the field must send "" so the
+                            // server reverts to the default path (null is skipped)
+                            video_upscaler_model_path: this.globalSettings.video?.upscaler_model_path ?? null,
                         }),
                     });
 

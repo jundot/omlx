@@ -1634,6 +1634,15 @@
             alert(window.t('chat.error.invalid_image_type'));
             return;
         }
+        // The video input_reference path only accepts formats the server
+        // magic-sniff allows; macOS drag-drops are often HEIC, which
+        // would 400 after the message is already committed.
+        if (this.isVideoModel()
+            && !['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+            alert(this.tVideo('chat.video.bad_reference_type',
+                'Video models accept PNG, JPEG or WebP reference images.'));
+            return;
+        }
 
         const maxSize = 10 * 1024 * 1024;
         if (file.size > maxSize) {
@@ -1823,6 +1832,17 @@
 
     selectModel(modelId) {
         this.currentModel = modelId;
+        // An armed continuation needs an image-capable video model; keep
+        // it only when the new selection can actually run it.
+        if (this.videoExtendFrom && !this.videoAcceptsImage()) {
+            this.videoExtendFrom = null;
+        }
+        // Video models take a single conditioning image; drop extras
+        // picked up while a VLM was selected (the bubble would otherwise
+        // claim images the server never received).
+        if (this.isVideoModel() && this.uploadImages.length > 1) {
+            this.uploadImages = this.uploadImages.slice(0, 1);
+        }
     },
 
     loadChatHistory() {
@@ -1844,6 +1864,9 @@
         this.currentChatId = 'chat_' + Date.now();
         this.messages = [];
         this.uploadImages = [];
+        // An armed continuation is scoped to the chat it was armed in --
+        // carrying it over would extend an unrelated video.
+        this.videoExtendFrom = null;
         this.systemPrompt = localStorage.getItem('omlx_chat_system_prompt') || '';
         this.isMobile = window.innerWidth < 768;
         this.sidebarOpen = window.innerWidth >= 768;
@@ -1854,6 +1877,7 @@
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (chat) {
             this.currentChatId = chatId;
+            this.videoExtendFrom = null;  // chat-scoped, see startNewChat
             this.messages = chat.messages || [];
             // Re-attach video bubbles. Persisted blob: URLs are DEAD links
             // (session-scoped) -- a <video> bound to one renders but never
@@ -2087,6 +2111,10 @@
         } catch (e) {
             msg._video.error = String(e.message || e);
             msg.content = `Error: ${msg._video.error}`;
+            // Disarm on failure too: a stuck chip silently wins over any
+            // freshly attached image on the next send (extend beats
+            // input_reference) and replays the same error.
+            this.videoExtendFrom = null;
         } finally {
             this.videoSubmitting = false;
             this.saveCurrentChat();
@@ -2175,6 +2203,19 @@
             }
             this.saveCurrentChat();
         } catch (e) { /* network hiccup: keep persisted state */ }
+    },
+
+            // Cancel any in-flight video jobs among messages about to be
+            // removed (regenerate/edit truncate the array). Without this
+            // the detached bubble's poll loop keeps running and the server
+            // job keeps the single video worker busy for its full render.
+            cancelRemovedVideos(removed) {
+        for (const m of removed || []) {
+            const v = m && m._video;
+            if (v && !v.url && !v.error && !v.cancelled) {
+                this.cancelVideo(m);
+            }
+        }
     },
 
             async cancelVideo(msg) {
@@ -2562,6 +2603,7 @@
 
         // Find the user message before this assistant message
         const messagesToKeep = this.messages.slice(0, index);
+        this.cancelRemovedVideos(this.messages.slice(index));
         this.messages = messagesToKeep;
         this.scheduleEnhanceMessages();
 
@@ -2632,6 +2674,7 @@
         const newContent = this.editContent.trim();
 
         // Remove all messages from this index onwards
+        this.cancelRemovedVideos(this.messages.slice(index));
         this.messages = this.messages.slice(0, index);
         this.scheduleEnhanceMessages();
 
