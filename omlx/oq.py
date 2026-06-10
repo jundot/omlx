@@ -1222,6 +1222,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "add_if_mean_lt_0_5",
         "transpose_",
         "moveaxis_",
+        "swapaxes_",
         "split_",
     )
     plan = {}
@@ -1382,6 +1383,12 @@ class _DiscoveredPlan:
             src_ax, dst_ax = int(parts[1]), int(parts[2])
             arr = self._materialize_source(sources[0])
             return mx.moveaxis(arr, src_ax, dst_ax)
+        
+        if transform.startswith("swapaxes_"):
+            parts = transform.split("_")
+            ax1, ax2 = int(parts[1]), int(parts[2])
+            arr = self._materialize_source(sources[0])
+            return mx.swapaxes(arr, ax1, ax2)
 
         if "split_" in transform:
             # split_N_M means take part N of M
