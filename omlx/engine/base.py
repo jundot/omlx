@@ -158,6 +158,41 @@ async def _run_scheduler_preflight_with_cleanup_retry(
         return
 
 
+def resolve_specprefill_kwargs(
+    kwargs: Dict[str, Any], model_settings: Any
+) -> Dict[str, Any]:
+    """Pop per-request SpecPrefill overrides from ``kwargs``, falling back
+    to per-model settings for keep_pct/threshold (issue #1263).
+
+    Per-request API values win. When a request carries no override, the
+    model's configured ``specprefill_keep_pct`` / ``specprefill_threshold``
+    apply here — at the engine chokepoint — so every entry point (chat
+    streaming and non-streaming, /v1/completions, /v1/messages, admin
+    benchmark) honors the settings without each route re-injecting them.
+
+    The ``specprefill`` enable flag stays request-only: engine_core already
+    enables SpecPrefill whenever the draft model is loaded, and the draft
+    model only loads when ``specprefill_enabled`` was set.
+    """
+    resolved: Dict[str, Any] = {}
+    if kwargs.get("specprefill") is not None:
+        resolved["specprefill"] = kwargs.pop("specprefill")
+    keep_pct = kwargs.pop("specprefill_keep_pct", None)
+    if keep_pct is None:
+        keep_pct = getattr(model_settings, "specprefill_keep_pct", None)
+    if keep_pct is not None:
+        resolved["specprefill_keep_pct"] = keep_pct
+    threshold = kwargs.pop("specprefill_threshold", None)
+    if threshold is None:
+        threshold = getattr(model_settings, "specprefill_threshold", None)
+    if threshold is not None:
+        resolved["specprefill_threshold"] = threshold
+    system_end = kwargs.pop("specprefill_system_end", None)
+    if system_end is not None:
+        resolved["specprefill_system_end"] = system_end
+    return resolved
+
+
 @dataclass
 class GenerationOutput:
     """
