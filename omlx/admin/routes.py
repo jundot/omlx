@@ -3894,6 +3894,14 @@ def _build_active_models_data() -> dict:
     now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
+
+    # Video models are never pool-loaded; overlay the job manager's live
+    # state so a generating model appears on the Active Models card (the
+    # loaded filter below would otherwise drop it).
+    from ..server import _server_state, overlay_video_activity
+
+    overlay_video_activity(status.get("models", []))
+
     models = []
     total_active = 0
     total_waiting = 0
@@ -3950,6 +3958,29 @@ def _build_active_models_data() -> dict:
                 snapshot = entry.engine.get_activity_snapshot()
                 active_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
+
+        # Generating video model: synthesize the activity row from the job
+        # manager (there is no engine object to snapshot).
+        if model_info.get("video_generating"):
+            manager = getattr(_server_state, "video_job_manager", None)
+            job = None
+            if manager is not None and manager._current_job_id:
+                job = manager.get(manager._current_job_id)
+            if job is not None:
+                active_requests = max(active_requests, 1)
+                activities = activities + [{
+                    "request_id": job.id,
+                    "kind": "video",
+                    "detail": (
+                        f"video {job.progress}% "
+                        f"({job.phase or 'starting'})"
+                    ),
+                    "elapsed_seconds": (
+                        max(0.0, time.time() - job.started_at)
+                        if job.started_at else None
+                    ),
+                    "last_activity_age_seconds": 0.0,
+                }]
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
