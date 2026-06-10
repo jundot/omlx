@@ -126,3 +126,11 @@ uv.lock
 # by packaging/build.py:_generate_venvstacks_toml() on every Swift app build.
 packaging/_venvstacks_resolved.toml
 .claude/
+
+# Video generation artifacts (job outputs live under {base_path}, never in-repo;
+# these guard against measurement/test runs writing into the worktree)
+*.mp4
+*.mp4.metadata.json
+video-jobs/
+video-artifacts/
+p0_video/
