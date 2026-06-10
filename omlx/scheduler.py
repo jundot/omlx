@@ -1198,6 +1198,12 @@ class Scheduler:
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
 
+        # DEBUG-only prefix-cache divergence probe (issue #1003): recent
+        # stored cache sequences, so a miss can be traced to the exact
+        # token where the new prompt diverges from what was cached.
+        # Populated only when debug logging is enabled — zero cost otherwise.
+        self._cache_probe_seqs: deque[tuple[str, list[int]]] = deque(maxlen=4)
+
         # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
         # When set, eligible requests bypass mlx-lm BatchGenerator for decode
         # and run through mlx-vlm's _mtp_rounds round loop instead.
@@ -4711,6 +4717,55 @@ class Scheduler:
 
         return extracted, model_cache_config
 
+    @staticmethod
+    def _common_prefix_len(a: list[int], b: list[int]) -> int:
+        n = min(len(a), len(b))
+        for i in range(n):
+            if a[i] != b[i]:
+                return i
+        return n
+
+    def _log_prefix_divergence(self, request: Request) -> None:
+        """DEBUG-only prefix-cache miss diagnostic (issue #1003).
+
+        Compares the new prompt against recently stored cache sequences and
+        logs the first divergent token offset with decoded context on both
+        sides, so an always-miss report can be traced to the exact prompt
+        position (template re-render drift, client echo changes, eviction)
+        instead of guessing from hit counters.
+        """
+        prompt = request.prompt_token_ids or []
+        if not prompt or not self._cache_probe_seqs:
+            return
+        best_id, best_seq, best_p = None, None, -1
+        for ref_id, seq in list(self._cache_probe_seqs):
+            p = self._common_prefix_len(prompt, seq)
+            if p > best_p:
+                best_id, best_seq, best_p = ref_id, seq, p
+        if best_seq is None:
+            return
+        cached = request.cached_tokens or 0
+        reusable = min(len(prompt), len(best_seq))
+        block = self.config.paged_cache_block_size
+        logger.debug(
+            f"Request {request.request_id}: prefix probe vs stored {best_id}: "
+            f"common_prefix={best_p}/{reusable} tokens "
+            f"(~{best_p // max(1, block)} blocks of {block}), "
+            f"served cached_tokens={cached}, prompt={len(prompt)}"
+        )
+        if best_p < reusable:
+            lo = max(0, best_p - 12)
+            hi = best_p + 12
+            try:
+                stored_ctx = self.tokenizer.decode(best_seq[lo:hi])
+                prompt_ctx = self.tokenizer.decode(prompt[lo:hi])
+            except Exception:
+                stored_ctx = prompt_ctx = "<decode failed>"
+            logger.debug(
+                f"Request {request.request_id}: first divergence at token "
+                f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
+            )
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -4850,6 +4905,11 @@ class Scheduler:
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
+
+        # DEBUG-only: trace where this prompt diverges from recently stored
+        # cache sequences (issue #1003 always-miss diagnosis).
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_prefix_divergence(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
@@ -6945,6 +7005,14 @@ class Scheduler:
                             else:
                                 cacheable_sequence = full_token_sequence
                             token_sequence_to_store = cacheable_sequence
+                            # DEBUG-only divergence probe (issue #1003)
+                            if logger.isEnabledFor(logging.DEBUG):
+                                self._cache_probe_seqs.append(
+                                    (
+                                        request.request_id,
+                                        list(token_sequence_to_store),
+                                    )
+                                )
                             cache_to_store = request._extracted_cache
                             model_cache_config = getattr(
                                 request, "_model_cache_config", None
