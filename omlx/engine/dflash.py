@@ -227,6 +227,11 @@ class DFlashEngine(BaseEngine):
             if model_settings
             else None
         )
+        self._copyspec_mode = (
+            getattr(model_settings, "dflash_copyspec_mode", None)
+            if model_settings
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -294,6 +299,7 @@ class DFlashEngine(BaseEngine):
             draft_window_size=self._draft_window_size,
             draft_sink_size=self._draft_sink_size,
             verify_mode=self._verify_mode,
+            copyspec_mode=self._copyspec_mode,
         )
         return build_runtime_context(cfg)
 

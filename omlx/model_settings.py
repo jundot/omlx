@@ -81,6 +81,10 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_copyspec_mode: Prompt-lookup (copyspec) drafting policy — "conservative",
+            "auto", or "off" (None = dflash default "conservative"). "auto" A/B-probes
+            copyspec throughput and latches it on/off per workload; helps copy-heavy
+            output (code edits, quoting) that the conservative one-strike disable kills.
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -156,6 +160,7 @@ class ModelSettings:
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_copyspec_mode: Optional[str] = None  # "conservative" | "auto" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.

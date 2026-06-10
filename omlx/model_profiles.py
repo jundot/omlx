@@ -59,6 +59,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_verify_mode",
+    "dflash_copyspec_mode",
     "mtp_enabled",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",

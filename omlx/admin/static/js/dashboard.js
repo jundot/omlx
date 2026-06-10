@@ -1454,6 +1454,7 @@
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
+                    dflash_copyspec_mode: s.dflash_copyspec_mode || 'conservative',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
@@ -1950,6 +1951,9 @@
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
+                                dflash_copyspec_mode: this.modelSettings.dflash_enabled
+                                    ? (this.modelSettings.dflash_copyspec_mode || 'conservative')
+                                    : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -2086,6 +2090,7 @@
                         this.modelSettings.dflash_draft_window_size = null;
                         this.modelSettings.dflash_draft_sink_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
+                        this.modelSettings.dflash_copyspec_mode = 'conservative';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {

@@ -29,6 +29,7 @@ class TestDFlashModelSettings:
         assert settings.dflash_draft_window_size is None
         assert settings.dflash_draft_sink_size is None
         assert settings.dflash_verify_mode is None
+        assert settings.dflash_copyspec_mode is None
 
     def test_no_speculative_tokens_field(self):
         """dflash_speculative_tokens was removed in v2 and stays removed."""
@@ -57,6 +58,7 @@ class TestDFlashModelSettings:
         assert "dflash_draft_window_size" not in d
         assert "dflash_draft_sink_size" not in d
         assert "dflash_verify_mode" not in d
+        assert "dflash_copyspec_mode" not in d
 
     def test_from_dict_with_dflash_fields(self):
         data = {
@@ -115,11 +117,13 @@ class TestDFlashModelSettings:
             "dflash_draft_window_size": 2048,
             "dflash_draft_sink_size": 32,
             "dflash_verify_mode": "adaptive",
+            "dflash_copyspec_mode": "auto",
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_draft_window_size == 2048
         assert settings.dflash_draft_sink_size == 32
         assert settings.dflash_verify_mode == "adaptive"
+        assert settings.dflash_copyspec_mode == "auto"
 
     def test_roundtrip_serialization(self):
         original = ModelSettings(
@@ -431,6 +435,7 @@ class TestDFlashEngineInit:
         assert engine._draft_window_size is None
         assert engine._draft_sink_size is None
         assert engine._verify_mode is None
+        assert engine._copyspec_mode is None
 
     def test_long_context_knobs_read_from_settings(self):
         """Issue #1276 — DFlashEngine picks up window/sink/verify_mode from ModelSettings."""
@@ -446,11 +451,13 @@ class TestDFlashEngineInit:
                 dflash_draft_window_size=2048,
                 dflash_draft_sink_size=32,
                 dflash_verify_mode="adaptive",
+                dflash_copyspec_mode="auto",
             ),
         )
         assert engine._draft_window_size == 2048
         assert engine._draft_sink_size == 32
         assert engine._verify_mode == "adaptive"
+        assert engine._copyspec_mode == "auto"
 
     def test_build_runtime_context_passes_knobs(self):
         """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
@@ -466,6 +473,7 @@ class TestDFlashEngineInit:
                 dflash_draft_window_size=512,
                 dflash_draft_sink_size=16,
                 dflash_verify_mode="dflash",
+                dflash_copyspec_mode="auto",
             ),
         )
         ctx = engine._build_runtime_context()
@@ -473,9 +481,10 @@ class TestDFlashEngineInit:
         assert runtime.draft_window_size == 512
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
+        assert runtime.copyspec_mode == "auto"
 
     def test_build_runtime_context_defaults_to_dflash_mlx_values(self):
-        """None settings → dflash-mlx fills DEFAULT_RUNTIME_CONFIG (1024 / 64 / 'adaptive')."""
+        """None settings → dflash-mlx fills DEFAULT_RUNTIME_CONFIG (1024 / 64 / 'adaptive' / 'conservative')."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -490,6 +499,7 @@ class TestDFlashEngineInit:
         assert runtime.draft_window_size == 1024
         assert runtime.draft_sink_size == 64
         assert runtime.verify_mode == "adaptive"
+        assert runtime.copyspec_mode == "conservative"
 
     def test_l2_max_bytes_from_settings(self, tmp_path):
         """Issue #1326 — dflash L2 disk budget comes from the per-model setting,

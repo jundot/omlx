@@ -145,6 +145,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_copyspec_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -2282,6 +2283,13 @@ async def update_model_settings(
         # Anything else (including empty string) → revert to dflash default.
         current_settings.dflash_verify_mode = (
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
+        )
+    if "dflash_copyspec_mode" in sent:
+        value = request.dflash_copyspec_mode
+        # dflash-mlx accepts: conservative | auto | off.
+        # Anything else (including empty string) → revert to dflash default.
+        current_settings.dflash_copyspec_mode = (
+            value if value in ("conservative", "auto", "off") else None
         )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
