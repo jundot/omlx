@@ -238,6 +238,47 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/embeddings` | Text embeddings |
 | `POST /v1/rerank` | Document reranking |
 | `GET /v1/models` | List available models |
+| `GET /api/status` | Server status for statuslines and scripts |
+
+### Status API
+
+A lightweight `GET /api/status` endpoint exposes server state for external pollers — Claude Code statuslines, monitoring scripts, terminal prompts. It uses the same bearer-token auth as the OpenAI-compatible endpoints, so any API key works:
+
+```bash
+curl -s -H "Authorization: Bearer $OMLX_API_KEY" \
+    http://localhost:8000/api/status
+```
+
+Returns a flat JSON object with serving stats, memory usage, loaded models, and Claude Code context-scaling configuration. Sample fields:
+
+```json
+{
+  "status": "ok",
+  "version": "0.3.8",
+  "uptime_seconds": 12834.2,
+  "default_model": "Qwen3-Coder-Next-8bit",
+  "loaded_models": ["Qwen3-Coder-Next-8bit"],
+  "models_loaded": 1,
+  "models_loading": 0,
+  "active_requests": 0,
+  "waiting_requests": 0,
+  "total_requests": 247,
+  "total_prompt_tokens": 1842310,
+  "total_completion_tokens": 89422,
+  "total_cached_tokens": 1612988,
+  "cache_efficiency": 87.5,
+  "avg_prefill_tps": 2140.3,
+  "avg_generation_tps": 78.4,
+  "model_memory_used": 17179869184,
+  "model_memory_max": 34359738368,
+  "model_memory_used_formatted": "16.0GB",
+  "model_memory_max_formatted": "32.0GB",
+  "claude_code_context_scaling_enabled": true,
+  "claude_code_target_context_size": 200000
+}
+```
+
+The shape is stable; new fields may be added but existing fields will not change. `claude_code_target_context_size` reflects the value reported to Claude Code so its auto-compact triggers at the right point, and `cache_efficiency` is the percentage of prompt tokens served from the prefix cache.
 
 ### Tool Calling & Structured Output
 

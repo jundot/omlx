@@ -1867,6 +1867,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
     metrics = get_server_metrics()
     snapshot = metrics.get_snapshot()
 
+    global_settings = _server_state.global_settings
     pool = _server_state.engine_pool
 
     models_discovered = 0
@@ -1932,6 +1933,16 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "model_memory_max": model_memory_max,
         "model_memory_used_formatted": format_size(model_memory_used) if model_memory_used else "0B",
         "model_memory_max_formatted": format_size(model_memory_max) if model_memory_max else "unlimited",
+        "claude_code_context_scaling_enabled": (
+            global_settings.claude_code.context_scaling_enabled
+            if global_settings is not None
+            else False
+        ),
+        "claude_code_target_context_size": (
+            global_settings.claude_code.target_context_size
+            if global_settings is not None
+            else 200000
+        ),
     }
 
 
