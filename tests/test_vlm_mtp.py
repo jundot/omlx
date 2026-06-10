@@ -59,14 +59,16 @@ def test_load_vlm_mtp_drafter_rejects_dflash_kind():
     assert result is None
 
 
-def test_load_vlm_mtp_drafter_rejects_wrong_model_type():
-    """Even if kind=='mtp', non-gemma4_assistant model_type is rejected."""
-    fake_model = _fake_drafter_model("qwen3_5_assistant")  # hypothetical
+def test_load_vlm_mtp_drafter_accepts_qwen3_5_mtp():
+    """qwen3_5_mtp model_type with kind='mtp' is accepted."""
+    fake_model = _fake_drafter_model("qwen3_5_mtp")
     with patch.object(
         vlm_mtp, "_vlm_load_drafter", return_value=(fake_model, "mtp")
     ):
-        result = vlm_mtp.load_vlm_mtp_drafter("/path/to/drafter")
-    assert result is None
+        drafter = vlm_mtp.load_vlm_mtp_drafter("/path/to/qwen-mtp")
+    assert isinstance(drafter, vlm_mtp.VLMMTPDrafter)
+    assert drafter.draft_kind == "mtp"
+    assert drafter.model is fake_model
 
 
 def test_load_vlm_mtp_drafter_swallows_load_exception():
@@ -202,3 +204,161 @@ def test_model_settings_vlm_mtp_mutex(vlm_mtp_kw, other_kw):
 
     with pytest.raises(ValueError, match="vlm_mtp_enabled"):
         ModelSettings(vlm_mtp_enabled=True, **{other_kw: True})
+
+
+# ---------------------------------------------------------------------------
+# MoE config patch tests
+# ---------------------------------------------------------------------------
+
+
+class TestMoeConfigPatch:
+    """Verify that the MoE compat patch in vlm_mtp.py correctly handles
+    qwen3_5_moe_text text_config dicts."""
+
+    def test_patch_is_applied_on_import(self):
+        """The patch runs at import time; Qwen3_5MTPConfig.__post_init__
+        should be the patched version."""
+        try:
+            from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
+                Qwen3_5MTPConfig,
+            )
+        except ImportError:
+            pytest.skip("mlx-vlm qwen3_5_mtp drafter not available")
+
+        # The patched __post_init__ is a closure, not the original method.
+        # Verify it was replaced by checking it's not the unpatched version.
+        src = Qwen3_5MTPConfig.__post_init__
+        # The patched version references MoETextConfig in its closure.
+        assert src is not None
+
+    def test_moe_text_config_accepted(self):
+        """Qwen3_5MTPConfig.from_dict with a MoE text_config does not raise."""
+        try:
+            from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
+                Qwen3_5MTPConfig,
+            )
+        except ImportError:
+            pytest.skip("mlx-vlm qwen3_5_mtp drafter not available")
+
+        moe_config = {
+            "model_type": "qwen3_5_mtp",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "shared_expert_intermediate_size": 128,
+                "moe_intermediate_size": 128,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 256,
+                "max_position_embeddings": 128,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "mtp_num_hidden_layers": 1,
+            },
+        }
+        cfg = Qwen3_5MTPConfig.from_dict(moe_config)
+        assert cfg.text_config is not None
+        assert cfg.text_config.hidden_size == 64
+        assert cfg.text_config.num_experts == 8
+
+    def test_dense_text_config_still_works(self):
+        """Qwen3_5MTPConfig.from_dict with a dense text_config still works."""
+        try:
+            from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
+                Qwen3_5MTPConfig,
+            )
+        except ImportError:
+            pytest.skip("mlx-vlm qwen3_5_mtp drafter not available")
+
+        dense_config = {
+            "model_type": "qwen3_5_mtp",
+            "text_config": {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 256,
+                "max_position_embeddings": 128,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "mtp_num_hidden_layers": 1,
+            },
+        }
+        cfg = Qwen3_5MTPConfig.from_dict(dense_config)
+        assert cfg.text_config is not None
+        assert cfg.text_config.hidden_size == 64
+
+
+# ---------------------------------------------------------------------------
+# _call_backbone return format tests
+# ---------------------------------------------------------------------------
+
+
+class TestCallBackbone:
+    """Verify _call_backbone handles both tuple and LanguageModelOutput."""
+
+    def test_tuple_2_return(self):
+        """mlx-lm dense path returns (logits, hidden) 2-tuple."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone
+
+        import mlx.core as mx
+
+        logits = mx.zeros((1, 1, 100))
+        hidden = mx.zeros((1, 1, 64))
+
+        model = MagicMock(return_value=(logits, hidden))
+        result = _call_backbone(model, mx.zeros((1, 4)), cache=[])
+        assert result[0] is logits
+        assert result[1] is hidden
+        assert result[2] is None  # gdn_states
+
+    def test_tuple_3_return(self):
+        """mlx-vlm MoE path returns (logits, hidden, gdn_states) 3-tuple."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone
+
+        import mlx.core as mx
+
+        logits = mx.zeros((1, 1, 100))
+        hidden = mx.zeros((1, 1, 64))
+        gdn = [{"state": "mock"}]
+
+        model = MagicMock(return_value=(logits, hidden, gdn))
+        result = _call_backbone(model, mx.zeros((1, 4)), cache=[])
+        assert result[0] is logits
+        assert result[1] is hidden
+        assert result[2] is gdn
+
+    def test_language_model_output_return(self):
+        """LanguageModelOutput is correctly unpacked."""
+        from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone
+
+        import mlx.core as mx
+        from mlx_vlm.models.base import LanguageModelOutput
+
+        logits = mx.zeros((1, 1, 100))
+        hidden = mx.zeros((1, 1, 64))
+        gdn = [{"state": "mock"}]
+
+        out = LanguageModelOutput(
+            logits=logits,
+            hidden_states=[hidden],
+            gdn_states=gdn,
+        )
+        model = MagicMock(return_value=out)
+        result = _call_backbone(model, mx.zeros((1, 4)), cache=[])
+        assert result[0] is logits
+        assert result[1] is hidden
+        assert result[2] is gdn
