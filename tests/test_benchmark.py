@@ -667,6 +667,37 @@ class TestRunBatchTest:
         assert metrics["batch_size"] == 2
 
     @pytest.mark.asyncio
+    async def test_batch_honors_model_specprefill_settings(self):
+        from omlx.model_settings import ModelSettings
+
+        class Core:
+            def __init__(self):
+                self.requests = []
+
+            async def add_request(self, **kwargs):
+                self.requests.append(kwargs)
+                return str(len(self.requests))
+
+            async def stream_outputs(self, request_id):
+                yield SimpleNamespace(
+                    completion_tokens=2, prompt_tokens=4, finished=True
+                )
+
+        core = Core()
+        engine = SimpleNamespace(
+            _engine=core,
+            _model_settings=ModelSettings(
+                specprefill_keep_pct=0.4, specprefill_threshold=100352
+            ),
+        )
+        await _run_batch_test(engine, [[1] * 4, [2] * 4], 4, 2, 2)
+        assert len(core.requests) == 2
+        for sent in core.requests:
+            assert sent["specprefill_keep_pct"] == 0.4
+            assert sent["specprefill_threshold"] == 100352
+            assert sent["skip_cache_store"] is True
+
+    @pytest.mark.asyncio
     async def test_rejects_mismatched_prompt_before_submission(self):
         core = MagicMock()
         engine = SimpleNamespace(_engine=core)

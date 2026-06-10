@@ -31,6 +31,7 @@ from .base import (
     _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    resolve_specprefill_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -1058,18 +1059,7 @@ class BatchedEngine(BaseEngine):
         Shared by ``generate`` and ``stream_generate`` so both request paths
         honour SpecPrefill overrides and the generation prompt marker alike.
         """
-        specprefill_kwargs: dict[str, Any] = {}
-        for key in (
-            "specprefill",
-            "specprefill_keep_pct",
-            "specprefill_threshold",
-            "specprefill_system_end",
-            "generation_prompt_text",
-            "generation_prompt_persists",
-        ):
-            if kwargs.get(key) is not None:
-                specprefill_kwargs[key] = kwargs.pop(key)
-        return specprefill_kwargs
+        return resolve_specprefill_kwargs(kwargs, None)
 
     def _inject_specprefill_system_end(
         self,
@@ -1185,9 +1175,8 @@ class BatchedEngine(BaseEngine):
             logits_observer=kwargs.get("logits_observer"),
         )
 
-        # SpecPrefill: forward per-request overrides to the engine, mirroring
-        # stream_generate so the non-streaming path is not silently ignored.
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
         tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
@@ -1272,8 +1261,8 @@ class BatchedEngine(BaseEngine):
             logits_observer=kwargs.get("logits_observer"),
         )
 
-        # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
         tools = kwargs.pop("tools", None)
 
         engine = self._engine

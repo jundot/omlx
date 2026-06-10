@@ -1092,6 +1092,11 @@ async def _run_batch_test(
             f"got {invalid_lengths}"
         )
 
+    from ..engine.base import resolve_specprefill_kwargs
+
+    specprefill_kwargs = resolve_specprefill_kwargs(
+        {}, getattr(engine, "_model_settings", None)
+    )
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
         temperature=0.0,
@@ -1111,6 +1116,7 @@ async def _run_batch_test(
             prompt=prompt,
             sampling_params=sampling_params,
             skip_cache_store=True,
+            **specprefill_kwargs,
         )
 
         async for output in engine_core.stream_outputs(request_id):
