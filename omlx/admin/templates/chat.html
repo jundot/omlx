@@ -1190,6 +1190,23 @@
                             <i data-lucide="image" class="w-5 h-5"></i>
                         </button>
 
+                        <!-- Video generation controls (video models only) -->
+                        <div x-show="isVideoModel()" class="flex items-center gap-1.5 pl-2 shrink-0">
+                            <select x-model="videoQuality"
+                                class="px-2 py-1.5 text-xs border rounded-lg bg-transparent outline-none"
+                                style="border-color: var(--border-faint); color: var(--text-secondary);">
+                                <option value="draft" x-text="tVideo('chat.video.quality_draft', 'Draft (fast)')"></option>
+                                <option value="standard" x-text="tVideo('chat.video.quality_standard', 'Standard (slow)')"></option>
+                            </select>
+                            <select x-model.number="videoSeconds"
+                                class="px-2 py-1.5 text-xs border rounded-lg bg-transparent outline-none"
+                                style="border-color: var(--border-faint); color: var(--text-secondary);">
+                                <option value="2">2s</option>
+                                <option value="3">3s</option>
+                                <option value="5">5s</option>
+                            </select>
+                        </div>
+
                         <textarea x-ref="messageInput" x-model="inputMessage"
                             @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
                             @input="autoResize($event.target)" @paste="handlePaste($event)"
@@ -1311,6 +1328,8 @@
             // Streaming State
             isStreaming: false,
             videoSubmitting: false,
+            videoQuality: 'standard',
+            videoSeconds: 3,
             streamingContent: '',
             abortController: null,
 
@@ -1926,18 +1945,23 @@
         this.forceScrollToBottom();
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
         try {
-            // Draft preset keeps in-chat latency in the ~2 minute range;
-            // full-quality renders go through the API / future video page.
+            // Quality from the input-bar controls. Draft trades quality
+            // for ~2-6 min latency; standard omits size/steps so the
+            // server defaults apply (tunable in admin settings,
+            // 480x272 / 20 steps out of the box, roughly 8-15 min).
+            const body = {
+                model: this.currentModel,
+                prompt,
+                seconds: this.videoSeconds || 3,
+            };
+            if (this.videoQuality === 'draft') {
+                body.size = '384x224';
+                body.steps = 8;
+            }
             const resp = await fetch('/v1/videos', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...auth },
-                body: JSON.stringify({
-                    model: this.currentModel,
-                    prompt,
-                    size: '384x224',
-                    seconds: 2,
-                    steps: 8,
-                }),
+                body: JSON.stringify(body),
             });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));

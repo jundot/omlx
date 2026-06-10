@@ -788,7 +788,9 @@
       "generating": "视频生成中...",
       "need_prompt": "输入一句提示词，用这个模型生成视频。",
       "cancel": "取消",
-      "cancelled": "已取消视频生成。"
+      "cancelled": "已取消视频生成。",
+      "quality_draft": "草稿（快）",
+      "quality_standard": "标准（慢）"
     }
   }
 }

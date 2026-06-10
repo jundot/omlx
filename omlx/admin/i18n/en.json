@@ -790,7 +790,9 @@
       "generating": "Generating video...",
       "need_prompt": "Type a prompt to generate a video with this model.",
       "cancel": "Cancel",
-      "cancelled": "Video generation cancelled."
+      "cancelled": "Video generation cancelled.",
+      "quality_draft": "Draft (fast)",
+      "quality_standard": "Standard (slow)"
     }
   }
 }
