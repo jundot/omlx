@@ -1935,13 +1935,17 @@
         // run server-side and queue, so the user may submit more prompts
         // while one renders; videoSubmitting only debounces the POST.
         this.videoSubmitting = true;
-        const msg = {
+        this.messages.push({
             role: 'assistant',
             content: '',
             model: this.currentModel,
             _video: { status: 'queued', progress: 0, phase: '', url: null, error: null, job_id: null, cancelled: false },
-        };
-        this.messages.push(msg);
+        });
+        // CRITICAL: mutate through the reactive proxy, not the raw object.
+        // Alpine only tracks writes made via the proxy returned by the
+        // reactive array; writes to the raw reference leave the bubble
+        // frozen at 0% forever (progress, url and error all invisible).
+        const msg = this.messages[this.messages.length - 1];
         this.forceScrollToBottom();
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
         try {
