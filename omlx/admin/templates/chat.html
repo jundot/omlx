@@ -1661,10 +1661,12 @@
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
 
-            // Filter out audio/embedding/reranker — chat only works with LLM/VLM
+            // Allowlist: chat only works with LLM/VLM. Any other type
+            // (audio_*, embedding, reranker, video, future ones) has its
+            // own endpoint and must not appear in the picker.
             this.availableModels = allModels.filter(m => {
-                const t = (this.modelTypeMap[m.id] || '').toLowerCase();
-                return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                const t = (this.modelTypeMap[m.id] || m.model_type || 'llm').toLowerCase();
+                return t === 'llm' || t === 'vlm';
             });
             // Get default model from health endpoint
             let defaultModel = null;
