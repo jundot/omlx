@@ -252,3 +252,22 @@ class TestVideoAutoRouting:
         """Auto-routing replaced the magic model switch."""
         body = _function_body(chat_source, "startVideoExtend")
         assert "selectModel(" not in body
+
+
+class TestSessionRestore:
+    """A reload must reopen the last-open chat: video jobs keep running
+    server-side and loadChat rehydrates their bubbles, but only if the
+    chat is actually reopened -- a blank view reads as 'my videos
+    disappeared' while the worker is still rendering."""
+
+    def test_init_restores_last_chat(self, chat_source):
+        body = _function_body(chat_source, "init")
+        assert "omlx_chat_current_id" in body
+        assert "loadChat(" in body
+
+    @pytest.mark.parametrize("fn", ["loadChat", "startNewChat", "sendMessage"])
+    def test_current_chat_id_persisted(self, chat_source, fn):
+        body = _function_body(chat_source, fn)
+        assert "omlx_chat_current_id" in body, (
+            f"{fn} must persist the current chat id for reload restore"
+        )
