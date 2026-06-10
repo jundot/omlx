@@ -197,6 +197,21 @@ class TestTTSEndpointBasic:
         )
         assert response.status_code == 200
 
+    def test_post_speech_rejects_unsupported_format(self, server_tts_client):
+        """Unsupported response_format gets 400, not silently-WAV bytes."""
+        client, _ = server_tts_client
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "qwen3-tts", "input": "Hello", "response_format": "mp3"},
+        )
+        assert response.status_code == 400
+        detail = response.json().get("detail") or response.json().get("error", {}).get(
+            "message", ""
+        )
+        # The error must name both the rejected format and the supported one.
+        assert "mp3" in detail
+        assert "wav" in detail.lower()
+
     def test_response_is_audio_bytes(self, server_tts_client):
         """Response body is non-empty bytes."""
         client, _ = server_tts_client
@@ -453,7 +468,7 @@ class TestTTSStreaming:
             assert call.kwargs.get("max_tokens") == 512
 
     def test_streaming_rejects_non_wav_response_format(self, server_tts_client):
-        """stream=true only supports response_format=wav in phase 1."""
+        """The response_format guard covers the streaming path too."""
         client, _ = server_tts_client
         response = client.post(
             "/v1/audio/speech",

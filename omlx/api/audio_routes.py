@@ -619,13 +619,18 @@ async def create_speech(request: AudioSpeechRequest):
 
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+    # Only WAV is produced (no transcoding); reject unsupported response_format
+    # with a clear 400 instead of silently returning WAV. (#753, #1013)
+    if request.response_format not in (None, "wav"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format '{request.response_format}' is not supported; "
+                "only 'wav' is currently available"
+            ),
+        )
     streaming_interval = DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
     if request.stream:
-        if request.response_format not in (None, "wav"):
-            raise HTTPException(
-                status_code=400,
-                detail="Streaming TTS currently only supports response_format='wav'",
-            )
         streaming_interval = _resolve_tts_streaming_interval(request)
 
     audio_bytes = _decode_ref_audio_base64(request)
