@@ -187,3 +187,34 @@ class TestVideoI18nKeys:
         data = json.loads(path.read_text(encoding="utf-8"))
         nested = [k for k, v in data.items() if not isinstance(v, str)]
         assert not nested, f"{path.name} has unreachable nested blocks: {nested}"
+
+
+class TestVideoOrientation:
+    """Portrait/landscape composition control for t2v generation. The
+    server's default size is landscape; portrait must be sent explicitly
+    (i2v follows the reference image's aspect and extends pin the source
+    geometry, so the control is a no-op there by design)."""
+
+    def test_generate_video_wires_orientation(self, chat_source):
+        body = _function_body(chat_source, "generateVideo")
+        assert "videoOrientation" in body
+        assert "224x384" in body and "272x480" in body, (
+            "portrait must swap both the draft and the standard sizes"
+        )
+
+    def test_orientation_select_in_template(self, chat_source):
+        assert 'x-model="videoOrientation"' in chat_source
+        # Hidden while a continuation is armed (geometry pinned to source)
+        assert re.search(
+            r'x-model="videoOrientation"\s+x-show="!videoExtendFrom"',
+            chat_source,
+        )
+
+    @pytest.mark.parametrize("lang", ["en", "zh"])
+    @pytest.mark.parametrize(
+        "key", ["orient_landscape", "orient_portrait", "orient_tooltip"]
+    )
+    def test_orientation_i18n_keys(self, lang, key):
+        data = json.loads((I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
+        flat_key = f"chat.video.{key}"
+        assert flat_key in data and data[flat_key].strip()

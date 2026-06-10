@@ -1226,6 +1226,13 @@
                                 <option value="3">3s</option>
                                 <option value="5">5s</option>
                             </select>
+                            <select x-model="videoOrientation" x-show="!videoExtendFrom"
+                                class="px-2 py-1.5 text-xs border rounded-lg bg-transparent outline-none"
+                                style="border-color: var(--border-faint); color: var(--text-secondary);"
+                                :title="tVideo('chat.video.orient_tooltip', 'Composition; a reference image or continuation overrides it')">
+                                <option value="landscape" x-text="tVideo('chat.video.orient_landscape', 'Landscape')"></option>
+                                <option value="portrait" x-text="tVideo('chat.video.orient_portrait', 'Portrait')"></option>
+                            </select>
                             <label class="flex items-center gap-1 px-1 text-xs cursor-pointer select-none"
                                    style="color: var(--text-secondary);"
                                    :title="tVideo('chat.video.upscale_tooltip', 'SeedVR2 per-frame upscale after generation')">
@@ -1358,6 +1365,7 @@
             videoQuality: 'standard',
             videoSeconds: 3,
             videoUpscale: false,         // SeedVR2 1080p upscale toggle
+            videoOrientation: 'landscape', // 'landscape' | 'portrait' (t2v composition)
             videoExtendFrom: null,       // { jobId } set by the extend button
             streamingContent: '',
             abortController: null,
@@ -2070,14 +2078,23 @@
             // for ~2-6 min latency; standard omits size/steps so the
             // server defaults apply (tunable in admin settings,
             // 480x272 / 20 steps out of the box, roughly 8-15 min).
+            // Composition: portrait swaps the frame dimensions. With a
+            // reference image (i2v) the aspect follows the image instead
+            // (mlx-gen treats the requested size as a target area), and
+            // extends pin the source geometry -- both make this a no-op.
+            const portrait = this.videoOrientation === 'portrait';
             const body = {
                 model: this.currentModel,
                 prompt,
                 seconds: this.videoSeconds || 3,
             };
             if (this.videoQuality === 'draft') {
-                body.size = '384x224';
+                body.size = portrait ? '224x384' : '384x224';
                 body.steps = 8;
+            } else if (portrait) {
+                // The server default size is landscape; portrait must be
+                // explicit (same pixel budget, swapped).
+                body.size = '272x480';
             }
             // Continuation wins over a fresh conditioning image (the server
             // rejects both together); size/fps are pinned server-side to

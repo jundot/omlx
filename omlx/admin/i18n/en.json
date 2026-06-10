@@ -795,5 +795,8 @@
   "chat.video.upscale": "1080p",
   "chat.video.upscale_tooltip": "SeedVR2 per-frame upscale after generation",
   "chat.video.need_image": "This model is image-to-video: attach an image (or use Continue on a finished video).",
-  "chat.video.bad_reference_type": "Video models accept PNG, JPEG or WebP reference images."
+  "chat.video.bad_reference_type": "Video models accept PNG, JPEG or WebP reference images.",
+  "chat.video.orient_landscape": "Landscape",
+  "chat.video.orient_portrait": "Portrait",
+  "chat.video.orient_tooltip": "Composition; a reference image or continuation overrides it"
 }
