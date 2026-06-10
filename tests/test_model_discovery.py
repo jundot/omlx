@@ -2,6 +2,7 @@
 """Tests for model discovery functionality."""
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from omlx.model_discovery import (
     _is_adapter_dir,
     _is_unsupported_model,
     _read_model_context_length,
+    _register_model,
     _resolve_hf_cache_entry,
     detect_model_type,
     discover_models,
@@ -655,6 +657,35 @@ class TestDiscoverModels:
         assert "llama-3b" in models
         assert models["llama-3b"].model_type == "llm"
         assert models["llama-3b"].engine_type == "batched"
+
+    def test_register_model_skips_duplicate_id(self, tmp_path, caplog):
+        """Collision guard: a second model with an already-registered model_id is
+        skipped (first registration kept), not silently overwritten, and the
+        collision is logged naming both the kept and the skipped path."""
+        # A real, registerable model dir — without the guard this WOULD overwrite.
+        second = tmp_path / "dup"
+        second.mkdir()
+        (second / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (second / "model.safetensors").write_bytes(b"0" * 1000)
+
+        original = DiscoveredModel(
+            model_id="dup",
+            model_path="/first/dup",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=123,
+        )
+        models = {"dup": original}
+        with caplog.at_level(logging.WARNING):
+            _register_model(models, second, "dup")
+
+        # Guard kept the first registration rather than overwriting it.
+        assert models["dup"] is original
+        assert models["dup"].model_path == "/first/dup"
+        # ...and surfaced the collision, naming both the kept and the skipped path.
+        assert "Duplicate model_id 'dup'" in caplog.text
+        assert "/first/dup" in caplog.text
+        assert str(second) in caplog.text
 
     def test_discover_model_dir_is_itself_a_model(self, tmp_path):
         """Test that pointing directly at a model directory works."""

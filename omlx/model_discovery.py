@@ -1052,6 +1052,12 @@ def _register_model(
     source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
+    if model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {model_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
     try:
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
