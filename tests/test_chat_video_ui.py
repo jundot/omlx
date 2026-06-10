@@ -112,26 +112,28 @@ class TestVideoImageToVideoUI:
         )
         assert re.search(
             r"if\s*\(\s*this\.videoExtendFrom\s*\)"
-            r"[\s\S]*?else\s+if\s*\([^)]*videoAcceptsImage\(\)[^)]*\)",
+            r"[\s\S]*?else\s+if\s*\([\s\S]*?routedPipeline[\s\S]*?\)",
             body,
         ), (
             "input_reference must only be attached in the else branch of "
-            "the videoExtendFrom check"
+            "the videoExtendFrom check, gated on the routed pipeline"
         )
 
     @pytest.mark.parametrize("fn", ["handleDrop", "handlePaste"])
-    def test_image_intake_open_for_i2v_models(self, chat_source, fn):
-        """Drag-drop and paste must accept images for i2v-capable video
-        models, not just VLMs (these handlers are not async)."""
+    def test_image_intake_open_for_video_models(self, chat_source, fn):
+        """Drag-drop and paste must accept images whenever ANY video model
+        is selected and an i2v-capable one exists (generateVideo
+        auto-routes); these handlers are not async."""
         body = _function_body(chat_source, fn)
-        assert "videoAcceptsImage()" in body, (
-            f"{fn} must allow images when videoAcceptsImage(), or i2v "
+        assert "videoCanUseImage()" in body, (
+            f"{fn} must allow images when videoCanUseImage(), or video "
             "models can never receive a conditioning image"
         )
 
     def test_upload_button_gated_on_vision_or_video_image(self, chat_source):
-        """The image upload button must show for VLMs and i2v video models."""
-        assert 'x-show="hasVisionSupport() || videoAcceptsImage()"' in chat_source
+        """The image upload button must show for VLMs and video models
+        with an i2v-capable model installed."""
+        assert 'x-show="hasVisionSupport() || videoCanUseImage()"' in chat_source
 
     @pytest.mark.parametrize("fn", ["startVideoExtend", "findExtendModel"])
     def test_extend_helpers_exist(self, chat_source, fn):
@@ -218,3 +220,35 @@ class TestVideoOrientation:
         data = json.loads((I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
         flat_key = f"chat.video.{key}"
         assert flat_key in data and data[flat_key].strip()
+
+
+class TestVideoAutoRouting:
+    """generateVideo routes between the installed wan checkpoints by
+    request shape (image/continuation -> i2v-capable, text -> t2v-capable)
+    so users never have to know which checkpoint does what."""
+
+    def test_resolve_video_model_exists(self, chat_source):
+        body = _function_body(chat_source, "resolveVideoModel")
+        assert "findExtendModel()" in body
+        assert "'t2v'" in body and "'i2v'" in body
+
+    def test_generate_video_uses_routed_model(self, chat_source):
+        body = _function_body(chat_source, "generateVideo")
+        assert "resolveVideoModel(" in body
+        assert "model: routedModel" in body, (
+            "both the POST body and the bubble must carry the routed model"
+        )
+        assert "model: this.currentModel," not in body.split("_video:")[1], (
+            "the request must not fall back to the raw selection"
+        )
+
+    def test_picker_badges_show_pipeline(self, chat_source):
+        assert 'x-text="videoBadge(model.id)"' in chat_source
+        body = _function_body(chat_source, "videoBadge")
+        for key in ("badge_t2v", "badge_i2v", "badge_ti2v"):
+            assert key in body
+
+    def test_extend_arming_does_not_switch_models(self, chat_source):
+        """Auto-routing replaced the magic model switch."""
+        body = _function_body(chat_source, "startVideoExtend")
+        assert "selectModel(" not in body
