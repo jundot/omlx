@@ -906,3 +906,210 @@ class TestTargetPrefillLeftoverCleanup:
         # Entry cleanup must restore the genuine rope before prefill runs
         assert seen["rope"] is genuine
         assert layer.self_attn.rope is genuine
+
+
+class TestResolveSpecprefillKwargs:
+    """Issue #1263 — per-model SpecPrefill settings reach the request.
+
+    The server only injects settings on the OpenAI chat route; every other
+    entry point (admin benchmark, non-streaming chat, /v1/completions,
+    /v1/messages) used to drop them. The engine-level helper applies the
+    model-settings fallback at the add_request chokepoint instead.
+    """
+
+    def _resolve(self, kwargs, settings):
+        from omlx.engine.base import resolve_specprefill_kwargs
+
+        return resolve_specprefill_kwargs(kwargs, settings)
+
+    def test_settings_fill_missing_values(self):
+        from omlx.model_settings import ModelSettings
+
+        settings = ModelSettings(
+            specprefill_keep_pct=0.1, specprefill_threshold=32768
+        )
+        resolved = self._resolve({}, settings)
+        assert resolved == {
+            "specprefill_keep_pct": 0.1,
+            "specprefill_threshold": 32768,
+        }
+
+    def test_request_value_wins_over_settings(self):
+        from omlx.model_settings import ModelSettings
+
+        settings = ModelSettings(
+            specprefill_keep_pct=0.1, specprefill_threshold=32768
+        )
+        kwargs = {"specprefill_keep_pct": 0.4, "specprefill_threshold": 2048}
+        resolved = self._resolve(kwargs, settings)
+        assert resolved["specprefill_keep_pct"] == 0.4
+        assert resolved["specprefill_threshold"] == 2048
+
+    def test_no_request_no_settings_yields_empty(self):
+        from omlx.model_settings import ModelSettings
+
+        assert self._resolve({}, ModelSettings()) == {}
+
+    def test_none_model_settings(self):
+        assert self._resolve({"specprefill_threshold": 4096}, None) == {
+            "specprefill_threshold": 4096
+        }
+
+    def test_kwargs_are_consumed(self):
+        kwargs = {
+            "specprefill": True,
+            "specprefill_keep_pct": 0.3,
+            "specprefill_threshold": 1024,
+            "specprefill_system_end": 17,
+            "unrelated": "stays",
+        }
+        resolved = self._resolve(kwargs, None)
+        assert kwargs == {"unrelated": "stays"}
+        assert resolved == {
+            "specprefill": True,
+            "specprefill_keep_pct": 0.3,
+            "specprefill_threshold": 1024,
+            "specprefill_system_end": 17,
+        }
+
+    def test_enable_flag_not_defaulted_from_settings(self):
+        """The enable flag stays request-only: engine_core already enables
+        SpecPrefill whenever the draft model is loaded, so the helper must
+        not inject specprefill=True/False from settings."""
+        from omlx.model_settings import ModelSettings
+
+        settings = ModelSettings(specprefill_enabled=True)
+        assert "specprefill" not in self._resolve({}, settings)
+
+
+class _FakeCoreEngine:
+    """Minimal AsyncEngineCore stand-in recording add_request/generate kwargs."""
+
+    def __init__(self):
+        self.add_request_kwargs = None
+        self.generate_kwargs = None
+
+    async def add_request(self, **kwargs):
+        self.add_request_kwargs = kwargs
+        return "req-1"
+
+    async def generate(self, **kwargs):
+        from types import SimpleNamespace
+
+        self.generate_kwargs = kwargs
+        return SimpleNamespace(
+            output_text="ok",
+            prompt_tokens=3,
+            completion_tokens=1,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    async def stream_outputs(self, request_id):
+        from types import SimpleNamespace
+
+        yield SimpleNamespace(
+            output_text="ok",
+            new_text="ok",
+            prompt_tokens=3,
+            completion_tokens=1,
+            finished=True,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+        )
+
+    async def abort_request(self, request_id):
+        return True
+
+
+class TestEngineSettingsFallback:
+    """Issue #1263 — BatchedEngine/VLM engines honor per-model SpecPrefill
+    settings on every generation path, not just the OpenAI chat route."""
+
+    def _batched_engine(self, settings):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine("test-model", model_settings=settings)
+        engine._loaded = True
+        engine._engine = _FakeCoreEngine()
+        return engine
+
+    def _vlm_engine(self, settings):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        engine = VLMBatchedEngine("test-model", model_settings=settings)
+        engine._loaded = True
+        engine._engine = _FakeCoreEngine()
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_batched_stream_generate_falls_back_to_settings(self):
+        """Benchmark path: stream_generate with no explicit kwargs."""
+        from omlx.model_settings import ModelSettings
+
+        engine = self._batched_engine(
+            ModelSettings(specprefill_keep_pct=0.1, specprefill_threshold=65536)
+        )
+        async for _ in engine.stream_generate(prompt="hi", max_tokens=4):
+            pass
+        sent = engine._engine.add_request_kwargs
+        assert sent["specprefill_keep_pct"] == 0.1
+        assert sent["specprefill_threshold"] == 65536
+
+    @pytest.mark.asyncio
+    async def test_batched_stream_generate_request_override_wins(self):
+        from omlx.model_settings import ModelSettings
+
+        engine = self._batched_engine(ModelSettings(specprefill_threshold=65536))
+        async for _ in engine.stream_generate(
+            prompt="hi", max_tokens=4, specprefill_threshold=2048
+        ):
+            pass
+        assert engine._engine.add_request_kwargs["specprefill_threshold"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_batched_generate_forwards_specprefill(self):
+        """Non-streaming path (engine.chat) used to drop the kwargs entirely."""
+        from omlx.model_settings import ModelSettings
+
+        engine = self._batched_engine(ModelSettings(specprefill_threshold=32768))
+        await engine.generate(
+            prompt="hi", max_tokens=4, specprefill_keep_pct=0.25
+        )
+        sent = engine._engine.generate_kwargs
+        assert sent["specprefill_keep_pct"] == 0.25
+        assert sent["specprefill_threshold"] == 32768
+
+    @pytest.mark.asyncio
+    async def test_batched_no_settings_sends_nothing(self):
+        """No settings, no kwargs → engine_core/scheduler defaults apply."""
+        engine = self._batched_engine(None)
+        async for _ in engine.stream_generate(prompt="hi", max_tokens=4):
+            pass
+        sent = engine._engine.add_request_kwargs
+        assert "specprefill_threshold" not in sent
+        assert "specprefill_keep_pct" not in sent
+
+    @pytest.mark.asyncio
+    async def test_vlm_stream_generate_falls_back_to_settings(self):
+        from omlx.model_settings import ModelSettings
+
+        engine = self._vlm_engine(
+            ModelSettings(specprefill_keep_pct=0.1, specprefill_threshold=65536)
+        )
+        async for _ in engine.stream_generate(prompt=[1, 2, 3], max_tokens=4):
+            pass
+        sent = engine._engine.add_request_kwargs
+        assert sent["specprefill_keep_pct"] == 0.1
+        assert sent["specprefill_threshold"] == 65536
+
+    @pytest.mark.asyncio
+    async def test_vlm_generate_forwards_specprefill(self):
+        from omlx.model_settings import ModelSettings
+
+        engine = self._vlm_engine(ModelSettings(specprefill_threshold=32768))
+        await engine.generate(prompt=[1, 2, 3], max_tokens=4)
+        assert engine._engine.generate_kwargs["specprefill_threshold"] == 32768
