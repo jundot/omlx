@@ -1786,18 +1786,28 @@
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (chat) {
             this.currentChatId = chatId;
-            // In-flight video bubbles cannot survive a reload (the polling
-            // closure and blob URL are gone); mark them interrupted so the
-            // progress UI does not spin forever.
-            this.messages = (chat.messages || []).map(m => {
-                if (m && m._video && !m._video.url && !m._video.error) {
-                    m._video.error = 'interrupted';
-                    if (!m.content) {
-                        m.content = `\`${m._video.job_id || 'video job'}\` interrupted (page reloaded; the file is still on the server)`;
+            this.messages = chat.messages || [];
+            // Re-attach video bubbles. Persisted blob: URLs are DEAD links
+            // (session-scoped) -- a <video> bound to one renders but never
+            // plays. Strip them, then rehydrate from the server by job id.
+            // Mutate via the reactive proxies (this.messages elements),
+            // never the raw parsed objects (Alpine ignores raw writes).
+            for (const m of this.messages) {
+                if (!m || !m._video) continue;
+                if (m._video.url && String(m._video.url).startsWith('blob:')) {
+                    m._video.url = null;
+                }
+                if (!m._video.url) {
+                    if (m._video.job_id) {
+                        this.rehydrateVideo(m);
+                    } else if (!m._video.error) {
+                        m._video.error = 'interrupted';
+                        if (!m.content) {
+                            m.content = 'video job interrupted (no job id recorded)';
+                        }
                     }
                 }
-                return m;
-            });
+            }
             this.systemPrompt = chat.systemPrompt || '';
             if (chat.model) {
                 this.currentModel = chat.model;
@@ -1816,6 +1826,12 @@
 
         // Strip base64 image data from content arrays to avoid localStorage quota issues
         const messagesForStorage = this.messages.map(msg => {
+            // Blob URLs are session-scoped: persisting one stores a dead
+            // link that renders an unplayable <video> after reload. Keep
+            // job_id/status so loadChat can rehydrate from the server.
+            if (msg._video && msg._video.url) {
+                msg = { ...msg, _video: { ...msg._video, url: null } };
+            }
             if (!Array.isArray(msg.content)) return msg;
             return {
                 ...msg,
@@ -1977,31 +1993,7 @@
             const job = await resp.json();
             msg._video.job_id = job.id;
             this.videoSubmitting = false;
-            // Poll until terminal (or cancelled via the bubble button)
-            for (;;) {
-                await new Promise(r => setTimeout(r, 4000));
-                if (msg._video.cancelled) return;
-                const s = await fetch(`/v1/videos/${job.id}`, { headers: auth });
-                if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
-                const j = await s.json();
-                if (msg._video.cancelled) return;
-                msg._video.status = j.status;
-                msg._video.progress = j.progress || 0;
-                msg._video.phase = j.phase || '';
-                if (j.status === 'completed') {
-                    const c = await fetch(`/v1/videos/${job.id}/content`, { headers: auth });
-                    if (!c.ok) throw new Error(`content HTTP ${c.status}`);
-                    const blob = await c.blob();
-                    msg._video.url = URL.createObjectURL(blob);
-                    // Text record survives reloads (the blob URL does not)
-                    msg.content = `\`${job.id}\` (${j.wall_seconds || '?'}s, ${j.size}, seed ${j.seed})`;
-                    break;
-                }
-                if (j.status === 'failed') {
-                    const e = j.error || {};
-                    throw new Error(e.code ? `${e.code}: ${e.message}` : 'generation failed');
-                }
-            }
+            await this.pollVideo(msg);
         } catch (e) {
             msg._video.error = String(e.message || e);
             msg.content = `Error: ${msg._video.error}`;
@@ -2010,6 +2002,89 @@
             this.saveCurrentChat();
             this.forceScrollToBottom();
         }
+    },
+
+            // Poll a job until terminal; throws on failure so callers set
+            // the error state. Reused by generateVideo and rehydrateVideo.
+            async pollVideo(msg) {
+        const v = msg._video;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        for (;;) {
+            await new Promise(r => setTimeout(r, 4000));
+            if (v.cancelled) return;
+            const s = await fetch(`/v1/videos/${v.job_id}`, { headers: auth });
+            if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
+            const j = await s.json();
+            if (v.cancelled) return;
+            v.status = j.status;
+            v.progress = j.progress || 0;
+            v.phase = j.phase || '';
+            if (j.status === 'completed') {
+                await this.attachVideoContent(msg, j);
+                return;
+            }
+            if (j.status === 'failed') {
+                const e = j.error || {};
+                throw new Error(e.code ? `${e.code}: ${e.message}` : 'generation failed');
+            }
+        }
+    },
+
+            async attachVideoContent(msg, j) {
+        const v = msg._video;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        const c = await fetch(`/v1/videos/${v.job_id}/content`, { headers: auth });
+        if (!c.ok) throw new Error(`content HTTP ${c.status}`);
+        const blob = await c.blob();
+        v.url = URL.createObjectURL(blob);
+        msg.content = `\`${v.job_id}\` (${j.wall_seconds || '?'}s, ${j.size}, seed ${j.seed})`;
+    },
+
+            // Re-attach a video bubble after a page reload. Blob URLs are
+            // session-scoped (a persisted one is a dead link), but the
+            // artifact lives on the server: completed jobs re-fetch the
+            // mp4, still-running jobs resume polling, purged artifacts
+            // surface the retention note.
+            async rehydrateVideo(msg) {
+        const v = msg._video;
+        if (!v || !v.job_id || v.url) return;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        try {
+            const s = await fetch(`/v1/videos/${v.job_id}`, { headers: auth });
+            if (s.status === 404) {
+                if (!v.error) v.error = 'expired';
+                if (!msg.content) msg.content = `\`${v.job_id}\` no longer on the server`;
+                this.saveCurrentChat();
+                return;
+            }
+            if (!s.ok) return; // transient: keep persisted state
+            const j = await s.json();
+            v.status = j.status;
+            v.progress = j.progress || 0;
+            v.phase = j.phase || '';
+            if (j.status === 'completed') {
+                try {
+                    await this.attachVideoContent(msg, j);
+                    v.error = null;
+                } catch (e) {
+                    v.error = 'artifact_expired';
+                    msg.content = `\`${v.job_id}\` artifact purged by the retention policy`;
+                }
+            } else if (j.status === 'failed') {
+                const e2 = j.error || {};
+                v.error = e2.code ? `${e2.code}: ${e2.message}` : 'failed';
+                if (!msg.content) msg.content = `Error: ${v.error}`;
+            } else {
+                // Still running server-side: resume live polling
+                v.error = null;
+                v.cancelled = false;
+                this.pollVideo(msg).catch((e3) => {
+                    v.error = String(e3.message || e3);
+                    msg.content = `Error: ${v.error}`;
+                }).finally(() => this.saveCurrentChat());
+            }
+            this.saveCurrentChat();
+        } catch (e) { /* network hiccup: keep persisted state */ }
     },
 
             async cancelVideo(msg) {
