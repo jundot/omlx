@@ -747,13 +747,17 @@ async def get_engine(
             if _server_state.default_model
             else None
         )
+        _default_type = getattr(_default_entry, "model_type", None)
         if (
             engine_type == EngineType.LLM
             and _server_state.global_settings
             and _server_state.global_settings.model.model_fallback
             and _server_state.default_model
-            and _default_entry is not None
-            and _default_entry.model_type in ("llm", "vlm")
+            # Block fallback only onto a KNOWN non-chat type; unknown
+            # entries (or non-string types from test doubles) preserve
+            # the old fallback behavior.
+            and (not isinstance(_default_type, str)
+                 or _default_type in ("llm", "vlm"))
         ):
             logger.info(
                 f"Model '{model_id}' not found, falling back to "
