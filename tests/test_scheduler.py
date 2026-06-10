@@ -2813,6 +2813,30 @@ class TestSchedulerBoundarySnapshots:
         args, kwargs = scheduler.block_aware_cache.store_cache.call_args
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
+    def test_think_stripping_template_keeps_prompt_only_store(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        """A template WITHOUT preserve_thinking support keeps the legacy #93
+        prompt-only store via real detection (not just empty model_name)."""
+        (tmp_path / "chat_template.jinja").write_text(
+            "{%- for message in messages %}{{ message.content }}{%- endfor %}"
+        )
+        config = SchedulerConfig(
+            paged_cache_block_size=4, model_name=str(tmp_path)
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = self._reasoning_request()
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt only
+
     def test_template_detection_is_cached(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch
     ):
