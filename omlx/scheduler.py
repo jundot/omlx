@@ -1580,6 +1580,15 @@ class SchedulerConfig:
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
     model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
 
+    # Whether to prefix-cache the generated tokens of thinking requests
+    # (prompts ending with an open <think> tag). None = auto: store them only
+    # when the chat template supports preserve_thinking, because history then
+    # re-renders WITH its <think> blocks and the tokens match the next
+    # request's prompt (issue #1003). False keeps the legacy prompt-only
+    # store — think-stripping templates can never match them, and storing
+    # dead tokens causes prefill/discard thrashing (issue #93).
+    cache_thinking_outputs: bool | None = None
+
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
@@ -2031,6 +2040,11 @@ class Scheduler:
                 "Decode KV cache materialization interval set to %d tokens",
                 self._decode_eval_kv_cache_interval,
             )
+
+        # Lazily detected: does this model's chat template keep <think>
+        # blocks in historical turns (preserve_thinking)? Drives whether
+        # thinking-request outputs are worth prefix-caching (issue #1003).
+        self._template_preserve_thinking: bool | None = None
 
         # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
         # When set, eligible requests bypass mlx-lm BatchGenerator for decode
@@ -6144,6 +6158,40 @@ class Scheduler:
                 return False
 
         return True
+
+    def _should_cache_thinking_outputs(self) -> bool:
+        """Whether generated tokens of thinking requests are worth caching.
+
+        With ``preserve_thinking`` (auto-enabled when the template supports
+        it), historical assistant turns re-render WITH their <think> blocks,
+        so a thinking request's generated tokens match the next request's
+        prompt and caching them extends prefix reuse past the prompt
+        boundary (issue #1003). Think-stripping templates can never match
+        them, and storing dead tokens causes prefill/discard thrashing
+        (issue #93) — so those keep the prompt-only store.
+        """
+        if self.config.cache_thinking_outputs is not None:
+            return self.config.cache_thinking_outputs
+        if self._template_preserve_thinking is None:
+            from .model_discovery import detect_preserve_thinking
+
+            try:
+                self._template_preserve_thinking = bool(
+                    detect_preserve_thinking(Path(self.config.model_name))
+                )
+            except Exception:
+                self._template_preserve_thinking = False
+        return self._template_preserve_thinking
+
+    def _cacheable_token_sequence(
+        self, request: "Request", full_token_sequence: list[int]
+    ) -> list[int]:
+        """Token sequence to store in the prefix cache for ``request``."""
+        if getattr(
+            request, "needs_think_prefix", False
+        ) and not self._should_cache_thinking_outputs():
+            return list(request.prompt_token_ids)
+        return full_token_sequence
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
@@ -11103,7 +11151,6 @@ class Scheduler:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
-
                             if prompt_boundary_store is not None:
                                 (
                                     token_sequence_to_store,
@@ -11113,13 +11160,14 @@ class Scheduler:
                                 ) = prompt_boundary_store
                                 cacheable_sequence = list(token_sequence_to_store)
                             else:
-                                # For reasoning models, only cache prompt tokens.
-                                # Output contains <think> tokens that the API layer
-                                # strips before the next turn, so they never match.
-                                if getattr(request, "needs_think_prefix", False):
-                                    cacheable_sequence = list(request.prompt_token_ids)
-                                else:
-                                    cacheable_sequence = full_token_sequence
+                                # Thinking requests keep generated tokens only
+                                # when their template renders them in history.
+                                # A boundary snapshot represents prompt tokens
+                                # only, so its sequence is intentionally left
+                                # unchanged by the branch above.
+                                cacheable_sequence = self._cacheable_token_sequence(
+                                    request, full_token_sequence
+                                )
                                 token_sequence_to_store = cacheable_sequence
                                 cache_to_store = request._extracted_cache
                                 model_cache_config = getattr(

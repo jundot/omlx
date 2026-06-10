@@ -2724,6 +2724,119 @@ class TestSchedulerBoundarySnapshots:
         args, kwargs = scheduler.block_aware_cache.store_cache.call_args
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt + output
 
+    @staticmethod
+    def _reasoning_request(request_id="req-think"):
+        request = Request(
+            request_id=request_id,
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        request.num_prompt_tokens = 8
+        request.output_token_ids = [9, 10, 11, 12]
+        request.needs_think_prefix = True
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+        return request
+
+    def test_cleanup_finished_stores_outputs_for_preserve_thinking_template(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        """Issue #1003 — when the template keeps <think> blocks in history
+        (preserve_thinking), the generated tokens DO match the next prompt
+        and must be stored, not carved out."""
+        (tmp_path / "chat_template.jinja").write_text(
+            "{%- if preserve_thinking is true %}<think>{%- endif %}"
+        )
+        config = SchedulerConfig(
+            paged_cache_block_size=4, model_name=str(tmp_path)
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = self._reasoning_request()
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # full sequence
+
+    def test_cache_thinking_outputs_false_overrides_template(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        """Explicit preserve_thinking=False (engine sets the config override)
+        keeps the legacy prompt-only store even on a preserve_thinking
+        template — storing dead tokens causes #93 thrashing."""
+        (tmp_path / "chat_template.jinja").write_text(
+            "{%- if preserve_thinking is true %}<think>{%- endif %}"
+        )
+        config = SchedulerConfig(
+            paged_cache_block_size=4,
+            model_name=str(tmp_path),
+            cache_thinking_outputs=False,
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = self._reasoning_request()
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt only
+
+    def test_cache_thinking_outputs_true_forces_full_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """cache_thinking_outputs=True stores the full sequence even when no
+        template is detectable."""
+        config = SchedulerConfig(
+            paged_cache_block_size=4, cache_thinking_outputs=True
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = self._reasoning_request()
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    def test_template_detection_is_cached(
+        self, mock_model, mock_tokenizer, tmp_path, monkeypatch
+    ):
+        """detect_preserve_thinking runs once; the result is memoized."""
+        import omlx.model_discovery as md
+
+        calls = {"n": 0}
+        real = md.detect_preserve_thinking
+
+        def counting(path):
+            calls["n"] += 1
+            return real(path)
+
+        monkeypatch.setattr(md, "detect_preserve_thinking", counting)
+        (tmp_path / "chat_template.jinja").write_text("preserve_thinking")
+        config = SchedulerConfig(
+            paged_cache_block_size=4, model_name=str(tmp_path)
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        assert scheduler._should_cache_thinking_outputs() is True
+        assert scheduler._should_cache_thinking_outputs() is True
+        assert calls["n"] == 1
+
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer
     ):
