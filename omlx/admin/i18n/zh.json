@@ -796,5 +796,13 @@
   "chat.video.bad_reference_type": "视频模型仅接受 PNG、JPEG 或 WebP 参考图。",
   "chat.video.orient_landscape": "横屏",
   "chat.video.orient_portrait": "竖屏",
-  "chat.video.orient_tooltip": "构图方向；参考图或续写会覆盖此设置"
+  "chat.video.orient_tooltip": "构图方向；参考图或续写会覆盖此设置",
+  "modal.model_settings.video_section": "视频生成默认值",
+  "modal.model_settings.video_hint": "该模型在 /v1/videos 与聊天内生成的默认参数；留空回退到全局视频设置。请求里显式给的参数始终优先。",
+  "modal.model_settings.video_steps": "默认步数",
+  "modal.model_settings.video_fps": "默认帧率",
+  "modal.model_settings.video_seconds": "默认时长（秒）",
+  "modal.model_settings.video_size": "默认尺寸（宽x高）",
+  "modal.model_settings.video_upscale": "自动超分（SeedVR2）",
+  "modal.model_settings.video_upscale_off": "关闭"
 }

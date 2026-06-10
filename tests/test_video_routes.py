@@ -887,3 +887,140 @@ class TestListVideos:
             "first_id": None,
             "last_id": None,
         }
+
+
+class TestModelDefaults:
+    """Per-model video generation defaults (ModelSettings.video_default_*).
+
+    Resolution order: explicit request value > per-model settings > global
+    video settings. The upscale default additionally requires the weights
+    to be present (a model default must not fail every request) and is
+    disabled by an explicit upscale_resolution=0.
+    """
+
+    def _patch_model_settings(self, monkeypatch, **fields):
+        defaults = {
+            "video_default_steps": None,
+            "video_default_fps": None,
+            "video_default_size": None,
+            "video_default_seconds": None,
+            "video_default_upscale_resolution": None,
+        }
+        defaults.update(fields)
+        ms = SimpleNamespace(**defaults)
+        monkeypatch.setattr(
+            omlx_server._server_state,
+            "settings_manager",
+            SimpleNamespace(get_settings=lambda mid: ms),
+        )
+        return ms
+
+    def test_model_defaults_fill_unset_params(self, video_env, monkeypatch):
+        client, manager = video_env()
+        self._patch_model_settings(
+            monkeypatch,
+            video_default_steps=12,
+            video_default_fps=24,
+            video_default_size="384x224",
+            video_default_seconds=2.0,
+        )
+        resp = client.post(
+            "/v1/videos", json={"model": VIDEO_MODEL, "prompt": "a cat"}
+        )
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert job.params["steps"] == 12
+        assert job.params["fps"] == 24
+        assert job.params["width"] == 384 and job.params["height"] == 224
+        # 2.0s * 24fps = 48 -> 4n+1 -> 49
+        assert job.params["frames"] == 49
+
+    def test_explicit_request_beats_model_defaults(self, video_env, monkeypatch):
+        client, manager = video_env()
+        self._patch_model_settings(
+            monkeypatch,
+            video_default_steps=12,
+            video_default_fps=24,
+            video_default_size="384x224",
+            video_default_seconds=2.0,
+        )
+        resp = client.post(
+            "/v1/videos",
+            json={
+                "model": VIDEO_MODEL, "prompt": "a cat",
+                "size": "480x272", "steps": 9, "fps": 16, "seconds": 3,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert job.params["steps"] == 9
+        assert job.params["fps"] == 16
+        assert job.params["width"] == 480 and job.params["height"] == 272
+
+    def test_upscale_default_applied_when_weights_present(
+        self, video_env, monkeypatch, tmp_path
+    ):
+        client, manager = video_env()
+        weights = tmp_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
+        (weights / "transformer").mkdir(parents=True)
+        (weights / "transformer" / "model.safetensors.index.json").write_text("{}")
+        self._patch_model_settings(
+            monkeypatch, video_default_upscale_resolution=1080
+        )
+        resp = client.post(
+            "/v1/videos", json={"model": VIDEO_MODEL, "prompt": "a cat"}
+        )
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert job.params["upscale_resolution"] == 1080
+        assert job.params["upscaler_model_dir"] == str(weights)
+
+    def test_upscale_default_skipped_when_weights_missing(
+        self, video_env, monkeypatch
+    ):
+        client, manager = video_env()
+        self._patch_model_settings(
+            monkeypatch, video_default_upscale_resolution=1080
+        )
+        resp = client.post(
+            "/v1/videos", json={"model": VIDEO_MODEL, "prompt": "a cat"}
+        )
+        # The default is skipped, NOT a 400 -- a model default must not
+        # break every generation on a box without the weights.
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert "upscale_resolution" not in job.params
+
+    def test_explicit_zero_disables_upscale_default(
+        self, video_env, monkeypatch, tmp_path
+    ):
+        client, manager = video_env()
+        weights = tmp_path / "models" / "AbstractFramework" / "seedvr2-3b-8bit"
+        (weights / "transformer").mkdir(parents=True)
+        (weights / "transformer" / "model.safetensors.index.json").write_text("{}")
+        self._patch_model_settings(
+            monkeypatch, video_default_upscale_resolution=1080
+        )
+        resp = client.post(
+            "/v1/videos",
+            json={
+                "model": VIDEO_MODEL, "prompt": "a cat",
+                "upscale_resolution": 0,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert "upscale_resolution" not in job.params
+
+    def test_no_settings_manager_keeps_global_defaults(self, video_env, monkeypatch):
+        client, manager = video_env()
+        monkeypatch.setattr(
+            omlx_server._server_state, "settings_manager", None
+        )
+        resp = client.post(
+            "/v1/videos", json={"model": VIDEO_MODEL, "prompt": "a cat"}
+        )
+        assert resp.status_code == 200, resp.text
+        job = manager.test_submitted[0]
+        assert job.params["width"] == 480 and job.params["height"] == 272
+        assert job.params["steps"] == 20

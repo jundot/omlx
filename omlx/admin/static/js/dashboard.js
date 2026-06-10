@@ -1712,6 +1712,12 @@
                     aligner_model: settings.aligner_model || '',
                     aligner_max_audio_seconds: settings.aligner_max_audio_seconds ?? null,
                     default_aligner_overflow: settings.default_aligner_overflow || '',
+                    // Video generation defaults (video models)
+                    video_default_steps: settings.video_default_steps ?? null,
+                    video_default_fps: settings.video_default_fps ?? null,
+                    video_default_size: settings.video_default_size || '',
+                    video_default_seconds: settings.video_default_seconds ?? null,
+                    video_default_upscale_resolution: settings.video_default_upscale_resolution ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1760,6 +1766,11 @@
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
+                                video_default_steps: this.modelSettings.video_default_steps || null,
+                                video_default_fps: this.modelSettings.video_default_fps || null,
+                                video_default_size: this.modelSettings.video_default_size?.trim() || null,
+                                video_default_seconds: this.modelSettings.video_default_seconds || null,
+                                video_default_upscale_resolution: this.modelSettings.video_default_upscale_resolution || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
