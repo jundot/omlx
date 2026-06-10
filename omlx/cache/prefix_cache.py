@@ -35,6 +35,11 @@ from .type_registry import CacheTypeRegistry
 
 logger = logging.getLogger(__name__)
 
+# Cap on the supersede-on-extend lineage map (tip hash -> previous tip hash).
+# Each entry is two 32-byte hashes; the cap only guards against unbounded
+# growth from many distinct conversation chains over a long-lived process.
+_TIP_LINEAGE_MAX_ENTRIES = 4096
+
 
 @dataclass
 class BlockCacheEntry:
@@ -106,6 +111,13 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
+
+        # Supersede-on-extend lineage for rotating (sliding-window) models:
+        # newest tip block hash -> previous tip block hash. When a chain is
+        # extended again, the entry two generations back is stripped of its
+        # rotating payload (see _strip_rotating_payload); the immediate
+        # previous tip is kept intact as the walk-back fallback.
+        self._rotating_tip_lineage: dict[bytes, bytes] = {}
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
@@ -460,6 +472,9 @@ class BlockAwarePrefixCache(CacheManager):
             )
 
         blocks_saved_to_ssd = 0
+        # Supersede-on-extend tracking (rotating models only, see below).
+        first_new_block_idx: int | None = None
+        tip_block_saved = False
 
         for i in range(num_new_blocks):
             start_idx = i * self.block_size
@@ -500,6 +515,8 @@ class BlockAwarePrefixCache(CacheManager):
                     continue
 
             # Allocate new block
+            if first_new_block_idx is None:
+                first_new_block_idx = len(block_table.block_ids)
             block = self.paged_cache.allocate_block()
             if not block:
                 # Handle memory pressure
@@ -639,6 +656,8 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     if saved:
                         blocks_saved_to_ssd += 1
+                        if is_last_block:
+                            tip_block_saved = True
                         logger.debug(
                             f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
@@ -663,6 +682,44 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+        # Supersede-on-extend: on rotating (sliding-window) models every store
+        # of a growing conversation writes one tip block carrying the full
+        # sliding-window state of all rotating layers (hundreds of MB fp16 on
+        # a gemma3-class model). Restore only ever consumes the newest such
+        # block, and the immediate previous tip is kept intact as the
+        # walk-back fallback — so the tip two generations back is dead
+        # weight. Without stripping it, those blocks fill the hot cache after
+        # ~10-20 turns and LRU eviction breaks the prefix chain (multi-turn
+        # cache hit collapses to 0%). Steady state after stripping: two heavy
+        # blocks per chain.
+        if (
+            tip_block_saved
+            and first_new_block_idx is not None
+            and 0 < first_new_block_idx < len(block_table.block_ids)
+            and layer_cache_types
+            and any(
+                CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
+            )
+        ):
+            prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
+            new_tip_id = block_table.block_ids[-1]
+            prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
+            new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
+            if (
+                prev_tip is not None
+                and prev_tip.block_hash is not None
+                and new_tip is not None
+                and new_tip.block_hash is not None
+            ):
+                superseded = self._rotating_tip_lineage.pop(
+                    prev_tip.block_hash, None
+                )
+                if superseded is not None:
+                    self._strip_rotating_payload(superseded)
+                self._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
+                if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                    self._rotating_tip_lineage.clear()
 
         # Update prefix index
         self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
@@ -808,6 +865,78 @@ class BlockAwarePrefixCache(CacheManager):
                             return seq_len
 
         return 0
+
+    def _strip_rotating_payload(self, block_hash: bytes) -> bool:
+        """Replace a superseded tip block's rotating payload with placeholders.
+
+        Sliceable layers (KVCache/TurboQuant slices) in the block are kept —
+        only RotatingKVCache-family layer states are replaced with the same
+        ``(mx.zeros((1,)), mx.zeros((1,)))`` placeholder that non-tip blocks
+        receive at store time, so restore treats the stripped block exactly
+        like any other placeholder block (walk-back or reject).
+
+        The rewrite goes through ``forget_block()`` + ``save_block()``: the
+        hot-cache entry is removed via ``_hot_cache_remove`` (which also
+        forgets the shared-budget accounting) and the slim payload re-enters
+        via ``_hot_cache_put`` (which re-registers it), so the hot-cache and
+        shared-budget byte counters stay consistent. In SSD mode the slim
+        payload is re-enqueued and overwrites the same hash-derived file
+        path.
+
+        Returns:
+            True if the block was rewritten with at least one layer stripped.
+        """
+        if self.paged_ssd_cache is None or not HAS_MLX:
+            return False
+        try:
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            if not data or not meta:
+                return False
+            types = meta.get("layer_cache_types") or []
+            new_data: list[Any] = []
+            stripped = 0
+            for i, layer in enumerate(data):
+                type_name = types[i] if i < len(types) else "KVCache"
+                if (
+                    CacheTypeRegistry.is_rotating_family(type_name)
+                    and isinstance(layer, (list, tuple))
+                    and len(layer) >= 2
+                    and hasattr(layer[0], "shape")
+                    and tuple(layer[0].shape) != (1,)
+                ):
+                    new_data.append((mx.zeros((1,)), mx.zeros((1,))))
+                    stripped += 1
+                else:
+                    new_data.append(layer)
+            if stripped == 0:
+                return False
+            # save_block dedups on an existing hash, so drop the old entry
+            # (hot cache, pending writes, SSD index) first. The brief gap is
+            # benign: a concurrent restore either already loaded the old
+            # payload or sees the placeholder version, which the
+            # walk-back/reject path handles like any partial match.
+            self.paged_ssd_cache.forget_block(block_hash)
+            saved = self.paged_ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=new_data,
+                token_count=int(meta.get("token_count") or self.block_size),
+                model_name=meta.get("model_name", self.paged_cache.model_name),
+                layer_cache_types=types or None,
+                layer_meta_states=meta.get("layer_meta_states"),
+            )
+            if saved:
+                logger.debug(
+                    "Stripped rotating payload from superseded tip block %s "
+                    "(%d of %d layers)",
+                    block_hash.hex()[:16],
+                    stripped,
+                    len(data),
+                )
+            return bool(saved)
+        except Exception as e:
+            logger.debug("Rotating payload strip failed for %s: %s",
+                         block_hash.hex()[:16], e)
+            return False
 
     def _extract_block_tensor_slice(
         self,

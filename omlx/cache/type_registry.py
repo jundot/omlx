@@ -116,6 +116,27 @@ class CacheTypeRegistry:
         return cls.get_handler(cache_type)
 
     @classmethod
+    def is_rotating_family(cls, class_name: str) -> bool:
+        """Check whether a class name belongs to the RotatingKVCache family.
+
+        Stored blocks serialize ``type(cache).__name__``, so subclasses such
+        as PrefillReadyRotatingKVCache (used for warm-restored caches) appear
+        under their live class name. Callers that need "is this a rotating
+        layer?" must match the family through this registry rather than
+        comparing exact class names.
+
+        Args:
+            class_name: The class name string (e.g., "RotatingKVCache")
+
+        Returns:
+            True if the name maps to a rotating cache type
+        """
+        return cls._class_name_map.get(class_name) in (
+            CacheType.ROTATING_KVCACHE,
+            CacheType.BATCH_ROTATING_KVCACHE,
+        )
+
+    @classmethod
     def detect_cache_type(cls, cache_obj: Any) -> CacheType:
         """Detect cache type from object.
 
