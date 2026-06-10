@@ -684,11 +684,17 @@ worker wired 自缚与 watchdog 语义不变.
   i2v 能力模型, 提交时带 extend_video_id.
 - 视频控件行加 1080p 超分开关 (upscale_resolution=1080).
 
-### 12.6 已知取舍
+### 12.6 已知取舍与降级语义
 
 - 逐帧超分无时序模块, 理论上有闪烁风险; 固定 seed + 单步扩散实测可接受
   程度待真机评估 (mflux 没有 SeedVR2 视频模式, 这是当前运行时的上限).
-- I2V 按条件图长宽比自适应输出尺寸 (请求尺寸按目标面积解释), 续片场景
-  源帧长宽比与请求一致, 无漂移.
+- 超分失败不烧渲染: 权重 shard 在 Wan 加载前逐个预检 (秒级失败);
+  加载后才爆的超分异常降级为交付 output_raw.mp4, job 仍 completed,
+  wire 上带 upscale_error 字段说明降级原因.
+- I2V 按条件图长宽比自适应输出尺寸 (请求尺寸按目标面积解释); 跨网格
+  续片 (如 A14B 源 -> TI2V-5B, 16px vs 32px 网格) 的新段帧由 worker
+  重采样回源尺寸再拼接, 不会在全程去噪后才爆帧尺寸校验.
 - 续片排队期间源产物受 retention 保护; 但 DELETE 源 job 不受保护, 续片
   job 调度时发现源缺失 -> failed (code=extend_source_missing).
+- retention 双上限按整个 blob 目录计量 (含 output_raw.mp4 与参考图),
+  不是只按 output.mp4.
