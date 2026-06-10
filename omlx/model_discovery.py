@@ -23,8 +23,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]
 
 # Diffusers pipeline classes (model_index.json "_class_name") that fmlx can
 # serve via the video engine (docs/video-generation-engine-spec.md). Unknown
@@ -417,6 +417,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     if pipeline_class in VIDEO_PIPELINE_CLASSES:
         return "video"
 
+    # SeedVR2-style upscaler weights: listed but never standalone-invocable.
+    if is_video_upscaler_dir(model_path):
+        return "video_upscaler"
+
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -758,6 +762,25 @@ def read_video_pipeline_kind(path: Path) -> str:
     return ""
 
 
+def is_video_upscaler_dir(path: Path) -> bool:
+    """Detect a prepared SeedVR2-style upscaler dir (AbstractFramework
+    layout): transformer/ + vae/ safetensors indexes at the root, with no
+    model_index.json, no root config.json and no text_encoder/ (which Wan
+    diffusers layouts have). These weights are listed as model_type
+    "video_upscaler" so they are visible, sized and deletable in the model
+    surfaces -- but they are never invocable on their own; the worker uses
+    them via the upscale_resolution parameter of POST /v1/videos.
+    """
+    if (path / "model_index.json").exists() or (path / "config.json").exists():
+        return False
+    if (path / "text_encoder").is_dir():
+        return False
+    return (
+        (path / "transformer" / "model.safetensors.index.json").is_file()
+        and (path / "vae" / "model.safetensors.index.json").is_file()
+    )
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model.
 
@@ -769,7 +792,11 @@ def _is_model_dir(path: Path) -> bool:
     """
     if _is_adapter_dir(path):
         return False
-    return (path / "config.json").exists() or (path / "model_index.json").exists()
+    return (
+        (path / "config.json").exists()
+        or (path / "model_index.json").exists()
+        or is_video_upscaler_dir(path)
+    )
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
@@ -840,6 +867,8 @@ def _register_model(
             engine_type = "audio_sts"
         elif model_type == "video":
             engine_type = "video"
+        elif model_type == "video_upscaler":
+            engine_type = "video_upscaler"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

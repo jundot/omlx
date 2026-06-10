@@ -727,12 +727,22 @@ async def get_engine(
     # 42GB entry never enters the admission/eviction loop (a misrouted
     # chat request must not evict resident LLMs). Spec section 3.
     _entry = pool.get_entry(model_id)
-    if _entry is not None and getattr(_entry, "model_type", "") == "video":
+    _mtype = getattr(_entry, "model_type", "") if _entry is not None else ""
+    if _mtype == "video":
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Model '{model_id}' is a video generation model. "
                 "Use POST /v1/videos."
+            ),
+        )
+    if _mtype == "video_upscaler":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_id}' is a video upscaler and cannot be "
+                "invoked on its own; it runs automatically via the "
+                "upscale_resolution parameter of POST /v1/videos."
             ),
         )
 
@@ -1872,14 +1882,15 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     entry = _server_state.engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
-    if entry.model_type == "video":
+    if entry.model_type in ("video", "video_upscaler"):
         # Pre-pool check: the blanket except below would swallow the typed
         # rejection into a 500 (spec 4.1).
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Model '{model_id}' is a video generation model and is "
-                "not pool-loaded. Use POST /v1/videos."
+                f"Model '{model_id}' is a {entry.model_type} model and is "
+                "never pool-loaded. Video models run via POST /v1/videos; "
+                "the upscaler runs via its upscale_resolution parameter."
             ),
         )
     if entry.engine is not None:
