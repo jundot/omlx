@@ -619,7 +619,7 @@ class VideoSettings:
 
     enabled: bool = False  # Master switch; handlers return 503 when off
     worker_python: str = ""  # Empty = {base_path}/venvs/video/bin/python
-    memory_lease_gb: float = 28.0  # Reserved against the enforcer ceiling per job
+    memory_lease_gb: float = 36.0  # Reserved against the enforcer ceiling per job (P0-calibrated)
     max_queued_jobs: int = 4  # Submissions beyond this 503
     job_timeout_seconds: int = 7200  # Per-run clock, starts at worker spawn
     progress_stall_timeout_seconds: int = 600  # Kill when worker JSONL goes silent
@@ -661,7 +661,7 @@ class VideoSettings:
         return cls(
             enabled=bool(data.get("enabled", False)),
             worker_python=data.get("worker_python", ""),
-            memory_lease_gb=float(data.get("memory_lease_gb", 28.0)),
+            memory_lease_gb=float(data.get("memory_lease_gb", 36.0)),
             max_queued_jobs=int(data.get("max_queued_jobs", 4)),
             job_timeout_seconds=int(data.get("job_timeout_seconds", 7200)),
             progress_stall_timeout_seconds=int(

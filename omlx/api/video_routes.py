@@ -35,13 +35,17 @@ router = APIRouter()
 
 GB = 1024**3
 
-# Provisional per-request peak predictor: peak_gb ~= BASE + COEF * latent
-# megatokens (latent tokens ~= (W/16)*(H/16)*ceil(frames/4)). Calibrated
-# from the P0 measurement matrix on m5max (docs spec 7); recalibrate on
-# every mlx-gen lock bump (spec 9.1).
-_PEAK_BASE_GB = 32.0  # weights + text encoder + fixed overhead (natural mode)
-_PEAK_COEF_GB_PER_MTOK = 35.0
-_PEAK_MARGIN_GB = 3.0
+# Per-request peak predictor, calibrated from the P0 low-RAM measurement
+# matrix on m5max (2026-06-11, mlx-gen==0.18.14 lock; recalibrate on every
+# lock bump, spec 9.1). Empirical findings: peak scales with PER-FRAME
+# spatial latent tokens (W/16 * H/16) and is invariant to frame count and
+# step count (measured: 480x272 49f==101f within 0.2GB; 20 vs 40 steps
+# byte-identical). Low-RAM mode (the worker default): 510 tok -> 18.83GB,
+# 1560 tok -> 21.88GB => BASE 17.5, COEF 0.0029 GB/token. Margin covers
+# the worst observed sub-poll transient (5.29GB per 0.5s) padded.
+_PEAK_BASE_GB = 17.5
+_PEAK_COEF_GB_PER_SPATIAL_TOKEN = 0.0029
+_PEAK_MARGIN_GB = 6.0
 
 
 def _get_video_manager():
@@ -156,9 +160,10 @@ def _normalize_params(
         )
 
     # Memory bound: predicted peak must fit the lease (spec 4.3/4.4). The
-    # static caps above are UX bounds only.
-    latent_mtok = (width / 16) * (height / 16) * math.ceil(frames / 4) / 1e6
-    predicted_gb = _PEAK_BASE_GB + _PEAK_COEF_GB_PER_MTOK * latent_mtok
+    # static caps above are UX bounds only. Peak is frame-count-invariant
+    # (P0 measured), so only per-frame spatial tokens enter the formula.
+    spatial_tokens = (width / 16) * (height / 16)
+    predicted_gb = _PEAK_BASE_GB + _PEAK_COEF_GB_PER_SPATIAL_TOKEN * spatial_tokens
     lease_gb = float(video_settings.memory_lease_gb)
     if predicted_gb + _PEAK_MARGIN_GB > lease_gb:
         raise HTTPException(

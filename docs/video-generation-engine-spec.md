@@ -420,7 +420,7 @@ admin GET/POST + GlobalSettingsRequest 平铺字段 + _settings.html 表单.
 |---|---|---|
 | enabled | false | 总开关; false 时 handler 一律 503 (路由仍挂载, §4.3) |
 | worker_python | "" | video venv 的 python 路径; 空 = {base_path}/venvs/video/bin/python |
-| memory_lease_gb | 28 | P0 实测后校准, 与 lock digest 绑定 |
+| memory_lease_gb | 36 | P0 已校准 (低 RAM 上限角 27.9 + 6 余量, §6), 与 lock digest 绑定 |
 | max_queued_jobs | 4 | 超限提交 503 |
 | job_timeout_seconds | 7200 | 单次运行超时 (spawn 起算), 排队不计 |
 | progress_stall_timeout_seconds | 600 | JSONL 静默杀 (§4.2) |
@@ -488,13 +488,35 @@ uv pip sync --python {base_path}/venvs/video/bin/python omlx/video/requirements.
 合计新增约 1.25k (业务) + 1.5k (测试), 修改约 370, 分布在 8 个上游同源
 文件的小补丁 (§10).
 
-## 6. 初始默认值
+## 6. 初始默认值与 P0 实测记录
 
 生成参数默认 (服务端兜底, 客户端可覆盖, UX 上限受 settings 钳制, 内存
 边界由预测器把守): size 480x272 (16 倍数), seconds 3 (按 fps=16 折 49 帧,
 4n+1), steps 20, guidance 4.0 / guidance_2 3.0 (mlx-gen A14B 模型默认),
-seed 随机. 预期单 job 时长: 按官方 480x240x101 帧 25 步约 30 分钟外推,
-默认参数应落在个位数分钟 -- P0 实测后把默认调到 "5 分钟内出片" 的档位.
+seed 随机. 实测默认档约 8 分钟出片 (含 ~60s 冷加载).
+
+### 6.1 P0 实测 (m5max, M5 Max 128GB, mlx-gen==0.18.14, A14B q8, 2026-06-11)
+
+| 档位 | 参数 | 真峰值 (lifetime ledger) | 用时 | 最差 0.5s 瞬时 |
+|---|---|---|---|---|
+| default (自然) | 480x272, 49f, 20 步 | 49.32 GB | 537s | 10.98 GB |
+| steps40 (自然) | 480x272, 49f, 40 步 | 49.32 GB | 861s | -- |
+| mid_spatial (自然) | 832x480, 49f, 20 步 | 75.46 GB | 2560s | -- |
+| frames101 (自然) | 480x272, 101f, 20 步 | 49.44 GB | 1278s | -- |
+| default (低 RAM) | 480x272, 49f, 20 步 | 18.83 GB | 491s | 3.15 GB |
+| mid_spatial (低 RAM) | 832x480, 49f, 20 步 | 21.88 GB | 2566s | 5.29 GB |
+
+结论 (全部进入实现):
+1. 峰值与步数无关 (49.32 == 49.32 逐字节), 与帧数无关 (49.32 vs 49.44);
+   只随单帧空间 token (W/16 x H/16) 线性增长. 预测器公式据此定为
+   peak = BASE + COEF x spatial_tokens, 帧数不进公式.
+2. 低 RAM 模式 (worker 默认): 内存降 62% 且不慢 (491s vs 537s), 空间缩放
+   也被压平 (3.06x token 只 +3GB). 校准: BASE=17.5, COEF=0.0029 GB/token,
+   margin=6 (最差瞬时 5.29 padded). 上限角 1280x720 预测 27.9+6=33.9,
+   lease 默认 36 可容纳.
+3. 自然模式是无谓的奢侈 (中档分辨率即 75GB), 仅留作 worker 可选项.
+4. 共驻算术: 107.5 ceiling - 36 lease = 71.5GB 留给 LLM, 128GB 机与
+   <=50GB 级模型真共驻成立; 与 85GB 级 (glm4.5) 互斥, job 排队.
 
 ## 7. 测试计划
 
@@ -596,8 +618,7 @@ docs/upstream-sync.md 记一条分化标记.
 
 ## 11. 待拍板的未决问题
 
-1. lease 默认 28GB / 预测器系数 / 默认生成参数档位 -- P0 实测后回填,
-   无需现在拍.
+1. lease 默认 / 预测器系数 / 默认参数档位 -- 已由 P0 实测回填 (§6.1), 关闭.
 2. settings.video.enabled 默认 false (需手动开启) vs 默认 true (venv 缺失
    时 503 指引) -- 倾向 false, 灰度心智.
 3. Xet 修复 (§4.7) 是否拆独立小 PR 先行 (与视频无耦合, 运维价值即时) --

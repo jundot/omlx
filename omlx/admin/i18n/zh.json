@@ -765,5 +765,22 @@
   "cluster.router.unknown": "未知",
   "cluster.healthy.yes": "是",
   "cluster.healthy.no": "否",
-  "cluster.save.failed": "保存失败"
+  "cluster.save.failed": "保存失败",
+  "settings": {
+    "video": {
+      "title": "视频生成",
+      "enabled": "启用视频生成",
+      "enabled_desc": "通过子进程 worker 提供 POST /v1/videos。需要先安装视频 worker venv。",
+      "memory_lease": "内存租约 (GB)",
+      "memory_lease_desc": "任务运行期间从内存上限中预留;共驻的 LLM 会相应限流。",
+      "default_steps": "默认去噪步数",
+      "default_fps": "默认帧率",
+      "max_queued_jobs": "最大排队任务数",
+      "job_timeout": "任务超时 (秒)",
+      "artifacts_max_gb": "产物存储上限 (GB)",
+      "artifacts_max_gb_desc": "超限时清除最旧的视频文件;任务记录保留。",
+      "worker_python": "Worker python 路径",
+      "worker_python_desc": "独立视频 venv 的 python。留空用默认路径。"
+    }
+  }
 }

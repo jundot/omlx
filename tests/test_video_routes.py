@@ -36,13 +36,11 @@ LLM_MODEL = "llama-llm"
 
 
 def _video_settings(**overrides) -> VideoSettings:
-    """Enabled settings with a lease big enough for the peak predictor.
-
-    NOTE the dataclass default memory_lease_gb=28.0 is BELOW the predictor
-    floor (_PEAK_BASE_GB 32 + _PEAK_MARGIN_GB 3 = 35GB), so default settings
-    would 413 every request; tests pass an explicit lease.
-    """
-    params = dict(enabled=True, memory_lease_gb=64.0)
+    """Enabled settings; lease defaults to the dataclass default (36GB,
+    P0-calibrated to admit the caps corner under the spatial-token
+    predictor). Tests that exercise the 413 boundary pass a smaller
+    explicit lease."""
+    params = dict(enabled=True)
     params.update(overrides)
     return VideoSettings(**params)
 
@@ -315,9 +313,10 @@ class TestCapsAndPredictor:
         assert "max_frames" in r.json()["detail"]
 
     def test_peak_predictor_413_when_over_lease(self, video_env):
-        # lease 36GB: predicted = 32 + 35*(80*45*21/1e6) = 34.65GB,
-        # +3 margin = 37.65 > 36 -> 413
-        client, _ = video_env(settings=_video_settings(memory_lease_gb=36.0))
+        # P0-calibrated formula: predicted = 17.5 + 0.0029 * (W/16 * H/16),
+        # frame-count-invariant. 1280x720 -> 3600 spatial tokens ->
+        # 17.5 + 10.44 = 27.94GB, +6 margin = 33.94 > lease 30 -> 413
+        client, _ = video_env(settings=_video_settings(memory_lease_gb=30.0))
         r = _post(client, width=1280, height=720, frames=81)
         assert r.status_code == 413
         detail = r.json()["detail"]
@@ -325,9 +324,24 @@ class TestCapsAndPredictor:
         assert "Predicted memory peak" in detail
 
     def test_peak_predictor_small_request_fits_same_lease(self, video_env):
-        # Same 36GB lease: 480x272x49 predicts 32.23 + 3 = 35.23 < 36 -> ok
-        client, _ = video_env(settings=_video_settings(memory_lease_gb=36.0))
+        # Same 30GB lease: 480x272 -> 510 tokens -> 17.5 + 1.48 = 18.98GB,
+        # +6 margin = 24.98 < 30 -> ok
+        client, _ = video_env(settings=_video_settings(memory_lease_gb=30.0))
         r = _post(client, width=480, height=272, frames=49)
+        assert r.status_code == 200
+
+    def test_peak_predictor_frame_count_invariant(self, video_env):
+        # Frames do not enter the memory formula (P0: 49f == 101f peaks);
+        # a long video at modest resolution must NOT 413.
+        client, _ = video_env(settings=_video_settings(memory_lease_gb=30.0))
+        r = _post(client, width=480, height=272, frames=121)
+        assert r.status_code == 200
+
+    def test_default_lease_admits_cap_corner(self, video_env):
+        # Out-of-the-box settings must admit the caps corner (the v1 bug:
+        # default lease below the predictor floor 413'd everything).
+        client, _ = video_env(settings=_video_settings())
+        r = _post(client, width=1280, height=720)
         assert r.status_code == 200
 
 

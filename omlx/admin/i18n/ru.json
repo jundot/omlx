@@ -742,5 +742,22 @@
   "cluster.router.unknown": "неизвестно",
   "cluster.healthy.yes": "да",
   "cluster.healthy.no": "нет",
-  "cluster.save.failed": "Не удалось сохранить"
+  "cluster.save.failed": "Не удалось сохранить",
+  "settings": {
+    "video": {
+      "title": "Генерация видео",
+      "enabled": "Включить генерацию видео",
+      "enabled_desc": "Обслуживать POST /v1/videos через подпроцесс-воркер. Требуется venv видео-воркера.",
+      "memory_lease": "Резерв памяти (ГБ)",
+      "memory_lease_desc": "Резервируется из лимита памяти на время задачи; LLM соответственно замедляются.",
+      "default_steps": "Шаги диффузии по умолчанию",
+      "default_fps": "FPS по умолчанию",
+      "max_queued_jobs": "Макс. задач в очереди",
+      "job_timeout": "Таймаут задачи (сек)",
+      "artifacts_max_gb": "Лимит хранения (ГБ)",
+      "artifacts_max_gb_desc": "Старые видеофайлы удаляются сверх лимита; записи задач сохраняются.",
+      "worker_python": "Путь к python воркера",
+      "worker_python_desc": "Python изолированного видео-venv. Пусто = путь по умолчанию."
+    }
+  }
 }
