@@ -806,6 +806,17 @@ def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
     """Collect concrete backing arrays from cache objects, not state slices."""
     arrays: list[mx.array] = []
 
+    def _extract(val: Any):
+        if isinstance(val, mx.array):
+            arrays.append(val)
+        elif hasattr(val, "__dataclass_fields__"):
+            import dataclasses
+            for f in dataclasses.fields(val):
+                _extract(getattr(val, f.name))
+        elif isinstance(val, (list, tuple)):
+            for v in val:
+                _extract(v)
+
     if isinstance(cache_obj, mx.array):
         return [cache_obj]
 
@@ -821,8 +832,7 @@ def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
 
     for attr in ("keys", "values", "left_padding", "lengths"):
         value = getattr(cache_obj, attr, None)
-        if isinstance(value, mx.array):
-            arrays.append(value)
+        _extract(value)
 
     return arrays
 
@@ -2292,7 +2302,11 @@ class Scheduler:
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        kv_indices = [
+            i
+            for i, c in enumerate(prompt_cache)
+            if isinstance(c, (KVCache, TurboQuantKVCache))
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
