@@ -330,8 +330,9 @@ def test_predicted_transient_takes_max_and_applies_safety():
     ns = _throttle_ctx(
         current=0, hard=40 * _GB, samples_bpt=5 * 1024 * 1024, monitor=monitor
     )
-    # static per-token at this kv_len:
+    # static per-token at this kv_len: SDPA transient plus the chunk's KV growth.
     static = monitor.estimate_chunk_transient_bytes(1, 100_001)
+    static += monitor.estimate_prompt_kv_bytes(1)
     measured = 5 * 1024 * 1024
     expected_per_token = max(measured, static) * Scheduler._PREFILL_TRANSIENT_SAFETY
     got = ns._predicted_chunk_transient(1, 100_000)
@@ -345,10 +346,11 @@ def test_predicted_transient_static_uses_candidate_chunk_size():
     n_tokens = 512
     kv_len = 100_000
 
-    expected = (
-        monitor.estimate_chunk_transient_bytes(n_tokens, kv_len + n_tokens)
-        * Scheduler._PREFILL_TRANSIENT_SAFETY
+    expected_static = monitor.estimate_chunk_transient_bytes(
+        n_tokens, kv_len + n_tokens
     )
+    expected_static += monitor.estimate_prompt_kv_bytes(n_tokens)
+    expected = expected_static * Scheduler._PREFILL_TRANSIENT_SAFETY
     old_query_one_style = (
         monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
         * n_tokens

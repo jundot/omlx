@@ -2683,9 +2683,8 @@ class Scheduler:
     _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512)
 
     # Safety margin applied to the headroom (hard_cap - current) when sizing
-    # a chunk predictively. The remaining 10% absorbs estimator error and the
-    # newly-allocated KV growth for this chunk that is not yet reflected in
-    # ``current`` (it is eval'd into residency after the forward pass).
+    # a chunk predictively. The remaining 10% absorbs estimator error and
+    # Metal command-buffer overhead above the modeled SDPA + KV growth.
     _PREFILL_HEADROOM_SAFETY: float = 0.90
 
     # Default fraction of the physical abort cap we allow a chunk's predicted
@@ -2702,17 +2701,18 @@ class Scheduler:
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
-        """Conservative predicted Metal transient (bytes) for one prefill chunk.
+        """Conservative predicted Metal peak growth for one prefill chunk.
 
         The per-chunk SDPA/MoE transient scales with ``query_len * kv_len``, so
         the per-token cost GROWS with context length. A long-run EWMA average
         lags that growth and underestimates the next chunk — the cause of the
         Metal command-buffer OOM crash at large kv_len. We therefore take the
         MAX of three signals and apply a safety factor:
-          - the most recently MEASURED per-token transient (last_delta /
-            last_n) — anchored on reality at the current kv_len regime,
+          - the most recently MEASURED per-token growth (last_delta / last_n)
+            — anchored on reality at the current kv_len regime,
           - the long-run EWMA (model-specific constants the static misses),
-          - the kv_len-aware static SDPA estimate.
+          - the kv_len-aware static estimate (SDPA transient + this chunk's
+            newly allocated KV).
         Returns 0 only when nothing is known (first chunk, no model info).
         """
         if n_tokens <= 0:
@@ -2730,6 +2730,7 @@ class Scheduler:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
                 n_tokens, kv_len + n_tokens
             )
+            static += self.memory_monitor.estimate_prompt_kv_bytes(n_tokens)
             per_token = max(per_token, float(static) / n_tokens)
         return per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
 
@@ -2902,12 +2903,12 @@ class Scheduler:
           - Measured: once the per-scheduler EWMA has samples, use its
             ``bytes_per_token`` (× the same 1.2 safety factor ``predict()``
             applies) — this is measurement-based and model-agnostic.
-          - First chunk (no samples yet): fall back to the static SDPA
-            estimate for the requested candidate chunk. ``kv_len`` is the
-            current context span (cached prefix + already-prefilled tokens),
-            so a large prefix-cache hit with a small suffix is throttled
-            correctly without classifying large prefill chunks as vector-path
-            traffic.
+          - First chunk (no samples yet): fall back to the static SDPA + KV
+            growth estimate for the requested candidate chunk. ``kv_len`` is
+            the current context span (cached prefix + already-prefilled
+            tokens), so a large prefix-cache hit with a small suffix is
+            throttled correctly without classifying large prefill chunks as
+            vector-path traffic.
 
         The discrete watermark tiers are retained as a *secondary clamp* —
         they only ever shrink further, never enlarge the predicted size.
@@ -2925,7 +2926,7 @@ class Scheduler:
             loop_label: "external" or "chunked_step", used only for debug
                 log identification.
             kv_len: Current context span (base/cached + processed tokens)
-                used for the first-chunk static transient estimate.
+                used for the first-chunk static peak-growth estimate.
 
         Returns:
             The chunk size to actually process (>= 1, <= requested).
@@ -2938,10 +2939,10 @@ class Scheduler:
         current = self._current_usage_bytes()
         min_chunk = max(1, self._prefill_min_chunk_tokens)
 
-        # Conservative per-token transient (measured-last / EWMA / static, ×
+        # Conservative per-token peak growth (measured-last / EWMA / static, ×
         # safety) — see _predicted_chunk_transient. Anchored on the most recent
-        # measurement so it tracks the transient's growth with kv_len instead
-        # of lagging behind a long-run average.
+        # measurement so it tracks growth with kv_len instead of lagging behind
+        # a long-run average.
         per_token = self._predicted_chunk_transient(requested, kv_len) / requested
         predictor = "measured" if per_token > 0 else "none"
 
