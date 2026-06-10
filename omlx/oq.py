@@ -1183,9 +1183,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
-    
-    if _orig["swapaxes"] is not None:    # <--- 추가
-        mx.swapaxes = _fake_swapaxes     # <--- 추가
+
+    if _orig["swapaxes"] is not None:
+        mx.swapaxes = _fake_swapaxes
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
