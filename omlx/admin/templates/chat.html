@@ -2468,14 +2468,23 @@
     },
 
             async regenerateMessage(index) {
-        if (this.isStreaming) return;
+        if (this.isStreaming || this.videoSubmitting) return;
 
         // Find the user message before this assistant message
         const messagesToKeep = this.messages.slice(0, index);
         this.messages = messagesToKeep;
         this.scheduleEnhanceMessages();
 
-        await this.streamResponse();
+        // Video models must route to /v1/videos, not chat completions
+        // (same branch as sendMessage; the server 400s a video model on
+        // /v1/chat/completions).
+        if (this.isVideoModel()) {
+            const lastUser = [...this.messages].reverse().find(m => m.role === 'user');
+            const prompt = lastUser ? this.getTextContent(lastUser.content).trim() : '';
+            await this.generateVideo(prompt);
+        } else {
+            await this.streamResponse();
+        }
     },
 
     _copyFallback(text) {
@@ -2527,7 +2536,7 @@
     },
 
             async saveEdit(index) {
-        if (!this.editContent.trim() || this.isStreaming) return;
+        if (!this.editContent.trim() || this.isStreaming || this.videoSubmitting) return;
 
         const newContent = this.editContent.trim();
 
@@ -2558,9 +2567,14 @@
         this.editContent = '';
         this.editImages = [];
 
-        // Scroll and get new response
+        // Scroll and get new response. Video models must route to
+        // /v1/videos, not chat completions (same branch as sendMessage).
         this.scrollToBottom();
-        await this.streamResponse();
+        if (this.isVideoModel()) {
+            await this.generateVideo(newContent);
+        } else {
+            await this.streamResponse();
+        }
     },
 
     // Delete chat
