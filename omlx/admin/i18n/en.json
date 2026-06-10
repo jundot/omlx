@@ -784,5 +784,11 @@
       "worker_python": "Worker python path",
       "worker_python_desc": "Python of the isolated video venv. Empty = default path."
     }
+  },
+  "chat": {
+    "video": {
+      "generating": "Generating video...",
+      "need_prompt": "Type a prompt to generate a video with this model."
+    }
   }
 }
