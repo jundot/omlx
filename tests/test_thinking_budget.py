@@ -952,3 +952,18 @@ class TestSoftThinkingBudget:
             logits = self._step(proc, step, _make_logits())  # all zeros, gap->1.0
         progress = (self.BUDGET - 1 - self.SOFT_START) / max(1, self.SPAN)
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * progress)
+
+    def test_multi_token_wrong_prefix_falls_back_to_first_id(self):
+        """A generated tail that matches a LATER marker id (not a proper
+        prefix) must not be treated as a partial close: bias ids[0]."""
+        end_ids = [42, 43]
+        proc = self._make_processor(end_ids=end_ids)
+        in_zone = self.SOFT_START + 2
+        for step in range(1, in_zone):
+            self._step(proc, step, self._ramp_logits(top=5.0))
+        # Model emits the SECOND marker id out of order: not a close prefix.
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), end_ids[1])
+        logits = proc(tokens, self._ramp_logits(top=5.0))
+        assert not proc._done
+        assert logits[0, 42].item() > 0.0  # first id targeted
+        assert logits[0, 43].item() == 0.0  # out-of-order id not boosted
