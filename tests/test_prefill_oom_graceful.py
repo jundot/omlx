@@ -4,7 +4,7 @@ bounded requeue) added to keep coding-agent workloads from hard-failing
 mid-prefill under memory pressure.
 
 Covers:
-  - MemoryMonitor.estimate_chunk_transient_bytes math (head_dim > 128 vs <= 128)
+  - MemoryMonitor.estimate_chunk_transient_bytes math (MLX SDPA dispatch)
   - Scheduler._adaptive_chunk_size predictive sizing (EWMA + static first chunk,
     early-return below the soft watermark, min-chunk floor, bucket clamp)
   - Scheduler._requeue_or_fail_prefill budget behavior + error-type gating
@@ -20,8 +20,7 @@ import pytest
 
 from omlx import scheduler as sched_mod
 from omlx.memory_monitor import (
-    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
-    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     MemoryMonitor,
 )
 from omlx.prefill_transient_tracker import PrefillTransientTracker
@@ -47,17 +46,12 @@ def _monitor(head_dim):
     return m
 
 
-def test_chunk_transient_head_dim_gt_128_scales_with_kv_len():
-    """head_dim > 128 → SDPA uses tiled scratch plus output buffer."""
+def test_chunk_transient_unsupported_vector_head_dim_scales_with_kv_len():
+    """head_dim=192 is unsupported by vector/full MLX SDPA and falls back."""
     m = _monitor(head_dim=192)
     n_q, hd = 32, 192
     n_tokens, kv_len = 4, 10_000
-    expected = (
-        n_q
-        * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-        * kv_len
-        * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-    )
+    expected = n_q * n_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
     expected += n_q * n_tokens * hd * 4
     assert m.estimate_chunk_transient_bytes(n_tokens, kv_len) == expected
     # Doubling kv_len roughly doubles the transient (kv term dominates).
@@ -65,14 +59,14 @@ def test_chunk_transient_head_dim_gt_128_scales_with_kv_len():
     assert bigger > expected
 
 
-def test_chunk_transient_head_dim_le_128_is_kv_independent():
-    """head_dim <= 128 → fused kernel, O(n): only the output buffer."""
+def test_chunk_transient_supported_vector_head_dim_is_kv_independent():
+    """head_dim=128 short queries use the fused vector kernel."""
     m = _monitor(head_dim=128)
     n_q, hd, n_tokens = 32, 128, 4
     expected = n_q * n_tokens * hd * 4
     assert m.estimate_chunk_transient_bytes(n_tokens, 10_000) == expected
     # kv_len must not change the estimate for the fused path.
-    assert m.estimate_chunk_transient_bytes(n_tokens, 1) == expected
+    assert m.estimate_chunk_transient_bytes(n_tokens, n_tokens) == expected
 
 
 def test_chunk_transient_zero_when_model_info_missing():
@@ -336,12 +330,36 @@ def test_predicted_transient_takes_max_and_applies_safety():
     ns = _throttle_ctx(
         current=0, hard=40 * _GB, samples_bpt=5 * 1024 * 1024, monitor=monitor
     )
-    # static per-token at this kv_len:
+    # static per-token at this kv_len: SDPA transient plus the chunk's KV growth.
     static = monitor.estimate_chunk_transient_bytes(1, 100_001)
+    static += monitor.estimate_prompt_kv_bytes(1)
     measured = 5 * 1024 * 1024
     expected_per_token = max(measured, static) * Scheduler._PREFILL_TRANSIENT_SAFETY
     got = ns._predicted_chunk_transient(1, 100_000)
     assert got == pytest.approx(expected_per_token, rel=1e-6)
+
+
+def test_predicted_transient_static_uses_candidate_chunk_size():
+    """Static fallback must classify the actual prefill chunk, not query=1."""
+    monitor = _monitor(head_dim=256)
+    ns = _throttle_ctx(current=0, hard=40 * _GB, samples_bpt=None, monitor=monitor)
+    n_tokens = 512
+    kv_len = 100_000
+
+    expected_static = monitor.estimate_chunk_transient_bytes(
+        n_tokens, kv_len + n_tokens
+    )
+    expected_static += monitor.estimate_prompt_kv_bytes(n_tokens)
+    expected = expected_static * Scheduler._PREFILL_TRANSIENT_SAFETY
+    old_query_one_style = (
+        monitor.estimate_chunk_transient_bytes(1, kv_len + 1)
+        * n_tokens
+        * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+
+    got = ns._predicted_chunk_transient(n_tokens, kv_len)
+    assert got == pytest.approx(expected, rel=1e-6)
+    assert got > old_query_one_style
 
 
 def test_predicted_transient_zero_without_signals():

@@ -70,6 +70,13 @@ def clean_special_tokens(text: str) -> str:
     return SPECIAL_TOKENS_PATTERN.sub("", text).strip()
 
 
+def remove_special_tokens_preserve_whitespace(text: str) -> str:
+    """Remove special tokens without trimming surrounding whitespace."""
+    if not text:
+        return text
+    return SPECIAL_TOKENS_PATTERN.sub("", text)
+
+
 def clean_output_text(text: str) -> str:
     """Clean model output by removing special tokens and thinking blocks.
 

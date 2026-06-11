@@ -9,6 +9,7 @@ gate even when ``_prefill_memory_guard`` was flipped on by the enforcer.
 These tests pin the wiring so a future refactor cannot silently revert it.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from omlx.memory_monitor import MemoryMonitor
@@ -118,6 +119,46 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     assert rejection.limit_bytes == 1
 
 
+def test_current_usage_subtracts_shared_hot_cache_bytes_from_phys_side():
+    scheduler = _make_scheduler()
+    scheduler.config.hot_cache_budget = SimpleNamespace(total_bytes=3 * 1024**3)
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=4 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 7 * 1024**3
+
+
+def test_current_usage_keeps_mlx_active_as_floor_after_hot_cache_subtract():
+    scheduler = _make_scheduler()
+    scheduler.config.hot_cache_budget = SimpleNamespace(total_bytes=9 * 1024**3)
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=6 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
+def test_current_usage_falls_back_to_local_hot_cache_counter():
+    scheduler = _make_scheduler()
+
+    class _LocalHotCacheManager:
+        _hot_cache_total_bytes = 2 * 1024**3
+
+        def get_stats(self):
+            raise RuntimeError("stats unavailable")
+
+    scheduler.paged_ssd_cache_manager = _LocalHotCacheManager()
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=1 * 1024**3),
+        patch("omlx.scheduler.get_phys_footprint", return_value=8 * 1024**3),
+    ):
+        assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
 def test_preflight_returns_none_when_guard_disabled():
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = False
@@ -138,9 +179,9 @@ def test_preflight_returns_none_when_request_fully_cached():
 def test_preflight_rejects_heavily_cached_long_context():
     """Regression for M3: a request whose suffix is small but whose
     *full* prompt is long must still trip the guard, because the SDPA
-    tiled scratch spans the full prompt (cached + new), not just the new
-    tokens. Previously the estimator passed only new_tokens to the
-    scratch formula and the heavily-cached path slipped through.
+    fallback score matrix spans the full prompt (cached + new), not just the
+    new tokens. Previously the estimator passed only new_tokens to the
+    fallback formula and the heavily-cached path slipped through.
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True

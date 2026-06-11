@@ -11,9 +11,17 @@ from omlx.model_settings import ModelSettingsManager
 
 
 class _FakeEntry:
-    def __init__(self, model_id: str):
-        self.engine_type = "batched"
-        self.model_type = "llm"
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        engine_type: str = "batched",
+        model_type: str = "llm",
+        config_model_type: str | None = None,
+    ):
+        self.engine_type = engine_type
+        self.model_type = model_type
+        self.config_model_type = config_model_type
         self.engine = None
         self.is_pinned = False
         self.is_loading = False
@@ -134,6 +142,52 @@ class TestProfileRoutes:
         r = c.post("/admin/api/models/model-a/profiles/coding/apply")
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
+
+    def test_apply_profile_sanitizes_diffusion_unsupported_settings(self, client):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["diffusion"] = _FakeEntry(
+            "diffusion",
+            engine_type="vlm",
+            model_type="vlm",
+            config_model_type="diffusion_gemma",
+        )
+        c.post("/admin/api/models/diffusion/profiles", json={
+            "name": "fast", "display_name": "Fast",
+            "settings": {
+                "temperature": 0.0,
+                "top_p": 0.5,
+                "guided_grammar_enabled": True,
+                "guided_grammar": 'root ::= "YES"',
+                "max_tool_result_tokens": 4096,
+                "turboquant_kv_enabled": True,
+                "specprefill_enabled": True,
+                "dflash_enabled": True,
+                "mtp_enabled": True,
+                "vlm_mtp_enabled": True,
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "custom_key": "ok",
+                },
+                "forced_ct_kwargs": ["enable_thinking", "custom_key"],
+            },
+        })
+
+        r = c.post("/admin/api/models/diffusion/profiles/fast/apply")
+        assert r.status_code == 200, r.text
+        settings = r.json()["settings"]
+        assert settings["temperature"] == 0.0
+        assert "top_p" not in settings
+        assert settings["guided_grammar_enabled"] is False
+        assert "guided_grammar" not in settings
+        assert "max_tool_result_tokens" not in settings
+        assert settings["turboquant_kv_enabled"] is False
+        assert settings["specprefill_enabled"] is False
+        assert settings["dflash_enabled"] is False
+        assert settings["mtp_enabled"] is False
+        assert settings["vlm_mtp_enabled"] is False
+        assert settings["chat_template_kwargs"] == {"custom_key": "ok"}
+        assert settings["forced_ct_kwargs"] == ["custom_key"]
 
     def test_apply_missing_404(self, client):
         c, _ = client
@@ -284,6 +338,50 @@ class TestModelsResponseActiveProfile:
         entry = next(m for m in r.json()["models"] if m["id"] == "model-a")
         assert entry["settings"]["guided_grammar_enabled"] is True
         assert entry["settings"]["guided_grammar"] == 'root ::= "YES"'
+
+    def test_diffusion_settings_update_sanitizes_unsupported_fields(self, client):
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._entries["diffusion"] = _FakeEntry(
+            "diffusion",
+            engine_type="vlm",
+            model_type="vlm",
+            config_model_type="diffusion_gemma",
+        )
+
+        r = c.put("/admin/api/models/diffusion/settings", json={
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "force_sampling": True,
+            "guided_grammar_enabled": True,
+            "guided_grammar": 'root ::= "YES"',
+            "max_tool_result_tokens": 4096,
+            "turboquant_kv_enabled": True,
+            "specprefill_enabled": True,
+            "dflash_enabled": True,
+            "dflash_in_memory_cache": False,
+            "dflash_ssd_cache": True,
+            "mtp_enabled": True,
+            "vlm_mtp_enabled": True,
+        })
+
+        assert r.status_code == 200, r.text
+        settings = r.json()["settings"]
+        assert settings["max_tokens"] == 32
+        assert settings["temperature"] == 0.0
+        assert "top_p" not in settings
+        assert settings["force_sampling"] is False
+        assert settings["guided_grammar_enabled"] is False
+        assert "guided_grammar" not in settings
+        assert "max_tool_result_tokens" not in settings
+        assert settings["turboquant_kv_enabled"] is False
+        assert settings["specprefill_enabled"] is False
+        assert settings["dflash_enabled"] is False
+        assert settings["dflash_in_memory_cache"] is True
+        assert settings["dflash_ssd_cache"] is False
+        assert settings["mtp_enabled"] is False
+        assert settings["vlm_mtp_enabled"] is False
 
 
 class TestActiveProfileDriftClearing:

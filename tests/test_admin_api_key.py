@@ -152,6 +152,31 @@ class TestValidateApiKey:
         assert is_valid is False
         assert "printable" in msg
 
+    def test_non_ascii_accented(self):
+        # Printable but non-ASCII: passes isprintable(), caught by isascii().
+        # Such a key can never be matched over HTTP (headers are latin-1
+        # decoded), so it must be rejected at configuration time.
+        is_valid, msg = validate_api_key("café-key")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_emoji(self):
+        is_valid, msg = validate_api_key("key-\U0001f511")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_cyrillic(self):
+        is_valid, msg = validate_api_key("ключ-секрет")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_ascii_key_still_valid(self):
+        # Regression guard: ordinary ASCII keys remain valid after the
+        # ASCII-only rule was added.
+        is_valid, msg = validate_api_key("sk-abc123XYZ")
+        assert is_valid is True
+        assert msg == ""
+
 
 class TestVerifyApiKeyAdmin:
     """Tests for verify_api_key() constant-time comparison."""

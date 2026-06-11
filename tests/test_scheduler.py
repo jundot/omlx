@@ -2881,6 +2881,122 @@ class TestBatchGeneratorAllTokens:
         assert call_kwargs["all_tokens"] == [[11, 12, 13]]
         assert scheduled == [request]
 
+    def test_chunked_prefill_converts_turboquant_cache_before_insert(
+        self, mock_model, mock_tokenizer
+    ):
+        """Chunked prefill must mirror external prefill's TQ epilogue."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._turboquant_skip_last = False
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+
+        request = Request(
+            request_id="req-chunked-tq",
+            prompt=[11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14, 15]
+        request.num_prompt_tokens = 5
+        request.cached_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[kv_cache],
+            tokens_remaining=mx.array([[]]),
+            last_token=[15],
+            tokens_processed=4,
+            base_size=4,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        with patch("omlx.scheduler._materialize_cache_storage") as materialize:
+            with patch("omlx.scheduler._sync_and_clear_cache") as sync_clear:
+                scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        inserted_cache = call_kwargs["caches"][0][0]
+        assert isinstance(inserted_cache, TurboQuantKVCache)
+        assert state.cache[0] is inserted_cache
+        materialize.assert_called_once_with(state.cache)
+        sync_clear.assert_called_once_with(scheduler._stream)
+        assert scheduled == [request]
+
+    def test_chunked_prefill_converts_after_sized_arrays_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        """Restored ArraysCache wrappers must not skip the TQ epilogue."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._turboquant_skip_last = False
+
+        arrays_cache = ArraysCache(size=2)
+        arrays_cache.cache[0] = mx.random.normal((1, 3, 16))
+        arrays_cache.cache[1] = mx.random.normal((1, 2, 16, 16))
+        sized_arrays_cache = SizedArraysCache(arrays_cache, token_count=4)
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+
+        request = Request(
+            request_id="req-chunked-tq-sized-arrays",
+            prompt=[11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14, 15]
+        request.num_prompt_tokens = 5
+        request.cached_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[sized_arrays_cache, kv_cache],
+            tokens_remaining=mx.array([[]]),
+            last_token=[15],
+            tokens_processed=4,
+            base_size=4,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        with patch("omlx.scheduler._materialize_cache_storage") as materialize:
+            with patch("omlx.scheduler._sync_and_clear_cache") as sync_clear:
+                scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        inserted_cache = call_kwargs["caches"][0]
+        assert inserted_cache[0] is sized_arrays_cache
+        assert isinstance(inserted_cache[1], TurboQuantKVCache)
+        assert state.cache[1] is inserted_cache[1]
+        materialize.assert_called_once_with(state.cache)
+        sync_clear.assert_called_once_with(scheduler._stream)
+        assert scheduled == [request]
+
 
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.

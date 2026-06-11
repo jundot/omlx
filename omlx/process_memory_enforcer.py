@@ -774,6 +774,8 @@ class ProcessMemoryEnforcer:
                     and getattr(engine, "_fallback_engine", None) is None
                 ):
                     continue
+                if getattr(engine, "is_diffusion_model", False):
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
                 # ``_resolve_scheduler()`` return None on a loaded engine

@@ -15,9 +15,10 @@ count, else fall back to the top-level config.
 from unittest.mock import MagicMock
 
 from omlx.memory_monitor import (
-    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
-    _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD,
-    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
+    _SDPA_FULL_SUPPORTED_HEAD_DIMS,
+    _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
+    _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
@@ -355,17 +356,16 @@ class TestSetModelInfoTurboQuantDtype:
         assert turboquant_peak < headroom
 
 
-class TestSdpaTiledScratch:
-    """MLX >= 0.31 avoids the old full fp32 scores allocation for head_dim > 128,
-    but local peak measurements still show a bounded tiled scratch term."""
+class TestSdpaDispatchEstimate:
+    """MemoryMonitor mirrors MLX SDPA full/vector dispatch support."""
 
-    def test_tiled_scratch_constants_match_mlx_031_observation(self):
-        assert _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD == 128
-        assert _SDPA_TILED_SCRATCH_QUERY_TOKENS == 512
-        assert _SDPA_TILED_SCRATCH_DTYPE_SIZE == 2
+    def test_sdpa_dispatch_constants_match_mlx_031(self):
+        assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
+        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
 
-    def test_estimate_prefill_uses_tiled_scratch_for_large_head_dim(self):
-        """head_dim=256 must not use the old full fp32 score-matrix path."""
+    def test_estimate_prefill_uses_full_fallback_for_head_dim_256(self):
+        """head_dim=256 is not supported by MLX fused full prefill."""
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         monitor.set_model_info(
             num_layers=28,
@@ -382,27 +382,21 @@ class TestSdpaTiledScratch:
 
         eff_chunk = min(chunk, new_tokens)
         output_only = n_q * eff_chunk * hd * 4
-        old_full_scores = n_q * eff_chunk * full_kv_len * 4 + output_only
-        expected_attn = (
-            n_q
-            * min(eff_chunk, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-            * full_kv_len
-            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        )
+        expected_attn = n_q * eff_chunk * full_kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         expected_attn += output_only
         kv = monitor.estimate_prompt_kv_bytes(new_tokens)
         expected_peak = expected_attn + kv
 
         actual = monitor.estimate_prefill_peak_bytes(new_tokens, chunk, cached_tokens=0)
         assert actual == expected_peak, (
-            f"head_dim=256 should use tiled scratch formula "
+            f"head_dim=256 should use full-score fallback formula "
             f"({expected_peak:,} bytes), "
             f"got {actual:,} bytes"
         )
-        assert output_only < expected_attn < old_full_scores
+        assert output_only < expected_attn
 
-    def test_estimate_chunk_transient_uses_tiled_scratch_for_large_head_dim(self):
-        """head_dim=256 chunk transient must include the tiled scratch term."""
+    def test_estimate_chunk_transient_uses_full_fallback_for_head_dim_256(self):
+        """head_dim=256 full prefill transient must include fp32 scores."""
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         monitor.set_model_info(
             num_layers=28,
@@ -417,12 +411,7 @@ class TestSdpaTiledScratch:
         kv_len = 327872
 
         output_only = n_q * n_tokens * hd * 4
-        expected = (
-            n_q
-            * min(n_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-            * kv_len
-            * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        )
+        expected = n_q * n_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         expected += output_only
         actual = monitor.estimate_chunk_transient_bytes(n_tokens, kv_len)
         assert actual == expected, (

@@ -8,12 +8,13 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from omlx.engine_pool import EngineEntry
-from omlx.exceptions import ModelNotFoundError
+from omlx.exceptions import InvalidRequestError, ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
+    _reject_diffusion_structured_outputs,
     _reset_boundary_snapshots_for_server,
     app,
     get_engine,
@@ -58,6 +59,31 @@ class TestBoundarySnapshotLifecycle:
             _reset_boundary_snapshots_for_server()
 
         assert stale_dir.exists()
+
+
+class TestDiffusionStructuredOutputGuard:
+    class _DiffusionEngine:
+        is_diffusion_model = True
+
+    def test_allows_plain_text_response_format(self):
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "text"},
+        )
+
+    def test_rejects_json_response_format(self):
+        with pytest.raises(InvalidRequestError, match="Structured response_format"):
+            _reject_diffusion_structured_outputs(
+                self._DiffusionEngine(),
+                response_format={"type": "json_object"},
+            )
+
+    def test_rejects_guided_grammar(self):
+        with pytest.raises(InvalidRequestError, match="guided grammar"):
+            _reject_diffusion_structured_outputs(
+                self._DiffusionEngine(),
+                guided_grammar='root ::= "ok"',
+            )
 
 
 class TestGetSamplingParams:

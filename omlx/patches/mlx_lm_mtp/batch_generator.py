@@ -1040,9 +1040,9 @@ def _call_backbone(
 
     - mlx-lm path returns the 2-tuple ``(logits, hidden)``; ``gdn_states``
       is ``None`` and rollback uses ``cache.rollback_state``.
-    - mlx-vlm path returns the 3-tuple ``(logits, hidden, gdn_states)`` so
-      a rejected draft can be rolled back via
-      ``rollback_speculative_cache``.
+    - mlx-vlm path returns a ``LanguageModelOutput`` or 3-tuple
+      ``(logits, hidden, gdn_states)`` so a rejected draft can be rolled
+      back via ``rollback_speculative_cache``.
 
     ``n_confirmed`` is forwarded so the mlx-lm path can split its
     GatedDeltaNet forward into confirmed and draft chunks. mlx-vlm
@@ -1052,6 +1052,12 @@ def _call_backbone(
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
     result = model(inputs, **kwargs)
+    # LanguageModelOutput (mlx-vlm dataclass)
+    if hasattr(result, "logits") and hasattr(result, "hidden_states"):
+        hidden = result.hidden_states
+        if isinstance(hidden, list):
+            hidden = hidden[-1] if hidden else None
+        return result.logits, hidden, getattr(result, "gdn_states", None)
     if isinstance(result, tuple):
         if len(result) == 3:
             return result

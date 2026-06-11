@@ -6,8 +6,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from omlx.memory_monitor import (
-    _SDPA_TILED_SCRATCH_DTYPE_SIZE,
-    _SDPA_TILED_SCRATCH_QUERY_TOKENS,
+    _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
+    _SDPA_FULL_SUPPORTED_HEAD_DIMS,
+    _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
+    _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryInfo,
     MemoryMonitor,
 )
@@ -300,11 +302,13 @@ class TestEstimatePrefillPeakBytes:
         )
         return m
 
-    def _expected_tiled_sdpa(self, n_q, query_tokens, kv_len, head_dim):
-        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-        scratch = n_q * tiled_query * kv_len * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+    def _expected_output_sdpa(self, n_q, query_tokens, head_dim):
+        return n_q * query_tokens * head_dim * 4
+
+    def _expected_fallback_sdpa(self, n_q, query_tokens, kv_len, head_dim):
+        scores = n_q * query_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         output = n_q * query_tokens * head_dim * 4
-        return scratch + output
+        return scores + output
 
     def test_returns_zero_when_model_info_missing(self):
         m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
@@ -315,8 +319,8 @@ class TestEstimatePrefillPeakBytes:
         m = self._make_monitor()
         assert m.estimate_prefill_peak_bytes(0, 2048, cached_tokens=32768) == 0
 
-    def test_fused_kernel_below_head_dim_128(self):
-        # head_dim<=128 → fused tiled kernel, SDPA peak is just output buffer
+    def test_fused_full_prefill_head_dim_128(self):
+        # head_dim=128 is supported by the fused full prefill kernel.
         m = self._make_monitor(head_dim=128, n_attn=32, n_kv=4, n_layers=62)
         peak = m.estimate_prefill_peak_bytes(32768, 2048)
         # KV: 62 layers * 4 kv_heads * 128 dim * 2 bytes * 2 (k+v) * 32768 ≈ 4.0 GB
@@ -324,19 +328,17 @@ class TestEstimatePrefillPeakBytes:
         # Total ≈ 4 GB
         assert 3 * 1024**3 < peak < 5 * 1024**3
 
-    def test_tiled_scratch_path_above_head_dim_128(self):
-        # head_dim>128 → tiled scratch, not the old full fp32 score matrix.
+    def test_prefill_head_dim_256_uses_full_score_fallback(self):
+        # head_dim=256 is vector-kernel-supported, but not full-prefill-supported.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
         peak = m.estimate_prefill_peak_bytes(32768, 2048)
-        expected_sdpa = self._expected_tiled_sdpa(8, 2048, 32768, 256)
+        expected_sdpa = self._expected_fallback_sdpa(8, 2048, 32768, 256)
         expected_kv = m.estimate_prompt_kv_bytes(32768)
-        old_full_scores = 8 * 2048 * 32768 * 4 + 8 * 2048 * 256 * 4
         assert peak == expected_sdpa + expected_kv
-        assert expected_sdpa < old_full_scores
         assert expected_sdpa > 8 * 2048 * 256 * 4
 
-    def test_sdpa_tiled_scratch_accounts_for_cached_kv_span(self):
-        """Regression for M3: SDPA scratch spans the FULL prompt (cached + new),
+    def test_sdpa_fallback_accounts_for_cached_kv_span(self):
+        """Regression for M3: SDPA fallback spans the FULL prompt (cached + new),
         not just new_tokens. A heavily-cached long-context request previously
         slipped through with under-counted peak.
         """
@@ -346,7 +348,7 @@ class TestEstimatePrefillPeakBytes:
         # - Heavy cache: cached=99k, new=1k
         all_new = m.estimate_prefill_peak_bytes(100 * 1024, 2048)
         heavy_cache = m.estimate_prefill_peak_bytes(1024, 2048, cached_tokens=99 * 1024)
-        expected_heavy_sdpa = self._expected_tiled_sdpa(8, 1024, 100 * 1024, 256)
+        expected_heavy_sdpa = self._expected_fallback_sdpa(8, 1024, 100 * 1024, 256)
         expected_heavy = expected_heavy_sdpa + m.estimate_prompt_kv_bytes(1024)
         assert heavy_cache == expected_heavy
         assert (
@@ -367,8 +369,8 @@ class TestEstimatePrefillPeakBytes:
         ratio = p32k / p8k
         assert 3.5 < ratio < 4.5
 
-    def test_sdpa_tiled_scratch_scales_with_context_length(self):
-        # head_dim>128 tiled scratch: SDPA peak ∝ query_tile * total_tokens.
+    def test_sdpa_fallback_scales_with_context_length(self):
+        # Unsupported full-prefill head dims: SDPA peak ∝ query_len * total_tokens.
         # When chunk is fixed (2048), peak grows linearly with total_tokens
         # plus KV grows linearly too. Doubling tokens should ~double peak.
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
@@ -385,7 +387,7 @@ class TestEstimatePrefillPeakBytes:
         """
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
         # 100-token prompt; chunk_size=2048. eff_chunk should be 100,
-        # not 2048 — so the query tile is 100, not the default step size.
+        # not 2048 — so the query width is 100, not the default step size.
         peak = m.estimate_prefill_peak_bytes(100, 2048)
         # KV: 48*4*256*2*2*100 ≈ 19 MB. SDPA is small here. Total < 25 MB.
         assert peak < 25 * 1024**2, (
@@ -404,7 +406,7 @@ class TestEstimatePrefillPeakBytes:
         assert peak < 100 * 1024**2, f"unexpected large peak: {peak / 1024**2:.1f} MB"
 
     def test_cached_tokens_extends_sdpa_span(self):
-        # head_dim>128 tiled scratch spans cached+new tokens.
+        # Unsupported full-prefill head dims span cached+new tokens.
         # A request with a big prefix-cache hit (small new suffix) must still
         # estimate the SDPA transient over the full span, not just new_tokens.
         m = self._make_monitor(head_dim=256, n_attn=16, n_kv=2, n_layers=40)
@@ -412,10 +414,10 @@ class TestEstimatePrefillPeakBytes:
         with_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=30 * 1024)
         # Same new_tokens, no cache → SDPA span is only 2k.
         without_cache = m.estimate_prefill_peak_bytes(2048, 2048, cached_tokens=0)
-        # The output buffer and KV growth are identical; only the tiled
-        # scratch span changes.
-        sdpa_with = self._expected_tiled_sdpa(16, 2048, 2048 + 30 * 1024, 256)
-        sdpa_without = self._expected_tiled_sdpa(16, 2048, 2048, 256)
+        # The output buffer and KV growth are identical; only the score-matrix
+        # K dimension changes.
+        sdpa_with = self._expected_fallback_sdpa(16, 2048, 2048 + 30 * 1024, 256)
+        sdpa_without = self._expected_fallback_sdpa(16, 2048, 2048, 256)
         assert with_cache - without_cache == sdpa_with - sdpa_without
         assert with_cache > without_cache * 2
 
@@ -433,6 +435,41 @@ class TestEstimatePrefillPeakBytes:
         m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
         # 512 new on top of 10k cached: query=512, span=10k+512.
         peak = m.estimate_prefill_peak_bytes(512, 2048, cached_tokens=10 * 1024)
-        expected_sdpa = self._expected_tiled_sdpa(8, 512, 512 + 10 * 1024, 256)
+        expected_sdpa = self._expected_fallback_sdpa(8, 512, 512 + 10 * 1024, 256)
         expected_kv = m.estimate_prompt_kv_bytes(512)
         assert peak == expected_sdpa + expected_kv
+
+    def test_sdpa_dispatch_constants_match_mlx_use_fallback(self):
+        assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
+        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+
+    def test_vector_path_head_dim_256_is_output_only_for_short_query(self):
+        m = self._make_monitor(head_dim=256, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(4, 10_000) == (
+            self._expected_output_sdpa(8, 4, 256)
+        )
+
+    def test_vector_path_head_dim_80_falls_back(self):
+        m = self._make_monitor(head_dim=80, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(4, 10_000) == (
+            self._expected_fallback_sdpa(8, 4, 10_000, 80)
+        )
+
+    def test_full_prefill_head_dim_80_is_output_only(self):
+        m = self._make_monitor(head_dim=80, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(512, 10_000) == (
+            self._expected_output_sdpa(8, 512, 80)
+        )
+
+    def test_full_prefill_head_dim_96_falls_back(self):
+        m = self._make_monitor(head_dim=96, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(512, 10_000) == (
+            self._expected_fallback_sdpa(8, 512, 10_000, 96)
+        )
+
+    def test_vector_path_gqa_limit_falls_back(self):
+        m = self._make_monitor(head_dim=256, n_attn=64, n_kv=1, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(1, 10_000) == (
+            self._expected_fallback_sdpa(64, 1, 10_000, 256)
+        )

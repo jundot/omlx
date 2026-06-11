@@ -2274,6 +2274,190 @@ class TestWalkBackTruncation:
         assert block2.ref_count == 1
 
 
+class TestTurboQuantFormatMismatchRecovery:
+    """Regression tests for TurboQuant/fp16 prefix-chain format mismatches."""
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def test_reconstruct_truncates_turboquant_chain_at_fp16_tail(self, mx):
+        """A pre-fix fp16 tail after TQ blocks should heal by truncation."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        mock_ssd.forget_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        blocks = []
+        for i in range(2):
+            block = paged_cache.allocate_block()
+            block.block_hash = f"hash-tq-{i}".encode()
+            block.token_count = 4
+            block.ref_count = 2
+            paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+            blocks.append(block)
+
+        block_table = BlockTable(
+            request_id="req-tq-mixed",
+            block_ids=[block.block_id for block in blocks],
+            num_tokens=8,
+        )
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+        tq_cache = TurboQuantKVCache.from_cache(kv_cache, bits=4.0)
+        tq_keys, tq_values = tq_cache.state
+        tq_block = [("__turboquant_v2__", (tq_keys, tq_values))]
+
+        fp16_tail = [
+            (
+                mx.random.normal((1, 2, 4, 32)),
+                mx.random.normal((1, 2, 4, 32)),
+            )
+        ]
+        tq_metadata = {
+            "model_name": "test-model",
+            "num_layers": 1,
+            "block_size": 4,
+            "layer_cache_types": ["TurboQuantKVCache"],
+            "layer_meta_states": [tq_cache.meta_state],
+        }
+        fp16_metadata = {
+            "model_name": "test-model",
+            "num_layers": 1,
+            "block_size": 4,
+            "layer_cache_types": ["KVCache"],
+            "layer_meta_states": [(4,)],
+        }
+        mock_ssd.load_block_with_metadata.side_effect = [
+            (tq_block, tq_metadata),
+            (fp16_tail, fp16_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 1
+        assert isinstance(result[0], KVCache)
+        assert block_table.block_ids == [blocks[0].block_id]
+        assert block_table.num_tokens == 4
+        assert blocks[1].ref_count == 1
+        mock_ssd.forget_block.assert_called_once_with(blocks[1].block_hash)
+        assert paged_cache.cached_block_hash_to_block.get_block(
+            blocks[1].block_hash
+        ) is None
+
+    def test_reconstruct_accepts_sized_arrays_metadata_with_turboquant(self, mx):
+        """SizedArraysCache is a restored ArraysCache wrapper, not a mismatch."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        blocks = []
+        for i in range(2):
+            block = paged_cache.allocate_block()
+            block.block_hash = f"hash-arrays-tq-{i}".encode()
+            block.token_count = 4
+            block.ref_count = 2
+            paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+            blocks.append(block)
+
+        block_table = BlockTable(
+            request_id="req-arrays-sized-tq",
+            block_ids=[block.block_id for block in blocks],
+            num_tokens=8,
+        )
+
+        arrays_state_1 = (
+            mx.ones((1, 3, 16)),
+            mx.ones((1, 2, 16, 16)),
+        )
+        arrays_state_2 = (
+            mx.ones((1, 3, 16)) * 2,
+            mx.ones((1, 2, 16, 16)) * 2,
+        )
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+        tq_cache = TurboQuantKVCache.from_cache(kv_cache, bits=4.0)
+        tq_keys, tq_values = tq_cache.state
+        tq_block = ("__turboquant_v2__", (tq_keys, tq_values))
+
+        arrays_metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "block_size": 4,
+            "layer_cache_types": ["ArraysCache", "TurboQuantKVCache"],
+            "layer_meta_states": [(), tq_cache.meta_state],
+        }
+        sized_metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "block_size": 4,
+            "layer_cache_types": ["SizedArraysCache", "TurboQuantKVCache"],
+            "layer_meta_states": [(), tq_cache.meta_state],
+        }
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([arrays_state_1, tq_block], arrays_metadata),
+            ([arrays_state_2, tq_block], sized_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 2
+        assert isinstance(result[0], SizedArraysCache)
+        assert isinstance(result[1], KVCache)
+        assert block_table.block_ids == [blocks[0].block_id, blocks[1].block_id]
+        assert block_table.num_tokens == 8
+        mock_ssd.forget_block.assert_not_called()
+
+
 class TestPerBlockMetaStates:
     """Tests for per-block meta_states in store_cache with boundary snapshots.
 

@@ -444,6 +444,147 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return is_dflash_compatible(model_path)
 
 
+def _entry_is_diffusion_model(entry) -> bool:
+    model_type = (getattr(entry, "config_model_type", None) or "").lower()
+    return model_type.replace("-", "_") == "diffusion_gemma"
+
+
+def _sanitize_diffusion_settings_dict(settings: dict) -> None:
+    """Clear unsupported diffusion-lane settings before ModelSettings parsing."""
+    unsupported_none_fields = (
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "max_tool_result_tokens",
+        "enable_thinking",
+        "preserve_thinking",
+        "thinking_budget_tokens",
+        "reasoning_parser",
+        "guided_grammar",
+        "index_cache_freq",
+        "specprefill_draft_model",
+        "specprefill_keep_pct",
+        "specprefill_threshold",
+        "dflash_draft_model",
+        "dflash_draft_quant_enabled",
+        "dflash_draft_quant_weight_bits",
+        "dflash_draft_quant_activation_bits",
+        "dflash_draft_quant_group_size",
+        "dflash_max_ctx",
+        "dflash_draft_window_size",
+        "dflash_draft_sink_size",
+        "dflash_verify_mode",
+        "vlm_mtp_draft_model",
+        "vlm_mtp_draft_block_size",
+    )
+    for key in unsupported_none_fields:
+        settings[key] = None
+
+    settings["force_sampling"] = False
+    settings["thinking_budget_enabled"] = False
+    settings["guided_grammar_enabled"] = False
+    settings["turboquant_kv_enabled"] = False
+    settings["turboquant_kv_bits"] = 4
+    settings["turboquant_skip_last"] = True
+    settings["specprefill_enabled"] = False
+    settings["dflash_enabled"] = False
+    settings["dflash_in_memory_cache"] = True
+    settings["dflash_in_memory_cache_max_entries"] = 4
+    settings["dflash_in_memory_cache_max_bytes"] = 8 * 1024 * 1024 * 1024
+    settings["dflash_ssd_cache"] = False
+    settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
+    settings["mtp_enabled"] = False
+    settings["vlm_mtp_enabled"] = False
+
+    unsupported_ct_kwargs = {
+        "enable_thinking",
+        "reasoning_effort",
+        "preserve_thinking",
+    }
+    kwargs = settings.get("chat_template_kwargs")
+    if kwargs:
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() if k not in unsupported_ct_kwargs
+        }
+        settings["chat_template_kwargs"] = filtered_kwargs or None
+    forced = settings.get("forced_ct_kwargs")
+    if forced:
+        allowed = set(settings.get("chat_template_kwargs") or {})
+        filtered_forced = [
+            k for k in forced if k not in unsupported_ct_kwargs and k in allowed
+        ]
+        settings["forced_ct_kwargs"] = filtered_forced or None
+
+
+def _sanitize_diffusion_model_settings(settings) -> None:
+    """Clear settings that the serial diffusion lane does not implement."""
+    settings.top_p = None
+    settings.top_k = None
+    settings.min_p = None
+    settings.repetition_penalty = None
+    settings.presence_penalty = None
+    settings.force_sampling = False
+    settings.max_tool_result_tokens = None
+    settings.enable_thinking = None
+    settings.preserve_thinking = None
+    settings.thinking_budget_enabled = False
+    settings.thinking_budget_tokens = None
+    settings.reasoning_parser = None
+    settings.guided_grammar_enabled = False
+    settings.guided_grammar = None
+
+    unsupported_ct_kwargs = {
+        "enable_thinking",
+        "reasoning_effort",
+        "preserve_thinking",
+    }
+    if settings.chat_template_kwargs:
+        filtered_kwargs = {
+            k: v
+            for k, v in settings.chat_template_kwargs.items()
+            if k not in unsupported_ct_kwargs
+        }
+        settings.chat_template_kwargs = filtered_kwargs or None
+    if settings.forced_ct_kwargs:
+        allowed = set(settings.chat_template_kwargs or {})
+        filtered_forced = [
+            k
+            for k in settings.forced_ct_kwargs
+            if k not in unsupported_ct_kwargs and k in allowed
+        ]
+        settings.forced_ct_kwargs = filtered_forced or None
+
+    settings.index_cache_freq = None
+    settings.turboquant_kv_enabled = False
+    settings.turboquant_kv_bits = 4
+    settings.turboquant_skip_last = True
+    settings.specprefill_enabled = False
+    settings.specprefill_draft_model = None
+    settings.specprefill_keep_pct = None
+    settings.specprefill_threshold = None
+    settings.dflash_enabled = False
+    settings.dflash_draft_model = None
+    settings.dflash_draft_quant_enabled = None
+    settings.dflash_draft_quant_weight_bits = None
+    settings.dflash_draft_quant_activation_bits = None
+    settings.dflash_draft_quant_group_size = None
+    settings.dflash_max_ctx = None
+    settings.dflash_in_memory_cache = True
+    settings.dflash_in_memory_cache_max_entries = 4
+    settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
+    settings.dflash_ssd_cache = False
+    settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
+    settings.dflash_draft_window_size = None
+    settings.dflash_draft_sink_size = None
+    settings.dflash_verify_mode = None
+    settings.mtp_enabled = False
+    settings.vlm_mtp_enabled = False
+    settings.vlm_mtp_draft_model = None
+    settings.vlm_mtp_draft_block_size = None
+
+
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
@@ -1900,6 +2041,7 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
+    is_diffusion_model = _entry_is_diffusion_model(entry)
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -2027,7 +2169,7 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     # DFlash settings
     if "dflash_enabled" in sent:
-        new_dflash_enabled = bool(request.dflash_enabled)
+        new_dflash_enabled = False if is_diffusion_model else bool(request.dflash_enabled)
         if new_dflash_enabled:
             from ..engine.dflash import is_dflash_compatible
 
@@ -2081,7 +2223,9 @@ async def update_model_settings(
         )
     if "dflash_ssd_cache" in sent:
         ssd_requested = bool(request.dflash_ssd_cache)
-        if ssd_requested:
+        if is_diffusion_model:
+            ssd_requested = False
+        elif ssd_requested:
             in_mem_after = (
                 bool(request.dflash_in_memory_cache)
                 if "dflash_in_memory_cache" in sent
@@ -2132,7 +2276,7 @@ async def update_model_settings(
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
-        new_mtp_enabled = bool(request.mtp_enabled)
+        new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
         if new_mtp_enabled:
             # Compatibility check: the model needs MTP heads in config.json AND
             # the model_type must be one PR 990 / PR 15 covers AND the weight
@@ -2206,7 +2350,7 @@ async def update_model_settings(
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
-        new_vlm_mtp = bool(request.vlm_mtp_enabled)
+        new_vlm_mtp = False if is_diffusion_model else bool(request.vlm_mtp_enabled)
         if new_vlm_mtp:
             drafter_after = (
                 request.vlm_mtp_draft_model
@@ -2269,6 +2413,9 @@ async def update_model_settings(
             server_state.default_model = model_id
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+
+    if is_diffusion_model:
+        _sanitize_diffusion_model_settings(current_settings)
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
@@ -2500,10 +2647,15 @@ async def apply_model_profile(
     is_admin: bool = Depends(require_admin),
 ):
     mgr = _require_settings_manager()
-    _require_model(model_id)
-    applied = mgr.apply_profile(model_id, name)
+    entry = _require_model(model_id)
+    is_diffusion_model = _entry_is_diffusion_model(entry)
+    sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+    applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    if is_diffusion_model:
+        _sanitize_diffusion_model_settings(applied)
+        mgr.set_settings(model_id, applied)
     return {"model_id": model_id, "settings": applied.to_dict()}
 
 
@@ -5850,12 +6002,14 @@ async def start_oq_quantization(
     is_admin: bool = Depends(require_admin),
 ):
     """Start an oQ quantization task."""
+    from ..oq import OQ_LEVELS
+
     if _oq_manager is None:
         raise HTTPException(status_code=503, detail="oQ quantizer not initialized")
-    if request.oq_level not in (2, 3, 3.5, 4, 5, 6, 8):
+    if request.oq_level not in OQ_LEVELS:
         raise HTTPException(
             status_code=400,
-            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
+            detail=f"Invalid oQ level. Must be one of {sorted(OQ_LEVELS)}",
         )
     if request.dtype not in ("bfloat16", "float16"):
         raise HTTPException(

@@ -11,7 +11,7 @@ import logging
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
     filter_profile_fields,
@@ -163,10 +163,11 @@ class ModelSettings:
     # with dflash and turboquant.
     mtp_enabled: bool = False
 
-    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm f96138e+).
-    # Target = Gemma4 VLM body, drafter = "gemma-4-26B-A4B-it-assistant"
-    # (model_type "gemma4_assistant"). Mutually exclusive with all other speculative
-    # paths because the wrapper bypasses mlx-lm BatchGenerator at decode time.
+    # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
+    # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
+    # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
+    # Mutually exclusive with all other speculative paths because the wrapper
+    # bypasses mlx-lm BatchGenerator at decode time.
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
     vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
@@ -627,7 +628,12 @@ class ModelSettingsManager:
                 raise
             return True
 
-    def apply_profile(self, model_id: str, name: str) -> Optional[ModelSettings]:
+    def apply_profile(
+        self,
+        model_id: str,
+        name: str,
+        settings_sanitizer: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> Optional[ModelSettings]:
         """Merge profile settings into the model's live settings and persist."""
         with self._lock:
             per_model = self._profiles.get(model_id, {})
@@ -644,6 +650,8 @@ class ModelSettingsManager:
             for k, v in profile_settings.items():
                 merged[k] = v
             merged["active_profile_name"] = name
+            if settings_sanitizer is not None:
+                settings_sanitizer(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:

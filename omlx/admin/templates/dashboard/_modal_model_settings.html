@@ -35,6 +35,7 @@
 
                 <!-- Profiles / Templates / Presets section -->
                 <div class="mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
+                     x-show="!modelSettings.is_diffusion_model" x-cloak
                      @input.stop="computeDrift()"
                      @change.stop="computeDrift()">
                     <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
@@ -258,7 +259,7 @@
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
                             <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
-                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
+                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
@@ -279,7 +280,7 @@
                                         <option value="audio_sts">Audio STS</option>
                                     </select>
                                 </div>
-                                <div x-show="reasoningParsers.length > 0">
+                                <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Reasoning Parser</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
@@ -295,7 +296,8 @@
                             <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                 <div class="space-y-5">
                                     <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4"
+                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
@@ -333,7 +335,8 @@
                                     </div>
 
                                     <!-- Row 4: Repetition Penalty / Presence Penalty -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4"
+                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
                                             <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -381,7 +384,8 @@
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
                              x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                             <!-- Enable Thinking -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.enable_thinking') }}</span>
@@ -406,7 +410,8 @@
                             </div>
 
                             <!-- Thinking Budget -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
@@ -426,7 +431,8 @@
                             </div>
 
                             <!-- Guided Grammar -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.guided_grammar') }}</span>
@@ -448,7 +454,8 @@
                             </div>
 
                             <!-- Limit Tool Result Tokens -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.limit_tool_result') }}</span>
@@ -468,7 +475,8 @@
                             </div>
 
                             <!-- Force Sampling -->
-                            <div class="p-4 bg-neutral-50 rounded-xl">
+                            <div class="p-4 bg-neutral-50 rounded-xl"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.force_sampling') }}</span>
@@ -513,11 +521,11 @@
                                         <div x-show="addOpen" @click.away="addOpen = false" x-transition
                                              class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                             <button type="button"
-                                                    x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
-                                                    x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
@@ -594,8 +602,9 @@
                                 <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                             </div>
 
-                            <!-- Experimental Features -->
-                            <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
+                            <div x-show="!modelSettings.is_diffusion_model" x-cloak>
+                                <!-- Experimental Features -->
+                                <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
                                 <!-- TurboQuant KV Cache -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
@@ -687,7 +696,7 @@
                                             <select x-model="modelSettings.specprefill_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">Select draft model...</option>
-                                                <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
+                                                <template x-for="m in specPrefillDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
@@ -743,7 +752,7 @@
                                             <select x-model="modelSettings.dflash_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">Select draft model...</option>
-                                                <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
+                                                <template x-for="m in dflashDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
@@ -939,7 +948,7 @@
                                         <select x-model="modelSettings.vlm_mtp_draft_model"
                                                 class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
                                             <option value="">{{ t('modal.model_settings.vlm_mtp_draft_model_placeholder') }}</option>
-                                            <template x-for="m in models.filter(m => /assistant/i.test(m.id))" :key="m.id">
+                                            <template x-for="m in vlmMtpDraftModelCandidates()" :key="m.id">
                                                 <option :value="m.id" x-text="m.id"></option>
                                             </template>
                                         </select>
@@ -952,6 +961,7 @@
                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black" />
                                     </div>
                                 </div>
+                            </div>
                         </div>
                     </div>
                 </div>

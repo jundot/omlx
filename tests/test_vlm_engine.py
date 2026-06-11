@@ -140,6 +140,324 @@ class TestVLMStreamingCleanup:
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
 
+class TestVLMDiffusionLane:
+    """Tests for DiffusionGemma routing in VLMBatchedEngine."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_stream_chat_uses_diffusion_lane(self, monkeypatch):
+        from omlx.engine.base import GenerationOutput
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._prepare_vision_inputs = MagicMock(
+            side_effect=AssertionError("AR VLM path should not run")
+        )
+        engine._process_diffusion_chat_messages = MagicMock(
+            return_value={"prompt_tokens": 2}
+        )
+
+        def fake_iter(diffusion_inputs, **kwargs):
+            yield GenerationOutput(
+                text="hello",
+                new_text="hello",
+                prompt_tokens=2,
+                completion_tokens=5,
+                finished=False,
+                finish_reason=None,
+            )
+            yield GenerationOutput(
+                text="hello",
+                new_text="",
+                prompt_tokens=2,
+                completion_tokens=5,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        monkeypatch.setattr(engine, "_iter_diffusion_outputs_sync", fake_iter)
+
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        ]
+
+        assert [output.new_text for output in outputs] == ["hello", ""]
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+        engine._prepare_vision_inputs.assert_not_called()
+        engine._process_diffusion_chat_messages.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_diffusion_chat_collects_streamed_blocks(self, monkeypatch):
+        from omlx.engine.base import GenerationOutput
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._process_diffusion_chat_messages = MagicMock(
+            return_value={"prompt_tokens": 3}
+        )
+
+        def fake_iter(diffusion_inputs, **kwargs):
+            yield GenerationOutput(
+                text="A",
+                new_text="A",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+            )
+            yield GenerationOutput(
+                text="AB",
+                new_text="B",
+                prompt_tokens=3,
+                completion_tokens=2,
+                finished=True,
+                finish_reason="length",
+            )
+
+        monkeypatch.setattr(engine, "_iter_diffusion_outputs_sync", fake_iter)
+
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+
+        assert output.text == "AB"
+        assert output.prompt_tokens == 3
+        assert output.completion_tokens == 2
+        assert output.finish_reason == "length"
+        assert output.cached_tokens == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_diffusion_preflight_rejects_tools(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Tool calling"):
+            await engine.preflight_chat(
+                [{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {"name": "lookup"}}],
+            )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    def test_diffusion_validation_rejects_audio(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Audio input"):
+            engine._validate_diffusion_request(audio=[object()])
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_diffusion_stream_generate_rejects_precomputed_vlm_inputs(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Precomputed VLM embeddings"):
+            async for _ in engine.stream_generate(
+                "hello",
+                vlm_inputs_embeds=object(),
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    async def test_diffusion_abort_all_requests_sets_cancel_events(self):
+        import threading
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        cancel_event = threading.Event()
+        engine._diffusion_cancel_events = {cancel_event}
+
+        assert await engine.abort_all_requests() == 1
+        assert cancel_event.is_set()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    def test_diffusion_iter_ignores_stale_final_text(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason="length",
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", ""]
+        assert outputs[-1].text == "Hello"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "length"
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    def test_diffusion_iter_flushes_final_detokenizer_segment(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="!",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason="stop",
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", "!"]
+        assert outputs[-1].text == "Hello!"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+
+    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    def test_diffusion_iter_preserves_leading_space_across_blocks(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text=" world",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason="stop",
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", " world"]
+        assert outputs[-1].text == "Hello world"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+
+
 # ---------------------------------------------------------------------------
 # TestInjectToolCalling
 # ---------------------------------------------------------------------------

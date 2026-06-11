@@ -34,12 +34,14 @@ except ImportError:
     HAS_MLX_METAL = False
     mx = None
 
-# MLX >= 0.31 no longer materializes the full fp32 score matrix for
-# head_dim > 128, but local peak measurements still show a tiled score/scratch
-# term. Model it as one fp16 query tile plus the fp32 output buffer.
-_SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD = 128
-_SDPA_TILED_SCRATCH_QUERY_TOKENS = 512
-_SDPA_TILED_SCRATCH_DTYPE_SIZE = 2
+# Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
+# generation/inference path. Full prefill and short vector kernels support
+# different head dimensions; unsupported cases fall back to an unfused fp32
+# score matrix allocation.
+_SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
+_SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
+_SDPA_FALLBACK_SCORE_DTYPE_SIZE = 4
 
 
 @dataclass
@@ -412,19 +414,39 @@ class MemoryMonitor:
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
 
+    def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        n_kv = self._num_kv_heads or n_q
+        if n_q <= 0 or n_kv <= 0 or hd <= 0 or query_tokens <= 0:
+            return False
+        if kv_len < query_tokens:
+            return False
+
+        if query_tokens <= _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD:
+            gqa_factor = max(1, n_q // n_kv)
+            return (
+                hd in _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+                and query_tokens * gqa_factor <= 32
+            )
+
+        return hd in _SDPA_FULL_SUPPORTED_HEAD_DIMS
+
     def _estimate_sdpa_activation_bytes(self, query_tokens: int, kv_len: int) -> int:
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0
         if n_q == 0 or hd == 0 or query_tokens <= 0:
             return 0
 
+        query_tokens = int(query_tokens)
+        kv_len = max(int(kv_len), 0)
+
         output = n_q * query_tokens * hd * 4
-        if hd <= _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD:
+        if self._uses_fused_sdpa(query_tokens, kv_len):
             return output
 
-        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-        scratch = n_q * tiled_query * max(kv_len, 0) * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        return scratch + output
+        scores = n_q * query_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        return scores + output
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
@@ -439,9 +461,10 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA avoids the old full fp32 score-matrix allocation for
-        head_dim > 128, but high-head-dim kernels still need a tiled scratch
-        term that spans the full key/value context. With prefix-cache hits,
+        MLX SDPA only uses fused full-attention kernels for the head dimensions
+        supported by ``ScaledDotProductAttention::use_fallback``. Unsupported
+        prefill chunks fall back to an unfused fp32 score matrix whose K
+        dimension spans the full key/value context. With prefix-cache hits,
         that context is ``new_tokens + cached_tokens``, not just the new suffix.
         Passing only ``new_tokens`` here silently under-counts long-context
         prefill, exactly where prefix caching makes such requests possible.
@@ -501,10 +524,9 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        MLX fused SDPA uses the output-buffer estimate for head_dim <= 128.
-        For larger head_dim values, current MLX avoids the old full fp32
-        score matrix but still needs a bounded query-tile scratch term that
-        scales with total ``kv_len``.
+        Fused MLX SDPA uses the output-buffer estimate. Unsupported
+        query/head-dim combinations use the unfused fp32 score-matrix fallback
+        and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
         """

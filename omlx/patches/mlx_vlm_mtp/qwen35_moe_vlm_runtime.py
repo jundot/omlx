@@ -243,13 +243,17 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         the fact via ``rollback_speculative_cache``.
         """
         return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which we need.
+        # both of which we need.  Pop any existing value from kwargs to avoid
+        # "got multiple values for keyword argument" when the caller already
+        # passed capture_layer_ids (e.g. speculative_verify_logits).
+        kwargs.pop("capture_layer_ids", None)
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -260,8 +264,15 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             capture_layer_ids=[last_layer_idx],
             **kwargs,
         )
+        from mlx_vlm.models.base import LanguageModelOutput
+
         hidden_pre_norm = out.hidden_states[0]
-        return out.logits, hidden_pre_norm, out.gdn_states
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[hidden_pre_norm],
+            gdn_states=out.gdn_states,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
     def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         mtp_out = self.mtp(
