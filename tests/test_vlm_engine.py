@@ -246,15 +246,14 @@ class TestVLMDiffusionLane:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
-    async def test_diffusion_preflight_rejects_tools(self):
+    async def test_diffusion_validation_rejects_tools(self):
         from omlx.exceptions import InvalidRequestError
 
         engine = _make_loaded_engine(model_type="diffusion_gemma")
         engine._diffusion_family = "block"
 
         with pytest.raises(InvalidRequestError, match="Tool calling"):
-            await engine.preflight_chat(
-                [{"role": "user", "content": "hi"}],
+            engine._validate_diffusion_request(
                 tools=[{"type": "function", "function": {"name": "lookup"}}],
             )
 

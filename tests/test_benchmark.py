@@ -2,6 +2,7 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ from omlx.admin.benchmark import (
     cleanup_old_runs,
     create_run,
     get_run,
+    run_benchmark,
 )
 
 
