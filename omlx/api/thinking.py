@@ -380,6 +380,12 @@ class ThinkingBudgetProcessor:
     exceeded, forces the close-think token(s) one at a time, then becomes
     a no-op for the rest of generation.
 
+    Includes a soft budget zone over the last 30% of the token budget:
+    instead of a single hard cut, the close-think logit is progressively
+    boosted relative to the model's own logit distribution, encouraging a
+    natural stopping point before the hard force at 100%. Mirrors vLLM's
+    soft thinking budget (vllm-project/vllm#38277).
+
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
@@ -387,7 +393,11 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        soft_budget: Enable the progressive soft zone (default True).
     """
+
+    # Fraction of the budget where the soft zone begins (0.7 = last 30%).
+    _SOFT_ZONE_START_FRAC = 0.7
 
     def __init__(
         self,
@@ -397,6 +407,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        soft_budget: bool = True,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -408,6 +419,8 @@ class ThinkingBudgetProcessor:
         self._budget = budget
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._soft_budget = soft_budget
+        self._soft_start = int(budget * self._SOFT_ZONE_START_FRAC) if budget > 0 else 0
 
         # State
         self._thinking_tokens: int = 0
@@ -456,7 +469,37 @@ class ThinkingBudgetProcessor:
                     return self._force_next_token(logits, mx)
                 self._waiting_utf8 = True
                 self._recent_tokens = []
+            elif self._soft_budget and self._thinking_tokens > self._soft_start:
+                return self._apply_soft_bias(logits, mx)
 
+        return logits
+
+    def _apply_soft_bias(self, logits, mx):
+        """Progressively boost the close-think logit through the soft zone.
+
+        At each step, measure the gap between the top logit and the
+        close-think token, then raise the close-think logit toward (and
+        past) the top as the budget runs out::
+
+            target = end_logit + 2 * gap * progress
+
+        progress=0 leaves logits unchanged, 0.5 makes close-think equal to
+        the top logit, and 1.0 makes it dominate — so the model can close
+        the thinking block at a natural boundary instead of being cut
+        mid-sentence by the hard force.
+        """
+        span = max(1, self._budget - self._soft_start)
+        progress = (self._thinking_tokens - self._soft_start) / span
+        end_id = self._think_end_ids[0]
+        top_logit = mx.max(logits).item()
+        end_logit = logits[..., end_id].item()
+        gap = max(top_logit - end_logit, 1.0)
+        target = end_logit + 2.0 * gap * progress
+        if target <= end_logit:
+            return logits
+        for token_id in self._think_end_ids:
+            if logits[..., token_id].item() < target:
+                logits[..., token_id] = target
         return logits
 
     def _update_state(self, token_id: int) -> None:
