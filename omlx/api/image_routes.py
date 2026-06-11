@@ -47,20 +47,22 @@ _IMAGE_MAGIC = (
     (b"\xff\xd8\xff", ".jpg"),
 )
 
-# Pre-calibration lease defaults by mflux alias (GB). Conservative until
-# the m5max measurement pass lands real peaks (then recalibrate here and
-# in docs, mirroring the video peak-predictor discipline). 4bit weights:
-# z-image-turbo 5.9GB, qwen-image 17.4GB, qwen-image-edit-2511 18.3GB --
-# activations ride on top, tiled VAE keeps decode flat.
+# Lease defaults by mflux alias (GB), calibrated on m5max (M5 Max 128GB,
+# mlx-gen 0.18.14, 2026-06-11) from worker lifetime-max phys manifests at
+# 1024x1024: z-image-turbo 8.6GB (9 steps); qwen-image 21.0GB (40 steps)
+# and 21.9GB (Lightning LoRA 8 steps); qwen-image-edit-2511 22.0GB
+# (40 steps, 1MP edit). Peaks are step-count invariant (weights + working
+# set dominate); ~4GB pad covers sub-poll transients. Recalibrate on every
+# mlx-gen lock bump (video spec 9.1 discipline).
 _DEFAULT_LEASE_GB = {
     "z-image-turbo": 12.0,
     "z-image": 12.0,
-    "qwen-image": 30.0,
-    "qwen-image-edit": 32.0,
-    "qwen-image-edit-2509": 32.0,
-    "qwen-image-edit-2511": 32.0,
+    "qwen-image": 26.0,
+    "qwen-image-edit": 26.0,
+    "qwen-image-edit-2509": 26.0,
+    "qwen-image-edit-2511": 26.0,
 }
-_FALLBACK_LEASE_GB = 32.0
+_FALLBACK_LEASE_GB = 26.0
 
 # Per-alias step defaults (mflux signature defaults are unsafe: 4 steps
 # everywhere except edit). Turbo is distilled for ~8 steps; the Qwen

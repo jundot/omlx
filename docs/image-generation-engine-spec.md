@@ -101,14 +101,27 @@ default_size (1024x1024), edit 不传尺寸 (mflux 按首参考图长宽比
 
 ## 4. 内存
 
-租约按别名预设 (待真机校准, 校准后回填): z-image* 12GB, qwen-image
-30GB, qwen-image-edit* 32GB; settings.image.memory_lease_gb > 0 时全局
-覆盖. worker 进场 mx.set_wired_limit(lease - 2GB), watchdog/停滞/超时
-语义与视频完全一致. 图像无峰值预测器 (MVP); 静态 caps (max_pixels
-默认 2048x2048) + 租约 + wired 自缚 + watchdog 四层够住, 真机测量后
-若需要再加预测器.
+租约按别名预设, 已经 m5max 实测校准 (M5 Max 128GB, mlx-gen 0.18.14,
+2026-06-11, worker lifetime-max phys manifest, 1024x1024):
+
+| 别名 | 实测真峰值 | 租约 | 用时 |
+|---|---|---|---|
+| z-image-turbo (9 步) | 8.6GB | 12GB | 22.4s |
+| qwen-image (40 步) | 21.0GB | 26GB | 312s |
+| qwen-image + Lightning LoRA (8 步) | 21.9GB | 26GB | 73s |
+| qwen-image-edit-2511 (40 步, 1MP) | 22.0GB | 26GB | 885s |
+
+峰值对步数不敏感 (权重 + 工作集主导), ~4GB pad 覆盖瞬时;
+settings.image.memory_lease_gb > 0 时全局覆盖. mlx-gen lock 升级必须
+重测 (视频 spec 9.1 纪律). worker 进场 mx.set_wired_limit(lease - 2GB),
+watchdog/停滞/超时语义与视频完全一致. 图像无峰值预测器 (MVP); 静态
+caps (max_pixels 默认 2048x2048) + 租约 + wired 自缚 + watchdog 四层
+够住. 共驻算术: 107.5 ceiling - 26 lease = 81.5GB 留给 LLM.
 
 8bit 量化明确不用: edit-2511-8bit 权重 30.3GB, 租约下激活放不下.
+Lightning LoRA 实测可用 (V1.1-bf16, 8 步 guidance 2.5, 4.3x 提速,
+质量目检可接受), 是 qwen 延迟的主要解药; edit-2511 全 40 步要
+~15 分钟, 同步调用方注意 sync_timeout (默认 900s 勉强够).
 
 ## 5. settings
 
