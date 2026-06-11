@@ -1270,6 +1270,20 @@ def get_sampling_params(
     )
 
 
+def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
+    """Drop the scheduler's synthetic think opener from a raw completions chunk.
+
+    Raw completions are a pure continuation of the prompt. When the prompt
+    itself ends with an open think tag, the scheduler still prepends a
+    synthetic ``"<think>\\n"`` to the first streamed chunk (chat streams rely
+    on it to rebuild the reasoning block), but the opener belongs to the
+    prompt and the non-streaming completions path never returns it. Stripping
+    it keeps both completion paths returning the same continuation.
+    """
+    prefix = f"{think_tag}\n"
+    return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
+
+
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     """Resolve thinking budget: request param > model settings > None."""
     # Check request-level override (OpenAI format)
@@ -3732,6 +3746,11 @@ async def stream_completion(
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
+    # Parity with the non-streaming path: when the prompt opens a thinking
+    # block, the first chunk carries the scheduler's synthetic think opener;
+    # strip it once so the stream is a pure continuation of the prompt.
+    think_tag = getattr(getattr(engine, "tokenizer", None), "think_start", "<think>") or "<think>"
+    pending_think_prefix_strip = prompt.rstrip().endswith(think_tag)
 
     (
         temperature,
@@ -3782,6 +3801,11 @@ async def stream_completion(
                 first_token_time = time.perf_counter()
             last_output = output
 
+            chunk_text = output.new_text
+            if pending_think_prefix_strip and chunk_text:
+                chunk_text = _strip_synthetic_think_prefix(chunk_text, think_tag)
+                pending_think_prefix_strip = False
+
             data = {
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
@@ -3790,7 +3814,7 @@ async def stream_completion(
                 "choices": [
                     {
                         "index": 0,
-                        "text": output.new_text,
+                        "text": chunk_text,
                         "finish_reason": (
                             output.finish_reason if output.finished else None
                         ),

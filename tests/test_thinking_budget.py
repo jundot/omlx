@@ -454,23 +454,142 @@ class TestCompletionsThinkingBudget:
         req = CompletionRequest(model="m", prompt="p", thinking_budget=128)
         assert _resolve_thinking_budget(req, None) == 128
 
-    def test_both_completion_paths_resolve_the_budget(self):
-        """Source-level guard, repo style: the field alone is useless if the
-        handlers stop threading it to the engine — which was the original
-        bug. Both the streaming and non-streaming completion paths must
-        resolve the budget."""
+    @staticmethod
+    def _engine_call_passes_budget(handler_name: str, engine_method: str) -> bool:
+        """True when ``handler_name`` calls ``<obj>.<engine_method>(...)`` with
+        a ``thinking_budget`` keyword built from ``_resolve_thinking_budget``.
+
+        Structural AST check: immune to reformatting, wrappers, and comments,
+        unlike substring counting."""
+        import ast
         from pathlib import Path
 
-        server_src = (
+        source = (
             Path(__file__).resolve().parents[1] / "omlx" / "server.py"
         ).read_text()
-        assert (
-            server_src.count(
-                "thinking_budget=_resolve_thinking_budget(request, request.model)"
-            )
-            >= 2
-        ), (
-            "/v1/completions must pass thinking_budget to engine.generate and "
-            "engine.stream_generate via _resolve_thinking_budget; dropping "
-            "either path silently disables the budget again. See #1825."
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == handler_name
+            ):
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    if not (isinstance(func, ast.Attribute) and func.attr == engine_method):
+                        continue
+                    for keyword in call.keywords:
+                        if keyword.arg != "thinking_budget":
+                            continue
+                        value = keyword.value
+                        if (
+                            isinstance(value, ast.Call)
+                            and isinstance(value.func, ast.Name)
+                            and value.func.id == "_resolve_thinking_budget"
+                        ):
+                            return True
+                return False
+        raise AssertionError(f"{handler_name} not found in server.py")
+
+    def test_non_streaming_completion_path_resolves_the_budget(self):
+        """The field alone is useless if the handler stops threading it to
+        the engine — which was the original bug. See #1825."""
+        assert self._engine_call_passes_budget("create_completion", "generate"), (
+            "/v1/completions (non-streaming) must pass "
+            "thinking_budget=_resolve_thinking_budget(...) to engine.generate; "
+            "dropping it silently disables the budget again. See #1825."
         )
+
+    def test_streaming_completion_path_resolves_the_budget(self):
+        assert self._engine_call_passes_budget("stream_completion", "stream_generate"), (
+            "/v1/completions (streaming) must pass "
+            "thinking_budget=_resolve_thinking_budget(...) to "
+            "engine.stream_generate; dropping it silently disables the "
+            "budget again. See #1825."
+        )
+
+    def test_negative_thinking_budget_is_rejected_on_completions(self):
+        """A negative budget has no semantics anywhere in the enforcement
+        chain; reject it at the API boundary instead of accepting it
+        silently."""
+        import pytest
+        from pydantic import ValidationError
+
+        from omlx.api.openai_models import CompletionRequest
+
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="m", prompt="p", thinking_budget=-1)
+
+    def test_negative_thinking_budget_is_rejected_on_chat(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from omlx.api.openai_models import ChatCompletionRequest
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                thinking_budget=-1,
+            )
+
+    def test_zero_thinking_budget_is_accepted(self):
+        """Zero is meaningful (thinking off), keep it valid."""
+        from omlx.api.openai_models import CompletionRequest
+
+        req = CompletionRequest(model="m", prompt="p", thinking_budget=0)
+        assert req.thinking_budget == 0
+
+
+class TestCompletionsStreamThinkPrefixParity:
+    """Raw completions are a continuation of the prompt: when the prompt
+    opens the thinking block itself, the synthetic ``<think>\\n`` opener the
+    scheduler prepends for chat streams must not leak into the completions
+    stream — the non-streaming path never returns it."""
+
+    def test_synthetic_prefix_is_stripped(self):
+        from omlx.server import _strip_synthetic_think_prefix
+
+        assert (
+            _strip_synthetic_think_prefix("<think>\n</think>\n\nHi", "<think>")
+            == "</think>\n\nHi"
+        )
+
+    def test_chunk_without_prefix_is_untouched(self):
+        from omlx.server import _strip_synthetic_think_prefix
+
+        assert _strip_synthetic_think_prefix("Hello", "<think>") == "Hello"
+
+    def test_bare_tag_without_newline_is_untouched(self):
+        """Only the exact synthetic shape (tag + newline) is synthetic;
+        anything else is model output and must pass through."""
+        from omlx.server import _strip_synthetic_think_prefix
+
+        assert _strip_synthetic_think_prefix("<think>data", "<think>") == "<think>data"
+
+    def test_stream_completion_wires_the_strip(self):
+        """Structural guard: the streaming handler must call the strip
+        helper, or the prefix leaks back on the first chunk."""
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1] / "omlx" / "server.py"
+        ).read_text()
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "stream_completion"
+            ):
+                called = {
+                    call.func.id
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                }
+                assert "_strip_synthetic_think_prefix" in called, (
+                    "stream_completion must strip the synthetic think opener "
+                    "from the first chunk when the prompt opens the thinking "
+                    "block; the non-streaming path never returns it. See #1825."
+                )
+                return
+        raise AssertionError("stream_completion not found in server.py")
