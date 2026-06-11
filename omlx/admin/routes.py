@@ -154,6 +154,9 @@ class ModelSettingsRequest(BaseModel):
     video_default_size: str | None = None
     video_default_seconds: float | None = Field(default=None, gt=0)
     video_default_upscale_resolution: int | None = Field(default=None, ge=0)
+    # Image generation defaults (image models)
+    image_default_steps: int | None = Field(default=None, ge=1)
+    image_default_size: str | None = None
     # ForcedAligner companion for STT models. When set on an ASR (e.g.
     # Qwen3-ASR-*), a /v1/audio/transcriptions call with word_timestamps=true
     # auto-chains this aligner on the (audio, ASR transcript) pair and
@@ -303,6 +306,23 @@ class GlobalSettingsRequest(BaseModel):
     video_artifacts_max_gb: float | None = Field(default=None, gt=0)
     video_upscaler_model_path: str | None = None
     video_max_upscale_resolution: int | None = Field(default=None, ge=480)
+
+    # Image generation settings (settings.image.*, mirrors the video block;
+    # memory_lease_gb 0 = auto by model kind, default_steps 0 = per-alias)
+    image_enabled: bool | None = None
+    image_worker_python: str | None = None
+    image_memory_lease_gb: float | None = Field(default=None, ge=0)
+    image_max_queued_jobs: int | None = Field(default=None, ge=1)
+    image_job_timeout_seconds: int | None = Field(default=None, ge=60)
+    image_progress_stall_timeout_seconds: int | None = Field(default=None, ge=30)
+    image_default_steps: int | None = Field(default=None, ge=0)
+    image_default_size: str | None = None
+    image_max_steps: int | None = Field(default=None, ge=1)
+    image_max_pixels: int | None = Field(default=None, ge=4096)
+    image_max_n: int | None = Field(default=None, ge=1)
+    image_sync_timeout_seconds: int | None = Field(default=None, ge=30)
+    image_artifacts_max_count: int | None = Field(default=None, ge=1)
+    image_artifacts_max_gb: float | None = Field(default=None, gt=0)
 
     # Auth settings
     api_key: str | None = None
@@ -1659,6 +1679,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "image_pipeline": model_info.get("image_pipeline", ""),
+            "image_alias": model_info.get("image_alias", ""),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
@@ -1701,6 +1723,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "video_default_size": settings.video_default_size,
                 "video_default_seconds": settings.video_default_seconds,
                 "video_default_upscale_resolution": settings.video_default_upscale_resolution,
+                "image_default_steps": settings.image_default_steps,
+                "image_default_size": settings.image_default_size,
                 "turboquant_kv_enabled": settings.turboquant_kv_enabled,
                 "turboquant_kv_bits": settings.turboquant_kv_bits,
                 "turboquant_skip_last": settings.turboquant_skip_last,
@@ -1988,6 +2012,24 @@ async def update_model_settings(
             if not _vvalue:
                 _vvalue = None
             setattr(current_settings, _vfield, _vvalue)
+    # Image generation defaults: same contract as video -- size must parse
+    # as WxH at save time so the image route never has to re-validate it.
+    if "image_default_size" in sent:
+        size_value = (request.image_default_size or "").strip() or None
+        if size_value is not None:
+            try:
+                w_str, h_str = size_value.lower().split("x", 1)
+                if int(w_str) <= 0 or int(h_str) <= 0:
+                    raise ValueError
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid image_default_size '{size_value}', expected 'WxH'",
+                )
+        current_settings.image_default_size = size_value
+    if "image_default_steps" in sent:
+        # 0/None clears (falls back to global, then the per-alias default)
+        current_settings.image_default_steps = request.image_default_steps or None
 
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
@@ -2916,6 +2958,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
         "video": global_settings.video.to_dict(),
+        "image": global_settings.image.to_dict(),
     }
 
 
@@ -3359,6 +3402,44 @@ async def update_global_settings(
         value = getattr(request, req_field, None)
         if value is not None:
             setattr(global_settings.video, attr, value)
+            runtime_applied.append(req_field)
+
+    # Apply image settings (same live semantics as video: enabled flips
+    # per-request gating immediately because handlers read settings.image
+    # each call; worker_python/memory_lease affect the NEXT job dispatch.)
+    if request.image_default_size is not None and request.image_default_size != "":
+        try:
+            w_str, h_str = request.image_default_size.lower().split("x", 1)
+            if int(w_str) <= 0 or int(h_str) <= 0:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid image_default_size '{request.image_default_size}', "
+                    "expected 'WxH'"
+                ),
+            )
+    _image_fields = {
+        "image_enabled": "enabled",
+        "image_worker_python": "worker_python",
+        "image_memory_lease_gb": "memory_lease_gb",
+        "image_max_queued_jobs": "max_queued_jobs",
+        "image_job_timeout_seconds": "job_timeout_seconds",
+        "image_progress_stall_timeout_seconds": "progress_stall_timeout_seconds",
+        "image_default_steps": "default_steps",
+        "image_default_size": "default_size",
+        "image_max_steps": "max_steps",
+        "image_max_pixels": "max_pixels",
+        "image_max_n": "max_n",
+        "image_sync_timeout_seconds": "sync_timeout_seconds",
+        "image_artifacts_max_count": "artifacts_max_count",
+        "image_artifacts_max_gb": "artifacts_max_gb",
+    }
+    for req_field, attr in _image_fields.items():
+        value = getattr(request, req_field, None)
+        if value is not None:
+            setattr(global_settings.image, attr, value)
             runtime_applied.append(req_field)
 
     # Apply auth settings (API key change)
