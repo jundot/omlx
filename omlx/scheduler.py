@@ -431,12 +431,14 @@ _uid_row_registry_lock = threading.Lock()
 
 
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
-    """Record the sampler and logits processors each freshly-inserted uid must run."""
+    """Record the sampler and logits processors each freshly-inserted uid must run.
+
+    Each (model, uid) key is inserted exactly once per request, so plain
+    insertion order is enough for the oldest-first backstop eviction.
+    """
     with _uid_row_registry_lock:
         for uid, sampler, lps in zip(uids, samplers, lps_rows):
-            key = (id(model), uid)
-            _uid_row_registry[key] = (sampler, list(lps) if lps else [])
-            _uid_row_registry.move_to_end(key)
+            _uid_row_registry[(id(model), uid)] = (sampler, list(lps or ()))
         while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
             _uid_row_registry.popitem(last=False)
 
