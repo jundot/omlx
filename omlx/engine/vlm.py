@@ -85,6 +85,8 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
+DIFFUSION_PREFILL_STEP_SIZE = 2048
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -2689,6 +2691,7 @@ class VLMBatchedEngine(BaseEngine):
                         getattr(tokenizer, "all_special_ids", None) or []
                     ),
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
+                    prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
                 )
                 for result in results:
                     if cancel_event is not None and cancel_event.is_set():
@@ -2700,8 +2703,7 @@ class VLMBatchedEngine(BaseEngine):
                     result_text = result.text or ""
                     if result_text:
                         has_token_progress = (
-                            result_tokens is None
-                            or int(result_tokens) > emitted_tokens
+                            result_tokens is None or int(result_tokens) > emitted_tokens
                         )
                         has_final_flush = (
                             finish_reason is not None
@@ -2734,6 +2736,25 @@ class VLMBatchedEngine(BaseEngine):
                             finished=finish_reason is not None,
                             finish_reason=finish_reason,
                             cached_tokens=0,
+                            prompt_tps=float(getattr(result, "prompt_tps", 0.0) or 0.0),
+                            generation_tps=float(
+                                getattr(result, "generation_tps", 0.0) or 0.0
+                            ),
+                            diffusion_canvas_tokens=int(
+                                getattr(result, "diffusion_canvas_tokens", 0) or 0
+                            ),
+                            diffusion_denoising_steps=int(
+                                getattr(result, "diffusion_denoising_steps", 0) or 0
+                            ),
+                            diffusion_work_tokens=int(
+                                getattr(result, "diffusion_work_tokens", 0) or 0
+                            ),
+                            diffusion_canvas_tps=float(
+                                getattr(result, "diffusion_canvas_tps", 0.0) or 0.0
+                            ),
+                            diffusion_work_tps=float(
+                                getattr(result, "diffusion_work_tps", 0.0) or 0.0
+                            ),
                         )
                     block_text = []
                     if finish_reason:

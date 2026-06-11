@@ -13,7 +13,9 @@ from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
+    _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
+    _resolve_metric_durations,
     app,
     get_engine,
     get_sampling_params,
@@ -40,6 +42,70 @@ class TestDiffusionStructuredOutputGuard:
 
 
 
+class TestGenerationSpeedLog:
+    def test_formats_plain_generation_speed(self):
+        assert (
+            _format_generation_speed_for_log(object(), 12.345, is_diffusion=False)
+            == "12.3 tok/s"
+        )
+
+    def test_formats_diffusion_native_stats(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            generation_tps=25.37,
+            diffusion_canvas_tps=25.37,
+            prompt_tps=2293.3,
+            diffusion_work_tps=1179.8,
+            diffusion_denoising_steps=93,
+        )
+
+        text = _format_generation_speed_for_log(output, 18.716, is_diffusion=True)
+
+        assert text == (
+            "18.7 tok/s e2e, output=25.4 tok/s, canvas=25.4 tok/s, "
+            "prompt=2293.3 tok/s, work=1179.8 tok/s, steps=93"
+        )
+
+    def test_formats_diffusion_canvas_speed_for_early_eos(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            generation_tps=19.2,
+            diffusion_canvas_tps=24.6,
+            prompt_tps=2293.7,
+            diffusion_work_tps=1179.8,
+            diffusion_denoising_steps=96,
+        )
+
+        text = _format_generation_speed_for_log(output, 14.3, is_diffusion=True)
+
+        assert text == (
+            "14.3 tok/s e2e, output=19.2 tok/s, canvas=24.6 tok/s, "
+            "prompt=2293.7 tok/s, work=1179.8 tok/s, steps=96"
+        )
+
+    def test_resolves_diffusion_native_durations(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            prompt_tokens=16384,
+            completion_tokens=512,
+            prompt_tps=2048.0,
+            generation_tps=32.0,
+        )
+
+        prefill, generation = _resolve_metric_durations(
+            output,
+            is_diffusion=True,
+            prefill_duration=99.0,
+            generation_duration=99.0,
+        )
+
+        assert prefill == 8.0
+        assert generation == 16.0
+
+
 class TestGetSamplingParams:
     """Tests for get_sampling_params function."""
 
@@ -59,7 +125,18 @@ class TestGetSamplingParams:
 
     def test_defaults(self):
         """Test default values with no request or model params."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(None, None)
+        (
+            temp,
+            top_p,
+            top_k,
+            rep_penalty,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            max_tokens,
+            xtc_prob,
+            xtc_thresh,
+        ) = get_sampling_params(None, None)
         assert temp == 1.0
         assert top_p == 0.95
         assert top_k == 0
@@ -93,7 +170,10 @@ class TestGetSamplingParams:
     def test_xtc_request_passthrough(self):
         """Test XTC params pass through from request values."""
         *_, xtc_prob, xtc_thresh = get_sampling_params(
-            None, None, req_xtc_probability=0.5, req_xtc_threshold=0.1,
+            None,
+            None,
+            req_xtc_probability=0.5,
+            req_xtc_threshold=0.1,
         )
         assert xtc_prob == 0.5
         assert xtc_thresh == 0.1
@@ -101,7 +181,9 @@ class TestGetSamplingParams:
     def test_xtc_partial_override(self):
         """Test setting only xtc_probability uses safe default threshold."""
         *_, xtc_prob, xtc_thresh = get_sampling_params(
-            None, None, req_xtc_probability=0.3,
+            None,
+            None,
+            req_xtc_probability=0.3,
         )
         assert xtc_prob == 0.3
         assert xtc_thresh == 0.1
@@ -114,15 +196,28 @@ class TestGetSamplingParams:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
             settings = ModelSettings(
-                temperature=0.3, top_k=50, repetition_penalty=1.2,
-                min_p=0.05, presence_penalty=0.3, max_tokens=2048,
+                temperature=0.3,
+                top_k=50,
+                repetition_penalty=1.2,
+                min_p=0.05,
+                presence_penalty=0.3,
+                max_tokens=2048,
             )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-                None, None, "test-model"
-            )
+            (
+                temp,
+                top_p,
+                top_k,
+                rep_penalty,
+                min_p,
+                presence_penalty,
+                frequency_penalty,
+                max_tokens,
+                xtc_prob,
+                xtc_thresh,
+            ) = get_sampling_params(None, None, "test-model")
             assert temp == 0.3
             assert top_p == 0.95  # falls back to global
             assert top_k == 50
@@ -161,7 +256,9 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(None, None, "test-model")
+            _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(
+                None, None, "test-model"
+            )
             assert rep_penalty == 1.5
 
     def test_global_repetition_penalty(self):
@@ -296,9 +393,7 @@ class TestModelFallback:
 
             pool.get_engine = AsyncMock(side_effect=mock_get_engine)
         else:
-            pool.get_engine = AsyncMock(
-                side_effect=ModelNotFoundError("unknown", [])
-            )
+            pool.get_engine = AsyncMock(side_effect=ModelNotFoundError("unknown", []))
 
         self._state.engine_pool = pool
         return pool
@@ -380,6 +475,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_stt_engine(self):
         """Requesting an STT model on an LLM endpoint returns HTTP 400, not 500."""
         from omlx.engine.stt import STTEngine
+
         stt = MagicMock(spec=STTEngine)
         self._pool_returning(stt)
 
@@ -387,12 +483,15 @@ class TestGetEngineLLMTypeValidation:
             await get_engine("whisper-large-v3-turbo", EngineType.LLM)
         assert exc_info.value.status_code == 400
         detail = str(exc_info.value.detail).lower()
-        assert "not an llm" in detail or "not a chat" in detail or "not a text" in detail
+        assert (
+            "not an llm" in detail or "not a chat" in detail or "not a text" in detail
+        )
 
     @pytest.mark.asyncio
     async def test_llm_rejects_tts_engine(self):
         """Requesting a TTS model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.tts import TTSEngine
+
         tts = MagicMock(spec=TTSEngine)
         self._pool_returning(tts)
 
@@ -404,6 +503,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_sts_engine(self):
         """Requesting an STS model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.sts import STSEngine
+
         sts = MagicMock(spec=STSEngine)
         self._pool_returning(sts)
 
@@ -415,6 +515,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_embedding_engine(self):
         """Requesting an embedding model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.embedding import EmbeddingEngine
+
         emb = MagicMock(spec=EmbeddingEngine)
         self._pool_returning(emb)
 
@@ -426,6 +527,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_reranker_engine(self):
         """Requesting a reranker model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.reranker import RerankerEngine
+
         rr = MagicMock(spec=RerankerEngine)
         self._pool_returning(rr)
 
@@ -437,6 +539,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_accepts_llm_engine(self):
         """A genuine LLM engine passes validation and is returned as-is."""
         from omlx.engine.base import BaseEngine
+
         llm = MagicMock(spec=BaseEngine)
         self._pool_returning(llm)
 

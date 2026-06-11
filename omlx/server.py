@@ -2593,13 +2593,25 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        speed_text = _format_generation_speed_for_log(
+            output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+        )
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({speed_text}), prompt: {output.prompt_tokens}")
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            output,
+            is_diffusion=is_diffusion,
+            generation_duration=elapsed,
+        )
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolved_model,
         )
 
@@ -2718,6 +2730,55 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+def _format_generation_speed_for_log(
+    output,
+    tokens_per_sec: float,
+    *,
+    is_diffusion: bool,
+) -> str:
+    if not is_diffusion:
+        return f"{tokens_per_sec:.1f} tok/s"
+
+    parts = [f"{tokens_per_sec:.1f} tok/s e2e"]
+    output_tps = float(getattr(output, "generation_tps", 0.0) or 0.0)
+    if output_tps > 0:
+        parts.append(f"output={output_tps:.1f} tok/s")
+    canvas_tps = float(getattr(output, "diffusion_canvas_tps", 0.0) or 0.0)
+    if canvas_tps > 0:
+        parts.append(f"canvas={canvas_tps:.1f} tok/s")
+    prompt_tps = float(getattr(output, "prompt_tps", 0.0) or 0.0)
+    if prompt_tps > 0:
+        parts.append(f"prompt={prompt_tps:.1f} tok/s")
+    work_tps = float(getattr(output, "diffusion_work_tps", 0.0) or 0.0)
+    if work_tps > 0:
+        parts.append(f"work={work_tps:.1f} tok/s")
+    steps = int(getattr(output, "diffusion_denoising_steps", 0) or 0)
+    if steps > 0:
+        parts.append(f"steps={steps}")
+    return ", ".join(parts)
+
+
+def _resolve_metric_durations(
+    output,
+    *,
+    is_diffusion: bool,
+    prefill_duration: float = 0.0,
+    generation_duration: float = 0.0,
+) -> tuple[float, float]:
+    if not is_diffusion:
+        return prefill_duration, generation_duration
+
+    prompt_tps = float(getattr(output, "prompt_tps", 0.0) or 0.0)
+    if prompt_tps > 0:
+        prefill_duration = output.prompt_tokens / prompt_tps
+
+    generation_tps = float(getattr(output, "generation_tps", 0.0) or 0.0)
+    if generation_tps > 0:
+        generation_duration = output.completion_tokens / generation_tps
+
+    return prefill_duration, generation_duration
 
 
 def _response_format_requests_grammar(response_format) -> bool:
@@ -3193,26 +3254,39 @@ async def stream_completion(
             if first_token_time
             else total_duration
         )
-        if getattr(engine, "is_diffusion_model", False):
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            last_output,
+            is_diffusion=is_diffusion,
+            prefill_duration=ttft,
+            generation_duration=gen_duration,
+        )
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
+        speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
-            last_output.completion_tokens / gen_duration
-            if gen_duration > 0
+            last_output.completion_tokens / speed_duration
+            if speed_duration > 0
             else 0
+        )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
         )
         logger.info(
             f"Completion: {last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({tokens_per_sec:.1f} tok/s), "
+            f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}"
         )
 
@@ -3237,10 +3311,10 @@ async def stream_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metric_prefill_duration, 2),
+                    generation_duration=round(metric_gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / metric_prefill_duration, 2) if metric_prefill_duration > 0 else None,
+                    generation_tokens_per_second=round(ct / metric_gen_duration, 2) if metric_gen_duration > 0 else None,
                 ).model_dump(exclude_none=True),
             }
             yield f"data: {json.dumps(usage_data)}\n\n"
@@ -3521,26 +3595,39 @@ async def stream_chat_completion(
             if first_token_time
             else total_duration
         )
-        if getattr(engine, "is_diffusion_model", False):
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            last_output,
+            is_diffusion=is_diffusion,
+            prefill_duration=ttft,
+            generation_duration=gen_duration,
+        )
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
         )
+        speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
-            last_output.completion_tokens / gen_duration
-            if gen_duration > 0
+            last_output.completion_tokens / speed_duration
+            if speed_duration > 0
             else 0
+        )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
         )
         logger.info(
             f"Chat completion: {last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({tokens_per_sec:.1f} tok/s), "
+            f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
             f"request_max_tokens={request.max_tokens}"
@@ -3565,10 +3652,10 @@ async def stream_chat_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metric_prefill_duration, 2),
+                    generation_duration=round(metric_gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / metric_prefill_duration, 2) if metric_prefill_duration > 0 else None,
+                    generation_tokens_per_second=round(ct / metric_gen_duration, 2) if metric_gen_duration > 0 else None,
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
