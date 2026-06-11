@@ -500,6 +500,15 @@ async def create_video(request: Request):
     return job.to_dict()
 
 
+def _get_video_job(manager, video_id: str):
+    """Kind guard: the manager is shared with the image engine, so image
+    jobs must be invisible on the video wire surface (and vice versa)."""
+    job = manager.get(video_id)
+    if job is None or getattr(job, "kind", "video") != "video":
+        raise HTTPException(status_code=404, detail=f"Video '{video_id}' not found")
+    return job
+
+
 @router.get("/v1/videos")
 async def list_videos(
     limit: int = 20, after: str | None = None, order: str = "desc"
@@ -508,7 +517,9 @@ async def list_videos(
     limit = max(1, min(int(limit), 100))
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be asc|desc")
-    page, has_more = manager.list_jobs(limit=limit, after=after, order=order)
+    page, has_more = manager.list_jobs(
+        limit=limit, after=after, order=order, kind="video"
+    )
     data = [j.to_dict() for j in page]
     return {
         "object": "list",
@@ -522,18 +533,13 @@ async def list_videos(
 @router.get("/v1/videos/{video_id}")
 async def get_video(video_id: str):
     manager = _get_video_manager()
-    job = manager.get(video_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Video '{video_id}' not found")
-    return job.to_dict()
+    return _get_video_job(manager, video_id).to_dict()
 
 
 @router.get("/v1/videos/{video_id}/content")
 async def get_video_content(video_id: str):
     manager = _get_video_manager()
-    job = manager.get(video_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Video '{video_id}' not found")
+    job = _get_video_job(manager, video_id)
     if job.status != "completed":
         raise HTTPException(
             status_code=409,
@@ -562,7 +568,6 @@ async def get_video_content(video_id: str):
 @router.delete("/v1/videos/{video_id}")
 async def delete_video(video_id: str):
     manager = _get_video_manager()
-    deleted = await manager.delete(video_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Video '{video_id}' not found")
+    _get_video_job(manager, video_id)
+    await manager.delete(video_id)
     return {"id": video_id, "object": "video.deleted", "deleted": True}

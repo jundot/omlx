@@ -44,10 +44,17 @@ ERR_MONITOR_FAILED = "monitor_failed"
 ERR_SERVER_RESTARTED = "server_restarted"
 ERR_OUTPUT_INVALID = "output_invalid"
 ERR_EXTEND_SOURCE_MISSING = "extend_source_missing"
+ERR_LEASE_INFEASIBLE = "memory_lease_infeasible"
 
 _WATCHDOG_INTERVAL_S = 2.0
 _ADMISSION_RECHECK_S = 5.0
 _SIGTERM_GRACE_S = 5.0
+# A queue-head job whose lease exceeds the enforcer ceiling can never pass
+# admission; after this long it is failed instead of retried, so it cannot
+# wedge the shared FIFO and starve feasible jobs of both kinds behind it.
+# Nonzero grace because the dynamic ceiling can dip transiently under
+# other-process memory pressure.
+_INFEASIBLE_FAIL_S = 180.0
 
 MEDIA_KINDS = ("video", "image")
 
@@ -217,6 +224,7 @@ class MediaJobManager:
         # venv, so a shared venv is probed once for both kinds.
         self._venv_probe_results: dict[str, tuple[bool, str]] = {}
         self._terminal_events: dict[str, asyncio.Event] = {}
+        self._infeasible_since: dict[str, float] = {}
 
         for kind in MEDIA_KINDS:
             self.jobs_dir_for(kind).mkdir(parents=True, exist_ok=True)
@@ -400,6 +408,30 @@ class MediaJobManager:
                 f"(ceiling {ceiling / GB:.1f}GB, lease {lease / GB:.0f}GB)"
             )
         return True, ""
+
+    def lease_fits_ceiling(self, lease_bytes: int) -> tuple[bool, str]:
+        """Submission-time feasibility: a lease at or above the enforcer
+        ceiling can never pass admission on this machine (the routes 413
+        instead of accepting a job that would only wedge the queue)."""
+        enf = self._enforcer
+        if enf is None or not getattr(enf, "is_running", False):
+            return True, ""
+        ceiling = int(enf.get_final_ceiling() or 0)
+        if ceiling > 0 and lease_bytes >= ceiling:
+            return False, (
+                f"memory lease {lease_bytes / GB:.0f}GB does not fit under "
+                f"this machine's memory ceiling {ceiling / GB:.1f}GB"
+            )
+        return True, ""
+
+    def _lease_infeasible(self, job: MediaJob) -> bool:
+        """True when the job's lease exceeds the CURRENT ceiling outright
+        (the permanent admission-failure arm, vs transient pressure)."""
+        enf = self._enforcer
+        if enf is None or not getattr(enf, "is_running", False):
+            return False
+        ceiling = int(enf.get_final_ceiling() or 0)
+        return ceiling > 0 and self._lease_bytes(job) >= ceiling
 
     # -- public API ----------------------------------------------------------
 
@@ -598,11 +630,26 @@ class MediaJobManager:
                 continue
             ok, reason = self._memory_admission(job)
             if not ok:
+                # Lease-over-ceiling is permanent (machine-fixed bounds);
+                # fail the head job after a grace window instead of letting
+                # it wedge the shared FIFO forever.
+                if self._lease_infeasible(job):
+                    started = self._infeasible_since.setdefault(
+                        job.id, time.time()
+                    )
+                    if time.time() - started >= _INFEASIBLE_FAIL_S:
+                        self._queue.pop(0)
+                        self._infeasible_since.pop(job.id, None)
+                        self._finish(job, "failed", ERR_LEASE_INFEASIBLE, reason)
+                        continue
+                else:
+                    self._infeasible_since.pop(job.id, None)
                 if job.phase != reason:
                     job.phase = reason
                     self._persist(job)
                 await asyncio.sleep(_ADMISSION_RECHECK_S)
                 continue
+            self._infeasible_since.pop(job.id, None)
             self._queue.pop(0)
             try:
                 await self._run_job(job)
@@ -824,7 +871,15 @@ class MediaJobManager:
             elif phase == "loaded":
                 job.progress = max(job.progress, 5)
             elif phase == "saving":
-                job.progress = max(job.progress, 97)
+                # Only the LAST image's save means near-done; earlier saves
+                # cap at their per-image band top or the bar would sit at
+                # 97% through the remaining n-1 renders.
+                if index >= n - 1:
+                    job.progress = max(job.progress, 97)
+                else:
+                    job.progress = max(
+                        job.progress, 5 + int(90 * (index + 1) / n)
+                    )
             elif total > 0 and step > 0:
                 done_fraction = (index + step / total) / n
                 job.progress = max(
@@ -910,6 +965,14 @@ class MediaJobManager:
                     return
             job.artifact_files = files
             job.artifact_path = str(blob_dir / files[0])
+            # The worker reports the ACTUAL output dimensions: with an input
+            # image mflux re-derives the canvas from the source aspect, so
+            # the requested width/height can be wrong for img2img/edit.
+            if isinstance(manifest.get("width"), int) and isinstance(
+                manifest.get("height"), int
+            ):
+                job.params["width"] = manifest["width"]
+                job.params["height"] = manifest["height"]
         else:
             if not output_path.exists() or output_path.stat().st_size == 0:
                 self._finish(job, "failed", ERR_OUTPUT_INVALID,

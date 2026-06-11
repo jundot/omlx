@@ -222,10 +222,21 @@ class TestImageChatSwitchPreservesInflight:
             "poll await, or a chat switch/reload mid-render loses it"
         )
 
-    def test_poll_image_is_chat_scoped(self, chat_source):
+    def test_poll_image_guard_is_identity_based(self, chat_source):
+        """The exit guard must compare the captured this.messages array
+        reference, not the chat id: an A->B->A switch within one 4s tick
+        restores the same chat id, so a chat-id guard leaves the stale
+        poller running alongside the rehydration-spawned one (double
+        content downloads, leaked blobs)."""
         body = _function_body(chat_source, "pollImage")
-        assert "pollChatId" in body and "currentChatId !== pollChatId" in body, (
-            "pollImage must exit when its chat is no longer open"
+        assert "const pollMessages = this.messages" in body, (
+            "pollImage must capture the messages-array reference at start"
+        )
+        assert "this.messages !== pollMessages" in body, (
+            "pollImage must exit when the messages array was reassigned"
+        )
+        assert "pollChatId" not in body, (
+            "the chat-id guard misses A->B->A switches within one tick"
         )
 
     def test_truncation_cancels_inflight_image_jobs(self, chat_source):
@@ -233,6 +244,77 @@ class TestImageChatSwitchPreservesInflight:
         same way it cancels video jobs."""
         body = _function_body(chat_source, "cancelRemovedVideos")
         assert "_image" in body and "cancelImage(" in body
+
+
+class TestImageResourceLifecycle:
+    """Object URLs pin their PNG blobs in memory until explicitly
+    revoked, and server jobs occupy the single media worker until
+    DELETEd. Every path that drops an image bubble or its urls must
+    release both (adversarial review findings, 2026-06)."""
+
+    def test_load_chat_strip_arm_revokes_blob_urls(self, chat_source):
+        """The _image strip arm must revoke each blob: URL before the
+        filter drops it, or every chat switch/reopen leaks the full
+        PNG set."""
+        body = _function_body(chat_source, "loadChat")
+        image_arm = body[body.index("m._image"):]
+        revoke_pos = image_arm.find("URL.revokeObjectURL(")
+        filter_pos = image_arm.find("m._image.urls.filter")
+        assert revoke_pos != -1, (
+            "loadChat's _image strip arm must call URL.revokeObjectURL"
+        )
+        assert filter_pos != -1 and revoke_pos < filter_pos, (
+            "revocation must happen before the blob: URLs are filtered out"
+        )
+
+    def test_attach_image_content_revokes_before_reassign(self, chat_source):
+        """Re-fetch paths (rehydrate racing a live poll) reassign
+        im.urls; the old object URLs must be revoked first."""
+        body = _function_body(chat_source, "attachImageContent")
+        revoke_pos = body.find("URL.revokeObjectURL(")
+        assign_pos = body.find("im.urls = urls")
+        assert revoke_pos != -1, (
+            "attachImageContent must revoke previously attached URLs"
+        )
+        assert assign_pos != -1 and revoke_pos < assign_pos, (
+            "revocation must precede the im.urls reassignment"
+        )
+
+    def test_truncation_revokes_removed_image_urls(self, chat_source):
+        """Messages removed by edit/regenerate never render again; their
+        blob URLs must be revoked. The cancel check must stay BEFORE the
+        revoke-and-blank block: it keys off urls being non-empty, and
+        blanking first would DELETE completed jobs' server artifacts."""
+        body = _function_body(chat_source, "cancelRemovedVideos")
+        revoke_pos = body.find("URL.revokeObjectURL(")
+        cancel_pos = body.find("cancelImage(")
+        assert revoke_pos != -1, (
+            "cancelRemovedVideos must revoke removed image blob URLs"
+        )
+        assert cancel_pos != -1 and cancel_pos < revoke_pos, (
+            "the cancelImage check must run before urls are blanked"
+        )
+
+    def test_generate_image_handles_cancel_before_post_response(self, chat_source):
+        """If the user cancels while POST /v1/images is in flight, the
+        job id arrives after cancellation and cancelImage had nothing to
+        DELETE; generateImage must DELETE the orphan job itself and skip
+        polling, or it occupies the single media worker for the full
+        render."""
+        body = _function_body(chat_source, "generateImage")
+        job_pos = body.index("msg._image.job_id = job.id")
+        poll_pos = body.index("await this.pollImage(msg)")
+        window = body[job_pos:poll_pos]
+        assert "cancelled" in window, (
+            "generateImage must check the cancelled flag right after the "
+            "job id is assigned from the POST response"
+        )
+        assert "method: 'DELETE'" in window, (
+            "the cancelled branch must fire a DELETE for the orphan job"
+        )
+        assert "return" in window, (
+            "the cancelled branch must return before pollImage starts"
+        )
 
 
 class TestImageI18nKeys:

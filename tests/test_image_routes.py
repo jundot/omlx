@@ -435,8 +435,10 @@ class TestSyncPath:
         assert r.status_code == 200, r.text
         body = r.json()
         job_id = body["id"]
+        # Absolute URL (request.base_url): OpenAI-style clients fetch it
+        # directly; TestClient's base is http://testserver.
         assert body["data"] == [
-            {"url": f"/v1/images/{job_id}/content?index=0"}
+            {"url": f"http://testserver/v1/images/{job_id}/content?index=0"}
         ]
         # The URL actually serves the artifact
         content = client.get(body["data"][0]["url"])
@@ -930,3 +932,154 @@ def test_queue_full_error_raised_by_real_submit(image_env):
                    params={})
     with pytest.raises(QueueFullError):
         asyncio.run(manager.submit(job))
+
+
+# ---------------------------------------------------------------------------
+# Regressions pinned from the adversarial branch review
+# ---------------------------------------------------------------------------
+
+
+class TestReviewRegressions:
+    def test_seed_negative_400(self, image_env):
+        client, _ = image_env()
+        assert _post_async(client, seed=-1).status_code == 400
+
+    def test_seed_too_large_400(self, image_env):
+        # Out-of-range seeds previously crashed the worker AFTER the full
+        # model load (mx.random.key rejects >= 2**64; seed+i overflows).
+        client, _ = image_env()
+        assert _post_async(client, seed=2**63).status_code == 400
+
+    def test_n_zero_400(self, image_env):
+        client, _ = image_env()
+        assert _post_async(client, n=0).status_code == 400
+
+    def test_steps_zero_400(self, image_env):
+        client, _ = image_env()
+        assert _post_async(client, steps=0).status_code == 400
+
+    def test_negative_size_400(self, image_env):
+        client, _ = image_env()
+        assert _post_async(client, size="-512x512").status_code == 400
+
+    def test_too_many_input_images_400(self, image_env):
+        client, _ = image_env()
+        r = _post_async(
+            client, model=EDIT_PLUS_MODEL, image=[PNG_DATA_URL] * 5
+        )
+        assert r.status_code == 400
+        assert "At most" in r.json()["detail"]
+
+    def test_lora_absolute_path_400(self, image_env):
+        client, _ = image_env()
+        r = _post_async(client, lora_paths=["/etc/shadow"])
+        assert r.status_code == 400
+        r = _post_async(client, lora_paths=["foo/../../bar.safetensors"])
+        assert r.status_code == 400
+
+    def test_lora_hf_reference_accepted(self, image_env):
+        client, manager = image_env()
+        r = _post_async(
+            client,
+            lora_paths=["lightx2v/Qwen-Image-Lightning:Qwen-8steps.safetensors"],
+        )
+        assert r.status_code == 200, r.text
+        assert manager.test_submitted[0].params["lora_paths"] == [
+            "lightx2v/Qwen-Image-Lightning:Qwen-8steps.safetensors"
+        ]
+
+    def test_text_only_with_only_edit_models_404(self, image_env, tmp_path):
+        # Auto-pick must not fall back to an edit model for a text-only
+        # request (it would guarantee a confusing "needs input image" 400).
+        entries = {
+            k: v for k, v in _default_entries(tmp_path).items()
+            if getattr(v, "image_pipeline", "") == "edit"
+        }
+        client, _ = image_env(entries=entries)
+        r = client.post("/v1/images", json={"prompt": "a cat", "sync": False})
+        assert r.status_code == 404
+
+    def test_lease_over_ceiling_413(self, image_env):
+        client, manager = image_env()
+        manager._enforcer = SimpleNamespace(
+            is_running=True,
+            get_final_ceiling=lambda: 10 * image_routes.GB,
+        )
+        # z-image-turbo alias lease default is 12GB > 10GB ceiling
+        r = _post_async(client)
+        assert r.status_code == 413
+        assert "does not fit" in r.json()["detail"]
+
+    def test_generations_timeout_cancels_job(self, image_env):
+        sleeper = (
+            "import json, sys, time\n"
+            "spec_path = sys.argv[sys.argv.index('--spec') + 1]\n"
+            "with open(spec_path) as f:\n"
+            "    spec = json.load(f)\n"
+            "print(json.dumps({'phase': 'loading'}), flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        client, manager = image_env(
+            settings=_image_settings(sync_timeout_seconds=1),
+            stub_submit=False,
+            worker_body=sleeper,
+        )
+        r = client.post(
+            "/v1/images/generations",
+            json={"model": T2I_MODEL, "prompt": "a cat"},
+        )
+        assert r.status_code == 504
+        assert "cancelled" in r.json()["detail"]
+        # The orphan job was DELETEd: SDK clients auto-retry 5xx, and a
+        # surviving job would hold the single-worker queue while duplicates
+        # pile up behind it.
+        page, _ = manager.list_jobs(kind="image")
+        assert page == []
+
+    def test_plain_sync_timeout_keeps_job(self, image_env):
+        sleeper = (
+            "import json, sys, time\n"
+            "spec_path = sys.argv[sys.argv.index('--spec') + 1]\n"
+            "with open(spec_path) as f:\n"
+            "    spec = json.load(f)\n"
+            "print(json.dumps({'phase': 'loading'}), flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        client, manager = image_env(
+            settings=_image_settings(sync_timeout_seconds=1),
+            stub_submit=False,
+            worker_body=sleeper,
+        )
+        r = _post(client)  # sync default true, NOT the generations alias
+        assert r.status_code == 504
+        assert "poll GET /v1/images/" in r.json()["detail"]
+        page, _ = manager.list_jobs(kind="image")
+        assert len(page) == 1  # fmlx-aware callers can still poll it
+
+
+class TestVideoRouteKindIsolation:
+    """Image jobs must be invisible on the /v1/videos wire surface."""
+
+    def test_image_jobs_invisible_on_video_surface(self, image_env, monkeypatch):
+        import omlx.api.video_routes as video_routes
+
+        _, manager = image_env()
+        job = _seed_completed_image(manager, "img_iso")
+        _seed_video_job(manager, "video_iso")
+
+        monkeypatch.setattr(
+            video_routes, "_get_video_manager", lambda: manager
+        )
+        app = FastAPI()
+        app.include_router(video_routes.router)
+        vclient = TestClient(app)
+
+        data = vclient.get("/v1/videos").json()["data"]
+        assert [j["id"] for j in data] == ["video_iso"]
+
+        assert vclient.get("/v1/videos/img_iso").status_code == 404
+        assert vclient.get("/v1/videos/img_iso/content").status_code == 404
+        assert vclient.delete("/v1/videos/img_iso").status_code == 404
+        # The cross-kind DELETE must not have removed the image job
+        assert manager.get("img_iso") is not None
+        assert job.artifact_path is not None

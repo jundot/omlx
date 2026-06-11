@@ -44,7 +44,10 @@ class ImageCreateParams(BaseModel):
     width: Optional[int] = None  # Explicit override beats size
     height: Optional[int] = None
     steps: Optional[int] = None
-    seed: Optional[int] = None
+    # Bounded: mlx random keys take uint64, and the worker derives per-image
+    # seeds as seed+i. An out-of-range seed would crash only AFTER the full
+    # multi-GB model load -- reject it at validation time instead.
+    seed: Optional[int] = Field(None, ge=0, lt=2**31)
     guidance: Optional[float] = None
     image_strength: Optional[float] = None  # img2img only (t2i models)
     lora_paths: Optional[list[str]] = None

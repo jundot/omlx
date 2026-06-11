@@ -2092,6 +2092,15 @@
                 }
                 if (m._image) {
                     if (Array.isArray(m._image.urls)) {
+                        // Revoke the session blob URLs before dropping
+                        // them -- an object URL pins its PNG blob in
+                        // memory until revoked, so every chat switch or
+                        // reopen would otherwise leak the full set.
+                        for (const u of m._image.urls) {
+                            if (u && String(u).startsWith('blob:')) {
+                                URL.revokeObjectURL(u);
+                            }
+                        }
                         m._image.urls = m._image.urls.filter(
                             u => u && !String(u).startsWith('blob:'));
                     } else {
@@ -2468,6 +2477,17 @@
             if (im && !(im.urls && im.urls.length > 0) && !im.error && !im.cancelled) {
                 this.cancelImage(m);
             }
+            // Removed bubbles never render again: revoke their blob
+            // object URLs (after the cancel check above, which keys off
+            // urls being non-empty) or the PNGs leak until tab close.
+            if (im && Array.isArray(im.urls)) {
+                for (const u of im.urls) {
+                    if (u && String(u).startsWith('blob:')) {
+                        URL.revokeObjectURL(u);
+                    }
+                }
+                im.urls = [];
+            }
         }
     },
 
@@ -2557,6 +2577,15 @@
             }
             const job = await resp.json();
             msg._image.job_id = job.id;
+            // Cancel-before-POST race: if the user cancelled while the
+            // POST was still in flight, cancelImage found no job_id to
+            // DELETE and the server job would orphan-render on the single
+            // media worker. Best-effort DELETE it now and skip polling.
+            if (msg._image.cancelled) {
+                fetch(`/v1/images/${job.id}`, { method: 'DELETE', headers: auth })
+                    .catch(() => { /* best effort */ });
+                return;
+            }
             this.imageSubmitting = false;
             // Persist NOW, not just in finally: until this save the bubble
             // exists only in memory, and switching chats or reloading
@@ -2578,16 +2607,19 @@
     async pollImage(msg) {
         const im = msg._image;
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
-        // Polls are chat-scoped: when the user switches away this loop
-        // exits (its msg proxy is detached from the view), and reopening
-        // the chat rehydrates from the server and starts a fresh poll.
-        // Without this, every switch leaks an invisible poller and the
-        // bubble it mutates is not the one on screen.
-        const pollChatId = this.currentChatId;
+        // Polls are scoped to the messages-array identity, not the chat
+        // id: loadChat and startNewChat always reassign this.messages, so
+        // comparing the captured reference exits this loop on ANY switch
+        // -- including A->B->A within one tick, where a chat-id guard
+        // would let the stale poller run alongside the one rehydrateImage
+        // spawns (double content downloads, leaked blobs). Exiting is
+        // always safe: reopening the chat rehydrates from the server and
+        // starts a fresh poll.
+        const pollMessages = this.messages;
         for (;;) {
             await new Promise(r => setTimeout(r, 4000));
             if (im.cancelled) return;
-            if (this.currentChatId !== pollChatId) return;
+            if (this.messages !== pollMessages) return;
             const s = await fetch(`/v1/images/${im.job_id}`, { headers: auth });
             if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
             const j = await s.json();
@@ -2618,6 +2650,14 @@
             urls.push(URL.createObjectURL(blob));
         }
         im.n = count;
+        // Revoke any previously attached object URLs before the
+        // reassignment drops them (re-fetch paths such as rehydrate
+        // racing a live poll), or the old PNG blobs leak until tab close.
+        for (const old of im.urls || []) {
+            if (old && String(old).startsWith('blob:')) {
+                URL.revokeObjectURL(old);
+            }
+        }
         im.urls = urls;
         msg.content = `\`${im.job_id}\` (${j.wall_seconds || '?'}s`
             + (j.size ? `, ${j.size}` : '')

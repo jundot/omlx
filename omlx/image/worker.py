@@ -250,6 +250,7 @@ def run(spec: dict) -> int:
     os.makedirs(output_dir, exist_ok=True)
     seed = int(spec["seed"])
     outputs: list[str] = []
+    out_width = out_height = None
     for i in range(n):
         current_index = i
         generated = model.generate_image(seed=seed + i, **base_kwargs)
@@ -257,6 +258,14 @@ def run(spec: dict) -> int:
         name = f"output-{i}.png"
         generated.save(path=os.path.join(output_dir, name), overwrite=True)
         outputs.append(name)
+        if out_width is None:
+            try:
+                # Report ACTUAL output dimensions: with an input image the
+                # default canvas policy re-derives the canvas from the
+                # source aspect, so requested width/height can be wrong.
+                out_width, out_height = generated.image.size
+            except Exception:
+                pass
         if n > 1:
             # Keep the cache from compounding across images.
             try:
@@ -281,6 +290,8 @@ def run(spec: dict) -> int:
             "alias": alias,
             "steps": int(spec["steps"]),
             "n": n,
+            "width": out_width,
+            "height": out_height,
         },
     )
     _emit(phase="done", wall_seconds=wall)

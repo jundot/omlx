@@ -41,6 +41,7 @@ router = APIRouter()
 GB = 1024**3
 
 _MAX_INPUT_IMAGE_BYTES = 16 * 1024 * 1024
+_MAX_INPUT_IMAGES = 4
 _IMAGE_MAGIC = (
     (b"\x89PNG\r\n\x1a\n", ".png"),
     (b"\xff\xd8\xff", ".jpg"),
@@ -218,6 +219,11 @@ async def _parse_create_body(
         raise
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed request body")
+    if len(images) > _MAX_INPUT_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {_MAX_INPUT_IMAGES} input images per request",
+        )
     for data_bytes in images:
         if not data_bytes:
             # b"" slips past truthiness gates upstream but would load GBs
@@ -264,7 +270,9 @@ def _pick_default_model(pool, want_edit: bool) -> str | None:
     for model_id, pipeline, _alias in candidates:
         if pipeline == "t2i":
             return model_id
-    return candidates[0][0]
+    # Only edit models installed: auto-picking one for a text-only request
+    # guarantees a confusing "requires an input image" 400 -- 404 instead.
+    return None
 
 
 def _normalize_params(
@@ -280,7 +288,9 @@ def _normalize_params(
     alias = getattr(entry, "image_alias", "") or ""
     pipeline = getattr(entry, "image_pipeline", "") or "t2i"
 
-    n = int(params.n or 1)
+    # n/steps distinguish None (use defaults) from explicit 0 (a 400):
+    # silent coercion of 0 to a default would mask client bugs.
+    n = 1 if params.n is None else int(params.n)
     max_n = int(getattr(image_settings, "max_n", 4))
     if n < 1 or n > max_n:
         raise HTTPException(
@@ -289,11 +299,11 @@ def _normalize_params(
 
     steps = params.steps
     if steps is None:
-        steps = getattr(model_settings, "image_default_steps", None)
-    if not steps:
-        steps = int(getattr(image_settings, "default_steps", 0) or 0)
-    if not steps:
-        steps = _DEFAULT_STEPS.get(alias, _FALLBACK_STEPS)
+        steps = getattr(model_settings, "image_default_steps", None) or None
+        if steps is None:
+            steps = int(getattr(image_settings, "default_steps", 0) or 0) or None
+        if steps is None:
+            steps = _DEFAULT_STEPS.get(alias, _FALLBACK_STEPS)
     steps = int(steps)
     max_steps = int(getattr(image_settings, "max_steps", 60))
     if steps < 1 or steps > max_steps:
@@ -330,6 +340,10 @@ def _normalize_params(
         except ValueError:
             width, height = 1024, 1024
     if width is not None and height is not None:
+        if width <= 0 or height <= 0:
+            raise HTTPException(
+                status_code=400, detail="width and height must be positive"
+            )
         width = _round_up(max(64, width), 16)
         height = _round_up(max(64, height), 16)
         max_pixels = int(getattr(image_settings, "max_pixels", 2048 * 2048))
@@ -402,6 +416,21 @@ def _normalize_params(
     if params.image_strength is not None and pipeline != "edit":
         normalized["image_strength"] = float(params.image_strength)
     if params.lora_paths:
+        # Request strings must not become arbitrary local filesystem paths
+        # in the worker (file-existence oracle via reflected loader errors).
+        # Allowed forms are mflux references: HF repo ids, collection syntax
+        # "org/repo:file.safetensors" and registry names -- never absolute
+        # paths or parent traversal.
+        for p in params.lora_paths:
+            p = str(p)
+            if p.startswith(("/", "~")) or ".." in p or "\\" in p:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "lora_paths entries must be HF references (e.g. "
+                        "org/repo:file.safetensors), not filesystem paths"
+                    ),
+                )
         normalized["lora_paths"] = [str(p) for p in params.lora_paths]
         if params.lora_scales:
             normalized["lora_scales"] = [float(s) for s in params.lora_scales]
@@ -415,12 +444,20 @@ def _lease_bytes_for(alias: str, image_settings: Any) -> int:
     return int(_DEFAULT_LEASE_GB.get(alias, _FALLBACK_LEASE_GB) * GB)
 
 
-def _sync_response(job: Any, response_format: str) -> dict[str, Any]:
+def _sync_response(
+    job: Any, response_format: str, request: Request
+) -> dict[str, Any]:
     """OpenAI images API shape from a completed job."""
     data = []
+    base = str(request.base_url).rstrip("/")
     for i, name in enumerate(job.artifact_files):
         if response_format == "url":
-            data.append({"url": f"/v1/images/{job.id}/content?index={i}"})
+            # Absolute URL so OpenAI-style clients can fetch it directly.
+            # The content endpoint sits behind the same API-key auth as
+            # this one -- callers reuse their credentials.
+            data.append(
+                {"url": f"{base}/v1/images/{job.id}/content?index={i}"}
+            )
         else:
             file_path = (
                 Path(job.artifact_path).parent / name
@@ -498,6 +535,14 @@ async def _create_image_impl(request: Request, force_sync: bool):
     )
     response_format = normalized.pop("response_format")
     alias = normalized["alias"]
+    lease_bytes = _lease_bytes_for(alias, image_settings)
+
+    # A lease at or above the machine ceiling would never pass dispatch
+    # admission -- reject now instead of accepting a job that can only
+    # wedge the queue until the dispatcher fails it.
+    ok, reason = manager.lease_fits_ceiling(lease_bytes)
+    if not ok:
+        raise HTTPException(status_code=413, detail=reason)
 
     from ..video.manager import MediaJob, QueueFullError
 
@@ -507,7 +552,7 @@ async def _create_image_impl(request: Request, force_sync: bool):
         model_id=resolved,
         model_dir=str(entry.model_path),
         params=normalized,
-        lease_bytes=_lease_bytes_for(alias, image_settings),
+        lease_bytes=lease_bytes,
     )
     try:
         await manager.submit(job, input_images=input_images or None)
@@ -525,6 +570,18 @@ async def _create_image_impl(request: Request, force_sync: bool):
         existing = manager.get(job.id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Job was deleted")
+        if force_sync:
+            # The generations alias serves OpenAI SDK clients that cannot
+            # poll and auto-retry 5xx responses -- an orphaned job would
+            # hold the queue while duplicates pile up behind it.
+            await manager.delete(job.id)
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Image generation exceeded {int(timeout)}s and was "
+                    "cancelled; retry with fewer steps or a smaller size"
+                ),
+            )
         raise HTTPException(
             status_code=504,
             detail=(
@@ -542,7 +599,7 @@ async def _create_image_impl(request: Request, force_sync: bool):
                 f"{error.get('message', '')}"
             ),
         )
-    return _sync_response(finished, response_format)
+    return _sync_response(finished, response_format, request)
 
 
 @router.post("/v1/images")

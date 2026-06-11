@@ -672,3 +672,66 @@ async def test_apply_progress_image_band_split_across_n(tmp_path):
         assert single.phase == "denoise"
     finally:
         await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: infeasible-lease fail-fast + actual-dimension manifest
+# ---------------------------------------------------------------------------
+
+
+async def test_infeasible_lease_fails_fast_and_unblocks_queue(
+    tmp_path, monkeypatch
+):
+    # A job whose lease exceeds the ceiling can never pass admission; the
+    # dispatcher must fail it after the grace window instead of wedging the
+    # shared FIFO (and starving feasible jobs of both kinds behind it).
+    monkeypatch.setattr(vm, "_INFEASIBLE_FAIL_S", 0.2)
+    manager, _ = _make_manager(
+        tmp_path, enforcer=FakeEnforcer(ceiling_gb=10.0)
+    )
+    try:
+        wedged = _make_image_job("img_wedge")
+        wedged.lease_bytes = 12 * GB  # > 10GB ceiling: permanently infeasible
+        feasible = _make_image_job("img_after")
+
+        await manager.submit(wedged)
+        await manager.submit(feasible)
+
+        await _wait_terminal(wedged)
+        assert wedged.status == "failed"
+        assert wedged.error is not None
+        assert wedged.error["code"] == vm.ERR_LEASE_INFEASIBLE
+
+        # The queue is unblocked: the feasible job behind it completes
+        await _wait_terminal(feasible)
+        assert feasible.status == "completed"
+    finally:
+        await manager.shutdown()
+
+
+_IMAGE_DIMS_BODY = """\
+emit({"phase": "loading"})
+emit({"phase": "loaded"})
+with open(os.path.join(spec["output_dir"], "output-0.png"), "wb") as f:
+    f.write(b"FAKE-PNG-BYTES")
+with open(spec["manifest_path"], "w") as f:
+    json.dump({"status": "completed", "outputs": ["output-0.png"],
+               "width": 768, "height": 432}, f)
+sys.exit(0)
+"""
+
+
+async def test_manifest_dimensions_override_requested_size(tmp_path):
+    # With an input image mflux re-derives the canvas from the source
+    # aspect, so the requested width/height can misreport the artifact;
+    # the worker manifests the ACTUAL dimensions and _conclude adopts them.
+    manager, _ = _make_manager(tmp_path, image_body=_IMAGE_DIMS_BODY)
+    try:
+        job = await manager.submit(_make_image_job("img_dims"))
+        await _wait_terminal(job)
+        assert job.status == "completed"
+        assert job.params["width"] == 768
+        assert job.params["height"] == 432
+        assert job.to_dict()["size"] == "768x432"
+    finally:
+        await manager.shutdown()
