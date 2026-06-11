@@ -915,8 +915,12 @@ class TestSoftThinkingBudget:
         self._step(proc, self.BUDGET, self._ramp_logits())
         assert proc._forcing
 
-    def test_multi_token_end_boosts_all_ids_with_first_gap(self):
-        """Multi-token close sequences clamp every end id to the target."""
+    def test_multi_token_end_boosts_only_first_id(self):
+        """Without a partial close prefix, only the first marker id is boosted.
+
+        Boosting later ids too could make the model sample them out of
+        order and leak a close-marker fragment into the thinking text.
+        """
         end_ids = [42, 43]
         proc = self._make_processor(end_ids=end_ids)
         logits = None
@@ -924,7 +928,21 @@ class TestSoftThinkingBudget:
             logits = self._step(proc, step, self._ramp_logits(top=5.0))
         target = self._expected_boost(self.BUDGET - 1)
         assert logits[0, 42].item() == pytest.approx(target)
-        assert logits[0, 43].item() == pytest.approx(target)
+        assert logits[0, 43].item() == 0.0
+
+    def test_multi_token_partial_prefix_biases_next_id(self):
+        """After the model emits the first marker id, the second is boosted."""
+        end_ids = [42, 43]
+        proc = self._make_processor(end_ids=end_ids)
+        in_zone = self.SOFT_START + 2
+        for step in range(1, in_zone):
+            self._step(proc, step, self._ramp_logits(top=5.0))
+        # Model naturally samples the first id of the close marker.
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), end_ids[0])
+        logits = proc(tokens, self._ramp_logits(top=5.0))
+        assert not proc._done  # marker not complete yet
+        assert logits[0, 43].item() > 0.0  # continuation id boosted
+        assert logits[0, 42].item() == 0.0  # first id no longer targeted
 
     def test_min_gap_floor_when_end_already_near_top(self):
         """gap is floored at 1.0 so the ramp still progresses on flat logits."""

@@ -492,20 +492,41 @@ class ThinkingBudgetProcessor:
         the top logit, and 1.0 makes it dominate — so the model can close
         the thinking block at a natural boundary instead of being cut
         mid-sentence by the hard force.
+
+        The whole path stays in lazy MLX array ops — no ``.item()``/eval,
+        so the decode loop never syncs on this bias (``progress`` comes
+        from Python-side counters). Only the *next valid* token of the
+        close marker is boosted; for multi-token markers, boosting later
+        ids could make the model sample them out of order and leak a
+        marker fragment into the thinking text.
         """
         span = max(1, self._budget - self._soft_start)
         progress = (self._thinking_tokens - self._soft_start) / span
-        end_id = self._think_end_ids[0]
-        top_logit = mx.max(logits).item()
-        end_logit = logits[..., end_id].item()
-        gap = max(top_logit - end_logit, 1.0)
-        target = end_logit + self._SOFT_BIAS_FACTOR * gap * progress
-        if target <= end_logit:
-            return logits
-        for token_id in self._think_end_ids:
-            if logits[..., token_id].item() < target:
-                logits[..., token_id] = target
+        next_id = self._next_close_token_id()
+        top_logit = mx.max(logits, axis=-1, keepdims=True)
+        end_logit = logits[..., next_id : next_id + 1]
+        gap = mx.maximum(top_logit - end_logit, 1.0)
+        target = end_logit + self._SOFT_BIAS_FACTOR * progress * gap
+        logits[..., next_id : next_id + 1] = mx.maximum(end_logit, target)
         return logits
+
+    def _next_close_token_id(self) -> int:
+        """The only close-marker token that is valid to sample next.
+
+        For a multi-token close marker, the model must emit the ids in
+        order; if the tail of recently generated tokens already matches a
+        proper prefix of the marker, the next id of the sequence is the
+        one to encourage. Otherwise (and always for single-token markers)
+        it is the first id.
+        """
+        ids = self._think_end_ids
+        if len(ids) == 1:
+            return ids[0]
+        recent = self._recent_tokens
+        for k in range(min(len(recent), len(ids) - 1), 0, -1):
+            if recent[-k:] == ids[:k]:
+                return ids[k]
+        return ids[0]
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
