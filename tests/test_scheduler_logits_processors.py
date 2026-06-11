@@ -520,3 +520,47 @@ class TestRowRealignment:
             "per-uid sampler and logits processors; the step chokepoint "
             "realigns rows from that registry. See #1823."
         )
+
+    def test_unregistered_uid_keeps_current_row_and_short_slots_pad(self, monkeypatch):
+        """Realignment must not invent state: a uid missing from the registry
+        keeps its current row, and missing trailing slots pad to empty
+        instead of raising."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+
+        captured = {}
+
+        def fake_original_step(self):
+            captured["logits_processors"] = list(self.logits_processors)
+            captured["samplers"] = list(self.samplers)
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        def legacy_processor(token_context, legacy_logits):
+            return legacy_logits
+
+        class FakeModel:
+            pass
+
+        class FakeBatch:
+            model = FakeModel()
+            uids = [7, 8]
+            # uid 7 is not registered but carries a live row: keep it.
+            # uid 8 has no slot at all (shorter list): pad to [].
+            logits_processors = [[legacy_processor]]
+            samplers = [None]
+            _next_tokens = None
+
+        batch = FakeBatch()
+        result = scheduler._patched_generation_batch_step(batch)
+
+        assert result == "stepped"
+        assert captured["logits_processors"][0] == [legacy_processor]
+        assert captured["logits_processors"][1] == []
+        assert len(batch.samplers) == len(batch.uids)
