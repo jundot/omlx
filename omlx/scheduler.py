@@ -4078,6 +4078,7 @@ class Scheduler:
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
+                greedy=(request.sampling_params.temperature or 0) <= 0,
             )
         except Exception as e:
             logger.warning(

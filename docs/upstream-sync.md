@@ -185,6 +185,32 @@ commit)。
     flyto 已全有): `MLX_MAX_OPS_PER_BUFFER` 降到 10-20、`iogpu.wired_limit_mb`
     sysctl、限上下文、留内存余量.
 
+- **2026-06-12 mlx-vlm v0.6.3 升级 + gemma4 12B MTP drafter 实测落地** --
+  分支 `sync/mlx-vlm-0.6.3`, PR #70. 不是 jundot/omlx 同步批, 是依赖 pin 升级
+  (mlx-vlm `041f889` -> v0.6.3 tag `5a4222a`, PyPI floor >=0.6.2).
+  - v0.6.3 带入: gemma4 量化谓词 #1288, gemma4_unified 静默丢图/视频修复,
+    Qwen3-VL chunked-prefill mask 修复 #1325/#1332, speculative chunked
+    prefill #1334. 兼容面审计: speculative/, turboquant, models/base.py 在
+    两 pin 间零改动; 唯一重叠 = Qwen3_5Attention `__call__` (flyto patch
+    逐字替换), 已把上游 batched cache.offset 修复移植进 patch 副本.
+  - **vlm_mtp 路径修活** (gemma4_unified 12B + 官方 qat-assistant drafter
+    实测踩出 3 个 bug): (1) engine_core 线程初始化只重绑 4 个模块的
+    generation_stream, 0.6.x 布局有 ~10 个独立 from-import 绑定 -> 改为
+    sys.modules 扫描; (2) drafter/target 模块树里 underscore 属性 (RoPE
+    `_freqs`) 不在 parameters() 里, 加载线程的 lazy 图跨线程 eval 崩
+    "There is no Stream(gpu, 1) in current thread" -> `_eval_module_arrays`
+    全树 eval; (3) temperature 0 时把 greedy_sampling 传给 _mtp_rounds,
+    旁路 _SpeculativeSamplerRNG 的跨线程 mx.random.state eval.
+  - **m5max 实测 (12B QAT 4bit target + 0.24B qat-assistant-4bit drafter,
+    batch-1, temp 0, 256-512 tok)**: mlx_vlm CLI: 无 drafter 16.5-17.7
+    tok/s, 有 drafter 38.8-48.7 tok/s (2.3-2.9x), 接受率 55% (短) / 68%
+    (长 7.6k prompt, 1.42x). fmlx API: 无 drafter ~42 tok/s (BatchGenerator
+    比 CLI 快 2.5x), 有 drafter ~56-58 tok/s = **1.38x**, 接受率 55-57%
+    @block 4. block_size 3/4/6 差异 <3%, 默认 4. 结论: 正向, 已可通过
+    model_settings (vlm_mtp_enabled + vlm_mtp_draft_model) 配置启用.
+  - 测试: 全量 5070 pass / 3 fail / 19 skip (已知 OMLX_SERVER_API_KEY
+    env-override 集), 升级前后一致, 零回归.
+
 ## 已引入(cherry-picked)
 
 | 上游 commit | flyto commit | 内容 | 引入日期 |

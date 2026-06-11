@@ -73,6 +73,36 @@ class VLMMTPDrafter:
         self.source_path = source_path
 
 
+def _eval_module_arrays(root: nn.Module) -> None:
+    """mx.eval every mx.array reachable from ``root``'s module tree,
+    including underscore attributes that ``parameters()`` skips."""
+    arrays: list[mx.array] = []
+    seen: set[int] = set()
+
+    def visit(obj: Any) -> None:
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, mx.array):
+            arrays.append(obj)
+        elif isinstance(obj, nn.Module):
+            # nn.Module subclasses dict; walk both dict items and attrs.
+            for v in obj.values():
+                visit(v)
+            for v in vars(obj).values():
+                visit(v)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                visit(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                visit(v)
+
+    visit(root)
+    if arrays:
+        mx.eval(arrays)
+
+
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     """Load a Gemma4 assistant drafter; return None and log if the artifact
     is the wrong kind. Soft-fails so a misconfigured toggle does not crash
@@ -108,6 +138,18 @@ def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
         )
         return None
 
+    # Force-materialize EVERY array in the drafter's module tree in the
+    # loading thread. mlx builds arrays lazily; un-evaluated graphs stay
+    # pinned to this thread's stream, and the first draft_block() on the
+    # engine thread then dies with "There is no Stream(gpu, N) in current
+    # thread" when it evaluates them cross-thread. ``parameters()`` is NOT
+    # enough: underscore attributes (e.g. the RoPE ``_freqs`` table built in
+    # ``initialize_rope`` at construction time) are excluded from the
+    # parameter tree but still sit un-evaluated in the graph. Materialized
+    # buffers carry no stream affinity, so a full-tree eval makes the
+    # drafter thread-safe to hand off.
+    _eval_module_arrays(drafter_model)
+
     logger.info(
         "VLM MTP drafter loaded: path=%s kind=%s model_type=%s",
         path,
@@ -141,6 +183,7 @@ def run_vlm_mtp_decode(
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    greedy: bool = False,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
@@ -149,11 +192,26 @@ def run_vlm_mtp_decode(
     batched decode (B > 1 ``mx.array``). ``None`` slots in the batched
     form mark rows that have finished.
 
+    ``greedy=True`` passes ``greedy_sampling`` through to the round loops,
+    which disables mlx-vlm's _SpeculativeSamplerRNG draft/target RNG-state
+    isolation. Beyond skipping pointless RNG bookkeeping for temperature-0
+    decode, this avoids cross-thread evals of ``mx.random.state`` (whose
+    lazy graph may be pinned to another thread's thread-local stream).
+
     The wrapper yields ``first_bonus`` as its first value: mlx-vlm's
     ``_mtp_rounds`` / ``_mtp_rounds_batch`` expect the caller to have
     already emitted the bonus token before the round loop starts
     (``emitted = 1`` baked in at the top of both helpers).
     """
+    # One-time guard: materialize any leftover lazy arrays in the target's
+    # module tree (same underscore-attribute hazard as the drafter, e.g.
+    # RoPE _freqs built in the model-load thread; see _eval_module_arrays).
+    # The MTP rounds run on the engine thread while the target was loaded on
+    # the global executor thread, so stale lazy graphs crash cross-thread.
+    if not getattr(target_language_model, "_omlx_vlm_mtp_arrays_evaled", False):
+        _eval_module_arrays(target_language_model)
+        target_language_model._omlx_vlm_mtp_arrays_evaled = True
+
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
 
     if is_batch:
@@ -173,6 +231,7 @@ def run_vlm_mtp_decode(
             token_dtype=token_dtype,
             stop_check=stop_check,
             eos_token_ids=eos_set,
+            greedy_sampling=greedy,
         ):
             # mlx-vlm only calls mx.clear_cache() every 256 tokens (see
             # _mtp_rounds_batch in mlx_vlm/speculative/utils.py). On large
@@ -200,6 +259,7 @@ def run_vlm_mtp_decode(
         sampler=sampler,
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
+        greedy_sampling=greedy,
     ):
         mx.clear_cache()
         yield tok
