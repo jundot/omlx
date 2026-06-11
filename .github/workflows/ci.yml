@@ -37,4 +37,4 @@ jobs:
           python -m pip install pytest pytest-asyncio
 
       - name: Run unit tests
-        run: python -m pytest tests/ -m "not slow and not integration"
+        run: python -m pytest tests/ -m "not slow and not integration and not jang_mlx"

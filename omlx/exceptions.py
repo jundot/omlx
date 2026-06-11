@@ -238,6 +238,18 @@ class ModelInferenceError(ModelError):
     pass
 
 
+class JANGLoadError(ModelLoadError):
+    """Error loading a JANG quantized model."""
+
+    pass
+
+
+class JANGDependencyError(ModelLoadError):
+    """Missing jang-tools dependency for JANG model loading."""
+
+    pass
+
+
 class TokenizerError(ModelError):
     """Error related to tokenization."""
 

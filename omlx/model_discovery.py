@@ -26,7 +26,10 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "jang", "audio_stt", "audio_tts", "audio_sts"]
+
+# JANG model config file names
+JANG_CONFIG_FILES = ("jang_config.json", "jjqf_config.json", "jang_cfg.json")
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -490,17 +493,33 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
+    is_jang = _is_jang_model(model_path)
+
     config_path = model_path / "config.json"
     if not config_path.exists():
+        # No config.json: if JANG config carries has_vision, honour it; otherwise llm.
+        jang_has_vision = _get_jang_has_vision(model_path)
+        if jang_has_vision is not None:
+            return "vlm" if jang_has_vision else "llm"
         return "llm"
 
     try:
         with open(config_path) as f:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
+        # config.json is malformed/unreadable: fall back to the jang has_vision
+        # flag before defaulting to "llm".  Without this, a jang VLM with an
+        # intact jang_config.json but a corrupt config.json silently drops
+        # vision capability (F3 edge regression).
+        jhv = _get_jang_has_vision(model_path)
+        if jhv is not None:
+            return "vlm" if jhv else "llm"
         return "llm"
 
-    # Check architectures field for reranker first (more specific)
+    # Check architectures field for reranker first (more specific).
+    # Embedding/reranker architecture checks must run BEFORE the JANG
+    # has_vision / preprocessor_config short-circuit: a jang-quantized
+    # embedding or reranker model would otherwise be mislabeled as llm/vlm.
     architectures = config.get("architectures", [])
     for arch in architectures:
         if arch in RERANKER_ARCHITECTURES:
@@ -548,6 +567,18 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     if normalized_type in EMBEDDING_MODEL_TYPES or model_type in EMBEDDING_MODEL_TYPES:
         return "embedding"
+
+    # Now apply the JANG-specific short-circuits (after ruling out embedding/reranker).
+    # A JANG model with an explicit has_vision flag in its config is classified by
+    # that flag; otherwise the preprocessor_config.json heuristic applies.
+    # These come after embedding/reranker detection so that a jang-quantized
+    # embedding model is not mislabeled as llm/vlm.
+    jang_has_vision = _get_jang_has_vision(model_path)
+    if jang_has_vision is not None:
+        return "vlm" if jang_has_vision else "llm"
+
+    if is_jang and (model_path / "preprocessor_config.json").exists():
+        return "vlm"
 
     # Ambiguous embedding types (have both embedding and LLM variants):
     # only classified as embedding if architecture matched above
@@ -852,9 +883,54 @@ def _is_adapter_dir(path: Path) -> bool:
     return (path / "adapter_config.json").exists()
 
 
+
+def _is_jang_model(model_path: Path) -> bool:
+    """Check if directory contains a JANG model config file."""
+    return any((model_path / f).exists() for f in JANG_CONFIG_FILES)
+
+
+# Model types for which a JANG config should win the engine routing.
+# Embedding, reranker, and audio types must use their own engines even if
+# a jang_config.json is present alongside the model files.
+JANG_ENGINE_MODEL_TYPES: frozenset[str] = frozenset({"llm", "vlm"})
+
+
+def resolve_jang_engine_type(model_path: Path, model_type: str | None) -> str | None:
+    """Return 'jang' if model_path is a jang model AND model_type is llm/vlm.
+
+    Returns None for any other combination — the caller should fall back to
+    the type-to-engine mapping.  model_type may be None or '' (treated as
+    not matching).
+    """
+    if model_type in JANG_ENGINE_MODEL_TYPES and _is_jang_model(model_path):
+        return "jang"
+    return None
+
+
+def _get_jang_has_vision(model_path: Path) -> bool | None:
+    """Read `architecture.has_vision` from a JANG config file if present."""
+    for cfg_name in JANG_CONFIG_FILES:
+        jang_config_path = model_path / cfg_name
+        if not jang_config_path.exists():
+            continue
+        try:
+            with open(jang_config_path) as f:
+                jang_config = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+        architecture = jang_config.get("architecture", {})
+        has_vision = architecture.get("has_vision") if isinstance(architecture, dict) else None
+        return has_vision if isinstance(has_vision, bool) else None
+    return None
+
+
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model (has config.json or jang_config.json)."""
+    if _is_adapter_dir(path):
+        return False
+    if (path / "config.json").exists():
+        return True
+    return any((path / f).exists() for f in JANG_CONFIG_FILES)
 
 
 def model_directory_access_error(path: Path) -> str | None:
@@ -1053,18 +1129,18 @@ def _register_model(
             return
 
         model_type = detect_model_type(model_dir)
+
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
+        elif model_type in ("audio_stt", "audio_tts", "audio_sts"):
+            engine_type = model_type  # type: ignore[assignment]
+        elif resolve_jang_engine_type(model_dir, model_type) is not None:
+            # jang wins for llm/vlm only; embedding/reranker/audio handled above.
+            engine_type = "jang"
         elif model_type == "vlm":
             engine_type = "vlm"
-        elif model_type == "audio_stt":
-            engine_type = "audio_stt"
-        elif model_type == "audio_tts":
-            engine_type = "audio_tts"
-        elif model_type == "audio_sts":
-            engine_type = "audio_sts"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

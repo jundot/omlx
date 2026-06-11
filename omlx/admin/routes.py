@@ -2091,16 +2091,26 @@ async def update_model_settings(
         }
         if override_value:
             entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            # JANG models must keep the jang engine even with an explicit override.
+            # resolve_jang_engine_type handles the "llm/vlm only" guard so that
+            # embedding/reranker/audio overrides use their own engines even when
+            # jang_config.json is present.
+            from pathlib import Path as _Path
+            from ..model_discovery import resolve_jang_engine_type as _resolve_jang
+            entry.engine_type = _resolve_jang(
+                _Path(entry.model_path), override_value
+            ) or type_to_engine.get(override_value, "batched")
         else:
             # Reset to auto-detected type
             from pathlib import Path
 
-            from ..model_discovery import detect_model_type
+            from ..model_discovery import detect_model_type, resolve_jang_engine_type
 
             detected_type = detect_model_type(Path(entry.model_path))
             entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            entry.engine_type = resolve_jang_engine_type(
+                Path(entry.model_path), detected_type
+            ) or type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
