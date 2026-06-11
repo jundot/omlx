@@ -1130,3 +1130,61 @@ class TestStopSafety:
         await engine.stop()
 
         mock_inner_engine.close.assert_called_once()
+
+
+class TestFilterVLMLoadWeights:
+    """_filter_vlm_load_weights: shared-KV orphan drop + nested-visual remap."""
+
+    def _model_with_predicate(self):
+        class _LM:
+            @staticmethod
+            def _is_unused_shared_kv_weight(key):
+                # Mimic mlx-vlm >= 0.6.3 gemma4: layers >= 15 are KV-shared.
+                prefix = "language_model.model.layers."
+                if not key.startswith(prefix):
+                    return False
+                parts = key[len(prefix):].split(".")
+                if len(parts) < 4 or parts[1] != "self_attn":
+                    return False
+                return int(parts[0]) >= 15 and parts[2] in {
+                    "k_proj", "v_proj", "k_norm", "v_norm",
+                }
+
+        class _Model:
+            language_model = _LM()
+
+        return _Model()
+
+    def test_drops_shared_kv_orphans(self):
+        from omlx.engine.vlm import _filter_vlm_load_weights
+
+        items = [
+            ("language_model.model.layers.0.self_attn.k_proj.weight", 1),
+            ("language_model.model.layers.15.self_attn.k_proj.weight", 2),
+            ("language_model.model.layers.15.self_attn.k_proj.scales", 3),
+            ("language_model.model.layers.15.self_attn.q_proj.weight", 4),
+            ("language_model.model.layers.20.self_attn.v_norm.weight", 5),
+        ]
+        out = _filter_vlm_load_weights(self._model_with_predicate(), items)
+        kept = [k for k, _ in out]
+        assert "language_model.model.layers.0.self_attn.k_proj.weight" in kept
+        assert "language_model.model.layers.15.self_attn.q_proj.weight" in kept
+        assert "language_model.model.layers.15.self_attn.k_proj.weight" not in kept
+        assert "language_model.model.layers.15.self_attn.k_proj.scales" not in kept
+        assert "language_model.model.layers.20.self_attn.v_norm.weight" not in kept
+
+    def test_noop_without_predicate(self):
+        from omlx.engine.vlm import _filter_vlm_load_weights
+
+        class _Plain:
+            pass
+
+        items = [("language_model.model.layers.15.self_attn.k_proj.weight", 1)]
+        assert _filter_vlm_load_weights(_Plain(), items) == items
+
+    def test_nested_visual_remap_still_applies(self):
+        from omlx.engine.vlm import _filter_vlm_load_weights
+
+        items = [("language_model.model.visual.patch_embed.weight", 7)]
+        out = _filter_vlm_load_weights(self._model_with_predicate(), items)
+        assert out == [("vision_tower.patch_embed.weight", 7)]
