@@ -416,6 +416,54 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
+def _filter_vlm_load_weights(model, weights_items):
+    """Adjust the (key, value) weight list before strict load_weights.
+
+    Two fixups for MLX-format checkpoints (where mlx-vlm skips sanitize):
+
+    1. Remap ``language_model.model.visual.*`` -> ``vision_tower.*`` (oQ
+       output keeps the nested-visual layout).
+    2. Drop k/v_proj weights of KV-shared layers. Old MLX-format gemma4
+       conversions ship k/v_proj for layers that mlx-vlm >= 0.6.3 no longer
+       instantiates (#1301 marks layers in the num_kv_shared_layers range
+       kv_shared_only and skips their KV modules). Upstream drops the
+       orphans in LanguageModel.sanitize, but sanitize is skipped for
+       MLX-format checkpoints, so strict load_weights dies on the extras.
+       Uses the model's own ``_is_unused_shared_kv_weight`` predicate when
+       present; no-op otherwise.
+    """
+    shared_kv_pred = getattr(
+        getattr(model, "language_model", None),
+        "_is_unused_shared_kv_weight",
+        None,
+    )
+
+    remapped = []
+    n = 0
+    n_shared = 0
+    for k, v in weights_items:
+        if k.startswith(_NESTED_VIS_PREFIX):
+            k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX) :]
+            n += 1
+        if shared_kv_pred is not None and shared_kv_pred(k):
+            n_shared += 1
+            continue
+        remapped.append((k, v))
+    if n:
+        logger.info(
+            "remap_nested_visual_on_load: remapped %d keys "
+            "'language_model.model.visual.*' -> 'vision_tower.*'",
+            n,
+        )
+    if n_shared:
+        logger.info(
+            "remap_nested_visual_on_load: dropped %d unused "
+            "shared-KV weights (kv_shared_only layers)",
+            n_shared,
+        )
+    return remapped
+
+
 @contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
@@ -441,19 +489,7 @@ def _remap_nested_visual_on_load(model_dir: Path):
         def _remapping_load_weights(self, weights_items, *args, **kw):
             if isinstance(weights_items, str):
                 return orig_load_weights(self, weights_items, *args, **kw)
-            remapped = []
-            n = 0
-            for k, v in weights_items:
-                if k.startswith(_NESTED_VIS_PREFIX):
-                    k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX) :]
-                    n += 1
-                remapped.append((k, v))
-            if n:
-                logger.info(
-                    "remap_nested_visual_on_load: remapped %d keys "
-                    "'language_model.model.visual.*' -> 'vision_tower.*'",
-                    n,
-                )
+            remapped = _filter_vlm_load_weights(self, weights_items)
             return orig_load_weights(self, remapped, *args, **kw)
 
         _nn.Module.load_weights = _remapping_load_weights
