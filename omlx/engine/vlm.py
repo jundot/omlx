@@ -30,6 +30,7 @@ import inspect
 import importlib
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,8 +38,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..api.utils import (
+    clean_special_tokens,
+    detect_and_strip_partial,
+    remove_special_tokens_preserve_whitespace,
+)
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
+from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
 from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
@@ -585,6 +591,10 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        self._diffusion_family: str | None = None
+        self._diffusion_lock = asyncio.Lock()
+        self._diffusion_active_requests = 0
+        self._diffusion_cancel_events: set[threading.Event] = set()
 
     @property
     def model_name(self) -> str:
@@ -616,6 +626,10 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def is_ocr_model(self) -> bool:
         return (self.model_type or "") in OCR_MODEL_TYPES
+
+    @property
+    def is_diffusion_model(self) -> bool:
+        return getattr(self, "_diffusion_family", None) == "block"
 
     @property
     def grammar_compiler(self):
@@ -663,6 +677,29 @@ class VLMBatchedEngine(BaseEngine):
             return self._engine.engine.scheduler.block_aware_cache is not None
         except AttributeError:
             return False
+
+    def _detect_diffusion_family(self) -> str | None:
+        """Return the mlx-vlm diffusion generation family for loaded models."""
+        try:
+            from mlx_vlm.generate.diffusion import diffusion_generation_family
+
+            family = diffusion_generation_family(self._vlm_model)
+            if family == "block":
+                return family
+            if family is not None:
+                logger.warning(
+                    "Unsupported diffusion generation family for %s: %s",
+                    self._model_name,
+                    family,
+                )
+            return None
+        except Exception as e:
+            logger.debug("mlx-vlm diffusion family detection skipped: %s", e)
+
+        config = getattr(self._vlm_model, "config", None)
+        if getattr(config, "canvas_length", None) is not None:
+            return "block"
+        return None
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
@@ -751,22 +788,33 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         _fix_processor_none_pixels(self._processor)
+        self._diffusion_family = self._detect_diffusion_family()
+        if self.is_diffusion_model:
+            logger.info(
+                "Diffusion VLM detected; using serial diffusion lane for %s",
+                self._model_name,
+            )
 
         # Initialize vision feature cache
         vision_ssd_dir = None
-        if self._scheduler_config and getattr(
-            self._scheduler_config, "paged_ssd_cache_dir", None
-        ):
-            vision_ssd_dir = (
-                Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+        if not self.is_diffusion_model:
+            if self._scheduler_config and getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            ):
+                vision_ssd_dir = (
+                    Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+                )
+            self._vision_cache = VisionFeatureSSDCache(
+                cache_dir=vision_ssd_dir,
+                max_memory_entries=20,
             )
-        self._vision_cache = VisionFeatureSSDCache(
-            cache_dir=vision_ssd_dir,
-            max_memory_entries=20,
-        )
-        logger.info(
-            "Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled"
-        )
+            logger.info(
+                "Vision feature cache enabled (SSD: %s)",
+                vision_ssd_dir or "disabled",
+            )
+        else:
+            self._vision_cache = None
+            self._vision_cache_enabled = False
 
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
@@ -779,6 +827,12 @@ class VLMBatchedEngine(BaseEngine):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
             self._tokenizer = copy.deepcopy(self._processor)
+
+        if self.is_diffusion_model:
+            self._inject_tool_calling(self._tokenizer)
+            self._loaded = True
+            logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
+            return
 
         # Create VLM model adapter wrapping language_model.
         # mlx-vlm models now handle per-sequence mx.array offsets natively
@@ -928,12 +982,17 @@ class VLMBatchedEngine(BaseEngine):
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None
+        for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
+            cancel_event.set()
+        self._diffusion_cancel_events = set()
         self._engine = None
         self._vlm_model = None
         self._processor = None
         self._adapter = None
         self._tokenizer = None
         self._vlm_mtp_drafter = None
+        self._diffusion_family = None
+        self._diffusion_active_requests = 0
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
@@ -1895,6 +1954,33 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if self.is_diffusion_model:
+            full_text = ""
+            last_output: GenerationOutput | None = None
+            async for output in self.stream_generate(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                **kwargs,
+            ):
+                full_text += output.new_text
+                last_output = output
+            if last_output is None:
+                return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
+            return GenerationOutput(
+                text=full_text,
+                prompt_tokens=last_output.prompt_tokens,
+                completion_tokens=last_output.completion_tokens,
+                finish_reason=last_output.finish_reason,
+                cached_tokens=0,
+            )
+
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
         # resolved by get_sampling_params() with OCR defaults as a fallback
@@ -1965,6 +2051,39 @@ class VLMBatchedEngine(BaseEngine):
         """Stream generation token by token."""
         if not self._loaded:
             await self.start()
+
+        if self.is_diffusion_model:
+            if (
+                vlm_inputs_embeds is not None
+                or vlm_extra_kwargs is not None
+                or vlm_image_hash is not None
+                or vlm_cache_key_ranges is not None
+                or vlm_cache_key_start
+            ):
+                raise InvalidRequestError(
+                    "Precomputed VLM embeddings and cache metadata are not "
+                    "supported with diffusion models."
+                )
+            self._validate_diffusion_request(
+                stop=stop,
+                kwargs=kwargs,
+            )
+            loop = asyncio.get_running_loop()
+            from ..engine_core import get_mlx_executor
+
+            diffusion_inputs = await loop.run_in_executor(
+                get_mlx_executor(),
+                self._prepare_diffusion_inputs_from_prompt,
+                prompt,
+            )
+            async for output in self._stream_diffusion_inputs(
+                diffusion_inputs,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=kwargs.get("seed"),
+            ):
+                yield output
+            return
 
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
@@ -2065,6 +2184,33 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if self.is_diffusion_model:
+            full_text = ""
+            last_output: GenerationOutput | None = None
+            async for output in self.stream_chat(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            ):
+                full_text += output.new_text
+                last_output = output
+            if last_output is None:
+                return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
+            return GenerationOutput(
+                text=full_text,
+                prompt_tokens=last_output.prompt_tokens,
+                completion_tokens=last_output.completion_tokens,
+                finish_reason=last_output.finish_reason,
+                cached_tokens=0,
+            )
+
         loop = asyncio.get_running_loop()
         (
             prompt,
@@ -2114,6 +2260,31 @@ class VLMBatchedEngine(BaseEngine):
         """Stream chat completion with vision support."""
         if not self._loaded:
             await self.start()
+
+        if self.is_diffusion_model:
+            self._validate_diffusion_request(
+                tools=tools,
+                stop=kwargs.get("stop"),
+                kwargs=kwargs,
+            )
+            loop = asyncio.get_running_loop()
+            from ..engine_core import get_mlx_executor
+
+            diffusion_inputs = await loop.run_in_executor(
+                get_mlx_executor(),
+                self._process_diffusion_chat_messages,
+                messages,
+                tools,
+                dict(kwargs),
+            )
+            async for output in self._stream_diffusion_inputs(
+                diffusion_inputs,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=kwargs.get("seed"),
+            ):
+                yield output
+            return
 
         # Run vision encoding on the MLX executor thread to avoid blocking
         # the event loop.  Blocking here (synchronous mx.eval) prevents
@@ -2295,6 +2466,336 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_ranges,
         )
 
+    def _validate_diffusion_request(
+        self,
+        *,
+        tools: list[dict] | None = None,
+        audio: list | None = None,
+        stop: list[str] | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.is_diffusion_model:
+            return
+        kwargs = kwargs or {}
+        if tools:
+            raise InvalidRequestError(
+                "Tool calling is not supported with diffusion models.",
+                field="tools",
+            )
+        if audio:
+            raise InvalidRequestError(
+                "Audio input is not supported with diffusion models.",
+                field="messages",
+            )
+        if stop:
+            raise InvalidRequestError(
+                "Custom stop sequences are not supported with diffusion models.",
+                field="stop",
+            )
+        if kwargs.get("compiled_grammar") is not None:
+            raise InvalidRequestError(
+                "Structured response_format is not supported with diffusion models.",
+                field="response_format",
+            )
+        if kwargs.get("specprefill") is True:
+            raise InvalidRequestError(
+                "SpecPrefill is not supported with diffusion models.",
+                field="specprefill",
+            )
+
+    def _diffusion_apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        images: list[Any],
+        chat_template_kwargs: dict[str, Any] | None = None,
+        tools: list[dict] | None = None,
+    ) -> str | list[int]:
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        num_images = len(images)
+        model_type = self.model_type or ""
+        if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
+            raise ValueError(
+                f"Model {model_type} does not support multi-image chat. "
+                f"Please use only 1 image."
+            )
+
+        try:
+            formatted_messages, _ = self._format_messages_for_vlm_template(
+                messages, num_images=num_images, num_audios=0
+            )
+        except Exception as e:
+            logger.debug(
+                "Falling back to mlx-vlm apply_chat_template for diffusion: %s",
+                e,
+            )
+            formatted_messages = apply_chat_template(
+                self._processor,
+                self._vlm_model.config,
+                messages,
+                num_images=num_images,
+                num_audios=0,
+                return_messages=True,
+            )
+
+        detect_and_strip_partial(formatted_messages)
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if self._enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self._enable_thinking
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+
+        template_target = self._processor
+        if not hasattr(template_target, "apply_chat_template"):
+            template_target = getattr(self._processor, "tokenizer", self._processor)
+        try:
+            return template_target.apply_chat_template(
+                formatted_messages, **template_kwargs
+            )
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            return template_target.apply_chat_template(
+                formatted_messages, **template_kwargs
+            )
+        except ValueError:
+            fallback = getattr(self._processor, "tokenizer", None)
+            if fallback is None or fallback is template_target:
+                raise
+            try:
+                return fallback.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+            except TypeError:
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
+                template_kwargs.pop("tools", None)
+                template_kwargs.pop("enable_thinking", None)
+                return fallback.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+
+    def _prepare_diffusion_inputs_from_prompt(
+        self,
+        prompt: str | list[int],
+        *,
+        images: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        from mlx_vlm.utils import prepare_inputs
+
+        images = images or []
+        if isinstance(prompt, list):
+            input_ids = mx.array([prompt])
+            return {
+                "input_ids": input_ids,
+                "pixel_values": None,
+                "attention_mask": None,
+                "mm_token_type_ids": None,
+                "prompt_tokens": int(input_ids.size),
+            }
+
+        inputs = prepare_inputs(
+            self._processor,
+            images=images if images else None,
+            prompts=[prompt],
+        )
+        input_ids = inputs["input_ids"]
+        return {
+            "input_ids": input_ids,
+            "pixel_values": inputs.get("pixel_values"),
+            "attention_mask": inputs.get("attention_mask"),
+            "mm_token_type_ids": inputs.get("mm_token_type_ids"),
+            "prompt_tokens": int(input_ids.size),
+        }
+
+    def _process_diffusion_chat_messages(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        text_messages, images, audio = extract_images_from_messages(messages)
+        self._validate_diffusion_request(
+            tools=tools,
+            audio=audio if audio else None,
+            stop=kwargs.get("stop"),
+            kwargs=kwargs,
+        )
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        diffusion_messages = messages if images else text_messages
+        prompt = self._diffusion_apply_chat_template(
+            diffusion_messages,
+            images=images,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+        )
+        return self._prepare_diffusion_inputs_from_prompt(prompt, images=images)
+
+    def _iter_diffusion_outputs_sync(
+        self,
+        diffusion_inputs: dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
+        from mlx_vlm.generate.diffusion import stream_diffusion_generate
+
+        try:
+            from mlx_vlm.generate.common import generation_stream, wired_limit
+
+            limit_ctx = wired_limit(self._vlm_model, [generation_stream])
+        except Exception:
+            limit_ctx = contextlib.nullcontext()
+
+        if seed is not None:
+            mx.random.seed(seed)
+
+        tokenizer = self._tokenizer
+        if hasattr(tokenizer, "stopping_criteria"):
+            tokenizer.stopping_criteria.reset(
+                getattr(self._vlm_model.config, "eos_token_id", None)
+            )
+
+        prompt_tokens = int(diffusion_inputs.get("prompt_tokens") or 0)
+        results = None
+        full_text = ""
+        block_text: list[str] = []
+        emitted_tokens = 0
+        last_stream_segment = ""
+        try:
+            with limit_ctx:
+                results = stream_diffusion_generate(
+                    self._vlm_model,
+                    self._processor,
+                    tokenizer,
+                    diffusion_inputs["input_ids"],
+                    diffusion_inputs.get("pixel_values"),
+                    diffusion_inputs.get("attention_mask"),
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    skip_special_token_ids=set(
+                        getattr(tokenizer, "all_special_ids", None) or []
+                    ),
+                    mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
+                )
+                for result in results:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if getattr(result, "is_draft", False):
+                        continue
+                    result_tokens = getattr(result, "generation_tokens", None)
+                    finish_reason = getattr(result, "finish_reason", None)
+                    result_text = result.text or ""
+                    if result_text:
+                        has_token_progress = (
+                            result_tokens is None
+                            or int(result_tokens) > emitted_tokens
+                        )
+                        has_final_flush = (
+                            finish_reason is not None
+                            and result_text != last_stream_segment
+                        )
+                        if has_token_progress or has_final_flush:
+                            block_text.append(result_text)
+                            last_stream_segment = result_text
+                    is_boundary = bool(
+                        getattr(result, "diffusion_block_complete", False)
+                    )
+                    if not is_boundary and not finish_reason:
+                        continue
+
+                    new_text = remove_special_tokens_preserve_whitespace(
+                        "".join(block_text)
+                    )
+                    full_text += new_text
+                    completion_tokens = int(result_tokens or emitted_tokens)
+                    emitted_tokens = max(emitted_tokens, completion_tokens)
+                    if new_text or finish_reason:
+                        yield GenerationOutput(
+                            text=full_text,
+                            new_text=new_text,
+                            prompt_tokens=int(
+                                getattr(result, "prompt_tokens", prompt_tokens)
+                                or prompt_tokens
+                            ),
+                            completion_tokens=emitted_tokens,
+                            finished=finish_reason is not None,
+                            finish_reason=finish_reason,
+                            cached_tokens=0,
+                        )
+                    block_text = []
+                    if finish_reason:
+                        break
+        finally:
+            if results is not None and callable(getattr(results, "close", None)):
+                results.close()
+            mx.synchronize()
+            mx.clear_cache()
+
+    async def _stream_diffusion_inputs(
+        self,
+        diffusion_inputs: dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None = None,
+    ) -> AsyncIterator[GenerationOutput]:
+        from ..engine_core import get_mlx_executor
+
+        async with self._diffusion_lock:
+            self._diffusion_active_requests += 1
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            cancel_event = threading.Event()
+            self._diffusion_cancel_events.add(cancel_event)
+            loop = asyncio.get_running_loop()
+
+            def _put(item: Any) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+
+            def _worker() -> None:
+                try:
+                    for item in self._iter_diffusion_outputs_sync(
+                        diffusion_inputs,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        seed=seed,
+                        cancel_event=cancel_event,
+                    ):
+                        _put(item)
+                        if cancel_event.is_set():
+                            break
+                except BaseException as e:
+                    _put(e)
+                finally:
+                    _put(None)
+
+            future = loop.run_in_executor(get_mlx_executor(), _worker)
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+            finally:
+                cancel_event.set()
+                await future
+                self._diffusion_cancel_events.discard(cancel_event)
+                self._diffusion_active_requests -= 1
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -2324,6 +2825,8 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
+        if self.is_diffusion_model:
+            return getattr(self, "_diffusion_active_requests", 0) > 0
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
@@ -2340,6 +2843,9 @@ class VLMBatchedEngine(BaseEngine):
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
         }
+        if self._diffusion_family is not None:
+            stats["diffusion_family"] = self._diffusion_family
+            stats["active_requests"] = self._diffusion_active_requests
         if self._engine:
             stats.update(self._engine.get_stats())
         return stats
@@ -2352,6 +2858,11 @@ class VLMBatchedEngine(BaseEngine):
 
     async def abort_all_requests(self) -> int:
         """Abort all active requests."""
+        if self.is_diffusion_model:
+            cancel_events = list(getattr(self, "_diffusion_cancel_events", ()))
+            for cancel_event in cancel_events:
+                cancel_event.set()
+            return len(cancel_events)
         if self._engine and self._engine.engine:
             return await self._engine.engine.abort_all_requests()
         return 0

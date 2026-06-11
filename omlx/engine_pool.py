@@ -220,6 +220,11 @@ class EnginePool:
         "image": "image",
     }
 
+    @staticmethod
+    def _entry_is_diffusion_model(entry: EngineEntry) -> bool:
+        model_type = (entry.config_model_type or "").lower().replace("-", "_")
+        return model_type == "diffusion_gemma"
+
     def apply_settings_overrides(
         self, settings_manager: "ModelSettingsManager"
     ) -> None:
@@ -602,7 +607,17 @@ class EnginePool:
             if model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if dflash_enabled and dflash_draft:
+                if (
+                    dflash_enabled
+                    and dflash_draft
+                    and self._entry_is_diffusion_model(entry)
+                ):
+                    logger.warning(
+                        "DFlash is not supported for diffusion models; "
+                        "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif dflash_enabled and dflash_draft:
                     try:
                         from .engine.dflash import DFlashEngine
                         engine = DFlashEngine(

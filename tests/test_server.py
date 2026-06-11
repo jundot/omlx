@@ -7,10 +7,37 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from omlx.exceptions import ModelNotFoundError
+from omlx.exceptions import InvalidRequestError, ModelNotFoundError
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
+from omlx.server import (
+    EngineType,
+    SamplingDefaults,
+    ServerState,
+    _reject_diffusion_structured_outputs,
+    app,
+    get_engine,
+    get_sampling_params,
+)
 from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+
+
+class TestDiffusionStructuredOutputGuard:
+    class _DiffusionEngine:
+        is_diffusion_model = True
+
+    def test_allows_plain_text_response_format(self):
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "text"},
+        )
+
+    def test_rejects_json_response_format(self):
+        with pytest.raises(InvalidRequestError, match="Structured response_format"):
+            _reject_diffusion_structured_outputs(
+                self._DiffusionEngine(),
+                response_format={"type": "json_object"},
+            )
+
 
 
 class TestGetSamplingParams:

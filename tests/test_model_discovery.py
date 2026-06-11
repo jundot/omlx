@@ -190,6 +190,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
+        """DiffusionGemma is served by mlx-vlm even without vision_config."""
+        config = {
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {
