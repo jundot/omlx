@@ -384,23 +384,20 @@ def _build_qwen3_omni_moe_processor(model_path, **kwargs):
 
     # If video_processor is still None but Qwen3OmniMoeProcessor requires it,
     # create a minimal mock so ProcessorMixin validation passes.
-    # Must inherit from the dummy BaseVideoProcessor (get_possibly_dynamic_module
-    # returns a dummy when torchvision is unavailable). We override __init__
-    # to skip the dummy's requires_backends check.
+    # get_possibly_dynamic_module("BaseVideoProcessor") returns a DummyObject
+    # (not a real class) when torchvision is unavailable, so we can't inherit
+    # from it.  Create a plain object-based mock instead.
     if video_processor is None:
-        from transformers.processing_utils import ProcessorMixin
-
-        _mock_base = ProcessorMixin.get_possibly_dynamic_module("BaseVideoProcessor")
-
-        class _MockVideoProcessor(_mock_base):
+        class _MockVideoProcessor:
             """Minimal mock video processor for torchvision-free environments."""
 
             model_input_names = ["video_grid_thw"]
+            temporal_patch_size = 2
+            merge_size = 14
 
-            def __init__(self, **kwargs):
-                # Skip super().__init__ because the dummy BaseVideoProcessor
-                # calls requires_backends(["torchvision"]) which raises.
-                self.temporal_patch_size = 2
+            def __call__(self, videos=None, **kwargs):
+                # Return empty batch so callers don't crash.
+                return {"video_grid_thw": []}
 
         video_processor = _MockVideoProcessor()
         logger.info("Using mock video_processor (torchvision unavailable)")
@@ -467,6 +464,24 @@ def _build_qwen3_omni_moe_processor(model_path, **kwargs):
             tokenizer=tokenizer,
             chat_template=chat_template,
         )
+        # Explicitly set video_processor — ProcessorMixin.__init__ may skip
+        # attributes that are None or that it doesn't recognise.  The
+        # Qwen3OmniMoeProcessor class lists video_processor in its
+        # attributes, so model_input_names / replace_multimodal_special_tokens
+        # will crash with AttributeError if it's missing.
+        if not hasattr(instance, "video_processor"):
+            instance.video_processor = video_processor
+
+        # Qwen3OmniMoeProcessor.__init__ sets these token attributes from the
+        # tokenizer, but we bypass __init__ so we must set them manually.
+        instance.audio_token = tokenizer.audio_token
+        instance.image_token = tokenizer.image_token
+        instance.video_token = tokenizer.video_token
+        instance.vision_bos_token = tokenizer.vision_bos_token
+        instance.vision_eos_token = tokenizer.vision_eos_token
+        instance.audio_bos_token = tokenizer.audio_bos_token
+        instance.audio_eos_token = tokenizer.audio_eos_token
+
         return instance
     finally:
         ProcessorMixin.__init__ = _orig_pm_init
