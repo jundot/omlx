@@ -6,6 +6,7 @@ import sys
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
@@ -109,6 +110,56 @@ def test_tiny_model_forward_and_cache_types():
     assert isinstance(cache[0], KVCache)
     assert isinstance(cache[1], RotatingKVCache)
     assert model.layers is model.model.layers
+
+
+def test_tiny_model_forward_with_attention_width_larger_than_hidden_size():
+    from omlx.patches.cohere2_moe import apply_cohere2_moe_patch
+
+    apply_cohere2_moe_patch()
+    from mlx_lm.models import cohere2_moe
+
+    args = cohere2_moe.ModelArgs(
+        **_tiny_args_config(
+            hidden_size=8,
+            head_dim=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=8,
+        )
+    )
+    model = cohere2_moe.Model(args)
+
+    logits = model(mx.array([[1, 2, 3]], dtype=mx.int32))
+    mx.eval(logits)
+
+    assert logits.shape == (1, 3, 32)
+    assert model.model.layers[0].self_attn.q_proj.weight.shape == (16, 8)
+    assert model.model.layers[0].self_attn.o_proj.weight.shape == (8, 16)
+
+
+def test_rms_norm_and_prefix_dense_force_rope_config():
+    from omlx.patches.cohere2_moe import apply_cohere2_moe_patch
+
+    apply_cohere2_moe_patch()
+    from mlx_lm.models import cohere2_moe
+
+    args = cohere2_moe.ModelArgs(
+        **_tiny_args_config(
+            rms_norm_eps=1e-6,
+            layer_norm_bias=False,
+            prefix_dense_sliding_window_pattern=1,
+            mlp_layer_types=["dense", "sparse"],
+            layer_types=["full_attention", "sliding_attention"],
+        )
+    )
+    model = cohere2_moe.Model(args)
+
+    assert isinstance(model.model.norm, nn.RMSNorm)
+    assert isinstance(model.model.layers[0].input_layernorm, nn.RMSNorm)
+    assert model.model.layers[0].self_attn.use_sliding_window is False
+    assert model.model.layers[0].self_attn.force_rope is True
+    assert model.model.layers[1].self_attn.use_sliding_window is True
+    assert model.model.layers[1].self_attn.force_rope is False
 
 
 def test_sanitize_accepts_north_prefixed_switch_mlp_weights():

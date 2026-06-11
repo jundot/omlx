@@ -94,19 +94,52 @@ class ModelArgs(BaseModelArgs):
     use_parallel_block: bool = True
     use_qk_norm: bool = False
     use_embedding_sharing: bool = True
+    layer_norm_bias: bool = False
+    rms_norm_eps: float | None = None
     first_k_dense_replace: int = 0
     prefix_dense_intermediate_size: int = 16384
     prefix_dense_sliding_window_pattern: int = 1
     layer_types: list[str] | None = None
+    mlp_layer_types: list[str] | None = None
 
     def __post_init__(self):
         if self.layer_types is None:
-            pattern = ["sliding_attention"] * (self.sliding_window_pattern - 1) + [
+            prefix_layers = [
+                (
+                    "sliding_attention"
+                    if (i + 1) % self.prefix_dense_sliding_window_pattern != 0
+                    else "full_attention"
+                )
+                for i in range(self.first_k_dense_replace)
+            ]
+            sliding_window_pattern = self.sliding_window_pattern or 4
+            rest_pattern = ["sliding_attention"] * (sliding_window_pattern - 1) + [
                 "full_attention"
             ]
-            self.layer_types = (pattern * (self.num_hidden_layers // len(pattern) + 1))[
-                : self.num_hidden_layers
+            rest_count = self.num_hidden_layers - self.first_k_dense_replace
+            rest_layers = (rest_pattern * (rest_count // len(rest_pattern) + 1))[
+                :rest_count
             ]
+            self.layer_types = prefix_layers + rest_layers
+        if self.mlp_layer_types is None:
+            self.mlp_layer_types = [
+                "dense" if i < self.first_k_dense_replace else "sparse"
+                for i in range(self.num_hidden_layers)
+            ]
+
+
+def _is_prefix_dense_layer(args: ModelArgs, layer_idx: int) -> bool:
+    return args.mlp_layer_types[layer_idx] == "dense"
+
+
+def _norm_layer(args: ModelArgs):
+    if args.rms_norm_eps is not None:
+        return nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+    return nn.LayerNorm(
+        args.hidden_size,
+        eps=args.layer_norm_eps,
+        bias=args.layer_norm_bias,
+    )
 
 
 class Attention(nn.Module):
@@ -119,11 +152,6 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
         self.head_dim = head_dim = args.head_dim
-        if head_dim * n_heads != dim:
-            raise ValueError(
-                f"hidden_size must equal num_attention_heads * head_dim "
-                f"(got hidden_size={dim}, heads={n_heads}, head_dim={head_dim})."
-            )
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.attention_bias)
@@ -133,6 +161,10 @@ class Attention(nn.Module):
 
         self.rope = nn.RoPE(head_dim, traditional=True, base=args.rope_theta)
         self.use_sliding_window = args.layer_types[layer_idx] == "sliding_attention"
+        self.force_rope = (
+            _is_prefix_dense_layer(args, layer_idx)
+            and args.prefix_dense_sliding_window_pattern == 1
+        )
 
     def __call__(
         self,
@@ -149,7 +181,7 @@ class Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        if self.use_sliding_window:
+        if self.use_sliding_window or self.force_rope:
             if cache is None:
                 queries = self.rope(queries)
                 keys = self.rope(keys)
@@ -247,16 +279,12 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Attention(args, layer_idx)
 
-        if layer_idx >= args.first_k_dense_replace:
-            self.mlp = Cohere2MoeSparseMoeBlock(args)
-        else:
+        if _is_prefix_dense_layer(args, layer_idx):
             self.mlp = MLP(args.hidden_size, args.prefix_dense_intermediate_size)
+        else:
+            self.mlp = Cohere2MoeSparseMoeBlock(args)
 
-        self.input_layernorm = nn.LayerNorm(
-            args.hidden_size,
-            eps=args.layer_norm_eps,
-            bias=False,
-        )
+        self.input_layernorm = _norm_layer(args)
         self.use_parallel_block = args.use_parallel_block
 
     def __call__(
@@ -290,11 +318,7 @@ class Cohere2MoeModel(nn.Module):
             TransformerBlock(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
-        self.norm = nn.LayerNorm(
-            args.hidden_size,
-            eps=args.layer_norm_eps,
-            bias=False,
-        )
+        self.norm = _norm_layer(args)
 
     def __call__(self, inputs: mx.array, cache=None):
         h = self.embed_tokens(inputs)
