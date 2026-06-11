@@ -1914,6 +1914,7 @@
     },
 
     startNewChat() {
+        this.saveCurrentChat();  // do not drop unsaved in-flight content
         this.currentChatId = 'chat_' + Date.now();
         localStorage.setItem('omlx_chat_current_id', this.currentChatId);
         this.messages = [];
@@ -1930,6 +1931,12 @@
     loadChat(chatId) {
         const chat = this.chatHistory.find(c => c.id === chatId);
         if (chat) {
+            // Persist the chat we are leaving first -- otherwise anything
+            // not yet saved (an in-flight video bubble, a just-typed
+            // message) is silently dropped on the way out.
+            if (this.currentChatId && this.currentChatId !== chatId) {
+                this.saveCurrentChat();
+            }
             this.currentChatId = chatId;
             localStorage.setItem('omlx_chat_current_id', chatId);
             this.videoExtendFrom = null;  // chat-scoped, see startNewChat
@@ -2182,6 +2189,10 @@
             msg._video.job_id = job.id;
             this.videoExtendFrom = null;
             this.videoSubmitting = false;
+            // Persist NOW, not just in finally: until this save the bubble
+            // exists only in memory, and switching chats or reloading
+            // mid-render would lose the whole submission.
+            this.saveCurrentChat();
             await this.pollVideo(msg);
         } catch (e) {
             msg._video.error = String(e.message || e);
@@ -2202,9 +2213,16 @@
             async pollVideo(msg) {
         const v = msg._video;
         const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        // Polls are chat-scoped: when the user switches away this loop
+        // exits (its msg proxy is detached from the view), and reopening
+        // the chat rehydrates from the server and starts a fresh poll.
+        // Without this, every switch leaks an invisible poller and the
+        // bubble it mutates is not the one on screen.
+        const pollChatId = this.currentChatId;
         for (;;) {
             await new Promise(r => setTimeout(r, 4000));
             if (v.cancelled) return;
+            if (this.currentChatId !== pollChatId) return;
             const s = await fetch(`/v1/videos/${v.job_id}`, { headers: auth });
             if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
             const j = await s.json();
