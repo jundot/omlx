@@ -69,8 +69,15 @@ class CodexIntegration(Integration):
         if is_reasoning:
             top_level_overrides["model_reasoning_effort"] = '"high"'
 
+        # Context window is a bare integer (TOML number), not a quoted string.
+        if ctx.context_window:
+            top_level_overrides["model_context_window"] = str(ctx.context_window)
+
         # Keys managed by oMLX that should be removed when not applicable
-        managed_keys = {"model_reasoning_effort"} - set(top_level_overrides.keys())
+        managed_keys = {
+            "model_reasoning_effort",
+            "model_context_window",
+        } - set(top_level_overrides.keys())
 
         seen_keys = set()
 

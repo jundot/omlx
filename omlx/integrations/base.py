@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -26,6 +27,7 @@ class IntegrationContext:
     max_tokens: int | None = None
     model_type: str | None = None
     reasoning: bool | None = None
+    preserve_thinking: bool | None = None
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
 

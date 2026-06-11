@@ -169,6 +169,8 @@ from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
+from .configured_model import ConfiguredModel, new_configured_model
+from .model_settings import ModelSettings
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -282,10 +284,30 @@ class ServerState:
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
 
+    def resolve_configuration(self, model_id: str) -> ConfiguredModel:
+        """Get all configuration layers for the specified model."""
+        ms = None
+        if self.settings_manager is not None:
+            ms = self.settings_manager.get_settings(model_id)
+        ee = None
+        if self.engine_pool is not None:
+            ee = self.engine_pool.get_entry(model_id)
+        return new_configured_model(
+            settings=ms,
+            model_entry=ee,
+            sampling=self.sampling,
+        )
 
 # Global server state instance
 _server_state: ServerState = ServerState()
 
+def model_config(model_id: str) -> ConfiguredModel:
+    """Return a ConfiguredModel for the provided model name.
+
+    If no such model is known, this returns a ConfiguredModel that refers
+    to global and sampling defaults only.
+    """
+    return _server_state.resolve_configuration(model_id)
 
 def get_server_state() -> ServerState:
     """Get the global server state."""
@@ -1410,24 +1432,6 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     return _server_state.sampling.max_context_window
 
 
-def get_embedding_max_length(
-    model_id: str | None = None,
-    request_max_length: int | None = None,
-) -> int | None:
-    """Get max token length for embedding requests.
-
-    Returns ``None`` when neither the request nor the server's
-    ``max_context_window`` pins a limit, so the embedding model resolves its
-    own configured context length (``max_position_embeddings`` / tokenizer
-    ``model_max_length`` in ``MLXEmbeddingModel._resolve_max_length``) instead
-    of re-truncating long-context models at the legacy 512-token cap (#1687).
-    """
-    if request_max_length is not None:
-        return request_max_length
-
-    return get_max_context_window(model_id)
-
-
 def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int:
     """
     Scale token count for Anthropic API response if context scaling is enabled.
@@ -1453,7 +1457,7 @@ def scale_anthropic_tokens(token_count: int, model_id: str | None = None) -> int
     if not cc.context_scaling_enabled:
         return token_count
 
-    actual = get_max_context_window(model_id)
+    actual = model_config(model_id).max_context_window
     if not actual or actual >= cc.target_context_size:
         return token_count
 
@@ -1468,7 +1472,7 @@ def validate_context_window(
 
     Raises HTTPException 400 if the prompt is too long.
     """
-    max_ctx = get_max_context_window(model_id)
+    max_ctx = model_config(model_id).max_context_window
     if max_ctx and num_prompt_tokens > max_ctx:
         raise HTTPException(
             status_code=400,
@@ -2293,19 +2297,14 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
-        settings_manager = _server_state.settings_manager
         for m in status["models"]:
             model_id = m["id"]
-            display_id = model_id
-            if settings_manager:
-                ms = settings_manager.get_settings(model_id)
-                if ms.model_alias:
-                    display_id = ms.model_alias
+            config = model_config(model_id)
             models.append(
                 ModelInfo(
-                    id=display_id,
+                    id=config.settings.model_alias or model_id,
                     owned_by="omlx",
-                    max_model_len=get_max_context_window(model_id),
+                    max_model_len=config.max_context_window,
                 )
             )
 
@@ -2335,17 +2334,15 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["max_tokens"] = None
             continue
 
-        m["max_context_window"] = get_max_context_window(model_id)
+        config = model_config(model_id)
+        m["max_context_window"] = config.max_context_window
+        m["max_tokens"] = config.max_tokens
+        m["enable_thinking"] = config.enable_thinking
+        m["preserve_thinking"] = config.preserve_thinking
+        ma = getattr(config.settings, "model_alias", None)
+        if ma is not None:
+            m["model_alias"] = ma
 
-        # Resolve effective max_tokens: model setting > global default
-        max_tokens = _server_state.sampling.max_tokens
-        if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(model_id)
-            if ms and ms.model_alias:
-                m["model_alias"] = ms.model_alias
-            if ms and ms.max_tokens is not None:
-                max_tokens = ms.max_tokens
-        m["max_tokens"] = max_tokens
     return status
 
 
@@ -2442,7 +2439,7 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    max_length = get_embedding_max_length(request.model, request.max_length)
+    max_length = model_config(request.model).embedding_max_length(request.max_length)
 
     async def _build_embeddings():
         start_time = time.perf_counter()
@@ -2827,7 +2824,10 @@ async def create_chat_completion(
     resolved_model = resolve_model_id(request.model) or request.model
 
     # Get per-model settings
-    max_tool_result_tokens = None
+    config = model_config(resolved_model)
+    max_tool_result_tokens = config.settings.max_tool_result_tokens
+    reasoning_parser = config.settings.reasoning_parser
+
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
     reasoning_parser = None
@@ -4560,21 +4560,18 @@ async def create_anthropic_message(
     resolved_model = resolve_model_id(request.model) or request.model
 
     # Get per-model settings
-    max_tool_result_tokens = None
+    config = model_config(resolved_model)
+    max_tool_result_tokens = config.settings.max_tool_result_tokens
+
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
-        if ms.chat_template_kwargs:
-            merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
-        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-        if ms.enable_thinking is not None:
-            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-        if ms.preserve_thinking is not None:
-            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+
+    if config.settings.chat_template_kwargs:
+        merged_ct_kwargs.update(config.settings.chat_template_kwargs)
+    forced_keys = set(config.settings.forced_ct_kwargs or [])
+    # Apply thinking template overrides
+    merged_ct_kwargs.update(config.thinking_template_overrides())
+
     # Per-request kwargs override model settings (except forced keys)
     if request.chat_template_kwargs:
         for k, v in request.chat_template_kwargs.items():
@@ -5006,23 +5003,20 @@ async def create_response(
         )
 
     # Get per-model settings
-    max_tool_result_tokens = None
+    config = model_config(resolved_model)
+    max_tool_result_tokens = config.settings.max_tool_result_tokens
+    reasoning_parser = config.settings.reasoning_parser
+
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
-    reasoning_parser = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
-        reasoning_parser = ms.reasoning_parser
-        if ms.chat_template_kwargs:
-            merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
-        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-        if ms.enable_thinking is not None:
-            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-        if ms.preserve_thinking is not None:
-            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+
+    if config.settings.chat_template_kwargs:
+        merged_ct_kwargs.update(config.settings.chat_template_kwargs)
+    forced_keys = set(config.settings.forced_ct_kwargs or [])
+    # Apply thinking template overrides
+    merged_ct_kwargs.update(config.thinking_template_overrides())
+
+    # Per-request kwargs not supported in Responses API.
 
     # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
     # are NOT called here because convert_responses_input_to_messages() already

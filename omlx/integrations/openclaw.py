@@ -49,9 +49,11 @@ class OpenClawIntegration(Integration):
                     "id": ctx.model,
                     "name": ctx.model,
                     "api": "openai-completions",
-                    "reasoning": bool(ctx.reasoning)
-                    if ctx.reasoning is not None
-                    else False,
+                    "reasoning": (
+                        bool(ctx.reasoning)
+                        if ctx.reasoning is not None
+                        else False
+                    ),
                     "input": ["text", "image"] if ctx.supports_images else ["text"],
                     "cost": {
                         "input": 0,

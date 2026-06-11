@@ -20,7 +20,7 @@ from omlx.server import (
     _reset_boundary_snapshots_for_server,
     app,
     get_engine,
-    get_max_context_window,
+    model_config,
     get_sampling_params,
 )
 from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
@@ -684,30 +684,30 @@ class TestGetMaxContextWindow:
         ``max_context_window_policy`` instead — see TestPolicyCap below.
         """
         self._mount_pool({"llama-3": self._entry("llama-3", None)})
-        assert get_max_context_window("llama-3") == 32768
+        assert model_config("llama-3").max_context_window == 32768
 
     def test_discovered_context_returned_when_no_override(self):
         """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
         self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
-        assert get_max_context_window("qwen3-coder") == 262144
+        assert model_config("qwen3-coder").max_context_window == 262144
 
     def test_per_model_override_wins_over_discovery(self):
         """Admin set 16384 → that wins over the model's declared 262144."""
         self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
         self._mount_settings({"qwen3-coder": ModelSettings(max_context_window=16384)})
-        assert get_max_context_window("qwen3-coder") == 16384
+        assert model_config("qwen3-coder").max_context_window == 16384
 
     def test_per_model_override_wins_over_global(self):
         """Override of 8192 wins even when the model didn't declare a value."""
         self._mount_pool({"llama-3": self._entry("llama-3", None)})
         self._mount_settings({"llama-3": ModelSettings(max_context_window=8192)})
-        assert get_max_context_window("llama-3") == 8192
+        assert model_config("llama-3").max_context_window == 8192
 
     def test_no_model_id_returns_global_default(self):
         """A bare /v1/messages-style call with no model id falls to the default."""
-        assert get_max_context_window(None) == 32768
+        assert model_config(None).max_context_window == 32768
 
     def test_unknown_model_id_returns_global_default(self):
         """An unknown model id doesn't crash — falls through to the default."""
         self._mount_pool({})
-        assert get_max_context_window("ghost-model") == 32768
+        assert model_config("ghost-model").max_context_window == 32768
