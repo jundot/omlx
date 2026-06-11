@@ -967,3 +967,74 @@ class TestSoftThinkingBudget:
         assert not proc._done
         assert logits[0, 42].item() > 0.0  # first id targeted
         assert logits[0, 43].item() == 0.0  # out-of-order id not boosted
+
+    @pytest.mark.parametrize(
+        ("end_ids", "recent", "expected"),
+        [
+            # Repeated leading id [A, A, B]: one trailing A is a 1-prefix, a
+            # double A a 2-prefix; an [A, B] tail is NOT a prefix of
+            # [A, A, B], so the bias falls back to ids[0].
+            ([1, 1, 2], [1], 1),
+            ([1, 1, 2], [1, 1], 2),
+            ([1, 1, 2], [1, 1, 1], 2),
+            ([1, 1, 2], [1, 2], 1),
+            ([1, 1, 2], [2, 1], 1),
+            # Overlapping marker [A, B, A]: a completed [A, B] tail targets
+            # the closing ids[2]; a bare trailing A re-matches the 1-prefix
+            # and targets ids[1].
+            ([1, 2, 1], [1], 2),
+            ([1, 2, 1], [1, 2], 1),
+            ([1, 2, 1], [2, 1], 2),
+            ([1, 2, 1], [1, 2, 1], 2),
+        ],
+    )
+    def test_next_close_token_id_on_repeated_and_overlapping_markers(
+        self, end_ids, recent, expected
+    ):
+        """Pin the longest-proper-prefix resolution on markers with repeated
+        or overlapping ids: the biased token must always keep the generated
+        tail a valid marker prefix, never leak a fragment."""
+        proc = self._make_processor(end_ids=end_ids)
+        proc._recent_tokens = list(recent)
+        assert proc._next_close_token_id() == expected
+
+    def test_soft_zone_policy_constants(self):
+        """The zone boundaries are product choices, not incidental values:
+        the soft zone covers the last 50% of the budget, and FACTOR=2 makes
+        the close-think logit overtake the top halfway through the zone.
+        Changing either changes when models stop thinking; update the PR
+        narrative (and the vllm#38277 port) together with this test."""
+        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.5
+        assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
+
+    def test_degenerate_budgets_keep_the_hard_cut_contract(self):
+        """Tiny budgets must degrade to the hard cut without a crash or a
+        dead zone: 0 and 1 force at the very first step, 2 has no usable
+        soft step before the wall."""
+        for budget in (0, 1):
+            proc = self._make_processor(budget=budget)
+            logits = self._step(proc, 1, self._ramp_logits())
+            assert proc._forcing
+            assert logits[0, self.THINK_END_ID].item() == 0.0
+            assert logits[0, 0].item() == float("-inf")
+
+        proc = self._make_processor(budget=2)
+        logits = self._step(proc, 1, self._ramp_logits())
+        assert not proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
+        self._step(proc, 2, self._ramp_logits())
+        assert proc._forcing
+
+    def test_budget_three_gets_one_soft_step(self):
+        """budget=3 is the smallest budget with a live soft step: step 2
+        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 3
+        is the hard wall."""
+        proc = self._make_processor(budget=3)
+        logits = self._step(proc, 1, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
+        logits = self._step(proc, 2, _make_logits())
+        assert not proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * 0.5)
+        self._step(proc, 3, _make_logits())
+        assert proc._forcing
