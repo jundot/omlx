@@ -271,3 +271,33 @@ class TestSessionRestore:
         assert "omlx_chat_current_id" in body, (
             f"{fn} must persist the current chat id for reload restore"
         )
+
+
+class TestChatSwitchPreservesInflight:
+    """Switching chats while a video renders must not lose content: the
+    outgoing chat is saved first, the bubble is persisted as soon as its
+    job id exists, and the orphaned poll loop exits (rehydration starts a
+    fresh one when the chat reopens)."""
+
+    def test_generate_video_saves_after_job_id(self, chat_source):
+        body = _function_body(chat_source, "generateVideo")
+        job_id_pos = body.index("msg._video.job_id = job.id")
+        poll_pos = body.index("await this.pollVideo(msg)")
+        save_pos = body.find("this.saveCurrentChat()", job_id_pos, poll_pos)
+        assert save_pos != -1, (
+            "the bubble must be persisted between job-id assignment and the "
+            "poll await, or a chat switch/reload mid-render loses it"
+        )
+
+    @pytest.mark.parametrize("fn", ["loadChat", "startNewChat"])
+    def test_outgoing_chat_saved_before_switch(self, chat_source, fn):
+        body = _function_body(chat_source, fn)
+        assert "saveCurrentChat()" in body, (
+            f"{fn} must save the chat being left before replacing messages"
+        )
+
+    def test_poll_video_is_chat_scoped(self, chat_source):
+        body = _function_body(chat_source, "pollVideo")
+        assert "pollChatId" in body and "currentChatId !== pollChatId" in body, (
+            "pollVideo must exit when its chat is no longer open"
+        )
