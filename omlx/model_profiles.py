@@ -76,6 +76,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "video_default_size",
     "video_default_seconds",
     "video_default_upscale_resolution",
+    # Image generation defaults (image models only)
+    "image_default_steps",
+    "image_default_size",
 )
 
 # Excluded — never stored in a profile or template.

@@ -74,6 +74,29 @@ resp = requests.post(
 print(resp.json()["choices"][0]["message"]["content"])
 ```
 
+## 视频与图像生成
+
+除了语言模型, fmlx 还能在同一个 server 里跑视频生成 (`/v1/videos`, Wan2.2) 和图像生成 (`/v1/images`). 两者共用一套独立 venv 的子进程 worker (mlx-gen 运行时), 生成任务持有内存租约, 与正在服务的 LLM 共驻而不互相挤爆——这是单机统一内存才有的玩法.
+
+图像侧支持三类模型, 放进模型目录 (`~/.fmlx/models/AbstractFramework/<repo>`) 重启即被自动识别:
+
+| 模型 | 用途 | 实测 (M5 Max, 1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | 快速文生图, 9 步出图 | 22 秒, 峰值 8.6GB |
+| qwen-image-2512-4bit | 中文排版/海报字天花板, 40 步 | 5 分钟; 挂 Lightning LoRA 8 步 73 秒 |
+| qwen-image-edit-2511-4bit | 指令改图/图内改字, 上传图片+一句话 | 15 分钟 (40 步) |
+
+开启方式: admin 设置页打开图像生成开关 (settings.image.enabled), worker venv 与视频引擎共用一个 (`uv venv -p 3.12 ~/.fmlx/venvs/video && uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock`). 聊天页直接选图像模型就能用: 纯文字生成图片, 带图自动路由到改图模型. API 走 OpenAI images 形态:
+
+```
+curl http://localhost:8000/v1/images \
+  -H "X-API-Key: 你的密钥" -H "Content-Type: application/json" \
+  -d '{"model": "z-image-turbo-4bit", "prompt": "咖啡店开业海报, 标题\"开业大吉\"",
+       "size": "1024x1024", "response_format": "url"}'
+```
+
+默认同步返回; 加 `"sync": false` 改为返回 job 对象轮询进度 (`GET /v1/images/{id}`), 适合分钟级的 qwen 任务. 扩展参数有 negative_prompt / steps / seed / guidance / n / image_strength / lora_paths, 官方 openai SDK 的 `client.images.generate` 也能直接打通 (`POST /v1/images/generations`). 步数和默认尺寸可以全局设, 也可以在模型设置里按模型覆盖. 设计细节见 [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md) 与 [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md).
+
 ## 多机集群路由
 
 如果有多台 Mac，集群路由器可以把请求按模型和负载自动分发到多台 `omlx serve`。它不是 GPU/显存级集群，也不是共享 KV 缓存——每台仍是独立 server，路由器只决定每个请求由哪台处理。请求只会发给装有目标模型的机器；更快的机器配更高 `weight`，自动多分流量；显存吃紧的机器会被降权避开冷加载。客户端把地址从某台的 `:8000` 换成路由器的 `:9000` 即可，单机直连不受影响。配置见 `omlx/cluster/cluster.example.json`，完整说明见 [docs/cluster.md](docs/cluster.md)。
@@ -120,6 +143,20 @@ pip install git+https://github.com/panwudi/flyto-mlx@v0.4.1
 ```
 
 Plain `pip install flyto-mlx` is not currently available. Flyto MLX, like oMLX itself, depends on unreleased mlx-vlm commits that PEP 508 §6 prevents from being declared in PyPI packages. Once `mlx-vlm 0.6.x` ships with those commits we will enable the PyPI channel.
+
+### Video and image generation
+
+Beyond language models, the same server runs video generation (`/v1/videos`, Wan2.2) and image generation (`/v1/images`). Both execute in a subprocess worker from a separate venv (the mlx-gen runtime) and hold a memory lease against the server's ceiling, so a render co-resides with your serving LLMs instead of fighting them -- a unified-memory trick a discrete-GPU stack cannot pull off.
+
+Three image model families are supported; drop them under `~/.fmlx/models/AbstractFramework/<repo>` and restart to auto-discover:
+
+| Model | Use | Measured (M5 Max, 1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | fast text-to-image, 9 steps | 22 s, 8.6 GB peak |
+| qwen-image-2512-4bit | best-in-class CJK typography, 40 steps | 5 min; 73 s with the Lightning LoRA at 8 steps |
+| qwen-image-edit-2511-4bit | instruction editing, in-image text replacement | 15 min (40 steps) |
+
+Enable via the admin settings page (settings.image.enabled); the worker venv is shared with the video engine (`uv venv -p 3.12 ~/.fmlx/venvs/video && uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock`). In the chat page just pick an image model: plain text generates, an attached image auto-routes to the edit model. The API speaks OpenAI images shape (`POST /v1/images`, sync by default with `b64_json`/`url`; `"sync": false` returns a pollable job for the minute-scale Qwen renders), and the official openai SDK works through `POST /v1/images/generations`. Extensions: negative_prompt / steps / seed / guidance / n / image_strength / lora_paths. Defaults are settable globally and per model. Design notes: [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md), [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md).
 
 ### Multi-machine cluster routing
 

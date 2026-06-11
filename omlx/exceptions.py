@@ -427,12 +427,13 @@ class ModelLoadingError(EnginePoolError):
 
 
 class ModelTypeNotLoadableError(EnginePoolError):
-    """Raised when a model type is not pool-loadable (e.g. video models).
+    """Raised when a model type is not pool-loadable (e.g. video/image models).
 
-    Video generation models are job-managed by the VideoJobManager and are
-    never loaded into the engine pool. Raised by EnginePool.get_engine
-    BEFORE the memory-admission loop so a misrouted request cannot evict
-    resident LLM engines (docs/video-generation-engine-spec.md section 3).
+    Video and image generation models are job-managed by the media job
+    manager and are never loaded into the engine pool. Raised by
+    EnginePool.get_engine BEFORE the memory-admission loop so a misrouted
+    request cannot evict resident LLM engines
+    (docs/video-generation-engine-spec.md section 3).
     The server layer maps this to HTTP 400 with an endpoint hint.
     """
 
@@ -444,6 +445,8 @@ class ModelTypeNotLoadableError(EnginePoolError):
                 "It is an auxiliary upscaling stage, used automatically via "
                 "the upscale_resolution parameter of POST /v1/videos."
             )
+        elif model_type == "image":
+            hint = "Use POST /v1/images."
         else:
             hint = "Use POST /v1/videos."
         super().__init__(

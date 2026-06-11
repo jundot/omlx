@@ -692,6 +692,81 @@ class VideoSettings:
 
 
 @dataclass
+class ImageSettings:
+    """Image generation engine settings (/v1/images, mlx-gen runtime).
+
+    The image engine shares the video engine's runtime pattern and venv:
+    a subprocess worker runs mflux (z-image / qwen-image / qwen-image-edit)
+    under a memory lease, dispatched by the same media job manager so video
+    and image jobs serialize against the single enforcer lease.
+    memory_lease_gb = 0 means auto: the lease is picked per model kind at
+    submission (see api/image_routes.py DEFAULT_LEASE_GB).
+    """
+
+    enabled: bool = False  # Master switch; handlers return 503 when off
+    worker_python: str = ""  # Empty = the video venv python (same mlx-gen venv)
+    memory_lease_gb: float = 0.0  # 0 = auto by model kind
+    max_queued_jobs: int = 8  # Submissions beyond this 503
+    job_timeout_seconds: int = 1800  # Per-run clock, starts at worker spawn
+    progress_stall_timeout_seconds: int = 300  # Kill when worker JSONL goes silent
+    default_steps: int = 0  # 0 = per-model-kind default (turbo 9 / qwen 40)
+    default_size: str = "1024x1024"
+    max_steps: int = 60
+    max_pixels: int = 2048 * 2048  # Per-image W*H cap
+    max_n: int = 4  # Images per request cap
+    sync_timeout_seconds: int = 900  # sync=true requests 504 past this
+    artifacts_max_count: int = 200  # LRU-purge artifact blobs beyond this
+    artifacts_max_gb: float = 10.0
+
+    def get_worker_python(self, base_path: Path) -> Path:
+        """Resolve the worker venv python path (defaults to the video venv)."""
+        if self.worker_python:
+            return Path(self.worker_python).expanduser()
+        return base_path / "venvs" / "video" / "bin" / "python"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "worker_python": self.worker_python,
+            "memory_lease_gb": self.memory_lease_gb,
+            "max_queued_jobs": self.max_queued_jobs,
+            "job_timeout_seconds": self.job_timeout_seconds,
+            "progress_stall_timeout_seconds": self.progress_stall_timeout_seconds,
+            "default_steps": self.default_steps,
+            "default_size": self.default_size,
+            "max_steps": self.max_steps,
+            "max_pixels": self.max_pixels,
+            "max_n": self.max_n,
+            "sync_timeout_seconds": self.sync_timeout_seconds,
+            "artifacts_max_count": self.artifacts_max_count,
+            "artifacts_max_gb": self.artifacts_max_gb,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ImageSettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            worker_python=data.get("worker_python", ""),
+            memory_lease_gb=float(data.get("memory_lease_gb", 0.0)),
+            max_queued_jobs=int(data.get("max_queued_jobs", 8)),
+            job_timeout_seconds=int(data.get("job_timeout_seconds", 1800)),
+            progress_stall_timeout_seconds=int(
+                data.get("progress_stall_timeout_seconds", 300)
+            ),
+            default_steps=int(data.get("default_steps", 0)),
+            default_size=str(data.get("default_size", "1024x1024")),
+            max_steps=int(data.get("max_steps", 60)),
+            max_pixels=int(data.get("max_pixels", 2048 * 2048)),
+            max_n=int(data.get("max_n", 4)),
+            sync_timeout_seconds=int(data.get("sync_timeout_seconds", 900)),
+            artifacts_max_count=int(data.get("artifacts_max_count", 200)),
+            artifacts_max_gb=float(data.get("artifacts_max_gb", 10.0)),
+        )
+
+
+@dataclass
 class NetworkSettings:
     """Network proxy and TLS trust settings."""
 
@@ -910,6 +985,7 @@ class GlobalSettings:
     ui: UISettings = field(default_factory=UISettings)
     idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
     video: VideoSettings = field(default_factory=VideoSettings)
+    image: ImageSettings = field(default_factory=ImageSettings)
 
     @classmethod
     def load(
@@ -1007,6 +1083,8 @@ class GlobalSettings:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
             if "video" in data:
                 self.video = VideoSettings.from_dict(data["video"])
+            if "image" in data:
+                self.image = ImageSettings.from_dict(data["image"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -1249,6 +1327,7 @@ class GlobalSettings:
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
             "video": self.video.to_dict(),
+            "image": self.image.to_dict(),
         }
 
         try:
@@ -1493,6 +1572,7 @@ class GlobalSettings:
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
             "video": self.video.to_dict(),
+            "image": self.image.to_dict(),
         }
 
 

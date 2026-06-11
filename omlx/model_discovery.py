@@ -23,8 +23,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]
 
 # Diffusers pipeline classes (model_index.json "_class_name") that fmlx can
 # serve via the video engine (docs/video-generation-engine-spec.md). Unknown
@@ -295,6 +295,8 @@ class DiscoveredModel:
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
+    image_pipeline: str = ""  # "t2i" | "edit" for image models, else ""
+    image_alias: str = ""  # mflux ModelConfig alias (e.g. "z-image-turbo"), else ""
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -420,6 +422,11 @@ def detect_model_type(model_path: Path) -> ModelType:
     # SeedVR2-style upscaler weights: listed but never standalone-invocable.
     if is_video_upscaler_dir(model_path):
         return "video_upscaler"
+
+    # mlx-gen saved-format image models (z-image / qwen-image / qwen-image-edit).
+    # Served via POST /v1/images; never pool-loaded.
+    if is_image_model_dir(model_path):
+        return "image"
 
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -781,6 +788,59 @@ def is_video_upscaler_dir(path: Path) -> bool:
     )
 
 
+def is_image_model_dir(path: Path) -> bool:
+    """Detect an mlx-gen (mflux) saved-format image model dir (AbstractFramework
+    layout): transformer/ + text_encoder/ + vae/ safetensors indexes at the
+    root, with no model_index.json and no root config.json. The text_encoder
+    requirement is what keeps this arm mutually exclusive with
+    is_video_upscaler_dir (which rejects dirs that have one). scheduler/ and
+    transformer_2/ mark a partially-downloaded Wan diffusers dir whose
+    model_index.json has not landed yet -- their presence disqualifies the
+    dir so it stays invisible instead of misregistering as an image model.
+    """
+    if (path / "model_index.json").exists() or (path / "config.json").exists():
+        return False
+    if (path / "scheduler").is_dir() or (path / "transformer_2").is_dir():
+        return False
+    return (
+        (path / "transformer" / "model.safetensors.index.json").is_file()
+        and (path / "text_encoder" / "model.safetensors.index.json").is_file()
+        and (path / "vae" / "model.safetensors.index.json").is_file()
+    )
+
+
+def read_image_model_kind(path: Path) -> tuple[str, str]:
+    """Classify an image model dir as ("t2i" | "edit", mflux ModelConfig alias).
+
+    mlx-gen saved-format dirs carry no class marker anywhere (component index
+    metadata holds only quantization_level + mflux_version), so the directory
+    name is the only available signal -- same precedent as
+    _is_causal_lm_reranker. Returns ("", "") when the name maps to no known
+    mflux alias; _register_model skips such dirs (registering them would
+    produce entries the image worker cannot load).
+
+    The alias feeds mflux ModelConfig.from_name() in the worker. There is no
+    static factory for every alias (qwen-image-edit-2511 has none), so
+    from_name() is the only safe resolution path.
+    """
+    name = path.name.lower()
+    if "qwen" in name and "edit" in name:
+        for marker, alias in (
+            ("2511", "qwen-image-edit-2511"),
+            ("2509", "qwen-image-edit-2509"),
+        ):
+            if marker in name:
+                return "edit", alias
+        return "edit", "qwen-image-edit"
+    if "z-image-turbo" in name:
+        return "t2i", "z-image-turbo"
+    if "z-image" in name:
+        return "t2i", "z-image"
+    if "qwen-image" in name:
+        return "t2i", "qwen-image"
+    return "", ""
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model.
 
@@ -796,6 +856,7 @@ def _is_model_dir(path: Path) -> bool:
         (path / "config.json").exists()
         or (path / "model_index.json").exists()
         or is_video_upscaler_dir(path)
+        or is_image_model_dir(path)
     )
 
 
@@ -853,6 +914,22 @@ def _register_model(
             return
 
         model_type = detect_model_type(model_dir)
+
+        # mflux saved-format image dirs whose name maps to no known mflux
+        # alias are skipped outright -- the image worker resolves the model
+        # class via ModelConfig.from_name(alias), so an entry without an
+        # alias would be unloadable (mirrors the unknown-pipeline skip above).
+        image_pipeline = ""
+        image_alias = ""
+        if model_type == "image":
+            image_pipeline, image_alias = read_image_model_kind(model_dir)
+            if not image_alias:
+                logger.warning(
+                    f"Skipping image model dir with unrecognized name "
+                    f"(no mflux alias match): {model_id}"
+                )
+                return
+
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
@@ -869,16 +946,21 @@ def _register_model(
             engine_type = "video"
         elif model_type == "video_upscaler":
             engine_type = "video_upscaler"
+        elif model_type == "image":
+            engine_type = "image"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
 
         # Read raw config model_type for sub-type detection (e.g., OCR models).
-        # Video models have no root config.json; surface the diffusers
-        # pipeline class instead so the admin UI shows something meaningful.
+        # Video/image models have no root config.json; surface the diffusers
+        # pipeline class / mflux alias instead so the admin UI shows something
+        # meaningful.
         config_model_type = ""
         if model_type == "video":
             config_model_type = pipeline_class or ""
+        elif model_type == "image":
+            config_model_type = image_alias
         else:
             try:
                 import json
@@ -902,6 +984,8 @@ def _register_model(
             video_pipeline=(
                 read_video_pipeline_kind(model_dir) if model_type == "video" else ""
             ),
+            image_pipeline=image_pipeline,
+            image_alias=image_alias,
         )
 
         size_gb = estimated_size / (1024**3)

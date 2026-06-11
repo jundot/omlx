@@ -45,6 +45,7 @@
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 video: { enabled: false, worker_python: '', memory_lease_gb: 36, max_queued_jobs: 4, job_timeout_seconds: 7200, progress_stall_timeout_seconds: 600, default_steps: 20, default_fps: 16, max_frames: 121, max_steps: 50, max_pixels_per_frame: 921600, artifacts_max_count: 50, artifacts_max_gb: 50 },
+                image: { enabled: false, worker_python: '', memory_lease_gb: 0, max_queued_jobs: 8, job_timeout_seconds: 1800, progress_stall_timeout_seconds: 300, default_steps: 0, default_size: '1024x1024', max_steps: 60, max_pixels: 4194304, max_n: 4, sync_timeout_seconds: 900, artifacts_max_count: 200, artifacts_max_gb: 10 },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -783,6 +784,7 @@
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             video: { ...this.globalSettings.video, ...data.video },
+                            image: { ...this.globalSettings.image, ...data.image },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
@@ -897,6 +899,15 @@
                             // ?? not ||: clearing the field must send "" so the
                             // server reverts to the default path (null is skipped)
                             video_upscaler_model_path: this.globalSettings.video?.upscaler_model_path ?? null,
+                            image_enabled: this.globalSettings.image?.enabled ?? null,
+                            // ?? not ||: clearing must send "" so the server
+                            // reverts to the default (video venv) worker path
+                            image_worker_python: this.globalSettings.image?.worker_python ?? null,
+                            image_memory_lease_gb: this.globalSettings.image?.memory_lease_gb ?? null,
+                            image_default_steps: this.globalSettings.image?.default_steps ?? null,
+                            image_default_size: this.globalSettings.image?.default_size ?? null,
+                            image_max_n: this.globalSettings.image?.max_n ?? null,
+                            image_sync_timeout_seconds: this.globalSettings.image?.sync_timeout_seconds ?? null,
                         }),
                     });
 
@@ -1718,6 +1729,9 @@
                     video_default_size: settings.video_default_size || '',
                     video_default_seconds: settings.video_default_seconds ?? null,
                     video_default_upscale_resolution: settings.video_default_upscale_resolution ?? null,
+                    // Image generation defaults (image models)
+                    image_default_steps: settings.image_default_steps ?? null,
+                    image_default_size: settings.image_default_size || '',
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1771,6 +1785,8 @@
                                 video_default_size: this.modelSettings.video_default_size?.trim() || null,
                                 video_default_seconds: this.modelSettings.video_default_seconds || null,
                                 video_default_upscale_resolution: this.modelSettings.video_default_upscale_resolution || null,
+                                image_default_steps: this.modelSettings.image_default_steps || null,
+                                image_default_size: this.modelSettings.image_default_size?.trim() || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)

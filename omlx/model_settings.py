@@ -103,6 +103,9 @@ class ModelSettings:
         video_default_upscale_resolution: Video models: auto-upscale completed
             videos to this short-side resolution via SeedVR2 (None/0 = off;
             requests sending upscale_resolution explicitly always win).
+        image_default_steps: Image models: default denoise steps (None = global,
+            then per-alias default).
+        image_default_size: Image models: default output size "WxH" (None = global).
         active_profile_name: Name of the currently-applied profile (None = no profile).
     """
 
@@ -129,6 +132,10 @@ class ModelSettings:
     video_default_size: Optional[str] = None  # "WxH"
     video_default_seconds: Optional[float] = None
     video_default_upscale_resolution: Optional[int] = None  # SeedVR2 short side, 0/None = off
+
+    # Image generation defaults (image models only; None = global default)
+    image_default_steps: Optional[int] = None
+    image_default_size: Optional[str] = None  # "WxH"
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
     preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)

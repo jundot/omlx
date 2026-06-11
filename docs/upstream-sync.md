@@ -463,3 +463,30 @@ settings.py (VideoSettings.upscaler_model_path / max_upscale_resolution),
 admin/routes.py (两个 video_* 设置字段), admin chat.html / dashboard
 模板与 i18n (en/zh). worker/manager/video_routes/video_models 是
 fmlx 自有文件, 无上游冲突面.
+
+## 2026-06-11 分化标记: 图像生成引擎 (fmlx 自有, 永不回流)
+
+feat/image-engine 引入 /v1/images 图像生成引擎 (spec:
+docs/image-generation-engine-spec.md), 与视频引擎同构同运行时,
+fmlx 与上游的有意分化. 注意上游 PR #855 (image generation) 在
+2026-06 评估时已明确跳过 -- fmlx 走 mlx-gen (mflux) 子进程 worker
+路线, 与上游的 in-process 路线互斥, 后续 sync 时上游 image 相关
+commit 一律跳过并在本台账登记.
+
+上游同源文件补丁面 (cherry-pick 撞到时按此理解):
+- model_discovery.py: is_image_model_dir / read_image_model_kind +
+  detect_model_type image 臂 + _register_model image 臂 + Literal +
+  DiscoveredModel.image_pipeline/image_alias
+- engine_pool.py: EngineEntry Literal/字段 + _MODEL_TYPE_TO_ENGINE +
+  get_engine/_load_engine 拒绝臂 image 项 + get_status 透传
+- server.py: image router 挂载 + pre-pool 400 image 臂 + load 端点 +
+  overlay_video_activity image 分支 + manager 构造传 image_settings
+- settings.py: ImageSettings section
+- admin/routes.py: valid_types/type_to_engine image 项 +
+  image_default_* 与 global-settings image 字段
+- exceptions.py: ModelTypeNotLoadableError image 提示臂
+- omlx/video/manager.py: VideoJobManager 泛化为 MediaJobManager
+  (fmlx 自有文件, 无上游冲突面, 但与视频引擎共享, 改动需双向回归)
+
+全新文件 (无冲突面): omlx/image/*, omlx/api/image_models.py,
+omlx/api/image_routes.py, tests/test_image_*.py.

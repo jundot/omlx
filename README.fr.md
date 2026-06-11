@@ -184,6 +184,36 @@ Chattez directement avec n'importe quel modèle chargé depuis le panneau d'admi
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
 </p>
 
+### Génération vidéo et image
+
+Au-delà des modèles de langage, le même serveur exécute la génération vidéo (`/v1/videos`, Wan2.2) et la génération d'images (`/v1/images`). Les deux tournent dans un worker en sous-processus issu d'un venv séparé (le runtime mlx-gen) et détiennent un bail mémoire sur le plafond du serveur : un rendu cohabite avec vos LLM en service au lieu de les évincer -- un avantage de la mémoire unifiée qu'une pile à GPU dédié ne peut pas reproduire.
+
+Trois familles de modèles d'image sont prises en charge ; placez-les sous `~/.fmlx/models/AbstractFramework/<repo>` et redémarrez pour la découverte automatique :
+
+| Modèle | Usage | Mesuré (M5 Max, 1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | text-to-image rapide, 9 étapes | 22 s, pic à 8,6 Go |
+| qwen-image-2512-4bit | référence de la typographie CJK, 40 étapes | 5 min ; 73 s avec la LoRA Lightning à 8 étapes |
+| qwen-image-edit-2511-4bit | édition par instruction, remplacement de texte dans l'image | 15 min (40 étapes) |
+
+L'activation se fait en deux temps. Préparez d'abord le venv du worker (partagé avec le moteur vidéo) :
+
+```bash
+uv venv -p 3.12 ~/.fmlx/venvs/video
+uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock
+```
+
+Activez ensuite l'interrupteur de génération d'images dans la page des paramètres admin (settings.image.enabled). Dans la page de chat, sélectionnez simplement un modèle d'image : un texte seul génère une image, une image jointe est routée automatiquement vers le modèle d'édition. L'API parle le format OpenAI images :
+
+```bash
+curl http://localhost:8000/v1/images \
+  -H "X-API-Key: votre-cle" -H "Content-Type: application/json" \
+  -d '{"model": "z-image-turbo-4bit", "prompt": "affiche pour un cafe",
+       "size": "1024x1024", "response_format": "url"}'
+```
+
+Par défaut la réponse est synchrone (`b64_json` ou `url`) ; avec `"sync": false` la requête renvoie un objet job dont la progression se suit via `GET /v1/images/{id}`, adapté aux rendus qwen de plusieurs minutes. Paramètres étendus : negative_prompt / steps / seed / guidance / n / image_strength / lora_paths. Le SDK openai officiel fonctionne tel quel via `POST /v1/images/generations` (`client.images.generate`). Les étapes et la taille par défaut se règlent globalement ou par modèle. Notes de conception : [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md), [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md).
+
 ### Téléchargement de modèles
 
 Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans le tableau de bord. Parcourez les fiches modèles, vérifiez les tailles de fichiers, et téléchargez en un clic.
