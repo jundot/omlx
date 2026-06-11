@@ -744,6 +744,7 @@
   "cluster.healthy.no": "いいえ",
   "cluster.save.failed": "保存に失敗しました",
   "settings.image.title": "画像生成",
+  "settings.image.section_hint": "POST /v1/images とチャットページから画像を生成します。有効化の手順、対応モデルと API 例は README の Video and image generation 節を参照。",
   "settings.image.enabled": "画像生成を有効にする",
   "settings.image.enabled_desc": "サブプロセスの worker で POST /v1/images を提供します。動画 worker と同じ venv を共有します。",
   "settings.image.memory_lease": "メモリリース (GB)",
@@ -751,7 +752,9 @@
   "settings.image.default_steps": "デフォルトのデノイズステップ数",
   "settings.image.default_steps_desc": "0 = モデル種別ごとのデフォルト (z-image-turbo 9、qwen-image 40)。",
   "settings.image.default_size": "デフォルトサイズ (幅x高さ)",
+  "settings.image.default_size_desc": "リクエストで size を省略した場合に使う 幅x高さ (例: 1024x1024)。",
   "settings.image.max_n": "1 リクエストあたりの最大画像数",
+  "settings.image.max_n_desc": "1 リクエストの n パラメータの上限。大きいほど描画時間が倍増します。",
   "settings.image.sync_timeout": "同期タイムアウト (秒)",
   "settings.image.sync_timeout_desc": "同期 (ブロッキング) リクエストはこの時間を超えると 504 を返します。ジョブは継続します。",
   "settings.image.worker_python": "Worker python のパス",
@@ -759,7 +762,9 @@
   "modal.model_settings.image_section": "画像生成のデフォルト",
   "modal.model_settings.image_hint": "このモデルの /v1/images とチャット内生成のデフォルト値。空欄はグローバルの画像設定にフォールバックします。リクエストで明示したパラメータが常に優先されます。",
   "modal.model_settings.image_steps": "デフォルトステップ数",
+  "modal.model_settings.image_steps_desc": "このモデルに限り、グローバル/自動のデフォルトステップ数を上書きします。",
   "modal.model_settings.image_size": "デフォルトサイズ (幅x高さ)",
+  "modal.model_settings.image_size_desc": "このモデルに限り、グローバルのデフォルトサイズを上書きします。",
   "modal.model_settings.image_pipeline": "パイプライン",
   "modal.model_settings.image_alias": "エイリアス",
   "modal.model_settings.image_pipeline_hint": "モデルのディレクトリ名から判定します。t2i = テキストから画像、edit = 入力画像をもとに編集。",
@@ -772,5 +777,7 @@
   "chat.image.need_image": "このモデルは画像編集用です。画像を添付してください。",
   "chat.image.no_edit_model": "画像編集モデルがインストールされていません。添付画像を削除するか、編集対応モデルをインストールしてください。",
   "chat.image.expired": "画像はサーバー上で期限切れです。再生成ボタンで作り直してください。",
-  "chat.image.bad_input_type": "画像モデルは PNG、JPEG、WebP の入力画像のみ受け付けます。"
+  "chat.image.bad_input_type": "画像モデルは PNG、JPEG、WebP の入力画像のみ受け付けます。",
+  "chat.image.placeholder_t2i": "生成したい画像を説明してください。ポスターの文字入れも試せます",
+  "chat.image.placeholder_edit": "画像をアップロードし、変更内容を一文で指示してください (例: タイトルを...に変更)"
 }

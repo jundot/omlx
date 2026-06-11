@@ -720,6 +720,7 @@
   "settings.resource.guard_tier_desc.balanced": "为系统和其他应用保留 8 GB (默认). 适合大多数交互式场景.",
   "settings.resource.guard_tier_desc.aggressive": "为系统和其他应用保留 6 GB. 模型可用内存最大化; 其他应用突发占内存时容易变慢.",
   "settings.image.title": "圖像生成",
+  "settings.image.section_hint": "透過 POST /v1/images 與聊天頁生成圖像. 啟用步驟, 模型選擇與 API 範例見 README 的影片與圖像生成一節.",
   "settings.image.enabled": "啟用圖像生成",
   "settings.image.enabled_desc": "透過子行程 worker 提供 POST /v1/images。與影片 worker 共用同一 venv。",
   "settings.image.memory_lease": "記憶體租約 (GB)",
@@ -727,7 +728,9 @@
   "settings.image.default_steps": "預設去噪步數",
   "settings.image.default_steps_desc": "0 = 依模型種類的預設值 (z-image-turbo 9 步,qwen-image 40 步)。",
   "settings.image.default_size": "預設尺寸 (寬x高)",
+  "settings.image.default_size_desc": "請求未指定 size 時使用, 寬x高, 如 1024x1024.",
   "settings.image.max_n": "單次請求最大圖片數",
+  "settings.image.max_n_desc": "單次請求 n 參數的上限; 越大渲染時間成倍增加.",
   "settings.image.sync_timeout": "同步逾時 (秒)",
   "settings.image.sync_timeout_desc": "同步 (阻塞) 請求超過此時間回傳 504;任務會繼續在背景執行。",
   "settings.image.worker_python": "Worker python 路徑",
@@ -735,7 +738,9 @@
   "modal.model_settings.image_section": "圖像生成預設值",
   "modal.model_settings.image_hint": "此模型在 /v1/images 與聊天內生成的預設參數；留空回退到全域圖像設定。請求中明確指定的參數永遠優先。",
   "modal.model_settings.image_steps": "預設步數",
+  "modal.model_settings.image_steps_desc": "覆蓋全域/自動的預設步數, 僅對此模型生效.",
   "modal.model_settings.image_size": "預設尺寸（寬x高）",
+  "modal.model_settings.image_size_desc": "覆蓋全域預設尺寸, 僅對此模型生效.",
   "modal.model_settings.image_pipeline": "管線",
   "modal.model_settings.image_alias": "別名",
   "modal.model_settings.image_pipeline_hint": "由模型目錄名稱識別：t2i 為文生圖，edit 為圖生圖（需輸入圖片）。",
@@ -748,5 +753,7 @@
   "chat.image.need_image": "該模型為圖生圖：請附加一張要編輯的圖片。",
   "chat.image.no_edit_model": "未安裝圖生圖模型；請移除附加的圖片，或安裝一個圖生圖模型。",
   "chat.image.expired": "圖片已在伺服器上過期，點擊重新生成按鈕可再生成一張。",
-  "chat.image.bad_input_type": "圖片模型僅接受 PNG、JPEG 或 WebP 輸入圖。"
+  "chat.image.bad_input_type": "圖片模型僅接受 PNG、JPEG 或 WebP 輸入圖。",
+  "chat.image.placeholder_t2i": "描述想生成的圖片; 試試中文海報文字",
+  "chat.image.placeholder_edit": "上傳圖片, 用一句話描述修改 (例: 把標題改成...)"
 }

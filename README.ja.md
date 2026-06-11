@@ -183,6 +183,35 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX チャット" width="720">
 </p>
 
+### 動画と画像の生成
+
+言語モデルに加えて、同じ server で動画生成 (`/v1/videos`、Wan2.2) と画像生成 (`/v1/images`) も動きます。どちらも独立 venv のサブプロセス worker (mlx-gen ランタイム) で実行され、生成ジョブはメモリリースを保持するため、サービング中の LLM と同居しても互いを圧迫しません -- ユニファイドメモリの Mac だからこそ成立する構成です。
+
+画像側は 3 系統のモデルに対応しています。モデルディレクトリ (`~/.fmlx/models/AbstractFramework/<repo>`) に置いて再起動すれば自動認識されます:
+
+| モデル | 用途 | 実測 (M5 Max、1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | 高速な text-to-image、9 ステップ | 22 秒、ピーク 8.6GB |
+| qwen-image-2512-4bit | CJK タイポグラフィ/ポスター文字の最高峰、40 ステップ | 5 分; Lightning LoRA + 8 ステップで 73 秒 |
+| qwen-image-edit-2511-4bit | 指示による画像編集/画像内の文字差し替え | 15 分 (40 ステップ) |
+
+有効化は 2 段階です。まず worker venv を用意します (動画エンジンと共用):
+
+```bash
+uv venv -p 3.12 ~/.fmlx/venvs/video
+uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock
+```
+
+次に admin 設定ページで画像生成のスイッチ (settings.image.enabled) をオンにします。チャットページでは画像モデルを選ぶだけで使えます: テキストのみなら画像を生成し、画像を添付すると編集モデルへ自動ルーティングされます。API は OpenAI images 形式です:
+
+```bash
+curl http://localhost:8000/v1/images \
+  -H "X-API-Key: your-key" -H "Content-Type: application/json" \
+  -d '{"model": "z-image-turbo-4bit", "prompt": "カフェ開店ポスター",
+       "size": "1024x1024", "response_format": "url"}'
+```
+
+デフォルトは同期応答 (`b64_json` または `url`) です。`"sync": false` を付けると job オブジェクトが返り、`GET /v1/images/{id}` で進捗をポーリングできます (分単位かかる qwen ジョブ向け)。拡張パラメータは negative_prompt / steps / seed / guidance / n / image_strength / lora_paths。公式 openai SDK の `client.images.generate` も `POST /v1/images/generations` 経由でそのまま使えます。ステップ数とデフォルトサイズはグローバルにも、モデル別設定でも上書きできます。設計の詳細は [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md) と [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md) を参照してください。
 
 ### モデルダウンロード
 

@@ -1288,7 +1288,7 @@
                         <textarea x-ref="messageInput" x-model="inputMessage"
                             @keydown.enter="if (!isMobile && !$event.shiftKey && !$event.isComposing && $event.keyCode !== 229) { $event.preventDefault(); sendMessage(); }"
                             @input="autoResize($event.target)" @paste="handlePaste($event)"
-                            :placeholder="isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')"
+                            :placeholder="inputPlaceholder()"
                             :disabled="!apiKeySet || !currentModel || isStreaming" rows="1"
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
                             style="color: var(--text-primary);"></textarea>
@@ -1697,6 +1697,24 @@
     tImage(key, fallback) {
         const v = window.t(key);
         return v === key ? fallback : v;
+    },
+
+    // Image models flip the input placeholder into a usage hint: t2i
+    // checkpoints want a scene description, edit checkpoints want an
+    // attached image plus a one-line instruction. Everything else keeps
+    // the generic chat placeholder.
+    inputPlaceholder() {
+        if (this.isImageModel()) {
+            if (this.imagePipelineMap[this.currentModel] === 'edit') {
+                return this.tImage('chat.image.placeholder_edit',
+                    'Upload an image, then describe the edit in one sentence (e.g. change the title to...)');
+            }
+            return this.tImage('chat.image.placeholder_t2i',
+                'Describe the image to generate; try poster text in Chinese');
+        }
+        return this.isMobile
+            ? window.t('chat.input_placeholder_mobile')
+            : window.t('chat.input_placeholder');
     },
 
             // ===== MCP Tools =====

@@ -183,6 +183,35 @@ brew services info omlx     # 查看状态
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX 聊天" width="720">
 </p>
 
+### 视频与图像生成
+
+除了语言模型, 同一个 server 还能跑视频生成 (`/v1/videos`, Wan2.2) 和图像生成 (`/v1/images`). 两者共用一套独立 venv 的子进程 worker (mlx-gen 运行时), 生成任务持有内存租约, 与正在服务的 LLM 共驻而不互相挤爆 -- 这是单机统一内存才有的玩法.
+
+图像侧支持三类模型, 放进模型目录 (`~/.fmlx/models/AbstractFramework/<repo>`) 重启即被自动识别:
+
+| 模型 | 用途 | 实测 (M5 Max, 1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | 快速文生图, 9 步出图 | 22 秒, 峰值 8.6GB |
+| qwen-image-2512-4bit | 中文排版/海报字天花板, 40 步 | 5 分钟; 挂 Lightning LoRA 8 步 73 秒 |
+| qwen-image-edit-2511-4bit | 指令改图/图内改字, 上传图片+一句话 | 15 分钟 (40 步) |
+
+开启分两步. 先准备 worker venv, 与视频引擎共用一个:
+
+```bash
+uv venv -p 3.12 ~/.fmlx/venvs/video
+uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock
+```
+
+然后在 admin 设置页打开图像生成开关 (settings.image.enabled). 聊天页直接选图像模型就能用: 纯文字生成图片, 带图自动路由到改图模型, 输入框的占位提示会跟着所选模型切换用法说明. API 走 OpenAI images 形态:
+
+```bash
+curl http://localhost:8000/v1/images \
+  -H "X-API-Key: 你的密钥" -H "Content-Type: application/json" \
+  -d '{"model": "z-image-turbo-4bit", "prompt": "咖啡店开业海报, 标题\"开业大吉\"",
+       "size": "1024x1024", "response_format": "url"}'
+```
+
+默认同步返回 (`b64_json` 或 `url`); 加 `"sync": false` 改为返回 job 对象, 用 `GET /v1/images/{id}` 轮询进度, 适合分钟级的 qwen 任务. 扩展参数有 negative_prompt / steps / seed / guidance / n / image_strength / lora_paths, 官方 openai SDK 的 `client.images.generate` 也能直接打通 (`POST /v1/images/generations`). 步数和默认尺寸可以全局设, 也可以在模型设置里按模型覆盖. 设计细节见 [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md) 与 [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md).
 
 ### 模型下载器
 

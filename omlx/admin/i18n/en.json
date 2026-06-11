@@ -784,6 +784,7 @@
   "settings.video.upscaler_path": "SeedVR2 upscaler weights",
   "settings.video.upscaler_path_desc": "Directory with the SeedVR2 weights used by upscale_resolution. Empty = models/AbstractFramework/seedvr2-3b-8bit.",
   "settings.image.title": "Image Generation",
+  "settings.image.section_hint": "Image generation via POST /v1/images and the chat page. Setup, supported models and API examples: see the Video and image generation section in the README.",
   "settings.image.enabled": "Enable image generation",
   "settings.image.enabled_desc": "Serve POST /v1/images via the subprocess worker. Shares the video worker venv.",
   "settings.image.memory_lease": "Memory lease (GB)",
@@ -791,7 +792,9 @@
   "settings.image.default_steps": "Default denoise steps",
   "settings.image.default_steps_desc": "0 = per-model-kind default (z-image-turbo 9, qwen-image 40).",
   "settings.image.default_size": "Default size (WxH)",
+  "settings.image.default_size_desc": "WxH used when a request omits size, e.g. 1024x1024.",
   "settings.image.max_n": "Max images per request",
+  "settings.image.max_n_desc": "Upper bound for a request's n (images per call); larger values multiply render time.",
   "settings.image.sync_timeout": "Sync timeout (seconds)",
   "settings.image.sync_timeout_desc": "Blocking (sync) requests return 504 past this; the job keeps running.",
   "settings.image.worker_python": "Worker python path",
@@ -826,7 +829,9 @@
   "modal.model_settings.image_section": "Image generation defaults",
   "modal.model_settings.image_hint": "Per-model defaults for /v1/images and in-chat generation. Empty fields fall back to the global image settings. Explicit request parameters always win.",
   "modal.model_settings.image_steps": "Default steps",
+  "modal.model_settings.image_steps_desc": "Overrides the global/auto step default for this model.",
   "modal.model_settings.image_size": "Default size (WxH)",
+  "modal.model_settings.image_size_desc": "Overrides the global default size for this model.",
   "modal.model_settings.image_pipeline": "Pipeline",
   "modal.model_settings.image_alias": "Alias",
   "modal.model_settings.image_pipeline_hint": "Detected from the model directory name: t2i = text-to-image, edit = image editing with input images.",
@@ -843,5 +848,7 @@
   "chat.image.need_image": "This model edits images: attach an image to use it.",
   "chat.image.no_edit_model": "No image editing model is installed; remove the attached image or install an edit-capable model.",
   "chat.image.expired": "Image expired on the server. Use the regenerate button to create a new one.",
-  "chat.image.bad_input_type": "Image models accept PNG, JPEG or WebP input images."
+  "chat.image.bad_input_type": "Image models accept PNG, JPEG or WebP input images.",
+  "chat.image.placeholder_t2i": "Describe the image to generate; try poster text in Chinese",
+  "chat.image.placeholder_edit": "Upload an image, then describe the edit in one sentence (e.g. change the title to...)"
 }

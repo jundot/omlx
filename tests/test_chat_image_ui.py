@@ -335,6 +335,8 @@ class TestImageI18nKeys:
         "no_edit_model",
         "expired",
         "bad_input_type",
+        "placeholder_t2i",
+        "placeholder_edit",
     ]
 
     @pytest.mark.parametrize("lang", LOCALES)
@@ -349,3 +351,27 @@ class TestImageI18nKeys:
         data = json.loads((I18N_DIR / "zh.json").read_text(encoding="utf-8"))
         assert data["chat.image.badge_t2i"] == "文生图"
         assert data["chat.image.badge_edit"] == "图生图"
+
+
+class TestImageInputPlaceholder:
+    """With an image model selected the message input placeholder must
+    explain usage per pipeline (t2i: describe the image; edit: attach an
+    image plus a one-line instruction) instead of the generic chat hint."""
+
+    def test_textarea_binds_input_placeholder_helper(self, chat_source):
+        assert ':placeholder="inputPlaceholder()"' in chat_source, (
+            "the message textarea must bind its placeholder through "
+            "inputPlaceholder() so image models can swap in usage hints"
+        )
+
+    def test_helper_branches_on_pipeline(self, chat_source):
+        body = _function_body(chat_source, "inputPlaceholder")
+        assert "isImageModel()" in body
+        assert "chat.image.placeholder_t2i" in body
+        assert "chat.image.placeholder_edit" in body
+        assert "'edit'" in body, (
+            "the edit-pipeline hint must key off imagePipelineMap"
+        )
+        # non-image models keep the generic (mobile-aware) placeholder
+        assert "chat.input_placeholder_mobile" in body
+        assert "chat.input_placeholder'" in body

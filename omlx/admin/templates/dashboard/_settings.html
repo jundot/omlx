@@ -663,11 +663,12 @@
 
                         <!-- Image Generation Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="image" class="w-4 h-4 text-neutral-500"></i>
                                     <h3 class="text-sm font-bold uppercase tracking-wider text-neutral-500">{{ t('settings.image.title') }}</h3>
                                 </div>
+                                <p class="text-xs text-neutral-400 mt-1">{{ t('settings.image.section_hint') }}</p>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -701,6 +702,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.image.default_size') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.image.default_size_desc') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.image.default_size"
                                            placeholder="1024x1024"
@@ -709,6 +711,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.image.max_n') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.image.max_n_desc') }}</p>
                                     </div>
                                     <input type="number" min="1" x-model.number="globalSettings.image.max_n"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">

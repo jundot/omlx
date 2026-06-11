@@ -183,6 +183,35 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX 채팅" width="720">
 </p>
 
+### 비디오 및 이미지 생성
+
+언어 모델 외에도 같은 server 에서 비디오 생성 (`/v1/videos`, Wan2.2) 과 이미지 생성 (`/v1/images`) 이 함께 돌아갑니다. 둘 다 독립 venv 의 서브프로세스 worker (mlx-gen 런타임) 에서 실행되고, 생성 작업은 메모리 리스를 보유하므로 서빙 중인 LLM 과 공존하면서 서로를 밀어내지 않습니다 -- 단일 머신 통합 메모리라서 가능한 구성입니다.
+
+이미지 쪽은 세 계열의 모델을 지원합니다. 모델 디렉터리 (`~/.fmlx/models/AbstractFramework/<repo>`) 에 넣고 재시작하면 자동 인식됩니다:
+
+| 모델 | 용도 | 실측 (M5 Max, 1024x1024) |
+|---|---|---|
+| z-image-turbo-4bit | 빠른 text-to-image, 9 스텝 | 22 초, 피크 8.6GB |
+| qwen-image-2512-4bit | CJK 타이포그래피/포스터 문구 최강, 40 스텝 | 5 분; Lightning LoRA + 8 스텝이면 73 초 |
+| qwen-image-edit-2511-4bit | 지시문 기반 편집/이미지 내 문자 교체 | 15 분 (40 스텝) |
+
+활성화는 두 단계입니다. 먼저 worker venv 를 준비합니다 (비디오 엔진과 공용):
+
+```bash
+uv venv -p 3.12 ~/.fmlx/venvs/video
+uv pip sync --python ~/.fmlx/venvs/video/bin/python omlx/video/requirements.lock
+```
+
+그다음 admin 설정 페이지에서 이미지 생성 스위치 (settings.image.enabled) 를 켭니다. 채팅 페이지에서는 이미지 모델을 고르기만 하면 됩니다: 텍스트만 입력하면 이미지를 생성하고, 이미지를 첨부하면 편집 모델로 자동 라우팅됩니다. API 는 OpenAI images 형식입니다:
+
+```bash
+curl http://localhost:8000/v1/images \
+  -H "X-API-Key: your-key" -H "Content-Type: application/json" \
+  -d '{"model": "z-image-turbo-4bit", "prompt": "카페 오픈 포스터",
+       "size": "1024x1024", "response_format": "url"}'
+```
+
+기본은 동기 응답 (`b64_json` 또는 `url`) 입니다. `"sync": false` 를 주면 job 객체가 반환되고 `GET /v1/images/{id}` 로 진행률을 폴링할 수 있습니다 (분 단위로 걸리는 qwen 작업에 적합). 확장 파라미터는 negative_prompt / steps / seed / guidance / n / image_strength / lora_paths 이며, 공식 openai SDK 의 `client.images.generate` 도 `POST /v1/images/generations` 를 통해 그대로 동작합니다. 스텝 수와 기본 크기는 전역으로도, 모델별 설정으로도 지정할 수 있습니다. 설계 세부는 [docs/image-generation-engine-spec.md](docs/image-generation-engine-spec.md) 와 [docs/video-generation-engine-spec.md](docs/video-generation-engine-spec.md) 를 참고하세요.
 
 ### 모델 다운로드
 

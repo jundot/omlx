@@ -369,11 +369,13 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.image_steps') }}</label>
                                             <input type="number" min="1" x-model.number="modelSettings.image_default_steps" placeholder="9"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.image_steps_desc') }}</p>
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.image_size') }}</label>
                                             <input type="text" x-model="modelSettings.image_default_size" placeholder="1024x1024"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.image_size_desc') }}</p>
                                         </div>
                                     </div>
                                     <!-- Pipeline / alias info: resolved by discovery from the dir name -->
