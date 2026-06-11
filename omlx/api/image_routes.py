@@ -596,12 +596,10 @@ async def get_image_content(job_id: str, index: int = 0):
             status_code=409,
             detail=f"Job is {job.status}; content is available once completed",
         )
-    if index < 0 or index >= len(job.artifact_files):
-        raise HTTPException(
-            status_code=404,
-            detail=f"index {index} out of range (job has "
-                   f"{len(job.artifact_files)} images)",
-        )
+    # Expiry check must run BEFORE the index range check: retention clears
+    # artifact_files to [] alongside artifact_path, so a purged job would
+    # otherwise always 404 as "index out of range" and clients would never
+    # see the artifact_expired code they key the expired-state UI on.
     if not job.artifact_path:
         raise HTTPException(
             status_code=404,
@@ -610,6 +608,12 @@ async def get_image_content(job_id: str, index: int = 0):
                 "message": "Artifact was purged by retention",
                 "expires_at": int(job.expires_at) if job.expires_at else None,
             },
+        )
+    if index < 0 or index >= len(job.artifact_files):
+        raise HTTPException(
+            status_code=404,
+            detail=f"index {index} out of range (job has "
+                   f"{len(job.artifact_files)} images)",
         )
     file_path = Path(job.artifact_path).parent / job.artifact_files[index]
     if not file_path.exists():
