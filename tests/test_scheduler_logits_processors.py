@@ -516,7 +516,7 @@ class TestRowRealignment:
         scheduler_src = (
             Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
         ).read_text()
-        assert scheduler_src.count("_register_uid_rows(uids") >= 2, (
+        assert scheduler_src.count("_register_uid_rows(self.model, uids") >= 2, (
             "every batch_generator.insert call site must register the "
             "per-uid sampler and logits processors; the step chokepoint "
             "realigns rows from that registry. See #1823."
