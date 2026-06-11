@@ -420,16 +420,32 @@ class _PrefillState:
 # uid is supposed to run; the step chokepoint realigns the positional lists
 # from it.  Bounded so a missing cleanup can never grow it unbounded.
 _UID_ROW_REGISTRY_MAX = 4096
-_uid_row_registry: "OrderedDict[int, tuple[Any, list]]" = OrderedDict()
+# Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
+# instance starting at 0, so two engines serving concurrently (or an engine
+# reload) produce colliding uid sequences. The model object is the one
+# identity both the insert sites and the step chokepoint can see.
+_uid_row_registry: "OrderedDict[tuple[int, int], tuple[Any, list]]" = OrderedDict()
+# Engines run on separate executor threads and share this module-level
+# registry; a plain OrderedDict is not safe under concurrent mutation.
+_uid_row_registry_lock = threading.Lock()
 
 
-def _register_uid_rows(uids, samplers, lps_rows) -> None:
+def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
     """Record the sampler and logits processors each freshly-inserted uid must run."""
-    for uid, sampler, lps in zip(uids, samplers, lps_rows):
-        _uid_row_registry[uid] = (sampler, list(lps) if lps else [])
-        _uid_row_registry.move_to_end(uid)
-    while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
-        _uid_row_registry.popitem(last=False)
+    with _uid_row_registry_lock:
+        for uid, sampler, lps in zip(uids, samplers, lps_rows):
+            key = (id(model), uid)
+            _uid_row_registry[key] = (sampler, list(lps) if lps else [])
+            _uid_row_registry.move_to_end(key)
+        while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
+            _uid_row_registry.popitem(last=False)
+
+
+def _unregister_uid_row(model, uid) -> None:
+    """Drop a finished request's row so heavy processors are not pinned
+    until LRU eviction; the bounded size stays as the backstop."""
+    with _uid_row_registry_lock:
+        _uid_row_registry.pop((id(model), uid), None)
 
 
 _original_generation_batch_step = GenerationBatch._step
@@ -480,8 +496,11 @@ def _patched_generation_batch_step(self):
     new_lps = []
     new_samplers = []
     drift = len(cur_lps) != len(self.uids)
+    model_id = id(getattr(self, "model", None))
+    with _uid_row_registry_lock:
+        registry_rows = [_uid_row_registry.get((model_id, uid)) for uid in self.uids]
     for i, uid in enumerate(self.uids):
-        entry = _uid_row_registry.get(uid)
+        entry = registry_rows[i]
         if entry is not None:
             sampler, lps = entry
             if not drift and i < len(cur_lps) and cur_lps[i] is not lps and (cur_lps[i] or lps):
@@ -1797,6 +1816,7 @@ class Scheduler:
                         e,
                     )
                 # Cleanup uid maps now that the slot is reclaimable.
+                _unregister_uid_row(self.model, uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 if request_id in self.request_id_to_uid:
@@ -3535,7 +3555,7 @@ class Scheduler:
             state_machines=[state.sm],
         )
         if uids:
-            _register_uid_rows(uids, [state.sampler], [per_row_lps])
+            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
 
         if uids:
             uid = uids[0]
@@ -7089,7 +7109,7 @@ class Scheduler:
                 state_machines=[sm],
             )
             if uids:
-                _register_uid_rows(uids, [sampler], [per_row_lps])
+                _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
 
             if uids:
                 uid = uids[0]

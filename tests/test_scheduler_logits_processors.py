@@ -456,13 +456,6 @@ class TestRowRealignment:
 
         sampler_uid2 = object()
 
-        # What the insert sites record: uid 1 is a plain request, uid 2 is
-        # the constrained one (grammar + thinking budget).
-        scheduler._register_uid_rows([1], [None], [[]])
-        scheduler._register_uid_rows(
-            [2], [sampler_uid2], [[budget_processor, grammar_processor]]
-        )
-
         class FakeModel:
             pass
 
@@ -473,6 +466,13 @@ class TestRowRealignment:
             logits_processors = [[], [], [budget_processor, grammar_processor]]
             samplers = [None, None, sampler_uid2]
             _next_tokens = None
+
+        # What the insert sites record: uid 1 is a plain request, uid 2 is
+        # the constrained one (grammar + thinking budget).
+        scheduler._register_uid_rows(FakeBatch.model, [1], [None], [[]])
+        scheduler._register_uid_rows(
+            FakeBatch.model, [2], [sampler_uid2], [[budget_processor, grammar_processor]]
+        )
 
         batch = FakeBatch()
         result = scheduler._patched_generation_batch_step(batch)
@@ -497,13 +497,14 @@ class TestRowRealignment:
         registry = OrderedDict()
         original = scheduler._uid_row_registry
         scheduler._uid_row_registry = registry
+        model = object()
         try:
             for uid in range(scheduler._UID_ROW_REGISTRY_MAX + 100):
-                scheduler._register_uid_rows([uid], [None], [[]])
+                scheduler._register_uid_rows(model, [uid], [None], [[]])
             assert len(registry) == scheduler._UID_ROW_REGISTRY_MAX
             # Oldest entries evicted first.
-            assert 0 not in registry
-            assert scheduler._UID_ROW_REGISTRY_MAX + 99 in registry
+            assert (id(model), 0) not in registry
+            assert (id(model), scheduler._UID_ROW_REGISTRY_MAX + 99) in registry
         finally:
             scheduler._uid_row_registry = original
 
@@ -564,3 +565,78 @@ class TestRowRealignment:
         assert captured["logits_processors"][0] == [legacy_processor]
         assert captured["logits_processors"][1] == []
         assert len(batch.samplers) == len(batch.uids)
+
+
+    def test_same_uid_on_two_models_does_not_cross_contaminate(self, monkeypatch):
+        """mlx-lm numbers uids per BatchGenerator instance, so two engines
+        serving concurrently produce colliding uid values. The registry must
+        key by model so engine A's realignment never installs engine B's
+        sampler and processors."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+
+        captured = {}
+
+        def fake_original_step(self):
+            captured[id(self.model)] = list(self.logits_processors)
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        def qwen_processor(token_context, logits):
+            return logits
+
+        def gemma_processor(token_context, logits):
+            return logits
+
+        class FakeModel:
+            pass
+
+        model_a, model_b = FakeModel(), FakeModel()
+        # SAME uid value on both engines, different processors.
+        scheduler._register_uid_rows(model_a, [7], [None], [[qwen_processor]])
+        scheduler._register_uid_rows(model_b, [7], [None], [[gemma_processor]])
+
+        def make_batch(model):
+            class FakeBatch:
+                pass
+
+            b = FakeBatch()
+            b.model = model
+            b.uids = [7]
+            b.logits_processors = [[]]
+            b.samplers = [None]
+            b._next_tokens = None
+            return b
+
+        scheduler._patched_generation_batch_step(make_batch(model_a))
+        scheduler._patched_generation_batch_step(make_batch(model_b))
+
+        assert captured[id(model_a)][0] == [qwen_processor]
+        assert captured[id(model_b)][0] == [gemma_processor]
+
+    def test_unregister_drops_the_row(self):
+        """Completion cleanup must release the row so heavy processors are
+        not pinned until LRU eviction."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        model = object()
+        try:
+            scheduler._register_uid_rows(model, [3], [None], [[object()]])
+            assert (id(model), 3) in registry
+            scheduler._unregister_uid_row(model, 3)
+            assert (id(model), 3) not in registry
+            # Unregistering twice (or an unknown uid) is a no-op.
+            scheduler._unregister_uid_row(model, 3)
+        finally:
+            scheduler._uid_row_registry = original
