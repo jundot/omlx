@@ -71,6 +71,82 @@ def _has_cli_overrides(args) -> bool:
     return False
 
 
+def _line_buffer_stdout_if_piped() -> None:
+    """Line-buffer stdout when it is not a tty (launchd / brew services).
+
+    Under launchd stdout is a pipe or file and therefore block-buffered:
+    startup prints (banner, bind address) only reach the service log when
+    the process exits, so a failed startup looks like a silent hang (#1814).
+    Line buffering makes them appear as they happen.
+    """
+    stdout = sys.stdout
+    if stdout is None or stdout.isatty():
+        return
+    try:
+        stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
+def _describe_port_listener(port: int) -> str:
+    """Best-effort "title (pid N)" for the process listening on `port`.
+
+    Uses lsof + ps so the title reflects the setproctitle rename
+    ("omlx-server"), which is what users see in ps output. Returns "" when
+    the owner cannot be identified.
+    """
+    import subprocess
+
+    try:
+        res = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pids = res.stdout.split()
+        if not pids:
+            return ""
+        pid = pids[0]
+        res = subprocess.run(
+            ["ps", "-p", pid, "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        title = res.stdout.strip() or "unknown process"
+        return f"{title} (pid {pid})"
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return ""
+
+
+def _bind_socket_or_explain(config, host: str, port: int):
+    """config.bind_socket() with a useful diagnosis when the bind fails.
+
+    uvicorn logs the bare OSError ("[Errno 48] Address already in use") and
+    raises SystemExit. Under launchd that single line is easy to miss, and
+    the common cause is a stale omlx-server still holding the port after an
+    unclean service stop (#1814). Name the owner and the fix before exiting.
+    """
+    import logging
+
+    try:
+        return config.bind_socket()
+    except SystemExit:
+        holder = _describe_port_listener(port)
+        msg = f"Could not bind http://{host}:{port}."
+        if holder:
+            msg += f" Port {port} is already in use by {holder}."
+            if "omlx-server" in holder:
+                pid = holder.rsplit("(pid ", 1)[-1].rstrip(")")
+                msg += (
+                    " A previous omlx-server is still running;"
+                    f" stop it with 'omlx stop' or 'kill {pid}' and retry."
+                )
+        logging.getLogger("omlx.cli").error(msg)
+        raise
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -83,6 +159,7 @@ def serve_command(args):
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     process_title.set_process_title()
+    _line_buffer_stdout_if_piped()
 
     try:
         from ._build_info import build_number
@@ -220,7 +297,9 @@ def serve_command(args):
     )
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
-    serve_sockets = [uvicorn_config.bind_socket()]
+    serve_sockets = [
+        _bind_socket_or_explain(uvicorn_config, bind_hosts[0], settings.server.port)
+    ]
     for h in bind_hosts[1:]:
         extra_cfg = uvicorn.Config(
             "omlx.server:app",
@@ -229,7 +308,9 @@ def serve_command(args):
             log_level=uvicorn_level,
             access_log=show_access_log,
         )
-        serve_sockets.append(extra_cfg.bind_socket())
+        serve_sockets.append(
+            _bind_socket_or_explain(extra_cfg, h, settings.server.port)
+        )
 
     try:
         # Import server and config after the port is known to be available.

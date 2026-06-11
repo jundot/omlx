@@ -1038,3 +1038,98 @@ class TestCLIDocstrings:
         assert (
             "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
         )
+
+
+class TestPortConflictVisibility:
+    """Tests for the #1814 launchd diagnosability helpers."""
+
+    # --- _line_buffer_stdout_if_piped ---
+
+    def test_line_buffers_piped_stdout(self, monkeypatch):
+        import io
+
+        from omlx.cli import _line_buffer_stdout_if_piped
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        assert stream.line_buffering is False
+        monkeypatch.setattr(sys, "stdout", stream)
+        _line_buffer_stdout_if_piped()
+        assert stream.line_buffering is True
+
+    def test_leaves_tty_stdout_alone(self, monkeypatch):
+        from omlx.cli import _line_buffer_stdout_if_piped
+
+        stream = MagicMock()
+        stream.isatty.return_value = True
+        monkeypatch.setattr(sys, "stdout", stream)
+        _line_buffer_stdout_if_piped()
+        stream.reconfigure.assert_not_called()
+
+    def test_tolerates_reconfigure_failure(self, monkeypatch):
+        from omlx.cli import _line_buffer_stdout_if_piped
+
+        stream = MagicMock()
+        stream.isatty.return_value = False
+        stream.reconfigure.side_effect = ValueError("cannot reconfigure")
+        monkeypatch.setattr(sys, "stdout", stream)
+        _line_buffer_stdout_if_piped()  # must not raise
+
+    # --- _describe_port_listener ---
+
+    def test_describes_own_listener(self):
+        import os
+        import shutil
+
+        from omlx.cli import _describe_port_listener
+
+        if not shutil.which("lsof"):
+            pytest.skip("lsof not available")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            desc = _describe_port_listener(port)
+        assert f"(pid {os.getpid()})" in desc
+
+    def test_returns_empty_for_free_port(self):
+        from omlx.cli import _describe_port_listener
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        # Socket is closed, so nothing is listening on the port now.
+        assert _describe_port_listener(port) == ""
+
+    # --- _bind_socket_or_explain ---
+
+    def test_explains_occupied_port(self, caplog):
+        import shutil
+
+        import uvicorn
+
+        from omlx.cli import _bind_socket_or_explain
+
+        with socket.socket() as blocker:
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            port = blocker.getsockname()[1]
+            cfg = uvicorn.Config("omlx.server:app", host="127.0.0.1", port=port)
+            with caplog.at_level("ERROR", logger="omlx.cli"):
+                with pytest.raises(SystemExit):
+                    _bind_socket_or_explain(cfg, "127.0.0.1", port)
+        assert f"Could not bind http://127.0.0.1:{port}" in caplog.text
+        if shutil.which("lsof"):
+            assert f"already in use by" in caplog.text
+
+    def test_passes_through_successful_bind(self):
+        import uvicorn
+
+        from omlx.cli import _bind_socket_or_explain
+
+        cfg = uvicorn.Config("omlx.server:app", host="127.0.0.1", port=0)
+        sock = _bind_socket_or_explain(cfg, "127.0.0.1", 0)
+        try:
+            assert sock is not None
+        finally:
+            sock.close()
