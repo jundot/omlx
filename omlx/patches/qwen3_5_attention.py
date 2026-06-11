@@ -21,7 +21,7 @@ This patch replaces ``Qwen3_5Attention.__call__`` with a body that
 - preserves the original mRoPE branch when position_ids carries
   genuinely multimodal positions (so vision input still works)
 
-The replacement body is built from the mlx-vlm 041f889
+The replacement body is built from the mlx-vlm v0.6.3 (5a4222a)
 ``Qwen3_5Attention.__call__`` *verbatim*, with only the RoPE block
 swapped for the plain-vs-mRoPE decision above. All of upstream's
 speculative-decode machinery -- the ``target_verify`` q/k/v projection,
@@ -30,11 +30,11 @@ per-token target-verify attention paths -- is preserved unchanged.
 flyto's spec-decode (DFlash / native MTP) depends on those paths, so
 they MUST survive the patch.
 
-Patch target (current upstream): mlx-vlm 041f889
+Patch target (current upstream): mlx-vlm v0.6.3 (5a4222a)
 - ``mlx_vlm.models.qwen3_5.language.Qwen3_5Attention``
 
 The companion file ``gated_delta_advance.py`` previously patched the
-GatedDeltaNet of the same module. As of mlx-vlm 041f889 that patch is
+GatedDeltaNet of the same module. As of mlx-vlm v0.6.3 (5a4222a) that patch is
 both redundant (the cache.advance + mx.contiguous fixes are upstream)
 and unsafe (it would clobber the new target_verify GatedDeltaNet path),
 so it is now a no-op -- see that file's docstring.
@@ -127,7 +127,7 @@ def _is_text_only_position_ids(position_ids: "mx.array") -> bool:
 def _build_replacement_call():
     """Construct the replacement Qwen3_5Attention.__call__.
 
-    Built by starting from the mlx-vlm 041f889 ``Qwen3_5Attention.__call__``
+    Built by starting from the mlx-vlm v0.6.3 (5a4222a) ``Qwen3_5Attention.__call__``
     *verbatim* and surgically replacing ONLY the RoPE block with flyto's
     plain-vs-mRoPE decision. Everything else upstream added -- the
     ``target_verify`` q/k/v projection (``_target_verify_linears``), the
@@ -148,7 +148,7 @@ def _build_replacement_call():
         position_embeddings: Optional[tuple] = None,
         target_verify: bool = False,
     ) -> "mx.array":
-        # 041f889 imports these module-level helpers from the language
+        # v0.6.3 (5a4222a) imports these module-level helpers from the language
         # module. Local import keeps the patch resilient if mlx-vlm renames
         # them across versions (apply_qwen3_5_attention_patch only patches
         # when the import in this body would succeed at call time).
@@ -180,10 +180,22 @@ def _build_replacement_call():
         kv_seq_len = keys.shape[-2]
 
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
-            position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
+            # Mirrors upstream v0.6.3: cache.offset may be a per-row array for
+            # batched caches; derive per-row positions instead of int math.
+            cache_offset = cache.offset
+            if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
+                offsets = mx.maximum(cache_offset[:B], 0)
+                kv_seq_len = kv_seq_len + offsets + 1
+                position_ids = offsets[:, None] + mx.arange(L)[None, :]
+                position_ids = mx.expand_dims(position_ids, axis=0)
+                position_ids = mx.tile(position_ids, (3, 1, 1))
+            else:
+                if isinstance(cache_offset, mx.array):
+                    cache_offset = int(cache_offset.item())
+                kv_seq_len += cache_offset + 1
+                position_ids = mx.arange(cache_offset, cache_offset + L)
+                position_ids = mx.expand_dims(position_ids, axis=0)
+                position_ids = mx.tile(position_ids, (3, 1, 1))
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
@@ -298,7 +310,7 @@ def _build_replacement_call():
                 keys = mx.concatenate([k_rot, k_pass], axis=-1)
 
         if not use_plain:
-            # multimodal mRoPE branch -- original mlx-vlm 041f889 flow,
+            # multimodal mRoPE branch -- original mlx-vlm v0.6.3 (5a4222a) flow,
             # honoring precomputed position_embeddings when provided.
             if position_embeddings is None:
                 queries, keys = self.rotary_emb.apply_rotary(
