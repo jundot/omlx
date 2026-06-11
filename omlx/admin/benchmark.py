@@ -43,6 +43,8 @@ class BenchmarkRequest(BaseModel):
     prompt_lengths: list[int]
     generation_length: int = 128
     batch_sizes: list[int] = []
+    force_lm_engine: bool = False
+
     @field_validator("prompt_lengths")
     @classmethod
     def validate_prompt_lengths(cls, v: list[int]) -> list[int]:
@@ -740,7 +742,9 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         if sm is not None:
             try:
                 model_settings = sm.get_settings(request.model_id)
-                run.experimental_features.extend(_detect_experimental_features(model_settings))
+                run.experimental_features.extend(
+                    _detect_experimental_features(model_settings)
+                )
             except Exception as e:
                 logger.warning(
                     f"Benchmark: failed to read experimental flags for "
@@ -779,8 +783,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             and getattr(model_settings, "vlm_mtp_enabled", False)
             and getattr(model_settings, "vlm_mtp_draft_model", None)
         )
+        force_lm = True if request.force_lm_engine else not vlm_mtp_active
         engine = await engine_pool.get_engine(
-            request.model_id, force_lm=not vlm_mtp_active
+            request.model_id,
+            force_lm=force_lm,
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
 

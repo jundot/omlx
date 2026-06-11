@@ -8268,6 +8268,81 @@ class Scheduler:
         except Exception as e:
             logger.debug(f"Failed to extract model info: {e}")
 
+    def _infer_live_layer_cache_types(self) -> list[str] | None:
+        """Infer the layer-cache signature that future SSD saves will use."""
+        if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
+            return None
+
+        make_cache = getattr(self.model, "make_cache", None)
+        if not callable(make_cache):
+            return None
+
+        try:
+            cache_list = make_cache()
+        except Exception as e:
+            logger.debug("Failed to build cache list for SSD signature: %s", e)
+            return None
+
+        if not isinstance(cache_list, (list, tuple)) or not cache_list:
+            return None
+
+        cache_list = list(cache_list)
+        try:
+            model_cache_config = ModelCacheConfig.from_cache_list(
+                cache_list,
+                model_name=self.config.model_name or "",
+            )
+            layer_cache_types = model_cache_config.get_type_names()
+        except Exception as e:
+            logger.debug("Failed to infer SSD layer cache signature: %s", e)
+            return None
+
+        if not layer_cache_types:
+            return None
+
+        if self._turboquant_kv_bits is None:
+            return layer_cache_types
+
+        try:
+            if not self._turboquant_eligible(cache_list):
+                return layer_cache_types
+            from mlx_lm.models.cache import KVCache
+        except Exception as e:
+            logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
+            return layer_cache_types
+
+        kv_indices = [i for i, c in enumerate(cache_list) if isinstance(c, KVCache)]
+        skip_last = self._turboquant_skip_last and len(kv_indices) > 1
+        last_kv_idx = kv_indices[-1] if skip_last else -1
+        for idx in kv_indices:
+            if idx != last_kv_idx and idx < len(layer_cache_types):
+                layer_cache_types[idx] = "TurboQuantKVCache"
+
+        return layer_cache_types
+
+    def refresh_ssd_layer_signature(self) -> list[str] | None:
+        """Set the SSD manager's live layer signature before prefix lookup."""
+        manager = self.paged_ssd_cache_manager
+        if manager is None:
+            return None
+
+        layer_cache_types = self._infer_live_layer_cache_types()
+        if not layer_cache_types:
+            return None
+
+        try:
+            set_signature = getattr(manager, "set_expected_layer_signature", None)
+            if callable(set_signature):
+                set_signature(layer_cache_types)
+            else:
+                manager.adopt_layer_signature_if_unset(layer_cache_types)
+            manager.invalidate_stale_layer_signature()
+        except Exception as e:
+            logger.warning("Failed to refresh SSD layer cache signature: %s", e)
+            return None
+
+        return layer_cache_types
+
     def _init_tiered_cache(self) -> bool:
         """Initialize paged SSD cache components if configured.
 

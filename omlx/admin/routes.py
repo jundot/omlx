@@ -5653,6 +5653,7 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
         "running": True,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
+        "force_lm_engine": run.request.force_lm_engine,
     }
 
 

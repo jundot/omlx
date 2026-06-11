@@ -2210,6 +2210,81 @@ class TestExtractCacheStatesRotatingNormalization:
         assert normalized_meta == ("0", "128", "1280", "128")
 
 
+class TestSchedulerSSDLayerSignature:
+    """Tests for pre-lookup SSD layer signature refresh."""
+
+    def test_refresh_uses_final_turboquant_layout_and_sweeps(
+        self, mock_tokenizer, tmp_path
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+
+        class TwoLayerModel:
+            config = SimpleNamespace(
+                num_hidden_layers=2,
+                num_key_value_heads=2,
+                num_attention_heads=2,
+                head_dim=32,
+            )
+
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        scheduler = Scheduler(
+            model=TwoLayerModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=4,
+                model_name="test-model",
+            ),
+        )
+        try:
+            manager = scheduler.paged_ssd_cache_manager
+            assert manager is not None
+            assert manager._expected_layer_cache_types is None
+
+            stale = PagedSSDBlockMetadata(
+                block_hash=b"stale".ljust(32, b"\0"),
+                file_path=tmp_path / "stale.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["KVCache", "KVCache"],
+            )
+            fresh = PagedSSDBlockMetadata(
+                block_hash=b"fresh".ljust(32, b"\0"),
+                file_path=tmp_path / "fresh.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["TurboQuantKVCache", "KVCache"],
+            )
+            manager._index.add(stale)
+            manager._index.add(fresh)
+
+            scheduler._turboquant_kv_bits = 4.0
+            scheduler._turboquant_skip_last = True
+
+            layer_cache_types = scheduler.refresh_ssd_layer_signature()
+
+            assert layer_cache_types == ["TurboQuantKVCache", "KVCache"]
+            assert manager._expected_layer_cache_types == layer_cache_types
+            assert manager._index.get(stale.block_hash) is None
+            assert manager._index.get(fresh.block_hash) is not None
+        finally:
+            scheduler.shutdown()
+
+
 class TestCacheCorruptionRecovery:
     """Tests for cache corruption detection and recovery."""
 

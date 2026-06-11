@@ -433,6 +433,8 @@
             benchModelId: '',
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
+            benchForceLmEngine: false,
+            benchAdvancedOptionsOpen: false,
             benchRunning: false,
             benchBenchId: null,
             benchProgress: null,
@@ -2752,6 +2754,7 @@
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            force_lm_engine: this.benchForceLmEngine,
                         }),
                     });
 
@@ -2906,6 +2909,7 @@
                 lines.push('oMLX - LLM inference, optimized for your Mac');
                 lines.push('https://github.com/jundot/omlx');
                 lines.push(`Benchmark Model: ${this.benchModelId}`);
+                lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
                 lines.push('='.repeat(80));
 
                 // Single Request Results
@@ -3043,6 +3047,7 @@
                         this.benchOtherActive = {
                             bench_id: data.bench_id,
                             model_id: data.model_id,
+                            force_lm_engine: !!data.force_lm_engine,
                         };
                         return;
                     }
@@ -3050,6 +3055,7 @@
                     // Fresh slate: attach.
                     this.benchBenchId = data.bench_id;
                     this.benchModelId = data.model_id;
+                    this.benchForceLmEngine = !!data.force_lm_engine;
                     this.benchRunning = true;
                     this.benchOtherActive = null;
                     this.connectBenchSSE(data.bench_id);
@@ -3068,6 +3074,7 @@
                 this.benchOtherActive = null;
                 this.benchBenchId = other.bench_id;
                 this.benchModelId = other.model_id;
+                this.benchForceLmEngine = !!other.force_lm_engine;
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];

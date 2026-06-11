@@ -136,6 +136,33 @@
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.batch_hint') }}</p>
                             </div>
 
+                            <!-- Advanced Options -->
+                            <div class="pt-2 border-t border-neutral-100">
+                                <button type="button"
+                                        @click="benchAdvancedOptionsOpen = !benchAdvancedOptionsOpen"
+                                        :disabled="benchRunning"
+                                        :aria-expanded="benchAdvancedOptionsOpen.toString()"
+                                        class="flex items-center gap-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 transition-colors disabled:opacity-50">
+                                    <i data-lucide="sliders-horizontal" class="w-4 h-4"></i>
+                                    <span>{{ t('bench.config.advanced_options') }}</span>
+                                    <i data-lucide="chevron-down"
+                                       class="w-4 h-4 text-neutral-400 transition-transform"
+                                       :class="benchAdvancedOptionsOpen && 'rotate-180'"></i>
+                                </button>
+                                <div x-show="benchAdvancedOptionsOpen" x-collapse x-cloak class="mt-3">
+                                    <label class="inline-flex items-start gap-2 cursor-pointer">
+                                        <input type="checkbox"
+                                               x-model="benchForceLmEngine"
+                                               :disabled="benchRunning"
+                                               class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                        <span>
+                                            <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.force_lm_engine') }}</span>
+                                            <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.force_lm_engine_hint') }}</span>
+                                        </span>
+                                    </label>
+                                </div>
+                            </div>
+
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"

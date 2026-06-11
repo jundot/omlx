@@ -1345,16 +1345,63 @@ class PagedSSDCacheManager(CacheManager):
             if metadata.block_size != self._expected_block_size:
                 return False
         if self._expected_layer_cache_types is not None:
-            if metadata.layer_cache_types != self._expected_layer_cache_types:
+            if _canonicalize_layer_cache_types(
+                metadata.layer_cache_types
+            ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
                 return False
-        expected_signature = (
-            self._expected_cache_signature()
-            if self._expected_layer_cache_types is not None
-            else ""
-        )
-        if expected_signature and metadata.cache_signature:
-            if metadata.cache_signature != expected_signature:
+        if (
+            self._expected_layer_cache_types is not None
+            and not self._is_compatible_cache_signature(metadata)
+        ):
+            return False
+        return True
+
+    def _is_compatible_cache_signature(self, metadata: PagedSSDBlockMetadata) -> bool:
+        """Return True when a saved cache_signature matches enabled checks."""
+        if not metadata.cache_signature:
+            return True
+
+        try:
+            payload = json.loads(metadata.cache_signature)
+        except (TypeError, ValueError):
+            expected_signature = (
+                self._expected_cache_signature()
+                if self._expected_layer_cache_types is not None
+                else ""
+            )
+            return (
+                not expected_signature or metadata.cache_signature == expected_signature
+            )
+
+        if self._expected_model_name:
+            if payload.get("model_name", "") != self._expected_model_name:
                 return False
+
+        if self._expected_num_layers > 0:
+            try:
+                num_layers = int(payload.get("num_layers", 0) or 0)
+            except (TypeError, ValueError):
+                num_layers = 0
+            if num_layers > 0 and num_layers != self._expected_num_layers:
+                return False
+
+        if self._expected_block_size > 0:
+            try:
+                block_size = int(payload.get("block_size", 0) or 0)
+            except (TypeError, ValueError):
+                block_size = 0
+            if block_size > 0 and block_size != self._expected_block_size:
+                return False
+
+        if self._expected_layer_cache_types is not None:
+            layer_cache_types = payload.get("layer_cache_types")
+            if not isinstance(layer_cache_types, (list, tuple)):
+                return False
+            if _canonicalize_layer_cache_types(
+                layer_cache_types
+            ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
+                return False
+
         return True
 
     def _expected_cache_signature(self) -> str:
@@ -2633,6 +2680,41 @@ class PagedSSDCacheManager(CacheManager):
             "(%d layers, %d unique types)",
             len(layer_cache_types),
             len(set(canonical or ())),
+        )
+        return True
+
+    def set_expected_layer_signature(self, layer_cache_types: list[str] | None) -> bool:
+        """Set the live layer-cache signature, replacing stale expectations.
+
+        Unlike ``adopt_layer_signature_if_unset``, this is used by callers that
+        learn the final cache layout after manager construction (for example
+        TurboQuant settings applied by the engine after the scheduler starts).
+
+        Returns True when the canonical signature changed and a stale-signature
+        sweep should run. Returns False for empty input or a canonical no-op.
+        """
+        if not layer_cache_types:
+            return False
+
+        new_signature = list(layer_cache_types)
+        new_canonical = _canonicalize_layer_cache_types(new_signature)
+
+        with self._lock:
+            old_signature = self._expected_layer_cache_types
+            old_canonical = _canonicalize_layer_cache_types(old_signature)
+            if old_canonical == new_canonical:
+                if old_signature != new_signature:
+                    self._expected_layer_cache_types = new_signature
+                return False
+
+            self._expected_layer_cache_types = new_signature
+            self._signature_sweep_completed = False
+
+        logger.info(
+            "PagedSSDCacheManager updated layer cache signature "
+            "(%d layers, %d unique types)",
+            len(new_signature),
+            len(set(new_canonical or ())),
         )
         return True
 

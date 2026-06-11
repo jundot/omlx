@@ -20,6 +20,7 @@ from omlx.admin.benchmark import (
     cleanup_old_runs,
     create_run,
     get_run,
+    run_benchmark,
 )
 
 
@@ -85,6 +86,21 @@ class TestBenchmarkRequest:
             prompt_lengths=[1024],
         )
         assert req.generation_length == 128
+
+    def test_force_lm_engine_defaults_to_false(self):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+        )
+        assert req.force_lm_engine is False
+
+    def test_force_lm_engine_can_be_enabled(self):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+            force_lm_engine=True,
+        )
+        assert req.force_lm_engine is True
 
 
 # =============================================================================
@@ -231,6 +247,110 @@ class TestBenchmarkRunLifecycle:
 
         completed = [r for r in _benchmark_runs.values() if r.status == "completed"]
         assert len(completed) <= 5
+
+
+class _FakeBenchTokenizer:
+    def encode(self, text):
+        return list(range(2048))
+
+    def decode(self, tokens):
+        return "prompt"
+
+
+class _FakeBenchEngine:
+    tokenizer = _FakeBenchTokenizer()
+
+    async def stream_generate(self, **kwargs):
+        yield SimpleNamespace(
+            completion_tokens=1,
+            prompt_tokens=1024,
+            cached_tokens=0,
+            new_text="x",
+            finished=True,
+            finish_reason="length",
+        )
+
+
+class _FakeSettingsManager:
+    def __init__(self, settings):
+        self.settings = settings
+
+    def get_settings(self, model_id):
+        return self.settings
+
+
+class _FakeBenchEnginePool:
+    def __init__(self, settings=None):
+        self._settings_manager = (
+            _FakeSettingsManager(settings) if settings is not None else None
+        )
+        self.force_lm_values = []
+
+    def get_loaded_model_ids(self):
+        return []
+
+    async def get_engine(self, model_id, force_lm=False):
+        self.force_lm_values.append(force_lm)
+        return _FakeBenchEngine()
+
+    async def _unload_engine(self, model_id):
+        pass
+
+
+class TestBenchmarkEngineSelection:
+    async def _run(self, *, settings=None, force_lm_engine=False):
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                force_lm_engine=force_lm_engine,
+            ),
+        )
+        pool = _FakeBenchEnginePool(settings)
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+        return run, pool
+
+    @pytest.mark.asyncio
+    async def test_auto_uses_vlm_engine_for_vlm_mtp_with_drafter(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="draft-model",
+        )
+
+        run, pool = await self._run(settings=settings)
+
+        assert pool.force_lm_values == [False]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_force_lm_engine_overrides_vlm_mtp_auto(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="draft-model",
+        )
+
+        run, pool = await self._run(settings=settings, force_lm_engine=True)
+
+        assert pool.force_lm_values == [True]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_auto_keeps_lm_engine_without_vlm_mtp_drafter(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model=None,
+        )
+
+        run, pool = await self._run(settings=settings)
+
+        assert pool.force_lm_values == [True]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
 
 
 # =============================================================================
