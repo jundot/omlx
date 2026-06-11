@@ -77,11 +77,12 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # PyPI spec for publish; dev pinned to commit 041f889 (adds gemma4_unified
-    # model support; Gemma4 MTP server batching #1166, speculative utils refactor
-    # #1169, Qwen native MTP drafter incl. batched target-verify, MiniCPM-V 4.6)
-    # via override below.
-    "mlx-vlm>=0.5.0",
+    # PyPI spec for publish; dev pinned to v0.6.3 tag commit 5a4222a (gemma4
+    # quantization predicate #1288, gemma4_unified image/video drop fix, Qwen3-VL
+    # chunked-prefill mask fixes, speculative chunked prefill #1334) via
+    # override below. 0.6.2 is the minimum carrying gemma4_unified + MTP drafter
+    # (#1267) and the long-text chunked prefill fix (#1280) we rely on.
+    "mlx-vlm>=0.6.2",
     "Pillow>=9.0.0",
     # PyPI spec for publish; dev pinned to commit 20d68db (bstnxbt repo: Gemma4
     # support, runtime package refactor, stable prefix snapshot reuse) via
@@ -208,7 +209,7 @@ include = ["omlx*"]
 override-dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@041f8891176996c916f347e542b3aae179300546",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@5a4222a15c70cb3725179d591442b1fbe1044b60",
     "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@20d68db3b3c0ae3dd6d3a2f0d3c10b2344ee514e",
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
 ]
