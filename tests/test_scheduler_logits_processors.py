@@ -622,7 +622,7 @@ class TestRowRealignment:
 
     def test_unregister_drops_the_row(self):
         """Completion cleanup must release the row so heavy processors are
-        not pinned until LRU eviction."""
+        not pinned until FIFO eviction."""
         from collections import OrderedDict
 
         import omlx.scheduler as scheduler
@@ -640,3 +640,175 @@ class TestRowRealignment:
             scheduler._unregister_uid_row(model, 3)
         finally:
             scheduler._uid_row_registry = original
+
+    def test_model_scoped_clear_drops_only_that_model(self):
+        """Reset/recovery/shutdown release by model: every row of the reset
+        engine goes, every row of the other engine stays."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        model_a, model_b = object(), object()
+        try:
+            scheduler._register_uid_rows(model_a, [0, 1], [None, None], [[], []])
+            scheduler._register_uid_rows(model_b, [0], [None], [[]])
+            scheduler._unregister_uid_rows_for_model(model_a)
+            assert (id(model_a), 0) not in registry
+            assert (id(model_a), 1) not in registry
+            assert (id(model_b), 0) in registry
+            # Clearing an unknown model is a no-op.
+            scheduler._unregister_uid_rows_for_model(object())
+            assert (id(model_b), 0) in registry
+        finally:
+            scheduler._uid_row_registry = original
+
+    def test_offset_rows_pass_through_without_registry(self, monkeypatch):
+        """The pre-fix behavior, pinned through the fallback path: with
+        nothing registered, the chokepoint cannot restore alignment, so the
+        #1823 probe shape (three slots for two uids) reaches the step with
+        uid 2 running no processors. This is the exact silent failure the
+        registry realignment corrects in
+        ``test_patched_step_realigns_offset_rows_from_registry``."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+
+        captured = {}
+
+        def fake_original_step(self):
+            captured["logits_processors"] = list(self.logits_processors)
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        def grammar_processor(token_context, logits):
+            return logits
+
+        class FakeModel:
+            pass
+
+        class FakeBatch:
+            model = FakeModel()
+            uids = [1, 2]
+            # Stale leading slot: uid 2's processors sit in slot 2, which the
+            # two-uid loop never reads.
+            logits_processors = [[], [], [grammar_processor]]
+            samplers = [None, None, object()]
+            _next_tokens = None
+
+        scheduler._patched_generation_batch_step(FakeBatch())
+
+        # Without registry rows the constrained request silently decodes
+        # unconstrained — the pre-#1824 behavior.
+        assert captured["logits_processors"][1] == []
+
+    def test_drift_warning_is_rate_limited(self, monkeypatch, caplog):
+        """One drift correction per window logs at WARNING; the rest go to
+        DEBUG so a pathological merge pattern cannot flood the logs."""
+        import logging
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+        monkeypatch.setattr(scheduler, "_uid_row_drift_last_warning", float("-inf"))
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", lambda self: "stepped"
+        )
+
+        def make_misaligned_batch():
+            class FakeModel:
+                pass
+
+            class FakeBatch:
+                pass
+
+            batch = FakeBatch()
+            batch.model = FakeModel()
+            batch.uids = [1]
+            # One stale slot too many: drift on every call.
+            batch.logits_processors = [[], []]
+            batch.samplers = [None, None]
+            batch._next_tokens = None
+            return batch
+
+        with caplog.at_level(logging.DEBUG, logger=scheduler.logger.name):
+            scheduler._patched_generation_batch_step(make_misaligned_batch())
+            scheduler._patched_generation_batch_step(make_misaligned_batch())
+
+        realign_levels = [
+            record.levelno
+            for record in caplog.records
+            if "Realigned generation-batch row state" in record.getMessage()
+        ]
+        assert realign_levels == [logging.WARNING, logging.DEBUG]
+
+
+class TestRegistryCleanupPaths:
+    """Every path that retires a uid — or the whole generator — must release
+    its registry rows. A finished, aborted, or failed request that stays
+    registered pins its (possibly heavy, stateful) processors until the FIFO
+    backstop, and entries surviving a generator reset or engine unload are
+    exactly the residue an ``id(model)`` recycle could later match.
+
+    Structural AST checks: cheaper than spinning up a Scheduler per path,
+    and immune to formatting churn (unlike substring counting)."""
+
+    PER_UID_RELEASE_PATHS = [
+        "_drain_pending_async_removes",
+        "_do_abort_request",
+        "_cleanup_finished",
+    ]
+    MODEL_WIDE_RELEASE_PATHS = [
+        "fail_all_requests",
+        "_recover_from_cache_error",
+        "_recover_from_generation_overflow_error",
+        "reset",
+        "shutdown",
+    ]
+
+    @staticmethod
+    def _called_names(func_name: str) -> set:
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
+        ).read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == func_name
+            ):
+                return {
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else getattr(call.func, "attr", None)
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call)
+                }
+        raise AssertionError(f"{func_name} not found in scheduler.py")
+
+    @pytest.mark.parametrize("func_name", PER_UID_RELEASE_PATHS)
+    def test_per_uid_paths_release_the_row(self, func_name):
+        assert "_unregister_uid_row" in self._called_names(func_name), (
+            f"{func_name} retires a uid from the batch but does not release "
+            "its registry row; the processors stay pinned until the FIFO "
+            "backstop. See #1823."
+        )
+
+    @pytest.mark.parametrize("func_name", MODEL_WIDE_RELEASE_PATHS)
+    def test_model_wide_paths_release_every_row(self, func_name):
+        assert "_unregister_uid_rows_for_model" in self._called_names(func_name), (
+            f"{func_name} clears the uid maps (or retires the generator) "
+            "wholesale but leaves the registry rows behind; release by model "
+            "so nothing survives a reset, recovery, or shutdown. See #1823."
+        )

@@ -428,6 +428,11 @@ _uid_row_registry: "OrderedDict[tuple[int, int], tuple[Any, list]]" = OrderedDic
 # Engines run on separate executor threads and share this module-level
 # registry; a plain OrderedDict is not safe under concurrent mutation.
 _uid_row_registry_lock = threading.Lock()
+# Drift corrections are worth one log line each, but a pathological batching
+# pattern could correct on every merge; cap the WARNING rate and route the
+# rest to DEBUG so the signal survives without flooding the logs.
+_UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
+_uid_row_drift_last_warning = float("-inf")
 
 
 def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
@@ -445,9 +450,23 @@ def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
 
 def _unregister_uid_row(model, uid) -> None:
     """Drop a finished request's row so heavy processors are not pinned
-    until LRU eviction; the bounded size stays as the backstop."""
+    until FIFO eviction; the bounded size stays as the backstop."""
     with _uid_row_registry_lock:
         _uid_row_registry.pop((id(model), uid), None)
+
+
+def _unregister_uid_rows_for_model(model) -> None:
+    """Drop every registry row for a model (generator reset, recovery, shutdown).
+
+    The recovery and reset paths clear the uid maps wholesale instead of
+    finishing requests one by one; releasing by model covers them, and leaves
+    nothing behind that a later engine load could match if ``id(model)`` were
+    recycled.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        for key in [key for key in _uid_row_registry if key[0] == model_id]:
+            del _uid_row_registry[key]
 
 
 _original_generation_batch_step = GenerationBatch._step
@@ -513,7 +532,12 @@ def _patched_generation_batch_step(self):
             new_samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
             new_lps.append(cur_lps[i] if i < len(cur_lps) else [])
     if drift:
-        logger.warning(
+        global _uid_row_drift_last_warning
+        now = time.monotonic()
+        rate_limited = now - _uid_row_drift_last_warning < _UID_ROW_DRIFT_WARNING_INTERVAL_S
+        if not rate_limited:
+            _uid_row_drift_last_warning = now
+        (logger.debug if rate_limited else logger.warning)(
             "Realigned generation-batch row state from the uid registry "
             f"(uids={list(self.uids)}, had {len(cur_lps)} processor slots); "
             "stale or offset slots would have run the wrong sampler/processors."
@@ -5912,6 +5936,7 @@ class Scheduler:
                     close = getattr(mtp_state.generator, "close", None)
                     if callable(close):
                         close()
+            _unregister_uid_row(self.model, uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -6077,7 +6102,9 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
-        # Reset batch generator only (cache is not corrupted)
+        # Reset batch generator only (cache is not corrupted). Every row dies
+        # with it; survivors re-register at re-insert.
+        _unregister_uid_rows_for_model(self.model)
         self.batch_generator = None
         self._current_sampler_params = None
         # Reclaim fragmented Metal buffers after generation failure.
@@ -7649,6 +7676,7 @@ class Scheduler:
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
+                    _unregister_uid_row(self.model, uid)
                     if uid in self.uid_to_request_id:
                         del self.uid_to_request_id[uid]
                     del self.request_id_to_uid[request_id]
@@ -7766,6 +7794,7 @@ class Scheduler:
         self._cache_rate_tracker.clear()
 
         # Clear UID mappings
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
 
@@ -7795,6 +7824,7 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._deferred_clear_at = None
@@ -8336,6 +8366,7 @@ class Scheduler:
         self.running.clear()
         self.requests.clear()
         self.finished_req_ids.clear()
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._generation_overflow_recovery_ids.clear()
@@ -8450,6 +8481,9 @@ class Scheduler:
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+        # Release whatever the per-path unregisters did not reach, so nothing
+        # survives this engine in the module-level row registry.
+        _unregister_uid_rows_for_model(self.model)
         logger.info("Scheduler shutdown completed")
 
     def adjust_store_cache_cap(self, pressure_level: str) -> None:
