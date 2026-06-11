@@ -153,7 +153,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking
+from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -3749,8 +3749,9 @@ async def stream_completion(
     # Parity with the non-streaming path: when the prompt opens a thinking
     # block, the first chunk carries the scheduler's synthetic think opener;
     # strip it once so the stream is a pure continuation of the prompt.
-    think_tag = getattr(getattr(engine, "tokenizer", None), "think_start", "<think>") or "<think>"
-    pending_think_prefix_strip = prompt.rstrip().endswith(think_tag)
+    pending_think_prefix_strip, think_tag = prompt_opens_thinking(
+        getattr(engine, "tokenizer", None), prompt
+    )
 
     (
         temperature,

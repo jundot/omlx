@@ -27,6 +27,97 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
 
 
+def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
+    if tokenizer is None:
+        return default
+    try:
+        return getattr(tokenizer, attr, default)
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
+def _single_token_id(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _convert_token_to_id(tokenizer, token: str) -> int | None:
+    convert = _safe_tokenizer_attr(tokenizer, "convert_tokens_to_ids")
+    if not callable(convert):
+        return None
+    try:
+        token_id = convert(token)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if token_id == _safe_tokenizer_attr(tokenizer, "unk_token_id"):
+        return None
+    return _single_token_id(token_id)
+
+
+def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
+    encode = _safe_tokenizer_attr(tokenizer, "encode")
+    if not callable(encode):
+        return None
+    try:
+        return list(encode(prompt, add_special_tokens=False))
+    except TypeError:
+        try:
+            return list(encode(prompt))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def prompt_opens_thinking(tokenizer, prompt: str) -> tuple[bool, str]:
+    """Return whether a raw prompt would make the engine prepend ``<think>``.
+
+    Presentation-layer stripping must mirror the engine/scheduler decision, not
+    just the raw text suffix. Some prompts can contain a literal ``<think>``
+    without tokenizing to the model's think-start id, and templates can leave
+    the think-start token in the final token tail without the raw string ending
+    in the visible tag.
+    """
+    think_tag = (
+        _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
+    )
+    if tokenizer is None:
+        return prompt.rstrip().endswith(think_tag), think_tag
+
+    think_start_id = _single_token_id(
+        _safe_tokenizer_attr(tokenizer, "think_start_id")
+    )
+    if think_start_id is None:
+        think_start_id = _convert_token_to_id(tokenizer, think_tag)
+    if think_start_id is None:
+        return False, think_tag
+
+    prompt_ids = _encode_prompt_ids(tokenizer, prompt)
+    if not prompt_ids or not think_start_id:
+        return False, think_tag
+
+    last_tokens = list(prompt_ids[-3:])
+    if think_start_id not in last_tokens:
+        return False, think_tag
+
+    last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+    after_start = last_tokens[last_idx + 1 :]
+
+    if after_start:
+        think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
+        if think_end_id is None:
+            think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
+            think_end_id = _convert_token_to_id(tokenizer, think_end_tag or _CLOSE_TAG)
+        if think_end_id is not None and think_end_id in after_start:
+            return False, think_tag
+
+    return True, think_tag
+
+
 def extract_thinking(text: str) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 

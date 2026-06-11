@@ -567,6 +567,80 @@ class TestCompletionsStreamThinkPrefixParity:
 
         assert _strip_synthetic_think_prefix("<think>data", "<think>") == "<think>data"
 
+    def test_prompt_detection_uses_tokenizer_over_text_suffix(self):
+        """A textual ``<think>`` suffix is not enough: completions should only
+        strip when the engine would actually add the synthetic opener."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [10, 11, 12]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "literal <think>\n")
+
+        assert (opens, tag) == (False, "<think>")
+
+    def test_prompt_detection_handles_tokenized_template_suffix(self):
+        """Mirror Scheduler._detect_needs_think_prefix: a prompt can need the
+        synthetic opener when the think-start token is in the final token tail,
+        even if the raw text does not literally end with the tag string."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [100, 41, 99]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "templated suffix")
+
+        assert (opens, tag) == (True, "<think>")
+
+    def test_prompt_detection_rejects_disabled_thinking_pattern(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [41, 42]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "<think></think>")
+
+        assert (opens, tag) == (False, "<think>")
+
+    def test_prompt_detection_rejects_text_suffix_when_think_id_is_unavailable(self):
+        """If a tokenizer is present but cannot resolve the think-start id,
+        mirror the scheduler and do not assume a synthetic opener exists."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                return self.unk_token_id
+
+            def encode(self, prompt, add_special_tokens=False):
+                return [10, 11, 12]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "literal <think>\n")
+
+        assert (opens, tag) == (False, "<think>")
+
+    def test_prompt_detection_keeps_text_fallback_without_tokenizer(self):
+        from omlx.api.thinking import prompt_opens_thinking
+
+        assert prompt_opens_thinking(None, "literal <think>\n") == (True, "<think>")
+
     def test_stream_completion_wires_the_strip(self):
         """Structural guard: the streaming handler must call the strip
         helper, or the prefix leaks back on the first chunk."""
@@ -586,6 +660,11 @@ class TestCompletionsStreamThinkPrefixParity:
                     for call in ast.walk(node)
                     if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                 }
+                assert "prompt_opens_thinking" in called, (
+                    "stream_completion must use the tokenizer-backed prompt "
+                    "detector so it only strips when the engine would add the "
+                    "synthetic opener."
+                )
                 assert "_strip_synthetic_think_prefix" in called, (
                     "stream_completion must strip the synthetic think opener "
                     "from the first chunk when the prompt opens the thinking "
