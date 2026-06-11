@@ -824,11 +824,16 @@ class TestSoftThinkingBudget:
 
     THINK_END_ID = 42
     THINK_START_ID = 41
+    BUDGET = 10
+    FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
+    FACTOR = ThinkingBudgetProcessor._SOFT_BIAS_FACTOR
+    SOFT_START = int(BUDGET * FRAC)
+    SPAN = BUDGET - SOFT_START
 
-    def _make_processor(self, budget: int = 10, soft_budget: bool = True, end_ids=None):
+    def _make_processor(self, budget: int = None, soft_budget: bool = True, end_ids=None):
         return ThinkingBudgetProcessor(
             think_end_token_ids=end_ids or [self.THINK_END_ID],
-            budget=budget,
+            budget=self.BUDGET if budget is None else budget,
             think_start_token_id=self.THINK_START_ID,
             soft_budget=soft_budget,
         )
@@ -844,44 +849,46 @@ class TestSoftThinkingBudget:
         tokens = _make_tokens(*range(10, 10 + n_tokens))
         return proc(tokens, logits if logits is not None else _make_logits())
 
+    def _expected_boost(self, step: int, top: float = 5.0) -> float:
+        """target - end_logit for a zeroed end logit at a given think step."""
+        if step <= self.SOFT_START:
+            return 0.0
+        progress = (step - self.SOFT_START) / max(1, self.SPAN)
+        return self.FACTOR * max(top, 1.0) * progress
+
     def test_no_bias_before_soft_zone(self):
-        """Below 70% of the budget, logits pass through unchanged."""
-        proc = self._make_processor(budget=10)
-        # budget=10 -> soft_start=7; steps 1..7 stay free.
-        for step in range(1, 8):
+        """Up to the zone boundary, logits pass through unchanged."""
+        proc = self._make_processor()
+        for step in range(1, self.SOFT_START + 1):
             logits = self._step(proc, step, self._ramp_logits())
             assert logits[0, self.THINK_END_ID].item() == 0.0
         assert not proc._forcing
 
     def test_soft_zone_boosts_end_logit_progressively(self):
         """Inside the soft zone the close-think logit ramps toward the top."""
-        proc = self._make_processor(budget=10)
+        proc = self._make_processor()
         boosts = []
-        for step in range(1, 10):
+        for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits(top=5.0))
             boosts.append(logits[0, self.THINK_END_ID].item())
-        # Steps 8 and 9 are in the soft zone (soft_start=7, budget=10).
-        assert boosts[6] == 0.0  # step 7: boundary, progress=0 -> unchanged
-        assert boosts[7] > 0.0  # step 8: progress=1/3
-        assert boosts[8] > boosts[7]  # step 9: progress=2/3, ramps up
-        # Adaptive formula: target = end + 2*gap*progress with gap=5.0.
-        assert boosts[7] == pytest.approx(2.0 * 5.0 * (1.0 / 3.0))
-        assert boosts[8] == pytest.approx(2.0 * 5.0 * (2.0 / 3.0))
+        assert boosts[self.SOFT_START - 1] == 0.0  # boundary step: progress=0
+        for step in range(self.SOFT_START + 1, self.BUDGET):
+            assert boosts[step - 1] == pytest.approx(self._expected_boost(step))
+        assert boosts[self.BUDGET - 2] > boosts[self.SOFT_START]
 
     def test_soft_zone_end_dominates_at_high_progress(self):
-        """Past 50% of the soft zone the close-think logit exceeds the top."""
-        proc = self._make_processor(budget=10)
+        """Past 1/FACTOR of the soft zone the close-think logit exceeds the top."""
+        proc = self._make_processor()
         logits = None
-        for step in range(1, 10):
+        for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits(top=5.0))
-        # progress=2/3 -> target = 2*5*(2/3) = 6.67 > top (5.0)
         assert logits[0, self.THINK_END_ID].item() > 5.0
 
     def test_hard_force_still_applies_at_budget(self):
         """The 100% hard force stays as the safety net."""
-        proc = self._make_processor(budget=10)
+        proc = self._make_processor()
         logits = None
-        for step in range(1, 11):
+        for step in range(1, self.BUDGET + 1):
             logits = self._step(proc, step, self._ramp_logits())
         assert proc._forcing
         assert logits[0, self.THINK_END_ID].item() == 0.0
@@ -889,42 +896,41 @@ class TestSoftThinkingBudget:
 
     def test_natural_close_in_soft_zone_stops_biasing(self):
         """Sampling </think> naturally inside the soft zone ends the ramp."""
-        proc = self._make_processor(budget=10)
-        for step in range(1, 9):
+        proc = self._make_processor()
+        in_zone = self.SOFT_START + 1
+        for step in range(1, in_zone):
             self._step(proc, step, self._ramp_logits())
-        # Model emits </think> as token 9 (inside the soft zone).
-        tokens = _make_tokens(*range(10, 18), self.THINK_END_ID)
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), self.THINK_END_ID)
         logits = proc(tokens, self._ramp_logits())
         assert proc._done
         assert logits[0, self.THINK_END_ID].item() == 0.0  # no further bias
 
     def test_soft_budget_disabled_keeps_hard_only(self):
         """soft_budget=False restores the previous hard-cut-only behavior."""
-        proc = self._make_processor(budget=10, soft_budget=False)
-        logits = None
-        for step in range(1, 10):
+        proc = self._make_processor(soft_budget=False)
+        for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits())
             assert logits[0, self.THINK_END_ID].item() == 0.0
         assert not proc._forcing
-        logits = self._step(proc, 10, self._ramp_logits())
+        self._step(proc, self.BUDGET, self._ramp_logits())
         assert proc._forcing
 
     def test_multi_token_end_boosts_all_ids_with_first_gap(self):
         """Multi-token close sequences clamp every end id to the target."""
         end_ids = [42, 43]
-        proc = self._make_processor(budget=10, end_ids=end_ids)
+        proc = self._make_processor(end_ids=end_ids)
         logits = None
-        for step in range(1, 10):
+        for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits(top=5.0))
-        target = 2.0 * 5.0 * (2.0 / 3.0)
+        target = self._expected_boost(self.BUDGET - 1)
         assert logits[0, 42].item() == pytest.approx(target)
         assert logits[0, 43].item() == pytest.approx(target)
 
     def test_min_gap_floor_when_end_already_near_top(self):
         """gap is floored at 1.0 so the ramp still progresses on flat logits."""
-        proc = self._make_processor(budget=10)
+        proc = self._make_processor()
         logits = None
-        for step in range(1, 10):
+        for step in range(1, self.BUDGET):
             logits = self._step(proc, step, _make_logits())  # all zeros, gap->1.0
-        # progress=2/3, gap floor 1.0 -> target = 2*1*(2/3)
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(4.0 / 3.0)
+        progress = (self.BUDGET - 1 - self.SOFT_START) / max(1, self.SPAN)
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * progress)
