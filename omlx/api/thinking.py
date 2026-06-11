@@ -10,7 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
 
 
@@ -73,14 +73,19 @@ def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
         return None
 
 
-def prompt_opens_thinking(tokenizer, prompt: str) -> tuple[bool, str]:
+def prompt_opens_thinking(
+    tokenizer,
+    prompt: str,
+    prompt_token_ids: Sequence[int] | None = None,
+) -> tuple[bool, str]:
     """Return whether a raw prompt would make the engine prepend ``<think>``.
 
     Presentation-layer stripping must mirror the engine/scheduler decision, not
     just the raw text suffix. Some prompts can contain a literal ``<think>``
     without tokenizing to the model's think-start id, and templates can leave
     the think-start token in the final token tail without the raw string ending
-    in the visible tag.
+    in the visible tag. When the caller already has prompt ids from the same
+    tokenizer path as the scheduler, those ids are authoritative.
     """
     think_tag = (
         _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
@@ -96,7 +101,10 @@ def prompt_opens_thinking(tokenizer, prompt: str) -> tuple[bool, str]:
     if think_start_id is None:
         return False, think_tag
 
-    prompt_ids = _encode_prompt_ids(tokenizer, prompt)
+    if prompt_token_ids is None:
+        prompt_ids = _encode_prompt_ids(tokenizer, prompt)
+    else:
+        prompt_ids = list(prompt_token_ids)
     if not prompt_ids or not think_start_id:
         return False, think_tag
 

@@ -2705,9 +2705,11 @@ async def create_completion(
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
     # Validate context window for each prompt
+    prompt_token_ids_by_prompt = []
     for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        prompt_token_ids = list(engine.tokenizer.encode(prompt))
+        prompt_token_ids_by_prompt.append(prompt_token_ids)
+        validate_context_window(len(prompt_token_ids), request.model)
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
@@ -2722,7 +2724,11 @@ async def create_completion(
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_completion(
-                    engine, prompts[0], request, model_load_duration=model_load_duration
+                    engine,
+                    prompts[0],
+                    request,
+                    model_load_duration=model_load_duration,
+                    prompt_token_ids=prompt_token_ids_by_prompt[0],
                 ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("openai_completion"),
@@ -3741,6 +3747,7 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     model_load_duration: float = 0.0,
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
@@ -3750,7 +3757,7 @@ async def stream_completion(
     # block, the first chunk carries the scheduler's synthetic think opener;
     # strip it once so the stream is a pure continuation of the prompt.
     pending_think_prefix_strip, think_tag = prompt_opens_thinking(
-        getattr(engine, "tokenizer", None), prompt
+        getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
     )
 
     (

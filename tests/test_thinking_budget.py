@@ -602,6 +602,26 @@ class TestCompletionsStreamThinkPrefixParity:
 
         assert (opens, tag) == (True, "<think>")
 
+    def test_prompt_detection_reuses_precomputed_prompt_ids(self):
+        """The streaming presentation guard should use the same prompt ids as
+        context validation instead of re-encoding with different tokenizer
+        options."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end_id = 42
+
+            def encode(self, prompt, add_special_tokens=False):
+                raise AssertionError("prompt ids should already be available")
+
+        opens, tag = prompt_opens_thinking(
+            Tokenizer(), "templated suffix", prompt_token_ids=[100, 41, 99]
+        )
+
+        assert (opens, tag) == (True, "<think>")
+
     def test_prompt_detection_rejects_disabled_thinking_pattern(self):
         from omlx.api.thinking import prompt_opens_thinking
 
@@ -665,6 +685,24 @@ class TestCompletionsStreamThinkPrefixParity:
                     "detector so it only strips when the engine would add the "
                     "synthetic opener."
                 )
+                prompt_detector_calls = [
+                    call
+                    for call in ast.walk(node)
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "prompt_opens_thinking"
+                    )
+                ]
+                assert any(
+                    keyword.arg == "prompt_token_ids"
+                    for call in prompt_detector_calls
+                    for keyword in call.keywords
+                ), (
+                    "stream_completion must pass the validation prompt ids "
+                    "into prompt_opens_thinking so both paths use the same "
+                    "tokenizer defaults."
+                )
                 assert "_strip_synthetic_think_prefix" in called, (
                     "stream_completion must strip the synthetic think opener "
                     "from the first chunk when the prompt opens the thinking "
@@ -672,3 +710,38 @@ class TestCompletionsStreamThinkPrefixParity:
                 )
                 return
         raise AssertionError("stream_completion not found in server.py")
+
+    def test_create_completion_threads_validation_prompt_ids_to_streaming(self):
+        """The completion endpoint should reuse the prompt ids it already
+        computed for context-window validation on the stream path."""
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1] / "omlx" / "server.py"
+        ).read_text()
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "create_completion"
+            ):
+                stream_calls = [
+                    call
+                    for call in ast.walk(node)
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "stream_completion"
+                    )
+                ]
+                assert any(
+                    keyword.arg == "prompt_token_ids"
+                    for call in stream_calls
+                    for keyword in call.keywords
+                ), (
+                    "create_completion must thread the validation prompt ids "
+                    "to stream_completion instead of making the strip guard "
+                    "re-encode the prompt."
+                )
+                return
+        raise AssertionError("create_completion not found in server.py")
