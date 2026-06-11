@@ -453,3 +453,24 @@ class TestCompletionsThinkingBudget:
 
         req = CompletionRequest(model="m", prompt="p", thinking_budget=128)
         assert _resolve_thinking_budget(req, None) == 128
+
+    def test_both_completion_paths_resolve_the_budget(self):
+        """Source-level guard, repo style: the field alone is useless if the
+        handlers stop threading it to the engine — which was the original
+        bug. Both the streaming and non-streaming completion paths must
+        resolve the budget."""
+        from pathlib import Path
+
+        server_src = (
+            Path(__file__).resolve().parents[1] / "omlx" / "server.py"
+        ).read_text()
+        assert (
+            server_src.count(
+                "thinking_budget=_resolve_thinking_budget(request, request.model)"
+            )
+            >= 2
+        ), (
+            "/v1/completions must pass thinking_budget to engine.generate and "
+            "engine.stream_generate via _resolve_thinking_budget; dropping "
+            "either path silently disables the budget again. See #1825."
+        )
