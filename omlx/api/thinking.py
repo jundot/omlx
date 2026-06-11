@@ -426,6 +426,9 @@ class ThinkingBudgetProcessor:
         self._token_to_piece = token_to_piece
         self._soft_budget = soft_budget
         self._soft_start = int(budget * self._SOFT_ZONE_START_FRAC) if budget > 0 else 0
+        # Invariant after construction; floored at 1 so tiny budgets cannot
+        # divide by zero in the progress computation.
+        self._soft_span = max(1, budget - self._soft_start)
 
         # State
         self._thinking_tokens: int = 0
@@ -500,8 +503,7 @@ class ThinkingBudgetProcessor:
         ids could make the model sample them out of order and leak a
         marker fragment into the thinking text.
         """
-        span = max(1, self._budget - self._soft_start)
-        progress = (self._thinking_tokens - self._soft_start) / span
+        progress = (self._thinking_tokens - self._soft_start) / self._soft_span
         next_id = self._next_close_token_id()
         top_logit = mx.max(logits, axis=-1, keepdims=True)
         end_logit = logits[..., next_id : next_id + 1]
