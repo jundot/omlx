@@ -838,6 +838,10 @@
                                   class="ml-2 px-1.5 py-0.5 text-[10px] rounded tracking-wide"
                                   style="background: var(--bg-secondary); color: var(--text-tertiary);"
                                   x-text="videoBadge(model.id)"></span>
+                            <span x-show="isImageModelId(model.id)"
+                                  class="ml-2 px-1.5 py-0.5 text-[10px] rounded tracking-wide"
+                                  style="background: var(--bg-secondary); color: var(--text-tertiary);"
+                                  x-text="imageBadge(model.id)"></span>
                         </button>
                     </template>
                     <div x-show="availableModels.length === 0" class="px-3 py-2 text-sm"
@@ -1059,6 +1063,43 @@
                                     </template>
                                 </div>
                             </template>
+                            <template x-if="msg._image">
+                                <div class="my-2">
+                                    <template x-if="msg._image.urls && msg._image.urls.length > 0">
+                                        <div class="flex flex-wrap gap-2">
+                                            <template x-for="(imgUrl, ii) in msg._image.urls" :key="ii">
+                                                <img :src="imgUrl" @click="openImageModal(imgUrl)"
+                                                     class="rounded-xl max-w-full cursor-pointer"
+                                                     style="max-height: 320px;">
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <!-- Artifact purged by retention: placeholder + regenerate hint
+                                         (the header regenerate button resubmits the prompt) -->
+                                    <template x-if="msg._image.error === 'artifact_expired'">
+                                        <div class="w-56 px-3 py-4 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-xs gap-1 text-center">
+                                            <i data-lucide="image-off" class="w-5 h-5"></i>
+                                            <span x-text="tImage('chat.image.expired', 'Image expired on the server. Use the regenerate button to create a new one.')"></span>
+                                        </div>
+                                    </template>
+                                    <template x-if="(!msg._image.urls || msg._image.urls.length === 0) && !msg._image.error">
+                                        <div class="text-sm" style="color: var(--text-tertiary);">
+                                            <div class="flex items-center gap-3">
+                                                <span x-text="`${tImage('chat.image.generating', 'Generating image...')} ${msg._image.progress || 0}%` + (msg._image.phase ? ` (${msg._image.phase})` : '')"></span>
+                                                <button @click="cancelImage(msg)"
+                                                        class="px-1.5 py-0.5 text-xs rounded border hover:bg-surface-muted"
+                                                        style="border-color: var(--border-faint); color: var(--text-tertiary);"
+                                                        x-text="tImage('chat.image.cancel', 'Cancel')"></button>
+                                            </div>
+                                            <div class="w-56 h-1.5 rounded-full mt-2" style="background: var(--bg-secondary);">
+                                                <div class="h-1.5 rounded-full transition-all duration-500"
+                                                     style="background: var(--text-primary);"
+                                                     :style="`width:${msg._image.progress || 0}%`"></div>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
                             <div class="message-body markdown-content" data-math-pending="true"
                                 :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
                                 x-html="renderMarkdown(msg.content)"></div>
@@ -1205,9 +1246,10 @@
 
                     <div class="flex items-end">
                         <!-- Image upload button (VLM models + any video model
-                             when an i2v-capable one exists: auto-routed) -->
-                        <button x-show="hasVisionSupport() || videoCanUseImage()" @click="$refs.imageInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= (isVideoModel() ? 1 : 10)"
+                             when an i2v-capable one exists + any image model
+                             when an edit-capable one exists: auto-routed) -->
+                        <button x-show="hasVisionSupport() || videoCanUseImage() || imageCanUseImage()" @click="$refs.imageInput.click()"
+                            :disabled="!apiKeySet || !currentModel || isStreaming || uploadImages.length >= maxUploadImages()"
                             class="p-3 shrink-0 transition-colors text-fg-tertiary hover:text-fg-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-5 h-5"></i>
@@ -1364,6 +1406,7 @@
             // Streaming State
             isStreaming: false,
             videoSubmitting: false,
+            imageSubmitting: false,      // debounces POST /v1/images, not isStreaming
             videoQuality: 'standard',
             videoSeconds: 3,
             videoUpscale: false,         // SeedVR2 1080p upscale toggle
@@ -1417,6 +1460,7 @@
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
             videoPipelineMap: {},        // { modelId: "t2v"|"i2v"|"ti2v" } for video models
+            imagePipelineMap: {},        // { modelId: "t2i"|"edit" } for image models
 
             // System Prompt
             systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
@@ -1481,12 +1525,15 @@
             const data = await resp.json();
             const map = {};
             const pipelines = {};
+            const imagePipelines = {};
             for (const m of (data.models || [])) {
                 map[m.id] = m.model_type || 'llm';
                 if (m.video_pipeline) pipelines[m.id] = m.video_pipeline;
+                if (m.image_pipeline) imagePipelines[m.id] = m.image_pipeline;
             }
             this.modelTypeMap = map;
             this.videoPipelineMap = pipelines;
+            this.imagePipelineMap = imagePipelines;
         } catch (e) {
             // Model status endpoint unavailable
         }
@@ -1580,6 +1627,78 @@
         return v === key ? fallback : v;
     },
 
+    // ===== Image generation helpers (image models route to /v1/images) =====
+
+    isImageModelId(modelId) {
+        return this.modelTypeMap[modelId] === 'image';
+    },
+
+    isImageModel() {
+        return this.isImageModelId(this.currentModel);
+    },
+
+    // edit models REQUIRE an input image, t2i models generate from text
+    // (server-enforced; mirrored here for the UI gates and auto-routing).
+    findEditImageModel() {
+        for (const [id, t] of Object.entries(this.modelTypeMap)) {
+            if (t === 'image' && this.imagePipelineMap[id] === 'edit') return id;
+        }
+        return null;
+    },
+
+    findT2iImageModel() {
+        for (const [id, t] of Object.entries(this.modelTypeMap)) {
+            if (t === 'image' && this.imagePipelineMap[id] === 't2i') return id;
+        }
+        return null;
+    },
+
+    // Whether the chat can take an input image for image editing right
+    // now: any image model selected, as long as an edit-capable model
+    // exists (generateImage auto-routes to it).
+    imageCanUseImage() {
+        return this.isImageModel() && !!this.findEditImageModel();
+    },
+
+    // Upload caps per selection: video models take a single conditioning
+    // image; image edit models take up to three (qwen-image-edit-2509/
+    // 2511 accept multiple inputs, the server 400s extras with a clear
+    // message); VLM chat takes ten.
+    maxUploadImages() {
+        if (this.isVideoModel()) return 1;
+        if (this.isImageModel()) return 3;
+        return 10;
+    },
+
+    // Route between the installed image checkpoints by request shape:
+    // an attached image needs an edit-capable model, plain text prefers
+    // a t2i one (edit models reject promptless/imageless requests).
+    // Returns null when no installed model can serve the request shape.
+    resolveImageModel(needsImage) {
+        const p = this.imagePipelineMap[this.currentModel];
+        if (needsImage) {
+            if (p === 'edit') return this.currentModel;
+            return this.findEditImageModel();
+        }
+        if (p !== 'edit') return this.currentModel;
+        return this.findT2iImageModel();
+    },
+
+    // Picker badge: surface the pipeline so t2i and edit checkpoints
+    // stop looking interchangeable ("image" tells the user nothing).
+    imageBadge(modelId) {
+        const p = this.imagePipelineMap[modelId];
+        if (p === 'edit') return this.tImage('chat.image.badge_edit', 'image→image');
+        if (p === 't2i') return this.tImage('chat.image.badge_t2i', 'text→image');
+        return 'image';
+    },
+
+    // Same stale-bundle fallback as tVideo (see comment there).
+    tImage(key, fallback) {
+        const v = window.t(key);
+        return v === key ? fallback : v;
+    },
+
             // ===== MCP Tools =====
 
             async fetchMcpTools() {
@@ -1668,7 +1787,8 @@
     // ===== Image Upload Functions =====
 
     handleDrop(event) {
-        if (!this.hasVisionSupport() && !this.videoCanUseImage()) return;
+        if (!this.hasVisionSupport() && !this.videoCanUseImage()
+            && !this.imageCanUseImage()) return;
         const files = event.dataTransfer?.files;
         if (files) {
             Array.from(files).forEach(f => this.loadImageFile(f));
@@ -1687,13 +1807,16 @@
             alert(window.t('chat.error.invalid_image_type'));
             return;
         }
-        // The video input_reference path only accepts formats the server
-        // magic-sniff allows; macOS drag-drops are often HEIC, which
-        // would 400 after the message is already committed.
-        if (this.isVideoModel()
+        // The video input_reference and image edit paths only accept
+        // formats the server magic-sniff allows; macOS drag-drops are
+        // often HEIC, which would 400 after the message is committed.
+        if ((this.isVideoModel() || this.isImageModel())
             && !['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
-            alert(this.tVideo('chat.video.bad_reference_type',
-                'Video models accept PNG, JPEG or WebP reference images.'));
+            alert(this.isVideoModel()
+                ? this.tVideo('chat.video.bad_reference_type',
+                    'Video models accept PNG, JPEG or WebP reference images.')
+                : this.tImage('chat.image.bad_input_type',
+                    'Image models accept PNG, JPEG or WebP input images.'));
             return;
         }
 
@@ -1703,8 +1826,8 @@
             return;
         }
 
-        // Video models take a single conditioning image (input_reference)
-        const cap = this.isVideoModel() ? 1 : 10;
+        // Per-selection cap (1 video conditioning / 3 image edit / 10 VLM)
+        const cap = this.maxUploadImages();
         if (this.uploadImages.length >= cap) return;
 
         const reader = new FileReader();
@@ -1725,7 +1848,8 @@
     },
 
     handlePaste(event) {
-        if (!this.hasVisionSupport() && !this.videoCanUseImage()) return;
+        if (!this.hasVisionSupport() && !this.videoCanUseImage()
+            && !this.imageCanUseImage()) return;
         const items = event.clipboardData?.items;
         if (!items) return;
 
@@ -1855,13 +1979,14 @@
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
 
-            // Allowlist: the picker offers LLM/VLM (chat completions) and
-            // video models (sendMessage routes those to POST /v1/videos).
-            // Anything else (audio_*, embedding, reranker, future types)
-            // has its own endpoint and must not appear here.
+            // Allowlist: the picker offers LLM/VLM (chat completions),
+            // video models (sendMessage routes those to POST /v1/videos)
+            // and image models (routed to POST /v1/images). Anything else
+            // (audio_*, embedding, reranker, future types) has its own
+            // endpoint and must not appear here.
             this.availableModels = allModels.filter(m => {
                 const t = (this.modelTypeMap[m.id] || m.model_type || 'llm').toLowerCase();
-                return t === 'llm' || t === 'vlm' || t === 'video';
+                return t === 'llm' || t === 'vlm' || t === 'video' || t === 'image';
             });
             // Get default model from health endpoint
             let defaultModel = null;
@@ -1890,11 +2015,12 @@
         if (this.videoExtendFrom && !this.isVideoModel()) {
             this.videoExtendFrom = null;
         }
-        // Video models take a single conditioning image; drop extras
-        // picked up while a VLM was selected (the bubble would otherwise
-        // claim images the server never received).
-        if (this.isVideoModel() && this.uploadImages.length > 1) {
-            this.uploadImages = this.uploadImages.slice(0, 1);
+        // Video/image models take fewer input images than a VLM; drop
+        // extras picked up while a VLM was selected (the bubble would
+        // otherwise claim images the server never received).
+        const cap = this.maxUploadImages();
+        if (this.uploadImages.length > cap) {
+            this.uploadImages = this.uploadImages.slice(0, cap);
         }
     },
 
@@ -1941,23 +2067,44 @@
             localStorage.setItem('omlx_chat_current_id', chatId);
             this.videoExtendFrom = null;  // chat-scoped, see startNewChat
             this.messages = chat.messages || [];
-            // Re-attach video bubbles. Persisted blob: URLs are DEAD links
-            // (session-scoped) -- a <video> bound to one renders but never
-            // plays. Strip them, then rehydrate from the server by job id.
-            // Mutate via the reactive proxies (this.messages elements),
-            // never the raw parsed objects (Alpine ignores raw writes).
+            // Re-attach video/image bubbles. Persisted blob: URLs are DEAD
+            // links (session-scoped) -- media bound to one renders but
+            // never plays. Strip them, then rehydrate from the server by
+            // job id. Mutate via the reactive proxies (this.messages
+            // elements), never the raw parsed objects (Alpine ignores raw
+            // writes).
             for (const m of this.messages) {
-                if (!m || !m._video) continue;
-                if (m._video.url && String(m._video.url).startsWith('blob:')) {
-                    m._video.url = null;
+                if (!m) continue;
+                if (m._video) {
+                    if (m._video.url && String(m._video.url).startsWith('blob:')) {
+                        m._video.url = null;
+                    }
+                    if (!m._video.url) {
+                        if (m._video.job_id) {
+                            this.rehydrateVideo(m);
+                        } else if (!m._video.error) {
+                            m._video.error = 'interrupted';
+                            if (!m.content) {
+                                m.content = 'video job interrupted (no job id recorded)';
+                            }
+                        }
+                    }
                 }
-                if (!m._video.url) {
-                    if (m._video.job_id) {
-                        this.rehydrateVideo(m);
-                    } else if (!m._video.error) {
-                        m._video.error = 'interrupted';
-                        if (!m.content) {
-                            m.content = 'video job interrupted (no job id recorded)';
+                if (m._image) {
+                    if (Array.isArray(m._image.urls)) {
+                        m._image.urls = m._image.urls.filter(
+                            u => u && !String(u).startsWith('blob:'));
+                    } else {
+                        m._image.urls = [];
+                    }
+                    if (m._image.urls.length === 0) {
+                        if (m._image.job_id) {
+                            this.rehydrateImage(m);
+                        } else if (!m._image.error) {
+                            m._image.error = 'interrupted';
+                            if (!m.content) {
+                                m.content = 'image job interrupted (no job id recorded)';
+                            }
                         }
                     }
                 }
@@ -1985,6 +2132,11 @@
             // job_id/status so loadChat can rehydrate from the server.
             if (msg._video && msg._video.url) {
                 msg = { ...msg, _video: { ...msg._video, url: null } };
+            }
+            // Same for image result blobs: keep job_id/status/n, drop the
+            // session-scoped object URLs.
+            if (msg._image && msg._image.urls && msg._image.urls.length > 0) {
+                msg = { ...msg, _image: { ...msg._image, urls: [] } };
             }
             if (!Array.isArray(msg.content)) return msg;
             return {
@@ -2050,7 +2202,8 @@
         const images = [...this.uploadImages];
 
         if (!userText && images.length === 0) return;
-        if (!this.currentModel || this.isStreaming || this.videoSubmitting) return;
+        if (!this.currentModel || this.isStreaming || this.videoSubmitting
+            || this.imageSubmitting) return;
 
         // Clear input state
         this.inputMessage = '';
@@ -2084,6 +2237,8 @@
         this.forceScrollToBottom();
         if (this.isVideoModel()) {
             await this.generateVideo(userText, images.map(i => i.base64));
+        } else if (this.isImageModel()) {
+            await this.generateImage(userText, images.map(i => i.base64));
         } else {
             await this.streamResponse();
         }
@@ -2298,15 +2453,20 @@
         } catch (e) { /* network hiccup: keep persisted state */ }
     },
 
-            // Cancel any in-flight video jobs among messages about to be
-            // removed (regenerate/edit truncate the array). Without this
-            // the detached bubble's poll loop keeps running and the server
-            // job keeps the single video worker busy for its full render.
+            // Cancel any in-flight video/image jobs among messages about
+            // to be removed (regenerate/edit truncate the array). Without
+            // this the detached bubble's poll loop keeps running and the
+            // server job keeps the single media worker busy for its full
+            // render.
             cancelRemovedVideos(removed) {
         for (const m of removed || []) {
             const v = m && m._video;
             if (v && !v.url && !v.error && !v.cancelled) {
                 this.cancelVideo(m);
+            }
+            const im = m && m._image;
+            if (im && !(im.urls && im.urls.length > 0) && !im.error && !im.cancelled) {
+                this.cancelImage(m);
             }
         }
     },
@@ -2319,6 +2479,209 @@
         if (msg._video.job_id) {
             try {
                 await fetch(`/v1/videos/${msg._video.job_id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                });
+            } catch (e) { /* best effort */ }
+        }
+        this.saveCurrentChat();
+    },
+
+    // ===== In-chat image generation (image models route to /v1/images) =====
+
+    async generateImage(prompt, imageUrls = []) {
+        if (!prompt) {
+            this.messages.push({
+                role: 'assistant',
+                content: this.tImage('chat.image.need_prompt',
+                    'Type a prompt to generate an image with this model.'),
+                model: this.currentModel,
+            });
+            return;
+        }
+        // Auto-route between the installed image checkpoints by request
+        // shape (attached image -> edit, plain text -> t2i); the bubble
+        // shows which model actually ran.
+        const needsImage = imageUrls.length > 0;
+        const routedModel = this.resolveImageModel(needsImage);
+        if (!routedModel) {
+            this.messages.push({
+                role: 'assistant',
+                content: needsImage
+                    ? this.tImage('chat.image.no_edit_model',
+                        'No image editing model is installed; remove the attached image or install an edit-capable model.')
+                    : this.tImage('chat.image.need_image',
+                        'This model edits images: attach an image to use it.'),
+                model: this.currentModel,
+            });
+            return;
+        }
+        // Deliberately NOT isStreaming: that flag drives the global
+        // streaming placeholder bubble and disables the input. Image jobs
+        // run server-side and queue, so the user may submit more prompts
+        // while one renders; imageSubmitting only debounces the POST.
+        this.imageSubmitting = true;
+        this.messages.push({
+            role: 'assistant',
+            content: '',
+            model: routedModel,
+            _image: { status: 'queued', progress: 0, phase: '', urls: [], n: 0, error: null, job_id: null, cancelled: false },
+        });
+        // CRITICAL: mutate through the reactive proxy, not the raw object.
+        // Alpine only tracks writes made via the proxy returned by the
+        // reactive array; writes to the raw reference leave the bubble
+        // frozen at 0% forever (progress, urls and error all invisible).
+        const msg = this.messages[this.messages.length - 1];
+        this.forceScrollToBottom();
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        try {
+            // sync=false: get the job dict back immediately and poll;
+            // the sync path would block the fetch for the whole render.
+            const body = { model: routedModel, prompt, sync: false };
+            if (imageUrls.length > 0) {
+                // Data URLs pass through unchanged (the endpoint decodes
+                // both data URLs and raw base64 in the JSON "image" field).
+                body.image = imageUrls;
+            }
+            const resp = await fetch('/v1/images', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...auth },
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                const detail = err.detail;
+                throw new Error(
+                    (detail && (detail.message || detail)) || `HTTP ${resp.status}`
+                );
+            }
+            const job = await resp.json();
+            msg._image.job_id = job.id;
+            this.imageSubmitting = false;
+            // Persist NOW, not just in finally: until this save the bubble
+            // exists only in memory, and switching chats or reloading
+            // mid-render would lose the whole submission.
+            this.saveCurrentChat();
+            await this.pollImage(msg);
+        } catch (e) {
+            msg._image.error = String(e.message || e);
+            msg.content = `Error: ${msg._image.error}`;
+        } finally {
+            this.imageSubmitting = false;
+            this.saveCurrentChat();
+            this.forceScrollToBottom();
+        }
+    },
+
+    // Poll a job until terminal; throws on failure so callers set the
+    // error state. Reused by generateImage and rehydrateImage.
+    async pollImage(msg) {
+        const im = msg._image;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        // Polls are chat-scoped: when the user switches away this loop
+        // exits (its msg proxy is detached from the view), and reopening
+        // the chat rehydrates from the server and starts a fresh poll.
+        // Without this, every switch leaks an invisible poller and the
+        // bubble it mutates is not the one on screen.
+        const pollChatId = this.currentChatId;
+        for (;;) {
+            await new Promise(r => setTimeout(r, 4000));
+            if (im.cancelled) return;
+            if (this.currentChatId !== pollChatId) return;
+            const s = await fetch(`/v1/images/${im.job_id}`, { headers: auth });
+            if (!s.ok) throw new Error(`status poll HTTP ${s.status}`);
+            const j = await s.json();
+            if (im.cancelled) return;
+            im.status = j.status;
+            im.progress = j.progress || 0;
+            im.phase = j.phase || '';
+            if (j.status === 'completed') {
+                await this.attachImageContent(msg, j);
+                return;
+            }
+            if (j.status === 'failed') {
+                const e = j.error || {};
+                throw new Error(e.code ? `${e.code}: ${e.message}` : 'generation failed');
+            }
+        }
+    },
+
+    async attachImageContent(msg, j) {
+        const im = msg._image;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        const count = j.outputs || j.n || 1;
+        const urls = [];
+        for (let i = 0; i < count; i++) {
+            const c = await fetch(`/v1/images/${im.job_id}/content?index=${i}`, { headers: auth });
+            if (!c.ok) throw new Error(`content HTTP ${c.status}`);
+            const blob = await c.blob();
+            urls.push(URL.createObjectURL(blob));
+        }
+        im.n = count;
+        im.urls = urls;
+        msg.content = `\`${im.job_id}\` (${j.wall_seconds || '?'}s`
+            + (j.size ? `, ${j.size}` : '')
+            + (j.seed != null ? `, seed ${j.seed}` : '') + ')';
+    },
+
+    // Re-attach an image bubble after a page reload. Blob URLs are
+    // session-scoped (a persisted one is a dead link), but the artifacts
+    // live on the server: completed jobs re-fetch the PNGs, still-running
+    // jobs resume polling, purged artifacts surface the expired
+    // placeholder with the regenerate hint.
+    async rehydrateImage(msg) {
+        const im = msg._image;
+        if (!im || !im.job_id || (im.urls && im.urls.length > 0)) return;
+        const auth = { 'Authorization': `Bearer ${this.getApiKey()}` };
+        try {
+            const s = await fetch(`/v1/images/${im.job_id}`, { headers: auth });
+            if (s.status === 404) {
+                if (!im.error) im.error = 'artifact_expired';
+                if (!msg.content) msg.content = `\`${im.job_id}\` no longer on the server`;
+                this.saveCurrentChat();
+                return;
+            }
+            if (!s.ok) return; // transient: keep persisted state
+            const j = await s.json();
+            im.status = j.status;
+            im.progress = j.progress || 0;
+            im.phase = j.phase || '';
+            if (j.status === 'completed') {
+                try {
+                    await this.attachImageContent(msg, j);
+                    im.error = null;
+                } catch (e) {
+                    // /content 404s with code artifact_expired once the
+                    // retention policy purges the PNGs.
+                    im.error = 'artifact_expired';
+                    msg.content = `\`${im.job_id}\` artifact purged by the retention policy`;
+                }
+            } else if (j.status === 'failed') {
+                const e2 = j.error || {};
+                im.error = e2.code ? `${e2.code}: ${e2.message}` : 'failed';
+                if (!msg.content) msg.content = `Error: ${im.error}`;
+            } else {
+                // Still running server-side: resume live polling
+                im.error = null;
+                im.cancelled = false;
+                this.pollImage(msg).catch((e3) => {
+                    im.error = String(e3.message || e3);
+                    msg.content = `Error: ${im.error}`;
+                }).finally(() => this.saveCurrentChat());
+            }
+            this.saveCurrentChat();
+        } catch (e) { /* network hiccup: keep persisted state */ }
+    },
+
+    async cancelImage(msg) {
+        const im = msg._image;
+        if (!im || (im.urls && im.urls.length > 0) || im.error) return;
+        im.cancelled = true;
+        im.error = 'cancelled';
+        msg.content = this.tImage('chat.image.cancelled', 'Image generation cancelled.');
+        if (im.job_id) {
+            try {
+                await fetch(`/v1/images/${im.job_id}`, {
                     method: 'DELETE',
                     headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
                 });
@@ -2692,7 +3055,7 @@
     },
 
             async regenerateMessage(index) {
-        if (this.isStreaming || this.videoSubmitting) return;
+        if (this.isStreaming || this.videoSubmitting || this.imageSubmitting) return;
 
         // Find the user message before this assistant message
         const messagesToKeep = this.messages.slice(0, index);
@@ -2700,14 +3063,19 @@
         this.messages = messagesToKeep;
         this.scheduleEnhanceMessages();
 
-        // Video models must route to /v1/videos, not chat completions
-        // (same branch as sendMessage; the server 400s a video model on
-        // /v1/chat/completions).
+        // Video/image models must route to /v1/videos / /v1/images, not
+        // chat completions (same branch as sendMessage; the server 400s
+        // those model types on /v1/chat/completions).
         if (this.isVideoModel()) {
             const lastUser = [...this.messages].reverse().find(m => m.role === 'user');
             const prompt = lastUser ? this.getTextContent(lastUser.content).trim() : '';
             const images = lastUser ? this.getImageUrls(lastUser.content) : [];
             await this.generateVideo(prompt, images);
+        } else if (this.isImageModel()) {
+            const lastUser = [...this.messages].reverse().find(m => m.role === 'user');
+            const prompt = lastUser ? this.getTextContent(lastUser.content).trim() : '';
+            const images = lastUser ? this.getImageUrls(lastUser.content) : [];
+            await this.generateImage(prompt, images);
         } else {
             await this.streamResponse();
         }
@@ -2762,7 +3130,8 @@
     },
 
             async saveEdit(index) {
-        if (!this.editContent.trim() || this.isStreaming || this.videoSubmitting) return;
+        if (!this.editContent.trim() || this.isStreaming || this.videoSubmitting
+            || this.imageSubmitting) return;
 
         const newContent = this.editContent.trim();
 
@@ -2795,11 +3164,14 @@
         this.editContent = '';
         this.editImages = [];
 
-        // Scroll and get new response. Video models must route to
-        // /v1/videos, not chat completions (same branch as sendMessage).
+        // Scroll and get new response. Video/image models must route to
+        // /v1/videos / /v1/images, not chat completions (same branch as
+        // sendMessage).
         this.scrollToBottom();
         if (this.isVideoModel()) {
             await this.generateVideo(newContent, editedImages);
+        } else if (this.isImageModel()) {
+            await this.generateImage(newContent, editedImages);
         } else {
             await this.streamResponse();
         }

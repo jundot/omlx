@@ -132,8 +132,12 @@ class TestVideoImageToVideoUI:
 
     def test_upload_button_gated_on_vision_or_video_image(self, chat_source):
         """The image upload button must show for VLMs and video models
-        with an i2v-capable model installed."""
-        assert 'x-show="hasVisionSupport() || videoCanUseImage()"' in chat_source
+        with an i2v-capable model installed (image models extend the same
+        gate; see test_chat_image_ui.py)."""
+        assert (
+            'x-show="hasVisionSupport() || videoCanUseImage() || imageCanUseImage()"'
+            in chat_source
+        )
 
     @pytest.mark.parametrize("fn", ["startVideoExtend", "findExtendModel"])
     def test_extend_helpers_exist(self, chat_source, fn):
