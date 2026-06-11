@@ -2779,3 +2779,70 @@ class TestPerBlockMetaStates:
             f"Last block should use snapshot offset=8, not shared offset=11, "
             f"got {b2_meta[1]}"
         )
+
+
+class TestSetPagedSSDCacheManagerTriggersSweep:
+    """``set_paged_ssd_cache_manager`` must trigger the one-shot sweep so
+    stale-signature blocks left over from a previous cache-config run for
+    this model are evicted before the first prefix lookup runs."""
+
+    @pytest.fixture
+    def prefix_cache(self):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=PagedCacheManager(
+                block_size=4,
+                max_blocks=16,
+                model_name="test",
+                initial_blocks=16,
+            ),
+            paged_ssd_cache_manager=None,
+        )
+
+    def test_attach_calls_invalidate(self, prefix_cache):
+        mock_mgr = MagicMock()
+        mock_mgr.invalidate_stale_layer_signature.return_value = 0
+
+        prefix_cache.set_paged_ssd_cache_manager(mock_mgr)
+
+        mock_mgr.invalidate_stale_layer_signature.assert_called_once_with()
+        assert prefix_cache.paged_ssd_cache is mock_mgr
+
+    def test_attach_survives_sweep_exception(self, prefix_cache):
+        mock_mgr = MagicMock()
+        mock_mgr.invalidate_stale_layer_signature.side_effect = RuntimeError("boom")
+
+        # Must not raise — sweep failure is logged but the manager
+        # connection must still complete.
+        prefix_cache.set_paged_ssd_cache_manager(mock_mgr)
+
+        assert prefix_cache.paged_ssd_cache is mock_mgr
+
+    def test_attach_none_no_call(self, prefix_cache):
+        # Detaching the manager must not invoke anything.
+        prefix_cache.set_paged_ssd_cache_manager(None)
+        assert prefix_cache.paged_ssd_cache is None
+
+
+class TestCanonicalLayerCacheTypes:
+    """The canonicalizer normalizes wrapper class names but must NOT
+    collapse types that change tensor representation (TurboQuantKVCache
+    stores 4-bit packed tensors; KVCache stores fp16) — collapsing those
+    would silently mix incompatible cache blocks."""
+
+    def test_none_passthrough(self):
+        assert BlockAwarePrefixCache._canonical_layer_cache_types(None) is None
+
+    def test_sized_arrays_normalized(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["SizedArraysCache", "SizedArraysCache", "KVCache"]
+        )
+        assert result == ["ArraysCache", "ArraysCache", "KVCache"]
+
+    def test_turboquant_not_collapsed(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["ArraysCache", "TurboQuantKVCache", "KVCache"]
+        )
+        # TurboQuant must remain distinct from plain KVCache.
+        assert "TurboQuantKVCache" in result
+        assert result != ["ArraysCache", "KVCache", "KVCache"]
