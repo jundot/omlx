@@ -237,14 +237,16 @@ class CohereCommandOutputParserSession:
                 index = int(getattr(call, "index", len(self._tool_calls)))
             except Exception:
                 index = len(self._tool_calls)
-            call_id = str(getattr(call, "id", "") or f"call_{index}")
-            name = str(getattr(call, "name", "") or "")
-            arguments = str(getattr(call, "arguments", "") or "")
-            self._tool_calls[index] = {
-                "id": call_id,
-                "name": name,
-                "arguments": arguments,
-            }
+            stored = self._tool_calls.setdefault(
+                index,
+                {"id": f"call_{index}", "name": "", "arguments": ""},
+            )
+            if call_id := str(getattr(call, "id", "") or ""):
+                stored["id"] = call_id
+            if name := str(getattr(call, "name", "") or ""):
+                stored["name"] = name
+            if arguments := str(getattr(call, "arguments", "") or ""):
+                stored["arguments"] += arguments
 
     def _format_result(self, result: Any) -> tuple[str, str]:
         self._remember_tool_calls(result)

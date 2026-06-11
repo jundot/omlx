@@ -506,6 +506,64 @@ class TestCohereCommandOutputParserSession:
         ]
         assert final.finish_reason == "tool_calls"
 
+    def test_accumulates_streamed_melody_tool_call_deltas(self, monkeypatch):
+        _patch_cohere_filter(
+            monkeypatch,
+            [
+                _melody_result(
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="0",
+                            name="",
+                            arguments="",
+                        )
+                    ]
+                ),
+                _melody_result(
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="",
+                            name="run_command",
+                            arguments="",
+                        )
+                    ]
+                ),
+                _melody_result(
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="",
+                            name="",
+                            arguments='{"cmd":"',
+                        )
+                    ]
+                ),
+                _melody_result(
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=0,
+                            id="",
+                            name="",
+                            arguments='pwd"}',
+                        )
+                    ]
+                ),
+            ],
+        )
+        tokenizer = CohereCommandTokenizer({1: "a", 2: "b", 3: "c", 4: "d"})
+        session = output_parser_mod.CohereCommandOutputParserSession(tokenizer)
+
+        for token_id in [1, 2, 3, 4]:
+            session.process_token(token_id)
+        final = session.finalize()
+
+        assert final.tool_calls == [
+            {"id": "0", "name": "run_command", "arguments": '{"cmd":"pwd"}'}
+        ]
+        assert final.finish_reason == "tool_calls"
+
     def test_end_of_turn_token_stops_without_recording(self, monkeypatch):
         _patch_cohere_filter(monkeypatch, [_melody_result()])
         tokenizer = CohereCommandTokenizer({4: "<|END_OF_TURN_TOKEN|>"})
