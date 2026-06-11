@@ -279,7 +279,16 @@ def _patch_model(dsv4: Any) -> None:
         inputs,
         cache=None,
         return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
+        # ``n_confirmed`` is part of the patched-backbone interface:
+        # batch_generator._call_backbone passes n_confirmed=1 during MTP
+        # verify cycles. It only matters for models with module-level
+        # recurrent state (Qwen3.5's GatedDeltaNet splits its forward to
+        # snapshot state after the confirmed prefix). DeepSeek-V4 keeps all
+        # decode state in cache objects (RotatingKVCache / PoolingCache)
+        # and draft rejection rolls back via cache.trim in
+        # _restore_or_trim_caches, so the argument is accepted and unused.
         if return_hidden:
             h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
             return self.lm_head(h), h_raw
@@ -497,6 +506,18 @@ def _patch_model(dsv4: Any) -> None:
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
                     )
+
+        # Same wo_a 2D -> 3D reshape for the MTP block's attention. The
+        # ndim==2 gate keeps this idempotent for checkpoints that already
+        # store the 3D MultiLinear layout (e.g. oQ output).
+        if has_mtp:
+            for mtp_idx in range(self.args.num_nextn_predict_layers):
+                prefix = f"mtp.{mtp_idx}.block.attn.wo_a"
+                for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                    if key in weights and weights[key].ndim == 2:
+                        weights[key] = weights[key].reshape(
+                            self.args.o_groups, self.args.o_lora_rank, -1
+                        )
 
         # Stack routed expert weights for MTP layers (PR 15).
         if has_mtp:

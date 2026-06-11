@@ -83,6 +83,8 @@ VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 
+DIFFUSION_PREFILL_STEP_SIZE = 2048
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -176,6 +178,7 @@ def _load_cohere2_moe_text_model(
         processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
 
     return model, processor
+
 
 _video_processor_patched = False
 
@@ -1733,10 +1736,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 ensure_mlx_audio_resample_export()
             audio = [
-                _load_audio(a, 16000)
-                if not isinstance(a, tuple)
-                else a
-                for a in audio
+                _load_audio(a, 16000) if not isinstance(a, tuple) else a for a in audio
             ]
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
@@ -1922,8 +1922,6 @@ class VLMBatchedEngine(BaseEngine):
         has_audio = "input_features" in extra_model_inputs
         has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
-
-
         if has_multimodal:
             # Build call kwargs from extra_model_inputs (includes input_features
             # for audio, image_grid_thw, etc.)
@@ -1936,7 +1934,11 @@ class VLMBatchedEngine(BaseEngine):
                 image_hash = compute_image_hash(images)
                 image_token_count = self._image_token_count(input_ids)
 
-            if num_images > 0 and self._vision_cache is not None and self._vision_cache_enabled:
+            if (
+                num_images > 0
+                and self._vision_cache is not None
+                and self._vision_cache_enabled
+            ):
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
@@ -3010,6 +3012,7 @@ class VLMBatchedEngine(BaseEngine):
                         getattr(tokenizer, "all_special_ids", None) or []
                     ),
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
+                    prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
                 )
                 for result in results:
                     if cancel_event is not None and cancel_event.is_set():
@@ -3021,8 +3024,7 @@ class VLMBatchedEngine(BaseEngine):
                     result_text = result.text or ""
                     if result_text:
                         has_token_progress = (
-                            result_tokens is None
-                            or int(result_tokens) > emitted_tokens
+                            result_tokens is None or int(result_tokens) > emitted_tokens
                         )
                         has_final_flush = (
                             finish_reason is not None
@@ -3055,6 +3057,25 @@ class VLMBatchedEngine(BaseEngine):
                             finished=finish_reason is not None,
                             finish_reason=finish_reason,
                             cached_tokens=0,
+                            prompt_tps=float(getattr(result, "prompt_tps", 0.0) or 0.0),
+                            generation_tps=float(
+                                getattr(result, "generation_tps", 0.0) or 0.0
+                            ),
+                            diffusion_canvas_tokens=int(
+                                getattr(result, "diffusion_canvas_tokens", 0) or 0
+                            ),
+                            diffusion_denoising_steps=int(
+                                getattr(result, "diffusion_denoising_steps", 0) or 0
+                            ),
+                            diffusion_work_tokens=int(
+                                getattr(result, "diffusion_work_tokens", 0) or 0
+                            ),
+                            diffusion_canvas_tps=float(
+                                getattr(result, "diffusion_canvas_tps", 0.0) or 0.0
+                            ),
+                            diffusion_work_tps=float(
+                                getattr(result, "diffusion_work_tps", 0.0) or 0.0
+                            ),
                         )
                     block_text = []
                     if finish_reason:

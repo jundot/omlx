@@ -1464,3 +1464,142 @@ class TestMTPPatchSelfHealing:
             "__call__ should carry the MTP marker after re-apply, "
             f"got {current_call!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Draft-rejection rollback atomicity
+# ---------------------------------------------------------------------------
+
+
+class _FakeTrimmable:
+    def __init__(self, trimmable=True):
+        self._trimmable = trimmable
+        self.trimmed = 0
+
+    def is_trimmable(self):
+        return self._trimmable
+
+    def trim(self, n):
+        self.trimmed += n
+        return n
+
+
+class TestRestoreOrTrimAtomicity:
+    """A layer that refuses rollback must leave every other layer untouched.
+
+    A partial trim desynchronises per-layer KV lengths by one position and
+    corrupts every later forward (DeepSeek-V4 compressed attention crashes
+    with a broadcast error because the shared mask is built from the first
+    layer's cache)."""
+
+    def test_partial_trim_is_rolled_back_to_noop(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        good_a = _FakeTrimmable()
+        bad = _FakeTrimmable(trimmable=False)
+        good_b = _FakeTrimmable()
+        assert _restore_or_trim_caches([good_a, bad, good_b]) is False
+        assert good_a.trimmed == 0
+        assert good_b.trimmed == 0
+
+    def test_all_trimmable_trims_all(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        caches = [_FakeTrimmable(), _FakeTrimmable()]
+        assert _restore_or_trim_caches(caches) is True
+        assert all(c.trimmed == 1 for c in caches)
+
+
+# ---------------------------------------------------------------------------
+# Rotating-cache MTP undo log
+# ---------------------------------------------------------------------------
+
+
+class TestRotatingCacheMtpUndo:
+    """A rotated RotatingKVCache cannot trim, so MTP draft rejection needs
+    the armed one-update undo log: restore the pre-verify references and
+    replay the confirmed token. Equivalence is checked against a reference
+    cache that never saw the rejected draft."""
+
+    @staticmethod
+    def _fill(cache, n, dim=4, start=0):
+        import mlx.core as mx
+
+        for i in range(start, start + n):
+            k = mx.full((1, 1, 1, dim), float(i))
+            cache.update_and_fetch(k, k)
+
+    def _run_equivalence(self, make_cache):
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = make_cache()
+        ref = make_cache()
+        # Rotate both well past max_size so stock trim is impossible.
+        self._fill(cache, 12)
+        self._fill(ref, 12)
+
+        confirmed = mx.full((1, 1, 1, 4), 100.0)
+        draft = mx.full((1, 1, 1, 4), 200.0)
+        both = mx.concatenate([confirmed, draft], axis=2)
+        cache_rollback.set_undo_armed(True)
+        try:
+            cache.update_and_fetch(both, both)
+        finally:
+            cache_rollback.set_undo_armed(False)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+
+        ref.update_and_fetch(confirmed, confirmed)
+
+        nxt = mx.full((1, 1, 1, 4), 300.0)
+        ck, cv = cache.update_and_fetch(nxt, nxt)
+        rk, rv = ref.update_and_fetch(nxt, nxt)
+        mx.eval(ck, cv, rk, rv)
+        assert mx.array_equal(ck, rk).item()
+        assert mx.array_equal(cv, rv).item()
+        c_off = cache.offset
+        r_off = ref.offset
+        if hasattr(c_off, "tolist"):
+            assert c_off.tolist() == r_off.tolist()
+        else:
+            assert c_off == r_off
+
+    def test_rotating_kv_cache_undo(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        self._run_equivalence(lambda: RotatingKVCache(max_size=8))
+
+    def test_batch_rotating_kv_cache_undo(self):
+        from mlx_lm.models.cache import BatchRotatingKVCache
+
+        self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]))
+
+    def test_unarmed_update_keeps_stock_semantics(self):
+        import mlx.core as mx
+
+        from mlx_lm.models.cache import RotatingKVCache
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = RotatingKVCache(max_size=8)
+        self._fill(cache, 12)
+        both = mx.full((1, 1, 2, 4), 7.0)
+        cache.update_and_fetch(both, both)
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0
+
+    def test_grow_mode_trim_unchanged(self):
+        import mlx.core as mx
+
+        from mlx_lm.models.cache import RotatingKVCache
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = RotatingKVCache(max_size=64)
+        self._fill(cache, 4)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        assert cache.offset == 3

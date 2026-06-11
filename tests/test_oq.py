@@ -39,8 +39,12 @@ from omlx.oq import (
     _LazyTensorIndex,
     _measure_sensitivity,
     _normalize_quant_path,
+    _perturb_bits_for,
+    _progress_total_bytes,
     _quantize_chunked,
     _should_quantize_tensor,
+    _validate_oq_dtype_for_model,
+    estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
     quantize_oq_streaming,
@@ -486,6 +490,12 @@ class TestResolveOutputName:
     def test_basic(self):
         assert resolve_output_name("Qwen3.5-122B-A10B", 4) == "Qwen3.5-122B-A10B-oQ4"
 
+    def test_deepseek_v4_oq8_mtp(self):
+        assert (
+            resolve_output_name("DeepSeek-V4-Flash", 8, "bfloat16", preserve_mtp=True)
+            == "DeepSeek-V4-Flash-oQ8-mtp"
+        )
+
     def test_strip_existing_bit_suffix(self):
         assert (
             resolve_output_name("Qwen3.5-122B-A10B-8bit", 4) == "Qwen3.5-122B-A10B-oQ4"
@@ -547,6 +557,36 @@ class TestResolveOutputName:
             resolve_output_name("Model-oQ6-mtp", 4, "bfloat16", preserve_mtp=True)
             == "Model-oQ4-mtp"
         )
+
+
+class TestOqDtypeModelSupport:
+    def test_rejects_deepseek_v4_float16(self):
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            _validate_oq_dtype_for_model({"model_type": "deepseek_v4"}, "float16")
+
+    def test_rejects_deepseek_v4_architecture_float16(self):
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            _validate_oq_dtype_for_model(
+                {"architectures": ["DeepseekV4ForCausalLM"]}, "float16"
+            )
+
+    def test_allows_deepseek_v4_bfloat16(self):
+        _validate_oq_dtype_for_model({"model_type": "deepseek_v4"}, "bfloat16")
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_streaming_rejects_before_output_dir_is_created(self, tmp_path):
+        src = tmp_path / "DeepSeek-V4-Flash"
+        src.mkdir()
+        (src / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4"}),
+            encoding="utf-8",
+        )
+
+        out = tmp_path / "DeepSeek-V4-Flash-oQ4-fp16"
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            quantize_oq_streaming(str(src), str(out), oq_level=4, dtype="float16")
+
+        assert not out.exists()
 
 
 class TestShouldSkipTensor:
@@ -870,11 +910,60 @@ class TestLevelBudgetPlan:
     """Tests for per-level target_bpw and budget plan activation."""
 
     def test_bpw_targets_for_level_returns_correct_values(self):
+        assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
+        assert _bpw_targets_for_level(2.7) == (3.35, 3.45)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
         assert _bpw_targets_for_level(5) == (5.5, 5.7)
         assert _bpw_targets_for_level(6) == (6.5, 6.7)
+
+    def test_oq25_base_bits_is_2(self):
+        assert _LEVEL_BITS[2.5] == 2
+        assert _LEVEL_BITS[2.7] == 2
+
+    @pytest.mark.parametrize(
+        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
+    )
+    def test_half_level_mandatory_expert_down_proj_boost(
+        self, oq_level, expected_bits
+    ):
+        """Fractional levels protect routed expert down_proj above base bits
+        even with negligible sensitivity scores."""
+        named_shapes = {
+            "model.layers.0.mlp.switch_mlp.down_proj": (8, 256, 256),
+            "model.layers.0.mlp.switch_mlp.gate_proj": (8, 256, 256),
+            "model.layers.0.self_attn.q_proj": (64, 64),
+        }
+        config = {
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.01},
+        }
+        target, cap = _OQ_BPW_TARGETS[oq_level]
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level, target_bpw=target, hard_cap_bpw=cap
+        )
+        boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
+        assert boost is not None
+        assert boost["bits"] == expected_bits
+
+    @pytest.mark.parametrize(
+        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
+    )
+    def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
+        """The non-budget predicate floor mirrors the mandatory boost."""
+        config = {
+            "num_hidden_layers": 32,
+            "num_experts": 8,
+            "hidden_size": 1024,
+        }
+        result = universal_quant_predicate(
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, oq_level
+        )
+        assert isinstance(result, dict)
+        assert result["bits"] == expected_bits
 
     def test_bpw_targets_for_level_returns_none_for_minimal(self):
         assert _bpw_targets_for_level(8) is None
@@ -1570,6 +1659,21 @@ class TestModelExceedsRamGuard:
         assert not (nbytes > int(large_ram * _MAX_MODEL_RAM_FRACTION))
 
 
+class TestQuantProgressTotalBytes:
+    def test_uses_logical_plan_when_larger_than_source(self, tmp_path):
+        source = tmp_path / "model"
+        source.mkdir()
+        (source / "model.safetensors").write_bytes(b"x" * 100)
+
+        class FakeWeights:
+            _plan = {"large.weight": {"shape": (50, 4)}}
+
+            def nbytes(self):
+                return 100
+
+        assert _progress_total_bytes(FakeWeights(), source) == 400
+
+
 class TestBuildProxyForSensitivity:
     """Tests for the auto-built sensitivity proxy.
 
@@ -1811,19 +1915,49 @@ class TestOnTheFlyFp8Dequant:
         assert result.dtype == mx.bfloat16
         assert "layer.weight" not in idx._index
 
-    def test_i8_with_e8m0_scale(self, tmp_path):
-        """I8 expert weights with E8M0 microscaling (1x16 block)."""
-        w = np.random.randint(-128, 127, (32, 32), dtype=np.int8)
-        s = np.full((32, 2), 127, dtype=np.uint8)  # 1x16 blocking, scale=1.0
+    def test_i8_with_e8m0_scale_is_fp4_packed(self, tmp_path):
+        """I8 bytes with a (rows, byte_cols/16) E8M0 scale are FP4-packed
+        (DeepSeek V4 expert layout): each byte holds two fp4 values, so the
+        dequant must unpack via mxfp4 instead of reading the bytes as int8
+        values."""
+        w = mx.random.normal((32, 64)).astype(mx.bfloat16)
+        qw, scales = mx.quantize(w, group_size=32, bits=4, mode="mxfp4")
         path = str(tmp_path / "i8.safetensors")
         _write_safetensors(
             path,
             {
-                "expert.weight": (w.tobytes(), [32, 32], "I8"),
-                "expert.scale": (s.tobytes(), [32, 2], "F8_E8M0"),
+                "expert.weight": (
+                    np.array(qw).view(np.int8).tobytes(),
+                    [32, 32],
+                    "I8",
+                ),
+                "expert.scale": (np.array(scales).tobytes(), [32, 2], "F8_E8M0"),
             },
         )
         idx = _LazyTensorIndex([path])
+        result = idx["expert.weight"]
+        expected = mx.dequantize(qw, scales, None, group_size=32, bits=4, mode="mxfp4")
+        assert result.shape == (32, 64)
+        assert result.dtype == mx.bfloat16
+        assert mx.allclose(
+            result.astype(mx.float32), expected.astype(mx.float32)
+        ).item()
+
+    def test_i8_with_block_e8m0_scale_plain_dequant(self, tmp_path):
+        """I8 with a non-fp4 scale layout (16x16 blocks) stays plain int8
+        block dequant."""
+        w = np.random.randint(-128, 127, (32, 32), dtype=np.int8)
+        s = np.full((2, 2), 127, dtype=np.uint8)  # 16x16 blocking, scale=1.0
+        path = str(tmp_path / "i8_block.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "expert.weight": (w.tobytes(), [32, 32], "I8"),
+                "expert.scale": (s.tobytes(), [2, 2], "F8_E8M0"),
+            },
+        )
+        idx = _LazyTensorIndex([path])
+        assert idx.source_quant_info("expert.weight") is None
         result = idx["expert.weight"]
         expected = mx.array(w.astype(np.float32)).astype(mx.bfloat16)
         assert mx.allclose(result, expected, atol=0.1).item()
@@ -1842,8 +1976,289 @@ class TestOnTheFlyFp8Dequant:
 
 
 # =============================================================================
-# End-to-end: protected pass-through tensor dtypes
+# Pre-quantized source passthrough (DeepSeek V4 fp4/fp8 checkpoints)
 # =============================================================================
+
+
+def _write_fp4_pair(tensors, name, rows, cols):
+    """Quantize a random tensor to mxfp4 and add it to a fixture dict in the
+    DeepSeek V4 raw layout (I8 packed bytes + E8M0 scale). Returns the
+    reference (qw, scales) pair."""
+    w = mx.random.normal((rows, cols)).astype(mx.bfloat16)
+    qw, scales = mx.quantize(w, group_size=32, bits=4, mode="mxfp4")
+    tensors[f"{name}.weight"] = (
+        np.array(qw).view(np.int8).tobytes(),
+        [rows, cols // 2],
+        "I8",
+    )
+    tensors[f"{name}.scale"] = (
+        np.array(scales).tobytes(),
+        [rows, cols // 32],
+        "F8_E8M0",
+    )
+    return qw, scales
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestPreQuantizedSource:
+    def test_fp4_detection_and_logical_shape(self, tmp_path):
+        path = str(tmp_path / "fp4.safetensors")
+        tensors = {}
+        _write_fp4_pair(tensors, "experts.0.w1", 8, 64)
+        _write_safetensors(path, tensors)
+        idx = _LazyTensorIndex([path])
+        info = idx.source_quant_info("experts.0.w1.weight")
+        assert info == {
+            "kind": "mxfp4",
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        }
+        logical = idx.logical_metadata()
+        assert logical["experts.0.w1.weight"] == ((8, 64), "BF16")
+        assert "experts.0.w1.scale" not in logical
+
+    def test_fp8_block_classification_and_load_packed(self, tmp_path):
+        rows, cols = 256, 128
+        w = np.random.randint(0, 255, (rows, cols), dtype=np.uint8)
+        s = np.full((2, 1), 127, dtype=np.uint8)
+        path = str(tmp_path / "fp8.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "attn.wq_a.weight": (w.tobytes(), [rows, cols], "F8_E4M3"),
+                "attn.wq_a.scale": (s.tobytes(), [2, 1], "F8_E8M0"),
+            },
+        )
+        idx = _LazyTensorIndex([path])
+        info = idx.source_quant_info("attn.wq_a.weight")
+        assert info == {
+            "kind": "fp8_block",
+            "bits": 8,
+            "group_size": 32,
+            "mode": "mxfp8",
+        }
+        packed, scales = idx._load_packed("attn.wq_a.weight")
+        assert packed.dtype == mx.uint32
+        assert packed.shape == (rows, cols // 4)
+        assert scales.dtype == mx.uint8
+        assert scales.shape == (rows, cols // 32)
+        ref = mx.repeat(mx.repeat(mx.array(s), 4, -1), 128, 0)
+        assert mx.array_equal(scales, ref).item()
+
+    def test_fp4_load_packed_roundtrip(self, tmp_path):
+        path = str(tmp_path / "fp4.safetensors")
+        tensors = {}
+        qw, scales = _write_fp4_pair(tensors, "experts.0.w1", 8, 64)
+        _write_safetensors(path, tensors)
+        idx = _LazyTensorIndex([path])
+        packed, sc = idx._load_packed("experts.0.w1.weight")
+        assert mx.array_equal(packed, qw).item()
+        assert mx.array_equal(sc, scales).item()
+
+    def test_reshape_astype_replay(self, tmp_path):
+        path = str(tmp_path / "w.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "wo_a.weight": np.arange(32, dtype=np.float16).reshape(4, 8),
+                "tid2eid": np.arange(8, dtype=np.float16).reshape(2, 4),
+            },
+        )
+        idx = _LazyTensorIndex([path])
+
+        def sanitize(weights):
+            out = dict(weights)
+            out["wo_a.weight"] = out["wo_a.weight"].reshape(2, 2, -1)
+            out["tid2eid"] = out["tid2eid"].astype(mx.int32)
+            return out
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        dp = _DiscoveredPlan(plan, idx)
+        wo_a = dp.pop("wo_a.weight")
+        assert wo_a.shape == (2, 2, 8)
+        assert mx.array_equal(
+            wo_a, mx.arange(32, dtype=mx.float16).reshape(2, 2, 8)
+        ).item()
+        tid = dp.pop("tid2eid")
+        assert tid.dtype == mx.int32
+        assert mx.array_equal(tid, mx.arange(8, dtype=mx.int32).reshape(2, 4)).item()
+
+    def test_stack_pop_packed(self, tmp_path):
+        path = str(tmp_path / "experts.safetensors")
+        tensors = {}
+        refs = [_write_fp4_pair(tensors, f"experts.{e}.w1", 8, 64) for e in range(4)]
+        _write_safetensors(path, tensors)
+        idx = _LazyTensorIndex([path])
+
+        def sanitize(weights):
+            stacked = [weights.pop(f"experts.{e}.w1.weight") for e in range(4)]
+            weights["switch.w1.weight"] = mx.stack(stacked)
+            return weights
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        dp = _DiscoveredPlan(plan, idx)
+        assert dp.source_quant_info("switch.w1.weight") == {
+            "kind": "mxfp4",
+            "bits": 4,
+            "group_size": 32,
+            "mode": "mxfp4",
+        }
+        assert dp.plan_shape("switch.w1.weight") == (4, 8, 64)
+        w, s = dp.pop_packed("switch.w1.weight")
+        assert w.dtype == mx.uint32 and w.shape == (4, 8, 8)
+        assert s.dtype == mx.uint8 and s.shape == (4, 8, 2)
+        for e, (qw, scales) in enumerate(refs):
+            assert mx.array_equal(w[e], qw).item()
+            assert mx.array_equal(s[e], scales).item()
+        assert "switch.w1.weight" not in dp
+
+    def test_mixed_kind_stack_no_passthrough(self, tmp_path):
+        path = str(tmp_path / "mixed.safetensors")
+        tensors = {}
+        _write_fp4_pair(tensors, "a", 8, 64)
+        w = np.random.randint(0, 255, (8, 64), dtype=np.uint8)
+        s = np.full((1, 2), 127, dtype=np.uint8)
+        tensors["b.weight"] = (w.tobytes(), [8, 64], "F8_E4M3")
+        tensors["b.scale"] = (s.tobytes(), [1, 2], "F8_E8M0")
+        _write_safetensors(path, tensors)
+        idx = _LazyTensorIndex([path])
+
+        def sanitize(weights):
+            weights["mixed.weight"] = mx.stack(
+                [weights.pop("a.weight"), weights.pop("b.weight")]
+            )
+            return weights
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        dp = _DiscoveredPlan(plan, idx)
+        assert dp.source_quant_info("mixed.weight") is None
+
+    def test_float_source_no_passthrough(self, tmp_path):
+        path = str(tmp_path / "plain.safetensors")
+        _write_safetensors(
+            path,
+            {"layer.weight": np.random.randn(4, 8).astype(np.float16)},
+        )
+        idx = _LazyTensorIndex([path])
+        assert idx.source_quant_info("layer.weight") is None
+
+        plan = _discover_sanitize_plan(lambda w: dict(w), idx)
+        dp = _DiscoveredPlan(plan, idx)
+        assert dp.source_quant_info("layer.weight") is None
+
+
+class TestPerturbBitsFor:
+    def test_snap_below(self):
+        assert _perturb_bits_for(8) == 6
+        assert _perturb_bits_for(6) == 5
+        assert _perturb_bits_for(4) == 3
+        assert _perturb_bits_for(3) == 2
+        assert _perturb_bits_for(2) is None
+
+
+class TestShouldQuantizeTensorWeightGuard:
+    def test_non_weight_2d_params_not_quantized(self):
+        assert not _should_quantize_tensor("model.layers.0.attn_hc.fn", (24, 16384))
+        assert not _should_quantize_tensor("model.layers.0.hc_head.fn", (4, 16384))
+        assert not _should_quantize_tensor(
+            "model.layers.0.attn.compressor.ape", (4, 1024)
+        )
+        assert not _should_quantize_tensor("mtp.0.hc_head.base", (4, 16384))
+
+    def test_weight_tensors_still_quantized(self):
+        assert _should_quantize_tensor("model.layers.0.attn.wq_a.weight", (1024, 4096))
+        assert _should_quantize_tensor("lm_head.weight", (1024, 4096))
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestBuildQuantPlanFixedOverrides:
+    def _shapes(self):
+        # The routed expert dominates the params so non-expert boosts fit
+        # comfortably under the hard bpw cap.
+        return {
+            "model.layers.0.self_attn.q_proj": (64, 64),
+            "model.layers.0.ffn.switch_mlp.gate_proj": (256, 64, 64),
+        }
+
+    def _config(self):
+        return {
+            "num_hidden_layers": 1,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0},
+        }
+
+    def test_fixed_paths_excluded_from_boosts(self):
+        fixed = {
+            "model.layers.0.self_attn.q_proj": {
+                "bits": 8,
+                "group_size": 32,
+                "mode": "mxfp8",
+            }
+        }
+        baseline = _build_quant_plan(
+            self._shapes(), self._config(), 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        assert "model.layers.0.self_attn.q_proj" in baseline.boost_map
+        plan = _build_quant_plan(
+            self._shapes(),
+            self._config(),
+            4,
+            target_bpw=4.6,
+            hard_cap_bpw=4.7,
+            fixed_overrides=fixed,
+        )
+        assert "model.layers.0.self_attn.q_proj" not in plan.boost_map
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestEstimateBpwHeaderOnly:
+    def _make_model_dir(self, tmp_path, with_mtp=False):
+        d = tmp_path / "model"
+        d.mkdir()
+        tensors = {}
+        _write_fp4_pair(tensors, "layers.0.ffn.experts.0.w1", 8, 64)
+        w = np.random.randint(0, 255, (64, 64), dtype=np.uint8)
+        s = np.full((1, 2), 127, dtype=np.uint8)
+        tensors["layers.0.attn.wq_a.weight"] = (w.tobytes(), [64, 64], "F8_E4M3")
+        tensors["layers.0.attn.wq_a.scale"] = (s.tobytes(), [1, 2], "F8_E8M0")
+        if with_mtp:
+            tensors["mtp.0.e_proj.weight"] = (w.tobytes(), [64, 64], "F8_E4M3")
+            tensors["mtp.0.e_proj.scale"] = (s.tobytes(), [1, 2], "F8_E8M0")
+        _write_safetensors(str(d / "model.safetensors"), tensors)
+        config = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 1,
+            "quantization_config": {"quant_method": "fp8"},
+        }
+        (d / "config.json").write_text(json.dumps(config))
+        index = {
+            "metadata": {},
+            "weight_map": {k: "model.safetensors" for k in tensors},
+        }
+        (d / "model.safetensors.index.json").write_text(json.dumps(index))
+        return d
+
+    def test_fp8_source_estimates_without_mx_load(self, tmp_path):
+        """F8_E8M0 scales crash mx.load; the header-only scan must not."""
+        d = self._make_model_dir(tmp_path)
+        result = estimate_bpw_and_size(str(d), 8)
+        # fp4 expert passthrough: 8x64 logical at 4 bits + 1B e8m0 per group.
+        expert_bytes = (8 * 64 * 4) // 8 + 8 * (64 // 32)
+        # fp8 attn passthrough: 64x64 at 8 bits + 1B e8m0 per group.
+        attn_bytes = 64 * 64 + 64 * (64 // 32)
+        assert result["output_size_bytes"] == expert_bytes + attn_bytes
+        assert result["effective_bpw"] > 0
+
+    def test_preserve_mtp_counts_protected_fp8_as_bf16(self, tmp_path):
+        d = self._make_model_dir(tmp_path, with_mtp=True)
+        without = estimate_bpw_and_size(str(d), 8, preserve_mtp=False)
+        with_mtp = estimate_bpw_and_size(str(d), 8, preserve_mtp=True)
+        # e_proj is MTP-protected -> full precision bf16 in the output.
+        assert (
+            with_mtp["output_size_bytes"] - without["output_size_bytes"]
+            == 64 * 64 * 2
+        )
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -2837,3 +3252,105 @@ class TestPrecomputedSensitivityMap:
 
         with pytest.raises(expected_exc, match=expected_match or ".*"):
             quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestReplayChainGuards:
+    """Chained transforms (only the last is tracked) must fall back to
+    eager sanitize instead of silently mis-replaying."""
+
+    def _idx(self, tmp_path):
+        path = str(tmp_path / "w.safetensors")
+        _write_safetensors(
+            path,
+            {"w.weight": np.arange(32, dtype=np.float16).reshape(4, 8)},
+        )
+        return _LazyTensorIndex([path])
+
+    def test_reshape_then_astype_falls_back(self, tmp_path):
+        idx = self._idx(tmp_path)
+
+        def sanitize(weights):
+            out = dict(weights)
+            out["w.weight"] = out["w.weight"].reshape(2, 2, -1).astype(mx.int32)
+            return out
+
+        with pytest.raises(ValueError, match="shape-changing"):
+            _discover_sanitize_plan(sanitize, idx)
+
+    def test_astype_then_reshape_falls_back(self, tmp_path):
+        idx = self._idx(tmp_path)
+
+        def sanitize(weights):
+            out = dict(weights)
+            out["w.weight"] = out["w.weight"].astype(mx.int32).reshape(2, 2, -1)
+            return out
+
+        with pytest.raises(ValueError, match="dtype-changing"):
+            _discover_sanitize_plan(sanitize, idx)
+
+
+# =============================================================================
+# End-to-end: oQ2.5 half-level
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQuantizeOqStreamingOq25:
+    def test_oq25_end_to_end_synthetic_moe(self, tmp_path):
+        """oQ2.5 output: 2-bit affine base with routed expert down_proj
+        protected at 3-bit via the mandatory half-level boost."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        h = 128
+        np_save(
+            {
+                "model.layers.0.mlp.switch_mlp.down_proj.weight": np.random.randn(
+                    8, h, h
+                ).astype(np.float32),
+                "model.layers.0.mlp.switch_mlp.gate_proj.weight": np.random.randn(
+                    8, h, h
+                ).astype(np.float32),
+                "model.layers.0.self_attn.q_proj.weight": np.random.randn(
+                    h, h
+                ).astype(np.float32),
+                "model.layers.0.input_layernorm.weight": np.ones(h, dtype=np.float32),
+            },
+            str(src / "model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_oq25",
+                    "num_hidden_layers": 1,
+                    "hidden_size": h,
+                    "num_experts": 8,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=2.5)
+
+        config = json.loads((out / "config.json").read_text())
+        q = config["quantization"]
+        assert q["bits"] == 2
+        assert q["group_size"] == 64
+        assert q["mode"] == "affine"
+        down = q.get("model.layers.0.mlp.switch_mlp.down_proj")
+        assert down is not None
+        assert down["bits"] == 3
+
+        tensors = {}
+        for sf in out.glob("*.safetensors"):
+            tensors.update(mx.load(str(sf)))
+        assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
+        assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors

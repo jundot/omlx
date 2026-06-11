@@ -493,7 +493,7 @@
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",
   "modal.model_settings.mtp_conflict_dflash": "Disable DFlash first.",
   "modal.model_settings.mtp_conflict_turboquant": "Disable TurboQuant KV first.",
-  "modal.model_settings.vlm_mtp": "VLM MTP (实验性)",
+  "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "通过外部 MTP drafter 模型进行推测解码（支持 Gemma 4 assistant 和 Qwen MTP）。单请求约 1.3–1.6× 加速；并发请求回退到标准批处理。",
   "modal.model_settings.vlm_mtp_conflict": "请先禁用 DFlash / SpecPrefill / MTP / TurboQuant KV — VLM MTP 独占推测解码路径。",
   "modal.model_settings.vlm_mtp_draft_model": "Drafter 模型",

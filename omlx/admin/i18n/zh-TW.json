@@ -493,7 +493,7 @@
   "modal.model_settings.mtp_conflict": "Disable DFlash and TurboQuant KV first — they patch the same path MTP relies on.",
   "modal.model_settings.mtp_conflict_dflash": "Disable DFlash first.",
   "modal.model_settings.mtp_conflict_turboquant": "Disable TurboQuant KV first.",
-  "modal.model_settings.vlm_mtp": "VLM MTP (experimental)",
+  "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "Speculative decoding via an external MTP drafter model (Gemma 4 assistant or Qwen MTP). ~1.3–1.6× single-request speedup; concurrent eligible requests fall back to standard batching.",
   "modal.model_settings.vlm_mtp_conflict": "Disable DFlash / SpecPrefill / MTP / TurboQuant KV first — VLM MTP owns the speculative decode path.",
   "modal.model_settings.vlm_mtp_draft_model": "Drafter model",

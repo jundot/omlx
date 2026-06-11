@@ -239,6 +239,7 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
+        return_hidden = bool(kwargs.get("return_hidden", False))
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)
@@ -306,6 +307,8 @@ class VLMModelAdapter(nn.Module):
                     self._vlm_model._set_position_state(input_ids)
                 result = self._language_model(input_ids, cache=cache, **kwargs)
 
+        if return_hidden and hasattr(result, "logits"):
+            return result
         if hasattr(result, "logits"):
             return result.logits
         return result

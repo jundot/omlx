@@ -493,7 +493,7 @@
   "modal.model_settings.mtp_conflict": "DFlash 와 TurboQuant KV 를 먼저 끄세요. 같은 경로를 패치하기 때문에 MTP 와 함께 쓸 수 없습니다.",
   "modal.model_settings.mtp_conflict_dflash": "DFlash 를 먼저 비활성화하세요.",
   "modal.model_settings.mtp_conflict_turboquant": "TurboQuant KV 를 먼저 비활성화하세요.",
-  "modal.model_settings.vlm_mtp": "VLM MTP (experimental)",
+  "modal.model_settings.vlm_mtp": "VLM MTP",
   "modal.model_settings.vlm_mtp_hint": "Speculative decoding via an external MTP drafter model (Gemma 4 assistant or Qwen MTP). ~1.3–1.6× single-request speedup; concurrent eligible requests fall back to standard batching.",
   "modal.model_settings.vlm_mtp_conflict": "Disable DFlash / SpecPrefill / MTP / TurboQuant KV first — VLM MTP owns the speculative decode path.",
   "modal.model_settings.vlm_mtp_draft_model": "Drafter model",

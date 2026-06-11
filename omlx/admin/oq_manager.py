@@ -255,7 +255,12 @@ class OQManager:
         Raises:
             ValueError: On invalid inputs or output conflict.
         """
-        from ..oq import OQ_DTYPES, OQ_LEVELS, resolve_output_name
+        from ..oq import (
+            OQ_DTYPES,
+            OQ_LEVELS,
+            _validate_oq_dtype_for_model,
+            resolve_output_name,
+        )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
 
         if oq_level not in OQ_LEVELS:
@@ -268,6 +273,10 @@ class OQManager:
         source = Path(model_path)
         if not source.exists() or not (source / "config.json").exists():
             raise ValueError(f"Model not found: {model_path}")
+
+        with open(source / "config.json") as f:
+            config = json.load(f)
+        _validate_oq_dtype_for_model(config, dtype)
 
         if preserve_mtp and not _checkpoint_has_mtp_weights(source):
             logger.warning(

@@ -491,6 +491,26 @@ class TestLogitsExtraction:
         result = adapter(MockMXArray(shape=(2, 10)), cache=[MagicMock()])
         assert result is lm_output.logits
 
+    def test_return_hidden_preserves_language_model_output(self):
+        """MTP backbone calls must keep hidden_states/gdn_states intact."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        lm_output = MagicMock()
+        lm_output.logits = MockMXArray(shape=(2, 10, 32000))
+        lm_output.hidden_states = [MockMXArray(shape=(2, 10, 128))]
+        lm_output.gdn_states = [{"state": "mock"}]
+        vlm.language_model.return_value = lm_output
+
+        result = adapter(
+            MockMXArray(shape=(2, 10)),
+            cache=[MagicMock()],
+            return_hidden=True,
+        )
+        assert result is lm_output
+
 
 class TestVLMModelAdapterModelProperty:
     """Tests for VLMModelAdapter.model property (for nested access)."""
@@ -506,5 +526,4 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
-
 

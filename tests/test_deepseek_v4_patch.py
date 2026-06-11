@@ -754,3 +754,251 @@ class TestPreLoadDispatch:
         maybe_apply_pre_load_patches(str(tmp_path))
         # Patch must be applied after this dispatch (or already applied).
         assert is_applied() is True
+
+
+class TestMakeQuantizationConfigMtp:
+    """make_quantization_config must cover the MTP fusion projections.
+
+    Without explicit entries, mtp.<i>.e_proj / mtp.<i>.h_proj fall through
+    to the affine default, whose QuantizedLinear expects a .biases tensor
+    the fp8 checkpoint doesn't ship, and strict load fails."""
+
+    def test_mtp_projections_get_mxfp8(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _MTPStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.e_proj = nn.Linear(8, 8, bias=False)
+                self.h_proj = nn.Linear(8, 8, bias=False)
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp = [_MTPStub()]
+                self.lm_head = nn.Linear(8, 8, bias=False)
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+        assert qcfg["mtp.0.e_proj"] == mxfp8
+        assert qcfg["mtp.0.h_proj"] == mxfp8
+        # Non-MTP paths keep the affine default (no per-path entry).
+        assert "lm_head" not in qcfg
+
+    def test_no_mtp_no_entries(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(8, 8, bias=False)
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        assert not any(k.startswith("mtp.") for k in qcfg)
+
+
+class TestMtpSanitizeWoAReshape:
+    """The MTP patch sanitize must reshape mtp.<i>.block.attn.wo_a from the
+    2D nn.Linear layout to the 3D MultiLinear layout, like the backbone."""
+
+    @pytest.fixture()
+    def patched_sanitize(self, applied_patch):
+        import omlx.patches.mlx_lm_mtp.deepseek_v4_model as mtp_dsv4
+
+        mtp_dsv4.apply()
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        return dsv4.Model.sanitize
+
+    @staticmethod
+    def _fake_model(with_mtp=True):
+        class _Args:
+            num_hidden_layers = 1
+            num_nextn_predict_layers = 1
+            o_groups = 2
+            o_lora_rank = 4
+            n_routed_experts = 2
+
+        class _Fake:
+            args = _Args()
+
+        fake = _Fake()
+        if with_mtp:
+            fake.mtp = [object()]
+        return fake
+
+    def test_mtp_wo_a_2d_reshaped_to_3d(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.attn.wo_a.weight": mx.zeros((8, 16), dtype=mx.bfloat16),
+        }
+        out = patched_sanitize(self._fake_model(), weights)
+        assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+    def test_mtp_wo_a_3d_unchanged(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.block.attn.wo_a.weight": mx.zeros((2, 4, 16), dtype=mx.bfloat16),
+        }
+        out = patched_sanitize(self._fake_model(), weights)
+        assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+
+class TestMtpBackboneInterface:
+    """The patched DSv4 Model.__call__ must accept the full patched-backbone
+    interface — batch_generator._call_backbone passes n_confirmed=1 during
+    MTP verify cycles (crashed with TypeError before the fix)."""
+
+    def test_call_accepts_n_confirmed(self, applied_patch):
+        import omlx.patches.mlx_lm_mtp.deepseek_v4_model as mtp_dsv4
+
+        mtp_dsv4.apply()
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        sig = inspect.signature(dsv4.Model.__call__)
+        assert "n_confirmed" in sig.parameters
+        assert sig.parameters["n_confirmed"].default == 0
+        assert "return_hidden" in sig.parameters
+
+
+class TestPoolingCacheTrimRollback:
+    """trim(1) must exactly undo the last (draft) token of an MTP verify
+    update, including the pool-boundary case where the draft completed a
+    compression window. Equivalence is checked behaviorally: a trimmed
+    cache must evolve identically to a reference cache that never saw the
+    rejected token."""
+
+    @staticmethod
+    def _push(cache, tokens, offset):
+        """Feed raw per-token rows through the PoolingCache contract,
+        compressing completed windows with a deterministic stand-in
+        (mean over the window) like Compressor does."""
+        import mlx.core as mx
+
+        kv = tokens
+        gate = tokens * 0.5
+        r_kv, _r_gate, _ = cache.accumulate_windows(kv, gate, offset)
+        if r_kv.size == 0:
+            rows = mx.zeros((kv.shape[0], 0, kv.shape[-1]), dtype=kv.dtype)
+        else:
+            rows = mx.unflatten(r_kv, 1, (-1, cache.ratio)).mean(axis=2)
+        return cache.update_and_fetch(rows)
+
+    @staticmethod
+    def _tok(values):
+        import mlx.core as mx
+
+        arr = mx.array(values, dtype=mx.float32)
+        return mx.broadcast_to(arr[None, :, None], (1, len(values), 8))
+
+    def _equivalence(self, cache_cls, prefix, verify, post, applied):
+        """Drive cache through prefix + 2-token verify, trim the draft,
+        push `post`; compare against a reference that never saw the draft."""
+        import mlx.core as mx
+
+        ratio = 4
+        if cache_cls.__name__ == "BatchPoolingCache":
+            cache = cache_cls(ratio, [0])
+            ref = cache_cls(ratio, [0])
+        else:
+            cache = cache_cls(ratio)
+            ref = cache_cls(ratio)
+
+        pos = 0
+        for chunk in prefix:
+            self._push(cache, self._tok(chunk), pos)
+            self._push(ref, self._tok(chunk), pos)
+            pos += len(chunk)
+
+        # Verify forward: [confirmed, draft] on cache; confirmed only on ref.
+        self._push(cache, self._tok(verify), pos)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        self._push(ref, self._tok(verify[:1]), pos)
+        pos += 1
+
+        out = self._push(cache, self._tok(post), pos)
+        ref_out = self._push(ref, self._tok(post), pos)
+
+        if out is None or getattr(out, "size", 0) == 0:
+            assert ref_out is None or getattr(ref_out, "size", 0) == 0
+        else:
+            pl = getattr(cache, "_pool_lengths", None)
+            n = pl[0] if pl is not None else out.shape[1]
+            ref_n = (
+                ref._pool_lengths[0]
+                if pl is not None
+                else ref_out.shape[1]
+            )
+            assert n == ref_n
+            assert mx.allclose(out[:, :n], ref_out[:, :n]).item()
+        assert (
+            cache.remainder if isinstance(cache.remainder, int)
+            else list(cache.remainder)
+        ) == (
+            ref.remainder if isinstance(ref.remainder, int)
+            else list(ref.remainder)
+        )
+
+    def test_easy_case_draft_in_buffer(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # After verify: remainder = (1 + 2) % 4 = 3 >= 1 -> buffer trim.
+        self._equivalence(PoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch)
+
+    def test_boundary_case_draft_completed_window(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # remainder before verify = 2; verify adds 2 -> window completes on
+        # the draft token -> undo log path (drop pooled row, replay
+        # confirmed into the buffer).
+        self._equivalence(
+            PoolingCache, [[1.0, 2.0]], [3.0, 4.0], [5.0, 6.0, 7.0], applied_patch
+        )
+
+    def test_boundary_case_with_existing_pool(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # One full window already pooled, then the boundary case again.
+        self._equivalence(
+            PoolingCache,
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]],
+            [7.0, 8.0],
+            [9.0, 10.0, 11.0],
+            applied_patch,
+        )
+
+    def test_batch_easy_case(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(
+            BatchPoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch
+        )
+
+    def test_batch_boundary_case(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(
+            BatchPoolingCache,
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]],
+            [7.0, 8.0],
+            [9.0, 10.0, 11.0],
+            applied_patch,
+        )
+
+    def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
+        """Prompt-sized updates (L > 2) don't stash an undo log; a trim at
+        a pool boundary right after one must report not-trimmable instead
+        of corrupting state."""
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(4)
+        self._push(cache, self._tok([1.0, 2.0, 3.0, 4.0]), 0)
+        assert cache.remainder == 0
+        assert cache.pooled is not None
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0

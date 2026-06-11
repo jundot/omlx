@@ -158,3 +158,24 @@ class TestOQManagerMtpDetection:
 
         assert task.preserve_mtp is False
         assert task.output_name == "QwenPawLike-oQ4"
+
+
+class TestOQManagerDtypeSupport:
+    @pytest.mark.asyncio
+    async def test_start_quantization_rejects_deepseek_v4_float16(self, tmp_path):
+        root = tmp_path / "models"
+        root.mkdir()
+        model = root / "DeepSeek-V4-Flash"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4"}),
+            encoding="utf-8",
+        )
+
+        manager = OQManager(model_dirs=[str(root)])
+
+        with pytest.raises(ValueError, match="dtype=float16.*deepseek_v4"):
+            await manager.start_quantization(str(model), 4, dtype="float16")
+
+        assert manager._tasks == {}
+        assert not (root / "DeepSeek-V4-Flash-oQ4-fp16").exists()

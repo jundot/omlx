@@ -76,6 +76,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from . import cache_rollback as _rollback_mod
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -978,7 +980,20 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
     KV cache layers (full-attention) expose ``trim`` and ``is_trimmable``;
     we trim by 1. Layers that support neither cause the entire MTP step to
     fall back to the standard path.
+
+    All layers are checked before anything is mutated: a partial rollback
+    (early layers trimmed, a later layer refusing) leaves per-layer KV
+    lengths desynchronised by one position and corrupts every subsequent
+    forward (the shared attention mask is built from the first layer's
+    cache, so the mismatch surfaces as a broadcast error on DeepSeek-V4
+    compressed-attention layers).
     """
+    for c in prompt_cache:
+        if getattr(c, "rollback_state", None) is not None:
+            continue
+        if hasattr(c, "is_trimmable") and c.is_trimmable():
+            continue
+        return False
     for c in prompt_cache:
         rollback = getattr(c, "rollback_state", None)
         if rollback is not None:
@@ -987,10 +1002,7 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
             c[1] = ssm_snap
             c.rollback_state = None
             continue
-        if hasattr(c, "is_trimmable") and c.is_trimmable():
-            c.trim(1)
-            continue
-        return False
+        c.trim(1)
     return True
 
 
@@ -1047,11 +1059,20 @@ def _call_backbone(
     ``n_confirmed`` is forwarded so the mlx-lm path can split its
     GatedDeltaNet forward into confirmed and draft chunks. mlx-vlm
     discards it (irrelevant — rollback is post-hoc, not splitwise).
+
+    The rotating-cache undo stash (cache_rollback) is armed for the
+    duration of the forward so a rejected draft can be rolled back even on
+    a rotated RotatingKVCache; non-MTP forwards keep stock trim semantics.
     """
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    result = model(inputs, **kwargs)
+    _rollback_mod.set_undo_armed(True)
+    try:
+        result = model(inputs, **kwargs)
+    finally:
+        _rollback_mod.set_undo_armed(False)
+
     # LanguageModelOutput (mlx-vlm dataclass)
     if hasattr(result, "logits") and hasattr(result, "hidden_states"):
         hidden = result.hidden_states
@@ -1067,10 +1088,15 @@ def _call_backbone(
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
-    """Drop ``rollback_state`` snapshots after a draft is accepted."""
+    """Drop rollback snapshots after a draft is accepted."""
     for c in prompt_cache:
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
             c.rollback_state = None
+        if getattr(c, "_mtp_undo", None) is not None:
+            c._mtp_undo = None
+        for sub in getattr(c, "caches", ()):
+            if getattr(sub, "_mtp_undo", None) is not None:
+                sub._mtp_undo = None
 
 
 def _ensure_uint32(arr):

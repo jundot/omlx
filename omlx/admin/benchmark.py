@@ -735,11 +735,12 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Snapshot experimental flags at run start. Settings can change mid-run,
         # and the produced numbers are tied to whatever was active when
         # generation actually ran.
+        model_settings = None
         sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
             try:
-                s = sm.get_settings(request.model_id)
-                run.experimental_features.extend(_detect_experimental_features(s))
+                model_settings = sm.get_settings(request.model_id)
+                run.experimental_features.extend(_detect_experimental_features(model_settings))
             except Exception as e:
                 logger.warning(
                     f"Benchmark: failed to read experimental flags for "
@@ -771,7 +772,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             "current": 0,
             "total": total_tests,
         })
-        engine = await engine_pool.get_engine(request.model_id, force_lm=True)
+        # VLM MTP requires VLMBatchedEngine (which has set_vlm_mtp_drafter),
+        # so don't force LM-only loading when VLM MTP is enabled.
+        vlm_mtp_active = (
+            model_settings is not None
+            and getattr(model_settings, "vlm_mtp_enabled", False)
+            and getattr(model_settings, "vlm_mtp_draft_model", None)
+        )
+        engine = await engine_pool.get_engine(
+            request.model_id, force_lm=not vlm_mtp_active
+        )
         logger.info(f"Benchmark: loaded {request.model_id}")
 
         # Generate prompts for all needed lengths
