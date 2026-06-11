@@ -136,6 +136,176 @@ class HarmonyOutputParserSession:
         )
 
 
+_COHERE_COMMAND_MODEL_TYPES = {"cohere2_moe", "cohere2_vision"}
+_COHERE_END_OF_TURN_TOKEN = "<|END_OF_TURN_TOKEN|>"
+
+
+def _is_cohere_command_model(
+    model_name: str,
+    model_config: dict[str, Any] | None = None,
+) -> bool:
+    if model_config is not None:
+        model_type = str(model_config.get("model_type") or "").lower()
+        if model_type in _COHERE_COMMAND_MODEL_TYPES:
+            return True
+
+    name = (model_name or "").lower()
+    return "north-mini-code" in name or "command-a-plus" in name
+
+
+def _make_cohere_command_filter():
+    try:
+        from cohere_melody import PyFilter, PyFilterOptions
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Cohere Command/North response parsing requires "
+            "cohere_melody>=0.9.0. Install or sync oMLX dependencies."
+        ) from exc
+
+    return PyFilter(PyFilterOptions().cmd4().stream_tool_actions())
+
+
+def _cohere_stop_token_ids(tokenizer: Any) -> set[int]:
+    ids: set[int] = set()
+
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        try:
+            token_id = convert(_COHERE_END_OF_TURN_TOKEN)
+            if isinstance(token_id, int) and token_id >= 0:
+                ids.add(token_id)
+        except Exception:
+            pass
+
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        try:
+            encoded = encode(_COHERE_END_OF_TURN_TOKEN, add_special_tokens=False)
+        except TypeError:
+            try:
+                encoded = encode(_COHERE_END_OF_TURN_TOKEN)
+            except Exception:
+                encoded = None
+        except Exception:
+            encoded = None
+        if encoded:
+            ids.update(int(token_id) for token_id in encoded)
+
+    return ids
+
+
+class CohereCommandOutputParserSession:
+    """Parser session backed by Cohere's Melody parser for Command 4 markup."""
+
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
+        self._tokenizer = tokenizer
+        self._filter = _make_cohere_command_filter()
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+        self._thinking_open = False
+        self._thinking_started = False
+        self._tool_calls: dict[int, dict[str, str]] = {}
+        self._stop_token_ids = _cohere_stop_token_ids(tokenizer)
+
+    @staticmethod
+    def _is_special_token(text: str) -> bool:
+        return text.startswith("<|") and text.endswith("|>")
+
+    def _decode_token(self, token_id: int) -> str:
+        decoded = ""
+        try:
+            decoded = self._tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            decoded = self._tokenizer.decode([token_id])
+        except Exception:
+            decoded = ""
+
+        if decoded and self._is_special_token(decoded):
+            return decoded
+
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+
+        return decoded
+
+    def _remember_tool_calls(self, result: Any) -> None:
+        for call in getattr(result, "tool_calls", []) or []:
+            try:
+                index = int(getattr(call, "index", len(self._tool_calls)))
+            except Exception:
+                index = len(self._tool_calls)
+            call_id = str(getattr(call, "id", "") or f"call_{index}")
+            name = str(getattr(call, "name", "") or "")
+            arguments = str(getattr(call, "arguments", "") or "")
+            self._tool_calls[index] = {
+                "id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }
+
+    def _format_result(self, result: Any) -> tuple[str, str]:
+        self._remember_tool_calls(result)
+
+        text = []
+        reasoning = getattr(result, "reasoning", None)
+        content = getattr(result, "content", None)
+
+        if reasoning:
+            if not self._thinking_open:
+                text.append("<think>\n")
+                self._thinking_open = True
+                self._thinking_started = True
+            text.append(str(reasoning))
+
+        if content:
+            if self._thinking_open:
+                text.append("</think>\n")
+                self._thinking_open = False
+            text.append(str(content))
+
+        out = "".join(text)
+        return out, out
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        decoded = self._decode_token(token_id)
+        if token_id in self._stop_token_ids or decoded == _COHERE_END_OF_TURN_TOKEN:
+            return OutputParserTokenResult(
+                is_stop=True,
+                record_token=False,
+            )
+
+        if not decoded:
+            return OutputParserTokenResult(record_token=True)
+
+        result = self._filter.write_decoded(decoded)
+        stream_text, visible_text = self._format_result(result)
+        return OutputParserTokenResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            record_token=True,
+        )
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        result = self._filter.flush_partials()
+        stream_text, visible_text = self._format_result(result)
+
+        if self._thinking_open and self._thinking_started:
+            stream_text += "</think>"
+            visible_text += "</think>"
+            self._thinking_open = False
+
+        tool_calls = [self._tool_calls[index] for index in sorted(self._tool_calls)]
+        return OutputParserFinalizeResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else None,
+        )
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -154,6 +324,18 @@ def detect_output_parser(
             stop_token_ids=temp_parser.get_stop_token_ids(),
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
+        )
+
+    if _is_cohere_command_model(model_name, model_config):
+        return OutputParserFactory(
+            kind="cohere_command4",
+            create_session=lambda session_tokenizer: CohereCommandOutputParserSession(
+                session_tokenizer,
+                model_path=model_name,
+            ),
+            stop_token_ids=_cohere_stop_token_ids(tokenizer),
+            thinking_end_text="<|END_THINKING|>",
+            thinking_end_trailing_text="<|START_TEXT|>",
         )
 
     if is_gemma4_model(model_name, model_config):

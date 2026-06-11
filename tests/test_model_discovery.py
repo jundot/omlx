@@ -2,7 +2,6 @@
 """Tests for model discovery functionality."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -150,6 +149,19 @@ class TestDetectModelType:
         config = {
             "model_type": "lfm2_moe",
             "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
+    def test_detect_north_mini_code_cohere2_moe_as_llm(self, tmp_path):
+        """North Mini Code is text-only despite the HF repo pipeline tag."""
+        llm_dir = tmp_path / "North-Mini-Code-1.0-bf16"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "cohere2_moe",
+            "architectures": ["Cohere2MoeForCausalLM"],
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
         }
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"

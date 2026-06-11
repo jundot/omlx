@@ -77,6 +77,8 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
+    # Cohere Command/North response parser (reasoning + tool-action markers)
+    "cohere_melody>=0.9.0",
     # mlx-vlm from commit (c9a6743, main) — includes Gemma4 shared-KV/load fixes,
     # Qwen quantized KV cache prompt-state fixes, Qwen3-VL visual mask/deepstack
     # chunked-prefill fixes, Phi 3.5 VL EOS fixes, and speculative prefill fixes.

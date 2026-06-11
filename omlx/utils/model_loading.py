@@ -141,6 +141,12 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
+    if model_type == "cohere2_moe":
+        from ..patches.cohere2_moe import apply_cohere2_moe_patch
+
+        if apply_cohere2_moe_patch():
+            logger.info("Cohere2 MoE pre-load patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None

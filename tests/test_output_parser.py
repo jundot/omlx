@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+from collections import deque
+from types import SimpleNamespace
 
+from omlx.adapter import output_parser as output_parser_mod
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.adapter.output_parser import detect_output_parser
@@ -51,6 +54,62 @@ class HarmonyTokenizer:
     @property
     def detokenizer(self):
         return FakeDetokenizer(lambda token_id: self._encoding.decode([token_id]))
+
+
+class CohereCommandTokenizer:
+    def __init__(self, token_map: dict[int, str]):
+        self._token_map = token_map
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        for token_id, text in self._token_map.items():
+            if text == token:
+                return token_id
+        return -1
+
+    def encode(self, text, add_special_tokens: bool = False):
+        return [
+            token_id
+            for token_id, token_text in self._token_map.items()
+            if token_text == text
+        ]
+
+    def decode(self, token_ids, skip_special_tokens: bool = False):
+        return "".join(self._token_map[token_id] for token_id in token_ids)
+
+
+class _QueuedMelodyFilter:
+    def __init__(self, results):
+        self.results = deque(results)
+        self.decoded = []
+        self.flushed = False
+
+    def write_decoded(self, decoded_text: str):
+        self.decoded.append(decoded_text)
+        if self.results:
+            return self.results.popleft()
+        return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+    def flush_partials(self):
+        self.flushed = True
+        return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+
+def _melody_result(content=None, reasoning=None, tool_calls=None):
+    return SimpleNamespace(
+        content=content,
+        reasoning=reasoning,
+        tool_calls=tool_calls or [],
+    )
+
+
+def _patch_cohere_filter(monkeypatch, results):
+    queued = _QueuedMelodyFilter(results)
+    monkeypatch.setattr(
+        output_parser_mod,
+        "_make_cohere_command_filter",
+        lambda: queued,
+    )
+    return queued
 
 
 def _write_json(path, data):
@@ -380,3 +439,79 @@ class TestOutputParserFactory:
         thinking, content = extract_thinking(output_text)
         assert thinking == "Let me think about this"
         assert content == "Four"
+
+    def test_detects_cohere2_moe_by_config(self):
+        tokenizer = CohereCommandTokenizer({4: "<|END_OF_TURN_TOKEN|>"})
+        factory = detect_output_parser(
+            "mlx-community/North-Mini-Code-1.0-bf16",
+            tokenizer,
+            {"model_type": "cohere2_moe"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "cohere_command4"
+        assert factory.stop_token_ids == {4}
+        assert factory.thinking_end_text == "<|END_THINKING|>"
+
+
+class TestCohereCommandOutputParserSession:
+    def test_streams_reasoning_and_content_as_think_envelope(self, monkeypatch):
+        queued = _patch_cohere_filter(
+            monkeypatch,
+            [
+                _melody_result(reasoning="Plan"),
+                _melody_result(reasoning=" more"),
+                _melody_result(content="Answer"),
+            ],
+        )
+        tokenizer = CohereCommandTokenizer({1: "a", 2: "b", 3: "c"})
+        session = output_parser_mod.CohereCommandOutputParserSession(tokenizer)
+
+        stream = []
+        visible = []
+        for token_id in [1, 2, 3]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert queued.decoded == ["a", "b", "c"]
+        assert queued.flushed is True
+        assert "".join(stream) == "<think>\nPlan more</think>\nAnswer"
+        assert "".join(visible) == "<think>\nPlan more</think>\nAnswer"
+
+    def test_converts_melody_tool_calls_on_finalize(self, monkeypatch):
+        tool_call = SimpleNamespace(
+            index=0,
+            id="call_0",
+            name="run_command",
+            arguments='{"cmd":"pwd"}',
+        )
+        _patch_cohere_filter(
+            monkeypatch,
+            [_melody_result(tool_calls=[tool_call])],
+        )
+        tokenizer = CohereCommandTokenizer({1: "tool"})
+        session = output_parser_mod.CohereCommandOutputParserSession(tokenizer)
+
+        result = session.process_token(1)
+        final = session.finalize()
+
+        assert result.stream_text == ""
+        assert result.visible_text == ""
+        assert final.tool_calls == [
+            {"id": "call_0", "name": "run_command", "arguments": '{"cmd":"pwd"}'}
+        ]
+        assert final.finish_reason == "tool_calls"
+
+    def test_end_of_turn_token_stops_without_recording(self, monkeypatch):
+        _patch_cohere_filter(monkeypatch, [_melody_result()])
+        tokenizer = CohereCommandTokenizer({4: "<|END_OF_TURN_TOKEN|>"})
+        session = output_parser_mod.CohereCommandOutputParserSession(tokenizer)
+
+        result = session.process_token(4)
+
+        assert result.is_stop is True
+        assert result.record_token is False
