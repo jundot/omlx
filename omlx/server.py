@@ -368,9 +368,11 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
         enforcer.start()
 
-    # Video job manager -- constructed AFTER the enforcer so the memory
-    # lease can be constructor-injected (testability seam, spec 4.2).
-    # Cheap when video is disabled: no worker spawns until a job arrives.
+    # Media job manager (video + image) -- constructed AFTER the enforcer
+    # so the memory lease can be constructor-injected (testability seam,
+    # spec 4.2). One manager dispatches both kinds: the enforcer holds at
+    # most one lease, so cross-kind serialization is mandatory. Cheap when
+    # both engines are disabled: no worker spawns until a job arrives.
     if _server_state.global_settings is not None:
         from .video.manager import VideoJobManager
 
@@ -379,9 +381,12 @@ async def lifespan(app: FastAPI):
                 settings=_server_state.global_settings.video,
                 base_path=_server_state.global_settings.base_path,
                 enforcer=_server_state.process_memory_enforcer,
+                image_settings=getattr(
+                    _server_state.global_settings, "image", None
+                ),
             )
         except Exception as e:  # noqa: BLE001 -- never block serving on video
-            logger.warning(f"Video job manager unavailable: {e}")
+            logger.warning(f"Media job manager unavailable: {e}")
             _server_state.video_job_manager = None
 
     # Start TTL-only checker if process memory enforcer is not running
@@ -478,6 +483,11 @@ except ImportError:
 # gates on settings.video.enabled / manager presence / worker venv instead.
 from .api.video_routes import router as video_router
 app.include_router(video_router, dependencies=[Depends(verify_api_key)])
+
+# Image routes follow the same unconditional-mount discipline; handlers
+# gate on settings.image.enabled / manager presence / worker venv.
+from .api.image_routes import router as image_router
+app.include_router(image_router, dependencies=[Depends(verify_api_key)])
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -723,9 +733,9 @@ async def get_engine(
     # Resolve alias to real model_id
     model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
 
-    # Video models are job-managed; reject BEFORE pool.get_engine so the
-    # 42GB entry never enters the admission/eviction loop (a misrouted
-    # chat request must not evict resident LLMs). Spec section 3.
+    # Video/image models are job-managed; reject BEFORE pool.get_engine so
+    # the multi-GB entry never enters the admission/eviction loop (a
+    # misrouted chat request must not evict resident LLMs). Spec section 3.
     _entry = pool.get_entry(model_id)
     _mtype = getattr(_entry, "model_type", "") if _entry is not None else ""
     if _mtype == "video":
@@ -734,6 +744,14 @@ async def get_engine(
             detail=(
                 f"Model '{model_id}' is a video generation model. "
                 "Use POST /v1/videos."
+            ),
+        )
+    if _mtype == "image":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{model_id}' is an image generation model. "
+                "Use POST /v1/images."
             ),
         )
     if _mtype == "video_upscaler":
@@ -1835,9 +1853,9 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
 
 
 def overlay_video_activity(models: list) -> None:
-    """Mark the video model whose worker is currently generating as loaded.
+    """Mark the media model whose worker is currently generating as loaded.
 
-    Video models are never pool-loaded (entry.engine stays None), so
+    Video/image models are never pool-loaded (entry.engine stays None), so
     get_status() reports them unloaded even mid-generation. The status
     surfaces (and the admin UI fed by them) overlay the job manager's
     live state instead. Also used by admin /api/models.
@@ -1852,9 +1870,14 @@ def overlay_video_activity(models: list) -> None:
     if not active:
         return
     for m in models:
-        if m.get("id") == active and m.get("model_type") == "video":
+        if m.get("id") != active:
+            continue
+        if m.get("model_type") == "video":
             m["loaded"] = True
             m["video_generating"] = True
+        elif m.get("model_type") == "image":
+            m["loaded"] = True
+            m["image_generating"] = True
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -1882,15 +1905,16 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     entry = _server_state.engine_pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
-    if entry.model_type in ("video", "video_upscaler"):
+    if entry.model_type in ("video", "video_upscaler", "image"):
         # Pre-pool check: the blanket except below would swallow the typed
         # rejection into a 500 (spec 4.1).
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Model '{model_id}' is a {entry.model_type} model and is "
-                "never pool-loaded. Video models run via POST /v1/videos; "
-                "the upscaler runs via its upscale_resolution parameter."
+                "never pool-loaded. Video models run via POST /v1/videos, "
+                "image models via POST /v1/images; the upscaler runs via "
+                "its upscale_resolution parameter."
             ),
         )
     if entry.engine is not None:

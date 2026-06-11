@@ -54,13 +54,15 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts", "video", "video_upscaler", "image"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     video_pipeline: str = ""  # "t2v" | "i2v" | "ti2v" for video models, else ""
+    image_pipeline: str = ""  # "t2i" | "edit" for image models, else ""
+    image_alias: str = ""  # mflux ModelConfig alias for image models, else ""
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -179,6 +181,8 @@ class EnginePool:
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
                     video_pipeline=getattr(info, "video_pipeline", ""),
+                    image_pipeline=getattr(info, "image_pipeline", ""),
+                    image_alias=getattr(info, "image_alias", ""),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -213,6 +217,7 @@ class EnginePool:
         "audio_sts": "audio_sts",
         "video": "video",
         "video_upscaler": "video_upscaler",
+        "image": "image",
     }
 
     def apply_settings_overrides(
@@ -341,12 +346,12 @@ class EnginePool:
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
 
-            # Video models are job-managed (POST /v1/videos) and never
-            # pool-loaded. Reject BEFORE the admission loop below -- letting
-            # a 42GB video entry into admission would evict resident LLM
-            # engines before failing (docs/video-generation-engine-spec.md
-            # section 3).
-            if entry.model_type in ("video", "video_upscaler"):
+            # Video/image models are job-managed (POST /v1/videos,
+            # POST /v1/images) and never pool-loaded. Reject BEFORE the
+            # admission loop below -- letting a 42GB video entry into
+            # admission would evict resident LLM engines before failing
+            # (docs/video-generation-engine-spec.md section 3).
+            if entry.model_type in ("video", "video_upscaler", "image"):
                 raise ModelTypeNotLoadableError(model_id, entry.model_type)
 
             # Already loaded - just update access time
@@ -674,10 +679,10 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
-                elif entry.engine_type in ("video", "video_upscaler"):
-                    # Defense in depth: get_engine rejects video entries
+                elif entry.engine_type in ("video", "video_upscaler", "image"):
+                    # Defense in depth: get_engine rejects video/image entries
                     # before admission; this arm catches any other caller
-                    # so a diffusers dir never falls into BatchedEngine.
+                    # so a diffusers/mflux dir never falls into BatchedEngine.
                     raise ModelTypeNotLoadableError(model_id, entry.model_type)
                 else:
                     engine = BatchedEngine(
@@ -964,6 +969,8 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "video_pipeline": e.video_pipeline,
+                    "image_pipeline": e.image_pipeline,
+                    "image_alias": e.image_alias,
                     "config_model_type": e.config_model_type,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
