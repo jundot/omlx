@@ -411,3 +411,112 @@ class TestHeterogeneousMergeReproduction:
             bg.next_generated()
 
         bg.close()
+
+
+class TestRowRealignment:
+    """Pin the uid-registry realignment (#1823).
+
+    Stale or offset row slots left by batch extend/filter/split shift every
+    row after them, so a request silently runs another request's — or no —
+    sampler and logits processors. The #1799 normalisation makes the step
+    crash-safe but cannot restore alignment; the chokepoint must realign
+    the positional lists from the per-uid registry."""
+
+    def test_patched_step_realigns_offset_rows_from_registry(self, monkeypatch):
+        """The #1823 probe scenario: three processor slots for two uids.
+
+        A stale leading slot (left by a finished request) offsets every row:
+        the constrained request's processors sit in a slot nothing reads,
+        and its row runs an empty one. Red before the registry realignment
+        (the wrapped step sees the offset rows: uid 2 runs no processors);
+        green after (uid 2's row runs its own sampler and processors).
+        """
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+
+        captured = {}
+
+        def fake_original_step(self):
+            captured["logits_processors"] = list(self.logits_processors)
+            captured["samplers"] = list(self.samplers)
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        def budget_processor(token_context, logits):
+            return logits
+
+        def grammar_processor(token_context, logits):
+            return logits
+
+        sampler_uid2 = object()
+
+        # What the insert sites record: uid 1 is a plain request, uid 2 is
+        # the constrained one (grammar + thinking budget).
+        scheduler._register_uid_rows([1], [None], [[]])
+        scheduler._register_uid_rows(
+            [2], [sampler_uid2], [[budget_processor, grammar_processor]]
+        )
+
+        class FakeModel:
+            pass
+
+        class FakeBatch:
+            model = FakeModel()
+            uids = [1, 2]
+            # Stale leading slot from a finished request: 3 slots, 2 uids.
+            logits_processors = [[], [], [budget_processor, grammar_processor]]
+            samplers = [None, None, sampler_uid2]
+            _next_tokens = None
+
+        batch = FakeBatch()
+        result = scheduler._patched_generation_batch_step(batch)
+
+        assert result == "stepped"
+        # uid 2's row must run ITS processors and sampler, not the offset ones.
+        assert captured["logits_processors"][1] == [
+            budget_processor,
+            grammar_processor,
+        ]
+        assert captured["samplers"][1] is sampler_uid2
+        # Alignment restored: exactly one slot per uid.
+        assert len(batch.logits_processors) == len(batch.uids)
+        assert len(batch.samplers) == len(batch.uids)
+
+    def test_registry_is_bounded(self):
+        """A missed cleanup must never grow the registry unbounded."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        try:
+            for uid in range(scheduler._UID_ROW_REGISTRY_MAX + 100):
+                scheduler._register_uid_rows([uid], [None], [[]])
+            assert len(registry) == scheduler._UID_ROW_REGISTRY_MAX
+            # Oldest entries evicted first.
+            assert 0 not in registry
+            assert scheduler._UID_ROW_REGISTRY_MAX + 99 in registry
+        finally:
+            scheduler._uid_row_registry = original
+
+    def test_scheduler_source_registers_rows_at_insert(self):
+        """Source-level guard: both insert sites must record what each uid
+        is supposed to run, or the chokepoint has nothing to realign from."""
+        from pathlib import Path
+
+        scheduler_src = (
+            Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
+        ).read_text()
+        assert scheduler_src.count("_register_uid_rows(uids") >= 2, (
+            "every batch_generator.insert call site must register the "
+            "per-uid sampler and logits processors; the step chokepoint "
+            "realigns rows from that registry. See #1823."
+        )

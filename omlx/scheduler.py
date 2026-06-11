@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -408,6 +408,30 @@ class _PrefillState:
 # After _original_step returns, self._next_tokens holds the freshly sampled
 # tokens.  We eval them synchronously and accept in grammar processors.
 # ---------------------------------------------------------------------------
+# Authoritative per-uid row state for the generation batch.
+#
+# mlx-lm keeps ``samplers`` / ``logits_processors`` as positional lists that
+# must stay aligned with ``uids``.  Heterogeneous continuous batching
+# (extend/filter/split across prompt and generation batches) can leave stale
+# or offset row slots behind; #1799 made the step crash-safe by normalising
+# ``None`` slots, but a misaligned row silently runs the WRONG sampler and
+# logits processors (e.g. a grammar/thinking-budget request decoding with no
+# constraints at all).  The registry below records, at insert time, what each
+# uid is supposed to run; the step chokepoint realigns the positional lists
+# from it.  Bounded so a missing cleanup can never grow it unbounded.
+_UID_ROW_REGISTRY_MAX = 4096
+_uid_row_registry: "OrderedDict[int, tuple[Any, list]]" = OrderedDict()
+
+
+def _register_uid_rows(uids, samplers, lps_rows) -> None:
+    """Record the sampler and logits processors each freshly-inserted uid must run."""
+    for uid, sampler, lps in zip(uids, samplers, lps_rows):
+        _uid_row_registry[uid] = (sampler, list(lps) if lps else [])
+        _uid_row_registry.move_to_end(uid)
+    while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
+        _uid_row_registry.popitem(last=False)
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -445,6 +469,37 @@ def _patched_generation_batch_step(self):
         self.logits_processors = [
             procs if procs is not None else [] for procs in self.logits_processors
         ]
+
+    # Realign per-row samplers and logits processors with ``uids`` from the
+    # per-uid registry.  Positional drift (stale/offset slots left by batch
+    # extend/filter/split) otherwise makes a row run another request's — or
+    # no — sampler and processors, which silently disables grammar
+    # constraints and thinking budgets under concurrent mixed load.
+    cur_lps = self.logits_processors
+    cur_samplers = getattr(self, "samplers", None) or []
+    new_lps = []
+    new_samplers = []
+    drift = len(cur_lps) != len(self.uids)
+    for i, uid in enumerate(self.uids):
+        entry = _uid_row_registry.get(uid)
+        if entry is not None:
+            sampler, lps = entry
+            if not drift and i < len(cur_lps) and cur_lps[i] is not lps and (cur_lps[i] or lps):
+                drift = drift or (cur_lps[i] != lps)
+            new_samplers.append(sampler)
+            new_lps.append(lps)
+        else:
+            new_samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
+            new_lps.append(cur_lps[i] if i < len(cur_lps) else [])
+    if drift:
+        logger.warning(
+            "Realigned generation-batch row state from the uid registry "
+            f"(uids={list(self.uids)}, had {len(cur_lps)} processor slots); "
+            "stale or offset slots would have run the wrong sampler/processors."
+        )
+    self.logits_processors = new_lps
+    self.samplers = new_samplers
+
 
     result = _original_generation_batch_step(self)
 
@@ -3479,6 +3534,8 @@ class Scheduler:
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
         )
+        if uids:
+            _register_uid_rows(uids, [state.sampler], [per_row_lps])
 
         if uids:
             uid = uids[0]
@@ -7031,6 +7088,8 @@ class Scheduler:
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
+            if uids:
+                _register_uid_rows(uids, [sampler], [per_row_lps])
 
             if uids:
                 uid = uids[0]
