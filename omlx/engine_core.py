@@ -32,31 +32,48 @@ logger = logging.getLogger(__name__)
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
+def _rebind_generation_streams(stream) -> None:
+    """Point every loaded mlx_lm / mlx_vlm / omlx module-global
+    ``generation_stream`` at ``stream``.
+
+    Module globals named ``generation_stream`` are created at import time in
+    whichever thread imported the module first (usually the main thread at
+    server startup). ``from .common import generation_stream`` style imports
+    copy the binding into each importing module's namespace, so patching one
+    canonical module is not enough -- mlx-vlm 0.6.x holds independent bindings
+    in generate/{__init__,common,ar,dispatch,diffusion}, speculative/{common,
+    mtp,eagle3,dflash,utils} and server/generation. A stale binding crashes
+    with "There is no Stream(gpu, N) in current thread" the moment that module
+    runs ``with mx.stream(generation_stream)`` on an engine thread (hit by the
+    vlm_mtp drafter path via mlx_vlm.speculative.mtp). Sweep sys.modules
+    instead of hardcoding the module list so upstream relayouts cannot
+    silently reintroduce the crash.
+    """
+    import sys
+
+    for name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if name == "omlx.scheduler" or name.startswith(("mlx_lm.", "mlx_vlm.")):
+            if getattr(mod, "generation_stream", None) is not None:
+                mod.generation_stream = stream
+
+
 def _init_mlx_thread() -> None:
     """Replace generation_stream with a thread-local stream on the executor thread.
 
-    mlx-lm's module-level ``generation_stream`` is created at import time in
-    whichever thread imported it first (the main thread at server startup).
     Arrays produced inside ``with mx.stream(generation_stream):`` blocks carry
     that stream reference.  If the stream was created on the main thread,
     subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
     thread fail with "There is no Stream(gpu, 0) in current thread".
 
-    Fix: create a thread-local stream HERE and replace the module-level
-    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
+    Fix: create a thread-local stream HERE and rebind every module-level
+    ``generation_stream`` (see _rebind_generation_streams).
     """
-    import sys
     import mlx.core as mx
 
     stream = mx.new_thread_local_stream(mx.default_device())
-
-    gen_mod = sys.modules.get("mlx_lm.generate")
-    if gen_mod is not None:
-        gen_mod.generation_stream = stream
-
-    sched_mod = sys.modules.get("omlx.scheduler")
-    if sched_mod is not None:
-        sched_mod.generation_stream = stream
+    _rebind_generation_streams(stream)
 
     logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
 
@@ -76,12 +93,10 @@ def _init_engine_mlx_thread(stream) -> None:
        with no active ``with mx.stream(...)`` context (mlx_vlm's _mtp_rounds does
        exactly this) targets the engine stream instead of crashing with
        "There is no Stream(gpu, N) in current thread".
-    2. The module-global ``generation_stream`` on mlx_lm.generate, omlx.scheduler,
-       and mlx_vlm's two speculative/generate modules, so any code that reads the
-       module global at call time also uses the engine stream. mlx_vlm modules
-       are only present in VLM setups -> guard each lookup.
+    2. Every loaded module-global ``generation_stream`` (mlx_lm / mlx_vlm /
+       omlx.scheduler), so any code that reads the module global at call time
+       also uses the engine stream (see _rebind_generation_streams).
     """
-    import sys
     import mlx.core as mx
 
     # Make bare (context-less) MLX ops on this thread use the engine stream.
@@ -90,15 +105,7 @@ def _init_engine_mlx_thread(stream) -> None:
     except Exception:  # noqa: BLE001 - older mlx may lack this; module patch below still helps
         logger.warning("set_default_stream unavailable; relying on module-global patch only")
 
-    for modname in (
-        "mlx_lm.generate",
-        "omlx.scheduler",
-        "mlx_vlm.speculative.utils",
-        "mlx_vlm.generate",
-    ):
-        mod = sys.modules.get(modname)
-        if mod is not None and hasattr(mod, "generation_stream"):
-            mod.generation_stream = stream
+    _rebind_generation_streams(stream)
 
     logger.info(f"Per-engine MLX thread initialized: stream = {stream}")
 
