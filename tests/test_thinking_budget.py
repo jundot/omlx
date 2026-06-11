@@ -430,3 +430,26 @@ class TestResolveThinkingBudget:
         req = MagicMock(spec=[])
         result = resolve(req, None)
         assert result is None
+
+
+class TestCompletionsThinkingBudget:
+    """The /v1/completions surface carries thinking_budget like chat."""
+
+    def test_completion_request_accepts_thinking_budget(self):
+        from omlx.api.openai_models import CompletionRequest
+
+        req = CompletionRequest(model="m", prompt="<think>\n", thinking_budget=300)
+        assert req.thinking_budget == 300
+
+    def test_completion_request_thinking_budget_defaults_to_none(self):
+        from omlx.api.openai_models import CompletionRequest
+
+        req = CompletionRequest(model="m", prompt="p")
+        assert req.thinking_budget is None
+
+    def test_resolve_thinking_budget_reads_completion_request(self):
+        from omlx.api.openai_models import CompletionRequest
+        from omlx.server import _resolve_thinking_budget
+
+        req = CompletionRequest(model="m", prompt="p", thinking_budget=128)
+        assert _resolve_thinking_budget(req, None) == 128
