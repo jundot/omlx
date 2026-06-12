@@ -171,6 +171,7 @@ Configurez les paramètres d'échantillonnage, les kwargs du template de chat, l
 
 - **Alias de modèle** : définissez un nom personnalisé visible par l'API. `/v1/models` retourne l'alias, et les requêtes acceptent l'alias comme le nom du répertoire.
 - **Type de modèle** : forcez manuellement un modèle en LLM ou VLM indépendamment de l'auto-détection.
+- **Profils** : enregistrez des ensembles nommés de paramètres par modèle et basculez entre eux depuis le panneau d'admin. Un profil peut éventuellement être exposé comme son propre modèle : `/v1/models` liste alors aussi `<modèle>:<profil>` (par ex. `qwen3-8b:thinking`), qui s'exécute sur le même moteur que le modèle de base avec les paramètres du profil appliqués à chaque requête — sans mémoire supplémentaire ni rechargement. Lorsque le modèle de base possède un alias, l'identifiant exposé est annoncé sous la forme `<alias>:<profil>` ; la forme avec le nom du répertoire continue de fonctionner, comme pour le modèle de base.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
