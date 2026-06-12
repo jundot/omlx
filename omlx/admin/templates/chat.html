@@ -1494,7 +1494,7 @@
         if (storedKey) {
             this.apiKeySet = true;
             await this.loadModels();
-            this.loadChatHistory();
+            await this.loadChatHistory();
             // Restore the last-open chat across reloads. Without this a
             // refresh blanks the view while video jobs keep running
             // server-side -- the bubbles look "lost" even though loadChat
@@ -1945,13 +1945,13 @@
         });
     },
 
-    saveApiKey() {
+    async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
         localStorage.setItem('omlx_chat_api_key', this.apiKeyInput.trim());
         this.apiKeySet = true;
         this.apiKeyInput = '';
         this.loadModels();
-        this.loadChatHistory();
+        await this.loadChatHistory();
     },
 
     clearApiKey() {
@@ -2042,7 +2042,51 @@
         }
     },
 
-    loadChatHistory() {
+    // Chat history lives in IndexedDB, not localStorage. localStorage's
+    // ~5MB quota forced saveCurrentChat to strip user-uploaded base64
+    // media from messages, so user images/videos vanished on reload
+    // while AI outputs (rehydrated by job id) survived. IndexedDB has no
+    // such practical limit, so user media persists as-is.
+    _chatDB: null,
+    openChatDB() {
+        if (this._chatDB) return Promise.resolve(this._chatDB);
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open('omlx_chat', 1);
+            req.onupgradeneeded = () => req.result.createObjectStore('kv');
+            req.onsuccess = () => { this._chatDB = req.result; resolve(req.result); };
+            req.onerror = () => reject(req.error);
+        });
+    },
+    async idbGet(key) {
+        const db = await this.openChatDB();
+        return new Promise((resolve, reject) => {
+            const req = db.transaction('kv', 'readonly').objectStore('kv').get(key);
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    },
+    async idbSet(key, value) {
+        const db = await this.openChatDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('kv', 'readwrite');
+            tx.objectStore('kv').put(value, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    },
+
+    async loadChatHistory() {
+        try {
+            const stored = await this.idbGet('history');
+            if (Array.isArray(stored)) {
+                this.chatHistory = stored;
+                return;
+            }
+        } catch (e) {
+            // IndexedDB unavailable (e.g. some private modes) -- fall back
+            // to whatever localStorage still holds.
+        }
+        // One-time migration from the legacy localStorage store.
         const history = localStorage.getItem('omlx_chat_history');
         if (history) {
             try {
@@ -2050,11 +2094,22 @@
             } catch (e) {
                 this.chatHistory = [];
             }
+            try {
+                await this.idbSet('history', JSON.parse(JSON.stringify(this.chatHistory)));
+                localStorage.removeItem('omlx_chat_history');
+            } catch (e) { /* keep legacy copy if migration fails */ }
         }
     },
 
     saveChatHistory() {
-        localStorage.setItem('omlx_chat_history', JSON.stringify(this.chatHistory));
+        // Alpine wraps state in reactive proxies that IndexedDB's
+        // structured clone rejects; serialize through JSON first.
+        const plain = JSON.parse(JSON.stringify(this.chatHistory));
+        this.idbSet('history', plain).catch(() => {
+            try {
+                localStorage.setItem('omlx_chat_history', JSON.stringify(plain));
+            } catch (e) { /* quota -- nothing sane to do */ }
+        });
     },
 
     startNewChat() {
@@ -2152,7 +2207,9 @@
         const existingIndex = this.chatHistory.findIndex(c => c.id === this.currentChatId);
         const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
 
-        // Strip base64 image data from content arrays to avoid localStorage quota issues
+        // History is stored in IndexedDB, so user-uploaded base64 media in
+        // content arrays persists as-is. Only blob: object URLs are
+        // stripped -- they are session-scoped dead links after reload.
         const messagesForStorage = this.messages.map(msg => {
             // Blob URLs are session-scoped: persisting one stores a dead
             // link that renders an unplayable <video> after reload. Keep
@@ -2169,7 +2226,8 @@
             return {
                 ...msg,
                 content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
+                    if (part.type === 'image_url'
+                        && String(part.image_url?.url || '').startsWith('blob:')) {
                         return { type: 'image_url', image_url: { url: '' } };
                     }
                     return part;
@@ -3242,8 +3300,13 @@
         this.chatHistory = this.chatHistory.filter(c => c.id !== chatId);
         this.saveChatHistory();
 
-        // If deleted current chat, start new
+        // If deleted current chat, start new. Drop the in-memory messages
+        // FIRST: startNewChat begins with saveCurrentChat(), which would
+        // otherwise re-add the just-deleted chat from this.messages and it
+        // would resurrect on the next reload.
         if (this.currentChatId === chatId) {
+            this.currentChatId = null;
+            this.messages = [];
             this.startNewChat();
         }
 
@@ -3255,6 +3318,10 @@
 
         this.chatHistory = [];
         this.saveChatHistory();
+        // Same resurrection hazard as deleteChat: clear in-memory state
+        // before startNewChat's saveCurrentChat runs.
+        this.currentChatId = null;
+        this.messages = [];
         this.startNewChat();
 
     },
