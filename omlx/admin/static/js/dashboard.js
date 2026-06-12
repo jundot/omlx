@@ -3511,6 +3511,58 @@
                 return '';
             },
 
+            // True when the kernel iogpu.wired_limit_mb (or Apple default
+            // working set) caps oMLX below its desired static ceiling.
+            get memoryGuardShowWiredLimitWarning() {
+                const sys = this.globalSettings.system || {};
+                const kernelBytes = sys.iogpu_wired_limit_bytes || 0;
+                const requestedBytes = sys.omlx_wired_limit_request_bytes || 0;
+                if (kernelBytes <= 0 || requestedBytes <= 0) return false;
+                return kernelBytes < requestedBytes;
+            },
+
+            // Red bold warning text (no copy button). The button is a
+            // separate sibling in the template so Alpine can wire @click.
+            get memoryGuardWiredLimitWarningHTML() {
+                if (!this.memoryGuardShowWiredLimitWarning) return '';
+                const sys = this.globalSettings.system;
+                const kernelGB = (sys.iogpu_wired_limit_bytes / (1024 ** 3)).toFixed(1);
+                const template = window.t('settings.resource.guard_tier.wired_limit_warning');
+                return template.replaceAll(
+                    '{kernel}',
+                    `<strong>${kernelGB} GB</strong>`,
+                );
+            },
+
+            // The sysctl command rendered in the dark bold <code> chip.
+            get memoryGuardWiredLimitCommand() {
+                if (!this.memoryGuardShowWiredLimitWarning) return '';
+                const requested = this.globalSettings.system.omlx_wired_limit_request_bytes;
+                const requestedMB = Math.ceil(requested / (1024 ** 2));
+                return `sudo sysctl iogpu.wired_limit_mb=${requestedMB}`;
+            },
+
+            // 2-second "Copied!" affordance after the clipboard button is
+            // pressed. Reset by the same setTimeout so it's harmless if
+            // the user clicks rapidly.
+            wiredLimitCopied: false,
+
+            copyWiredLimitCommand() {
+                const text = this.memoryGuardWiredLimitCommand;
+                if (!text) return;
+                const onSuccess = () => {
+                    this.wiredLimitCopied = true;
+                    setTimeout(() => { this.wiredLimitCopied = false; }, 2000);
+                };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+                        onSuccess();
+                    });
+                } else {
+                    onSuccess();
+                }
+            },
+
             // Parse cache size string (e.g., "10GB") to percent of SSD total capacity
             parseCacheToPercent(cacheStr, totalBytes) {
                 if (!cacheStr || cacheStr === 'auto' || !totalBytes || totalBytes === 0) {

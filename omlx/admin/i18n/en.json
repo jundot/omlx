@@ -850,5 +850,6 @@
   "chat.image.expired": "Image expired on the server. Use the regenerate button to create a new one.",
   "chat.image.bad_input_type": "Image models accept PNG, JPEG or WebP input images.",
   "chat.image.placeholder_t2i": "Describe the image to generate; try poster text in Chinese",
-  "chat.image.placeholder_edit": "Upload an image, then describe the edit in one sentence (e.g. change the title to...)"
+  "chat.image.placeholder_edit": "Upload an image, then describe the edit in one sentence (e.g. change the title to...)",
+  "settings.resource.guard_tier.wired_limit_warning": "Kernel iogpu.wired_limit_mb is only {kernel}; oMLX can only allocate up to {kernel}. Raise it in Terminal:"
 }

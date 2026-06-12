@@ -848,5 +848,6 @@
   "chat.image.expired": "图像已在服务器上过期，点击重新生成按钮可再生成一张。",
   "chat.image.bad_input_type": "图像模型仅接受 PNG、JPEG 或 WebP 输入图。",
   "chat.image.placeholder_t2i": "描述想生成的图片; 试试中文海报文字",
-  "chat.image.placeholder_edit": "上传图片, 用一句话描述修改 (例: 把标题改成...)"
+  "chat.image.placeholder_edit": "上传图片, 用一句话描述修改 (例: 把标题改成...)",
+  "settings.resource.guard_tier.wired_limit_warning": "内核 iogpu.wired_limit_mb 仅为 {kernel}，超出此上限的分配可能导致崩溃。请在终端执行以下命令调高限制："
 }

@@ -732,5 +732,6 @@
   "chat.image.expired": "이미지가 서버에서 만료되었습니다. 다시 생성 버튼으로 새로 만드세요.",
   "chat.image.bad_input_type": "이미지 모델은 PNG, JPEG, WebP 입력 이미지만 허용합니다.",
   "chat.image.placeholder_t2i": "생성할 이미지를 설명하세요. 포스터 문구 넣기도 시도해 보세요",
-  "chat.image.placeholder_edit": "이미지를 업로드하고 수정 내용을 한 문장으로 설명하세요 (예: 제목을 ...로 바꿔 줘)"
+  "chat.image.placeholder_edit": "이미지를 업로드하고 수정 내용을 한 문장으로 설명하세요 (예: 제목을 ...로 바꿔 줘)",
+  "settings.resource.guard_tier.wired_limit_warning": "커널 iogpu.wired_limit_mb 는 {kernel} 뿐입니다; 이 한도를 초과하면 패닉이 발생할 수 있습니다. 터미널에서 다음 명령으로 한도를 높이세요:"
 }

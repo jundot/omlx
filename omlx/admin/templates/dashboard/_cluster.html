@@ -118,7 +118,10 @@
             </p>
         </div>
 
-        <div class="px-5 py-4 space-y-5" x-show="cluster.config">
+        <!-- x-if (not x-show): with a null config Alpine would still
+             evaluate every x-model binding inside and spam console errors -->
+        <template x-if="cluster.config">
+        <div class="px-5 py-4 space-y-5">
             <!-- Top-level fields -->
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
@@ -196,5 +199,6 @@
                 <span x-show="cluster.saveError" x-cloak class="text-sm text-red-500" x-text="cluster.saveError"></span>
             </div>
         </div>
+        </template>
     </div>
 </div>
