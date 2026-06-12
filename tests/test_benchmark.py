@@ -17,6 +17,7 @@ from omlx.admin.benchmark import (
     _detect_experimental_features,
     _detect_quantization,
     _generate_prompt,
+    _run_single_test,
     cleanup_old_runs,
     create_run,
     get_run,
@@ -201,6 +202,84 @@ class TestComputeMetrics:
         assert metrics["ttft_ms"] == 0.0
         assert metrics["gen_tps"] > 0  # Protected by max(duration, 1e-9)
 
+    def test_native_duration_overrides(self):
+        """Native engine timings can override streaming timing artifacts."""
+        metrics = _compute_single_metrics(
+            prompt_tokens=1024,
+            completion_tokens=128,
+            start_time=0.0,
+            first_token_time=1.0,
+            end_time=1.0,
+            peak_memory=0,
+            cached_tokens=0,
+            prefill_duration_s=4.0,
+            generation_duration_s=8.0,
+        )
+
+        assert metrics["processing_tps"] == pytest.approx(256.0)
+        assert metrics["gen_tps"] == pytest.approx(16.0)
+        assert metrics["tpot_ms"] == pytest.approx(62.99, abs=0.01)
+
+
+class TestRunSingleTest:
+    @pytest.mark.asyncio
+    async def test_uses_native_diffusion_metrics_for_chunked_stream(self):
+        """Diffusion streams by canvas, so benchmark must not use chunk timing."""
+
+        class ChunkedDiffusionEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 10,
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=256.0,
+                    generation_tps=32.0,
+                )
+
+        metrics = await _run_single_test(
+            ChunkedDiffusionEngine(),
+            prompt="prompt",
+            max_tokens=128,
+            pp_len=1024,
+        )
+
+        assert metrics["processing_tps"] == pytest.approx(256.0)
+        assert metrics["gen_tps"] == pytest.approx(32.0)
+        assert metrics["gen_tps"] < 1000.0
+
+    @pytest.mark.asyncio
+    async def test_uses_diffusion_canvas_metrics_when_eos_stops_early(self):
+        """Diffusion benchmark TG should measure canvas work, not early EOS text."""
+
+        class EarlyStopDiffusionEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=16,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="short answer",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tps=256.0,
+                    generation_tps=2.0,
+                    diffusion_canvas_tokens=128,
+                    diffusion_canvas_tps=64.0,
+                )
+
+        metrics = await _run_single_test(
+            EarlyStopDiffusionEngine(),
+            prompt="prompt",
+            max_tokens=128,
+            pp_len=1024,
+        )
+
+        assert metrics["completion_tokens"] == 128
+        assert metrics["gen_tps"] == pytest.approx(64.0)
+        assert metrics["tpot_ms"] == pytest.approx(15.75, abs=0.01)
+
 
 # =============================================================================
 # BenchmarkRun lifecycle tests
@@ -259,6 +338,7 @@ class _FakeBenchTokenizer:
 
 class _FakeBenchEngine:
     tokenizer = _FakeBenchTokenizer()
+    _engine = None
 
     async def stream_generate(self, **kwargs):
         yield SimpleNamespace(
@@ -280,10 +360,11 @@ class _FakeSettingsManager:
 
 
 class _FakeBenchEnginePool:
-    def __init__(self, settings=None):
+    def __init__(self, settings=None, engine=None):
         self._settings_manager = (
             _FakeSettingsManager(settings) if settings is not None else None
         )
+        self._engine = engine or _FakeBenchEngine()
         self.force_lm_values = []
 
     def get_loaded_model_ids(self):
@@ -291,7 +372,7 @@ class _FakeBenchEnginePool:
 
     async def get_engine(self, model_id, force_lm=False):
         self.force_lm_values.append(force_lm)
-        return _FakeBenchEngine()
+        return self._engine
 
     async def _unload_engine(self, model_id):
         pass
@@ -351,6 +432,65 @@ class TestBenchmarkEngineSelection:
         assert pool.force_lm_values == [True]
         assert run.experimental_features == ["vlm_mtp"]
         assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_batch_request_skips_engine_with_none_scheduler_core(self):
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                batch_sizes=[2],
+            ),
+        )
+        pool = _FakeBenchEnginePool(engine=_FakeBenchEngine())
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert [r["test_type"] for r in run.results] == ["single"]
+
+    @pytest.mark.asyncio
+    async def test_diffusion_warmup_uses_benchmark_generation_length(self):
+        class FakeDiffusionEngine(_FakeBenchEngine):
+            is_diffusion_model = True
+
+            def __init__(self):
+                self.calls = []
+
+            async def stream_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=256.0,
+                    generation_tps=32.0,
+                    diffusion_canvas_tokens=128,
+                    diffusion_canvas_tps=64.0,
+                )
+
+        engine = FakeDiffusionEngine()
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=128,
+            ),
+        )
+        pool = _FakeBenchEnginePool(engine=engine)
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert engine.calls[0]["max_tokens"] == 128
 
 
 # =============================================================================

@@ -43,18 +43,19 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Request as FastAPIRequest
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -84,6 +85,28 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.embedding_models import (
+    EmbeddingData,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    EmbeddingUsage,
+)
+from .api.embedding_utils import (
+    encode_embedding_base64,
+    normalize_embedding_items,
+    normalize_input,
+    truncate_embedding,
+)
+from .api.markitdown import (
+    MARKITDOWN_MODEL_ID,
+    MarkItDownRequestError,
+    convert_messages_to_markdown_async,
+    is_markitdown_model,
+    markitdown_model_visible,
+    preprocess_markitdown_file_parts_async,
+    request_has_file_parts,
+    stream_messages_to_markdown_async,
+)
 
 # Import from new modular API
 from .api.openai_models import (
@@ -104,18 +127,6 @@ from .api.openai_models import (
     ToolCall,
     Usage,
 )
-from .api.embedding_models import (
-    EmbeddingRequest,
-    EmbeddingResponse,
-    EmbeddingData,
-    EmbeddingUsage,
-)
-from .api.embedding_utils import (
-    encode_embedding_base64,
-    normalize_embedding_items,
-    truncate_embedding,
-    normalize_input,
-)
 from .api.rerank_models import (
     RerankRequest,
     RerankResponse,
@@ -132,9 +143,9 @@ from .api.responses_models import (
     TextConfig,
 )
 from .api.responses_utils import (
-    ResponseStore,
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
+    ResponseStore,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -145,19 +156,19 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
+from .api.thinking import ThinkingParser, extract_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
-    restore_gemma4_param_names,
     extract_tool_calls_with_thinking,
     parse_json_output,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
-from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import (
     clean_output_text,
     clean_special_tokens,
@@ -178,16 +189,6 @@ from .exceptions import (
     ModelTooLargeError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
-)
-from .api.markitdown import (
-    MARKITDOWN_MODEL_ID,
-    MarkItDownRequestError,
-    convert_messages_to_markdown_async,
-    is_markitdown_model,
-    markitdown_model_visible,
-    preprocess_markitdown_file_parts_async,
-    request_has_file_parts,
-    stream_messages_to_markdown_async,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -503,7 +504,8 @@ app = FastAPI(
 )
 
 # Include MCP routes
-from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
+from .api.mcp_routes import router as mcp_router
+from .api.mcp_routes import set_mcp_manager_getter
 
 set_mcp_manager_getter(get_mcp_manager)
 app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
@@ -513,6 +515,7 @@ app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 # would always import successfully — we need an explicit mlx-audio check.
 try:
     import mlx_audio as _  # noqa: F401
+
     from .api.audio_routes import router as audio_router
 
     app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
@@ -521,8 +524,9 @@ except ImportError:
     pass
 
 # Include admin routes
-from .admin.routes import router as admin_router, set_admin_getters
 from .admin.auth import _RedirectToLogin
+from .admin.routes import router as admin_router
+from .admin.routes import set_admin_getters
 
 set_admin_getters(
     get_server_state,
@@ -676,6 +680,34 @@ async def scheduler_queue_full_handler(
     )
 
 
+def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
+    return (
+        "oMLX prefill memory guard rejected this prompt: "
+        f"{str(exc)} "
+        "To continue, set Memory Guard to aggressive, raise the custom "
+        "memory guard ceiling, free system memory, or compact/reduce context."
+    )
+
+
+def _prefill_memory_openai_error_body(
+    exc: PrefillMemoryExceededError,
+    *,
+    status_code: int = 400,
+) -> dict:
+    content = _openai_error_body(
+        _prefill_memory_error_detail(exc),
+        status_code,
+        code="prefill_memory_exceeded",
+    )
+    content["type"] = "error"
+    content["error"]["omlx_code"] = "prefill_memory_exceeded"
+    if exc.estimated_bytes is not None:
+        content["error"]["estimated_bytes"] = exc.estimated_bytes
+    if exc.limit_bytes is not None:
+        content["error"]["limit_bytes"] = exc.limit_bytes
+    return content
+
+
 @app.exception_handler(PrefillMemoryExceededError)
 async def prefill_memory_exceeded_handler(
     request: FastAPIRequest, exc: PrefillMemoryExceededError
@@ -693,12 +725,7 @@ async def prefill_memory_exceeded_handler(
     this oMLX memory-guard failure into Anthropic's generic
     "Request too large (max 32MB)" body-size error.
     """
-    detail = (
-        "oMLX prefill memory guard rejected this prompt: "
-        f"{str(exc)} "
-        "To continue, set Memory Guard to aggressive, raise the custom "
-        "memory guard ceiling, free system memory, or compact/reduce context."
-    )
+    detail = _prefill_memory_error_detail(exc)
     status_code = 400
     logger.warning(
         "%s %s → %d: %s",
@@ -714,19 +741,11 @@ async def prefill_memory_exceeded_handler(
         # invalid_request_error with code=None and clients can only
         # tell the user "shorten your prompt" — which is wrong when
         # the actual fix is to loosen the memory guard.
-        content = _openai_error_body(
-            detail, status_code, code="prefill_memory_exceeded"
-        )
         # Surface the structured fields so clients can branch on
         # numeric values instead of regex-matching the human message.
         # OpenAI clients ignore unknown error fields so this is a
         # forward-compatible extension.
-        content["type"] = "error"
-        content["error"]["omlx_code"] = "prefill_memory_exceeded"
-        if exc.estimated_bytes is not None:
-            content["error"]["estimated_bytes"] = exc.estimated_bytes
-        if exc.limit_bytes is not None:
-            content["error"]["limit_bytes"] = exc.limit_bytes
+        content = _prefill_memory_openai_error_body(exc, status_code=status_code)
     else:
         content = {
             "detail": detail,
@@ -1668,7 +1687,7 @@ def init_server(
 
     # Initialize ModelScope downloader (optional - requires modelscope SDK)
     try:
-        from .admin.ms_downloader import MSDownloader, MS_SDK_AVAILABLE
+        from .admin.ms_downloader import MS_SDK_AVAILABLE, MSDownloader
 
         if MS_SDK_AVAILABLE:
             from .admin.routes import set_ms_downloader
@@ -1849,8 +1868,14 @@ async def _with_sse_keepalive(
                 try:
                     result = task.result()
                 except Exception as e:
-                    logger.error(f"SSE generator error: {e}")
-                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                    if isinstance(e, PrefillMemoryExceededError):
+                        logger.warning(f"SSE generator prefill rejected: {e}")
+                        error_data = _prefill_memory_openai_error_body(e)
+                    else:
+                        logger.error(f"SSE generator error: {e}")
+                        error_data = {
+                            "error": {"message": str(e), "type": "server_error"}
+                        }
                     yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -1940,7 +1965,12 @@ async def _with_json_keepalive(
             if keepalive_elapsed >= interval:
                 keepalive_elapsed = 0.0
                 yield " "
-        result = task.result()
+        try:
+            result = task.result()
+        except PrefillMemoryExceededError as e:
+            logger.warning(f"JSON keepalive prefill rejected: {e}")
+            yield json.dumps(_prefill_memory_openai_error_body(e))
+            return
         if result is not None:
             yield result
     finally:
@@ -3337,6 +3367,7 @@ def _build_format_element(structured_outputs=None, response_format=None):
     compiled directly (EBNF / regex / choice) rather than via structural tag.
     """
     import json as _json
+
     from .api.openai_models import StructuredOutputOptions
 
     if structured_outputs is not None:

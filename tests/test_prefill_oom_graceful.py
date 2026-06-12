@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from omlx import scheduler as sched_mod
+from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     MemoryMonitor,
@@ -286,12 +287,45 @@ def test_guard_raises_clean_error_when_even_floor_cannot_fit():
         current=current, hard=hard, samples_bpt=bpt, reclaim_to=current
     )  # reclaim can't help
     ns._fake_current = current
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(PrefillMemoryExceededError) as exc:
         _guard_call(ns, 256, kv_len=122_000)
     assert "too large for available memory" in str(exc.value)
     assert "Memory limit exceeded" not in str(exc.value)  # → fails fast, no requeue
     assert "prefill safety cap" in str(exc.value)
     assert "90% of effective ceiling 42.0GB" in str(exc.value)
+    assert exc.value.estimated_bytes is not None
+    assert exc.value.limit_bytes == int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+
+
+def test_guard_requests_eviction_before_capacity_rejection():
+    hard = 42 * _GB
+    current = 41 * _GB
+    bpt = 27 * 1024 * 1024
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt, reclaim_to=current)
+    ns._fake_current = current
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+
+    with pytest.raises(_PrefillEvictionNeeded) as exc:
+        with (
+            patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+            patch.object(sched_mod, "get_phys_footprint", return_value=current),
+        ):
+            Scheduler._guard_prefill_chunk(
+                ns,
+                256,
+                kv_len=122_000,
+                progress=0,
+                loop_label="test",
+                request_id="r",
+            )
+
+    assert request.prefill_eviction_retries == 1
+    assert exc.value.request.reason == "prefill_safety_cap"
 
 
 def test_guard_custom_margin_allows_95_percent_of_ceiling():

@@ -3196,12 +3196,53 @@ class TestLayerSignatureSweep:
         assert dropped == 0
         assert mgr._index.get(b"aa" * 10) is not None
 
+    def test_sweep_canonicalizes_prefill_ready_rotating_cache(
+        self, tmp_path: Path
+    ):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"ac" * 10,
+                model_name="test-model",
+                layer_cache_types=stored,
+                num_layers=3,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 0
+        assert mgr._index.get(b"ac" * 10) is not None
+
     def test_startup_compat_canonicalizes_sized_arrays_cache(self, tmp_path: Path):
         expected = ["ArraysCache", "ArraysCache", "KVCache"]
         stored = ["SizedArraysCache", "SizedArraysCache", "KVCache"]
         mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
         meta = self._make_meta(
             block_hash=b"ab" * 10,
+            model_name="test-model",
+            layer_cache_types=stored,
+            num_layers=40,
+        )
+        meta.cache_signature = _cache_compat_signature(
+            model_name="test-model",
+            num_layers=40,
+            block_size=2048,
+            layer_cache_types=stored,
+        )
+
+        assert mgr._is_compatible_block(meta) is True
+
+    def test_startup_compat_canonicalizes_prefill_ready_rotating_cache(
+        self, tmp_path: Path
+    ):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        meta = self._make_meta(
+            block_hash=b"ad" * 10,
             model_name="test-model",
             layer_cache_types=stored,
             num_layers=40,
@@ -3244,6 +3285,26 @@ class TestLayerSignatureSweep:
 
         assert changed is False
         assert mgr._expected_layer_cache_types == ["SizedArraysCache", "KVCache"]
+        assert mgr._signature_sweep_completed is True
+
+    def test_set_expected_layer_signature_noop_for_prefill_ready_rotating_match(
+        self, tmp_path: Path
+    ):
+        mgr = self._make_manager(
+            tmp_path,
+            expected_layer_cache_types=["KVCache", "RotatingKVCache"],
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(
+            ["KVCache", "PrefillReadyRotatingKVCache"]
+        )
+
+        assert changed is False
+        assert mgr._expected_layer_cache_types == [
+            "KVCache",
+            "PrefillReadyRotatingKVCache",
+        ]
         assert mgr._signature_sweep_completed is True
 
     def test_sweep_leaves_other_models_alone(self, tmp_path: Path):

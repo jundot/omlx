@@ -37,7 +37,11 @@ from mlx_lm.generate import (
 )
 from mlx_lm.models.cache import (
     KVCache as _MLXKVCache,
+)
+from mlx_lm.models.cache import (
     RotatingKVCache as _MLXRotatingKVCache,
+)
+from mlx_lm.models.cache import (
     make_prompt_cache,
 )
 from mlx_lm.sample_utils import make_logits_processors
@@ -45,7 +49,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
-from .exceptions import is_cache_corruption_error
+from .exceptions import PrefillMemoryExceededError, is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -336,6 +340,40 @@ class _PrefillEvictionNeeded(Exception):
     def __init__(self, request: PrefillEvictionRequest):
         super().__init__(request.reason)
         self.request = request
+
+
+def _prefill_memory_error_output(
+    request_id: str,
+    message: str,
+    *,
+    estimated_bytes: int | None = None,
+    limit_bytes: int | None = None,
+) -> RequestOutput:
+    metadata: dict[str, int | str] = {"request_id": request_id}
+    if estimated_bytes is not None:
+        metadata["estimated_bytes"] = estimated_bytes
+    if limit_bytes is not None:
+        metadata["limit_bytes"] = limit_bytes
+    return RequestOutput(
+        request_id=request_id,
+        finished=True,
+        finish_reason="error",
+        error=message,
+        error_code="prefill_memory_exceeded",
+        error_metadata=metadata,
+    )
+
+
+def _prefill_memory_exception_output(
+    request_id: str,
+    exc: PrefillMemoryExceededError,
+) -> RequestOutput:
+    return _prefill_memory_error_output(
+        request_id,
+        str(exc),
+        estimated_bytes=exc.estimated_bytes,
+        limit_bytes=exc.limit_bytes,
+    )
 
 
 @dataclass
@@ -2855,13 +2893,19 @@ class Scheduler:
                 round(margin * 100),
                 base_cap / 1024**3,
             )
-            raise RuntimeError(
+            message = (
                 "Prefill context too large for available memory "
                 f"(pre-chunk guard at {progress} tokens, kv_len={kv_len}): "
                 "predicted peak would exceed prefill safety cap "
                 f"{cap / 1024**3:.1f}GB "
                 f"({round(margin * 100)}% of effective ceiling "
                 f"{base_cap / 1024**3:.1f}GB)"
+            )
+            raise PrefillMemoryExceededError(
+                message=message,
+                request_id=request_id,
+                estimated_bytes=int(current + min_transient),
+                limit_bytes=int(cap),
             )
 
         # The floor fits — pick the largest chunk that still fits under the cap.
@@ -3480,6 +3524,15 @@ class Scheduler:
                     e.request.reason,
                 )
                 break
+            except PrefillMemoryExceededError as e:
+                logger.error("Chunked prefill capacity rejected for %s: %s", rid, e)
+                self._prefill_states.pop(rid, None)
+                self._release_paged_cache_for_request(rid)
+                self.requests.pop(rid, None)
+                get_prefill_tracker().remove(rid)
+                _sync_and_clear_cache()
+                rejected.append(_prefill_memory_exception_output(rid, e))
+                continue
             except RuntimeError as e:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
@@ -5189,7 +5242,11 @@ class Scheduler:
                 drafter=drafter,
                 prompt_cache=prefilled_cache,
                 hidden=hidden,
-                shared_kv_states=getattr(out, "shared_kv_states", {}) if not isinstance(out, tuple) else {},
+                shared_kv_states=(
+                    getattr(out, "shared_kv_states", {})
+                    if not isinstance(out, tuple)
+                    else {}
+                ),
                 first_bonus=int(first_bonus_arr.item()),
                 max_tokens=request.sampling_params.max_tokens,
                 sampler=mtp_sampler,
@@ -5997,6 +6054,24 @@ class Scheduler:
                 estimated_bytes=int(estimated),
                 limit_bytes=int(hard_limit),
             )
+        safety_rejection = self._preflight_safety_rejection(
+            num_prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            current_usage_bytes=current,
+        )
+        if safety_rejection is not None:
+            requested_tokens = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
+            self._raise_prefill_eviction_if_available(
+                request_id=request.request_id,
+                current=current,
+                target_cap=safety_rejection.limit_bytes,
+                predicted_transient=max(
+                    0, int(safety_rejection.estimated_bytes) - int(current)
+                ),
+                requested_tokens=requested_tokens,
+                reason="prefill_safety_cap",
+            )
+            return safety_rejection
         return None
 
     def preflight_or_raise(
@@ -6010,7 +6085,7 @@ class Scheduler:
 
         Called from the engine's ``preflight_chat`` / ``preflight_completion``
         before the FastAPI route wraps the body in a ``StreamingResponse``,
-        so the typed exception can be mapped to HTTP 413 by the registered
+        so the typed exception can be mapped to HTTP 400 by the registered
         handler. A no-op when the guard is disabled or the request fits.
 
         Mirrors the ``_preflight_memory_check`` math but takes token counts
@@ -6036,36 +6111,180 @@ class Scheduler:
             return
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
-        if current + peak <= self._memory_hard_limit_bytes:
-            return
-
-        from .exceptions import PrefillMemoryExceededError
-        from .utils.hardware import format_bytes
-
-        usage_gb = current / (1024**3)
-        ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
-        message = (
-            f"Prefill would require ~{format_bytes(current + peak)} peak "
-            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-            f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
-            f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-            f"Reduce context length, free system memory, or loosen "
-            f"memory_guard_tier (safe → balanced → aggressive)."
-        )
-
         if not request_id:
             import uuid as _uuid
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+
+        if current + peak > self._memory_hard_limit_bytes:
+            from .utils.hardware import format_bytes
+
+            usage_gb = current / (1024**3)
+            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
+            message = (
+                f"Prefill would require ~{format_bytes(current + peak)} peak "
+                f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                f"Reduce context length, free system memory, or loosen "
+                f"memory_guard_tier (safe → balanced → aggressive)."
+            )
+
+            logger.warning(
+                "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+                num_prompt_tokens,
+                cached_tokens,
+                request_id,
+                message,
+            )
+            raise PrefillMemoryExceededError(
+                message=message,
+                request_id=request_id,
+                estimated_bytes=int(current + peak),
+                limit_bytes=int(self._memory_hard_limit_bytes),
+            )
+
+        safety_rejection = self._preflight_safety_rejection(
+            num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
+            current_usage_bytes=current,
+        )
+        if safety_rejection is None:
+            return
+
         logger.warning(
-            "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
-            num_prompt_tokens, cached_tokens, request_id, message,
+            "Preflight safety-cap rejected (%d tokens, cached=%d, "
+            "request_id=%s): %s",
+            num_prompt_tokens,
+            cached_tokens,
+            request_id,
+            safety_rejection.message,
         )
         raise PrefillMemoryExceededError(
-            message=message,
+            message=safety_rejection.message,
             request_id=request_id,
-            estimated_bytes=int(current + peak),
-            limit_bytes=int(self._memory_hard_limit_bytes),
+            estimated_bytes=safety_rejection.estimated_bytes,
+            limit_bytes=safety_rejection.limit_bytes,
+        )
+
+    def preflight_eviction_request(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int = 0,
+        request_id: str | None = None,
+    ) -> PrefillEvictionRequest | None:
+        """Return an idle-model eviction request for route-level preflight.
+
+        ``preflight_or_raise`` runs before a ``Request`` is admitted, so it
+        cannot use the request-bound ``_raise_prefill_eviction_if_available``.
+        The API-facing engines call this first, run the async pool callback if
+        needed, then call ``preflight_or_raise`` to re-measure and reject only
+        if eviction did not create enough headroom.
+        """
+        if not self._prefill_memory_guard:
+            return None
+        if self._memory_hard_limit_bytes <= 0:
+            return None
+        if self.memory_monitor is None:
+            return None
+
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        if new_tokens == 0:
+            return None
+
+        current = self._current_usage_bytes(refresh_mlx_active=False)
+        request_id = request_id or "preflight"
+
+        peak = self.memory_monitor.estimate_prefill_peak_bytes(
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
+        )
+        if peak and current + peak > self._memory_hard_limit_bytes:
+            return PrefillEvictionRequest(
+                request_id=request_id,
+                model_id=getattr(self.config, "model_name", ""),
+                current_bytes=int(current),
+                target_cap_bytes=int(self._memory_hard_limit_bytes),
+                predicted_transient_bytes=int(peak),
+                requested_tokens=int(min(new_tokens, self.config.prefill_step_size)),
+                reason="prefill_preflight",
+            )
+
+        safety_rejection = self._preflight_safety_rejection(
+            num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
+            current_usage_bytes=current,
+        )
+        if safety_rejection is None:
+            return None
+
+        requested_tokens = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
+        return PrefillEvictionRequest(
+            request_id=request_id,
+            model_id=getattr(self.config, "model_name", ""),
+            current_bytes=int(current),
+            target_cap_bytes=int(safety_rejection.limit_bytes),
+            predicted_transient_bytes=max(
+                0, int(safety_rejection.estimated_bytes) - int(current)
+            ),
+            requested_tokens=int(requested_tokens),
+            reason="prefill_safety_cap",
+        )
+
+    def _preflight_safety_rejection(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int = 0,
+        current_usage_bytes: int,
+    ) -> _PreflightRejection | None:
+        """Predict whether even the safety floor chunk cannot fit.
+
+        This mirrors the mid-prefill ``_guard_prefill_chunk`` rejection, but
+        runs before the route returns a ``StreamingResponse``. It charges the
+        resident KV that will be allocated by the prompt plus the minimum
+        chunk transient at the full prompt context length.
+        """
+        if self.memory_monitor is None:
+            return None
+        base_cap, cap, margin = self._prefill_abort_description()
+        if cap <= 0:
+            return None
+
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        if new_tokens == 0:
+            return None
+
+        floor_chunk = min(max(1, self._prefill_min_chunk_tokens), new_tokens)
+        kv_len = max(int(num_prompt_tokens) - 1, 1)
+        kv_growth = self.memory_monitor.estimate_prompt_kv_bytes(new_tokens)
+        min_transient = self._predicted_chunk_transient(floor_chunk, kv_len)
+        if kv_growth <= 0 and min_transient <= 0:
+            return None
+
+        estimated = int(current_usage_bytes + kv_growth + min_transient)
+        if estimated <= cap:
+            return None
+
+        from .utils.hardware import format_bytes
+
+        message = (
+            "Prefill context too large for available memory "
+            f"(preflight safety guard, kv_len={kv_len}, "
+            f"min_chunk={floor_chunk}): predicted peak would require "
+            f"~{format_bytes(estimated)} "
+            f"(current {format_bytes(current_usage_bytes)} + "
+            f"KV {format_bytes(kv_growth)} + "
+            f"min-chunk transient {format_bytes(min_transient)}) "
+            f"but prefill safety cap is {format_bytes(cap)} "
+            f"({round(margin * 100)}% of effective ceiling "
+            f"{format_bytes(base_cap)}). Reduce context length, free system "
+            "memory, or loosen memory_guard_tier (safe → balanced → aggressive)."
+        )
+        return _PreflightRejection(
+            message=message,
+            estimated_bytes=estimated,
+            limit_bytes=int(cap),
         )
 
     def _schedule_waiting(
@@ -6137,11 +6356,7 @@ class Scheduler:
             # defer scheduling if memory pressure is high to prevent
             # Metal allocation failures during batch_generator.next().
             # First request always passes (no admitted work yet).
-            if (
-                self._prefill_memory_guard
-                and self._memory_limit_bytes > 0
-                and admitted
-            ):
+            if self._prefill_memory_guard and self._memory_limit_bytes > 0 and admitted:
                 current = self._current_usage_bytes()
                 if current > self._memory_limit_bytes:
                     logger.debug(
@@ -6273,11 +6488,11 @@ class Scheduler:
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
                 rejected_outputs.append(
-                    RequestOutput(
-                        request_id=request.request_id,
-                        finished=True,
-                        finish_reason="error",
-                        error=preflight_rejection.message,
+                    _prefill_memory_error_output(
+                        request.request_id,
+                        preflight_rejection.message,
+                        estimated_bytes=preflight_rejection.estimated_bytes,
+                        limit_bytes=preflight_rejection.limit_bytes,
                     )
                 )
                 continue
@@ -6556,6 +6771,21 @@ class Scheduler:
                             reset_chunked_state=True,
                         )
                         break
+                    except PrefillMemoryExceededError as e:
+                        logger.error(
+                            "Chunked prefill (first chunk) capacity rejected "
+                            "for %s: %s",
+                            request.request_id,
+                            e,
+                        )
+                        self._release_paged_cache_for_request(request.request_id)
+                        self.requests.pop(request.request_id, None)
+                        get_prefill_tracker().remove(request.request_id)
+                        _sync_and_clear_cache()
+                        rejected_outputs.append(
+                            _prefill_memory_exception_output(request.request_id, e)
+                        )
+                        continue
                     except RuntimeError as e:
                         # Hard memory limit hit on the first chunk.
                         # _step_prefill_chunk updates the PrefillProgressTracker
@@ -6621,6 +6851,22 @@ class Scheduler:
                     get_prefill_tracker().remove(request.request_id)
                     self._pause_for_prefill_eviction(request, e.request)
                     break
+                except PrefillMemoryExceededError as e:
+                    logger.error(
+                        "Prefill capacity rejected for %s: %s",
+                        request.request_id,
+                        e,
+                    )
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    self.request_id_to_uid.pop(request.request_id, None)
+                    self._release_paged_cache_for_request(request.request_id)
+                    self.requests.pop(request.request_id, None)
+                    get_prefill_tracker().remove(request.request_id)
+                    _sync_and_clear_cache()
+                    rejected_outputs.append(
+                        _prefill_memory_exception_output(request.request_id, e)
+                    )
+                    continue
                 except RuntimeError as e:
                     # Hard memory limit hit during external prefill. Without
                     # this catch, the exception bubbles up to step() and then
@@ -7364,10 +7610,9 @@ class Scheduler:
 
     def _is_generation_overflow_error(self, error: Exception) -> bool:
         """Check for MLX/libc++ unordered-container overflow during decode."""
-        return (
-            isinstance(error, OverflowError)
-            and self._GENERATION_OVERFLOW_PATTERN in str(error)
-        )
+        return isinstance(
+            error, OverflowError
+        ) and self._GENERATION_OVERFLOW_PATTERN in str(error)
 
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
@@ -8126,6 +8371,11 @@ class Scheduler:
                 logger.debug("Could not extract model config for memory estimation")
                 return
 
+            def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
             # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
             # language-model dimensions under a sub-config. Prefer
             # ``text_config`` / ``language_config`` / ``llm_config`` when ANY
@@ -8139,31 +8389,28 @@ class Scheduler:
             # so a GPT-style nested config is also picked up. Falls back to the
             # top-level config only when no sub-config has either field.
             for sub_attr in ("text_config", "language_config", "llm_config"):
-                sub = getattr(config, sub_attr, None)
+                sub = _cfg_get(config, sub_attr)
                 if sub is not None and (
-                    getattr(sub, "num_hidden_layers", None)
-                    or getattr(sub, "n_layer", None)
+                    _cfg_get(sub, "num_hidden_layers") or _cfg_get(sub, "n_layer")
                 ):
                     config = sub
                     break
 
             # Extract KV cache dimensions
-            num_layers = getattr(config, "num_hidden_layers", None) or getattr(
-                config, "n_layer", None
+            num_layers = _cfg_get(config, "num_hidden_layers") or _cfg_get(
+                config, "n_layer"
             )
             num_kv_heads = (
-                getattr(config, "num_key_value_heads", None)
-                or getattr(config, "num_attention_heads", None)
-                or getattr(config, "n_head", None)
+                _cfg_get(config, "num_key_value_heads")
+                or _cfg_get(config, "num_attention_heads")
+                or _cfg_get(config, "n_head")
             )
-            head_dim = getattr(config, "head_dim", None)
-            hidden_size = getattr(config, "hidden_size", None) or getattr(
-                config, "n_embd", None
-            )
+            head_dim = _cfg_get(config, "head_dim")
+            hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
 
             # Calculate head_dim if not directly available
             if head_dim is None and hidden_size and num_kv_heads:
-                num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
+                num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
                 head_dim = hidden_size // num_heads
 
             # Determine base dtype size for uncompressed KV cache elements.
@@ -8177,8 +8424,8 @@ class Scheduler:
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
             num_attention_heads = (
-                getattr(config, "num_attention_heads", None)
-                or getattr(config, "n_head", None)
+                _cfg_get(config, "num_attention_heads")
+                or _cfg_get(config, "n_head")
                 or num_kv_heads
             )
 
@@ -8221,17 +8468,14 @@ class Scheduler:
                     else not self._model_uses_mla()
                 )
             ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (
-                    2.0 / head_dim
-                )
+                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
                 if (
                     self._turboquant_skip_last
                     and not isinstance(actual_kv_cache_layers, bool)
                     and actual_kv_cache_layers > 1
                 ):
                     dtype_size = (
-                        (actual_kv_cache_layers - 1) * tq_dtype_size
-                        + base_dtype_size
+                        (actual_kv_cache_layers - 1) * tq_dtype_size + base_dtype_size
                     ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
@@ -8404,16 +8648,13 @@ class Scheduler:
             # paired with ``_set_model_info_for_monitor()`` means the
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
-            if (
-                self.memory_monitor is not None
-                and self.memory_monitor.has_model_info()
-            ):
+            if self.memory_monitor is not None and self.memory_monitor.has_model_info():
                 # ``estimate_block_memory(1)`` returns all-layers K+V
                 # bytes for a single token at the dtype the monitor was
                 # configured with — exactly the per-token cost the
                 # queue cap needs to weigh.
-                expected_kv_bytes_per_token = (
-                    self.memory_monitor.estimate_block_memory(1)
+                expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
+                    1
                 )
             else:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default

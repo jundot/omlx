@@ -207,16 +207,25 @@ def _compute_single_metrics(
     end_time: float,
     peak_memory: int,
     cached_tokens: int,
+    prefill_duration_s: float | None = None,
+    generation_duration_s: float | None = None,
 ) -> dict:
     """Compute all metrics for a single request benchmark."""
     ttft_s = first_token_time - start_time
-    gen_duration = end_time - first_token_time
+    prefill_duration = (
+        prefill_duration_s if prefill_duration_s is not None else ttft_s
+    )
+    gen_duration = (
+        generation_duration_s
+        if generation_duration_s is not None
+        else end_time - first_token_time
+    )
     e2e_duration = end_time - start_time
 
     ttft_ms = ttft_s * 1000
     tpot_ms = (gen_duration / max(completion_tokens - 1, 1)) * 1000
     gen_tps = completion_tokens / max(gen_duration, 1e-9)
-    processing_tps = prompt_tokens / max(ttft_s, 1e-9)
+    processing_tps = prompt_tokens / max(prefill_duration, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
     return {
@@ -231,6 +240,18 @@ def _compute_single_metrics(
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
     }
+
+
+def _get_batch_benchmark_core(engine: Any) -> Any | None:
+    """Return the scheduler core when this engine supports batch benchmarks."""
+    engine_core = getattr(engine, "_engine", None)
+    if engine_core is None:
+        return None
+    if not callable(getattr(engine_core, "add_request", None)):
+        return None
+    if not callable(getattr(engine_core, "stream_outputs", None)):
+        return None
+    return engine_core
 
 
 async def _send_event(run: BenchmarkRun, event: dict) -> None:
@@ -299,14 +320,34 @@ async def _run_single_test(
             f"(expected 0). Results may not reflect true prefill performance."
         )
 
+    prefill_duration_s = None
+    generation_duration_s = None
+    metric_completion_tokens = completion_tokens
+    if last_output is not None:
+        prompt_tps = float(getattr(last_output, "prompt_tps", 0.0) or 0.0)
+        if prompt_tps > 0 and prompt_tokens > 0:
+            prefill_duration_s = prompt_tokens / prompt_tps
+
+        canvas_tps = float(getattr(last_output, "diffusion_canvas_tps", 0.0) or 0.0)
+        canvas_tokens = int(getattr(last_output, "diffusion_canvas_tokens", 0) or 0)
+        if canvas_tps > 0 and canvas_tokens > 0:
+            metric_completion_tokens = canvas_tokens
+            generation_duration_s = canvas_tokens / canvas_tps
+        else:
+            generation_tps = float(getattr(last_output, "generation_tps", 0.0) or 0.0)
+            if generation_tps > 0 and completion_tokens > 0:
+                generation_duration_s = completion_tokens / generation_tps
+
     return _compute_single_metrics(
         prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        completion_tokens=metric_completion_tokens,
         start_time=start_time,
         first_token_time=first_token_time,
         end_time=end_time,
         peak_memory=peak_memory,
         cached_tokens=cached_tokens,
+        prefill_duration_s=prefill_duration_s,
+        generation_duration_s=generation_duration_s,
     )
 
 
@@ -330,7 +371,9 @@ async def _run_batch_test(
     """
     from ..request import SamplingParams
 
-    engine_core = engine._engine
+    engine_core = _get_batch_benchmark_core(engine)
+    if engine_core is None:
+        raise ValueError("Engine does not support batch benchmarks")
 
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -812,8 +855,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             "total": total_tests,
         })
         warmup_prompt = _generate_prompt(tokenizer, 32)
+        warmup_max_tokens = (
+            request.generation_length
+            if getattr(engine, "is_diffusion_model", False)
+            else 8
+        )
         async for _ in engine.stream_generate(
-            prompt=warmup_prompt, max_tokens=8, temperature=0.0
+            prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
         ):
             pass
         logger.info("Benchmark: warmup complete")
@@ -857,14 +905,15 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         max_batch = max(request.batch_sizes) if request.batch_sizes else 0
         batch_prompts = [_generate_prompt(tokenizer, 1024) for _ in range(max_batch)]
 
-        # Skip batch tests for engines without scheduler core (e.g. DFlashEngine)
-        if request.batch_sizes and not hasattr(engine, "_engine"):
+        # Skip batch tests for engines without scheduler core (e.g. VLM/Diffusion)
+        batch_core = _get_batch_benchmark_core(engine)
+        if request.batch_sizes and batch_core is None:
             logger.info(
                 "Batch test skipped: engine does not support concurrent batching"
             )
             current_test += len(request.batch_sizes)
 
-        for batch_size in request.batch_sizes if hasattr(engine, "_engine") else []:
+        for batch_size in request.batch_sizes if batch_core is not None else []:
             current_test += 1
             await _send_event(run, {
                 "type": "progress",

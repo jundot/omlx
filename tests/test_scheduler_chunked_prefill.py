@@ -11,6 +11,7 @@ patching _step_prefill_chunk directly.
 from collections import deque
 from unittest.mock import MagicMock, patch
 
+from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -22,6 +23,7 @@ from omlx.scheduler import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_scheduler(chunked_prefill: bool = True, step_size: int = 4) -> Scheduler:
     """Return a Scheduler with a mock model/tokenizer and chunked_prefill config."""
@@ -63,7 +65,9 @@ def _make_request(request_id: str = "req-1", n_tokens: int = 10) -> Request:
     return req
 
 
-def _make_prefill_state(scheduler: Scheduler, request: Request, n_remaining: int = 20) -> _PrefillState:
+def _make_prefill_state(
+    scheduler: Scheduler, request: Request, n_remaining: int = 20
+) -> _PrefillState:
     """Build a minimal _PrefillState for direct testing."""
     import mlx.core as mx
 
@@ -90,6 +94,7 @@ def _make_prefill_state(scheduler: Scheduler, request: Request, n_remaining: int
 # SchedulerConfig
 # ---------------------------------------------------------------------------
 
+
 class TestSchedulerConfigChunkedPrefill:
     def test_default_is_false(self):
         config = SchedulerConfig()
@@ -103,6 +108,7 @@ class TestSchedulerConfigChunkedPrefill:
 # ---------------------------------------------------------------------------
 # _PrefillState
 # ---------------------------------------------------------------------------
+
 
 class TestPrefillState:
     def test_fields_accessible(self):
@@ -149,6 +155,7 @@ class TestPrefillState:
 # Scheduler queues initialised
 # ---------------------------------------------------------------------------
 
+
 class TestSchedulerQueues:
     def test_prefilling_queue_exists(self):
         sched = _make_scheduler()
@@ -165,6 +172,7 @@ class TestSchedulerQueues:
 # ---------------------------------------------------------------------------
 # has_requests includes prefilling
 # ---------------------------------------------------------------------------
+
 
 class TestHasRequests:
     def test_false_when_all_empty(self):
@@ -188,6 +196,7 @@ class TestHasRequests:
 # get_stats includes num_prefilling
 # ---------------------------------------------------------------------------
 
+
 class TestGetStats:
     def test_num_prefilling_in_stats(self):
         sched = _make_scheduler()
@@ -206,6 +215,7 @@ class TestGetStats:
 # reset() clears prefilling
 # ---------------------------------------------------------------------------
 
+
 class TestReset:
     def test_reset_clears_prefilling(self):
         sched = _make_scheduler()
@@ -223,6 +233,7 @@ class TestReset:
 # ---------------------------------------------------------------------------
 # fail_all_requests() includes prefilling
 # ---------------------------------------------------------------------------
+
 
 class TestFailAllRequests:
     def test_fail_all_includes_prefilling(self):
@@ -243,6 +254,7 @@ class TestFailAllRequests:
 # _do_abort_request() cleans up prefilling
 # ---------------------------------------------------------------------------
 
+
 class TestAbortPrefilling:
     def test_abort_removes_from_prefilling(self):
         sched = _make_scheduler()
@@ -261,6 +273,7 @@ class TestAbortPrefilling:
 # ---------------------------------------------------------------------------
 # _advance_chunked_prefills(): core logic
 # ---------------------------------------------------------------------------
+
 
 class TestAdvanceChunkedPrefills:
     def test_no_op_when_queue_empty(self):
@@ -281,7 +294,9 @@ class TestAdvanceChunkedPrefills:
         sched.prefilling.append(req)
         sched._prefill_states[req.request_id] = state
 
-        with patch.object(sched, "_step_prefill_chunk", return_value=False) as mock_step:
+        with patch.object(
+            sched, "_step_prefill_chunk", return_value=False
+        ) as mock_step:
             scheduled = []
             rejected = []
             sched._advance_chunked_prefills(scheduled, rejected)
@@ -344,8 +359,7 @@ class TestAdvanceChunkedPrefills:
         sched._prefill_states[req.request_id] = state
 
         with patch.object(
-            sched, "_step_prefill_chunk",
-            side_effect=_PrefillAbortedError([], 4)
+            sched, "_step_prefill_chunk", side_effect=_PrefillAbortedError([], 4)
         ):
             scheduled = []
             rejected = []
@@ -367,8 +381,7 @@ class TestAdvanceChunkedPrefills:
         sched._prefill_states[req.request_id] = state
 
         with patch.object(
-            sched, "_step_prefill_chunk",
-            side_effect=RuntimeError("kernel panic")
+            sched, "_step_prefill_chunk", side_effect=RuntimeError("kernel panic")
         ):
             scheduled = []
             rejected = []
@@ -396,8 +409,9 @@ class TestAdvanceChunkedPrefills:
         sched._prefill_states[req.request_id] = state
 
         with patch.object(
-            sched, "_step_prefill_chunk",
-            side_effect=RuntimeError("Memory limit exceeded during chunked prefill")
+            sched,
+            "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded during chunked prefill"),
         ):
             scheduled = []
             rejected = []
@@ -410,6 +424,38 @@ class TestAdvanceChunkedPrefills:
         assert sched.requests.get(req.request_id) is req
         assert req in sched.waiting
         assert req.prefill_oom_retries == 1
+
+    def test_capacity_error_surfaces_as_typed_request_error(self):
+        """A deterministic capacity rejection is not retried as transient OOM."""
+        sched = _make_scheduler()
+        req = _make_request("capacity")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        err = PrefillMemoryExceededError(
+            message="Prefill context too large for available memory",
+            request_id=req.request_id,
+            estimated_bytes=123,
+            limit_bytes=100,
+        )
+        with patch.object(sched, "_step_prefill_chunk", side_effect=err):
+            scheduled = []
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        out = rejected[0]
+        assert out.error == str(err)
+        assert out.error_code == "prefill_memory_exceeded"
+        assert out.error_metadata == {
+            "request_id": req.request_id,
+            "estimated_bytes": 123,
+            "limit_bytes": 100,
+        }
+        assert req.prefill_oom_retries == 0
 
     def test_multiple_requests_all_advanced(self):
         """All requests in prefilling get one chunk advanced per call."""
@@ -425,6 +471,7 @@ class TestAdvanceChunkedPrefills:
             sched._prefill_states[req.request_id] = state
 
         call_count = 0
+
         def fake_step(state):
             nonlocal call_count
             call_count += 1
@@ -440,6 +487,7 @@ class TestAdvanceChunkedPrefills:
 # _schedule_waiting(): chunked fork is taken for long prompts
 # ---------------------------------------------------------------------------
 
+
 class TestScheduleWaitingChunkedFork:
     def _setup(self, n_tokens: int, chunked: bool = True, step_size: int = 4):
         sched = _make_scheduler(chunked_prefill=chunked, step_size=step_size)
@@ -452,7 +500,9 @@ class TestScheduleWaitingChunkedFork:
         # step_size=4, prompt=3 tokens → not long enough to trigger chunked fork
         sched, req = self._setup(n_tokens=3, step_size=4)
 
-        with patch.object(sched, "_do_external_prefill", return_value=([], [0])) as mock_ep:
+        with patch.object(
+            sched, "_do_external_prefill", return_value=([], [0])
+        ) as mock_ep:
             with patch.object(sched, "_begin_prefill") as mock_bp:
                 sched._schedule_waiting()
 
@@ -464,7 +514,9 @@ class TestScheduleWaitingChunkedFork:
         # step_size=4, 10 tokens → triggers chunked path
         sched, req = self._setup(n_tokens=10, step_size=4)
 
-        with patch.object(sched, "_begin_prefill", return_value=_make_prefill_state(sched, req)) as mock_bp:
+        with patch.object(
+            sched, "_begin_prefill", return_value=_make_prefill_state(sched, req)
+        ) as mock_bp:
             with patch.object(sched, "_step_prefill_chunk", return_value=False):
                 sched._schedule_waiting()
 
@@ -517,7 +569,9 @@ class TestScheduleWaitingChunkedFork:
         """chunked_prefill=False always uses the full-prefill path."""
         sched, req = self._setup(n_tokens=100, chunked=False, step_size=4)
 
-        with patch.object(sched, "_do_external_prefill", return_value=([], [0])) as mock_ep:
+        with patch.object(
+            sched, "_do_external_prefill", return_value=([], [0])
+        ) as mock_ep:
             with patch.object(sched, "_begin_prefill") as mock_bp:
                 sched._schedule_waiting()
 
@@ -572,9 +626,9 @@ class TestScheduleWaitingChunkedFork:
     def _mock_current(self, sched, current_gb):
         """Context manager-ish — patch both memory probes to current_gb."""
         target = int(current_gb * 1024**3)
-        return patch(
-            "omlx.scheduler.mx.get_active_memory", return_value=target
-        ), patch("omlx.scheduler.get_phys_footprint", return_value=target)
+        return patch("omlx.scheduler.mx.get_active_memory", return_value=target), patch(
+            "omlx.scheduler.get_phys_footprint", return_value=target
+        )
 
     def test_adaptive_throttle_below_soft_watermark_passthrough(self):
         """current < soft watermark → no throttle, full chunk."""
@@ -746,14 +800,13 @@ class TestPrefillRejectionReleasesPagedCache:
         sched._prefill_states[req.request_id] = state
 
         with patch.object(
-            sched, "_step_prefill_chunk",
+            sched,
+            "_step_prefill_chunk",
             side_effect=RuntimeError("Memory limit exceeded"),
         ):
             sched._advance_chunked_prefills([], [])
 
-        sched.block_aware_cache.release_cache.assert_called_once_with(
-            "oom-chunked"
-        )
+        sched.block_aware_cache.release_cache.assert_called_once_with("oom-chunked")
 
     def test_schedule_waiting_non_chunked_releases_on_runtime_error(self):
         """The non-chunked _do_external_prefill rejection path must release
@@ -769,14 +822,13 @@ class TestPrefillRejectionReleasesPagedCache:
         sched.block_aware_cache.reset_mock()
 
         with patch.object(
-            sched, "_do_external_prefill",
+            sched,
+            "_do_external_prefill",
             side_effect=RuntimeError("kernel panic"),
         ):
             sched._schedule_waiting()
 
-        sched.block_aware_cache.release_cache.assert_called_once_with(
-            "oom-direct"
-        )
+        sched.block_aware_cache.release_cache.assert_called_once_with("oom-direct")
 
     def test_schedule_waiting_chunked_first_chunk_releases_on_runtime_error(self):
         """The chunked first-chunk rejection path must release the
@@ -789,18 +841,18 @@ class TestPrefillRejectionReleasesPagedCache:
         sched.block_aware_cache.reset_mock()
 
         with patch.object(
-            sched, "_begin_prefill",
+            sched,
+            "_begin_prefill",
             return_value=_make_prefill_state(sched, req),
         ):
             with patch.object(
-                sched, "_step_prefill_chunk",
+                sched,
+                "_step_prefill_chunk",
                 side_effect=RuntimeError("kernel panic"),
             ):
                 sched._schedule_waiting()
 
-        sched.block_aware_cache.release_cache.assert_called_once_with(
-            "oom-first-chunk"
-        )
+        sched.block_aware_cache.release_cache.assert_called_once_with("oom-first-chunk")
 
     def test_schedule_waiting_preflight_rejection_releases(self):
         """_preflight_memory_check rejection (the non-RuntimeError path
@@ -818,7 +870,8 @@ class TestPrefillRejectionReleasesPagedCache:
         from omlx.scheduler import _PreflightRejection
 
         with patch.object(
-            sched, "_preflight_memory_check",
+            sched,
+            "_preflight_memory_check",
             return_value=_PreflightRejection(
                 message="Memory limit exceeded by preflight estimate",
                 estimated_bytes=1,
@@ -831,6 +884,4 @@ class TestPrefillRejectionReleasesPagedCache:
         assert len(rejected) == 1
         assert rejected[0].request_id == "oom-preflight"
         assert rejected[0].finish_reason == "error"
-        sched.block_aware_cache.release_cache.assert_called_once_with(
-            "oom-preflight"
-        )
+        sched.block_aware_cache.release_cache.assert_called_once_with("oom-preflight")

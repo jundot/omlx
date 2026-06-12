@@ -7,6 +7,7 @@ guard surfaces in production, so a refactor that changes either the
 error body shape or the HTTP code will be caught here.
 """
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -94,6 +95,63 @@ class TestPrefillMemoryHandler:
         assert body["omlx_code"] == "prefill_memory_exceeded"
 
 
+class TestPostCommitPrefillMemorySurface:
+    @pytest.mark.asyncio
+    async def test_json_keepalive_emits_openai_error_body(self):
+        import json
+
+        import omlx.server as srv
+
+        class _Request:
+            async def is_disconnected(self):
+                return False
+
+        async def _raise_late():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-json",
+                estimated_bytes=123,
+                limit_bytes=100,
+            )
+
+        chunks = [
+            chunk
+            async for chunk in srv._with_json_keepalive(
+                _Request(), _raise_late(), disconnect_poll=0.001
+            )
+        ]
+        body = json.loads("".join(chunks))
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] == 123
+        assert body["error"]["limit_bytes"] == 100
+
+    @pytest.mark.asyncio
+    async def test_sse_keepalive_emits_openai_error_chunk(self):
+        import json
+
+        import omlx.server as srv
+
+        async def _gen():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-sse",
+                estimated_bytes=123,
+                limit_bytes=100,
+            )
+            yield ""
+
+        chunks = [
+            chunk
+            async for chunk in srv._with_sse_keepalive(_gen(), keepalive_chunk=None)
+        ]
+        assert chunks[-1] == "data: [DONE]\n\n"
+        data = chunks[0].removeprefix("data: ").strip()
+        body = json.loads(data)
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+
+
 class TestResponsesEndpointReaches400:
     """End-to-end regression for ``/v1/responses``. The handler-shape tests
     above use a synthetic ``/v1/raise`` route, which proves the handler
@@ -174,10 +232,9 @@ class TestResponsesEndpointReaches400:
             fake_pool.shutdown = AsyncMock()
             srv._server_state.engine_pool = fake_pool
             with TestClient(app, raise_server_exceptions=False) as client:
-                with patch.object(
-                    srv, "resolve_model_id", lambda name: name
-                ), patch.object(
-                    srv, "validate_context_window", lambda *a, **k: None
+                with (
+                    patch.object(srv, "resolve_model_id", lambda name: name),
+                    patch.object(srv, "validate_context_window", lambda *a, **k: None),
                 ):
                     resp = client.post(
                         "/v1/responses",
@@ -187,9 +244,9 @@ class TestResponsesEndpointReaches400:
                             "stream": False,
                         },
                     )
-            assert resp.status_code == 400, (
-                f"expected 400, got {resp.status_code}: {resp.text}"
-            )
+            assert (
+                resp.status_code == 400
+            ), f"expected 400, got {resp.status_code}: {resp.text}"
             body = resp.json()
             assert "error" in body, body
             assert "Prefill would require" in body["error"]["message"]

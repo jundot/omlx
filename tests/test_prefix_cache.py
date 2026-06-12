@@ -2894,6 +2894,12 @@ class TestCanonicalLayerCacheTypes:
         )
         assert result == ["ArraysCache", "ArraysCache", "KVCache"]
 
+    def test_prefill_ready_rotating_normalized(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["KVCache", "PrefillReadyRotatingKVCache", "RotatingKVCache"]
+        )
+        assert result == ["KVCache", "RotatingKVCache", "RotatingKVCache"]
+
     def test_turboquant_not_collapsed(self):
         result = BlockAwarePrefixCache._canonical_layer_cache_types(
             ["ArraysCache", "TurboQuantKVCache", "KVCache"]

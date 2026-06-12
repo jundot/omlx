@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx.engine_core import AsyncEngineCore, EngineConfig, EngineCore
+from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
@@ -353,7 +354,9 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_add_request_with_default_sampling_params(self, mock_model, mock_tokenizer):
+    async def test_add_request_with_default_sampling_params(
+        self, mock_model, mock_tokenizer
+    ):
         """Test add_request() uses default sampling params when none provided."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -783,7 +786,9 @@ class TestEngineCoreErrorPropagation:
     """Tests for error propagation from engine loop to requests."""
 
     @pytest.mark.asyncio
-    async def test_error_output_propagates_to_collector(self, mock_model, mock_tokenizer):
+    async def test_error_output_propagates_to_collector(
+        self, mock_model, mock_tokenizer
+    ):
         """Test that engine loop errors are sent to request collectors."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -860,6 +865,51 @@ class TestEngineCoreErrorPropagation:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_stream_outputs_restores_prefill_memory_error(
+        self, mock_model, mock_tokenizer
+    ):
+        """Structured capacity errors must survive the RequestOutput boundary."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(
+                    prompt="Hello",
+                    sampling_params=SamplingParams(max_tokens=50),
+                )
+
+                collector = engine._output_collectors[request_id]
+                collector.put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error="Prefill context too large for available memory",
+                        error_code="prefill_memory_exceeded",
+                        error_metadata={
+                            "request_id": request_id,
+                            "estimated_bytes": 123,
+                            "limit_bytes": 100,
+                        },
+                    )
+                )
+
+                with pytest.raises(PrefillMemoryExceededError) as exc:
+                    async for _ in engine.stream_outputs(request_id):
+                        pass
+
+                assert exc.value.request_id == request_id
+                assert exc.value.estimated_bytes == 123
+                assert exc.value.limit_bytes == 100
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_generate_raises_on_error(self, mock_model, mock_tokenizer):
         """Test generate() raises RuntimeError when error output received."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -901,6 +951,56 @@ class TestEngineCoreErrorPropagation:
 
                 assert final_output is not None
                 assert final_output.error == "Memory limit exceeded during prefill"
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_restores_prefill_memory_error(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(
+                    prompt="Hello",
+                    sampling_params=SamplingParams(max_tokens=50),
+                )
+                engine._output_collectors[request_id].put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error="Prefill context too large for available memory",
+                        error_code="prefill_memory_exceeded",
+                        error_metadata={
+                            "request_id": request_id,
+                            "estimated_bytes": 123,
+                            "limit_bytes": 100,
+                        },
+                    )
+                )
+                engine._finished_events[request_id].set()
+
+                async def _reuse_existing_request(*args, **kwargs):
+                    return request_id
+
+                engine.add_request = _reuse_existing_request  # type: ignore[method-assign]
+
+                with pytest.raises(PrefillMemoryExceededError) as exc:
+                    await engine.generate(
+                        prompt="ignored",
+                        sampling_params=SamplingParams(max_tokens=50),
+                    )
+
+                assert exc.value.request_id == request_id
+                assert exc.value.estimated_bytes == 123
+                assert exc.value.limit_bytes == 100
             finally:
                 await engine.stop()
                 engine.close()
@@ -1140,6 +1240,7 @@ class TestGlobalMLXExecutor:
         """
         import threading
         import time
+
         from omlx.engine_core import get_mlx_executor
 
         executor = get_mlx_executor()
@@ -1172,8 +1273,10 @@ class TestGlobalMLXExecutor:
 
         # All tasks completed
         assert set(results) == {
-            "engine_a_step1", "engine_b_step1",
-            "engine_a_step2", "engine_b_step2",
+            "engine_a_step1",
+            "engine_b_step1",
+            "engine_a_step2",
+            "engine_b_step2",
         }
         # Critical: no two tasks ever ran at the same time
         assert max_concurrent == 1, (
@@ -1241,9 +1344,9 @@ class TestGlobalMLXExecutor:
                 engine1.close()
                 engine2.close()
 
-        assert total_steps >= 4, (
-            f"Expected at least 4 steps from two engines, got {total_steps}"
-        )
+        assert (
+            total_steps >= 4
+        ), f"Expected at least 4 steps from two engines, got {total_steps}"
         # With per-engine executors (#1248), two engines CAN run concurrently.
         # max_concurrent >= 2 means both engines overlapped at least once.
         assert max_concurrent >= 2, (
@@ -1325,9 +1428,7 @@ class TestStepBurst:
                 decode_burst_budget_single_s=budget,
                 decode_burst_budget_s=budget,
             )
-            return EngineCore(
-                model=mock_model, tokenizer=mock_tokenizer, config=config
-            )
+            return EngineCore(model=mock_model, tokenizer=mock_tokenizer, config=config)
 
     def test_max_steps_1_runs_single_step(self, mock_model, mock_tokenizer):
         """max_steps=1 disables bursting -> exactly one scheduler.step()."""
@@ -1407,18 +1508,14 @@ class TestStepBurst:
 
     def test_breaks_on_budget(self, mock_model, mock_tokenizer):
         """Elapsed budget ends the burst (also caps slow prefill-chunk steps)."""
-        engine = self._make_engine(
-            mock_model, mock_tokenizer, max_steps=8, budget=0.05
-        )
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.05)
         try:
             engine.scheduler.step = MagicMock(
                 return_value=SchedulerOutput(has_work=True)
             )
             engine.scheduler.has_requests = MagicMock(return_value=True)
             # deadline = monotonic()(=100.0) + 0.05; next check (=200.0) exceeds it.
-            with patch(
-                "omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]
-            ):
+            with patch("omlx.engine_core.time.monotonic", side_effect=[100.0, 200.0]):
                 outs = engine._step_burst()
             assert len(outs) == 1
             assert engine.scheduler.step.call_count == 1
@@ -1427,9 +1524,7 @@ class TestStepBurst:
 
     def test_budget_zero_disables_bursting(self, mock_model, mock_tokenizer):
         """budget<=0 (with max_steps>1) still runs a single step."""
-        engine = self._make_engine(
-            mock_model, mock_tokenizer, max_steps=8, budget=0.0
-        )
+        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=8, budget=0.0)
         try:
             engine.scheduler.step = MagicMock(
                 return_value=SchedulerOutput(has_work=True)

@@ -5,7 +5,7 @@ wrappers.
 The full end-to-end value of these methods is that they raise
 ``PrefillMemoryExceededError`` BEFORE the route handler wraps the
 response in a ``StreamingResponse``, so the FastAPI handler can turn
-the exception into HTTP 413. We exercise the contract by:
+the exception into HTTP 400. We exercise the contract by:
 
 - Stubbing the wrapper chain (engine -> _engine.engine.scheduler) and the
   tokenizer.
@@ -20,15 +20,19 @@ import pytest
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
 
-
 # ---------------------------------------------------------------------------
 # Scheduler.preflight_or_raise / _preflight_memory_check_tokens
 # ---------------------------------------------------------------------------
 
 
 class _ModelConfig:
-    def __init__(self, num_hidden_layers=32, num_key_value_heads=8,
-                 num_attention_heads=32, head_dim=192):
+    def __init__(
+        self,
+        num_hidden_layers=32,
+        num_key_value_heads=8,
+        num_attention_heads=32,
+        head_dim=192,
+    ):
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
         self.num_attention_heads = num_attention_heads
@@ -47,7 +51,9 @@ def _make_scheduler():
     tokenizer.eos_token_id = 2
 
     config = SchedulerConfig(
-        max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0,
+        max_num_seqs=8,
+        prefill_step_size=2048,
+        paged_cache_block_size=0,
     )
     return Scheduler(model=model, tokenizer=tokenizer, config=config)
 
@@ -71,7 +77,7 @@ class TestPreflightOrRaise:
     def test_returns_silently_when_within_budget(self, monkeypatch):
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = True
-        scheduler._memory_hard_limit_bytes = 10 ** 18  # effectively unbounded
+        scheduler._memory_hard_limit_bytes = 10**18  # effectively unbounded
 
         import omlx.scheduler as scheduler_mod
 
@@ -86,7 +92,7 @@ class TestPreflightOrRaise:
         scheduler._prefill_memory_guard = False
         scheduler._memory_hard_limit_bytes = 1
         # Even with an impossibly small limit, disabled guard never raises.
-        scheduler.preflight_or_raise(num_prompt_tokens=10 ** 6)
+        scheduler.preflight_or_raise(num_prompt_tokens=10**6)
 
     def test_accounts_for_cached_tokens(self, monkeypatch):
         """A fully cached request must not be rejected even at a tiny limit."""
@@ -119,6 +125,7 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
     engine = engine_cls.__new__(engine_cls)
     engine._loaded = True
     engine._enable_thinking = None
+    engine._prefill_eviction_callback = None
 
     tokenizer = MagicMock()
     tokenizer.apply_chat_template = MagicMock(return_value="hello world")
@@ -134,6 +141,46 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
     async_engine_core.engine = inner_engine_core
     engine._engine = async_engine_core
     return engine
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_runs_eviction_before_final_check():
+    from types import SimpleNamespace
+
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = MagicMock()
+    eviction_request = SimpleNamespace(request_id="req-evict")
+    scheduler.preflight_eviction_request.return_value = eviction_request
+    order = []
+    scheduler.preflight_or_raise.side_effect = lambda **kwargs: order.append(
+        ("final", "checked")
+    )
+
+    async def _evict(request):
+        order.append(("evict", request.request_id))
+        return True
+
+    engine = BatchedEngine(
+        model_name="test-model",
+        prefill_eviction_callback=_evict,
+    )
+
+    await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=123,
+        request_id="req-evict",
+    )
+
+    scheduler.preflight_eviction_request.assert_called_once_with(
+        num_prompt_tokens=123,
+        request_id="req-evict",
+    )
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=123,
+        request_id="req-evict",
+    )
+    assert order == [("evict", "req-evict"), ("final", "checked")]
 
 
 @pytest.mark.asyncio
@@ -207,7 +254,7 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
     """Each image-bearing content part must add
     ``_IMAGE_TOKEN_UPPER_BOUND_FALLBACK`` to the prompt size the scheduler sees,
     so image-heavy borderline requests can't slip past."""
-    from omlx.engine.vlm import VLMBatchedEngine, _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+    from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
 
     scheduler = _make_scheduler()
     engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
@@ -226,7 +273,10 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
             "role": "user",
             "content": [
                 {"type": "text", "text": "hello"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,..."},
+                },
                 {"type": "image", "source": {}},
                 {"type": "text", "text": "world"},
             ],
@@ -244,7 +294,7 @@ async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
     the text. If preflight templates the raw messages, the resulting
     tokenized prompt already contains image-placeholder tokens AND we
     then add the per-image budget on top — a double count that
-    produces spurious 413s on borderline image-bearing requests the
+    produces spurious 400s on borderline image-bearing requests the
     real chat path would have admitted. ``preflight_chat`` must
     therefore call ``extract_images_from_messages`` BEFORE
     ``_apply_chat_template``, the same way ``_process_chat_messages``
@@ -276,12 +326,10 @@ async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
     user_content = call_messages[0]["content"]
     if isinstance(user_content, list):
         types_seen = {part.get("type") for part in user_content}
-        assert "image_url" not in types_seen, (
-            "image_url part leaked into template input"
-        )
-        assert "image" not in types_seen, (
-            "image part leaked into template input"
-        )
+        assert (
+            "image_url" not in types_seen
+        ), "image_url part leaked into template input"
+        assert "image" not in types_seen, "image part leaked into template input"
     else:
         # Some packs reduce single-text content to a string.
         assert isinstance(user_content, str)
@@ -312,7 +360,9 @@ async def test_vlm_preflight_chat_converts_pydantic_tools(monkeypatch):
         "type": "function",
         "function": {"name": "do_x", "parameters": {}},
     }
-    await engine.preflight_chat(messages=[{"role": "user", "content": "x"}], tools=[sentinel_tool])
+    await engine.preflight_chat(
+        messages=[{"role": "user", "content": "x"}], tools=[sentinel_tool]
+    )
 
     # convert_tools_for_template returned a list (possibly unchanged for a
     # dict that already has the right shape, possibly transformed) — the
@@ -322,11 +372,14 @@ async def test_vlm_preflight_chat_converts_pydantic_tools(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_batched_engine_preflight_logs_when_scheduler_unreachable(monkeypatch, caplog):
+async def test_batched_engine_preflight_logs_when_scheduler_unreachable(
+    monkeypatch, caplog
+):
     """If the wrapper chain doesn't expose a scheduler (e.g. partial
     init failure), preflight no-ops but logs a warning rather than
     silently swallowing the safety check."""
     import logging
+
     from omlx.engine.batched import BatchedEngine
 
     engine = BatchedEngine.__new__(BatchedEngine)
@@ -356,6 +409,7 @@ async def test_preflight_chat_swallows_tokenizer_errors(caplog):
     on borderline-malformed-prompt requests.
     """
     import logging
+
     from omlx.engine.batched import BatchedEngine
 
     scheduler = _make_scheduler()
@@ -376,9 +430,9 @@ async def test_preflight_chat_swallows_tokenizer_errors(caplog):
         # Must NOT raise the UnicodeDecodeError up to the caller.
         await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
 
-    assert not raise_called["yes"], (
-        "preflight_or_raise must NOT be called when tokenizer fails"
-    )
+    assert not raise_called[
+        "yes"
+    ], "preflight_or_raise must NOT be called when tokenizer fails"
     assert any(
         "tokenizer.encode raised" in r.message for r in caplog.records
     ), "expected a warning logging the tokenizer error"
@@ -388,6 +442,7 @@ async def test_preflight_chat_swallows_tokenizer_errors(caplog):
 async def test_preflight_completion_swallows_tokenizer_errors(caplog):
     """Same contract on the completion path."""
     import logging
+
     from omlx.engine.batched import BatchedEngine
 
     scheduler = _make_scheduler()
@@ -408,6 +463,7 @@ async def test_preflight_completion_swallows_tokenizer_errors(caplog):
 async def test_vlm_preflight_chat_swallows_tokenizer_errors(caplog):
     """VLM path mirrors BatchedEngine on tokenizer-error handling."""
     import logging
+
     from omlx.engine.vlm import VLMBatchedEngine
 
     scheduler = _make_scheduler()

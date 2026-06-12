@@ -171,15 +171,19 @@ def _canonicalize_layer_cache_types(
 ) -> list[str] | None:
     """Normalize wrapper class names for metadata compatibility checks.
 
-    Currently maps ``SizedArraysCache`` to ``ArraysCache`` so blocks saved
-    under either wrapper class compare equal. Types that change tensor
-    representation (e.g., ``TurboQuantKVCache`` vs ``KVCache``) are NOT
-    collapsed — that mismatch is real and the block must be invalidated.
+    Wrapper classes that keep the same tensor representation compare equal.
+    Types that change tensor representation (e.g., ``TurboQuantKVCache`` vs
+    ``KVCache``) are NOT collapsed -- that mismatch is real and the block must
+    be invalidated.
     """
     if layer_cache_types is None:
         return None
+    wrapper_to_canonical = {
+        "SizedArraysCache": "ArraysCache",
+        "PrefillReadyRotatingKVCache": "RotatingKVCache",
+    }
     return [
-        "ArraysCache" if cache_type == "SizedArraysCache" else cache_type
+        wrapper_to_canonical.get(cache_type, cache_type)
         for cache_type in layer_cache_types
     ]
 

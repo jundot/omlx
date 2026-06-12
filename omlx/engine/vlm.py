@@ -26,8 +26,8 @@ Usage:
 import asyncio
 import contextlib
 import copy
-import inspect
 import importlib
+import inspect
 import json
 import logging
 import threading
@@ -769,6 +769,28 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
 
+    async def _preflight_or_raise_with_eviction(
+        self,
+        scheduler: Any,
+        *,
+        num_prompt_tokens: int,
+        request_id: str | None,
+    ) -> None:
+        eviction_request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        if eviction_request is not None and self._prefill_eviction_callback is not None:
+            logger.info(
+                "Running preflight LRU eviction for request %s",
+                eviction_request.request_id,
+            )
+            await self._prefill_eviction_callback(eviction_request)
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -1081,7 +1103,6 @@ class VLMBatchedEngine(BaseEngine):
 
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
-
                         from ..utils.model_loading import materialize_lazy_state
 
                         was_mtp = False
@@ -1713,7 +1734,8 @@ class VLMBatchedEngine(BaseEngine):
               cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
-        from mlx_vlm.utils import load_audio as _load_audio, prepare_inputs
+        from mlx_vlm.utils import load_audio as _load_audio
+        from mlx_vlm.utils import prepare_inputs
 
         num_images = len(images)
         num_audios = len(audio) if audio else 0
@@ -2460,7 +2482,7 @@ class VLMBatchedEngine(BaseEngine):
           2. Count its tokens.
           3. Add a per-image upper-bound budget (``_IMAGE_TOKEN_UPPER_BOUND``)
              for each image-bearing content part — over-counts somewhat
-             on small images (false-positive 413s for borderline-and-image
+             on small images (false-positive 400s for borderline-and-image
              cases) but never under-counts, which is the property the
              guard needs to stay safe against the Apple IOGPUFamily
              panic path.
@@ -2476,7 +2498,7 @@ class VLMBatchedEngine(BaseEngine):
         Raises ``PrefillMemoryExceededError`` if the conservative estimate
         would exceed the configured memory ceiling. See
         ``BatchedEngine.preflight_chat`` for the upstream rationale
-        (avoiding the ``StreamingResponse`` 200 commit so HTTP 413
+        (avoiding the ``StreamingResponse`` 200 commit so HTTP 400
         actually reaches the client).
         """
         if not self._loaded:
@@ -2499,7 +2521,7 @@ class VLMBatchedEngine(BaseEngine):
         # strings inline with the text; if we leave them in, the
         # tokenized prompt already contains some image-placeholder
         # tokens AND we then add the per-image budget on top — a double
-        # count that 413's borderline image-bearing prompts the real
+        # count that rejects borderline image-bearing prompts the real
         # chat path would have handled. The real ``chat`` flow itself
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
@@ -2539,8 +2561,8 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def preflight_completion(
@@ -2572,8 +2594,8 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def stream_chat(
