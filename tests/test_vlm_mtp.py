@@ -94,7 +94,9 @@ def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
     with (
         patch.object(vlm_mtp, "_mtp_rounds", return_value=iter(yielded)) as m_single,
         patch.object(vlm_mtp, "_mtp_rounds_batch") as m_batch,
+        patch.object(vlm_mtp, "_buffer_mtp_target_cache") as m_buffer,
     ):
+        prompt_tokens = mx.array([[5, 6, 7]], dtype=mx.int32)
         out = list(
             vlm_mtp.run_vlm_mtp_decode(
                 target_language_model=target,
@@ -105,6 +107,7 @@ def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
                 first_bonus=7,
                 max_tokens=4,
                 sampler=sampler,
+                prompt_tokens=prompt_tokens,
             )
         )
 
@@ -112,10 +115,16 @@ def test_run_vlm_mtp_decode_single_request_dispatches_to_mtp_rounds():
     assert out == [7, 11, 22, 33]
     m_single.assert_called_once()
     m_batch.assert_not_called()
+    m_buffer.assert_called_once()
+    buffer_args = m_buffer.call_args.args
+    assert buffer_args[0] == []
+    assert getattr(buffer_args[1], "_drafter", buffer_args[1]) is fake_model
+    assert buffer_args[2] is None
     # first_bonus int forwarded as int
     kwargs = m_single.call_args.kwargs
     assert kwargs["first_bonus"] == 7
     assert kwargs["max_tokens"] == 4
+    assert kwargs["prompt_tokens"] is prompt_tokens
 
 
 def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
@@ -131,6 +140,7 @@ def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
     with (
         patch.object(vlm_mtp, "_mtp_rounds_batch", return_value=iter(yielded)) as m_batch,
         patch.object(vlm_mtp, "_mtp_rounds") as m_single,
+        patch.object(vlm_mtp, "_buffer_mtp_target_cache") as m_buffer,
     ):
         out = list(
             vlm_mtp.run_vlm_mtp_decode(
@@ -150,6 +160,7 @@ def test_run_vlm_mtp_decode_batch_dispatches_to_mtp_rounds_batch():
     assert out == [[1, 2, 3], [1, None, 3], [None, None, None]]
     m_batch.assert_called_once()
     m_single.assert_not_called()
+    m_buffer.assert_not_called()
     kwargs = m_batch.call_args.kwargs
     # EOS forwarded as a fresh set (function does its own copy)
     assert kwargs["eos_token_ids"] == {2, 5}

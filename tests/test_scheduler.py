@@ -33,6 +33,7 @@ from omlx.scheduler import (
     SchedulingPolicy,
     _PrefillState,
     _StoreCacheGate,
+    _VLMMTPDecodeState,
 )
 
 
@@ -645,6 +646,53 @@ class TestSchedulerAbortRequest:
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
 
+    def test_abort_vlm_mtp_request_clears_active_generator(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aborting negative vlm_mtp UIDs must release the serialized drafter."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-vlm-mtp",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+
+        class ClosableGenerator:
+            closed = False
+
+            def __next__(self):
+                return 1
+
+            def close(self):
+                self.closed = True
+
+        generator = ClosableGenerator()
+        uid = -1
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        scheduler._vlm_mtp_active[uid] = _VLMMTPDecodeState(
+            generator=generator,
+            request=request,
+            prompt_cache=[],
+            sampler=MagicMock(),
+            state_machine=MagicMock(),
+            max_tokens=16,
+        )
+        scheduler.batch_generator = MagicMock()
+
+        scheduler.abort_request(request.request_id)
+        scheduler._process_pending_aborts()
+
+        assert uid not in scheduler._vlm_mtp_active
+        assert generator.closed is True
+        scheduler.batch_generator.remove.assert_not_called()
+
     def test_abort_cleans_all_scheduler_state(self, mock_model, mock_tokenizer):
         """Abort must clean running, uid mappings, and requests dict.
 
@@ -1187,6 +1235,7 @@ class TestSchedulerSuppressTokens:
         assert captured["target_language_model"] is mock_model
         assert float(mock_model.batch_rope_deltas.item()) == 123.0
         assert captured["first_bonus"] == 2
+        assert "prompt_tokens" not in captured
 
         round_logits = mx.array([[0.0, 0.0, 1.0, 99.0, 0.0]])
         round_token = captured["sampler"](round_logits)

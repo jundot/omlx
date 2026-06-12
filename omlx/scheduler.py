@@ -5737,6 +5737,12 @@ class Scheduler:
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
+            if uid < 0:
+                mtp_state = self._vlm_mtp_active.pop(uid, None)
+                if mtp_state is not None:
+                    close = getattr(mtp_state.generator, "close", None)
+                    if callable(close):
+                        close()
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 

@@ -31,6 +31,7 @@ class FakeLanguageModel:
 
     def __init__(self):
         self.rollback_called = False
+        self.model = object()
 
     def __call__(self, *args, **kwargs):
         from mlx_vlm.models.base import LanguageModelOutput
@@ -46,15 +47,22 @@ class FakeLanguageModel:
         self.rollback_called = True
         return accepted
 
+    def speculative_logits_from_hidden(self, hidden):
+        return hidden
+
 
 class FakeVLMAdapter:
     """Mimics VLMModelAdapter with _language_model and patched methods."""
 
-    def __init__(self):
+    def __init__(self, expose_rollback: bool = True, uses_mrope: bool = False):
         self._language_model = FakeLanguageModel()
+        self._uses_mrope = uses_mrope
         self.forward_called = False
-        # Mimic _patch_vlm_model_adapter() which delegates to _language_model.
-        self.rollback_speculative_cache = self._language_model.rollback_speculative_cache
+        if expose_rollback:
+            # Mimic _patch_vlm_model_adapter() which delegates to _language_model.
+            self.rollback_speculative_cache = (
+                self._language_model.rollback_speculative_cache
+            )
 
     def __call__(self, *args, **kwargs):
         self.forward_called = True
@@ -119,6 +127,21 @@ class TestVLMAdapterMTPProxy:
 
         proxy.rollback_speculative_cache([], [], 0, 4)
         assert adapter._language_model.rollback_called
+
+    def test_rollback_falls_back_to_language_model_when_adapter_lacks_passthrough(self):
+        adapter = FakeVLMAdapter(expose_rollback=False)
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+
+        proxy.rollback_speculative_cache([], [], 0, 4)
+        assert adapter._language_model.rollback_called
+
+    def test_mrope_proxy_hides_fast_path_attrs_but_keeps_rollback(self):
+        adapter = FakeVLMAdapter(expose_rollback=False, uses_mrope=True)
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+
+        assert hasattr(proxy, "rollback_speculative_cache")
+        assert not hasattr(proxy, "model")
+        assert not hasattr(proxy, "speculative_logits_from_hidden")
 
     def test_mtp_rounds_sees_no_language_model(self):
         """Simulates the hasattr check in _mtp_rounds / _mtp_rounds_batch."""
