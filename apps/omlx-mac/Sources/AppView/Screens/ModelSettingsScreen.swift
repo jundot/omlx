@@ -328,7 +328,19 @@ private struct ProfilesTab: View {
                         self.preview = nil
                     }
                 },
-                onClosePreview: { self.preview = nil }
+                onClosePreview: { self.preview = nil },
+                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                onToggleExpose: preview.scope == .model
+                    ? { exposed in
+                        Task {
+                            await vm.setExposeAsModel(
+                                name: preview.name, exposed: exposed, client: client
+                            )
+                        }
+                    }
+                    : nil
             )
         } else {
             // No preview → show the active state's detail.
@@ -358,7 +370,19 @@ private struct ProfilesTab: View {
                     basedOn: nil,
                     isWorkingBase: false,
                     compact: false,
-                    hasWorking: false
+                    hasWorking: false,
+                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(named: name)?.modelId,
+                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    onToggleExpose: scope == .model
+                        ? { exposed in
+                            Task {
+                                await vm.setExposeAsModel(
+                                    name: name, exposed: exposed, client: client
+                                )
+                            }
+                        }
+                        : nil
                 )
             case .defaults:
                 ProfileDetailCard(
@@ -376,6 +400,12 @@ private struct ProfilesTab: View {
                 )
             }
         }
+    }
+
+    /// Per-model profile DTO lookup — source of the expose-as-model state
+    /// and the derived model ID shown on the detail card.
+    private func modelProfile(named name: String) -> ProfileDTO? {
+        vm.profiles.first { $0.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -2296,6 +2326,22 @@ final class ModelSettingsScreenVM: ObservableObject {
                 id: modelID,
                 name: original,
                 body: UpdateProfileRequest(newName: renamed)
+            )
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    /// Flip `expose_as_model` on a per-model profile via PUT. The body
+    /// carries only the flag (absent fields are merge-no-ops server-side);
+    /// reload picks up the derived `model_id` the profile serves under.
+    func setExposeAsModel(name: String, exposed: Bool, client: OMLXClient) async {
+        do {
+            _ = try await client.updateModelProfile(
+                id: modelID,
+                name: name,
+                body: UpdateProfileRequest(exposeAsModel: exposed)
             )
             await load(modelID: modelID, client: client)
         } catch {
