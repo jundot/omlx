@@ -73,11 +73,20 @@ class TestDiffusionStructuredOutputGuard:
             response_format={"type": "text"},
         )
 
-    def test_rejects_json_response_format(self):
-        with pytest.raises(InvalidRequestError, match="Structured response_format"):
+    def test_allows_json_response_format_degrades_to_prompt(self):
+        # response_format degrades to prompt-injected JSON (with the
+        # #1241 Warning header) instead of being rejected — the same
+        # fallback used when xgrammar is not installed.
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "json_object"},
+        )
+
+    def test_rejects_structured_outputs(self):
+        with pytest.raises(InvalidRequestError, match="structured_outputs"):
             _reject_diffusion_structured_outputs(
                 self._DiffusionEngine(),
-                response_format={"type": "json_object"},
+                structured_outputs={"json_schema": {"type": "object"}},
             )
 
     def test_rejects_guided_grammar(self):

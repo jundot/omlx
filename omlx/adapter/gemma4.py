@@ -301,6 +301,7 @@ class Gemma4OutputParserSession:
         self._tokenizer = tokenizer
         self._buffer = ""
         self._in_thought = False
+        self._text_mode = False
 
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
@@ -449,9 +450,24 @@ class Gemma4OutputParserSession:
             text = self._tokenizer.decode([token_id])
         return self._consume_text(text)
 
+    def process_text(self, text: str) -> OutputParserTokenResult:
+        """Process an already-detokenized text segment.
+
+        Engines that emit text segments instead of token ids (the serial
+        diffusion lane detokenizes inside ``stream_diffusion_generate``)
+        feed their output through this entry point so protocol markers
+        are handled identically to the token-id path.  Switches the
+        session to text mode so ``finalize`` does not flush the unused
+        token detokenizer.
+        """
+        self._text_mode = True
+        if not text:
+            return OutputParserTokenResult(stream_text="", visible_text="")
+        return self._consume_text(text)
+
     def finalize(self) -> OutputParserFinalizeResult:
         text = ""
-        if self._detokenizer is not None:
+        if self._detokenizer is not None and not self._text_mode:
             self._detokenizer.finalize()
             text = self._detokenizer.last_segment
 

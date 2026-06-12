@@ -180,7 +180,9 @@ class TestProfileRoutes:
         assert "top_p" not in settings
         assert settings["guided_grammar_enabled"] is False
         assert "guided_grammar" not in settings
-        assert "max_tool_result_tokens" not in settings
+        # Tool calling works on the diffusion lane (prompt-driven +
+        # output parsing), so its settings are preserved.
+        assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
@@ -374,7 +376,8 @@ class TestModelsResponseActiveProfile:
         assert settings["force_sampling"] is False
         assert settings["guided_grammar_enabled"] is False
         assert "guided_grammar" not in settings
-        assert "max_tool_result_tokens" not in settings
+        # Tool calling works on the diffusion lane; setting preserved.
+        assert settings["max_tool_result_tokens"] == 4096
         assert settings["turboquant_kv_enabled"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False

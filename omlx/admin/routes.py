@@ -450,14 +450,18 @@ def _entry_is_diffusion_model(entry) -> bool:
 
 
 def _sanitize_diffusion_settings_dict(settings: dict) -> None:
-    """Clear unsupported diffusion-lane settings before ModelSettings parsing."""
+    """Clear unsupported diffusion-lane settings before ModelSettings parsing.
+
+    Tool-calling settings (``max_tool_result_tokens``) are intentionally NOT
+    cleared: tool calling is prompt-driven plus output parsing and works on
+    the diffusion lane when a tool parser matches the chat template.
+    """
     unsupported_none_fields = (
         "top_p",
         "top_k",
         "min_p",
         "repetition_penalty",
         "presence_penalty",
-        "max_tool_result_tokens",
         "enable_thinking",
         "preserve_thinking",
         "thinking_budget_tokens",
@@ -519,14 +523,17 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
 
 
 def _sanitize_diffusion_model_settings(settings) -> None:
-    """Clear settings that the serial diffusion lane does not implement."""
+    """Clear settings that the serial diffusion lane does not implement.
+
+    ``max_tool_result_tokens`` is intentionally preserved — tool calling
+    works on the diffusion lane (prompt-driven + output parsing).
+    """
     settings.top_p = None
     settings.top_k = None
     settings.min_p = None
     settings.repetition_penalty = None
     settings.presence_penalty = None
     settings.force_sampling = False
-    settings.max_tool_result_tokens = None
     settings.enable_thinking = None
     settings.preserve_thinking = None
     settings.thinking_budget_enabled = False

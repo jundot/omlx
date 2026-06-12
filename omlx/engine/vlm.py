@@ -805,8 +805,27 @@ class VLMBatchedEngine(BaseEngine):
         return getattr(self, "_diffusion_family", None) == "block"
 
     @property
+    def supports_tool_calling(self) -> bool:
+        """True when a tool parser was injected into the tokenizer.
+
+        Tool calling is prompt-driven plus output parsing — it does not
+        require grammar-constrained decoding, so it works on any lane
+        (autoregressive or diffusion) whose chat template matched a
+        parser in ``_inject_tool_calling``.
+        """
+        return bool(getattr(self._tokenizer, "has_tool_calling", False))
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this VLM model."""
+        if self.is_diffusion_model:
+            # The diffusion lane denoises canvas positions in parallel —
+            # there is no sequential logit stream to mask, so compiled
+            # grammars cannot be enforced. Returning None routes
+            # response_format through the existing prompt-injection
+            # fallback (with the #1241 Warning header) instead of
+            # compiling a grammar that the lane would have to reject.
+            return None
         if self._grammar_compiler is not None:
             return self._grammar_compiler
         if self._grammar_compiler_init_attempted:
@@ -2802,9 +2821,10 @@ class VLMBatchedEngine(BaseEngine):
         if not self.is_diffusion_model:
             return
         kwargs = kwargs or {}
-        if tools:
+        if tools and not self.supports_tool_calling:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         if audio:
@@ -2999,6 +3019,63 @@ class VLMBatchedEngine(BaseEngine):
         block_text: list[str] = []
         emitted_tokens = 0
         last_stream_segment = ""
+
+        # Special tokens are stripped from the stream, EXCEPT protocol
+        # markers the model's output parser needs to see in the text:
+        # tool-call markers (e.g. Gemma's <|tool_call> / <tool_call|>)
+        # for the tool parser, and channel/turn markers for the output
+        # parser session (thought-channel → <think> conversion). They
+        # are removed downstream (parser session / parse_tool_calls /
+        # ToolCallStreamFilter) so they never leak to clients.
+        skip_special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+        preserved_marker_texts: list[str] = []
+        if getattr(tokenizer, "has_tool_calling", False):
+            preserved_marker_texts.extend(
+                m
+                for m in (
+                    getattr(tokenizer, "tool_call_start", None),
+                    getattr(tokenizer, "tool_call_end", None),
+                )
+                if m
+            )
+
+        # Detect a protocol output parser (e.g. gemma4 channel markers).
+        # The diffusion lane emits detokenized text segments, so only
+        # sessions exposing ``process_text`` can be used here.
+        parser_session = None
+        try:
+            from ..adapter.output_parser import detect_output_parser
+
+            model_config = (
+                {"model_type": self.model_type} if self.model_type else None
+            )
+            factory = detect_output_parser(
+                self._model_name, tokenizer, model_config
+            )
+            if factory is not None:
+                session = factory.create_session(tokenizer)
+                if hasattr(session, "process_text"):
+                    parser_session = session
+                    preserved_marker_texts.extend(factory.protocol_marker_texts)
+        except Exception as e:
+            logger.debug("Diffusion output parser unavailable: %s", e)
+            parser_session = None
+
+        for marker in preserved_marker_texts:
+            try:
+                marker_id = tokenizer.convert_tokens_to_ids(marker)
+            except Exception:
+                marker_id = None
+            if marker_id is not None:
+                skip_special_ids.discard(marker_id)
+
+        def _parse_block(text: str, *, final: bool = False) -> str:
+            if parser_session is None:
+                return text
+            parsed = parser_session.process_text(text).visible_text
+            if final:
+                parsed += parser_session.finalize().visible_text
+            return parsed
         try:
             with limit_ctx:
                 results = stream_diffusion_generate(
@@ -3010,9 +3087,7 @@ class VLMBatchedEngine(BaseEngine):
                     diffusion_inputs.get("attention_mask"),
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    skip_special_token_ids=set(
-                        getattr(tokenizer, "all_special_ids", None) or []
-                    ),
+                    skip_special_token_ids=skip_special_ids,
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
                     prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
                 )
@@ -3042,7 +3117,10 @@ class VLMBatchedEngine(BaseEngine):
                         continue
 
                     new_text = remove_special_tokens_preserve_whitespace(
-                        "".join(block_text)
+                        _parse_block(
+                            "".join(block_text),
+                            final=finish_reason is not None,
+                        )
                     )
                     full_text += new_text
                     completion_tokens = int(result_tokens or emitted_tokens)

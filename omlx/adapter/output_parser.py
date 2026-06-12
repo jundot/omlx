@@ -64,6 +64,12 @@ class OutputParserFactory:
     stop_token_ids: set[int] = field(default_factory=set)
     thinking_end_text: str | None = None
     thinking_end_trailing_text: str | None = None
+    # Marker strings that must survive special-token stripping so the
+    # parser session can see them in the text stream.  Engines that strip
+    # special tokens during detokenization (e.g. the serial diffusion
+    # lane) preserve the token ids of these markers and let the parser
+    # session remove them instead.
+    protocol_marker_texts: tuple[str, ...] = ()
 
 
 class HarmonyOutputParserSession:
@@ -295,7 +301,14 @@ def detect_output_parser(
         )
 
     if is_gemma4_model(model_name, model_config):
-        from .gemma4 import Gemma4OutputParserSession
+        from .gemma4 import (
+            _CLOSE_MARKER,
+            _OPEN_MARKER_BARE,
+            _TOOL_RESPONSE_CLOSE,
+            _TOOL_RESPONSE_OPEN,
+            _TURN_END_MARKER,
+            Gemma4OutputParserSession,
+        )
 
         return OutputParserFactory(
             kind="gemma4",
@@ -305,6 +318,13 @@ def detect_output_parser(
             ),
             stop_token_ids=set(),
             thinking_end_text="<channel|>",
+            protocol_marker_texts=(
+                _OPEN_MARKER_BARE,
+                _CLOSE_MARKER,
+                _TURN_END_MARKER,
+                _TOOL_RESPONSE_OPEN,
+                _TOOL_RESPONSE_CLOSE,
+            ),
         )
 
     if _is_cohere2_moe_model(model_name, model_config):
