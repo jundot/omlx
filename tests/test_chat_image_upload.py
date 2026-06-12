@@ -54,21 +54,25 @@ class TestChatImageUpload:
         texts = [p for p in msg["content"] if p["type"] == "text"]
         assert len(texts) == 0
 
-    def test_localstorage_stripping(self):
-        """Stripping base64 from image_url parts for localStorage"""
+    def test_history_persistence_stripping(self):
+        """saveCurrentChat keeps data: URLs (history lives in IndexedDB now)
+        and strips only session-dead blob: object URLs."""
         content = [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,LARGE"}},
+            {"type": "image_url", "image_url": {"url": "blob:http://x/dead-link"}},
             {"type": "text", "text": "describe this"},
         ]
         # Simulate the stripping logic from saveCurrentChat()
         stripped = [
             {"type": "image_url", "image_url": {"url": ""}}
             if p["type"] == "image_url"
+            and p["image_url"]["url"].startswith("blob:")
             else p
             for p in content
         ]
-        assert stripped[0]["image_url"]["url"] == ""
-        assert stripped[1]["text"] == "describe this"
+        assert stripped[0]["image_url"]["url"] == "data:image/png;base64,LARGE"
+        assert stripped[1]["image_url"]["url"] == ""
+        assert stripped[2]["text"] == "describe this"
 
     def test_base64_data_uri_format(self):
         """Valid base64 data URIs for images"""
