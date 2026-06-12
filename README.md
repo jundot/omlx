@@ -18,7 +18,7 @@ Flyto MLX 是基于 [@jundot/oMLX](https://github.com/jundot/omlx) 派生的 Mac
 
 最显著的一项是音频对话。`/v1/chat/completions` 接受 OpenAI 标准的 `input_audio` 内容类型，可以让 `gemma4-e2b` / `gemma4-e4b` 听一段音频再回答问题——不是简单替代专用语音转写，而是让语速、停顿、犹豫这些声音信号一起参与推理。实测一段 158 秒的中文销售电话录音，模型给出贴近原文的转写加上对客户态度的判断。上游 oMLX 在六个不同位置（内容解析器、Pydantic schema、chat 模板、Gemma 4 adapter、引擎 prepare_inputs、最外层 gate）把音频路径切断了，这次都修通了。
 
-DFlash 双引擎让通义千问和 Gemma 4 共用一套草稿模型加目标模型的 Metal 内存布局，跑 30B 以上模型时吞吐量有明显提升。
+DFlash 双引擎让通义千问和 Gemma 4 共用一套草稿模型加目标模型的 Metal 内存布局，跑 30B 以上模型时吞吐量有明显提升。Google 官方的 Gemma 4 MTP assistant drafter 也已接通：12B 目标模型挂 0.24B drafter 后单流解码实测从 42 提到 57 tok/s（提升 1.38 倍），模型设置里配 `vlm_mtp_enabled` 加 drafter 路径即可启用。
 
 macOS 26（Tahoe）把菜单栏遮挡检测的标志位从 `0x2` 改成了 `0x2000`，不改这一处菜单栏状态会判错，已修。
 
@@ -41,10 +41,14 @@ brew services start flyto-mlx
 如果在 Linux 上，或者已经有 Python 环境想做开发，可以直接从 git 装：
 
 ```
-pip install git+https://github.com/panwudi/flyto-mlx@v0.4.1
+pip install flyto-mlx
 ```
 
-`pip install flyto-mlx` 走 PyPI 这条路目前不可用。oMLX 全家依赖 mlx-vlm 几个还没发布到 PyPI 的提交，而 PyPI 不接受包的依赖里出现 git URL（PEP 508 §6 的硬约束）。等 mlx-vlm 0.6.x 把那些提交正式发版后再开通。
+从 0.6.0 起 PyPI 通道已开通：mlx-vlm 0.6.x 把此前只存在于 git 提交里的依赖正式发版了，整条依赖链都能从 PyPI 解析。想跟最新主干也可以从 git 装：
+
+```
+pip install git+https://github.com/panwudi/flyto-mlx@v0.6.0
+```
 
 ## 一个示例
 
@@ -118,7 +122,7 @@ Flyto MLX is a downstream fork of [@jundot/oMLX](https://github.com/jundot/omlx)
 
 The most visible addition is audio chat. `/v1/chat/completions` now accepts OpenAI's `input_audio` content type, letting `gemma4-e2b` or `gemma4-e4b` actually listen to audio rather than just transcribe it. Prosody, hesitation, and accent information feed into the answer, which an ASR-then-LLM pipeline cannot do. We verified this against a 158-second Chinese sales call: faithful transcription plus a meaningful analysis of the customer's attitude. Upstream oMLX silently broke the audio path in six places (content parser, Pydantic schema, chat template, Gemma 4 adapter, engine `prepare_inputs`, outer gate); all six are fixed here.
 
-DFlash Path A runs Qwen and Gemma 4 backends with drafter and target model co-loaded into the same Metal heap, giving measurable throughput gains for 30B+ models on Mac mini and Studio.
+DFlash Path A runs Qwen and Gemma 4 backends with drafter and target model co-loaded into the same Metal heap, giving measurable throughput gains for 30B+ models on Mac mini and Studio. Google's official Gemma 4 MTP assistant drafters are wired up too: a 0.24B drafter lifts the 12B target from 42 to 57 tok/s single-stream (1.38x, measured); enable per model with `vlm_mtp_enabled` plus the drafter path.
 
 macOS 26 (Tahoe) shifted NSStatusItem's occlusion bit from `0x2` to `0x2000`. Without the fix the menubar status check is wrong. Fixed.
 
@@ -139,10 +143,14 @@ CLI: `fmlx serve --port 8000` (primary) or `omlx serve --port 8000` (kept as an 
 For Linux or development use:
 
 ```
-pip install git+https://github.com/panwudi/flyto-mlx@v0.4.1
+pip install flyto-mlx
 ```
 
-Plain `pip install flyto-mlx` is not currently available. Flyto MLX, like oMLX itself, depends on unreleased mlx-vlm commits that PEP 508 §6 prevents from being declared in PyPI packages. Once `mlx-vlm 0.6.x` ships with those commits we will enable the PyPI channel.
+The PyPI channel is live as of 0.6.0: mlx-vlm 0.6.x released the commits we previously had to pin from git, so the whole dependency chain now resolves from PyPI. To track the latest main instead:
+
+```
+pip install git+https://github.com/panwudi/flyto-mlx@v0.6.0
+```
 
 ### Video and image generation
 
