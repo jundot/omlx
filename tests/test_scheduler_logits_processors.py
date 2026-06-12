@@ -641,6 +641,54 @@ class TestRowRealignment:
         finally:
             scheduler._uid_row_registry = original
 
+    def test_realigned_rows_rebuilds_in_uid_order(self):
+        """Direct unit coverage of the pure rebuild: offset slots are
+        replaced by the registered rows and the drift flag is set."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        model = object()
+        proc = object()
+        sampler = object()
+        try:
+            scheduler._register_uid_rows(model, [1], [None], [[]])
+            scheduler._register_uid_rows(model, [2], [sampler], [[proc]])
+            # The #1823 probe shape: a stale leading slot, 3 slots for 2 uids.
+            samplers, lps, drift = scheduler._realigned_rows(
+                model, [1, 2], [None, None, sampler], [[], [], [proc]]
+            )
+            assert drift is True
+            assert samplers == [None, sampler]
+            assert lps == [[], [proc]]
+        finally:
+            scheduler._uid_row_registry = original
+
+    def test_realigned_rows_steady_state_reports_no_drift(self):
+        """Feeding the rebuilt lists back in (the post-realignment state)
+        must report no drift: the identity fast path short-circuits."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        model = object()
+        proc = object()
+        try:
+            scheduler._register_uid_rows(model, [1], [None], [[proc]])
+            samplers, lps, drift = scheduler._realigned_rows(model, [1], [], [])
+            assert drift is True  # short slots on the first pass
+            samplers, lps, drift = scheduler._realigned_rows(model, [1], samplers, lps)
+            assert drift is False
+            assert lps == [[proc]]
+        finally:
+            scheduler._uid_row_registry = original
+
     def test_model_scoped_clear_drops_only_that_model(self):
         """Reset/recovery/shutdown release by model: every row of the reset
         engine goes, every row of the other engine stays."""

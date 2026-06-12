@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -419,12 +419,19 @@ class _PrefillState:
 # constraints at all).  The registry below records, at insert time, what each
 # uid is supposed to run; the step chokepoint realigns the positional lists
 # from it.  Bounded so a missing cleanup can never grow it unbounded.
+class _RegisteredRow(NamedTuple):
+    """What a uid is supposed to run, recorded at request insert."""
+
+    sampler: Any
+    logits_processors: list
+
+
 _UID_ROW_REGISTRY_MAX = 4096
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
 # identity both the insert sites and the step chokepoint can see.
-_uid_row_registry: "OrderedDict[tuple[int, int], tuple[Any, list]]" = OrderedDict()
+_uid_row_registry: "OrderedDict[tuple[int, int], _RegisteredRow]" = OrderedDict()
 # Engines run on separate executor threads and share this module-level
 # registry; a plain OrderedDict is not safe under concurrent mutation.
 _uid_row_registry_lock = threading.Lock()
@@ -443,7 +450,7 @@ def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
     """
     with _uid_row_registry_lock:
         for uid, sampler, lps in zip(uids, samplers, lps_rows):
-            _uid_row_registry[(id(model), uid)] = (sampler, list(lps or ()))
+            _uid_row_registry[(id(model), uid)] = _RegisteredRow(sampler, list(lps or ()))
         while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
             _uid_row_registry.popitem(last=False)
 
@@ -467,6 +474,61 @@ def _unregister_uid_rows_for_model(model) -> None:
     with _uid_row_registry_lock:
         for key in [key for key in _uid_row_registry if key[0] == model_id]:
             del _uid_row_registry[key]
+
+
+def _row_drifted(current_lps, expected_lps) -> bool:
+    """True when a slot's processors genuinely differ from the registered row.
+
+    Two distinct empty lists are equivalent — the #1799 normalisation mints
+    fresh ``[]`` objects every step — so only differing content counts. The
+    caller's identity check is the steady-state fast path; this only runs
+    past it.
+    """
+    if not current_lps and not expected_lps:
+        return False
+    return current_lps != expected_lps
+
+
+def _log_drift_correction(uids, slot_count) -> None:
+    """Log a corrected drift: one WARNING per window, the rest at DEBUG."""
+    global _uid_row_drift_last_warning
+    now = time.monotonic()
+    rate_limited = now - _uid_row_drift_last_warning < _UID_ROW_DRIFT_WARNING_INTERVAL_S
+    if not rate_limited:
+        _uid_row_drift_last_warning = now
+    (logger.debug if rate_limited else logger.warning)(
+        "Realigned generation-batch row state from the uid registry "
+        f"(uids={list(uids)}, had {slot_count} processor slots); "
+        "stale or offset slots would have run the wrong sampler/processors."
+    )
+
+
+def _realigned_rows(model, uids, cur_samplers, cur_lps):
+    """Rebuild the positional row lists in uid order from the registry.
+
+    Registered uids take their recorded row; unregistered uids keep their
+    current slot (the #1799 fallback), padding when the lists are shorter
+    than ``uids``. Returns ``(samplers, logits_processors, drift)`` — drift
+    only drives logging, the rebuilt lists are always installed. In steady
+    state the slots already are the registry lists, so the identity check
+    skips any comparison work.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        rows = [_uid_row_registry.get((model_id, uid)) for uid in uids]
+
+    drift = len(cur_lps) != len(uids)
+    samplers, lps = [], []
+    for i, row in enumerate(rows):
+        if row is not None:
+            if not drift and i < len(cur_lps) and cur_lps[i] is not row.logits_processors:
+                drift = _row_drifted(cur_lps[i], row.logits_processors)
+            samplers.append(row.sampler)
+            lps.append(row.logits_processors)
+        else:
+            samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
+            lps.append(cur_lps[i] if i < len(cur_lps) else [])
+    return samplers, lps, drift
 
 
 _original_generation_batch_step = GenerationBatch._step
@@ -508,40 +570,16 @@ def _patched_generation_batch_step(self):
         ]
 
     # Realign per-row samplers and logits processors with ``uids`` from the
-    # per-uid registry.  Positional drift (stale/offset slots left by batch
-    # extend/filter/split) otherwise makes a row run another request's — or
-    # no — sampler and processors, which silently disables grammar
-    # constraints and thinking budgets under concurrent mixed load.
-    cur_lps = self.logits_processors
-    cur_samplers = getattr(self, "samplers", None) or []
-    new_lps = []
-    new_samplers = []
-    drift = len(cur_lps) != len(self.uids)
-    model_id = id(getattr(self, "model", None))
-    with _uid_row_registry_lock:
-        registry_rows = [_uid_row_registry.get((model_id, uid)) for uid in self.uids]
-    for i, uid in enumerate(self.uids):
-        entry = registry_rows[i]
-        if entry is not None:
-            sampler, lps = entry
-            if not drift and i < len(cur_lps) and cur_lps[i] is not lps and (cur_lps[i] or lps):
-                drift = drift or (cur_lps[i] != lps)
-            new_samplers.append(sampler)
-            new_lps.append(lps)
-        else:
-            new_samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
-            new_lps.append(cur_lps[i] if i < len(cur_lps) else [])
+    # per-uid registry; stale or offset slots left by batch extend/filter/
+    # split would otherwise run another request's — or no — rows. See #1823.
+    new_samplers, new_lps, drift = _realigned_rows(
+        getattr(self, "model", None),
+        self.uids,
+        getattr(self, "samplers", None) or [],
+        self.logits_processors,
+    )
     if drift:
-        global _uid_row_drift_last_warning
-        now = time.monotonic()
-        rate_limited = now - _uid_row_drift_last_warning < _UID_ROW_DRIFT_WARNING_INTERVAL_S
-        if not rate_limited:
-            _uid_row_drift_last_warning = now
-        (logger.debug if rate_limited else logger.warning)(
-            "Realigned generation-batch row state from the uid registry "
-            f"(uids={list(self.uids)}, had {len(cur_lps)} processor slots); "
-            "stale or offset slots would have run the wrong sampler/processors."
-        )
+        _log_drift_correction(self.uids, len(self.logits_processors))
     self.logits_processors = new_lps
     self.samplers = new_samplers
 
