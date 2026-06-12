@@ -398,9 +398,11 @@
                             <!-- Sampling settings (LLM/VLM only) -->
                             <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                 <div class="space-y-5">
-                                    <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4"
-                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
+                                    <!-- Row 2: Ctx Window / Max Tokens / Temperature.
+                                         Kept visible for diffusion models: the serial
+                                         diffusion lane honors all three (the settings
+                                         sanitizer deliberately preserves them). -->
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
@@ -418,8 +420,12 @@
                                         </div>
                                     </div>
 
-                                    <!-- Row 3: Top P / Top K / Min P -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                    <!-- Row 3: Top P / Top K / Min P. Hidden for
+                                         diffusion models: the entropy-bound sampler
+                                         only takes temperature; the settings
+                                         sanitizer nulls these knobs. -->
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4"
+                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
                                             <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
