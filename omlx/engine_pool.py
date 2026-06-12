@@ -320,9 +320,10 @@ class EnginePool:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
-        then scans model settings for alias match. If those fail and input
-        contains a provider prefix (e.g. "omlx/my-model"), strips the prefix
-        and retries. Returns the original string if no match found.
+        then exposed profile model IDs, then scans model settings for alias
+        match. If those fail and input contains a provider prefix (e.g.
+        "omlx/my-model"), strips the prefix and retries. Returns the
+        original string if no match found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -334,6 +335,13 @@ class EnginePool:
 
         all_settings = None
         if settings_manager is not None:
+            # Exposed profiles resolve to the physical model they overlay
+            # (handles provider prefixes internally).
+            profile_source = settings_manager.get_exposed_profile_source_model_id(
+                model_id_or_alias
+            )
+            if profile_source is not None:
+                return profile_source
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
                 if ms.model_alias and ms.model_alias == model_id_or_alias:

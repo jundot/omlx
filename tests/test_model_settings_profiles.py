@@ -235,3 +235,170 @@ class TestTemplatesPersistence:
         # vs user classification lives on the client (preset bundle), not
         # on this response.
         assert "is_builtin" not in m2.get_template("custom")
+
+
+# ==================== Exposed profile models ====================
+
+
+def _save_exposed_profile(manager, model_id="qwen-base", name="thinking", settings=None):
+    return manager.save_profile(
+        model_id=model_id,
+        name=name,
+        display_name=name.title(),
+        description=None,
+        settings=settings if settings is not None else {"temperature": 0.6, "enable_thinking": True},
+        expose_as_model=True,
+    )
+
+
+class TestExposedProfilePersistence:
+    def test_save_profile_can_expose_profile_as_model(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+
+        profile = _save_exposed_profile(manager)
+
+        assert profile["expose_as_model"] is True
+
+        reloaded = ModelSettingsManager(tmp_path)
+        exposed = reloaded.list_exposed_profile_models()
+        assert len(exposed) == 1
+        assert exposed[0]["model_id"] == "qwen-base:thinking"
+        assert exposed[0]["source_model_id"] == "qwen-base"
+
+    def test_list_profiles_includes_derived_model_id(self, mgr):
+        _save_exposed_profile(mgr)
+
+        profiles = mgr.list_profiles("qwen-base")
+
+        assert [p["model_id"] for p in profiles] == ["qwen-base:thinking"]
+
+    def test_list_profiles_derives_has_engine_fields(self, mgr):
+        """The server classifies engine-construction overrides so UIs can
+        warn on exposure without mirroring the field list."""
+        _save_exposed_profile(mgr, name="thinking")
+        _save_exposed_profile(
+            mgr,
+            name="accelerated",
+            settings={"temperature": 0.6, "dflash_enabled": True},
+        )
+
+        flags = {p["name"]: p["has_engine_fields"] for p in mgr.list_profiles("qwen-base")}
+
+        assert flags == {"thinking": False, "accelerated": True}
+
+    def test_alias_drives_advertised_model_id(self, mgr):
+        """A base-model alias renames the advertised exposed ID, mirroring
+        how /v1/models lists the base model under its alias."""
+        mgr.set_settings("qwen-base", ModelSettings(model_alias="gpt-4"))
+        _save_exposed_profile(mgr)
+
+        exposed = mgr.list_exposed_profile_models()
+        assert [p["model_id"] for p in exposed] == ["gpt-4:thinking"]
+        profiles = mgr.list_profiles("qwen-base")
+        assert [p["model_id"] for p in profiles] == ["gpt-4:thinking"]
+
+        # Both the alias form and the directory-name form resolve.
+        assert mgr.get_exposed_profile_source_model_id("gpt-4:thinking") == "qwen-base"
+        assert mgr.get_exposed_profile_source_model_id("qwen-base:thinking") == "qwen-base"
+
+    def test_unexposed_profile_is_not_a_model(self, mgr):
+        mgr.save_profile(
+            model_id="qwen-base",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings={"temperature": 0.6},
+        )
+
+        assert mgr.list_exposed_profile_models() == []
+        assert mgr.get_exposed_profile_source_model_id("qwen-base:thinking") is None
+
+    def test_rename_keeps_exposure_and_updates_model_id(self, mgr):
+        _save_exposed_profile(mgr)
+
+        mgr.update_profile("qwen-base", "thinking", new_name="reasoning")
+
+        exposed = mgr.list_exposed_profile_models()
+        assert [p["model_id"] for p in exposed] == ["qwen-base:reasoning"]
+        assert mgr.get_exposed_profile_source_model_id("qwen-base:thinking") is None
+
+    def test_delete_profile_removes_exposed_model(self, mgr):
+        _save_exposed_profile(mgr)
+
+        mgr.delete_profile("qwen-base", "thinking")
+
+        assert mgr.list_exposed_profile_models() == []
+        assert mgr.get_exposed_profile_source_model_id("qwen-base:thinking") is None
+
+
+class TestExposedProfileRequestSettings:
+    def test_request_settings_overlay_base_without_mutating_it(self, mgr):
+        mgr.set_settings("qwen-base", ModelSettings(temperature=0.2, top_p=0.8))
+        _save_exposed_profile(mgr)
+
+        settings = mgr.get_settings_for_request(
+            "qwen-base:thinking",
+            resolved_model_id="qwen-base",
+        )
+
+        assert settings.temperature == 0.6
+        assert settings.top_p == 0.8
+        assert settings.enable_thinking is True
+        assert mgr.get_settings("qwen-base").temperature == 0.2
+        assert mgr.get_settings("qwen-base").active_profile_name is None
+
+    def test_request_settings_handle_provider_prefix(self, mgr):
+        _save_exposed_profile(mgr)
+
+        settings = mgr.get_settings_for_request(
+            "omlx/qwen-base:thinking",
+            resolved_model_id="qwen-base",
+        )
+
+        assert settings.temperature == 0.6
+        assert mgr.get_exposed_profile_source_model_id("omlx/qwen-base:thinking") == "qwen-base"
+
+    def test_engine_construction_fields_are_not_overlaid(self, mgr):
+        """Exposed profiles overlay request-time fields only — engine
+        knobs in the profile stay at the base model's values."""
+        mgr.set_settings("qwen-base", ModelSettings(temperature=0.2))
+        _save_exposed_profile(
+            mgr,
+            settings={"temperature": 0.9, "dflash_enabled": True},
+        )
+
+        settings = mgr.get_settings_for_request(
+            "qwen-base:thinking",
+            resolved_model_id="qwen-base",
+        )
+
+        assert settings.temperature == 0.9
+        assert settings.dflash_enabled is False
+
+    def test_request_settings_fall_back_to_resolved_physical_model(self, mgr):
+        mgr.set_settings(
+            "qwen-base", ModelSettings(temperature=0.2, model_alias="my-alias")
+        )
+
+        settings = mgr.get_settings_for_request(
+            "my-alias",
+            resolved_model_id="qwen-base",
+        )
+
+        assert settings.temperature == 0.2
+
+    def test_alias_form_of_exposed_profile_serves_overlay(self, mgr):
+        """Requests to <alias>:<profile> get the profile overlay, same as
+        the directory-name form."""
+        mgr.set_settings(
+            "qwen-base", ModelSettings(temperature=0.2, model_alias="gpt-4")
+        )
+        _save_exposed_profile(mgr)
+
+        settings = mgr.get_settings_for_request(
+            "gpt-4:thinking",
+            resolved_model_id="qwen-base",
+        )
+
+        assert settings.temperature == 0.6
+        assert settings.enable_thinking is True

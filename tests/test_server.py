@@ -673,6 +673,9 @@ class TestGetMaxContextWindow:
         """Mount a settings_manager that returns the given per-model overrides."""
         manager = MagicMock()
         manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        manager.get_settings_for_request.side_effect = (
+            lambda mid, resolved_model_id=None: overrides.get(resolved_model_id or mid)
+        )
         self._state.settings_manager = manager
 
     def test_global_default_when_nothing_discovered(self):
@@ -711,3 +714,131 @@ class TestGetMaxContextWindow:
         """An unknown model id doesn't crash — falls through to the default."""
         self._mount_pool({})
         assert get_max_context_window("ghost-model") == 32768
+
+
+class TestExposedProfileModels:
+    """Server behavior for profiles exposed as API-visible models."""
+
+    class _FakePool:
+        def get_status(self):
+            return {"models": [{"id": "qwen-base"}]}
+
+        def resolve_model_id(self, model_id, settings_manager=None):
+            if settings_manager is not None:
+                source = settings_manager.get_exposed_profile_source_model_id(model_id)
+                if source:
+                    return source
+            return model_id
+
+    @staticmethod
+    def _save_exposed_profile(manager, settings):
+        return manager.save_profile(
+            model_id="qwen-base",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings=settings,
+            expose_as_model=True,
+        )
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        """Swap a real ModelSettingsManager into the live server state."""
+        import omlx.server as server_module
+
+        original_pool = server_module._server_state.engine_pool
+        original_settings_manager = server_module._server_state.settings_manager
+        manager = ModelSettingsManager(tmp_path)
+        server_module._server_state.settings_manager = manager
+        try:
+            yield manager
+        finally:
+            server_module._server_state.engine_pool = original_pool
+            server_module._server_state.settings_manager = original_settings_manager
+
+    @pytest.mark.asyncio
+    async def test_v1_models_includes_exposed_profile_models(self, manager):
+        import omlx.server as server_module
+
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(
+            manager, {"max_context_window": 4096, "enable_thinking": True}
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "qwen-base:thinking" in model_ids
+        profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
+        assert profile_model.max_model_len == 4096
+
+    @pytest.mark.asyncio
+    async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
+        """With a base-model alias set, the catalog lists <alias>:<profile> —
+        consistent with the base model being listed under its alias."""
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base", ModelSettings(model_alias="gpt-4", max_context_window=100000)
+        )
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "gpt-4" in model_ids
+        assert "gpt-4:thinking" in model_ids
+        assert "qwen-base:thinking" not in model_ids
+        profile_model = next(m for m in response.data if m.id == "gpt-4:thinking")
+        assert profile_model.max_model_len == 4096
+
+    def test_sampling_params_use_exposed_profile_settings(self, manager):
+        """Runtime settings come from the requested profile model, not its source."""
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(temperature=0.1))
+        self._save_exposed_profile(manager, {"temperature": 0.9})
+        server_module._server_state.engine_pool = pool
+
+        temperature, *_ = get_sampling_params(None, None, "qwen-base:thinking")
+
+        assert temperature == 0.9
+
+    def test_thinking_budget_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=64),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"thinking_budget_enabled": True, "thinking_budget_tokens": 512},
+        )
+        server_module._server_state.engine_pool = pool
+
+        budget = server_module._resolve_thinking_budget(object(), "qwen-base:thinking")
+
+        assert budget == 512
+
+    def test_max_context_window_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = pool
+
+        max_context = get_max_context_window("qwen-base:thinking")
+
+        assert max_context == 4096

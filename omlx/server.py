@@ -1123,13 +1123,11 @@ def get_sampling_params(
     """
     global_sampling = _server_state.sampling
 
-    # Resolve alias so per-model settings are found by real model ID
-    model_id = resolve_model_id(model_id)
+    # Get per-model (or exposed-profile) settings if available
+    model_settings = get_model_settings_for_request(model_id)
 
-    # Get per-model settings if available
-    model_settings = None
-    if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
+    # Resolve alias so physical-model defaults can still be found by real model ID
+    model_id = resolve_model_id(model_id)
 
     # Resolve OCR defaults if not provided by caller
     if ocr_defaults is None and model_id:
@@ -1279,13 +1277,22 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
         req_budget = getattr(request.thinking, "budget_tokens", None)
     if req_budget is not None:
         return req_budget
-    # Check model settings
-    resolved = resolve_model_id(model_id)
-    if resolved and _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved)
-        if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
-            return ms.thinking_budget_tokens
+    ms = get_model_settings_for_request(model_id)
+    if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
+        return ms.thinking_budget_tokens
     return None
+
+
+def get_model_settings_for_request(model_id: str | None):
+    """Return settings for the requested API model name via ModelSettingsManager."""
+    sm = _server_state.settings_manager
+    if not model_id or sm is None:
+        return None
+
+    return sm.get_settings_for_request(
+        model_id,
+        resolved_model_id=resolve_model_id(model_id),
+    )
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -1408,12 +1415,10 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         (only possible when neither the model nor the global default
         provides a value, which shouldn't happen in practice).
     """
-    # Resolve alias so per-model settings are found by real model ID
+    # Resolve alias for physical model metadata, but keep requested alias settings.
+    requested_model_id = model_id
+    model_settings = get_model_settings_for_request(requested_model_id)
     model_id = resolve_model_id(model_id)
-
-    model_settings = None
-    if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
 
     # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
@@ -2344,6 +2349,22 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     max_model_len=get_max_context_window(model_id),
                 )
             )
+        if settings_manager:
+            physical_ids = {m["id"] for m in status["models"]}
+            existing_ids = {m.id for m in models}
+            for profile in settings_manager.list_exposed_profile_models():
+                source_model_id = profile["source_model_id"]
+                profile_model_id = profile["model_id"]
+                if source_model_id not in physical_ids or profile_model_id in existing_ids:
+                    continue
+                models.append(
+                    ModelInfo(
+                        id=profile_model_id,
+                        owned_by="omlx",
+                        max_model_len=get_max_context_window(profile_model_id),
+                    )
+                )
+                existing_ids.add(profile_model_id)
 
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models
@@ -2868,8 +2889,8 @@ async def create_chat_completion(
     forced_keys: set[str] = set()
     reasoning_parser = None
     settings_guided_grammar = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
         settings_guided_grammar = _settings_guided_grammar(ms)
@@ -4629,8 +4650,8 @@ async def create_anthropic_message(
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
@@ -5107,8 +5128,8 @@ async def create_response(
     # Get per-model settings
     merged_ct_kwargs = {}
     reasoning_parser = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)

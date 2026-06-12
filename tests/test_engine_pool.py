@@ -129,6 +129,44 @@ class TestEnginePoolInit:
         assert entry_b.is_pinned is False
 
 
+class TestExposedProfileModelResolution:
+    """Tests for exposed profile model IDs that share a physical engine."""
+
+    def _manager_with_exposed_profile(self, tmp_path):
+        from omlx.model_settings import ModelSettingsManager
+
+        manager = ModelSettingsManager(tmp_path)
+        manager.save_profile(
+            model_id="model-b",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings={"enable_thinking": True},
+            expose_as_model=True,
+        )
+        return manager
+
+    def test_resolve_model_id_maps_exposed_profile_to_source_model(self, small_mock_model_dir, tmp_path):
+        """Exposed profile model IDs resolve to their base model for loading."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        manager = self._manager_with_exposed_profile(tmp_path)
+
+        resolved = pool.resolve_model_id("model-b:thinking", manager)
+
+        assert resolved == "model-b"
+
+    def test_resolve_model_id_maps_provider_prefixed_exposed_profile_to_source(self, small_mock_model_dir, tmp_path):
+        """Provider prefixes do not prevent exposed profile resolution."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        manager = self._manager_with_exposed_profile(tmp_path)
+
+        resolved = pool.resolve_model_id("omlx/model-b:thinking", manager)
+
+        assert resolved == "model-b"
+
+
 class TestDiscoverModelsMerge:
     """Tests for discover_models merge behavior (issue #89)."""
 
@@ -1453,6 +1491,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1469,6 +1508,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1492,6 +1532,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1516,6 +1557,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {

@@ -594,6 +594,9 @@ class TestModelsStatusEndpoint:
             def get_settings(self, model_id):
                 return Settings()
 
+            def get_settings_for_request(self, model_id, resolved_model_id=None):
+                return Settings()
+
         original_settings_manager = _server_state.settings_manager
         try:
             _server_state.settings_manager = SettingsManager()
@@ -1009,6 +1012,71 @@ class TestAnthropicMessagesEndpoint:
         assert tool_use_blocks[0]["name"] == "get_weather"
         assert tool_use_blocks[0]["input"] == {"city": "SF"}
         assert data["stop_reason"] == "tool_use"
+
+    def test_anthropic_messages_with_exposed_profile_model(
+        self, client, mock_llm_engine, mock_engine_pool, tmp_path
+    ):
+        """A model:profile id resolves and overlays profile settings on /v1/messages."""
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
+        from omlx.server import _server_state
+
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings("test-model", ModelSettings(temperature=0.1))
+        manager.save_profile(
+            model_id="test-model",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings={"temperature": 0.9, "enable_thinking": True},
+            expose_as_model=True,
+        )
+
+        def resolve_model_id(model_id, settings_manager=None):
+            if settings_manager is not None:
+                source = settings_manager.get_exposed_profile_source_model_id(model_id)
+                if source:
+                    return source
+            return model_id
+
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(
+                text="Hello from the profile.",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.chat = chat
+        original_resolve = mock_engine_pool.resolve_model_id
+        original_settings_manager = _server_state.settings_manager
+        mock_engine_pool.resolve_model_id = resolve_model_id
+        try:
+            _server_state.settings_manager = manager
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "test-model:thinking",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        finally:
+            _server_state.settings_manager = original_settings_manager
+            mock_engine_pool.resolve_model_id = original_resolve
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["type"] == "message"
+        assert data["role"] == "assistant"
+
+        # The profile's settings — not the base model's — reached the engine.
+        assert recorded_chat_kwargs
+        assert recorded_chat_kwargs[0]["temperature"] == 0.9
+        ct_kwargs = recorded_chat_kwargs[0].get("chat_template_kwargs") or {}
+        assert ct_kwargs.get("enable_thinking") is True
 
 
 class TestEmbeddingsEndpoint:

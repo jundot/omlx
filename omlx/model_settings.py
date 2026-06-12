@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
+    MODEL_SPECIFIC_PROFILE_FIELDS,
     filter_profile_fields,
     filter_universal_fields,
     validate_profile_name,
@@ -369,6 +370,32 @@ class ModelSettingsManager:
 
             return ModelSettings()
 
+    def get_settings_for_request(
+        self,
+        model_id: str,
+        resolved_model_id: Optional[str] = None,
+    ) -> ModelSettings:
+        """Get settings for an API-requested model name.
+
+        Exposed profile model IDs return the base model's settings merged
+        with the profile's universal (request-time) overrides; engine-
+        construction fields in the profile are ignored here and only take
+        effect when the profile is applied to the base model. Any other
+        name falls back to the settings of the already-resolved physical
+        model.
+        """
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                profile_match = self._find_exposed_profile_locked(candidate)
+                if profile_match is not None:
+                    base_model_id, profile = profile_match
+                    return self._settings_with_profile_locked(base_model_id, profile)
+
+        return self.get_settings(resolved_model_id or model_id)
+
     def set_settings(self, model_id: str, settings: ModelSettings) -> None:
         """Set settings for a specific model.
 
@@ -498,11 +525,110 @@ class ModelSettingsManager:
                 temp_file.unlink(missing_ok=True)
             raise
 
+    def _profile_model_id(self, model_id: str, profile_name: str) -> str:
+        return f"{model_id}:{profile_name}"
+
+    def _display_profile_model_id_locked(
+        self, model_id: str, profile_name: str
+    ) -> str:
+        """Advertised form of an exposed profile's model ID.
+
+        Uses the base model's alias when set, mirroring how /v1/models
+        lists the base model itself. The directory-name form remains
+        accepted for requests, exactly like the base model's directory
+        name.
+        """
+        base = self._settings.get(model_id)
+        display_base = base.model_alias if base and base.model_alias else model_id
+        return self._profile_model_id(display_base, profile_name)
+
+    def _find_exposed_profile_locked(
+        self, model_id: str
+    ) -> Optional[tuple[str, Dict[str, Any]]]:
+        for base_model_id, profiles in self._profiles.items():
+            base = self._settings.get(base_model_id)
+            alias = base.model_alias if base else None
+            for profile in profiles.values():
+                if not profile.get("expose_as_model"):
+                    continue
+                name = profile["name"]
+                if model_id == self._profile_model_id(base_model_id, name):
+                    return base_model_id, profile
+                if alias and model_id == self._profile_model_id(alias, name):
+                    return base_model_id, profile
+        return None
+
+    def _settings_with_profile_locked(
+        self, model_id: str, profile: Dict[str, Any]
+    ) -> ModelSettings:
+        base = self._settings.get(model_id)
+        merged = base.to_dict() if base is not None else {}
+        # Exposed profiles are request-time overlays, so only universal
+        # (request-time) fields apply. Engine-construction knobs in the
+        # profile can't vary per request on the shared engine; they take
+        # effect only when the profile is applied to the base model.
+        merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        return ModelSettings.from_dict(merged)
+
+    def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
+        """Return the base model for an exposed profile model ID, if any."""
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                match = self._find_exposed_profile_locked(candidate)
+                if match is not None:
+                    return match[0]
+            return None
+
+    def list_exposed_profile_models(self) -> list[dict]:
+        """Return profile records promoted to independently visible model IDs."""
+        with self._lock:
+            exposed = []
+            for base_model_id, profiles in self._profiles.items():
+                for profile in profiles.values():
+                    if not profile.get("expose_as_model"):
+                        continue
+                    item = dict(profile)
+                    item["model_id"] = self._display_profile_model_id_locked(
+                        base_model_id, profile["name"]
+                    )
+                    item["source_model_id"] = base_model_id
+                    item["settings"] = self._settings_with_profile_locked(
+                        base_model_id, item
+                    ).to_dict()
+                    exposed.append(item)
+            return exposed
+
+    @staticmethod
+    def _has_engine_fields(profile: Dict[str, Any]) -> bool:
+        """True when the profile overrides any engine-construction field.
+
+        Those fields are inert on the exposed-model overlay (see
+        ``_settings_with_profile_locked``); UIs use this flag to warn when
+        a profile that carries them is exposed as a model.
+        """
+        settings = profile.get("settings", {}) or {}
+        return any(
+            k in MODEL_SPECIFIC_PROFILE_FIELDS and v is not None
+            for k, v in settings.items()
+        )
+
     def list_profiles(self, model_id: str) -> list[dict]:
         """Return all profiles for ``model_id`` as serializable dicts."""
         with self._lock:
             per_model = self._profiles.get(model_id, {})
-            return [dict(p) for p in per_model.values()]
+            return [
+                {
+                    **p,
+                    "model_id": self._display_profile_model_id_locked(
+                        model_id, p["name"]
+                    ),
+                    "has_engine_fields": self._has_engine_fields(p),
+                }
+                for p in per_model.values()
+            ]
 
     def get_profile(self, model_id: str, name: str) -> Optional[dict]:
         with self._lock:
@@ -516,6 +642,7 @@ class ModelSettingsManager:
         description: Optional[str],
         settings: Dict[str, Any],
         source_template: Optional[str] = None,
+        expose_as_model: bool = False,
     ) -> dict:
         """Create a new profile. Raises if name is invalid or already exists."""
         validate_profile_name(name)
@@ -533,6 +660,7 @@ class ModelSettingsManager:
                 "updated_at": now,
                 "settings": filtered,
                 "source_template": source_template,
+                "expose_as_model": bool(expose_as_model),
             }
             self._save_profiles()
             return dict(per_model[name])
@@ -547,6 +675,7 @@ class ModelSettingsManager:
         description: Optional[str] = None,
         settings: Optional[Dict[str, Any]] = None,
         source_template: Optional[str] = None,
+        expose_as_model: Optional[bool] = None,
     ) -> Optional[dict]:
         """Update a profile's metadata/settings. Returns updated dict or None if not found."""
         with self._lock:
@@ -573,6 +702,8 @@ class ModelSettingsManager:
                 profile["settings"] = filter_profile_fields(settings)
             if source_template is not None:
                 profile["source_template"] = source_template or None
+            if expose_as_model is not None:
+                profile["expose_as_model"] = bool(expose_as_model)
             profile["updated_at"] = utcnow().isoformat()
 
             # Snapshot for rollback on write failure
