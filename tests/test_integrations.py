@@ -10,6 +10,7 @@ from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
+from omlx.integrations.codex_app import CodexAppIntegration
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
@@ -31,12 +32,13 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 7
+        assert len(integrations) == 8
         names = {i.name for i in integrations}
         assert names == {
             "claude",
-            "copilot",
             "codex",
+            "codex_app",
+            "copilot",
             "opencode",
             "openclaw",
             "hermes",
@@ -45,8 +47,9 @@ class TestIntegrationRegistry:
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
-        assert get_integration("copilot") is not None
         assert get_integration("codex") is not None
+        assert get_integration("codex_app") is not None
+        assert get_integration("copilot") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
@@ -239,6 +242,73 @@ name = "old-omlx"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+
+class TestCodexAppIntegration:
+    def test_get_command(self):
+        from omlx.integrations.codex_app import CodexAppIntegration
+        codex_app = CodexAppIntegration()
+        cmd = codex_app.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
+        assert "omlx launch codex_app" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_configure(self, tmp_path):
+        from omlx.integrations.codex_app import CodexAppIntegration
+        codex_app = CodexAppIntegration()
+        config_path = tmp_path / "codex" / "config.toml"
+        with patch.object(CodexAppIntegration, "CONFIG_PATH", config_path):
+            codex_app.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+
+        assert config_path.exists()
+        content = config_path.read_text()
+        assert 'model = "qwen3.5"' in content
+        assert 'model_provider = "omlx"' in content
+        assert 'base_url = "http://127.0.0.1:8000/v1"' in content
+        assert 'env_key = "OMLX_API_KEY"' in content
+
+    def test_launch_app(self, tmp_path):
+        from omlx.integrations.codex_app import CodexAppIntegration
+        codex_app = CodexAppIntegration()
+        config_path = tmp_path / "codex" / "config.toml"
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex_app.os.environ", base_env),
+            patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
+        ):
+            codex_app.launch(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="qwen3.5",
+                    extra_args=(),
+                )
+            )
+
+        # Codex App should launch with "app" subcommand, not "-m <model>"
+        assert captured["argv"] == ["codex", "app"]
+        assert captured["env"]["OMLX_API_KEY"] == "key"
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+
+    def test_type(self):
+        from omlx.integrations.codex_app import CodexAppIntegration
+        codex_app = CodexAppIntegration()
+        assert codex_app.type == "config_file"
+        assert codex_app.display_name == "Codex App"
+        assert codex_app.name == "codex_app"
 
 
 class TestOpenCodeIntegration:
