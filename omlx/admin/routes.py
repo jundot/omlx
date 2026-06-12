@@ -169,6 +169,7 @@ class CreateProfileRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
     source_template: str | None = None
+    expose_as_model: bool = False
 
 
 class UpdateProfileRequest(BaseModel):
@@ -179,6 +180,7 @@ class UpdateProfileRequest(BaseModel):
     description: str | None = None
     settings: dict[str, Any] | None = None
     source_template: str | None = None
+    expose_as_model: bool | None = None
     also_save_as_template: bool = False
 
 
@@ -2567,6 +2569,7 @@ async def create_model_profile(
             description=request.description,
             settings=request.settings or {},
             source_template=request.source_template,
+            expose_as_model=request.expose_as_model,
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2606,6 +2609,7 @@ async def update_model_profile(
             description=request.description,
             settings=request.settings,
             source_template=request.source_template,
+            expose_as_model=request.expose_as_model,
         )
     except InvalidProfileNameError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -187,7 +187,7 @@
             _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
-            newProfile: { name: '', display_name: '', description: '', also_as_template: false },
+            newProfile: { name: '', description: '', also_as_template: false },
             showNewTemplateForm: false,
             newTemplate: { name: '', display_name: '', description: '' },
             editingProfile: null,        // profile name being edited inline
@@ -1537,20 +1537,27 @@
                 try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
             },
 
+            isValidProfileName(name) {
+                // Mirror of the backend rule (validate_profile_name) and the
+                // Mac app's isValidSlug. The profile name IS the exposed model
+                // ID suffix (<model>:<name>), so it must be a clean slug. We
+                // validate and reject rather than silently rewrite the user's
+                // input — matching the server and the native app.
+                return /^[a-z0-9][a-z0-9_-]{0,31}$/.test((name || '').trim());
+            },
             async createProfile() {
                 if (!this.selectedModel) return;
                 this.profileError = '';
-                const displayName = this.newProfile.display_name.trim();
-                if (!displayName) {
-                    this.profileError = 'Name required';
+                const name = this.newProfile.name.trim();
+                if (!this.isValidProfileName(name)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
                     return;
                 }
-                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
-                const autoId = 'p-' + Date.now().toString(36) + '-' +
-                               Math.random().toString(36).slice(2, 6);
+                // name doubles as the display label and the exposed model ID;
+                // duplicate names are caught by the server (409).
                 const body = {
-                    name: autoId,
-                    display_name: displayName,
+                    name: name,
+                    display_name: name,
                     description: this.newProfile.description.trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
@@ -1565,7 +1572,7 @@
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
-                        this.newProfile = { name: '', display_name: '', description: '', also_as_template: false };
+                        this.newProfile = { name: '', description: '', also_as_template: false };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1671,6 +1678,24 @@
                 } finally {
                     this.profileDeleteConfirm = null;
                 }
+            },
+            updateProfileFromEdit(p) {
+                // Edit-dialog save. The name IS the exposed model ID, so
+                // renaming re-IDs the profile (clients pinned to the old ID
+                // will need updating). Validate the new name rather than
+                // rewrite it; only send new_name when it actually changed.
+                this.profileError = '';
+                const newName = (p._editName ?? p.name).trim();
+                const patch = { settings: this.formValuesForProfile() };
+                if (newName !== p.name) {
+                    if (!this.isValidProfileName(newName)) {
+                        this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                        return;
+                    }
+                    patch.new_name = newName;
+                    patch.display_name = newName;  // keep display label == name
+                }
+                return this.updateProfile(p.name, patch);
             },
             async updateProfile(name, patch) {
                 // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }

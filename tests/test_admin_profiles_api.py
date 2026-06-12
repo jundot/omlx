@@ -119,6 +119,16 @@ class TestProfileRoutes:
         assert r.json()["profile"]["display_name"] == "Coding v2"
         assert r.json()["profile"]["settings"]["temperature"] == 0.2
 
+    def test_rename_invalid_name_400(self, client):
+        """Renaming to a non-slug is rejected, like creation."""
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "coding", "display_name": "coding", "settings": {},
+        })
+        r = c.put("/admin/api/models/model-a/profiles/coding",
+                  json={"new_name": "Has Space"})
+        assert r.status_code == 400
+
     def test_delete_profile(self, client):
         c, _ = client
         c.post("/admin/api/models/model-a/profiles", json={
@@ -408,3 +418,118 @@ class TestActiveProfileDriftClearing:
         r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.5})
         assert r.status_code == 200
         assert r.json()["settings"].get("active_profile_name") is None
+
+
+class TestExposeAsModelAPI:
+    """Request models and UI round-trip for the expose-as-model flag."""
+
+    def test_profile_requests_accept_expose_as_model_flag(self):
+        create = admin_routes.CreateProfileRequest.model_validate(
+            {
+                "name": "thinking",
+                "display_name": "Thinking",
+                "settings": {},
+                "expose_as_model": True,
+            }
+        )
+        update = admin_routes.UpdateProfileRequest.model_validate(
+            {"expose_as_model": False}
+        )
+
+        assert create.expose_as_model is True
+        assert update.expose_as_model is False
+        assert "expose_as_model" in update.model_fields_set
+
+    def test_create_exposed_profile_surfaces_in_list(self, client):
+        """Creating with expose_as_model persists it; list_profiles enriches
+        each entry with the derived model_id and has_engine_fields."""
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "thinking", "display_name": "thinking",
+            "settings": {"temperature": 0.6, "dflash_enabled": True},
+            "expose_as_model": True,
+        })
+        profiles = c.get("/admin/api/models/model-a/profiles").json()["profiles"]
+        prof = next(p for p in profiles if p["name"] == "thinking")
+        assert prof["expose_as_model"] is True
+        assert prof["model_id"] == "model-a:thinking"
+        assert prof["has_engine_fields"] is True
+
+    def test_put_toggles_exposure_without_touching_settings(self, client):
+        """The eye/switch path: a flag-only PUT flips exposure and leaves the
+        profile's settings intact (None for expose_as_model means 'don't
+        touch' on other fields)."""
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "fast", "display_name": "fast",
+            "settings": {"temperature": 0.3},
+        })
+        r = c.put("/admin/api/models/model-a/profiles/fast",
+                  json={"expose_as_model": True})
+        assert r.status_code == 200
+        assert r.json()["profile"]["expose_as_model"] is True
+        assert r.json()["profile"]["settings"]["temperature"] == 0.3
+
+        # Unexpose with the same flag-only PUT.
+        r = c.put("/admin/api/models/model-a/profiles/fast",
+                  json={"expose_as_model": False})
+        assert r.json()["profile"]["expose_as_model"] is False
+
+    def test_rename_exposed_profile_updates_model_id(self, client):
+        """The strict edit-dialog flow: renaming an exposed profile re-IDs it
+        (the exposed model_id follows) and keeps it exposed."""
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "thinking", "display_name": "thinking",
+            "settings": {"temperature": 0.6}, "expose_as_model": True,
+        })
+        r = c.put("/admin/api/models/model-a/profiles/thinking",
+                  json={"new_name": "reasoning", "display_name": "reasoning"})
+        assert r.status_code == 200
+
+        profiles = c.get("/admin/api/models/model-a/profiles").json()["profiles"]
+        names = {p["name"] for p in profiles}
+        assert names == {"reasoning"}
+        prof = profiles[0]
+        assert prof["expose_as_model"] is True
+        assert prof["model_id"] == "model-a:reasoning"
+
+    def test_settings_only_put_preserves_exposure(self, client):
+        """An update that omits expose_as_model must not clear it — the Mac
+        app and web both rely on this 'absent = don't touch' contract."""
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "keep", "display_name": "keep",
+            "settings": {"temperature": 0.3}, "expose_as_model": True,
+        })
+        c.put("/admin/api/models/model-a/profiles/keep",
+              json={"settings": {"temperature": 0.9}})
+        profiles = c.get("/admin/api/models/model-a/profiles").json()["profiles"]
+        prof = next(p for p in profiles if p["name"] == "keep")
+        assert prof["expose_as_model"] is True
+        assert prof["settings"]["temperature"] == 0.9
+
+    def test_dashboard_profile_ui_round_trips_expose_as_model_flag(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
+        html = (root / "omlx/admin/templates/dashboard/_modal_model_settings.html").read_text()
+        en = (root / "omlx/admin/i18n/en.json").read_text()
+
+        # The profile name IS the exposed model ID, so it's validated as a
+        # slug and rejected on bad input — never silently rewritten (matches
+        # the server and the Mac app).
+        assert "isValidProfileName" in js
+        assert "modal.model_settings.profiles.invalid_name" in en
+        # Exposure is the one-click eye toggle on the chip row (flag-only PUT);
+        # the engine-fields warning is folded into its tooltip and amber color.
+        assert "expose_as_model: !p.expose_as_model" in html
+        assert "p.has_engine_fields" in html
+        # One name: renaming the profile re-IDs it (and the exposed model),
+        # validated and only when the name actually changed.
+        assert "updateProfileFromEdit" in js
+        assert "updateProfileFromEdit(p)" in html
+        assert "modal.model_settings.profiles.expose_as_model" in html
+        assert "modal.model_settings.profiles.exposed_as" in en
+        assert "modal.model_settings.profiles.expose_engine_fields_hint" in en

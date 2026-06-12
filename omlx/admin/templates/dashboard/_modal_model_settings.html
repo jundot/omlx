@@ -178,14 +178,26 @@
                                                 ? 'bg-emerald-500 text-white border border-emerald-500'
                                                 : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
                                             class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
-                                        <span x-text="p.display_name || p.name"></span>
+                                        <span x-text="p.name"></span>
                                         <span x-show="activeProfileName === p.name && profilesDrift"
                                               class="w-1.5 h-1.5 rounded-full bg-white"
                                               :title="t('modal.model_settings.profiles.drift_hint')"></span>
                                     </button>
-                                    <button type="button" @click="editingProfile = p.name"
+                                    <button type="button" @click="editingProfile = p.name; p._editName = p.name; profileError = ''"
                                             class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+                                    </button>
+                                    <button type="button" @click="updateProfile(p.name, {expose_as_model: !p.expose_as_model})"
+                                            @mouseenter="showTip($event.currentTarget, p.expose_as_model
+                                                ? (t('modal.model_settings.profiles.exposed_as') + ' ' + p.model_id
+                                                   + (p.has_engine_fields ? ' — ' + t('modal.model_settings.profiles.expose_engine_fields_hint') : ''))
+                                                : t('modal.model_settings.profiles.expose_as_model'))"
+                                            @mouseleave="hideTip()"
+                                            :class="p.expose_as_model
+                                                ? (p.has_engine_fields ? 'text-amber-600 hover:text-amber-700' : 'text-emerald-600 hover:text-emerald-700')
+                                                : 'text-neutral-400 hover:text-neutral-700'"
+                                            class="p-0.5 hover:bg-neutral-200 rounded transition-colors">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
                                     </button>
                                     <button type="button" @click="profileDeleteConfirm = p.name"
                                             class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
@@ -200,7 +212,7 @@
                                 </div>
                             </template>
                             <button type="button"
-                                    @click="showNewProfileForm = true; newProfile = {name:'',display_name:'',description:'',also_as_template:false}"
+                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {name:'',description:'',also_as_template:false}"
                                     class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
                                 {{ t('modal.model_settings.profiles.new_profile') }}
                             </button>
@@ -209,8 +221,8 @@
 
                     <!-- New profile inline form (model scope) -->
                     <div x-show="profileScope === 'model' && showNewProfileForm" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
-                        <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
-                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                        <input type="text" x-model="newProfile.name" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
@@ -224,11 +236,12 @@
                     <!-- Edit profile inline dialog (model scope) -->
                     <template x-for="p in profiles" :key="'edit-'+p.name">
                         <div x-show="profileScope === 'model' && editingProfile === p.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
-                            <input type="text" :value="p.display_name" @input="p.display_name = $event.target.value"
-                                   class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                            <input type="text" :value="p.name" @input="p._editName = $event.target.value"
+                                   :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                                   class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
                             <div class="flex justify-between gap-2 flex-wrap">
                                 <button type="button"
-                                        @click="updateProfile(p.name, {display_name: p.display_name, settings: formValuesForProfile() })"
+                                        @click="updateProfileFromEdit(p)"
                                         class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">
                                     {{ t('modal.model_settings.profiles.update_from_form') }}
                                 </button>
