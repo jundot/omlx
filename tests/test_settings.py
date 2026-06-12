@@ -33,6 +33,21 @@ from omlx.settings import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_omlx_env(monkeypatch):
+    """Strip OMLX_* env overrides so settings tests see only file/arg values.
+
+    GlobalSettings.load applies OMLX_* environment overrides (e.g.
+    OMLX_API_KEY) on top of the settings file. Developer machines that
+    export these for day-to-day testing would otherwise leak into the
+    assertions here.
+    """
+    for key in list(os.environ):
+        if key.startswith("OMLX_"):
+            monkeypatch.delenv(key, raising=False)
+
+
+
 class TestServerSettings:
     """Tests for ServerSettings dataclass."""
 

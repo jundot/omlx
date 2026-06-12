@@ -779,5 +779,6 @@
   "chat.image.expired": "L'image a expiré sur le serveur. Utilisez le bouton de régénération pour en créer une nouvelle.",
   "chat.image.bad_input_type": "Les modèles d'image acceptent des images d'entrée PNG, JPEG ou WebP.",
   "chat.image.placeholder_t2i": "Décrivez l'image à générer ; essayez du texte d'affiche",
-  "chat.image.placeholder_edit": "Téléversez une image, puis décrivez la modification en une phrase (p. ex. remplacer le titre par...)"
+  "chat.image.placeholder_edit": "Téléversez une image, puis décrivez la modification en une phrase (p. ex. remplacer le titre par...)",
+  "settings.resource.guard_tier.wired_limit_warning": "Le kernel iogpu.wired_limit_mb est seulement {kernel} ; les allocations au-delà de cette limite peuvent provoquer un crash. Exécutez ceci dans le Terminal pour augmenter la limite :"
 }

@@ -779,5 +779,6 @@
   "chat.image.expired": "画像はサーバー上で期限切れです。再生成ボタンで作り直してください。",
   "chat.image.bad_input_type": "画像モデルは PNG、JPEG、WebP の入力画像のみ受け付けます。",
   "chat.image.placeholder_t2i": "生成したい画像を説明してください。ポスターの文字入れも試せます",
-  "chat.image.placeholder_edit": "画像をアップロードし、変更内容を一文で指示してください (例: タイトルを...に変更)"
+  "chat.image.placeholder_edit": "画像をアップロードし、変更内容を一文で指示してください (例: タイトルを...に変更)",
+  "settings.resource.guard_tier.wired_limit_warning": "カーネルの iogpu.wired_limit_mb は {kernel} のみです；この上限を超えた割り当てはパニックを引き起こす可能性があります。ターミナルで以下を実行して上限を引き上げてください："
 }
