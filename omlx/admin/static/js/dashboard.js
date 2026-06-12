@@ -5,6 +5,57 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
+        'diffusion_gemma',
+    ]);
+    const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
+        'top_p',
+        'top_k',
+        'min_p',
+        'repetition_penalty',
+        'presence_penalty',
+        'force_sampling',
+        'enable_thinking',
+        'preserve_thinking',
+        'thinking_budget_enabled',
+        'thinking_budget_tokens',
+        'reasoning_parser',
+        'guided_grammar_enabled',
+        'guided_grammar',
+        'max_tool_result_tokens',
+        'index_cache_freq',
+        'turboquant_kv_enabled',
+        'turboquant_kv_bits',
+        'turboquant_skip_last',
+        'specprefill_enabled',
+        'specprefill_draft_model',
+        'specprefill_keep_pct',
+        'specprefill_threshold',
+        'dflash_enabled',
+        'dflash_draft_model',
+        'dflash_draft_quant_enabled',
+        'dflash_draft_quant_weight_bits',
+        'dflash_draft_quant_activation_bits',
+        'dflash_draft_quant_group_size',
+        'dflash_max_ctx',
+        'dflash_in_memory_cache',
+        'dflash_in_memory_cache_max_entries',
+        'dflash_in_memory_cache_max_bytes',
+        'dflash_ssd_cache',
+        'dflash_ssd_cache_max_bytes',
+        'dflash_draft_window_size',
+        'dflash_draft_sink_size',
+        'dflash_verify_mode',
+        'mtp_enabled',
+        'vlm_mtp_enabled',
+        'vlm_mtp_draft_model',
+        'vlm_mtp_draft_block_size',
+    ]);
+    const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
+        'enable_thinking',
+        'reasoning_effort',
+        'preserve_thinking',
+    ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench', 'cluster']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
@@ -101,6 +152,7 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                is_diffusion_model: false,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -1113,9 +1165,11 @@
             formValuesForProfile() {
                 const ms = this.modelSettings;
                 const out = {};
+                const isDiffusion = !!ms.is_diffusion_model;
 
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
+                    if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
                         if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
                         continue;
@@ -1139,12 +1193,17 @@
                 const forced = [];
                 for (const e of (ms.ctKwargEntries || [])) {
                     if (e.type === 'enable_thinking') {
+                        if (isDiffusion) continue;
                         ctk.enable_thinking = e.value === 'true';
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
+                        if (isDiffusion) continue;
                         ctk.reasoning_effort = e.value;
                         if (e.force) forced.push('reasoning_effort');
                     } else if (e.type === 'custom' && e.key && e.key.trim()) {
+                        if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(e.key.trim())) {
+                            continue;
+                        }
                         let v = e.value;
                         if (v === 'true') v = true;
                         else if (v === 'false') v = false;
@@ -1308,6 +1367,53 @@
                 this.tip.visible = false;
             },
 
+            isDiffusionModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
+            },
+
+            isDiffusionUnsupportedProfileField(field) {
+                return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
+            },
+
+            isDiffusionUnsupportedCtKwarg(key) {
+                return DIFFUSION_UNSUPPORTED_CT_KWARGS.has(key);
+            },
+
+            buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
+                const ctk = chatTemplateKwargs || {};
+                const forced = new Set(forcedCtKwargs || []);
+                const entries = [];
+                for (const [key, value] of Object.entries(ctk)) {
+                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                        continue;
+                    }
+                    if (key === 'enable_thinking') {
+                        entries.push({
+                            type: 'enable_thinking',
+                            value: String(value),
+                            force: forced.has('enable_thinking'),
+                        });
+                    } else if (key === 'reasoning_effort') {
+                        entries.push({
+                            type: 'reasoning_effort',
+                            value: String(value),
+                            force: forced.has('reasoning_effort'),
+                        });
+                    } else {
+                        entries.push({
+                            type: 'custom',
+                            key,
+                            value: String(value),
+                            force: forced.has(key),
+                        });
+                    }
+                }
+                return entries;
+            },
+
             _resetPresetApplicableFields() {
                 // Reset all fields a preset can touch so switching presets does not leave
                 // stale values. Intentionally does NOT touch model_alias / model_type_override
@@ -1337,26 +1443,25 @@
                 this._resetPresetApplicableFields();
                 const s = preset.settings || {};
                 const ms = this.modelSettings;
+                const isDiffusion = !!ms.is_diffusion_model;
                 for (const k of Object.keys(s)) {
+                    if (isDiffusion
+                        && k !== 'chat_template_kwargs'
+                        && k !== 'forced_ct_kwargs'
+                        && this.isDiffusionUnsupportedProfileField(k)) {
+                        continue;
+                    }
                     if (k === 'thinking_budget_enabled') {
                         ms.enableThinkingBudget = !!s[k];
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
-                        const ctk = s.chat_template_kwargs || {};
-                        const forced = new Set(s.forced_ct_kwargs || []);
-                        const entries = [];
-                        for (const [key, value] of Object.entries(ctk)) {
-                            if (key === 'enable_thinking') {
-                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
-                            } else if (key === 'reasoning_effort') {
-                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
-                            } else {
-                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
-                            }
-                        }
-                        ms.ctKwargEntries = entries;
+                        ms.ctKwargEntries = this.buildCtKwargEntries(
+                            s.chat_template_kwargs,
+                            s.forced_ct_kwargs,
+                            isDiffusion,
+                        );
                     } else {
                         ms[k] = s[k];
                     }
@@ -1413,8 +1518,15 @@
                 // Merge all profile fields into the form (no server call — user clicks Save to persist).
                 const s = profile.settings || {};
                 const ms = this.modelSettings;
+                const isDiffusion = !!ms.is_diffusion_model;
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
                     if (!(k in s)) continue;
+                    if (isDiffusion
+                        && k !== 'chat_template_kwargs'
+                        && k !== 'forced_ct_kwargs'
+                        && this.isDiffusionUnsupportedProfileField(k)) {
+                        continue;
+                    }
                     if (k === 'thinking_budget_enabled') {
                         ms.enableThinkingBudget = !!s[k];
                     } else if (k === 'index_cache_freq') {
@@ -1425,19 +1537,11 @@
                         ms.max_tool_result_tokens = s[k] || null;
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
                         // Rebuild ctKwargEntries
-                        const ctk = s.chat_template_kwargs || {};
-                        const forced = new Set(s.forced_ct_kwargs || []);
-                        const entries = [];
-                        for (const [key, value] of Object.entries(ctk)) {
-                            if (key === 'enable_thinking') {
-                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
-                            } else if (key === 'reasoning_effort') {
-                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
-                            } else {
-                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
-                            }
-                        }
-                        ms.ctKwargEntries = entries;
+                        ms.ctKwargEntries = this.buildCtKwargEntries(
+                            s.chat_template_kwargs,
+                            s.forced_ct_kwargs,
+                            isDiffusion,
+                        );
                     } else {
                         ms[k] = s[k];
                     }
@@ -1631,41 +1735,42 @@
                 this.editingTemplate = null;
                 this.profileDeleteConfirm = null;
                 this.templateDeleteConfirm = null;
-                this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
-                try {
-                    const saved = localStorage.getItem('omlx_profile_scope');
-                    if (saved === 'preset' || saved === 'global' || saved === 'model') {
-                        this.profileScope = saved;
-                    }
-                } catch (e) {}
-                await Promise.all([
-                    this.loadProfilesForModel(model.id),
-                    this.loadTemplates(),
-                ]);
-                this.computeDrift();
-                if (this.reasoningParsers.length === 0) {
+                const isDiffusion = this.isDiffusionModel(model);
+                this.activeProfileName = isDiffusion
+                    ? null
+                    : ((model.settings && model.settings.active_profile_name) || null);
+                if (isDiffusion) {
+                    this.profiles = [];
+                    this.templates = [];
+                    this.profilesDrift = false;
+                } else {
                     try {
-                        const resp = await fetch('/admin/api/grammar/parsers');
-                        if (resp.ok) this.reasoningParsers = await resp.json();
-                        else if (resp.status === 401) window.location.href = '/admin';
-                    } catch (_) { /* network error */ }
+                        const saved = localStorage.getItem('omlx_profile_scope');
+                        if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                            this.profileScope = saved;
+                        }
+                    } catch (e) {}
+                    await Promise.all([
+                        this.loadProfilesForModel(model.id),
+                        this.loadTemplates(),
+                    ]);
+                    if (this.reasoningParsers.length === 0) {
+                        try {
+                            const resp = await fetch('/admin/api/grammar/parsers');
+                            if (resp.ok) this.reasoningParsers = await resp.json();
+                            else if (resp.status === 401) window.location.href = '/admin';
+                        } catch (_) { /* network error */ }
+                    }
                 }
                 this.selectedModel = model;
                 // Load existing settings if available
                 const settings = model.settings || {};
                 // Parse chat_template_kwargs into ctKwargEntries
-                const ctk = settings.chat_template_kwargs || {};
-                const forcedKeys = new Set(settings.forced_ct_kwargs || []);
-                const ctKwargEntries = [];
-                for (const [key, value] of Object.entries(ctk)) {
-                    if (key === 'enable_thinking') {
-                        ctKwargEntries.push({type: 'enable_thinking', value: String(value), force: forcedKeys.has('enable_thinking')});
-                    } else if (key === 'reasoning_effort') {
-                        ctKwargEntries.push({type: 'reasoning_effort', value: String(value), force: forcedKeys.has('reasoning_effort')});
-                    } else {
-                        ctKwargEntries.push({type: 'custom', key, value: String(value), force: forcedKeys.has(key)});
-                    }
-                }
+                const ctKwargEntries = this.buildCtKwargEntries(
+                    settings.chat_template_kwargs,
+                    settings.forced_ct_kwargs,
+                    isDiffusion,
+                );
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
                     model_alias: settings.model_alias || '',
@@ -1733,8 +1838,14 @@
                     image_default_steps: settings.image_default_steps ?? null,
                     image_default_size: settings.image_default_size || '',
                     ctKwargEntries,
+                    is_diffusion_model: isDiffusion,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
+                if (isDiffusion) {
+                    this.profilesDrift = false;
+                } else {
+                    this.computeDrift();
+                }
                 this.showModelSettingsModal = true;
             },
 
@@ -1747,14 +1858,17 @@
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify((() => {
+                            const isDiffusion = !!this.modelSettings.is_diffusion_model;
                             // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
                             const chatTemplateKwargs = {};
                             const forcedCtKwargs = [];
                             for (const entry of this.modelSettings.ctKwargEntries) {
                                 if (entry.type === 'enable_thinking') {
+                                    if (isDiffusion) continue;
                                     chatTemplateKwargs.enable_thinking = entry.value === 'true';
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
+                                    if (isDiffusion) continue;
                                     chatTemplateKwargs.reasoning_effort = entry.value;
                                     if (entry.force) forcedCtKwargs.push('reasoning_effort');
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
@@ -1763,11 +1877,14 @@
                                     else if (val === 'false') val = false;
                                     else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
                                     const key = entry.key.trim();
+                                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                                        continue;
+                                    }
                                     chatTemplateKwargs[key] = val;
                                     if (entry.force) forcedCtKwargs.push(key);
                                 }
                             }
-                            return {
+                            const payload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
@@ -1860,6 +1977,48 @@
                                 default_aligner_overflow: this.modelSettings.default_aligner_overflow || null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
+                            if (isDiffusion) {
+                                Object.assign(payload, {
+                                    top_p: null,
+                                    top_k: null,
+                                    repetition_penalty: null,
+                                    min_p: null,
+                                    presence_penalty: null,
+                                    force_sampling: false,
+                                    reasoning_parser: null,
+                                    index_cache_freq: 0,
+                                    enable_thinking: null,
+                                    thinking_budget_enabled: false,
+                                    thinking_budget_tokens: 0,
+                                    max_tool_result_tokens: 0,
+                                    turboquant_kv_enabled: false,
+                                    turboquant_kv_bits: 4,
+                                    specprefill_enabled: false,
+                                    specprefill_draft_model: null,
+                                    specprefill_keep_pct: null,
+                                    specprefill_threshold: null,
+                                    dflash_enabled: false,
+                                    dflash_draft_model: null,
+                                    dflash_draft_quant_enabled: false,
+                                    dflash_draft_quant_weight_bits: null,
+                                    dflash_draft_quant_activation_bits: null,
+                                    dflash_draft_quant_group_size: null,
+                                    dflash_max_ctx: null,
+                                    dflash_in_memory_cache: true,
+                                    dflash_in_memory_cache_max_entries: 4,
+                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
+                                    dflash_ssd_cache: false,
+                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
+                                    dflash_draft_window_size: null,
+                                    dflash_draft_sink_size: null,
+                                    dflash_verify_mode: null,
+                                    mtp_enabled: false,
+                                    vlm_mtp_enabled: false,
+                                    vlm_mtp_draft_model: null,
+                                    vlm_mtp_draft_block_size: null,
+                                });
+                            }
+                            return payload;
                         })()),
                     });
 

@@ -18,6 +18,7 @@ import pytest
 
 try:
     import mlx.core as mx
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -26,6 +27,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
+
 
 class MockVLMTokenizer:
     """Mock that mimics mlx-vlm's TokenizerWrapper __getattr__ delegation.
@@ -43,9 +45,7 @@ class MockVLMTokenizer:
     def __getattr__(self, attr):
         # Mimic mlx-vlm: delegate to HF tokenizer (which doesn't have
         # tool calling attrs), raising AttributeError
-        raise AttributeError(
-            f"'{type(self).__name__}' has no attribute '{attr}'"
-        )
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{attr}'")
 
     def get_vocab(self):
         return self._vocab
@@ -119,11 +119,14 @@ class FakeStreamingCore:
 # Test stream cleanup
 # ---------------------------------------------------------------------------
 
+
 class TestVLMStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_stream_abort_uses_captured_engine_if_engine_cleared(self):
         """Generator finalization aborts on the original engine reference."""
         fake_engine = FakeStreamingCore()
@@ -140,9 +143,364 @@ class TestVLMStreamingCleanup:
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
 
+class TestVLMDiffusionLane:
+    """Tests for DiffusionGemma routing in VLMBatchedEngine."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_chat_uses_diffusion_lane(self, monkeypatch):
+        from omlx.engine.base import GenerationOutput
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._prepare_vision_inputs = MagicMock(
+            side_effect=AssertionError("AR VLM path should not run")
+        )
+        engine._process_diffusion_chat_messages = MagicMock(
+            return_value={"prompt_tokens": 2}
+        )
+
+        def fake_iter(diffusion_inputs, **kwargs):
+            yield GenerationOutput(
+                text="hello",
+                new_text="hello",
+                prompt_tokens=2,
+                completion_tokens=5,
+                finished=False,
+                finish_reason=None,
+            )
+            yield GenerationOutput(
+                text="hello",
+                new_text="",
+                prompt_tokens=2,
+                completion_tokens=5,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        monkeypatch.setattr(engine, "_iter_diffusion_outputs_sync", fake_iter)
+
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                temperature=0.0,
+            )
+        ]
+
+        assert [output.new_text for output in outputs] == ["hello", ""]
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+        engine._prepare_vision_inputs.assert_not_called()
+        engine._process_diffusion_chat_messages.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_chat_collects_streamed_blocks(self, monkeypatch):
+        from omlx.engine.base import GenerationOutput
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._process_diffusion_chat_messages = MagicMock(
+            return_value={"prompt_tokens": 3}
+        )
+
+        def fake_iter(diffusion_inputs, **kwargs):
+            yield GenerationOutput(
+                text="A",
+                new_text="A",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+            )
+            yield GenerationOutput(
+                text="AB",
+                new_text="B",
+                prompt_tokens=3,
+                completion_tokens=2,
+                finished=True,
+                finish_reason="length",
+            )
+
+        monkeypatch.setattr(engine, "_iter_diffusion_outputs_sync", fake_iter)
+
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+
+        assert output.text == "AB"
+        assert output.prompt_tokens == 3
+        assert output.completion_tokens == 2
+        assert output.finish_reason == "length"
+        assert output.cached_tokens == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_validation_rejects_tools(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Tool calling"):
+            engine._validate_diffusion_request(
+                tools=[{"type": "function", "function": {"name": "lookup"}}],
+            )
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_validation_rejects_audio(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Audio input"):
+            engine._validate_diffusion_request(audio=[object()])
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_stream_generate_rejects_precomputed_vlm_inputs(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        with pytest.raises(InvalidRequestError, match="Precomputed VLM embeddings"):
+            async for _ in engine.stream_generate(
+                "hello",
+                vlm_inputs_embeds=object(),
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_abort_all_requests_sets_cancel_events(self):
+        import threading
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        cancel_event = threading.Event()
+        engine._diffusion_cancel_events = {cancel_event}
+
+        assert await engine.abort_all_requests() == 1
+        assert cancel_event.is_set()
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_iter_ignores_stale_final_text(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+        stream_kwargs = {}
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            stream_kwargs.update(kwargs)
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason="length",
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", ""]
+        assert outputs[-1].text == "Hello"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "length"
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_iter_flushes_final_detokenizer_segment(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+        stream_kwargs = {}
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            stream_kwargs.update(kwargs)
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="!",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason="stop",
+                diffusion_block_complete=False,
+                is_draft=False,
+                prompt_tps=123.0,
+                generation_tps=45.0,
+                diffusion_canvas_tokens=64,
+                diffusion_denoising_steps=7,
+                diffusion_work_tokens=448,
+                diffusion_canvas_tps=90.0,
+                diffusion_work_tps=630.0,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", "!"]
+        assert outputs[-1].text == "Hello!"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+        assert stream_kwargs["prefill_step_size"] == 2048
+        assert outputs[-1].prompt_tps == 123.0
+        assert outputs[-1].generation_tps == 45.0
+        assert outputs[-1].diffusion_canvas_tokens == 64
+        assert outputs[-1].diffusion_denoising_steps == 7
+        assert outputs[-1].diffusion_work_tokens == 448
+        assert outputs[-1].diffusion_canvas_tps == 90.0
+        assert outputs[-1].diffusion_work_tps == 630.0
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_iter_preserves_leading_space_across_blocks(self, monkeypatch):
+        import importlib
+
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        def fake_stream_diffusion_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                text="Hello",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=1,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=True,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text=" world",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason=None,
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+            yield SimpleNamespace(
+                text="",
+                generation_tokens=2,
+                prompt_tokens=2,
+                finish_reason="stop",
+                diffusion_block_complete=False,
+                is_draft=False,
+            )
+
+        monkeypatch.setattr(
+            diffusion_module,
+            "stream_diffusion_generate",
+            fake_stream_diffusion_generate,
+        )
+
+        outputs = list(
+            engine._iter_diffusion_outputs_sync(
+                {"input_ids": object(), "prompt_tokens": 2},
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+        assert [output.new_text for output in outputs] == ["Hello", " world"]
+        assert outputs[-1].text == "Hello world"
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
+
+
 # ---------------------------------------------------------------------------
 # TestInjectToolCalling
 # ---------------------------------------------------------------------------
+
 
 class TestInjectToolCalling:
     """Tests for VLMBatchedEngine._inject_tool_calling()."""
@@ -166,7 +524,7 @@ class TestInjectToolCalling:
         """Chat template with <tool_call>\\n<function= → qwen3_coder parser."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
-            chat_template='prefix <tool_call>\n<function= suffix',
+            chat_template="prefix <tool_call>\n<function= suffix",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
@@ -182,8 +540,10 @@ class TestInjectToolCalling:
 
         engine._inject_tool_calling(tokenizer)
 
-        assert not hasattr(tokenizer, "has_tool_calling") or \
-            getattr(tokenizer, "has_tool_calling", False) is False
+        assert (
+            not hasattr(tokenizer, "has_tool_calling")
+            or getattr(tokenizer, "has_tool_calling", False) is False
+        )
 
     def test_skips_when_no_tool_markers(self):
         """Chat template without any tool markers → no injection."""
@@ -254,6 +614,7 @@ class TestInjectToolCalling:
 # ---------------------------------------------------------------------------
 # TestApplyChatTemplate
 # ---------------------------------------------------------------------------
+
 
 class TestApplyChatTemplate:
     """Tests for VLMBatchedEngine._apply_chat_template()."""
@@ -352,6 +713,7 @@ class TestApplyChatTemplate:
 # TestApplyOcrPrompt
 # ---------------------------------------------------------------------------
 
+
 class TestApplyOcrPrompt:
     """Tests for VLMBatchedEngine._apply_ocr_prompt()."""
 
@@ -360,7 +722,10 @@ class TestApplyOcrPrompt:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                     {"type": "text", "text": text},
                 ],
             }
@@ -374,7 +739,8 @@ class TestApplyOcrPrompt:
         result = engine._apply_ocr_prompt(messages)
 
         text_parts = [
-            p for p in result[0]["content"]
+            p
+            for p in result[0]["content"]
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert len(text_parts) == 1
@@ -388,7 +754,8 @@ class TestApplyOcrPrompt:
         result = engine._apply_ocr_prompt(messages)
 
         text_parts = [
-            p for p in result[0]["content"]
+            p
+            for p in result[0]["content"]
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts[0]["text"] == "Read this document"
@@ -400,7 +767,10 @@ class TestApplyOcrPrompt:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             }
         ]
@@ -418,7 +788,8 @@ class TestApplyOcrPrompt:
         result = engine._apply_ocr_prompt(messages)
 
         text_parts = [
-            p for p in result[0]["content"]
+            p
+            for p in result[0]["content"]
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts[0]["text"] == "Text Recognition:"
@@ -431,7 +802,8 @@ class TestApplyOcrPrompt:
         result = engine._apply_ocr_prompt(messages)
 
         text_parts = [
-            p for p in result[0]["content"]
+            p
+            for p in result[0]["content"]
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts[0]["text"] == "Convert the document to markdown."
@@ -453,7 +825,10 @@ class TestApplyOcrPrompt:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             }
         ]
@@ -461,7 +836,8 @@ class TestApplyOcrPrompt:
         result = engine._apply_ocr_prompt(messages)
 
         image_parts = [
-            p for p in result[0]["content"]
+            p
+            for p in result[0]["content"]
             if isinstance(p, dict) and p.get("type") == "image_url"
         ]
         assert len(image_parts) == 1
@@ -481,6 +857,7 @@ class TestApplyOcrPrompt:
 # TestProcessChatMessages
 # ---------------------------------------------------------------------------
 
+
 class TestProcessChatMessages:
     """Tests for VLMBatchedEngine._process_chat_messages()."""
 
@@ -498,7 +875,14 @@ class TestProcessChatMessages:
         messages = [{"role": "user", "content": "Hello"}]
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
-        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
+        (
+            token_ids,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        ) = result
         assert token_ids == [1, 2, 3]
         assert vlm_embeds is None
         assert vlm_kwargs is None
@@ -550,15 +934,30 @@ class TestProcessChatMessages:
             return_value=([1, 2, 3], MagicMock(), {}, "hash123", 12, [(12, "hash123")])
         )
 
-        messages = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
-            {"type": "text", "text": "Describe"},
-        ]}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,x"},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
 
         result = engine._process_chat_messages(messages, tools=None, kwargs={})
 
         engine._prepare_vision_inputs.assert_called_once()
-        token_ids, vlm_embeds, vlm_kwargs, image_hash, image_cache_key_start, image_cache_key_ranges = result
+        (
+            token_ids,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        ) = result
         assert token_ids == [1, 2, 3]
         assert image_hash == "hash123"
         assert image_cache_key_start == 12
@@ -579,7 +978,9 @@ class TestProcessChatMessages:
             return_value=([1, 2, 3], None, None, None, 0, [])
         )
 
-        tools = [{"type": "function", "function": {"name": "analyze", "parameters": {}}}]
+        tools = [
+            {"type": "function", "function": {"name": "analyze", "parameters": {}}}
+        ]
         messages = [{"role": "user", "content": "Describe"}]
 
         with patch("omlx.engine.vlm.convert_tools_for_template") as mock_convert:
@@ -617,6 +1018,7 @@ class TestProcessChatMessages:
 # TestPrepareVisionInputs
 # ---------------------------------------------------------------------------
 
+
 class TestPrepareVisionInputs:
     """Tests for VLMBatchedEngine._prepare_vision_inputs()."""
 
@@ -650,6 +1052,7 @@ class TestPrepareVisionInputs:
 
         messages = [{"role": "user", "content": "Describe"}]
         from PIL import Image
+
         images = [Image.new("RGB", (4, 4), "red")]
         tools = [{"type": "function", "function": {"name": "test"}}]
 
@@ -675,6 +1078,7 @@ class TestPrepareVisionInputs:
 
         messages = [{"role": "user", "content": "Describe"}]
         from PIL import Image
+
         images = [Image.new("RGB", (4, 4), "red")]
 
         engine._prepare_vision_inputs(messages, images, tools=None)
@@ -689,6 +1093,7 @@ class TestPrepareVisionInputs:
         engine._processor = MagicMock()
 
         from PIL import Image
+
         images = [Image.new("RGB", (4, 4), "red"), Image.new("RGB", (4, 4), "blue")]
         messages = [{"role": "user", "content": "Describe"}]
 
@@ -728,7 +1133,10 @@ class TestFormatMessagesForVLMTemplate:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "What is this image?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             },
         ]
@@ -748,8 +1156,14 @@ class TestFormatMessagesForVLMTemplate:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,b"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,a"},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,b"},
+                    },
                     {"type": "text", "text": "Compare"},
                 ],
             },
@@ -808,7 +1222,10 @@ class TestFormatMessagesForVLMTemplate:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "What is this?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             },
         ]
@@ -868,9 +1285,7 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted, _ = engine._format_messages_for_vlm_template(
-            messages, num_images=0
-        )
+        formatted, _ = engine._format_messages_for_vlm_template(messages, num_images=0)
 
         assert formatted[0]["reasoning_content"] == "R"
         assert formatted[0]["tool_calls"][0]["function"]["name"] == "fn"
@@ -888,9 +1303,7 @@ class TestFormatMessagesForVLMTemplate:
             {"role": "assistant", "content": "A"},
         ]
 
-        formatted, _ = engine._format_messages_for_vlm_template(
-            messages, num_images=0
-        )
+        formatted, _ = engine._format_messages_for_vlm_template(messages, num_images=0)
 
         # Default path flattens text-only list content to string (see #796),
         # so if we accidentally preserve verbatim the content may stay as-is
@@ -917,9 +1330,7 @@ class TestFormatMessagesForVLMTemplate:
             },
         ]
 
-        formatted, _ = engine._format_messages_for_vlm_template(
-            messages, num_images=0
-        )
+        formatted, _ = engine._format_messages_for_vlm_template(messages, num_images=0)
 
         assert "reasoning_content" not in formatted[0]
 
@@ -927,6 +1338,7 @@ class TestFormatMessagesForVLMTemplate:
 # ---------------------------------------------------------------------------
 # TestCountChatTokens
 # ---------------------------------------------------------------------------
+
 
 class TestCountChatTokens:
     """Tests for VLMBatchedEngine.count_chat_tokens()."""
@@ -956,7 +1368,10 @@ class TestCountChatTokens:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                     {"type": "text", "text": "Describe"},
                 ],
             }
@@ -970,6 +1385,7 @@ class TestCountChatTokens:
 # ---------------------------------------------------------------------------
 # TestPartialModeVLM
 # ---------------------------------------------------------------------------
+
 
 class TestPartialModeVLM:
     """Tests for partial mode in VLM engine — always ignored."""
@@ -1001,6 +1417,7 @@ class TestPartialModeVLM:
 # TestGetStats
 # ---------------------------------------------------------------------------
 
+
 class TestGetStats:
     """Tests for VLMBatchedEngine.get_stats()."""
 
@@ -1019,6 +1436,7 @@ class TestGetStats:
 # ---------------------------------------------------------------------------
 # TestSplitVisionFeatures
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="mlx not installed")
 class TestSplitVisionFeatures:
@@ -1071,7 +1489,9 @@ class TestSplitVisionFeatures:
         grid_thw = mx.array([[1, 4, 4]])  # → 4 merged tokens
         features = mx.ones((99, 128))  # Mismatch
 
-        result = engine._split_vision_features(features, 1, {"image_grid_thw": grid_thw})
+        result = engine._split_vision_features(
+            features, 1, {"image_grid_thw": grid_thw}
+        )
         # Single image: returns [features] regardless of shape
         assert result is not None
 
@@ -1086,6 +1506,7 @@ class TestSplitVisionFeatures:
 # ---------------------------------------------------------------------------
 # TestStopSafety
 # ---------------------------------------------------------------------------
+
 
 class TestStopSafety:
     """Tests for VLMBatchedEngine.stop() exception safety."""

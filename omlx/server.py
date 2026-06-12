@@ -162,6 +162,7 @@ from .engine_pool import EnginePool
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
+    InvalidRequestError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
@@ -592,6 +593,24 @@ async def validation_exception_handler(
     else:
         content = {"detail": exc.errors()}
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(InvalidRequestError)
+async def invalid_request_error_handler(
+    request: FastAPIRequest, exc: InvalidRequestError
+):
+    """Map internal request validation failures to OpenAI-compatible 400s."""
+    logger.warning(
+        "%s %s -> 400: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(str(exc), 400, param=exc.field)
+    else:
+        content = {"detail": str(exc)}
+    return JSONResponse(status_code=400, content=content)
 
 
 @app.exception_handler(SchedulerQueueFullError)
@@ -2371,6 +2390,11 @@ async def create_chat_completion(
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
+    _reject_diffusion_structured_outputs(
+        engine,
+        response_format=response_format,
+        structured_outputs=request.structured_outputs,
+    )
     if request.structured_outputs is not None or response_format:
         await engine.start()
     compiled_grammar = _compile_grammar_for_request(
@@ -2402,9 +2426,18 @@ async def create_chat_completion(
         else:
             structured_output_headers["X-OMLX-Structured-Output"] = "enforced"
 
-    # Merge MCP tools with user-provided tools
-    effective_tools = request.tools
-    if _server_state.mcp_manager:
+    # Merge MCP tools with user-provided tools. Diffusion models cannot do
+    # tool calling: reject explicit tools, skip MCP tool injection.
+    if getattr(engine, "is_diffusion_model", False):
+        if request.tools and request.tool_choice != "none":
+            raise InvalidRequestError(
+                "Tool calling is not supported with diffusion models.",
+                field="tools",
+            )
+        effective_tools = None
+    else:
+        effective_tools = request.tools
+    if _server_state.mcp_manager and not getattr(engine, "is_diffusion_model", False):
         # Convert Pydantic ToolDefinition models to dicts for merge_tools
         user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
         effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
@@ -2560,13 +2593,25 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        speed_text = _format_generation_speed_for_log(
+            output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+        )
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({speed_text}), prompt: {output.prompt_tokens}")
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            output,
+            is_diffusion=is_diffusion,
+            generation_duration=elapsed,
+        )
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             cached_tokens=output.cached_tokens,
-            generation_duration=elapsed,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolved_model,
         )
 
@@ -2685,6 +2730,88 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+def _format_generation_speed_for_log(
+    output,
+    tokens_per_sec: float,
+    *,
+    is_diffusion: bool,
+) -> str:
+    if not is_diffusion:
+        return f"{tokens_per_sec:.1f} tok/s"
+
+    parts = [f"{tokens_per_sec:.1f} tok/s e2e"]
+    output_tps = float(getattr(output, "generation_tps", 0.0) or 0.0)
+    if output_tps > 0:
+        parts.append(f"output={output_tps:.1f} tok/s")
+    canvas_tps = float(getattr(output, "diffusion_canvas_tps", 0.0) or 0.0)
+    if canvas_tps > 0:
+        parts.append(f"canvas={canvas_tps:.1f} tok/s")
+    prompt_tps = float(getattr(output, "prompt_tps", 0.0) or 0.0)
+    if prompt_tps > 0:
+        parts.append(f"prompt={prompt_tps:.1f} tok/s")
+    work_tps = float(getattr(output, "diffusion_work_tps", 0.0) or 0.0)
+    if work_tps > 0:
+        parts.append(f"work={work_tps:.1f} tok/s")
+    steps = int(getattr(output, "diffusion_denoising_steps", 0) or 0)
+    if steps > 0:
+        parts.append(f"steps={steps}")
+    return ", ".join(parts)
+
+
+def _resolve_metric_durations(
+    output,
+    *,
+    is_diffusion: bool,
+    prefill_duration: float = 0.0,
+    generation_duration: float = 0.0,
+) -> tuple[float, float]:
+    if not is_diffusion:
+        return prefill_duration, generation_duration
+
+    prompt_tps = float(getattr(output, "prompt_tps", 0.0) or 0.0)
+    if prompt_tps > 0:
+        prefill_duration = output.prompt_tokens / prompt_tps
+
+    generation_tps = float(getattr(output, "generation_tps", 0.0) or 0.0)
+    if generation_tps > 0:
+        generation_duration = output.completion_tokens / generation_tps
+
+    return prefill_duration, generation_duration
+
+
+def _response_format_requests_grammar(response_format) -> bool:
+    """True when an OpenAI ``response_format`` maps to grammar-constrained JSON.
+
+    Delegates to :func:`_build_format_element` so the check stays in sync with
+    what actually gets compiled: non-``None`` exactly for ``json_object`` and a
+    ``json_schema`` carrying a schema; a plain ``{"type": "text"}`` (or a
+    json_schema with no schema) maps to nothing and must not reject.
+    """
+    if response_format is None:
+        return False
+    return _build_format_element(response_format=response_format) is not None
+
+
+def _reject_diffusion_structured_outputs(
+    engine: BaseEngine,
+    *,
+    response_format=None,
+    structured_outputs=None,
+) -> None:
+    if not getattr(engine, "is_diffusion_model", False):
+        return
+    if structured_outputs is None and not _response_format_requests_grammar(
+        response_format
+    ):
+        return
+    raise InvalidRequestError(
+        "Structured response_format and guided grammar are not supported "
+        "with diffusion models.",
+        field="response_format",
+    )
+
 
 
 def _build_format_element(structured_outputs=None, response_format=None):
@@ -3121,18 +3248,47 @@ async def stream_completion(
     # Record metrics
     if last_output and last_output.finished:
         end_time = time.perf_counter()
-        ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
-        gen_duration = end_time - (first_token_time or start_time)
+        total_duration = end_time - start_time
+        ttft = (
+            (first_token_time - start_time)
+            if first_token_time
+            else total_duration
+        )
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
+            gen_duration = total_duration
+        else:
+            gen_duration = end_time - (first_token_time or start_time)
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            last_output,
+            is_diffusion=is_diffusion,
+            prefill_duration=ttft,
+            generation_duration=gen_duration,
+        )
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
-        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(f"Completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
+        speed_duration = total_duration if is_diffusion else gen_duration
+        tokens_per_sec = (
+            last_output.completion_tokens / speed_duration
+            if speed_duration > 0
+            else 0
+        )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+        )
+        logger.info(
+            f"Completion: {last_output.completion_tokens} tokens in "
+            f"{total_duration:.2f}s ({speed_text}), "
+            f"prompt: {last_output.prompt_tokens}"
+        )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3155,10 +3311,10 @@ async def stream_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metric_prefill_duration, 2),
+                    generation_duration=round(metric_gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / metric_prefill_duration, 2) if metric_prefill_duration > 0 else None,
+                    generation_tokens_per_second=round(ct / metric_gen_duration, 2) if metric_gen_duration > 0 else None,
                 ).model_dump(exclude_none=True),
             }
             yield f"data: {json.dumps(usage_data)}\n\n"
@@ -3433,18 +3589,49 @@ async def stream_chat_completion(
     # Record metrics and emit usage chunk
     if last_output and last_output.finished:
         end_time = time.perf_counter()
-        ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
-        gen_duration = end_time - (first_token_time or start_time)
+        total_duration = end_time - start_time
+        ttft = (
+            (first_token_time - start_time)
+            if first_token_time
+            else total_duration
+        )
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
+            gen_duration = total_duration
+        else:
+            gen_duration = end_time - (first_token_time or start_time)
+        metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
+            last_output,
+            is_diffusion=is_diffusion,
+            prefill_duration=ttft,
+            generation_duration=gen_duration,
+        )
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
+            prefill_duration=metric_prefill_duration,
+            generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
         )
-        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
+        speed_duration = total_duration if is_diffusion else gen_duration
+        tokens_per_sec = (
+            last_output.completion_tokens / speed_duration
+            if speed_duration > 0
+            else 0
+        )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+        )
+        logger.info(
+            f"Chat completion: {last_output.completion_tokens} tokens in "
+            f"{total_duration:.2f}s ({speed_text}), "
+            f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
+            f"max_tokens={kwargs.get('max_tokens')}, "
+            f"request_max_tokens={request.max_tokens}"
+        )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3465,10 +3652,10 @@ async def stream_chat_completion(
                     model_load_duration=round(model_load_duration, 2) if model_load_duration > 1.0 else None,
                     time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(ttft, 2),
-                    generation_duration=round(gen_duration, 2),
-                    prompt_tokens_per_second=round(pt / ttft, 2) if ttft > 0 else None,
-                    generation_tokens_per_second=round(ct / gen_duration, 2) if gen_duration > 0 else None,
+                    prompt_eval_duration=round(metric_prefill_duration, 2),
+                    generation_duration=round(metric_gen_duration, 2),
+                    prompt_tokens_per_second=round(pt / metric_prefill_duration, 2) if metric_prefill_duration > 0 else None,
+                    generation_tokens_per_second=round(ct / metric_gen_duration, 2) if metric_gen_duration > 0 else None,
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
@@ -3802,13 +3989,22 @@ async def stream_anthropic_messages(
     # Record metrics
     if last_output:
         end_time = time.perf_counter()
-        ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        total_duration = end_time - start_time
+        ttft = (
+            (first_token_time - start_time)
+            if first_token_time
+            else total_duration
+        )
+        if getattr(engine, "is_diffusion_model", False):
+            gen_duration = total_duration
+        else:
+            gen_duration = end_time - (first_token_time or start_time)
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
-            generation_duration=end_time - (first_token_time or start_time),
+            generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
 
@@ -3967,7 +4163,14 @@ async def create_anthropic_message(
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
-    if _server_state.mcp_manager:
+    if getattr(engine, "is_diffusion_model", False):
+        if user_internal:
+            raise InvalidRequestError(
+                "Tool calling is not supported with diffusion models.",
+                field="tools",
+            )
+        internal_tools = None
+    elif _server_state.mcp_manager:
         mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
         combined = (mcp_openai_tools or []) + (user_internal or [])
         # Deduplicate by function name (user tools take precedence)
@@ -4269,6 +4472,11 @@ async def create_response(
 
     # Convert tools: flat → nested
     openai_tools = convert_responses_tools(request.tools)
+    if getattr(engine, "is_diffusion_model", False) and openai_tools:
+        raise InvalidRequestError(
+            "Tool calling is not supported with diffusion models.",
+            field="tools",
+        )
 
     # Get per-model settings
     max_tool_result_tokens = None
@@ -4313,6 +4521,10 @@ async def create_response(
         if response_format:
             from .api.openai_models import ResponseFormat
 
+            _reject_diffusion_structured_outputs(
+                engine,
+                response_format=response_format,
+            )
             await engine.start()
             rf = ResponseFormat(**response_format)
             compiled_grammar = _compile_grammar_for_request(
@@ -4329,8 +4541,10 @@ async def create_response(
             compiled_grammar = None
 
     # Merge MCP tools
-    effective_tools = openai_tools
-    if _server_state.mcp_manager and openai_tools:
+    effective_tools = (
+        None if getattr(engine, "is_diffusion_model", False) else openai_tools
+    )
+    if _server_state.mcp_manager and effective_tools:
         effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
     # Convert tools for chat template
@@ -5054,8 +5268,16 @@ async def stream_responses_api(
     usage_data = None
     if last_output and last_output.finished:
         end_time = time.perf_counter()
-        ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
-        gen_duration = end_time - (first_token_time or start_time)
+        total_duration = end_time - start_time
+        ttft = (
+            (first_token_time - start_time)
+            if first_token_time
+            else total_duration
+        )
+        if getattr(engine, "is_diffusion_model", False):
+            gen_duration = total_duration
+        else:
+            gen_duration = end_time - (first_token_time or start_time)
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,

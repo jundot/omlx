@@ -516,3 +516,53 @@ commit 一律跳过并在本台账登记.
 
 全新文件 (无冲突面): omlx/image/*, omlx/api/image_models.py,
 omlx/api/image_routes.py, tests/test_image_*.py.
+
+## 2026-06-12 同步: DiffusionGemma 基础支持 (sync/diffusion-gemma)
+
+目标: 引入上游 diffusion_gemma (google/diffusiongemma-26B-A4B-it) 服务
+能力. mlx-vlm pin (v0.6.3 = 5a4222a) 已含模型实现, 无需升级依赖.
+
+引入 (cherry-pick -x):
+- 035851b feat: upgrade mlx-vlm and add basic diffusion support without
+  cache. 冲突重 (12 文件). 决策:
+  - pyproject.toml: 取 ours (上游把 mlx-vlm 钉到 5a4222a, 与我们既有
+    pin 相同, 我们的 PyPI/override 双轨写法保留).
+  - preflight_chat/preflight_completion (vlm.py) 整体 skip: 依赖上游
+    scheduler.preflight_or_raise 内存 guard 线, 我们走 PR#53 的
+    external memcheck 路线, 该方法在 fmlx 是死代码. 对应
+    test_vlm_engine 的 preflight 测试改为直调 _validate_diffusion_request.
+  - guided_grammar 特性 (request 字段/设置/admin UI/测试) 全部剥离:
+    上游早前特性, fmlx 从未引入, 不属本次范围. server.py 仅移植
+    _reject_diffusion_structured_outputs + _response_format_requests_grammar
+    (去 guided_grammar 形参).
+  - 上游 enforcer warning/propagate-every-poll 行为及其测试 skip
+    (fmlx enforcer 已分化).
+  - apps/omlx-mac ModelSettingsScreen.swift skip (fmlx 是 thin 菜单栏壳,
+    全套 GUI 屏早已删除).
+  - admin routes OQ_LEVELS 校验取上游 (我们已有 OQ_LEVELS 含 3.5).
+- b0365e6 fix: align diffusion prefill and throughput metrics. server.py
+  26 处冲突几乎全为上游 black 重排噪音: 取 ours 后手工移植
+  _format_generation_speed_for_log / _resolve_metric_durations 及
+  非流式 chat + stream_completion + stream_chat_completion 三处调用与
+  usage chunk 字段. cohere2_moe 加载器 (a46dece 件) 与上游 audio
+  归一化路径 skip (fmlx 已有自有 audio 管线, audios= 形参).
+- 54bdb0b fix: correct diffusion benchmark metrics. 组合解:
+  processing_tps 取上游 (prefill_duration 回退 ttft); batch 跳过门用
+  上游 _get_batch_benchmark_core 但保留 fmlx 的 DFlash
+  stream_generate 旁路. 顺带移植 force_lm_engine 字段 + vlm_mtp/
+  diffusion 不强制 LM 加载 (443734f 的核心逻辑, 该 commit 本体未引).
+  上游 TestBenchmarkEngineSelection 三个 force_lm 测试与
+  TestExperimentalFeatureDetection skip (依赖未引入的 6942733).
+- d39eb23 fix: support mxfp4 diffusion embeddings. 仅取 diffusion_gemma
+  patch 臂; step3p7 / llama4 patch 臂 skip (上游其他模型线).
+
+跳过 (本轮明确不引): a46dece (cohere2_moe), ece9842/b0e2090/4c2d1b1
+(VLM MTP 外置 Qwen drafter 线, 另行评估), 6942733 (force mlx-lm
+benchmark 选项, 仅移植其 force_lm_engine 字段语义), 2183499/48f8e33/
+49cb755 (oQ fractional/DeepSeek 线, 另行评估), e28fcb9/5820985/ba512fe
+(DeepSeek V4 MTP 线), fe086df/d2d608d/93adf8c/4c64f16/473f629/07054ca
+(cache/prefill 修复线, 另行评估), dd39b89 (admin 全局表单), 5ec79cd/
+9d72e32/6ae5142 (版本与 Homebrew).
+
+测试: 全量 5098 pass / 3 fail (已知 OMLX_SERVER_API_KEY env-override
+基线集) / 19 skip, 对基线 (5073/3/19) 零回归, 新增 25 测试全绿.

@@ -23,6 +23,7 @@ class GenerationOutput:
 
     Compatible with both simple and batched engines.
     """
+
     text: str
     tokens: List[int] = field(default_factory=list)
     prompt_tokens: int = 0
@@ -35,6 +36,15 @@ class GenerationOutput:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Optional engine-native throughput stats. Diffusion models report
+    # generation after prefill separately from end-to-end request time.
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
+    diffusion_canvas_tokens: int = 0
+    diffusion_denoising_steps: int = 0
+    diffusion_work_tokens: int = 0
+    diffusion_canvas_tps: float = 0.0
+    diffusion_work_tps: float = 0.0
 
 
 class BaseEngine(ABC):

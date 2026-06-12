@@ -42,6 +42,8 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
+    "diffusion_gemma",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -516,7 +518,12 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
     # Text-only quants won't have vision_config in their config.json.
+    # gemma4_unified and diffusion_gemma are exceptions: they are served by
+    # mlx-vlm regardless of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+            logger.info(f"{model_type} detected as VLM (mlx-vlm native model)")
+            return "vlm"
         if "vision_config" in config:
             # For ambiguous model types (families with both VLM and text-only
             # variants), vision_config alone is not reliable — text-only quants
