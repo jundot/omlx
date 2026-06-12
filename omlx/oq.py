@@ -3925,24 +3925,29 @@ def _build_proxy_for_sensitivity(
     prev_active = is_mtp_active() if _have_lm_patch else False
     try:
         from omlx.utils.model_loading import (
-            _checkpoint_has_mtp_weights,
-            _has_mtp_heads,
+            _should_activate_mtp_for_model,
         )
 
         # Read config to check if model declares MTP heads. Only activate
         # MTP when the config AND weights both declare it (some models like
         # Nex-N2-mini have MTP heads in config but no actual weights).
-        _mtp_config = {}
+        _proxy_config = {}
         try:
             import json as _json
             from pathlib import Path as _Path
 
             cfg_path = _Path(model_path) / "config.json"
             if cfg_path.exists():
-                _mtp_config = _json.loads(cfg_path.read_text())
+                _proxy_config = _json.loads(cfg_path.read_text())
         except Exception:
-            pass
-        has_mtp = _has_mtp_heads(_mtp_config) and _checkpoint_has_mtp_weights(model_path)
+            logger.warning(
+                "Failed to read config.json from %s; MTP will be disabled", model_path
+            )
+        has_mtp, config_ok = _should_activate_mtp_for_model(_proxy_config, model_path)
+        if not config_ok:
+            logger.warning(
+                "Could not read model config; MTP will be disabled for %s", model_path
+            )
         if _have_lm_patch:
             set_mtp_active(has_mtp)
 
@@ -4016,7 +4021,7 @@ def _measure_sensitivity_from_quantized_model(
         # Only activate MTP when the config AND weights both declare it.
         # Models like Nex-N2-mini have MTP heads in config but no actual
         # weights, so setting mtp_active=True causes a load failure.
-        has_mtp = _has_mtp_heads(config) and _checkpoint_has_mtp_weights(model_path)
+        has_mtp, _ = _should_activate_mtp_for_model(config, model_path)
         if _have_lm_patch:
             set_mtp_active(has_mtp)
         try:
