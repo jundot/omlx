@@ -566,3 +566,12 @@ benchmark 选项, 仅移植其 force_lm_engine 字段语义), 2183499/48f8e33/
 
 测试: 全量 5098 pass / 3 fail (已知 OMLX_SERVER_API_KEY env-override
 基线集) / 19 skip, 对基线 (5073/3/19) 零回归, 新增 25 测试全绿.
+
+## 2026-06-13 基线更新: 全量测试 0 fail
+
+PR #76 起全量基线为 0 fail (旧的 3 个 OMLX_SERVER_API_KEY env-override
+失败实为测试未隔离机器环境变量, 已用 autouse fixture 剥离 OMLX_*)。
+此后 sync 的零回归标准 = 0 fail。同 PR 顺带移植了上游内存守卫
+wired-limit 警告的 dashboard getter 与 8 语言 i18n (此前模板引用但
+JS 从未移植, 设置页每次渲染报 Alpine 错), 并修 bench/cluster 两处
+null 读取。
