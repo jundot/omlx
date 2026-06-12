@@ -2626,10 +2626,11 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None,
         kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        text_messages, images, audio = extract_images_from_messages(messages)
+        text_messages, images = extract_images_from_messages(messages)
+        _, audios = extract_audios_from_messages(text_messages)
         self._validate_diffusion_request(
             tools=tools,
-            audio=audio if audio else None,
+            audio=audios if audios else None,
             stop=kwargs.get("stop"),
             kwargs=kwargs,
         )
