@@ -1077,5 +1077,7 @@
   "settings.video.prompt_extend_off": "Off (no extension)",
   "settings.video.first_frame": "First Frame (T2I->I2V)",
   "settings.video.first_frame_desc": "Generate the I2V first frame from the prompt with an image model, then animate it -- image models follow prompts far better, so the action comes out right. Per request: first_frame_from_text. Off when unset.",
-  "settings.video.first_frame_off": "Off (no first frame)"
+  "settings.video.first_frame_off": "Off (no first frame)",
+  "chat.video.first_frame": "First frame",
+  "chat.video.first_frame_tooltip": "Generate the first frame from your prompt with an image model, then animate it (better action fidelity). Routes to an i2v model."
 }

@@ -1077,5 +1077,7 @@
   "settings.video.prompt_extend_off": "無効 (拡張なし)",
   "settings.video.first_frame": "最初のフレーム生成 (T2I->I2V)",
   "settings.video.first_frame_desc": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします -- 画像モデルは動画モデルよりプロンプト追従が高く, 動作が正確になります. リクエスト単位は first_frame_from_text. 未設定で無効.",
-  "settings.video.first_frame_off": "無効 (最初のフレームなし)"
+  "settings.video.first_frame_off": "無効 (最初のフレームなし)",
+  "chat.video.first_frame": "最初のフレーム",
+  "chat.video.first_frame_tooltip": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします (動作がより正確). i2v モデルに自動でルーティングします."
 }
