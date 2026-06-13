@@ -1071,5 +1071,8 @@
   "status.runtime_cache.table.model": "모델",
   "status.runtime_cache.table.ssd_files": "SSD 파일",
   "status.runtime_cache.table.ssd_size": "SSD 크기",
-  "status.runtime_cache.table.sub_block_cache": "서브 블록 캐시"
+  "status.runtime_cache.table.sub_block_cache": "서브 블록 캐시",
+  "settings.video.prompt_extend": "프롬프트 확장",
+  "settings.video.prompt_extend_desc": "생성 전에 LLM으로 간단한 프롬프트를 자세한 동작 설명으로 확장하여 지시 따르기를 크게 개선합니다. 비워두면 비활성화됩니다. 작고 빠른 채팅 모델을 선택하세요.",
+  "settings.video.prompt_extend_off": "끄기 (확장 안 함)"
 }
