@@ -1077,5 +1077,7 @@
   "settings.video.prompt_extend_off": "Desactive (aucune extension)",
   "settings.video.first_frame": "Premiere image (T2I->I2V)",
   "settings.video.first_frame_desc": "Genere la premiere image I2V depuis le prompt avec un modele d'image, puis l'anime -- les modeles d'image suivent bien mieux les prompts, donc l'action est correcte. Par requete : first_frame_from_text. Desactive si vide.",
-  "settings.video.first_frame_off": "Desactive (aucune premiere image)"
+  "settings.video.first_frame_off": "Desactive (aucune premiere image)",
+  "chat.video.first_frame": "Premiere image",
+  "chat.video.first_frame_tooltip": "Genere la premiere image depuis votre prompt avec un modele d'image, puis l'anime (meilleure fidelite de l'action). Achemine vers un modele i2v."
 }

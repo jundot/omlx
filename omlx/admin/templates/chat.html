@@ -1283,6 +1283,14 @@
                                 <input type="checkbox" x-model="videoUpscale" class="accent-current">
                                 <span x-text="tVideo('chat.video.upscale', '1080p')"></span>
                             </label>
+                            <!-- T2I->I2V: only meaningful for a text prompt with no
+                                 attached image and not continuing a video. -->
+                            <label x-show="!videoExtendFrom" class="flex items-center gap-1 px-1 text-xs cursor-pointer select-none"
+                                   style="color: var(--text-secondary);"
+                                   :title="tVideo('chat.video.first_frame_tooltip', 'Generate the first frame from your prompt with an image model, then animate it (better action fidelity). Routes to an i2v model.')">
+                                <input type="checkbox" x-model="videoFirstFrame" class="accent-current">
+                                <span x-text="tVideo('chat.video.first_frame', 'First frame')"></span>
+                            </label>
                         </div>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -1410,6 +1418,7 @@
             videoQuality: 'standard',
             videoSeconds: 3,
             videoUpscale: false,         // SeedVR2 1080p upscale toggle
+            videoFirstFrame: false,      // T2I->I2V: gen a first frame from the prompt, then animate (text-only)
             videoOrientation: 'landscape', // 'landscape' | 'portrait' (t2v composition)
             videoExtendFrom: null,       // { jobId } set by the extend button
             streamingContent: '',
@@ -2344,7 +2353,13 @@
         // Auto-route between the installed wan checkpoints by request
         // shape (image/continuation -> i2v, plain text -> t2v); the
         // bubble shows which model actually ran.
-        const needsImage = !!this.videoExtendFrom || imageUrls.length > 0;
+        // First-frame mode (T2I->I2V) only applies to a plain text prompt:
+        // no attached image, not continuing a video. It routes to an i2v
+        // model and asks the server to generate the conditioning frame.
+        const useFirstFrame = this.videoFirstFrame
+            && !this.videoExtendFrom
+            && imageUrls.length === 0;
+        const needsImage = !!this.videoExtendFrom || imageUrls.length > 0 || useFirstFrame;
         const routedModel = this.resolveVideoModel(needsImage);
         if (!routedModel) {
             this.messages.push({
@@ -2412,6 +2427,11 @@
             }
             if (this.videoUpscale) {
                 body.upscale_resolution = 1080;
+            }
+            // Text-only first-frame mode: the server generates the i2v
+            // conditioning frame from the prompt (no input_reference here).
+            if (useFirstFrame) {
+                body.first_frame_from_text = true;
             }
             const resp = await fetch('/v1/videos', {
                 method: 'POST',

@@ -1077,5 +1077,7 @@
   "settings.video.prompt_extend_off": "关闭 (不扩写)",
   "settings.video.first_frame": "首帧生成 (图生视频)",
   "settings.video.first_frame_desc": "用图像模型按提示词先出一张首帧再让视频模型动起来 -- 图像模型对提示词的遵循远强于视频模型, 动作更准. 按请求用 first_frame_from_text 开. 留空为关闭.",
-  "settings.video.first_frame_off": "关闭 (不生成首帧)"
+  "settings.video.first_frame_off": "关闭 (不生成首帧)",
+  "chat.video.first_frame": "首帧",
+  "chat.video.first_frame_tooltip": "先用图像模型按提示词生成首帧再让它动起来 (动作更准). 会自动路由到图生视频模型."
 }

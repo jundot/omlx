@@ -1077,5 +1077,7 @@
   "settings.video.prompt_extend_off": "Desactivado (sin extension)",
   "settings.video.first_frame": "Primer fotograma (T2I->I2V)",
   "settings.video.first_frame_desc": "Genera el primer fotograma I2V desde el prompt con un modelo de imagen y luego lo anima: los modelos de imagen siguen mucho mejor los prompts, asi la accion sale bien. Por solicitud: first_frame_from_text. Desactivado si esta vacio.",
-  "settings.video.first_frame_off": "Desactivado (sin primer fotograma)"
+  "settings.video.first_frame_off": "Desactivado (sin primer fotograma)",
+  "chat.video.first_frame": "Primer fotograma",
+  "chat.video.first_frame_tooltip": "Genera el primer fotograma desde tu prompt con un modelo de imagen y luego lo anima (mejor fidelidad de la accion). Enruta a un modelo i2v."
 }
