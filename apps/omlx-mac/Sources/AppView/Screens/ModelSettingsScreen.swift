@@ -1544,6 +1544,12 @@ final class ModelSettingsScreenVM: ObservableObject {
     static let diffusionConfigModelTypes: Set<String> = [
         "diffusion_gemma",
     ]
+    /// `config_model_type` values accepted by the HTML admin's VLM MTP
+    /// assistant-drafter picker. Mirrored from `dashboard.js`
+    /// (`VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES`).
+    static let vlmMtpDrafterConfigModelTypes: Set<String> = [
+        "gemma4_assistant", "gemma4_unified_assistant", "qwen3_5_mtp",
+    ]
     static let diffusionUnsupportedCtKwargKeys: Set<String> = [
         "enable_thinking", "reasoning_effort", "preserve_thinking",
     ]
@@ -2029,9 +2035,9 @@ final class ModelSettingsScreenVM: ObservableObject {
     }
 
     /// Draft-model options for VLM MTP. mlx-vlm's MTP loop takes an
-    /// "assistant" drafter, so the picker filters to model ids containing
-    /// "assistant" (case-insensitive), matching the HTML editor's filter,
-    /// and drops the current model so it can't draft for itself.
+    /// assistant drafter. Match the HTML editor by accepting known
+    /// config-derived drafter types first, then falling back to names that
+    /// contain "assistant" or a standalone "mtp" token.
     ///
     /// The stored value is the model **id**, not its path: the server
     /// resolves the drafter by registry id (`engine_pool` looks it up in
@@ -2044,11 +2050,30 @@ final class ModelSettingsScreenVM: ObservableObject {
                         comment: "Initial placeholder option in the VLM MTP draft-model picker")),
         ]
         for m in allModels
-        where m.id != modelID
-            && m.id.range(of: "assistant", options: .caseInsensitive) != nil {
+        where Self.isVlmMtpDraftModelCandidate(m, currentModelID: modelID) {
             out.append((m.id, m.id))
         }
         return out
+    }
+
+    static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
+        guard model.id != currentModelID else { return false }
+
+        if let type = model.configModelType?.lowercased(),
+           vlmMtpDrafterConfigModelTypes.contains(type) {
+            return true
+        }
+
+        let searchText = [model.id, model.modelPath]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        if searchText.range(of: "assistant", options: .caseInsensitive) != nil {
+            return true
+        }
+        return searchText.range(
+            of: #"(^|[-_/\s])mtp($|[-_/\s])"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     var isDSAConfigModel: Bool {
