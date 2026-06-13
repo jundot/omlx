@@ -1071,5 +1071,8 @@
   "status.runtime_cache.table.model": "Модель",
   "status.runtime_cache.table.ssd_files": "Файлы SSD",
   "status.runtime_cache.table.ssd_size": "Размер SSD",
-  "status.runtime_cache.table.sub_block_cache": "Подблочный кэш"
+  "status.runtime_cache.table.sub_block_cache": "Подблочный кэш",
+  "settings.video.prompt_extend": "Расширение промпта",
+  "settings.video.prompt_extend_desc": "Использует LLM для расширения краткого промпта в подробное описание движения перед генерацией -- лучшее решение при плохом следовании инструкциям. Выключено, если не задано; выберите небольшую быструю чат-модель.",
+  "settings.video.prompt_extend_off": "Выключено (без расширения)"
 }

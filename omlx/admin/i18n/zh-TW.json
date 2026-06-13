@@ -1071,5 +1071,8 @@
   "status.runtime_cache.table.model": "模型",
   "status.runtime_cache.table.ssd_files": "SSD 檔案數",
   "status.runtime_cache.table.ssd_size": "SSD 大小",
-  "status.runtime_cache.table.sub_block_cache": "子區塊快取"
+  "status.runtime_cache.table.sub_block_cache": "子區塊快取",
+  "settings.video.prompt_extend": "提示詞擴寫",
+  "settings.video.prompt_extend_desc": "生成前用 LLM 把簡短提示詞擴寫成詳細的動作描述, 大幅改善指令遵循. 留空為關閉, 建議選一個小而快的對話模型.",
+  "settings.video.prompt_extend_off": "關閉 (不擴寫)"
 }

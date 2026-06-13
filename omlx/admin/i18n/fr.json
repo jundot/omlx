@@ -1071,5 +1071,8 @@
   "status.runtime_cache.table.model": "Modèle",
   "status.runtime_cache.table.ssd_files": "Fichiers SSD",
   "status.runtime_cache.table.ssd_size": "Taille SSD",
-  "status.runtime_cache.table.sub_block_cache": "Cache de sous-blocs"
+  "status.runtime_cache.table.sub_block_cache": "Cache de sous-blocs",
+  "settings.video.prompt_extend": "Extension de prompt",
+  "settings.video.prompt_extend_desc": "Utilise un LLM pour developper un prompt succinct en une description detaillee du mouvement avant la generation -- la meilleure correction pour un suivi d'instructions faible. Desactive si vide ; choisissez un petit modele de chat rapide.",
+  "settings.video.prompt_extend_off": "Desactive (aucune extension)"
 }

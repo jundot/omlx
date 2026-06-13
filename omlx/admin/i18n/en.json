@@ -1071,5 +1071,8 @@
   "status.integrations.profile_full": "Full",
   "models.queue.retry_tooltip": "Retry download",
   "settings.resource.guard_tier.custom": "Custom",
-  "settings.resource.guard_tier.custom_input_placeholder": "e.g. 90"
+  "settings.resource.guard_tier.custom_input_placeholder": "e.g. 90",
+  "settings.video.prompt_extend": "Prompt Extension",
+  "settings.video.prompt_extend_desc": "Use an LLM to expand a terse prompt into a detailed motion description before generation -- the biggest fix for weak instruction following. Off when unset; pick a small, fast chat model.",
+  "settings.video.prompt_extend_off": "Off (no extension)"
 }
