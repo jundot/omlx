@@ -38,6 +38,9 @@ class _Manager:
         self._timeout = timeout
         self.submitted = []
 
+    def lease_fits_ceiling(self, lease_bytes):
+        return (True, "")
+
     async def submit(self, job, **kw):
         self.submitted.append(job)
 
@@ -61,6 +64,7 @@ class _Manager:
 @pytest.fixture(autouse=True)
 def _patch_image_routes(monkeypatch):
     monkeypatch.setattr(image_routes, "_resolve_model", lambda m: m)
+    monkeypatch.setattr(image_routes, "_lease_bytes_for", lambda alias, s: 8 * 1024**3)
     monkeypatch.setattr(
         image_routes,
         "_normalize_params",

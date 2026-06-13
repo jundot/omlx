@@ -54,6 +54,7 @@ async def generate_first_frame(
     """
     # Lazy import avoids a video_routes <-> image_routes import cycle.
     from .image_models import ImageCreateParams
+    from .image_routes import _lease_bytes_for as _img_lease_bytes
     from .image_routes import _normalize_params as _img_normalize
     from .image_routes import _resolve_model as _img_resolve
     from ..video.manager import MediaJob, QueueFullError
@@ -99,12 +100,20 @@ async def generate_first_frame(
         )
     normalized.pop("response_format", None)
 
+    # Image jobs need a positive memory lease (the worker refuses lease 0).
+    # Reuse the same per-alias lease sizing /v1/images uses.
+    lease_bytes = _img_lease_bytes(normalized.get("alias", ""), image_settings)
+    ok, reason = manager.lease_fits_ceiling(lease_bytes)
+    if not ok:
+        raise FirstFrameError(f"first-frame image lease too large: {reason}")
+
     job = MediaJob(
         id=f"image_{uuid.uuid4().hex}",
         kind="image",
         model_id=resolved,
         model_dir=str(entry.model_path),
         params=normalized,
+        lease_bytes=lease_bytes,
     )
     try:
         await manager.submit(job)
