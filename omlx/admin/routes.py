@@ -300,6 +300,7 @@ class GlobalSettingsRequest(BaseModel):
     video_default_steps: int | None = Field(default=None, ge=1)
     video_default_fps: int | None = Field(default=None, ge=1)
     video_prompt_extend_model: str | None = None
+    video_first_frame_model: str | None = None
     video_max_frames: int | None = Field(default=None, ge=5)
     video_max_steps: int | None = Field(default=None, ge=1)
     video_max_pixels_per_frame: int | None = Field(default=None, ge=256)
@@ -3540,6 +3541,7 @@ async def update_global_settings(
         "video_default_steps": "default_steps",
         "video_default_fps": "default_fps",
         "video_prompt_extend_model": "prompt_extend_model",
+        "video_first_frame_model": "first_frame_model",
         "video_max_frames": "max_frames",
         "video_max_steps": "max_steps",
         "video_max_pixels_per_frame": "max_pixels_per_frame",

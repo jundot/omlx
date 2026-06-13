@@ -95,7 +95,7 @@
                 integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
-                video: { enabled: false, worker_python: '', memory_lease_gb: 36, max_queued_jobs: 4, job_timeout_seconds: 7200, progress_stall_timeout_seconds: 600, default_steps: 20, default_fps: 16, prompt_extend_model: '', max_frames: 121, max_steps: 50, max_pixels_per_frame: 921600, artifacts_max_count: 50, artifacts_max_gb: 50 },
+                video: { enabled: false, worker_python: '', memory_lease_gb: 36, max_queued_jobs: 4, job_timeout_seconds: 7200, progress_stall_timeout_seconds: 600, default_steps: 20, default_fps: 16, prompt_extend_model: '', first_frame_model: '', max_frames: 121, max_steps: 50, max_pixels_per_frame: 921600, artifacts_max_count: 50, artifacts_max_gb: 50 },
                 image: { enabled: false, worker_python: '', memory_lease_gb: 0, max_queued_jobs: 8, job_timeout_seconds: 1800, progress_stall_timeout_seconds: 300, default_steps: 0, default_size: '1024x1024', max_steps: 60, max_pixels: 4194304, max_n: 4, sync_timeout_seconds: 900, artifacts_max_count: 200, artifacts_max_gb: 10 },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -950,6 +950,7 @@
                             // ?? not ||: clearing to "" must reach the server (turns
                             // extension off); null is skipped (leaves it unchanged)
                             video_prompt_extend_model: this.globalSettings.video?.prompt_extend_model ?? null,
+                            video_first_frame_model: this.globalSettings.video?.first_frame_model ?? null,
                             video_artifacts_max_gb: this.globalSettings.video?.artifacts_max_gb ?? null,
                             // ?? not ||: clearing the field must send "" so the
                             // server reverts to the default path (null is skipped)
@@ -2281,6 +2282,11 @@
 
             get llmModels() {
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
+            },
+
+            // Text-to-image models, for the T2I->I2V first-frame selector.
+            get imageModels() {
+                return this.models.filter(m => m.model_type === 'image');
             },
 
             shellQuote(value) {

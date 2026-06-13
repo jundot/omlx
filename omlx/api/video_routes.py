@@ -27,6 +27,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
+from .first_frame import FirstFrameError, generate_first_frame
 from .prompt_extend import extend_video_prompt
 from .video_models import VideoCreateParams
 
@@ -345,6 +346,55 @@ async def create_video(request: Request):
     # discovered before this field existed default to t2v.
     pipeline = getattr(entry, "video_pipeline", "") or "t2v"
     extend_id = (params.extend_video_id or "").strip() or None
+
+    from omlx.server import _server_state
+
+    video_settings = _server_state.global_settings.video
+    settings_manager = getattr(_server_state, "settings_manager", None)
+    model_settings = (
+        settings_manager.get_settings(resolved) if settings_manager else None
+    )
+
+    # T2I->I2V: generate the conditioning first frame from the prompt instead
+    # of requiring an uploaded image. Valid only for i2v/ti2v models with no
+    # input_reference and no extend. The frame is generated after prompt
+    # extension (below) so it benefits from the richer prompt.
+    first_frame_model = (
+        getattr(video_settings, "first_frame_model", "") or ""
+    ).strip()
+    want_first_frame = bool(
+        params.first_frame_from_text
+        and pipeline in ("i2v", "ti2v")
+        and ref_bytes is None
+        and not extend_id
+    )
+    if params.first_frame_from_text and not want_first_frame:
+        # Explicit opt-in that can't apply: tell the caller why rather than
+        # silently ignoring it.
+        if pipeline == "t2v":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "first_frame_from_text needs an image-to-video (i2v/ti2v) "
+                    "model; this model is text-to-video only"
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "first_frame_from_text cannot combine with input_reference or "
+                "extend_video_id"
+            ),
+        )
+    if want_first_frame and not first_frame_model:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "first_frame_from_text requested but video.first_frame_model "
+                "is not configured"
+            ),
+        )
+
     if ref_bytes is not None and extend_id:
         raise HTTPException(
             status_code=400,
@@ -361,7 +411,7 @@ async def create_video(request: Request):
                 "accept an input image; use an image-to-video (i2v) model"
             ),
         )
-    if pipeline == "i2v" and ref_bytes is None and not extend_id:
+    if pipeline == "i2v" and ref_bytes is None and not extend_id and not want_first_frame:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -376,14 +426,6 @@ async def create_video(request: Request):
     venv_ok, venv_reason = await manager.probe_worker_venv()
     if not venv_ok:
         raise HTTPException(status_code=503, detail=venv_reason)
-
-    from omlx.server import _server_state
-
-    video_settings = _server_state.global_settings.video
-    settings_manager = getattr(_server_state, "settings_manager", None)
-    model_settings = (
-        settings_manager.get_settings(resolved) if settings_manager else None
-    )
 
     # Extending pins the new segment to the source's frame geometry so the
     # stitch is seamless; user-supplied size/fps are overridden.
@@ -458,6 +500,29 @@ async def create_video(request: Request):
             normalized["original_prompt"] = normalized["prompt"]
             normalized["prompt"] = final_prompt
             normalized["prompt_extended"] = True
+
+    # T2I->I2V: generate the conditioning first frame from the (extended)
+    # prompt via the image engine, then proceed exactly as i2v. Synchronous:
+    # the POST blocks for the image gen, then queues the video job. A failure
+    # is surfaced as an error (the caller opted in; i2v needs a frame).
+    if want_first_frame:
+        try:
+            ref_bytes, ref_suffix = await generate_first_frame(
+                normalized["prompt"],
+                width=int(normalized["width"]),
+                height=int(normalized["height"]),
+                model_id=first_frame_model,
+                manager=manager,
+                engine_pool=pool,
+                settings_manager=settings_manager,
+                image_settings=_server_state.global_settings.image,
+                timeout_s=float(
+                    getattr(video_settings, "job_timeout_seconds", 7200)
+                ),
+            )
+        except FirstFrameError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        normalized["first_frame_from_text"] = True
 
     # SeedVR2 upscale stage: per-frame, runs in the worker after generation
     # (and after the stitch, for extends). Weights are a separate download;
