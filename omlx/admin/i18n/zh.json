@@ -402,6 +402,8 @@
   "settings.advanced.burst_decode_light": "Light",
   "settings.advanced.burst_decode_balanced": "Balanced (default)",
   "settings.advanced.burst_decode_aggressive": "Aggressive (fastest)",
+  "settings.advanced.preserve_mid_system_cache": "Preserve Prefix Cache for Mid-Conversation System Notes",
+  "settings.advanced.preserve_mid_system_cache_hint": "When a model's chat template cannot render system or developer messages after the first turn, oMLX rewrites safe trailing notes into the nearest user message so long conversation history can remain prefix-cacheable. Tool call and tool result sequences are left unchanged.",
   "settings.advanced.cache": "缓存",
   "settings.advanced.initial_cache_blocks": "初始缓存块数",
   "settings.advanced.initial_cache_blocks_hint": "启动时预分配的块数。值越大，动态分配开销越小。",

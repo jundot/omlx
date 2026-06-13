@@ -34,6 +34,31 @@ class TestExtractGemma4Messages:
         assert result[0] == {"role": "user", "content": "Hello"}
         assert result[1] == {"role": "assistant", "content": "Hi"}
 
+    def test_mid_system_consolidated_by_default(self):
+        messages = [
+            Message(role="user", content="Stable history"),
+            Message(role="system", content="Tail instruction"),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert result == [
+            {"role": "system", "content": "Tail instruction"},
+            {"role": "user", "content": "Stable history"},
+        ]
+
+    def test_mid_system_position_can_be_deferred(self):
+        messages = [
+            Message(role="user", content="Stable history"),
+            Message(role="system", content="Tail instruction"),
+        ]
+        result = extract_gemma4_messages(
+            messages,
+            consolidate_system_messages=False,
+        )
+        assert result == [
+            {"role": "user", "content": "Stable history"},
+            {"role": "system", "content": "Tail instruction"},
+        ]
+
     def test_tool_result_folded_onto_model_turn(self):
         """Single tool result is attached to the same assistant message as tool_calls."""
         messages = [
@@ -154,7 +179,10 @@ class TestExtractGemma4Messages:
                 role="user",
                 content=[
                     {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             ),
         ]
@@ -163,6 +191,7 @@ class TestExtractGemma4Messages:
         types = [p["type"] for p in result[0]["content"]]
         assert "image_url" in types
         assert "text" in types
+
     def test_input_audio_preserved_in_user_message(self):
         """User messages with input_audio parts keep them for VLM processing."""
         messages = [
@@ -170,7 +199,10 @@ class TestExtractGemma4Messages:
                 role="user",
                 content=[
                     {"type": "text", "text": "listen to this"},
-                    {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "abc", "format": "wav"},
+                    },
                 ],
             ),
         ]
@@ -202,7 +234,10 @@ class TestExtractGemma4Messages:
                 role="user",
                 content=[
                     {"type": "text", "text": "Look at this"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
                 ],
             ),
             Message(role="user", content="What is it?"),
@@ -286,7 +321,9 @@ class TestExtractGemma4Messages:
 
     def test_multiple_stray_markers_stripped_from_prose(self):
         """Multiple stray markers in prose are all removed."""
-        msg = Message(role="assistant", content="Part 1.<tool_call|>Part 2.<tool_call|>")
+        msg = Message(
+            role="assistant", content="Part 1.<tool_call|>Part 2.<tool_call|>"
+        )
         result = extract_gemma4_messages([msg])
         assert result[0]["content"] == "Part 1.Part 2."
 
@@ -379,18 +416,14 @@ class TestGemma4OutputParserSession:
         """``<|channel>thought<channel|>`` with no newline is recovered via
         the bare-marker fallback, with the ``thought`` keyword absorbed."""
         sess = self._make_session()
-        result = sess._consume_text(
-            "<|channel>thought<channel|>after", final=True
-        )
+        result = sess._consume_text("<|channel>thought<channel|>after", final=True)
         assert result.visible_text == "<think>\n</think>\nafter"
 
     def test_bare_open_with_non_thought_channel(self):
         """A bare ``<|channel>X<channel|>`` (unknown channel name) is wrapped
         defensively as a thought block rather than leaking the markers."""
         sess = self._make_session()
-        result = sess._consume_text(
-            "<|channel>X<channel|>after", final=True
-        )
+        result = sess._consume_text("<|channel>X<channel|>after", final=True)
         assert result.visible_text == "<think>\nX</think>\nafter"
 
     def test_streaming_canonical_split_at_marker_boundary(self):
@@ -400,9 +433,7 @@ class TestGemma4OutputParserSession:
         # Streaming defer: nothing emitted yet because the bare match could
         # still extend to the canonical form.
         assert r1.visible_text == ""
-        r2 = sess._consume_text(
-            "thought\nreasoning\n<channel|>answer", final=True
-        )
+        r2 = sess._consume_text("thought\nreasoning\n<channel|>answer", final=True)
         assert r1.visible_text + r2.visible_text == (
             "<think>\nreasoning\n</think>\nanswer"
         )
@@ -432,7 +463,7 @@ class TestGemma4OutputParserSession:
     def test_tool_response_markers_dropped(self):
         sess = self._make_session()
         result = sess._consume_text(
-            "<|tool_response>{\"x\":1}<tool_response|>after", final=True
+            '<|tool_response>{"x":1}<tool_response|>after', final=True
         )
         assert result.visible_text == '{"x":1}after'
 

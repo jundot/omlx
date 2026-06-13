@@ -74,6 +74,7 @@ def extract_gemma4_messages(
     messages: list[Any],
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
 ) -> list[dict]:
     """Convert OpenAI-format messages to Gemma 4 chat-template format.
 
@@ -100,6 +101,10 @@ def extract_gemma4_messages(
         max_tool_result_tokens: Maximum token count for tool results
             (truncation applied when tokenizer is provided).
         tokenizer: Tokenizer for optional truncation.
+        consolidate_system_messages: When True, preserve the legacy behavior
+            of moving all system/developer messages to the leading system
+            prompt. Server routes pass False and defer that decision until the
+            model chat template can be probed.
 
     Returns:
         List of dicts ready for ``tokenizer.apply_chat_template``.
@@ -280,9 +285,11 @@ def extract_gemma4_messages(
         _merge_consecutive_roles,
     )
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed))
-    )
+    cleaned = processed
+    if consolidate_system_messages:
+        cleaned = _consolidate_system_messages(cleaned)
+    cleaned = _drop_void_assistant_messages(cleaned)
+    return _merge_consecutive_roles(cleaned)
 
 
 def _matching_prefix_len(text: str, marker: str) -> int:

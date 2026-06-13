@@ -1495,6 +1495,25 @@ class TestUnresolvableSchedulerWarning:
             f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
         )
 
+    def test_no_warning_for_stopped_engine_during_unload(self, enforcer, caplog):
+        """During EnginePool unload there is a short window where the engine
+        object still sits on the entry but its scheduler has already been
+        released. That is teardown, not a broken wrapper chain.
+        """
+        engine = MagicMock(spec=["_loaded"])
+        engine._loaded = False
+        entry = _make_entry("model-stopped", engine=engine)
+        enforcer._engine_pool._entries = {"model-stopped": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
     def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
         """DFlash normal mode has no scheduler until fallback is started."""
 

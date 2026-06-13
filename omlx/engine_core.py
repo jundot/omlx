@@ -34,6 +34,7 @@ from typing import (
 
 import mlx.core as mx
 
+from .exceptions import PrefillMemoryExceededError
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
@@ -45,6 +46,24 @@ from .utils.compile_cache import (
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_request_output_error(output: RequestOutput) -> None:
+    if output.error_code == "prefill_memory_exceeded":
+        metadata = output.error_metadata or {}
+        request_id = metadata.get("request_id")
+        estimated_bytes = metadata.get("estimated_bytes")
+        limit_bytes = metadata.get("limit_bytes")
+        raise PrefillMemoryExceededError(
+            message=output.error or "Prefill memory exceeded",
+            request_id=str(request_id) if request_id is not None else output.request_id,
+            estimated_bytes=(
+                int(estimated_bytes) if estimated_bytes is not None else None
+            ),
+            limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
+        )
+    raise RuntimeError(output.error)
+
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -442,9 +461,7 @@ class EngineCore:
                         if self.scheduler.has_requests():
                             continue
                         with suppress(TimeoutError):
-                            await asyncio.wait_for(
-                                event.wait(), timeout=step_interval
-                            )
+                            await asyncio.wait_for(event.wait(), timeout=step_interval)
 
             except asyncio.CancelledError:
                 break
@@ -560,7 +577,7 @@ class EngineCore:
         # without the explicit cleanup below the per-rejection leak
         # accumulates one collector + one stream_state + one
         # asyncio.Event per refused request. Re-raise after cleanup so
-        # the typed exception still reaches the FastAPI 413 handler.
+        # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(
@@ -734,7 +751,7 @@ class EngineCore:
                     yield output
 
                     if output.error:
-                        raise RuntimeError(output.error)
+                        _raise_request_output_error(output)
 
                     if output.finished:
                         break
@@ -811,7 +828,7 @@ class EngineCore:
             raise RuntimeError(f"No output for request {request_id}")
 
         if final_output.error:
-            raise RuntimeError(final_output.error)
+            _raise_request_output_error(final_output)
 
         return final_output
 
@@ -834,8 +851,9 @@ class EngineCore:
         Returns:
             List of RequestOutput in same order as prompts
         """
-        from .request import Request
         import uuid as uuid_module
+
+        from .request import Request
 
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -921,9 +939,7 @@ class EngineCore:
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
             fn_name = getattr(fn, "__name__", repr(fn))
             try:
-                self._mlx_executor.submit(fn).result(
-                    timeout=FATAL_TEARDOWN_TIMEOUT_S
-                )
+                self._mlx_executor.submit(fn).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
             except concurrent.futures.TimeoutError:
                 fatal_exit(
                     f"Engine teardown timed out after "

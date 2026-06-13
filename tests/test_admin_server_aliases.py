@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.admin.routes as admin_routes
+import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 from omlx.admin.routes import GlobalSettingsRequest
 from omlx.utils.network import (
     detect_server_aliases,
@@ -21,19 +21,21 @@ from omlx.utils.network import (
     is_valid_ip,
 )
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
 
 
-def _make_global_settings(server_aliases: list[str] | None = None, host: str = "127.0.0.1"):
+def _make_global_settings(
+    server_aliases: list[str] | None = None, host: str = "127.0.0.1"
+):
     """Build a MagicMock GlobalSettings with the fields the alias paths touch."""
     gs = MagicMock()
     gs.server.host = host
     gs.server.port = 8000
     gs.server.log_level = "info"
     gs.server.server_aliases = list(server_aliases or [])
+    gs.server.preserve_mid_system_cache = True
     # Validation is invoked at the end of update_global_settings; return no errors.
     gs.validate.return_value = []
     gs.save.return_value = None
@@ -450,6 +452,24 @@ class TestUpdateGlobalSettingsHotCache:
         gs.save.assert_not_called()
 
 
+class TestUpdateGlobalSettingsMidSystemCache:
+    """update_global_settings: save the mid-system prefix-cache fallback toggle."""
+
+    def test_saves_disabled_mid_system_cache_fallback(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(preserve_mid_system_cache=False)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "preserve_mid_system_cache" in result["runtime_applied"]
+        assert gs.server.preserve_mid_system_cache is False
+        gs.save.assert_called_once()
+
+
 class TestUpdateGlobalSettingsSampling:
     """update_global_settings: saving and hot-applying sampling defaults."""
 
@@ -541,10 +561,13 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5)
 
-        with _patched_global_settings(gs), patch.object(
-            omlx.server,
-            "_server_state",
-            server_state,
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
         ):
             result = asyncio.run(
                 admin_routes.update_global_settings(request=request, is_admin=True)
@@ -582,10 +605,13 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5)
 
-        with _patched_global_settings(gs), patch.object(
-            omlx.server,
-            "_server_state",
-            server_state,
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
@@ -606,10 +632,13 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5, api_key="abc")
 
-        with _patched_global_settings(gs), patch.object(
-            omlx.server,
-            "_server_state",
-            server_state,
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
@@ -630,10 +659,13 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         server_state = SimpleNamespace(engine_pool=pool)
         request = GlobalSettingsRequest(embedding_batch_size=5)
 
-        with _patched_global_settings(gs), patch.object(
-            omlx.server,
-            "_server_state",
-            server_state,
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(

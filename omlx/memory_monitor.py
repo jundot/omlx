@@ -503,7 +503,7 @@ class MemoryMonitor:
         # prompts (smaller than chunk_size) would otherwise be charged the
         # full chunk_size width in the scores tensor, over-estimating by
         # chunk_size / new_tokens — a constant-factor over-count that
-        # raised false-positive 413s on small prompts.
+        # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
         attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
@@ -633,6 +633,11 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             logger.debug("Could not extract model config for memory estimation")
             return
 
+        def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
         # language-model dimensions under a sub-config. Prefer
         # ``text_config`` / ``language_config`` / ``llm_config`` when ANY of
@@ -643,31 +648,28 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         # ``n_layer`` alias. Falls back to the top-level config only when no
         # sub-config has either field.
         for sub_attr in ("text_config", "language_config", "llm_config"):
-            sub = getattr(config, sub_attr, None)
+            sub = _cfg_get(config, sub_attr)
             if sub is not None and (
-                getattr(sub, "num_hidden_layers", None)
-                or getattr(sub, "n_layer", None)
+                _cfg_get(sub, "num_hidden_layers") or _cfg_get(sub, "n_layer")
             ):
                 config = sub
                 break
 
         # Extract KV cache dimensions
-        num_layers = getattr(config, "num_hidden_layers", None) or getattr(
-            config, "n_layer", None
+        num_layers = _cfg_get(config, "num_hidden_layers") or _cfg_get(
+            config, "n_layer"
         )
         num_kv_heads = (
-            getattr(config, "num_key_value_heads", None)
-            or getattr(config, "num_attention_heads", None)
-            or getattr(config, "n_head", None)
+            _cfg_get(config, "num_key_value_heads")
+            or _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
         )
-        head_dim = getattr(config, "head_dim", None)
-        hidden_size = getattr(config, "hidden_size", None) or getattr(
-            config, "n_embd", None
-        )
+        head_dim = _cfg_get(config, "head_dim")
+        hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
 
         # Calculate head_dim if not directly available
         if head_dim is None and hidden_size and num_kv_heads:
-            num_heads = getattr(config, "num_attention_heads", None) or num_kv_heads
+            num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
             head_dim = hidden_size // num_heads
 
         # Determine dtype size
@@ -680,8 +682,8 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
 
         # Extract num_attention_heads (query heads) for SDPA peak estimation
         num_attention_heads = (
-            getattr(config, "num_attention_heads", None)
-            or getattr(config, "n_head", None)
+            _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
             or num_kv_heads
         )
 

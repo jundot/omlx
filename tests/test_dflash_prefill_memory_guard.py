@@ -82,6 +82,30 @@ def test_estimator_produces_nonzero_peak():
     assert guard.memory_monitor.estimate_prefill_peak_bytes(65536, 2048) > 0
 
 
+def test_set_model_info_from_model_handles_dict_nested_text_config():
+    model = MagicMock()
+    model.config = {
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "num_hidden_layers": 40,
+            "num_key_value_heads": 2,
+            "num_attention_heads": 16,
+            "head_dim": 256,
+        },
+    }
+    del model.make_cache
+    model.dtype = mx.float16
+
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    set_model_info_from_model(monitor, model)
+
+    assert monitor._num_layers == 40
+    assert monitor._num_kv_heads == 2
+    assert monitor._num_attention_heads == 16
+    assert monitor._head_dim == 256
+    assert monitor.estimate_prefill_peak_bytes(50_000, 2048) > 0
+
+
 def test_preflight_passes_within_limit():
     """Positive control: a normal prompt under a generous limit must NOT raise."""
     guard = _make_guard()

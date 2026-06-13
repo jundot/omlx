@@ -769,6 +769,12 @@ class ProcessMemoryEnforcer:
                     # would fire on a routine startup before any model is
                     # loaded and turn the signal into noise.
                     continue
+                if getattr(engine, "_loaded", True) is False:
+                    # EnginePool clears entry.engine after stop(), but an
+                    # enforcer tick can observe the engine in the small
+                    # teardown window after its scheduler has been released.
+                    # Treat that like an unloaded entry, not a wrapper break.
+                    continue
                 if (
                     type(engine).__name__ == "DFlashEngine"
                     and getattr(engine, "_fallback_engine", None) is None
