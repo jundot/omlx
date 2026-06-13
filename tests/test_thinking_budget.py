@@ -456,8 +456,13 @@ class TestCompletionsThinkingBudget:
 
     @staticmethod
     def _engine_call_passes_budget(handler_name: str, engine_method: str) -> bool:
-        """True when ``handler_name`` calls ``<obj>.<engine_method>(...)`` with
-        a ``thinking_budget`` keyword built from ``_resolve_thinking_budget``.
+        """True when ``handler_name`` threads a ``thinking_budget`` resolved from
+        ``_resolve_thinking_budget`` into ``<obj>.<engine_method>(...)``.
+
+        Accepts both wirings: the inline ``thinking_budget=_resolve_thinking_budget(...)``
+        keyword and the ``**gen_kwargs`` dict-unpack pattern the chat path uses
+        (#1844), where the handler sets ``gen_kwargs["thinking_budget"]`` from the
+        resolved value and unpacks the dict into the engine call.
 
         Structural AST check: immune to reformatting, wrappers, and comments,
         unlike substring counting."""
@@ -467,28 +472,71 @@ class TestCompletionsThinkingBudget:
         source = (
             Path(__file__).resolve().parents[1] / "omlx" / "server.py"
         ).read_text()
+
+        def _is_resolve_call(value) -> bool:
+            return (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "_resolve_thinking_budget"
+            )
+
         for node in ast.walk(ast.parse(source)):
-            if (
+            if not (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name == handler_name
             ):
-                for call in ast.walk(node):
-                    if not isinstance(call, ast.Call):
-                        continue
-                    func = call.func
-                    if not (isinstance(func, ast.Attribute) and func.attr == engine_method):
-                        continue
-                    for keyword in call.keywords:
-                        if keyword.arg != "thinking_budget":
-                            continue
-                        value = keyword.value
-                        if (
-                            isinstance(value, ast.Call)
-                            and isinstance(value.func, ast.Name)
-                            and value.func.id == "_resolve_thinking_budget"
-                        ):
-                            return True
+                continue
+
+            # Locals bound directly to _resolve_thinking_budget(...), e.g.
+            #     thinking_budget = _resolve_thinking_budget(request, request.model)
+            resolved_locals = {
+                t.id
+                for n in ast.walk(node)
+                if isinstance(n, ast.Assign) and _is_resolve_call(n.value)
+                for t in n.targets
+                if isinstance(t, ast.Name)
+            }
+            # Dicts that get a "thinking_budget" entry from the resolved value, e.g.
+            #     gen_kwargs["thinking_budget"] = thinking_budget
+            budget_dicts = set()
+            for n in ast.walk(node):
+                if not isinstance(n, ast.Assign):
+                    continue
+                for t in n.targets:
+                    if (
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.value, ast.Name)
+                        and isinstance(t.slice, ast.Constant)
+                        and t.slice.value == "thinking_budget"
+                        and (
+                            _is_resolve_call(n.value)
+                            or (
+                                isinstance(n.value, ast.Name)
+                                and n.value.id in resolved_locals
+                            )
+                        )
+                    ):
+                        budget_dicts.add(t.value.id)
+
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                if not (isinstance(func, ast.Attribute) and func.attr == engine_method):
+                    continue
+                for keyword in call.keywords:
+                    # inline: engine.generate(..., thinking_budget=_resolve_thinking_budget(...))
+                    if keyword.arg == "thinking_budget" and _is_resolve_call(keyword.value):
+                        return True
+                    # dict-unpack: engine.generate(..., **gen_kwargs)
+                    if (
+                        keyword.arg is None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in budget_dicts
+                    ):
+                        return True
                 return False
+            return False
         raise AssertionError(f"{handler_name} not found in server.py")
 
     def test_non_streaming_completion_path_resolves_the_budget(self):
