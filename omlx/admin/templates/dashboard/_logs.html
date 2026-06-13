@@ -88,7 +88,7 @@
 
                     <!-- Stats -->
                     <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
-                        <span x-show="logLastUpdated" x-text="'Last updated: ' + logLastUpdated"></span>
+                        <span x-show="logLastUpdated" x-text="window.t('logs.last_updated') + logLastUpdated"></span>
                         <span x-show="logError" class="text-red-500" x-text="logError"></span>
                     </div>
                 </div>

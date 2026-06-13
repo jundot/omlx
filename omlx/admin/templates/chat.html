@@ -972,7 +972,7 @@
                                         @click="msg._perfVisible = !msg._perfVisible"
                                         class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                         :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                        :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
+                                        :title="msg._perfVisible ? window.t('chat.timeline.hide_tooltip') : window.t('chat.timeline.show_tooltip') + msg._perfTotal + ')'">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
                                     <button @click="copyMessage(msg.content)"
@@ -1017,7 +1017,7 @@
                                             <circle cx="12" cy="12" r="10" />
                                             <path d="M12 8v4M12 16h.01" />
                                         </svg>
-                                        <span class="thinking-text">Thinking</span>
+                                        <span class="thinking-text">{{ t('chat.thinking.label') }}</span>
                                         <svg class="thinking-toggle" :class="{ collapsed: !msg._thinkingOpen }"
                                             viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                             <polyline points="18 15 12 9 6 15" />
@@ -1120,7 +1120,7 @@
                             <button @click="statusTimelineVisible = !statusTimelineVisible"
                                 class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                 :style="statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                title="Toggle timeline">
+                                :title="window.t('chat.timeline.toggle_tooltip')">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
                             </button>
                             <button @click="stopStreaming()"
@@ -1175,7 +1175,7 @@
                                         d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
                                 </svg>
                             </span>
-                            <span x-text="engineStatus?.text || 'Starting'"></span>
+                            <span x-text="engineStatus?.text || window.t('chat.status.starting')"></span>
                             <span class="loading-dots" style="display:inline-flex;gap:2px;margin:0;">
                                 <span class="loading-dot" style="width:4px;height:4px;"></span>
                                 <span class="loading-dot" style="width:4px;height:4px;"></span>
@@ -1191,7 +1191,7 @@
                                     <circle cx="12" cy="12" r="10" />
                                     <path d="M12 8v4M12 16h.01" />
                                 </svg>
-                                <span class="thinking-text" x-text="finalContent ? 'Thinking' : 'Thinking...'"></span>
+                                <span class="thinking-text" x-text="finalContent ? window.t('chat.thinking.label') : window.t('chat.thinking.in_progress')"></span>
                                 <svg class="thinking-toggle" :class="{ collapsed: !streamingThinkingOpen }"
                                     viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <polyline points="18 15 12 9 6 15" />
@@ -1315,7 +1315,7 @@
         <button class="image-modal-close" @click="closeImageModal()">
             <i data-lucide="x" class="w-5 h-5"></i>
         </button>
-        <img :src="imageModal.src" @click.stop alt="Preview" x-show="imageModal.src">
+        <img :src="imageModal.src" @click.stop :alt="window.t('chat.image_modal_alt')" x-show="imageModal.src">
     </div>
 
     <!-- System Prompt Modal -->
@@ -1771,22 +1771,22 @@
             const model = models.find(m => m.id === this.currentModel);
             if (this.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
             if (model?.is_loading || (!model && models.some(m => m.is_loading))) {
-                this.setEngineStatus({ text: 'Loading model' });
+                this.setEngineStatus({ text: window.t('chat.status.loading_model') });
             } else if (model?.prefilling?.length > 0) {
                 const p = model.prefilling[0];
                 if (p.total > 0) {
                     const pct = Math.round(p.processed / p.total * 100);
                     if (pct >= 100) {
-                        this.engineStatus = { text: 'Generating' }; // prefill done, now generating
+                        this.engineStatus = { text: window.t('chat.status.generating') }; // prefill done, now generating
                     } else {
                         const speed = p.speed > 0 ? ` · ${Math.round(p.speed)} tok/s` : '';
-                        this.engineStatus = { text: `Prefilling ${pct}%${speed}` };
+                        this.engineStatus = { text: `${window.t('chat.status.prefilling')} ${pct}%${speed}` };
                     }
                 } else {
-                    this.engineStatus = { text: 'Prefilling' };
+                    this.engineStatus = { text: window.t('chat.status.prefilling_short') };
                 }
             } else if (model?.generating?.length > 0) {
-                this.setEngineStatus({ text: 'Generating' });
+                this.setEngineStatus({ text: window.t('chat.status.generating') });
             }
         } catch (e) { /* ignore poll errors */ }
     },
@@ -2158,7 +2158,7 @@
                         } else if (!m._video.error) {
                             m._video.error = 'interrupted';
                             if (!m.content) {
-                                m.content = 'video job interrupted (no job id recorded)';
+                                m.content = window.t('chat.video.interrupted_no_job');
                             }
                         }
                     }
@@ -2185,7 +2185,7 @@
                         } else if (!m._image.error) {
                             m._image.error = 'interrupted';
                             if (!m.content) {
-                                m.content = 'image job interrupted (no job id recorded)';
+                                m.content = window.t('chat.image.interrupted_no_job');
                             }
                         }
                     }
@@ -2436,7 +2436,7 @@
             await this.pollVideo(msg);
         } catch (e) {
             msg._video.error = String(e.message || e);
-            msg.content = `Error: ${msg._video.error}`;
+            msg.content = window.t('chat.error.prefix').replace('{msg}', msg._video.error);
             // Disarm on failure too: a stuck chip silently wins over any
             // freshly attached image on the next send (extend beats
             // input_reference) and replays the same error.
@@ -2504,7 +2504,7 @@
             const s = await fetch(`/v1/videos/${v.job_id}`, { headers: auth });
             if (s.status === 404) {
                 if (!v.error) v.error = 'expired';
-                if (!msg.content) msg.content = `\`${v.job_id}\` no longer on the server`;
+                if (!msg.content) msg.content = `\`${v.job_id}\` ${window.t('chat.video.no_longer_on_server')}`;
                 this.saveCurrentChat();
                 return;
             }
@@ -2519,19 +2519,19 @@
                     v.error = null;
                 } catch (e) {
                     v.error = 'artifact_expired';
-                    msg.content = `\`${v.job_id}\` artifact purged by the retention policy`;
+                    msg.content = `\`${v.job_id}\` ${window.t('chat.video.artifact_purged')}`;
                 }
             } else if (j.status === 'failed') {
                 const e2 = j.error || {};
                 v.error = e2.code ? `${e2.code}: ${e2.message}` : 'failed';
-                if (!msg.content) msg.content = `Error: ${v.error}`;
+                if (!msg.content) msg.content = window.t('chat.error.prefix').replace('{msg}', v.error);
             } else {
                 // Still running server-side: resume live polling
                 v.error = null;
                 v.cancelled = false;
                 this.pollVideo(msg).catch((e3) => {
                     v.error = String(e3.message || e3);
-                    msg.content = `Error: ${v.error}`;
+                    msg.content = window.t('chat.error.prefix').replace('{msg}', v.error);
                 }).finally(() => this.saveCurrentChat());
             }
             this.saveCurrentChat();
@@ -2670,7 +2670,7 @@
             await this.pollImage(msg);
         } catch (e) {
             msg._image.error = String(e.message || e);
-            msg.content = `Error: ${msg._image.error}`;
+            msg.content = window.t('chat.error.prefix').replace('{msg}', msg._image.error);
         } finally {
             this.imageSubmitting = false;
             this.saveCurrentChat();
@@ -2753,7 +2753,7 @@
             const s = await fetch(`/v1/images/${im.job_id}`, { headers: auth });
             if (s.status === 404) {
                 if (!im.error) im.error = 'artifact_expired';
-                if (!msg.content) msg.content = `\`${im.job_id}\` no longer on the server`;
+                if (!msg.content) msg.content = `\`${im.job_id}\` ${window.t('chat.image.no_longer_on_server')}`;
                 this.saveCurrentChat();
                 return;
             }
@@ -2770,19 +2770,19 @@
                     // /content 404s with code artifact_expired once the
                     // retention policy purges the PNGs.
                     im.error = 'artifact_expired';
-                    msg.content = `\`${im.job_id}\` artifact purged by the retention policy`;
+                    msg.content = `\`${im.job_id}\` ${window.t('chat.image.artifact_purged')}`;
                 }
             } else if (j.status === 'failed') {
                 const e2 = j.error || {};
                 im.error = e2.code ? `${e2.code}: ${e2.message}` : 'failed';
-                if (!msg.content) msg.content = `Error: ${im.error}`;
+                if (!msg.content) msg.content = window.t('chat.error.prefix').replace('{msg}', im.error);
             } else {
                 // Still running server-side: resume live polling
                 im.error = null;
                 im.cancelled = false;
                 this.pollImage(msg).catch((e3) => {
                     im.error = String(e3.message || e3);
-                    msg.content = `Error: ${im.error}`;
+                    msg.content = window.t('chat.error.prefix').replace('{msg}', im.error);
                 }).finally(() => this.saveCurrentChat());
             }
             this.saveCurrentChat();
@@ -2810,7 +2810,7 @@
         if (depth > this.MAX_TOOL_DEPTH) {
             this.messages.push({
                 role: 'assistant',
-                content: `Error: Maximum tool call depth (${this.MAX_TOOL_DEPTH}) exceeded. The model may be stuck in a loop.`,
+                content: window.t('chat.error.max_tool_depth').replace('{depth}', this.MAX_TOOL_DEPTH),
                 model: this.currentModel,
                 _perfVisible: false,
             });
@@ -2837,7 +2837,7 @@
         this.streamingContent = '';
         this.abortController = new AbortController();
         this.autoScrollEnabled = true;
-        this.setEngineStatus({ text: 'Starting' });
+        this.setEngineStatus({ text: window.t('chat.status.starting') });
         this.startPrefillPolling();
 
         // Build messages for API - pass through tool_calls/tool_call_id for MCP loop
@@ -2876,7 +2876,7 @@
 
             if (!response.ok) {
                 const errorText = await response.text();
-                throw new Error(errorText || `Error: ${response.status}`);
+                throw new Error(errorText || window.t('chat.error.http_status').replace('{status}', response.status));
             }
 
             const reader = response.body.getReader();
@@ -2933,8 +2933,8 @@
                                 if (names.length > 0) {
                                     const unique = [...new Set(names)];
                                     const liveLabel = names.length > 3
-                                        ? `Calling ${unique.slice(0, 2).join(', ')} +${names.length - 2} more`
-                                        : `Calling ${names.join(', ')}`;
+                                        ? window.t('chat.status.calling_more').replace('{names}', unique.slice(0, 2).join(', ')).replace('{count}', names.length - 2)
+                                        : window.t('chat.status.calling').replace('{names}', names.join(', '));
                                     this.engineStatus = { text: liveLabel, icon: 'wrench' };
                                 }
                             }
@@ -2944,7 +2944,7 @@
                                 if (!this.thinkingState.isInThinking) {
                                     this.thinkingState.isInThinking = true;
                                     this.thinkingState.thinkingStartTime = Date.now();
-                                    this.setEngineStatus({ text: 'Thinking' });
+                                    this.setEngineStatus({ text: window.t('chat.status.thinking') });
                                 }
                                 // Accumulate into live thinking bubble
                                 this.streamingThinking += delta.reasoning_content;
@@ -2958,7 +2958,7 @@
                                 // Log thinking duration to timeline when content starts
                                 if (this.thinkingState.isInThinking) {
                                     const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                                    this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
+                                    this.setEngineStatus({ text: window.t('chat.status.thought_for').replace('{secs}', thinkSecs) });
                                     this.thinkingState.isInThinking = false;
                                     this.thinkingState.thinkingStartTime = null;
                                 }
@@ -2980,7 +2980,7 @@
             // If model ended while still thinking (tool-call turn), log elapsed and reset
             if (this.thinkingState.isInThinking) {
                 const thinkSecs = ((Date.now() - this.thinkingState.thinkingStartTime) / 1000).toFixed(1);
-                this.setEngineStatus({ text: `Thought for ${thinkSecs}s` });
+                this.setEngineStatus({ text: window.t('chat.status.thought_for').replace('{secs}', thinkSecs) });
                 this.thinkingState.isInThinking = false;
                 this.thinkingState.thinkingStartTime = null;
             }
@@ -3005,8 +3005,8 @@
                 const names = toolCalls.map(t => t.function.name).filter(Boolean);
                 const uniqueNames = [...new Set(names)];
                 const label = toolCalls.length > 3
-                    ? `Calling ${uniqueNames.slice(0, 2).join(', ')} +${toolCalls.length - 2} more`
-                    : `Calling ${names.join(', ')}`;
+                    ? window.t('chat.status.calling_more').replace('{names}', uniqueNames.slice(0, 2).join(', ')).replace('{count}', toolCalls.length - 2)
+                    : window.t('chat.status.calling').replace('{names}', names.join(', '));
                 if (names.length) this.setEngineStatus({ text: label, icon: 'wrench' });
 
                 // Store the assistant tool_calls turn (hidden from chat UI)
@@ -3057,9 +3057,9 @@
                 // Log each tool outcome to the status timeline
                 results.forEach((result) => {
                     if (result.error) {
-                        this.setEngineStatus({ text: `${result.toolName} failed`, icon: 'error' });
+                        this.setEngineStatus({ text: window.t('chat.status.tool_failed').replace('{tool}', result.toolName), icon: 'error' });
                     } else {
-                        this.setEngineStatus({ text: `${result.toolName} done in ${result.elapsed}s`, icon: 'check' });
+                        this.setEngineStatus({ text: window.t('chat.status.tool_done').replace('{tool}', result.toolName).replace('{secs}', result.elapsed), icon: 'check' });
                     }
                 });
 
@@ -3122,7 +3122,7 @@
                 console.error('Streaming error:', error);
                 this.messages.push({
                     role: 'assistant',
-                    content: `Error: ${error.message}`,
+                    content: window.t('chat.error.prefix').replace('{msg}', error.message),
                     model: this.currentModel,
                     _perfVisible: false,
                 });
@@ -3135,7 +3135,7 @@
                     const msg = this.messages[i];
                     if (msg.role === 'assistant' && msg._ui !== false) {
                         if (this.statusLog.length > 0) {
-                            const totalTime = ((Date.now() - this._statusStart) / 1000).toFixed(2) + 's total';
+                            const totalTime = window.t('chat.timeline.total').replace('{secs}', ((Date.now() - this._statusStart) / 1000).toFixed(2));
                             msg._perfLog = [...this.statusLog];
                             msg._perfTotal = totalTime;
                         }
@@ -3373,7 +3373,7 @@
                                 <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
                                 <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                             </svg>
-                            <span class="thinking-text">Thought for ${thinkingTime} seconds</span>
+                            <span class="thinking-text">${window.t('chat.thinking.thought_for_seconds').replace('{secs}', thinkingTime)}</span>
                             <svg class="thinking-toggle" id="thinking-toggle-${uniqueId}" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg">
                                 <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                             </svg>
@@ -3451,7 +3451,7 @@
                                         <circle cx="10" cy="10" r="9" stroke="currentColor" stroke-width="1.5"/>
                                         <path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                                     </svg>
-                                    <span class="thinking-text">Thinking...</span>
+                                    <span class="thinking-text">${window.t('chat.thinking.in_progress')}</span>
                                 </div>
                                 <div class="thinking-content" id="streaming-thinking-content">
                                     ${this.escapeHtml(thinkingContent).replace(/\n/g, '<br>')}
@@ -3560,13 +3560,13 @@
             // Create copy button
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy-btn';
-            copyBtn.textContent = 'Copy';
+            copyBtn.textContent = window.t('chat.code_copy');
             copyBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 this._copyText(codeBlock.textContent).then(() => {
-                    copyBtn.textContent = 'Copied!';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.textContent = window.t('chat.code_copied');
+                    setTimeout(() => copyBtn.textContent = window.t('chat.code_copy'), 2000);
                 });
             };
             pre.parentElement.appendChild(copyBtn);

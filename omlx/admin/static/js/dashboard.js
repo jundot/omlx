@@ -878,13 +878,13 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('js.field.host'));
+                if (!s.server.port) errors.push(window.t('js.field.port'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.field.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('js.field.max_concurrent_requests'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.field.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.field.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('js.field.max_tokens'));
 
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
@@ -966,7 +966,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.saveSuccess = true;
-                        this.saveMessage = data.message || 'Settings saved successfully';
+                        this.saveMessage = data.message || window.t('js.success.settings_saved');
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
@@ -1480,7 +1480,7 @@
                 this.profileError = '';
                 const displayName = this.newProfile.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
@@ -1508,7 +1508,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1646,7 +1646,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1656,7 +1656,7 @@
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -1682,7 +1682,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1703,7 +1703,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2763,7 +2763,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('js.bench.uploading_community'),
                                 current: 0,
                                 total: 0,
                             };
@@ -3115,7 +3115,7 @@
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to add to queue');
+                        throw new Error(err.detail || window.t('js.error.add_to_queue_failed'));
                     }
                     const data = await resp.json();
                     this.accQueue = data.queue || [];
@@ -3809,7 +3809,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || 'Failed to save'));
+                        alert(Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -3857,7 +3857,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timeout');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -3935,7 +3935,7 @@
                         this.startHFRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Retry failed';
+                        this.hfError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -4039,15 +4039,15 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        this.oqSuccess = window.t('js.success.quantization_started').replace('{name}', name).replace('{level}', this.oqLevel);
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_error');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -4224,7 +4224,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -4277,15 +4277,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('js.success.upload_queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -4368,14 +4368,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to load recommended models';
+                        this.hfError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -4455,14 +4455,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Search failed';
+                        this.hfError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -4525,14 +4525,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to fetch model info';
+                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -4621,7 +4621,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timeout');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -4682,7 +4682,7 @@
                         this.startMSRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Retry failed';
+                        this.msError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -4739,14 +4739,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to load recommended models';
+                        this.msError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -4804,14 +4804,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Search failed';
+                        this.msError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -4866,14 +4866,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to fetch model info';
+                        this.msError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

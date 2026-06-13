@@ -46,7 +46,7 @@
                                target="_blank"
                                class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-900 transition-all">
                                 <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
-                                My Submissions
+                                {{ t('bench.my_submissions') }}
                             </a>
                         </div>
                         <p class="text-sm text-neutral-500 mt-2">{{ t('bench.description') }}</p>
@@ -62,19 +62,18 @@
                          class="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 mb-6 flex items-center justify-between gap-4">
                         <div class="flex items-center gap-3">
                             <i data-lucide="info" class="w-5 h-5 text-amber-600 flex-shrink-0"></i>
-                            <div class="text-sm text-amber-900">
-                                Another throughput benchmark is running on
-                                <span class="font-medium" x-text="benchOtherActive?.model_id"></span>.
+                            <div class="text-sm text-amber-900"
+                                 x-text="window.t('bench.other_active.message').replace('{model}', benchOtherActive?.model_id || '')">
                             </div>
                         </div>
                         <div class="flex items-center gap-2 flex-shrink-0">
                             <button @click="acceptOtherBench()"
                                     class="px-3 py-1.5 bg-amber-600 text-white text-xs font-medium rounded-lg hover:bg-amber-700 transition-all">
-                                View live
+                                {{ t('bench.other_active.view_live') }}
                             </button>
                             <button @click="dismissOtherBench()"
                                     class="px-3 py-1.5 text-amber-700 text-xs font-medium hover:text-amber-900 transition-all">
-                                Dismiss
+                                {{ t('bench.other_active.dismiss') }}
                             </button>
                         </div>
                     </div>
@@ -97,7 +96,7 @@
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
-                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
+                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : window.t('bench.config.size_unknown')) + ')'"></option>
                                     </template>
                                 </select>
                             </div>
@@ -141,7 +140,7 @@
                                 <button x-show="!benchRunning"
                                         @click="startBenchmark()"
                                         :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
-                                        :title="benchOtherActive ? 'Another throughput benchmark is already running in this server.' : ''"
+                                        :title="benchOtherActive ? window.t('bench.config.run_disabled_tooltip') : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('bench.config.run_button') }}
@@ -312,11 +311,11 @@
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="upload-cloud" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Community Benchmark Upload</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.upload.section_label') }}</span>
                             </div>
                             <div x-show="benchUploading && benchUploadResults.length === 0" class="flex items-center gap-2">
                                 <div class="w-4 h-4 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin"></div>
-                                <span class="text-xs text-neutral-500">Uploading...</span>
+                                <span class="text-xs text-neutral-500">{{ t('bench.results.upload.uploading') }}</span>
                             </div>
                         </div>
                         <div class="px-6 py-4 space-y-2">
@@ -338,7 +337,7 @@
                                             <a :href="r.url" target="_blank"
                                                class="flex items-center gap-1.5 text-sm text-amber-600 hover:text-amber-700">
                                                 <i data-lucide="copy" class="w-4 h-4"></i>
-                                                <span>Already exists</span>
+                                                <span>{{ t('bench.results.upload.already_exists') }}</span>
                                                 <i data-lucide="external-link" class="w-3 h-3"></i>
                                             </a>
                                         </template>
@@ -355,12 +354,12 @@
                             <!-- Upload complete summary -->
                             <div x-show="benchUploadDone" x-cloak class="pt-3 flex items-center justify-between">
                                 <span class="text-xs text-neutral-500"
-                                      x-text="(benchUploadDone?.success || 0) + '/' + (benchUploadDone?.total || 0) + ' uploaded'"></span>
+                                      x-text="window.t('bench.results.upload.uploaded_summary').replace('{success}', benchUploadDone?.success || 0).replace('{total}', benchUploadDone?.total || 0)"></span>
                                 <a x-show="benchUploadDone?.owner_hash"
                                    :href="'https://omlx.ai/my/' + benchUploadDone?.owner_hash"
                                    target="_blank"
                                    class="flex items-center gap-1.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 transition-colors">
-                                    Manage on omlx.ai
+                                    {{ t('bench.results.upload.manage_link') }}
                                     <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                                 </a>
                             </div>
