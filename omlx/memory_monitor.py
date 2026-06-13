@@ -36,12 +36,19 @@ except ImportError:
 
 # Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
 # generation/inference path. Full prefill and short vector kernels support
-# different head dimensions; unsupported cases fall back to an unfused fp32
-# score matrix allocation.
+# different head dimensions; unsupported cases fall back to an unfused
+# score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
 _SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
-_SDPA_FALLBACK_SCORE_DTYPE_SIZE = 4
+# Default bytes/elem for the materialized unfused score matrix when the model's
+# compute dtype is unknown. MLX softmax accumulates in fp32, but the dominant
+# scratch buffer is allocated at the model's compute dtype, not fp32 — measured
+# ~2.1-2.2 bytes/elem on MLX 0.31.2 for a head_dim=256 prefill (fp16/bf16),
+# ~4.4 for fp32. Callers that know the model dtype pass it via
+# ``set_model_info(compute_dtype_size=...)``; this default covers the rare
+# dim-less path and matches the fp16/bf16 majority of MLX inference models.
+_SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
 
 @dataclass
@@ -122,7 +129,11 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: float = 2  # Default float16/bfloat16
+        self._dtype_size: float = 2  # KV storage width (may be fractional w/ TurboQuant)
+        # SDPA score-matrix width = model compute/activation dtype, distinct from
+        # _dtype_size (which the scheduler may override to a fractional TurboQuant
+        # KV width). Set via set_model_info(compute_dtype_size=...).
+        self._score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
 
@@ -301,6 +312,7 @@ class MemoryMonitor:
         dtype_size: float = 2,
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
+        compute_dtype_size: Optional[float] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -309,18 +321,28 @@ class MemoryMonitor:
             num_layers: Number of transformer layers
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
-            dtype_size: Bytes per element. This may be fractional for
-                quantized KV cache layouts.
+            dtype_size: Bytes per element of the *stored KV cache*. This may
+                be fractional for quantized (e.g. TurboQuant) KV layouts.
             num_attention_heads: Number of query attention heads (for SDPA
                 peak estimation). Defaults to num_kv_heads if not set.
             num_kv_cache_layers: Number of layers that use KVCache
                 (full attention). For hybrid models this may be less than
                 num_layers. Defaults to num_layers.
+            compute_dtype_size: Bytes per element of the model's
+                compute/activation dtype (2 for fp16/bf16, 4 for fp32). Used
+                for the unfused SDPA score-matrix transient, which is allocated
+                at the activation dtype regardless of KV quantization. Defaults
+                to the fp16/bf16 fallback when unknown.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._score_dtype_size = (
+            compute_dtype_size
+            if compute_dtype_size and compute_dtype_size > 0
+            else _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        )
         self._num_attention_heads = num_attention_heads or num_kv_heads
         self._num_kv_cache_layers = num_kv_cache_layers or num_layers
 
@@ -445,7 +467,7 @@ class MemoryMonitor:
         if self._uses_fused_sdpa(query_tokens, kv_len):
             return output
 
-        scores = n_q * query_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        scores = n_q * query_tokens * kv_len * self._score_dtype_size
         return scores + output
 
     def estimate_prefill_peak_bytes(
@@ -724,6 +746,9 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 dtype_size=dtype_size,
                 num_attention_heads=num_attention_heads,
                 num_kv_cache_layers=num_kv_cache_layers,
+                # This path uses the uncompressed base dtype for KV, so
+                # dtype_size already equals the compute/activation dtype.
+                compute_dtype_size=dtype_size,
             )
             logger.debug(
                 f"Model info for memory estimation: "

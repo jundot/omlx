@@ -8496,6 +8496,9 @@ class Scheduler:
                     dtype_size=dtype_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
+                    # SDPA scores are materialized at the compute/activation
+                    # dtype, not the (possibly fractional TurboQuant) KV width.
+                    compute_dtype_size=base_dtype_size,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
