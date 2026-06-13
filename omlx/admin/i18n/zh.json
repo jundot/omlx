@@ -1074,5 +1074,8 @@
   "status.runtime_cache.table.sub_block_cache": "子块缓存",
   "settings.video.prompt_extend": "提示词扩写",
   "settings.video.prompt_extend_desc": "生成前用 LLM 把简短提示词扩写成详细的动作描述, 大幅改善指令遵循. 留空为关闭, 建议选一个小而快的对话模型.",
-  "settings.video.prompt_extend_off": "关闭 (不扩写)"
+  "settings.video.prompt_extend_off": "关闭 (不扩写)",
+  "settings.video.first_frame": "首帧生成 (图生视频)",
+  "settings.video.first_frame_desc": "用图像模型按提示词先出一张首帧再让视频模型动起来 -- 图像模型对提示词的遵循远强于视频模型, 动作更准. 按请求用 first_frame_from_text 开. 留空为关闭.",
+  "settings.video.first_frame_off": "关闭 (不生成首帧)"
 }

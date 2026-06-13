@@ -1074,5 +1074,8 @@
   "status.runtime_cache.table.sub_block_cache": "서브 블록 캐시",
   "settings.video.prompt_extend": "프롬프트 확장",
   "settings.video.prompt_extend_desc": "생성 전에 LLM으로 간단한 프롬프트를 자세한 동작 설명으로 확장하여 지시 따르기를 크게 개선합니다. 비워두면 비활성화됩니다. 작고 빠른 채팅 모델을 선택하세요.",
-  "settings.video.prompt_extend_off": "끄기 (확장 안 함)"
+  "settings.video.prompt_extend_off": "끄기 (확장 안 함)",
+  "settings.video.first_frame": "첫 프레임 생성 (T2I->I2V)",
+  "settings.video.first_frame_desc": "이미지 모델로 프롬프트에서 첫 프레임을 생성한 뒤 영상 모델로 움직입니다 -- 이미지 모델이 영상 모델보다 프롬프트를 훨씬 잘 따라 동작이 정확해집니다. 요청별 first_frame_from_text. 비워두면 비활성화.",
+  "settings.video.first_frame_off": "끄기 (첫 프레임 없음)"
 }

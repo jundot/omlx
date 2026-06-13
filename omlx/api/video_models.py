@@ -50,3 +50,8 @@ class VideoCreateParams(BaseModel):
     # server setting (extend iff video.prompt_extend_model is configured);
     # True = force extend; False = skip extension for this request.
     prompt_extend: Optional[bool] = None
+    # T2I->I2V: generate the I2V conditioning first frame from the prompt
+    # (via video.first_frame_model) instead of requiring an uploaded image.
+    # Only valid for i2v/ti2v models with no input_reference/extend. Default
+    # off; True opts in, requires a configured first_frame_model.
+    first_frame_from_text: Optional[bool] = None

@@ -632,6 +632,19 @@
                                     </select>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div class="min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.video.first_frame') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.video.first_frame_desc') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.video.first_frame_model"
+                                            class="w-full sm:w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">{{ t('settings.video.first_frame_off') }}</option>
+                                        <template x-for="m in imageModels" :key="m.id">
+                                            <option :value="m.id" x-text="m.id"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('settings.video.max_queued_jobs') }}</label>
                                     </div>

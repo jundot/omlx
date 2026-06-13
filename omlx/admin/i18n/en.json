@@ -1074,5 +1074,8 @@
   "settings.resource.guard_tier.custom_input_placeholder": "e.g. 90",
   "settings.video.prompt_extend": "Prompt Extension",
   "settings.video.prompt_extend_desc": "Use an LLM to expand a terse prompt into a detailed motion description before generation -- the biggest fix for weak instruction following. Off when unset; pick a small, fast chat model.",
-  "settings.video.prompt_extend_off": "Off (no extension)"
+  "settings.video.prompt_extend_off": "Off (no extension)",
+  "settings.video.first_frame": "First Frame (T2I->I2V)",
+  "settings.video.first_frame_desc": "Generate the I2V first frame from the prompt with an image model, then animate it -- image models follow prompts far better, so the action comes out right. Per request: first_frame_from_text. Off when unset.",
+  "settings.video.first_frame_off": "Off (no first frame)"
 }

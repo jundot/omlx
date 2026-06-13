@@ -630,6 +630,13 @@ class VideoSettings:
     # motion descriptions server-side before dispatch -- the highest-leverage
     # fix for weak instruction following. Use a small fast model.
     prompt_extend_model: str = ""
+    # T2I->I2V first-frame model. Empty = off. Set to a text-to-image model
+    # id: when a request opts in (first_frame_from_text), the server
+    # generates a first frame from the prompt with this model and feeds it
+    # to the i2v/ti2v video model -- image models follow prompts far better
+    # than video models, so the action comes out right. Reuses the image
+    # engine (loosely coupled); off by default.
+    first_frame_model: str = ""
     max_frames: int = 121  # UX bound; memory bound is the peak predictor
     max_steps: int = 50
     max_pixels_per_frame: int = 1280 * 720
@@ -664,6 +671,7 @@ class VideoSettings:
             "default_steps": self.default_steps,
             "default_fps": self.default_fps,
             "prompt_extend_model": self.prompt_extend_model,
+            "first_frame_model": self.first_frame_model,
             "max_frames": self.max_frames,
             "max_steps": self.max_steps,
             "max_pixels_per_frame": self.max_pixels_per_frame,
@@ -688,6 +696,7 @@ class VideoSettings:
             default_steps=int(data.get("default_steps", 20)),
             default_fps=int(data.get("default_fps", 16)),
             prompt_extend_model=data.get("prompt_extend_model", ""),
+            first_frame_model=data.get("first_frame_model", ""),
             max_frames=int(data.get("max_frames", 121)),
             max_steps=int(data.get("max_steps", 50)),
             max_pixels_per_frame=int(data.get("max_pixels_per_frame", 1280 * 720)),

@@ -1074,5 +1074,8 @@
   "status.runtime_cache.table.sub_block_cache": "サブブロックキャッシュ",
   "settings.video.prompt_extend": "プロンプト拡張",
   "settings.video.prompt_extend_desc": "生成前に LLM で簡潔なプロンプトを詳細な動作記述に拡張し, 指示追従を大幅に改善します. 未設定で無効. 小型で高速なチャットモデルを選んでください.",
-  "settings.video.prompt_extend_off": "無効 (拡張なし)"
+  "settings.video.prompt_extend_off": "無効 (拡張なし)",
+  "settings.video.first_frame": "最初のフレーム生成 (T2I->I2V)",
+  "settings.video.first_frame_desc": "画像モデルでプロンプトから最初のフレームを生成し, それを動かします -- 画像モデルは動画モデルよりプロンプト追従が高く, 動作が正確になります. リクエスト単位は first_frame_from_text. 未設定で無効.",
+  "settings.video.first_frame_off": "無効 (最初のフレームなし)"
 }

@@ -163,11 +163,13 @@ def video_env(monkeypatch, tmp_path):
             )
         monkeypatch.setattr(video_routes, "_get_engine_pool", lambda: pool)
         monkeypatch.setattr(video_routes, "_resolve_model", lambda m: m)
-        # create_video reads _server_state.global_settings.video directly
+        # create_video reads _server_state.global_settings.video directly,
+        # and .image when generating a first frame (T2I->I2V).
+        from omlx.settings import ImageSettings
         monkeypatch.setattr(
             omlx_server._server_state,
             "global_settings",
-            SimpleNamespace(video=vs),
+            SimpleNamespace(video=vs, image=ImageSettings()),
         )
 
         app = FastAPI()
@@ -329,6 +331,94 @@ class TestPromptExtension:
         assert r.status_code == 200
         job = manager.get(r.json()["id"])
         assert job.params["prompt"] == "伸懒腰"
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/videos -- T2I->I2V first-frame generation wiring
+# ---------------------------------------------------------------------------
+
+
+class TestFirstFrameFromText:
+    def test_generates_frame_and_runs_i2v(self, video_env, monkeypatch):
+        # i2v model + first_frame_from_text + configured model: the route
+        # generates a frame and submits the job WITH it as the conditioning
+        # image (no upload needed).
+        client, manager = video_env(
+            settings=_video_settings(first_frame_model="z-image-turbo")
+        )
+        calls = {}
+
+        async def _fake_gen(prompt, *, width, height, model_id, **kw):
+            calls["prompt"] = prompt
+            calls["wh"] = (width, height)
+            calls["model_id"] = model_id
+            return PNG_BYTES, ".png"
+
+        monkeypatch.setattr(video_routes, "generate_first_frame", _fake_gen)
+        r = client.post(
+            "/v1/videos",
+            json={
+                "model": I2V_MODEL,
+                "prompt": "一个人伸懒腰",
+                "first_frame_from_text": True,
+                "size": "480x272",
+            },
+        )
+        assert r.status_code == 200, r.text
+        job = manager.get(r.json()["id"])
+        assert job.params["first_frame_from_text"] is True
+        # The generated frame reached the worker as the conditioning image
+        assert "image_path" in job.params
+        assert calls["model_id"] == "z-image-turbo"
+        assert calls["wh"] == (480, 272)
+
+    def test_t2v_model_rejected_400(self, video_env):
+        client, _ = video_env(
+            settings=_video_settings(first_frame_model="z-image-turbo")
+        )
+        r = _post(client, first_frame_from_text=True)  # default model is t2v
+        assert r.status_code == 400
+        assert "image-to-video" in r.json()["detail"]
+
+    def test_no_model_configured_400(self, video_env):
+        client, _ = video_env()  # no first_frame_model
+        r = client.post(
+            "/v1/videos",
+            json={"model": I2V_MODEL, "prompt": "x", "first_frame_from_text": True},
+        )
+        assert r.status_code == 400
+        assert "first_frame_model is not configured" in r.json()["detail"]
+
+    def test_generation_failure_502(self, video_env, monkeypatch):
+        client, _ = video_env(
+            settings=_video_settings(first_frame_model="z-image-turbo")
+        )
+
+        async def _fail(*a, **k):
+            raise video_routes.FirstFrameError("image worker died")
+
+        monkeypatch.setattr(video_routes, "generate_first_frame", _fail)
+        r = client.post(
+            "/v1/videos",
+            json={"model": I2V_MODEL, "prompt": "x", "first_frame_from_text": True},
+        )
+        assert r.status_code == 502
+        assert "image worker died" in r.json()["detail"]
+
+    def test_off_by_default_i2v_still_requires_image(self, video_env, monkeypatch):
+        # Without first_frame_from_text, an i2v model with no image still 400s
+        # (unchanged behavior; the feature is strictly opt-in).
+        client, _ = video_env(
+            settings=_video_settings(first_frame_model="z-image-turbo")
+        )
+
+        async def _boom(*a, **k):
+            raise AssertionError("must not generate a frame when not opted in")
+
+        monkeypatch.setattr(video_routes, "generate_first_frame", _boom)
+        r = client.post("/v1/videos", json={"model": I2V_MODEL, "prompt": "x"})
+        assert r.status_code == 400
+        assert "requires" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
