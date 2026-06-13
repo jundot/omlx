@@ -46,3 +46,7 @@ class VideoCreateParams(BaseModel):
     guidance_2: Optional[float] = None
     extend_video_id: Optional[str] = None  # Continue this completed job
     upscale_resolution: Optional[int] = None  # SeedVR2 target short side
+    # Per-request override for LLM prompt extension. None = follow the
+    # server setting (extend iff video.prompt_extend_model is configured);
+    # True = force extend; False = skip extension for this request.
+    prompt_extend: Optional[bool] = None
