@@ -258,6 +258,80 @@ class TestCreateVideo:
 
 
 # ---------------------------------------------------------------------------
+# POST /v1/videos -- LLM prompt extension wiring
+# ---------------------------------------------------------------------------
+
+
+class TestPromptExtension:
+    def test_extension_off_by_default(self, video_env):
+        # No prompt_extend_model configured -> prompt passes through verbatim.
+        client, manager = video_env()
+        r = _post(client, prompt="伸懒腰")
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert job.params["prompt"] == "伸懒腰"
+        assert "original_prompt" not in job.params
+        assert "prompt_extended" not in job.params
+
+    def test_extension_applied_when_model_configured(
+        self, video_env, monkeypatch
+    ):
+        client, manager = video_env(
+            settings=_video_settings(prompt_extend_model="small-llm")
+        )
+
+        async def _fake_extend(prompt, *, model_id, engine_pool, **kw):
+            assert model_id == "small-llm"
+            return "a person slowly raises both arms and arches their back", True
+
+        monkeypatch.setattr(video_routes, "extend_video_prompt", _fake_extend)
+        r = _post(client, prompt="伸懒腰")
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert job.params["prompt"].startswith("a person slowly raises")
+        assert job.params["original_prompt"] == "伸懒腰"
+        assert job.params["prompt_extended"] is True
+
+    def test_extension_failure_falls_back(self, video_env, monkeypatch):
+        client, manager = video_env(
+            settings=_video_settings(prompt_extend_model="small-llm")
+        )
+
+        async def _fail_extend(prompt, *, model_id, engine_pool, **kw):
+            return prompt, False  # helper swallowed an error
+
+        monkeypatch.setattr(video_routes, "extend_video_prompt", _fail_extend)
+        r = _post(client, prompt="伸懒腰")
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert job.params["prompt"] == "伸懒腰"
+        assert "original_prompt" not in job.params
+
+    def test_request_extend_true_without_model_400(self, video_env):
+        # Explicit prompt_extend=true but no configured model -> 400, not
+        # a silent no-op.
+        client, _ = video_env()
+        r = _post(client, prompt="伸懒腰", prompt_extend=True)
+        assert r.status_code == 400
+        assert "prompt_extend_model is not configured" in r.json()["detail"]
+
+    def test_request_extend_false_skips(self, video_env, monkeypatch):
+        # Model configured, but the request opts out -> verbatim prompt.
+        client, manager = video_env(
+            settings=_video_settings(prompt_extend_model="small-llm")
+        )
+
+        async def _boom(*a, **k):  # must not be called
+            raise AssertionError("extension should be skipped")
+
+        monkeypatch.setattr(video_routes, "extend_video_prompt", _boom)
+        r = _post(client, prompt="伸懒腰", prompt_extend=False)
+        assert r.status_code == 200
+        job = manager.get(r.json()["id"])
+        assert job.params["prompt"] == "伸懒腰"
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/videos -- model resolution errors
 # ---------------------------------------------------------------------------
 

@@ -27,6 +27,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
+from .prompt_extend import extend_video_prompt
 from .video_models import VideoCreateParams
 
 logger = logging.getLogger(__name__)
@@ -428,6 +429,35 @@ async def create_video(request: Request):
     normalized["pipeline"] = pipeline
     if src_job is not None:
         normalized["extend_source_id"] = src_job.id
+
+    # LLM prompt extension (Wan's --use_prompt_extend equivalent): expand a
+    # terse prompt into an explicit motion description server-side before
+    # dispatch -- the highest-leverage fix for weak instruction following.
+    # Runs here (not in the mflux-only worker venv) via the engine pool.
+    # Best-effort: any failure falls back to the original prompt.
+    extend_model = (getattr(video_settings, "prompt_extend_model", "") or "").strip()
+    want_extend = (
+        params.prompt_extend if params.prompt_extend is not None
+        else bool(extend_model)
+    )
+    if params.prompt_extend and not extend_model:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "prompt_extend requested but video.prompt_extend_model is not "
+                "configured"
+            ),
+        )
+    if want_extend and extend_model:
+        final_prompt, extended = await extend_video_prompt(
+            normalized["prompt"],
+            model_id=_resolve_model(extend_model),
+            engine_pool=pool,
+        )
+        if extended:
+            normalized["original_prompt"] = normalized["prompt"]
+            normalized["prompt"] = final_prompt
+            normalized["prompt_extended"] = True
 
     # SeedVR2 upscale stage: per-frame, runs in the worker after generation
     # (and after the stitch, for extends). Weights are a separate download;

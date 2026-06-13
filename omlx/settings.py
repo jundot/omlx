@@ -625,6 +625,11 @@ class VideoSettings:
     progress_stall_timeout_seconds: int = 600  # Kill when worker JSONL goes silent
     default_steps: int = 20
     default_fps: int = 16
+    # LLM prompt extension (Wan's --use_prompt_extend equivalent). Empty =
+    # off. Set to a chat-capable model id to expand terse prompts into rich
+    # motion descriptions server-side before dispatch -- the highest-leverage
+    # fix for weak instruction following. Use a small fast model.
+    prompt_extend_model: str = ""
     max_frames: int = 121  # UX bound; memory bound is the peak predictor
     max_steps: int = 50
     max_pixels_per_frame: int = 1280 * 720
@@ -658,6 +663,7 @@ class VideoSettings:
             "progress_stall_timeout_seconds": self.progress_stall_timeout_seconds,
             "default_steps": self.default_steps,
             "default_fps": self.default_fps,
+            "prompt_extend_model": self.prompt_extend_model,
             "max_frames": self.max_frames,
             "max_steps": self.max_steps,
             "max_pixels_per_frame": self.max_pixels_per_frame,
@@ -681,6 +687,7 @@ class VideoSettings:
             ),
             default_steps=int(data.get("default_steps", 20)),
             default_fps=int(data.get("default_fps", 16)),
+            prompt_extend_model=data.get("prompt_extend_model", ""),
             max_frames=int(data.get("max_frames", 121)),
             max_steps=int(data.get("max_steps", 50)),
             max_pixels_per_frame=int(data.get("max_pixels_per_frame", 1280 * 720)),
