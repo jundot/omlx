@@ -374,7 +374,7 @@
                                                             @click="copyWiredLimitCommand()"
                                                             :class="wiredLimitCopied ? 'text-green-500' : 'text-fg-tertiary hover:text-fg'"
                                                             class="transition-colors flex-shrink-0"
-                                                            :title="wiredLimitCopied ? 'Copied' : 'Copy'">
+                                                            :title="wiredLimitCopied ? window.t('settings.resource.copied_tooltip') : window.t('settings.resource.copy_tooltip')">
                                                         <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                                     </button>
                                                 </div>
@@ -832,41 +832,41 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Network</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
+                                    {{ t('settings.network.live_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTP Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.http_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.http_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.http_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTPS Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.https_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.https_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.https_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">No Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Comma-separated hosts to bypass proxy</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.no_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.no_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.no_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">CA Bundle</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Path to PEM file for corporate TLS interception</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.ca_bundle') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.ca_bundle_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.ca_bundle"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -1190,62 +1190,62 @@
                                             <!-- 3. Per-field chips (original colors, rounded-full shape) -->
                                             <template x-if="model.settings?.max_context_window">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                                                    ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
+                                                    {{ t('settings.models.badge.ctx_window') }} <span class="ml-1" x-text="model.settings.max_context_window"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tokens">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200">
-                                                    max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
+                                                    {{ t('settings.models.badge.max_tokens') }} <span class="ml-1" x-text="model.settings.max_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-orange-50 text-orange-700 border border-orange-200">
-                                                    temp: <span class="ml-1" x-text="model.settings.temperature"></span>
+                                                    {{ t('settings.models.badge.temp') }} <span class="ml-1" x-text="model.settings.temperature"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-green-50 text-green-700 border border-green-200">
-                                                    top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
+                                                    {{ t('settings.models.badge.top_p') }} <span class="ml-1" x-text="model.settings.top_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-purple-50 text-purple-700 border border-purple-200">
-                                                    top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
+                                                    {{ t('settings.models.badge.top_k') }} <span class="ml-1" x-text="model.settings.top_k"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-                                                    min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
+                                                    {{ t('settings.models.badge.min_p') }} <span class="ml-1" x-text="model.settings.min_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-pink-50 text-pink-700 border border-pink-200">
-                                                    rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
+                                                    {{ t('settings.models.badge.rep_penalty') }} <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
-                                                    presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
+                                                    {{ t('settings.models.badge.presence_penalty') }} <span class="ml-1" x-text="model.settings.presence_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-teal-50 text-teal-700 border border-teal-200">
-                                                    tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
+                                                    {{ t('settings.models.badge.tool_result_tokens') }} <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.reasoning_parser">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-violet-50 text-violet-700 border border-violet-200">
-                                                    reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
+                                                    {{ t('settings.models.badge.reasoning_parser') }} <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.enable_thinking === true">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-sky-50 text-sky-700 border border-sky-200">
-                                                    thinking
+                                                    {{ t('settings.models.badge.thinking') }}
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.force_sampling">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-red-50 text-red-700 border border-red-200">
-                                                    force_sampling
+                                                    {{ t('settings.models.badge.force_sampling') }}
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.chat_template_kwargs">

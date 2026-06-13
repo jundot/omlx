@@ -143,14 +143,14 @@
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5">
                                                         <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                                        <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                        <span class="text-xs text-blue-500 font-medium" x-text="window.t('status.active_models.loading') + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' ' + window.t('status.active_models.time_left') : '')"></span>
                                                     </div>
                                                 </template>
                                                 <!-- Prefilling -->
                                                 <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
                                                     <div class="flex items-center gap-1.5">
                                                         <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                                                        <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                                        <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' ' + window.t('status.active_models.pp') + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
                                                     </div>
                                                 </template>
                                                 <!-- Active (generation only) -->
@@ -164,7 +164,7 @@
                                                 <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests === 0">
                                                     <div class="flex items-center gap-1.5">
                                                         <span class="w-2 h-2 rounded-full bg-neutral-300"></span>
-                                                        <span class="text-xs text-neutral-400">idle</span>
+                                                        <span class="text-xs text-neutral-400" x-text="window.t('status.active_models.idle')"></span>
                                                     </div>
                                                 </template>
                                             </div>
@@ -197,10 +197,10 @@
                                                     <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
                                                     <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
-                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? window.t('status.active_models.draft_scored') + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? window.t('status.active_models.selected') + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
                                                     <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
                                                     <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
-                                                          x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                                          x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' ' + window.t('status.active_models.time_left') : '') + ')'"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -250,7 +250,7 @@
                                                     <span class="w-2 h-2 rounded-full bg-amber-300"></span>
                                                     <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
-                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="window.t('status.active_models.prompt_label') + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -279,12 +279,12 @@
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.runtime_cache.section_label') }}</span>
                             </div>
                             <div class="flex items-center gap-2">
                                 <!-- Memory gauge (only when hot cache is enabled AND models are loaded) -->
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
-                                    <span class="text-xs text-neutral-400">Memory</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.runtime_cache.memory_label') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeHotCachePercent + '%'"></div>
@@ -295,11 +295,11 @@
                                         <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
                                                 @click="showClearHotCacheConfirm = true"
                                                 class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
-                                                title="Clear memory cache">
+                                                :title="window.t('status.runtime_cache.clear_memory_cache_tooltip')">
                                             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                                         </button>
                                         <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
-                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <span class="text-xs text-red-600" x-text="window.t('status.runtime_cache.clear_memory_cache_confirm')"></span>
                                             <button @click="clearHotCache()"
                                                     class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
                                                 {{ t('status.clear_yes') }}
@@ -315,7 +315,7 @@
                                 <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
                                 <!-- SSD gauge (always visible) -->
                                 <div class="flex items-center gap-2">
-                                    <span class="text-xs text-neutral-400">SSD</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.runtime_cache.ssd_label') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
@@ -347,12 +347,12 @@
                         <div class="px-6 py-4 space-y-3">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                                 <div>
-                                    <div class="text-neutral-400 mb-1">Active base_path</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.active_base_path') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.base_path || '-' "></code>
                                 </div>
                                 <div>
-                                    <div class="text-neutral-400 mb-1">Effective ssd_cache_dir</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.effective_ssd_cache_dir') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.ssd_cache_dir || '-' "></code>
                                 </div>
@@ -360,7 +360,7 @@
 
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                                 <div>
-                                    <div class="text-neutral-400 mb-1">response-state directory</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.response_state_dir') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.response_state_dir || '-' "></code>
                                 </div>
@@ -372,22 +372,22 @@
                                  :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
                                  class="grid gap-3 border border-neutral-100 rounded-lg p-3">
                                 <div>
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Hit Rate</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_hit_rate') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
                                 </div>
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Hit Rate</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_hit_rate') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
                                 </div>
                                 <div>
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Evictions</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_evictions') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="(c.evictions || 0).toLocaleString()"></p>
                                 </div>
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Evictions</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_evictions') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
                                 </div>
@@ -398,14 +398,14 @@
                                 <table class="min-w-full text-xs">
                                     <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
                                         <tr>
-                                            <th class="px-3 py-2 text-left">Model</th>
-                                            <th class="px-3 py-2 text-right">Block Size</th>
-                                            <th class="px-3 py-2 text-right">Indexed Blocks</th>
-                                            <th class="px-3 py-2 text-right">Sub-block Cache</th>
-                                            <th class="px-3 py-2 text-right">SSD Files</th>
-                                            <th class="px-3 py-2 text-right">SSD Size</th>
-                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Entries</th>
-                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Size</th>
+                                            <th class="px-3 py-2 text-left">{{ t('status.runtime_cache.table.model') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.block_size') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.indexed_blocks') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.sub_block_cache') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.ssd_files') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.ssd_size') }}</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.memory_entries') }}</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">{{ t('status.runtime_cache.table.memory_size') }}</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-neutral-100 text-neutral-700">
@@ -435,7 +435,7 @@
                             </div>
 
                             <div class="text-[11px] text-neutral-500">
-                                Note: <span class="font-medium text-amber-600">Sub-block Cache</span> means requests below one full block (for example &lt;1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.
+                                {{ t('status.runtime_cache.note_label') }} <span class="font-medium text-amber-600">{{ t('status.runtime_cache.table.sub_block_cache') }}</span> {{ t('status.runtime_cache.note_body') }}
                             </div>
                         </div>
                     </div>
@@ -448,7 +448,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
                             </div>
                             <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">Host</label>
+                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host_label') }}</label>
                                 <select id="server-alias-select"
                                         x-model="selectedAlias"
                                         class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
@@ -710,10 +710,10 @@
                                 <select x-model="globalSettings.integrations.openclaw_tools_profile"
                                         @change="saveIntegrationSettings()"
                                         class="text-xs border border-neutral-200 rounded-md px-2 py-1 text-neutral-600 bg-white focus:outline-none focus:ring-1 focus:ring-neutral-300 flex-shrink-0">
-                                    <option value="minimal">Minimal</option>
-                                    <option value="coding">Coding</option>
-                                    <option value="messaging">Messaging</option>
-                                    <option value="full">Full</option>
+                                    <option value="minimal">{{ t('status.integrations.profile_minimal') }}</option>
+                                    <option value="coding">{{ t('status.integrations.profile_coding') }}</option>
+                                    <option value="messaging">{{ t('status.integrations.profile_messaging') }}</option>
+                                    <option value="full">{{ t('status.integrations.profile_full') }}</option>
                                 </select>
                                 <button x-data="{ copied: false }"
                                         @click="copyToClipboard(openclawCommand); copied = true; setTimeout(() => copied = false, 2000)"
@@ -786,7 +786,7 @@
                                         </template>
                                         <template x-if="!engine.commit">
                                             <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono"
-                                                  x-text="engine.version || 'unknown'"></code>
+                                                  x-text="engine.version || window.t('status.engines.unknown_version')"></code>
                                         </template>
                                     </div>
                                 </div>

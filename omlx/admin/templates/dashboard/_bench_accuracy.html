@@ -30,7 +30,7 @@
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('acc_bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
-                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
+                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : window.t('acc_bench.config.size_unknown')) + ')'"></option>
                                     </template>
                                 </select>
                             </div>
@@ -107,7 +107,7 @@
                                                             <template x-for="s in b.sizes" :key="s">
                                                                 <option :value="s" x-text="s"></option>
                                                             </template>
-                                                            <option value="0" x-text="'Full (' + b.fullSize.toLocaleString() + ')'"></option>
+                                                            <option value="0" x-text="window.t('acc_bench.config.sample_full') + ' (' + b.fullSize.toLocaleString() + ')'"></option>
                                                         </select>
                                                         <!-- Code exec warning badge -->
                                                         <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
@@ -179,7 +179,7 @@
                                 <div class="flex items-center gap-2">
                                     <span class="text-xs font-medium text-neutral-400 uppercase" x-text="accCurrentModel"></span>
                                     <span class="text-neutral-300">·</span>
-                                    <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || 'Preparing...'"></span>
+                                    <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || window.t('acc_bench.progress.preparing')"></span>
                                 </div>
                                 <div class="flex items-center gap-3">
                                     <span class="text-xs text-neutral-400" x-text="accProgress?.bench_current && accProgress?.bench_total ? (accProgress.bench_current + ' / ' + accProgress.bench_total) : ''"></span>
@@ -196,9 +196,9 @@
                                      :style="'width: ' + (accProgress?.bench_total ? (accProgress.bench_current / accProgress.bench_total * 100) : 0) + '%'"></div>
                             </div>
                             <div class="flex items-center gap-2 mt-2">
-                                <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? ('Running: ' + accProgress.benchmark.toUpperCase()) : ''"></span>
+                                <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? (window.t('acc_bench.progress.running_prefix') + accProgress.benchmark.toUpperCase()) : ''"></span>
                                 <span class="text-xs text-neutral-300">·</span>
-                                <span class="text-xs text-neutral-400" x-text="(accProgress?.current || 0) + ' / ' + (accProgress?.total || 0) + ' benchmarks'"></span>
+                                <span class="text-xs text-neutral-400" x-text="(accProgress?.current || 0) + ' / ' + (accProgress?.total || 0) + window.t('acc_bench.progress.benchmarks_suffix')"></span>
                             </div>
                         </div>
                     </div>
@@ -239,7 +239,7 @@
                                                     <span class="text-xs font-medium text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.thinking_badge') }}</span>
                                                 </template>
                                             </div>
-                                            <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + ' correct · ' + r.time_s + 's'"></span>
+                                            <span class="text-xs text-neutral-400" x-text="r.correct + ' / ' + r.total + window.t('acc_bench.results.correct_label') + r.time_s + 's'"></span>
                                         </div>
                                     </div>
                                     <div class="text-right">
@@ -318,7 +318,7 @@
                             <button @click="accCopyText()"
                                     class="absolute top-3 right-3 px-3 py-1.5 text-xs font-medium bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-all flex items-center gap-1.5">
                                 <i :data-lucide="accCopied ? 'check' : 'copy'" class="w-3.5 h-3.5"></i>
-                                <span x-text="accCopied ? 'Copied' : 'Copy'"></span>
+                                <span x-text="accCopied ? window.t('acc_bench.results.copied') : window.t('acc_bench.results.copy')"></span>
                             </button>
                         </div>
                     </div>

@@ -126,7 +126,7 @@
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                     <label class="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">{{ t('cluster.field.listen') }}</label>
-                    <input type="text" x-model="cluster.config.listen" placeholder="0.0.0.0:9000"
+                    <input type="text" x-model="cluster.config.listen" :placeholder="window.t('cluster.field.ph_listen')"
                            class="w-full px-3 py-2 text-sm border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg font-mono text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                 </div>
                 <div>
@@ -170,7 +170,7 @@
                         <div class="grid grid-cols-12 gap-2 items-center">
                             <input type="text" x-model="b.name" :placeholder="window.t('cluster.backend.ph_name')"
                                    class="col-span-2 px-2 py-1.5 text-xs border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
-                            <input type="text" x-model="b.base_url" placeholder="http://10.0.0.1:8000"
+                            <input type="text" x-model="b.base_url" :placeholder="window.t('cluster.backend.ph_base_url')"
                                    class="col-span-5 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
                             <input type="password" x-model="b.api_key" :placeholder="window.t('cluster.backend.ph_api_key')" autocomplete="new-password"
                                    class="col-span-3 px-2 py-1.5 text-xs font-mono border border-neutral-200 dark:border-neutral-700 dark:bg-neutral-800 rounded-lg focus:ring-1 focus:ring-neutral-900">
