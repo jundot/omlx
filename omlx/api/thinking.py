@@ -73,6 +73,22 @@ def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
         return None
 
 
+def _think_end_token_ids(tokenizer) -> list[int] | None:
+    think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
+    if think_end_id is not None:
+        return [think_end_id]
+
+    think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
+    encoded = _encode_prompt_ids(tokenizer, think_end_tag or _CLOSE_TAG)
+    if encoded:
+        return encoded
+
+    token_id = _convert_token_to_id(tokenizer, _CLOSE_TAG)
+    if token_id is not None:
+        return [token_id]
+    return None
+
+
 def prompt_opens_thinking(
     tokenizer,
     prompt: str,
@@ -116,11 +132,8 @@ def prompt_opens_thinking(
     after_start = last_tokens[last_idx + 1 :]
 
     if after_start:
-        think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
-        if think_end_id is None:
-            think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
-            think_end_id = _convert_token_to_id(tokenizer, think_end_tag or _CLOSE_TAG)
-        if think_end_id is not None and think_end_id in after_start:
+        think_end_ids = _think_end_token_ids(tokenizer)
+        if think_end_ids and think_end_ids[0] in after_start:
             return False, think_tag
 
     return True, think_tag

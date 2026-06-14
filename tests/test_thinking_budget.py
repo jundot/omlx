@@ -685,6 +685,30 @@ class TestCompletionsStreamThinkPrefixParity:
 
         assert (opens, tag) == (False, "<think>")
 
+    def test_prompt_detection_rejects_multi_token_disabled_thinking_pattern(self):
+        """Mirror the scheduler's encode(think_end) fallback: when the close
+        marker is multi-token, seeing its first token after <think> still means
+        the prompt disabled thinking."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end = "</think>"
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                return self.unk_token_id
+
+            def encode(self, prompt, add_special_tokens=False):
+                if prompt == self.think_end:
+                    return [42, 43]
+                return [41, 42]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "<think></think>")
+
+        assert (opens, tag) == (False, "<think>")
+
     def test_prompt_detection_rejects_text_suffix_when_think_id_is_unavailable(self):
         """If a tokenizer is present but cannot resolve the think-start id,
         mirror the scheduler and do not assume a synthetic opener exists."""
