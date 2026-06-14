@@ -380,7 +380,7 @@ class ThinkingBudgetProcessor:
     exceeded, forces the close-think token(s) one at a time, then becomes
     a no-op for the rest of generation.
 
-    Includes a soft budget zone over the last 50% of the token budget:
+    Includes a soft budget zone over the last 30% of the token budget:
     instead of a single hard cut, the close-think logit is progressively
     boosted relative to the model's own logit distribution, encouraging a
     natural stopping point before the hard force at 100%. Mirrors vLLM's
@@ -396,10 +396,10 @@ class ThinkingBudgetProcessor:
         soft_budget: Enable the progressive soft zone (default True).
     """
 
-    # Fraction of the budget where the soft zone begins (0.5 = last 50%).
-    # Tuned on local validation: an earlier zone closes thinking sooner at
-    # equal answer/recall quality, saving budget; see the PR for the sweep.
-    _SOFT_ZONE_START_FRAC = 0.5
+    # Fraction of the budget where the soft zone begins (0.7 = last 30%).
+    # Tuned on local validation: 0.7 stays closer to the requested budget while
+    # still avoiding abrupt hard-wall cuts; see the PR for the sweep.
+    _SOFT_ZONE_START_FRAC = 0.7
     # Multiplier on the measured gap; 2.0 makes the close-think logit
     # dominate at 50% of the zone, 1.0 only reaches the top at 100%.
     _SOFT_BIAS_FACTOR = 2.0

@@ -1000,16 +1000,16 @@ class TestSoftThinkingBudget:
 
     def test_soft_zone_policy_constants(self):
         """The zone boundaries are product choices, not incidental values:
-        the soft zone covers the last 50% of the budget, and FACTOR=2 makes
+        the soft zone covers the last 30% of the budget, and FACTOR=2 makes
         the close-think logit overtake the top halfway through the zone.
         Changing either changes when models stop thinking; update the PR
         narrative (and the vllm#38277 port) together with this test."""
-        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.5
+        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
         assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
 
     def test_degenerate_budgets_keep_the_hard_cut_contract(self):
         """Tiny budgets must degrade to the hard cut without a crash or a
-        dead zone: 0 and 1 force at the very first step, 2 has no usable
+        dead zone: 0 and 1 force at the very first step, 2 and 3 have no usable
         soft step before the wall."""
         for budget in (0, 1):
             proc = self._make_processor(budget=budget)
@@ -1018,23 +1018,27 @@ class TestSoftThinkingBudget:
             assert logits[0, self.THINK_END_ID].item() == 0.0
             assert logits[0, 0].item() == float("-inf")
 
-        proc = self._make_processor(budget=2)
-        logits = self._step(proc, 1, self._ramp_logits())
-        assert not proc._forcing
-        assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
-        self._step(proc, 2, self._ramp_logits())
-        assert proc._forcing
+        for budget in (2, 3):
+            proc = self._make_processor(budget=budget)
+            for step in range(1, budget):
+                logits = self._step(proc, step, self._ramp_logits())
+                assert not proc._forcing
+                assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
+            self._step(proc, budget, self._ramp_logits())
+            assert proc._forcing
 
-    def test_budget_three_gets_one_soft_step(self):
-        """budget=3 is the smallest budget with a live soft step: step 2
-        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 3
+    def test_budget_four_gets_one_soft_step(self):
+        """budget=4 is the smallest budget with a live soft step: step 3
+        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 4
         is the hard wall."""
-        proc = self._make_processor(budget=3)
+        proc = self._make_processor(budget=4)
         logits = self._step(proc, 1, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == 0.0
-        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
         logits = self._step(proc, 2, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
+        logits = self._step(proc, 3, _make_logits())
         assert not proc._forcing
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * 0.5)
-        self._step(proc, 3, _make_logits())
+        self._step(proc, 4, _make_logits())
         assert proc._forcing
