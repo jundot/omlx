@@ -821,10 +821,9 @@ class TestHermesIntegration:
         assert captured["binary"] == "hermes"
         assert captured["argv"] == [
             "hermes",
-            "--provider",
-            "omlx",
+            "chat",
             "--tui",
-            "--model",
+            "-m",
             "qwen3.5",
         ]
         assert "PYTHONHOME" not in captured["env"]
@@ -851,7 +850,7 @@ class TestHermesIntegration:
         ):
             hermes.launch(ctx(port=8000, api_key="", model=""))
 
-        assert captured["argv"] == ["hermes", "--provider", "omlx", "--tui"]
+        assert captured["argv"] == ["hermes", "chat", "--tui"]
 
     def test_type(self):
         hermes = HermesIntegration()
