@@ -521,6 +521,11 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
     samplers, lps = [], []
     for i, row in enumerate(rows):
         if row is not None:
+            if not drift:
+                if i >= len(cur_samplers):
+                    drift = row.sampler is not None
+                elif cur_samplers[i] is not row.sampler:
+                    drift = True
             if not drift and i < len(cur_lps) and cur_lps[i] is not row.logits_processors:
                 drift = _row_drifted(cur_lps[i], row.logits_processors)
             samplers.append(row.sampler)
@@ -582,7 +587,6 @@ def _patched_generation_batch_step(self):
         _log_drift_correction(self.uids, len(self.logits_processors))
     self.logits_processors = new_lps
     self.samplers = new_samplers
-
 
     result = _original_generation_batch_step(self)
 
@@ -3620,8 +3624,6 @@ class Scheduler:
         )
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
-
-        if uids:
             uid = uids[0]
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
@@ -7177,8 +7179,6 @@ class Scheduler:
             )
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
-
-            if uids:
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id

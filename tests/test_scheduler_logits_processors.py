@@ -689,6 +689,29 @@ class TestRowRealignment:
         finally:
             scheduler._uid_row_registry = original
 
+    def test_realigned_rows_reports_sampler_only_drift(self):
+        """A corrected sampler-only mismatch is still row-state drift."""
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        registry = OrderedDict()
+        original = scheduler._uid_row_registry
+        scheduler._uid_row_registry = registry
+        model = object()
+        expected_sampler = object()
+        wrong_sampler = object()
+        try:
+            scheduler._register_uid_rows(model, [1], [expected_sampler], [[]])
+            samplers, lps, drift = scheduler._realigned_rows(
+                model, [1], [wrong_sampler], [[]]
+            )
+            assert drift is True
+            assert samplers == [expected_sampler]
+            assert lps == [[]]
+        finally:
+            scheduler._uid_row_registry = original
+
     def test_model_scoped_clear_drops_only_that_model(self):
         """Reset/recovery/shutdown release by model: every row of the reset
         engine goes, every row of the other engine stays."""
