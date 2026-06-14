@@ -1789,6 +1789,40 @@ class TestParseGemma4ToolCallFallback:
         assert result["name"] == "search"
         assert result["arguments"] == {"query": "hello world"}
 
+    def test_unbalanced_open_brace_in_json_string(self):
+        """A lone ``{`` inside a JSON string must not unbalance the span
+        (#1854). Before the string-aware scan this drove brace depth above
+        zero so the span never closed and the whole call was dropped."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"content": "open { brace"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"content": "open { brace"}
+
+    def test_multi_call_with_brace_in_first_args(self):
+        """A ``}`` inside the first call's JSON string must not corrupt the
+        consumed-span bookkeeping that separates sibling calls (#1854).
+        Pre-fix the first span truncated early, so the second call's head
+        landed inside the supposed-consumed region."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"a": "x } y"}call:foo{"b": 1}'
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["name"] == "ns:create"
+        assert result[0]["arguments"] == {"a": "x } y"}
+        assert result[1]["name"] == "foo"
+        assert result[1]["arguments"] == {"b": 1}
+
+    def test_escaped_backslash_before_closing_quote(self):
+        """A value ending in an escaped backslash (Windows path) closes on
+        the following quote, not on the backslash-escaped one (#1854)."""
+        result = _parse_gemma4_tool_call_fallback(
+            r'call:ns:create{"path": "C:\\tmp\\"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"path": "C:\\tmp\\"}
+
     def test_empty_args(self):
         result = _parse_gemma4_tool_call_fallback("call:get_time{}")
         assert result["name"] == "get_time"
@@ -1880,6 +1914,52 @@ class TestParseToolCallsGemma4Integration:
         # Markers should be stripped from cleaned_text
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
+
+    def test_brace_in_json_string_survives_remap(self):
+        """A ``}`` inside a JSON double-quoted value must not truncate the
+        args span, even when the parse then remaps onto a registered tool
+        (#1854). Before the fix the span scanner stopped at the brace inside
+        the string, the legacy recovery produced a corrupted ``{"content":
+        "has }`` parse, and the suffix remap turned ``ns:create`` into an
+        executable ``create`` call carrying silently mangled arguments. The
+        full content must round-trip intact."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "has } brace"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        # Remap fired: ns:create -> registered create.
+        assert tool_calls[0].function.name == "create"
+        # ...and the brace inside the string did not corrupt the value.
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == "has } brace"
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_escaped_quote_in_json_string_does_not_close_early(self):
+        """An escaped ``\\"`` inside a JSON value must not be read as the
+        closing quote, so a following ``}`` stays string content (#1854)."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "a \\" } b"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "create"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == 'a " } b'
 
     def test_markers_stripped_on_total_failure(self, caplog):
         """Even when fallback fails, markers are stripped and warning is logged."""

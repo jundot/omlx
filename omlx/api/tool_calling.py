@@ -461,8 +461,9 @@ def _scan_gemma4_args_span(
     ``open_idx``, or -1 if no balanced span exists within bounds.
 
     Iterative single-pass walk that counts brace depth only OUTSIDE string
-    literals (``<|"|>``-paired strings and anchored single-quoted values), so
-    a brace inside string content cannot truncate or unbalance the span.
+    literals (``<|"|>``-paired strings, standard JSON double-quoted strings,
+    and anchored single-quoted values), so a brace inside string content
+    cannot truncate or unbalance the span.
     This deliberately replaces a recursive regex:
     - linear time: recursive alternation patterns degrade quadratically on
       unbalanced model output (measured ~590ms at 80KB), an injection-driven
@@ -489,6 +490,27 @@ def _scan_gemma4_args_span(
             last_sig = '"'
             continue
         ch = text[i]
+        if ch == '"':
+            # Standard JSON double-quoted string. The <|"|> delimiter is
+            # matched by the startswith branch above before we reach here, so
+            # a bare ``"`` is an ordinary JSON string open: skip to its closing
+            # unescaped quote so a ``}`` inside the value cannot truncate the
+            # span (#1854 — without this the suffix remap turned the corrupted
+            # parse into an executable call with silently mangled arguments).
+            # Honors ``\"`` and ``\\`` so an escaped quote never closes early.
+            j = i + 1
+            while j < limit:
+                if text[j] == "\\":
+                    j += 2  # escaped char is literal, never closes the string
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            else:
+                return -1  # unterminated string within bounds: drop cleanly
+            i = j + 1
+            last_sig = '"'
+            continue
         if ch == "'" and last_sig in ":,[":
             k = bisect.bisect_right(squote_closes, i)
             if k < len(squote_closes):
