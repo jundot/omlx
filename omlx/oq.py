@@ -1993,6 +1993,13 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
 
                 proxy = _Proxy()
                 proxy.config = model_config
+                # Nested-VLM sanitizes (e.g. MiniMax-M3 minimax_m3_vl) read
+                # self.language_model.args.{num_hidden_layers,num_local_experts}
+                # for MoE expert stacking; expose text_config so proxy-based
+                # discovery works without instantiating the full model.
+                _lm_proxy = type("_LMProxy", (), {})()
+                _lm_proxy.args = text_config
+                proxy.language_model = _lm_proxy
                 w = model_module.Model.sanitize(proxy, weights)
 
                 w = sanitize_weights(model_module.VisionModel, w, vision_config)
