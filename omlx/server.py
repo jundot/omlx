@@ -5529,7 +5529,11 @@ async def create_response(
                         messages = _inject_json_instruction(messages, json_instruction)
             else:
                 compiled_grammar = None
-        messages = _inject_thinking_budget_instruction(messages, thinking_budget)
+        messages = _inject_thinking_budget_instruction(
+            messages,
+            thinking_budget,
+            final_json=response_format is not None,
+        )
 
         # Merge MCP tools
         effective_tools = (

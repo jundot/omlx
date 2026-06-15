@@ -432,6 +432,11 @@ class ThinkingBudgetProcessor:
         # Invariant after construction; floored at 1 so tiny budgets cannot
         # divide by zero in the progress computation.
         self._soft_span = max(1, budget - self._soft_start - 1)
+        self._soft_ramp_start = self._soft_sigmoid(0.0)
+        self._soft_ramp_span = max(
+            self._soft_sigmoid(1.0) - self._soft_ramp_start,
+            1e-6,
+        )
 
         # State
         self._thinking_tokens: int = 0
@@ -511,17 +516,23 @@ class ThinkingBudgetProcessor:
         return logits
 
     @classmethod
-    def _normalized_soft_ramp(cls, progress: float) -> float:
+    def _soft_sigmoid(cls, progress: float) -> float:
+        return 1.0 / (
+            1.0
+            + math.exp(
+                -cls._SOFT_SIGMOID_SHARPNESS
+                * (progress - cls._SOFT_SIGMOID_CENTER)
+            )
+        )
+
+    def _normalized_soft_ramp(self, progress: float) -> float:
         """Map soft-zone progress [0, 1] to a late-rising sigmoid [0, 1]."""
         progress = min(max(progress, 0.0), 1.0)
-
-        def sigmoid(x: float) -> float:
-            return 1.0 / (1.0 + math.exp(-cls._SOFT_SIGMOID_SHARPNESS * x))
-
-        start = sigmoid(0.0 - cls._SOFT_SIGMOID_CENTER)
-        finish = sigmoid(1.0 - cls._SOFT_SIGMOID_CENTER)
-        value = sigmoid(progress - cls._SOFT_SIGMOID_CENTER)
-        return min(max((value - start) / (finish - start), 0.0), 1.0)
+        value = self._soft_sigmoid(progress)
+        return min(
+            max((value - self._soft_ramp_start) / self._soft_ramp_span, 0.0),
+            1.0,
+        )
 
     def _next_close_token_id(self) -> int:
         """The only close-marker token that is valid to sample next.
