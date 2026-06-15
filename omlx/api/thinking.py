@@ -402,10 +402,10 @@ class ThinkingBudgetProcessor:
     # Multiplier on the measured gap; 2.0 makes the close-think logit
     # dominate at 50% of the zone, 1.0 only reaches the top at 100%.
     _SOFT_BIAS_FACTOR = 2.0
-    # Only nudge the close-think token if it is already close to the model's
-    # preferred next token. Otherwise a very large gap would create a very
-    # large boost and behave like an early hard force.
-    _SOFT_BIAS_MAX_GAP = 5.0
+    # Only nudge the close-think token if it is within the observed useful
+    # gap range. Otherwise a very large gap would create a very large boost
+    # and behave like an early hard force.
+    _SOFT_BIAS_MAX_GAP = 30.0
     # Once eligible, allow a small push above the top logit, but cap it so
     # the soft zone remains a nudge instead of a deterministic force.
     _SOFT_BIAS_MAX_OVERSHOOT = 1.0

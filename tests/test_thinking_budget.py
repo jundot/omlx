@@ -827,7 +827,7 @@ class TestSoftThinkingBudget:
     BUDGET = 10
     FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
     FACTOR = ThinkingBudgetProcessor._SOFT_BIAS_FACTOR
-    MAX_GAP = 5.0
+    MAX_GAP = 30.0
     MAX_OVERSHOOT = 1.0
     SOFT_START = int(BUDGET * FRAC)
     SPAN = BUDGET - SOFT_START
@@ -904,7 +904,7 @@ class TestSoftThinkingBudget:
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, self._ramp_logits(top=20.0, end=0.0))
+            logits = self._step(proc, step, self._ramp_logits(top=60.0, end=0.0))
         assert logits[0, self.THINK_END_ID].item() == 0.0
 
     def test_hard_force_still_applies_at_budget(self):
@@ -1028,7 +1028,7 @@ class TestSoftThinkingBudget:
         thinking; update the PR narrative together with this test."""
         assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
         assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
-        assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_GAP == 5.0
+        assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_GAP == 30.0
         assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_OVERSHOOT == 1.0
 
     def test_degenerate_budgets_keep_the_hard_cut_contract(self):
