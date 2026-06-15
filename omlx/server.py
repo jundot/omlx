@@ -3609,7 +3609,7 @@ def _inject_thinking_budget_instruction(
     *,
     final_json: bool = False,
 ) -> list:
-    """Guide reasoning length in the prompt when a thinking budget is active."""
+    """Guide reasoning length with a cache-friendly tail system note."""
     if budget is None or budget <= 0:
         return list(messages)
     final_kind = "final JSON answer" if final_json else "final answer"
@@ -3617,7 +3617,7 @@ def _inject_thinking_budget_instruction(
         f"Think step by step and use fewer than {budget} reasoning tokens "
         f"before the {final_kind}."
     )
-    return _inject_json_instruction(messages, instruction)
+    return [*messages, {"role": "system", "content": instruction}]
 
 
 def _normalize_structured_outputs(

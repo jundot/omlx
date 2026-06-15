@@ -197,7 +197,7 @@ class TestInjectJsonInstructionEdgeCases:
 class TestInjectThinkingBudgetInstruction:
     """Tests for thinking-budget prompt guidance."""
 
-    def test_appends_budget_to_leading_system_message(self):
+    def test_appends_budget_as_tail_system_message(self):
         messages = [
             {"role": "system", "content": "You solve carefully."},
             {"role": "user", "content": "2+2?"},
@@ -205,28 +205,30 @@ class TestInjectThinkingBudgetInstruction:
 
         result = _inject_thinking_budget_instruction(messages, 100)
 
-        assert len(result) == 2
+        assert len(result) == 3
         assert result[0]["role"] == "system"
-        assert "You solve carefully." in result[0]["content"]
-        assert "fewer than 100 reasoning tokens" in result[0]["content"]
+        assert result[0]["content"] == "You solve carefully."
+        assert result[1]["role"] == "user"
+        assert result[2]["role"] == "system"
+        assert "fewer than 100 reasoning tokens" in result[2]["content"]
 
-    def test_prepends_system_message_when_missing(self):
+    def test_appends_system_message_when_missing(self):
         messages = [{"role": "user", "content": "2+2?"}]
 
         result = _inject_thinking_budget_instruction(messages, 50)
 
         assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert "fewer than 50 reasoning tokens" in result[0]["content"]
-        assert result[1]["role"] == "user"
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "system"
+        assert "fewer than 50 reasoning tokens" in result[1]["content"]
 
     def test_can_reference_final_json_answer(self):
         messages = [{"role": "user", "content": "2+2?"}]
 
         result = _inject_thinking_budget_instruction(messages, 50, final_json=True)
 
-        assert "fewer than 50 reasoning tokens" in result[0]["content"]
-        assert "final JSON answer" in result[0]["content"]
+        assert "fewer than 50 reasoning tokens" in result[1]["content"]
+        assert "final JSON answer" in result[1]["content"]
 
     def test_does_not_inject_for_zero_budget(self):
         messages = [{"role": "user", "content": "2+2?"}]
