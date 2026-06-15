@@ -898,13 +898,11 @@ class TestSoftThinkingBudget:
         """Expected close-think logit at a given think step."""
         if step <= self.SOFT_START:
             return end
-        if end < kth:
-            return end
+        topk_span = max(top - kth, 1e-6)
         progress = (step - self.SOFT_START) / max(1, self.SPAN)
         gap_to_top = max(top - end, 0.0)
-        topk_span = max(top - kth, 1e-6)
         normalized_gap = gap_to_top / topk_span
-        proximity = 1.0 / (1.0 + normalized_gap) ** 2
+        proximity = 1.0 / (1.0 + normalized_gap)
         ramp = min(self.FACTOR * progress * proximity, 1.0)
         return end + ramp * ((top + self.MAX_OVERSHOOT) - end)
 
@@ -937,13 +935,38 @@ class TestSoftThinkingBudget:
         assert logits[0, self.THINK_END_ID].item() > 5.0
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(6.0)
 
-    def test_soft_zone_does_not_boost_implausible_close_token(self):
-        """A close-think token outside the top-k set is not promoted."""
+    def test_soft_zone_boosts_close_token_just_below_topk(self):
+        """A close-think token just under the top-k set gets a small nudge."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._outside_topk_logits())
-        assert logits[0, self.THINK_END_ID].item() == 20.0
+        target = self._expected_end_logit(
+            self.BUDGET - 1,
+            top=40.0,
+            kth=24.5,
+            end=20.0,
+        )
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(target)
+
+    def test_soft_zone_far_below_topk_gets_weaker_boost(self):
+        """A far close token is still nudged, but less than a near-tail one."""
+        near_proc = self._make_processor()
+        far_proc = self._make_processor()
+        near_logits = far_logits = None
+        for step in range(1, self.BUDGET):
+            near_logits = self._step(near_proc, step, self._outside_topk_logits())
+            far_logits = self._step(
+                far_proc,
+                step,
+                self._outside_topk_logits(end=5.0),
+            )
+
+        far_boost = far_logits[0, self.THINK_END_ID].item() - 5.0
+        assert far_boost > 0.0
+        assert near_logits[0, self.THINK_END_ID].item() > far_logits[
+            0, self.THINK_END_ID
+        ].item()
 
     def test_soft_zone_prefers_near_top_close_token_over_topk_edge(self):
         """A close token near the top gets a stronger final rank than one at
@@ -1082,9 +1105,9 @@ class TestSoftThinkingBudget:
 
     def test_soft_zone_policy_constants(self):
         """The zone boundaries are product choices, not incidental values:
-        the soft zone covers the last 30% of the budget, only top-k close
-        tokens are eligible, and eligible tokens can only overtake the top by
-        a small margin. Changing these values changes when models stop
+        the soft zone covers the last 30% of the budget, top-k logits define
+        the local plausibility span, and the close token can only overtake the
+        top by a small margin. Changing these values changes when models stop
         thinking; update the PR narrative together with this test."""
         assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
         assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
