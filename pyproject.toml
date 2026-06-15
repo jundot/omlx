@@ -29,15 +29,15 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.31.2",
-    # mlx-lm from commit (39c4019, v0.31.3) - short-prompt think-token fix,
-    # Mellum support, and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
+    # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
+    # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
+    "transformers>=5.7.0",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -200,7 +200,7 @@ include = ["omlx*"]
 # mlx-lm is pinned to a git commit; override transitive pins
 # (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@39c4019f67402c6448eba0d789b5d834460046dd",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
 ]
 
 [tool.black]

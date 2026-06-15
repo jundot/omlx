@@ -73,11 +73,20 @@ class TestDiffusionStructuredOutputGuard:
             response_format={"type": "text"},
         )
 
-    def test_rejects_json_response_format(self):
-        with pytest.raises(InvalidRequestError, match="Structured response_format"):
+    def test_allows_json_response_format_degrades_to_prompt(self):
+        # response_format degrades to prompt-injected JSON (with the
+        # #1241 Warning header) instead of being rejected — the same
+        # fallback used when xgrammar is not installed.
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "json_object"},
+        )
+
+    def test_rejects_structured_outputs(self):
+        with pytest.raises(InvalidRequestError, match="structured_outputs"):
             _reject_diffusion_structured_outputs(
                 self._DiffusionEngine(),
-                response_format={"type": "json_object"},
+                structured_outputs={"json_schema": {"type": "object"}},
             )
 
     def test_rejects_guided_grammar(self):
@@ -357,7 +366,7 @@ class TestGetSamplingParams:
         assert rep_penalty == 1.3
 
     def test_force_sampling(self):
-        """Test force_sampling ignores request params."""
+        """Test force_sampling ignores sampling params but honors max_tokens."""
         self._state.sampling = SamplingDefaults(
             temperature=0.5, top_p=0.8, max_tokens=4096, force_sampling=True
         )
@@ -367,10 +376,10 @@ class TestGetSamplingParams:
         )
         assert temp == 0.5  # forced, not request
         assert top_p == 0.8  # forced, not request
-        assert max_tokens == 4096  # forced, not request
+        assert max_tokens == 8192  # output cap, not forced sampling
 
-    def test_force_sampling_model_max_tokens(self):
-        """Test force_sampling with model-level max_tokens overrides global."""
+    def test_force_sampling_request_max_tokens_overrides_model(self):
+        """Test request max_tokens wins over model settings in force mode."""
         import tempfile
         from pathlib import Path
 
@@ -383,7 +392,23 @@ class TestGetSamplingParams:
             _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
                 None, None, "test-model", req_max_tokens=1024
             )
-            assert max_tokens == 8192  # model setting wins in force mode
+            assert max_tokens == 1024  # request cap wins even in force mode
+
+    def test_force_sampling_without_request_uses_model_max_tokens(self):
+        """Test force_sampling falls back to model max_tokens when request omits it."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = ModelSettings(max_tokens=8192, force_sampling=True)
+            manager.set_settings("test-model", settings)
+            self._state.settings_manager = manager
+
+            _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
+                None, None, "test-model"
+            )
+            assert max_tokens == 8192  # model setting wins when request omits cap
 
     def test_max_tokens_no_request_uses_model_settings(self):
         """Test that model max_tokens is used when request doesn't specify it."""

@@ -118,6 +118,10 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            realign_rows = getattr(self, "_omlx_realign_rows", None)
+            if callable(realign_rows):
+                realign_rows()
+
             if _is_mtp_batch_eligible(self):
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
@@ -331,10 +335,9 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
         return False
-    if (
-        getattr(gen_batch, "_omlx_mtp_batch_state", None) is None
-        and not _batch_rows_aligned_for_mtp(gen_batch)
-    ):
+    if getattr(
+        gen_batch, "_omlx_mtp_batch_state", None
+    ) is None and not _batch_rows_aligned_for_mtp(gen_batch):
         return False
     return True
 

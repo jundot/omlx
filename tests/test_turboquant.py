@@ -3,16 +3,21 @@
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import KVCache
-
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
+    _build_codec,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
-    _build_codec,
     turboquant_enabled,
 )
 
-from omlx.turboquant_kv import BatchTurboQuantKVCache, _rebuild_codecs, _infer_head_dim
+from omlx.turboquant_kv import (
+    BatchTurboQuantKVCache,
+    _concat_state,
+    _concat_state_token_axis,
+    _infer_head_dim,
+    _rebuild_codecs,
+)
 
 pytestmark = pytest.mark.turboquant
 
@@ -351,6 +356,156 @@ def test_attention_patch_routes_tq():
     assert out.shape == (1, 4, 1, 32)
 
 
+def test_attention_patch_preserves_sinks_with_dequant_fallback(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+
+    apply_turboquant_attention_patch()
+
+    fp_cache = KVCache()
+    keys = mx.random.normal((1, 2, 8, 32))
+    values = mx.random.normal((1, 2, 8, 32))
+    fp_cache.update_and_fetch(keys, values)
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+
+    def fail_decode(*args, **kwargs):
+        raise AssertionError("sink fallback must not use TurboQuant decode kernel")
+
+    calls = {}
+    original_dequantize = TurboQuantKVCache.dequantize
+
+    def spy_dequantize(self, *args, **kwargs):
+        calls["dequant_kwargs"] = kwargs
+        return original_dequantize(self, *args, **kwargs)
+
+    def fake_sdpa(queries, keys, values, **kwargs):
+        calls["sdpa_sinks"] = kwargs.get("sinks")
+        calls["sdpa_key_shape"] = keys.shape
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(TurboQuantKVCache, "decode_attention", fail_decode)
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", fake_sdpa)
+
+    queries = mx.random.normal((1, 4, 1, 32))
+    sinks = mx.zeros((4,))
+    out = mlx_base.scaled_dot_product_attention(
+        queries,
+        ks,
+        vs,
+        tq,
+        scale=32**-0.5,
+        mask=None,
+        sinks=sinks,
+    )
+
+    assert out.shape == queries.shape
+    assert calls["dequant_kwargs"] == {"keys_state": ks, "values_state": vs}
+    assert calls["sdpa_sinks"] is sinks
+    assert calls["sdpa_key_shape"] == keys.shape
+
+
+def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    calls = []
+    prefill_calls = []
+
+    def fake_prefill_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        prefill_calls.append((keys_state, values_state))
+        return None
+
+    def fake_quantized_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        calls.append((keys_state, values_state, self.prefill_query_block_size))
+        assert self.prefill_key_chunk_size == 16384
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "prefill_attention",
+        fake_prefill_attention,
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "quantized_attention",
+        fake_quantized_attention,
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+
+    assert out.shape == queries.shape
+    assert prefill_calls == [(ks, vs)]
+    assert len(calls) == 1
+    assert calls[0][0] is ks
+    assert calls[0][1] is vs
+    assert calls[0][2] == 256
+
+
+def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    ks, vs = tq.state
+    calls = {"quantized": 0, "dequantize": 0}
+
+    def failing_quantized_attention(self, *args, **kwargs):
+        calls["quantized"] += 1
+        raise RuntimeError("forced quantized prefill failure")
+
+    original_dequantize = TurboQuantKVCache.dequantize
+
+    def spy_dequantize(self, *args, **kwargs):
+        calls["dequantize"] += 1
+        return original_dequantize(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "quantized_attention",
+        failing_quantized_attention,
+    )
+    monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=32**-0.5, mask=None
+    )
+    mx.eval(out)
+
+    assert out.shape == queries.shape
+    assert calls == {"quantized": 1, "dequantize": 1}
+
+
 # ---------------------------------------------------------------------------
 # Codec rebuild tests (SSD cache reconstruction, issue #577)
 # ---------------------------------------------------------------------------
@@ -409,13 +564,28 @@ def test_infer_head_dim():
     assert _infer_head_dim(ks, 4) == 128
 
 
+def test_concat_state_token_axis_mse_matches_pairwise_concat():
+    codec = _TurboQuantMSECodec(32, 4, seed=0)
+    first = codec.quantize(mx.random.normal((1, 2, 3, 32)))
+    second = codec.quantize(mx.random.normal((1, 2, 5, 32)))
+
+    got = _concat_state_token_axis([first, second])
+    expected = _concat_state(first, second)
+    mx.eval(got.norms, got.indices, expected.norms, expected.indices)
+
+    assert got.norms.shape == (1, 2, 8)
+    assert got.indices.shape == expected.indices.shape
+    assert mx.all(got.norms == expected.norms).item()
+    assert mx.all(got.indices == expected.indices).item()
+
+
 def test_ssd_type_map_completeness():
     """All TQ state types from turboquant_kv must be in SSD type_map."""
     from omlx.turboquant_kv import (
         TurboQuantMSEState,
-        TurboQuantProdState,
-        TurboQuantPolarState,
         TurboQuantPolarProdState,
+        TurboQuantPolarState,
+        TurboQuantProdState,
         TurboQuantSplitState,
     )
 
@@ -444,11 +614,11 @@ def test_ssd_type_map_completeness():
 
 
 def test_turboquant_eligible_gate():
-    """Only dense KVCache and state-array caches are batch-convertible.
+    """Hybrid cache layouts may convert KVCache layers and pass through others.
 
-    Chunked/rotating/quantized caches must gate OFF so chunked-attention
-    models (Llama-4) and sliding-window models stay fp16 instead of crashing
-    in _merge_caches() — the #771 SIGABRT class.
+    Rotating/sliding-window caches are not themselves TurboQuant-converted, but
+    they can coexist with converted full-attention KVCache layers. Chunked and
+    legacy QuantizedKVCache layouts still gate OFF.
     """
     from types import SimpleNamespace
 
@@ -464,21 +634,98 @@ def test_turboquant_eligible_gate():
     from omlx.scheduler import Scheduler
 
     # _turboquant_eligible consults the model for MLA architecture (#1613)
-    # before checking cache types; inject a non-MLA stub so this test isolates
-    # the cache-type gating it is exercising.
+    # and attention sinks before checking cache types; inject a compatible stub
+    # so this test isolates the cache-type gating it is exercising.
     def elig(cache):
-        stub = SimpleNamespace(_model_uses_mla=lambda: False)
+        stub = SimpleNamespace(
+            _model_uses_mla=lambda: False,
+            _model_uses_attention_sinks=lambda: False,
+        )
         return Scheduler._turboquant_eligible(stub, cache)
 
     assert elig([KVCache(), KVCache()]) is True
     assert elig([]) is False
     assert elig([KVCache(), ChunkedKVCache(8192)]) is False
-    assert elig([KVCache(), RotatingKVCache(32)]) is False
+    assert elig([KVCache(), RotatingKVCache(32)]) is True
     assert elig([QuantizedKVCache()]) is False
     assert elig([CacheList(KVCache(), KVCache())]) is True
     assert elig([ArraysCache(size=2), KVCache()]) is True
     assert elig([CacheList(ArraysCache(size=2), KVCache())]) is True
-    assert elig([CacheList(KVCache(), RotatingKVCache(32))]) is False
+    assert elig([CacheList(KVCache(), RotatingKVCache(32))]) is True
+
+
+def test_turboquant_convert_hybrid_cache_keeps_rotating_passthrough():
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from omlx.scheduler import Scheduler
+
+    first = KVCache()
+    first.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    rotating = RotatingKVCache(max_size=32)
+    rotating.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    last = KVCache()
+    last.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    mx.eval(first.state, rotating.state, last.state)
+
+    ns = SimpleNamespace(_turboquant_kv_bits=4.0, _turboquant_skip_last=True)
+    cache = [first, rotating, last]
+
+    Scheduler._apply_turboquant_kv_convert(ns, cache)
+
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert cache[1] is rotating
+    assert isinstance(cache[1], RotatingKVCache)
+    assert cache[2] is last
+    assert isinstance(cache[2], KVCache)
+
+
+def test_turboquant_convert_preserves_skip_last_after_partial_tq_restore():
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from omlx.scheduler import Scheduler
+
+    first_fp = KVCache()
+    first_fp.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    first_tq = TurboQuantKVCache.from_cache(first_fp, bits=4.0)
+    rotating = RotatingKVCache(max_size=32)
+    rotating.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    last = KVCache()
+    last.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    mx.eval(first_tq.keys, first_tq.values, rotating.state, last.state)
+
+    ns = SimpleNamespace(_turboquant_kv_bits=4.0, _turboquant_skip_last=True)
+    cache = [first_tq, rotating, last]
+
+    Scheduler._apply_turboquant_kv_convert(ns, cache)
+
+    assert cache[0] is first_tq
+    assert isinstance(cache[0], TurboQuantKVCache)
+    assert cache[1] is rotating
+    assert isinstance(cache[1], RotatingKVCache)
+    assert cache[2] is last
+    assert isinstance(cache[2], KVCache)
 
 
 def test_from_cache_merge_builds_working_batch():

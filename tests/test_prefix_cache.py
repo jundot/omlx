@@ -2363,7 +2363,7 @@ class TestTurboQuantFormatMismatchRecovery:
 
         assert result is not None
         assert len(result) == 1
-        assert isinstance(result[0], KVCache)
+        assert isinstance(result[0], TurboQuantKVCache)
         assert block_table.block_ids == [blocks[0].block_id]
         assert block_table.num_tokens == 4
         assert blocks[1].ref_count == 1
@@ -2507,7 +2507,7 @@ class TestTurboQuantFormatMismatchRecovery:
         assert result is not None
         assert len(result) == 2
         assert isinstance(result[0], SizedArraysCache)
-        assert isinstance(result[1], KVCache)
+        assert isinstance(result[1], TurboQuantKVCache)
         assert block_table.block_ids == [blocks[0].block_id, blocks[1].block_id]
         assert block_table.num_tokens == 8
         mock_ssd.forget_block.assert_not_called()

@@ -247,6 +247,7 @@ class TestVLMDiffusionLane:
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
     async def test_diffusion_preflight_rejects_tools(self):
+        """Tools rejected when no tool parser matched the chat template."""
         from omlx.exceptions import InvalidRequestError
 
         engine = _make_loaded_engine(model_type="diffusion_gemma")
@@ -257,6 +258,41 @@ class TestVLMDiffusionLane:
                 [{"role": "user", "content": "hi"}],
                 tools=[{"type": "function", "function": {"name": "lookup"}}],
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_preflight_allows_tools_with_parser(self):
+        """Tools accepted when the tokenizer has an injected tool parser."""
+        tokenizer = MockVLMTokenizer()
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = "<|tool_call>"
+        tokenizer.tool_call_end = "<tool_call|>"
+        tokenizer.tool_parser = lambda text, tools=None: {
+            "name": "lookup",
+            "arguments": "{}",
+        }
+
+        engine = _make_loaded_engine(
+            model_type="diffusion_gemma", tokenizer=tokenizer
+        )
+        engine._diffusion_family = "block"
+
+        assert engine.supports_tool_calling is True
+        # Must not raise
+        await engine.preflight_chat(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+        )
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_supports_tool_calling_false_without_parser(self):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        assert engine.supports_tool_calling is False
 
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"

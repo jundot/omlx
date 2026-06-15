@@ -14,6 +14,8 @@ count, else fall back to the top-level config.
 
 from unittest.mock import MagicMock
 
+import mlx.core as mx
+
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
     _SDPA_FULL_SUPPORTED_HEAD_DIMS,
@@ -313,6 +315,17 @@ class TestSetModelInfoTurboQuantDtype:
         sched = self._make_sched_with_config(_MLAConfig())
         sched._turboquant_kv_bits = 4.0
         sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["dtype_size"] == 2
+
+    def test_turboquant_attention_sink_model_uses_full_dtype(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.modules = lambda: [{"sinks": mx.zeros((8,))}]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = True
 
         sched._set_model_info_for_monitor()
 

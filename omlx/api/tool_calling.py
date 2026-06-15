@@ -427,10 +427,46 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
         except (json.JSONDecodeError, ValueError):
             return f": {json.dumps(value)}{suffix}"
 
+    # Keep the pre-step-5 text: if step 5 fails, its partial quoting has
+    # corrupted multi-line bare values and step 6 must start clean.
+    pre_quote_text = text
     text = regex.sub(
         r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
     )
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 6. Last resort: key-anchored value capture. Bare values that
+    # themselves contain commas, braces, or newlines (e.g. long markdown
+    # emitted into an ``answer:`` argument — observed live on the
+    # diffusion lane) defeat the per-pair regex in step 5. Anchor on the
+    # quoted keys produced by step 2 and treat everything between a
+    # key's colon and the next key (or the end) as that key's value.
+    # Operates on the pre-step-5 text so step 5's partial quoting cannot
+    # corrupt the captured values.
+    inner = pre_quote_text.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    key_pat = regex.compile(r'"([A-Za-z_]\w*)"\s*:')
+    key_matches = list(key_pat.finditer(inner))
+    if not key_matches:
+        return json.loads(text)  # re-raise original-style error
+    result: dict = {}
+    for i, km in enumerate(key_matches):
+        value_start = km.end()
+        value_end = (
+            key_matches[i + 1].start() if i + 1 < len(key_matches) else len(inner)
+        )
+        raw_value = inner[value_start:value_end].strip()
+        if i + 1 < len(key_matches):
+            raw_value = raw_value.rstrip().rstrip(",").rstrip()
+        try:
+            result[km.group(1)] = json.loads(raw_value)
+        except (json.JSONDecodeError, ValueError):
+            result[km.group(1)] = raw_value
+    return result
 
 
 def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
@@ -440,11 +476,18 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     Extends mlx-lm's parser to handle:
     - Bare string values without ``<|"|>`` delimiters
     - Colons / dots / hyphens in function names
+    - Degenerate prefixes from the diffusion lane's parallel denoising,
+      which can drop a token from the opening (observed live:
+      ``calldone{...}`` — missing colon — and ``:done{...}`` — missing
+      ``call``). The text is already marker-delimited (between
+      ``<|tool_call>`` and ``<tool_call|>``), so a permissive prefix
+      cannot misfire on ordinary prose.
     """
     import regex
 
     pattern = regex.compile(
-        r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
+        r"(?:call)?:?([\w.-]+(?::[\w.-]+)*)(\{(?:[^{}]|(?2))*\})",
+        regex.DOTALL,
     )
     matches = list(pattern.finditer(text))
     if not matches:

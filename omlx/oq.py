@@ -96,7 +96,7 @@ def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
 
 def _is_deepseek_v4_config(config: dict) -> bool:
     model_type = str(config.get("model_type", "")).lower()
-    if model_type == "deepseek_v4":
+    if model_type.startswith("deepseek_v4"):
         return True
 
     architectures = config.get("architectures") or []
@@ -564,7 +564,10 @@ def _build_quant_plan(
             expert_params += n
 
     current_bpw = _estimate_effective_bpw(
-        named_shapes, base_bits, base_group_size, base_mode,
+        named_shapes,
+        base_bits,
+        base_group_size,
+        base_mode,
         overrides=fixed_overrides,
     )
     total_bits_f = current_bpw * total_params
@@ -1445,9 +1448,7 @@ class _DiscoveredPlan:
             mx.clear_cache()
             return w_res, s_res
 
-        raise ValueError(
-            f"cannot materialize packed {key!r}: transform={transform}"
-        )
+        raise ValueError(f"cannot materialize packed {key!r}: transform={transform}")
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
@@ -2012,9 +2013,9 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
 
         # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
-        # ``_get_classes(config)`` for model_type=="deepseek_v4" succeeds.
+        # ``_get_classes(config)`` for deepseek_v4* model types succeeds.
         # No-op for other model types.
-        if config.get("model_type") == "deepseek_v4":
+        if str(config.get("model_type", "")).startswith("deepseek_v4"):
             try:
                 from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
 
@@ -2741,6 +2742,7 @@ def quantize_oq_streaming(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     auto_proxy_sensitivity: bool = True,
+    trust_remote_code: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -2772,6 +2774,8 @@ def quantize_oq_streaming(
             False, the quantization aborts on RAM-exceeding models with a
             RuntimeError so callers always get a real sensitivity-driven
             output. Ignored if sensitivity_model_path is set explicitly.
+        trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads and
+            conversion when a checkpoint requires custom model code.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -2851,10 +2855,11 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                trust_remote_code=trust_remote_code,
             )
         elif (
             not _model_exceeds_ram
-            and config.get("model_type") == "deepseek_v4"
+            and str(config.get("model_type", "")).startswith("deepseek_v4")
             and isinstance(config.get("quantization_config"), dict)
             and config["quantization_config"].get("quant_method") == "fp8"
         ):
@@ -2873,6 +2878,7 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                trust_remote_code=trust_remote_code,
             )
         elif _model_exceeds_ram and auto_proxy_sensitivity:
             logger.warning(
@@ -2888,6 +2894,7 @@ def quantize_oq_streaming(
                     model_path,
                     dtype=dtype,
                     working_dir=str(output.parent),
+                    trust_remote_code=trust_remote_code,
                 )
                 logger.info(
                     f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
@@ -2898,6 +2905,7 @@ def quantize_oq_streaming(
                     oq_level,
                     num_samples=128,
                     seq_length=256,
+                    trust_remote_code=trust_remote_code,
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -2928,6 +2936,7 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                trust_remote_code=trust_remote_code,
             )
 
     # Single enforcement point. Inner measurement helpers may return {} on
@@ -3071,9 +3080,7 @@ def quantize_oq_streaming(
             hasattr(all_weights, "pop_packed")
             and not (
                 text_only
-                and (
-                    _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
-                )
+                and (_is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name))
             )
             and not (not preserve_mtp and _is_mtp_tensor(tensor_name))
         ):
@@ -3153,9 +3160,7 @@ def quantize_oq_streaming(
                         per_layer_config[base] = layer_cfg
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(
-                            tensor_name, w_mx, target_dtype
-                        )
+                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
@@ -3701,7 +3706,7 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
     argument (hash expert routing indexes tid2eid with them). Everything
     else keeps the generic 3D inputs + causal masks + position ids.
     """
-    if getattr(model, "model_type", None) == "deepseek_v4":
+    if str(getattr(model, "model_type", "")).startswith("deepseek_v4"):
         args = model.args
         h = mx.broadcast_to(
             inputs[:, :, None, :],
@@ -3796,6 +3801,7 @@ def _measure_sensitivity(
     calib_dataset="code_multilingual",
     num_samples=32,
     seq_length=256,
+    trust_remote_code: bool = False,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
     from omlx.utils.model_loading import (
@@ -3846,14 +3852,22 @@ def _measure_sensitivity(
         if is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            model = vlm_load_model(Path(model_path), lazy=True)
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+            )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
             from mlx_lm import load as lm_load
 
-            model, tokenizer = lm_load(model_path, lazy=True)
+            model, tokenizer = lm_load(
+                model_path,
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+            )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
         return {}
@@ -3956,6 +3970,7 @@ def _measure_sensitivity_from_quantized_model(
     calib_dataset="code_multilingual",
     num_samples=32,
     seq_length=256,
+    trust_remote_code: bool = False,
 ):
     """Measure sensitivity via re-quantization on a quantized model.
 
@@ -3997,7 +4012,11 @@ def _measure_sensitivity_from_quantized_model(
         if _have_lm_patch:
             set_mtp_active(True)
         try:
-            model, tokenizer = lm_load(model_path, lazy=True)
+            model, tokenizer = lm_load(
+                model_path,
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+            )
         except Exception as e:
             logger.error(f"Sensitivity proxy load failed ({e})")
             return {}

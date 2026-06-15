@@ -681,6 +681,95 @@ class TestCompletionEndpoint:
         data = response.json()
         assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
 
+    def test_completion_forwards_thinking_budget(self, client, mock_llm_engine):
+        """Non-streaming /v1/completions must forward thinking_budget to the
+        engine. Regression for #1825: the field was absent from
+        CompletionRequest, so Pydantic dropped it and it never reached
+        generate()."""
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Explain why the sky is blue.",
+                "thinking_budget": 300,
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_llm_engine.generate.call_args.kwargs["thinking_budget"] == 300
+
+    def test_completion_streaming_forwards_thinking_budget(
+        self, client, mock_llm_engine
+    ):
+        """Streaming /v1/completions must forward thinking_budget to the
+        engine (companion to the non-streaming path; see #1825)."""
+        captured = {}
+
+        async def recording_stream_generate(prompt, **kwargs):
+            captured.update(kwargs)
+            yield MockGenerationOutput(text="Hi", new_text="Hi", finished=False)
+            yield MockGenerationOutput(
+                text="Hi there",
+                new_text=" there",
+                finished=True,
+                finish_reason="stop",
+            )
+
+        mock_llm_engine.stream_generate = recording_stream_generate
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Explain why the sky is blue.",
+                "stream": True,
+                "thinking_budget": 300,
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured.get("thinking_budget") == 300
+
+    def test_completion_thinking_budget_from_model_settings(
+        self, client, mock_llm_engine
+    ):
+        """A model-level thinking budget (admin settings) applies to
+        /v1/completions even when the request omits the parameter, matching
+        /v1/chat/completions."""
+        from omlx.model_settings import ModelSettings
+        from omlx.server import _server_state
+
+        class StubSettingsManager:
+            def get_settings(self, model_id):
+                return ModelSettings(
+                    thinking_budget_enabled=True,
+                    thinking_budget_tokens=256,
+                )
+
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+
+        original_settings_manager = _server_state.settings_manager
+        _server_state.settings_manager = StubSettingsManager()
+        try:
+            response = client.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "Explain why the sky is blue.",
+                },
+            )
+        finally:
+            _server_state.settings_manager = original_settings_manager
+
+        assert response.status_code == 200
+        assert mock_llm_engine.generate.call_args.kwargs["thinking_budget"] == 256
+
 
 class TestChatCompletionEndpoint:
     """Tests for the /v1/chat/completions endpoint."""

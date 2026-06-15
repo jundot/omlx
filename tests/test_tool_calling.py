@@ -1806,6 +1806,48 @@ class TestParseGemma4ToolCallFallback:
         with pytest.raises(ValueError):
             _parse_gemma4_tool_call_fallback("not a tool call")
 
+    def test_degenerate_prefix_missing_colon(self):
+        """Diffusion lane can drop the colon: ``calldone{...}``."""
+        result = _parse_gemma4_tool_call_fallback('calldone{answer: ok}')
+        assert result["name"] == "done"
+        assert result["arguments"] == {"answer": "ok"}
+
+    def test_degenerate_prefix_missing_call(self):
+        """Diffusion lane can drop ``call``: ``:done{...}``."""
+        result = _parse_gemma4_tool_call_fallback(':done{answer: ok}')
+        assert result["name"] == "done"
+        assert result["arguments"] == {"answer": "ok"}
+
+    def test_long_bare_value_with_commas_and_newlines(self):
+        """Key-anchored capture recovers markdown-laden bare values
+        (observed live: hindsight reflect ``done`` calls whose ``answer``
+        contains tables, commas, and newlines)."""
+        text = (
+            "calldone{answer:# Title\n\n"
+            "| A | B |\n| :--- | :--- |\n| x, y | z |\n"
+            ",directive_compliance:1. ok. 2. fine."
+            ",memory_ids:[mm-abc123]"
+            ",mental_model_ids:[]"
+            ",observation_ids:[]}"
+        )
+        result = _parse_gemma4_tool_call_fallback(text)
+        assert result["name"] == "done"
+        args = result["arguments"]
+        assert set(args.keys()) == {
+            "answer",
+            "directive_compliance",
+            "memory_ids",
+            "mental_model_ids",
+            "observation_ids",
+        }
+        assert args["answer"].startswith("# Title")
+        assert "x, y" in args["answer"]
+        assert args["observation_ids"] == []
+
+    def test_prose_without_braces_still_raises(self):
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback("just words, no payload")
+
 
 class TestParseToolCallsGemma4Integration:
     """Integration tests for parse_tool_calls() with Gemma 4 tokenizer."""

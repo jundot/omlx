@@ -6,7 +6,8 @@ Two surgical changes from PR 1192 are applied:
 1. Weight loading goes through ``_load_safetensors`` instead of ``mx.load`` so
    safetensors files declaring the F8_E8M0 dtype (used by DeepSeek V4 fp8
    block-scale tensors) can be reinterpreted as U8 in-place.
-2. The ``elif quant_method == "fp8" and model_type == "deepseek_v4"`` branch
+2. The ``elif quant_method == "fp8" and model_type.startswith("deepseek_v4")``
+   branch
    in the quantization config dispatch builds the per-layer quantization
    spec via ``deepseek_v4.make_quantization_config``.
 
@@ -108,6 +109,7 @@ def _build_patched_load_model() -> Callable:
         strict: bool = True,
         model_config: dict[str, Any] | None = None,
         get_model_classes: Callable = default_get_classes,
+        trust_remote_code: bool = False,
     ) -> tuple[nn.Module, dict]:
         config = _utils.load_config(model_path)
         if model_config is not None:
@@ -123,6 +125,12 @@ def _build_patched_load_model() -> Callable:
             weights.update(_load_safetensors(wf))  # PR 1192 change
 
         if (model_file := config.get("model_file")) is not None:
+            if not trust_remote_code:
+                raise ValueError(
+                    f"The model at {model_path} requires executing custom model "
+                    f"code ({model_file!r}). Pass trust_remote_code=True if you "
+                    "trust this model."
+                )
             spec = importlib.util.spec_from_file_location(
                 "custom_model",
                 model_path / model_file,
@@ -185,9 +193,8 @@ def _build_patched_load_model() -> Callable:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
                 _quantize(quantization)
-            elif (
-                quant_method == "fp8"
-                and config.get("model_type", None) == "deepseek_v4"
+            elif quant_method == "fp8" and str(config.get("model_type", "")).startswith(
+                "deepseek_v4"
             ):  # PR 1192 new branch
                 from mlx_lm.models.deepseek_v4 import make_quantization_config
 

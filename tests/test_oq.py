@@ -922,12 +922,8 @@ class TestLevelBudgetPlan:
         assert _LEVEL_BITS[2.5] == 2
         assert _LEVEL_BITS[2.7] == 2
 
-    @pytest.mark.parametrize(
-        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
-    )
-    def test_half_level_mandatory_expert_down_proj_boost(
-        self, oq_level, expected_bits
-    ):
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
+    def test_half_level_mandatory_expert_down_proj_boost(self, oq_level, expected_bits):
         """Fractional levels protect routed expert down_proj above base bits
         even with negligible sensitivity scores."""
         named_shapes = {
@@ -949,9 +945,7 @@ class TestLevelBudgetPlan:
         assert boost is not None
         assert boost["bits"] == expected_bits
 
-    @pytest.mark.parametrize(
-        "oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)]
-    )
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
     def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
         """The non-budget predicate floor mirrors the mandatory boost."""
         config = {
@@ -2256,8 +2250,7 @@ class TestEstimateBpwHeaderOnly:
         with_mtp = estimate_bpw_and_size(str(d), 8, preserve_mtp=True)
         # e_proj is MTP-protected -> full precision bf16 in the output.
         assert (
-            with_mtp["output_size_bytes"] - without["output_size_bytes"]
-            == 64 * 64 * 2
+            with_mtp["output_size_bytes"] - without["output_size_bytes"] == 64 * 64 * 2
         )
 
 
@@ -3020,6 +3013,19 @@ class TestMeasureSensitivityVlmMtp:
         assert mock_set_active.call_args_list[0] == ((True,),)
         assert mock_set_active.call_args_list[-1] == ((False,),)
 
+    def test_vlm_load_forwards_trust_remote_code(self, monkeypatch):
+        self._patch_common(monkeypatch, has_mtp=True)
+
+        _measure_sensitivity(
+            "/fake/vlm-mtp",
+            {"vision_config": {}},
+            6,
+            trust_remote_code=True,
+        )
+
+        load_model = sys.modules["mlx_vlm.utils"].load_model
+        assert load_model.call_args.kwargs["trust_remote_code"] is True
+
     @pytest.mark.parametrize("prev_active", [False, True])
     def test_mtp_active_restored_after_load(self, monkeypatch, prev_active):
         """The previous mtp_active state is restored once the load returns."""
@@ -3077,6 +3083,21 @@ class TestMeasureSensitivityVlmMtp:
         mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
         mock_set_active.assert_not_called()
+
+    def test_text_load_forwards_trust_remote_code(self, monkeypatch):
+        """Text sensitivity load forwards the mlx-lm custom-code opt-in."""
+        self._patch_common(monkeypatch, has_mtp=True)
+        mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
+
+        _measure_sensitivity(
+            "/fake/text",
+            {},
+            6,
+            trust_remote_code=True,
+        )
+
+        assert mock_load.call_args.kwargs["trust_remote_code"] is True
 
 
 # =============================================================================
@@ -3217,9 +3238,15 @@ class TestPrecomputedSensitivityMap:
         )
 
         out = tmp_path / "out"
-        quantize_oq_streaming(str(src), str(out), oq_level=4)
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            trust_remote_code=True,
+        )
 
         _oq._measure_sensitivity.assert_called_once()
+        assert _oq._measure_sensitivity.call_args.kwargs["trust_remote_code"] is True
 
     @pytest.mark.parametrize(
         ("content,expected_exc,expected_match"),
@@ -3313,9 +3340,9 @@ class TestQuantizeOqStreamingOq25:
                 "model.layers.0.mlp.switch_mlp.gate_proj.weight": np.random.randn(
                     8, h, h
                 ).astype(np.float32),
-                "model.layers.0.self_attn.q_proj.weight": np.random.randn(
-                    h, h
-                ).astype(np.float32),
+                "model.layers.0.self_attn.q_proj.weight": np.random.randn(h, h).astype(
+                    np.float32
+                ),
                 "model.layers.0.input_layernorm.weight": np.ones(h, dtype=np.float32),
             },
             str(src / "model.safetensors"),

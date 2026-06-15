@@ -211,14 +211,15 @@ private struct ClaudeSetupCommandSection: View {
 /// Claude Code section and each per-tool row in OtherIntegrationsSection.
 private struct CommandBlock: View {
     let command: String
+    var caption: String? = nil
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(String(localized: "integrations.command.terminal_caption",
-                            defaultValue: "$ Terminal",
-                            comment: "Caption above each shell command block"))
+                Text(caption ?? String(localized: "integrations.command.terminal_caption",
+                                       defaultValue: "$ Terminal",
+                                       comment: "Caption above each shell command block"))
                     .font(.omlxText(10, weight: .semibold))
                     .foregroundStyle(theme.textTertiary)
                     .textCase(.uppercase)
@@ -295,7 +296,14 @@ private struct OtherIntegrationsSection: View {
                     Task { await vm.save(.codexModel, client: client) }
                 }),
                 modelOptions: vm.modelOptions,
-                command: vm.codexCommand
+                command: vm.codexCommand,
+                commandLabel: String(localized: "integrations.codex.cli",
+                                     defaultValue: "CLI",
+                                     comment: "Label for the Codex CLI launcher command"),
+                secondaryCommand: vm.codexAppCommand,
+                secondaryCommandLabel: String(localized: "integrations.codex.app",
+                                             defaultValue: "Desktop App",
+                                             comment: "Label for the Codex desktop app launcher command")
             )
             IntegrationRow(
                 name: String(localized: "integrations.tool.opencode",
@@ -366,6 +374,9 @@ private struct IntegrationRow: View {
     let modelBinding: Binding<String>
     let modelOptions: [(String, String)]
     let command: String
+    var commandLabel: String? = nil
+    var secondaryCommand: String? = nil
+    var secondaryCommandLabel: String? = nil
     var profileBinding: Binding<String>? = nil
     var profileSublabel: String? = nil
     var isLast: Bool = false
@@ -421,7 +432,14 @@ private struct IntegrationRow: View {
                         )
                     }
                 }
-                CommandBlock(command: command)
+                if let secondaryCommand {
+                    VStack(alignment: .leading, spacing: 6) {
+                        CommandBlock(command: command, caption: commandLabel)
+                        CommandBlock(command: secondaryCommand, caption: secondaryCommandLabel)
+                    }
+                } else {
+                    CommandBlock(command: command, caption: commandLabel)
+                }
             }
         }
     }
@@ -584,6 +602,7 @@ final class IntegrationsScreenVM: ObservableObject {
     }
 
     var codexCommand: String    { "\(cliCommandPrefix) launch codex" }
+    var codexAppCommand: String { "\(cliCommandPrefix) launch codex_app" }
     var opencodeCommand: String { "\(cliCommandPrefix) launch opencode" }
     var openclawCommand: String {
         let profile = openclawToolsProfile.isEmpty ? "coding" : openclawToolsProfile

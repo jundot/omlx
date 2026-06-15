@@ -14,7 +14,7 @@ fake object so no model load or GPU is required.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -25,7 +25,7 @@ from omlx.memory_monitor import (
     MemoryMonitor,
 )
 from omlx.prefill_transient_tracker import PrefillTransientTracker
-from omlx.scheduler import Scheduler, _PrefillEvictionNeeded
+from omlx.scheduler import Scheduler, _PrefillEvictionNeeded, _PrefillState
 
 _GB = 1024**3
 
@@ -399,6 +399,84 @@ def test_predicted_transient_static_uses_candidate_chunk_size():
 def test_predicted_transient_zero_without_signals():
     ns = _throttle_ctx(current=0, hard=40 * _GB, samples_bpt=None, monitor=None)
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
+
+
+def test_record_chunk_transient_skips_tail_samples():
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=256,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    ns._record_chunk_transient(
+        64,
+        0,
+        32 * 1024**2,
+        request_id="req-tail",
+        loop_label="unit",
+    )
+    assert tracker.samples == 0
+
+    ns._record_chunk_transient(
+        256,
+        0,
+        32 * 1024**2,
+        request_id="req-full",
+        loop_label="unit",
+    )
+    assert tracker.samples == 1
+    assert tracker.last_delta_bytes == 32 * 1024**2
+
+
+def test_step_prefill_reclaims_before_first_guard():
+    events = []
+    request = SimpleNamespace(request_id="req-prefill")
+    state = _PrefillState(
+        request=request,
+        cache=[],
+        tokens_remaining=sched_mod.mx.array([[1, 2, 3]]),
+        last_token=[4],
+        tokens_processed=0,
+        base_size=0,
+        emitted_boundaries={},
+        boundary_enabled=False,
+        block_size=0,
+        total_length=4,
+    )
+    ns = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2, model_name=""),
+        _stream="stream",
+        _memory_limit_bytes=0,
+        model=lambda *args, **kwargs: events.append("model"),
+        _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
+        _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
+        _record_chunk_transient=MagicMock(),
+    )
+    ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
+
+    with (
+        patch.object(
+            sched_mod,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: events.append("sync"),
+        ),
+        patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
+        patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+    ):
+        done = ns._step_prefill_chunk(state)
+
+    assert done is False
+    assert events[:3] == ["sync", "adaptive", "guard"]
+    ns._record_chunk_transient.assert_called_once_with(
+        2,
+        100,
+        300,
+        request_id="req-prefill",
+        loop_label="chunked_step",
+    )
 
 
 # --------------------------------------------------------------------------

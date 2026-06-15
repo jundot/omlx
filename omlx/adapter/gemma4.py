@@ -74,6 +74,7 @@ def extract_gemma4_messages(
     messages: list[Any],
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
 ) -> list[dict]:
     """Convert OpenAI-format messages to Gemma 4 chat-template format.
 
@@ -100,6 +101,10 @@ def extract_gemma4_messages(
         max_tool_result_tokens: Maximum token count for tool results
             (truncation applied when tokenizer is provided).
         tokenizer: Tokenizer for optional truncation.
+        consolidate_system_messages: When True, preserve the legacy behavior
+            of moving all system/developer messages to the leading system
+            prompt. Server routes pass False and defer that decision until the
+            model chat template can be probed.
 
     Returns:
         List of dicts ready for ``tokenizer.apply_chat_template``.
@@ -280,9 +285,11 @@ def extract_gemma4_messages(
         _merge_consecutive_roles,
     )
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed))
-    )
+    cleaned = processed
+    if consolidate_system_messages:
+        cleaned = _consolidate_system_messages(cleaned)
+    cleaned = _drop_void_assistant_messages(cleaned)
+    return _merge_consecutive_roles(cleaned)
 
 
 def _matching_prefix_len(text: str, marker: str) -> int:
@@ -301,6 +308,7 @@ class Gemma4OutputParserSession:
         self._tokenizer = tokenizer
         self._buffer = ""
         self._in_thought = False
+        self._text_mode = False
 
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
@@ -449,9 +457,24 @@ class Gemma4OutputParserSession:
             text = self._tokenizer.decode([token_id])
         return self._consume_text(text)
 
+    def process_text(self, text: str) -> OutputParserTokenResult:
+        """Process an already-detokenized text segment.
+
+        Engines that emit text segments instead of token ids (the serial
+        diffusion lane detokenizes inside ``stream_diffusion_generate``)
+        feed their output through this entry point so protocol markers
+        are handled identically to the token-id path.  Switches the
+        session to text mode so ``finalize`` does not flush the unused
+        token detokenizer.
+        """
+        self._text_mode = True
+        if not text:
+            return OutputParserTokenResult(stream_text="", visible_text="")
+        return self._consume_text(text)
+
     def finalize(self) -> OutputParserFinalizeResult:
         text = ""
-        if self._detokenizer is not None:
+        if self._detokenizer is not None and not self._text_mode:
             self._detokenizer.finalize()
             text = self._detokenizer.last_segment
 

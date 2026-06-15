@@ -266,6 +266,7 @@ class BatchedEngine(BaseEngine):
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self._trust_remote_code,
             )
 
         loop = asyncio.get_running_loop()
@@ -360,7 +361,15 @@ class BatchedEngine(BaseEngine):
                             pass
                         set_mtp_active(False)
                         try:
-                            draft_model, _ = load(specprefill_draft)
+                            draft_tokenizer_config = get_tokenizer_config(
+                                specprefill_draft,
+                                trust_remote_code=self._trust_remote_code,
+                            )
+                            draft_model, _ = load(
+                                specprefill_draft,
+                                tokenizer_config=draft_tokenizer_config,
+                                trust_remote_code=self._trust_remote_code,
+                            )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
                             # mx.eval(model.parameters()) and leaves siblings

@@ -107,6 +107,7 @@ class MLXLanguageModel:
                 self.model, self.tokenizer = load(
                     self.model_name,
                     tokenizer_config=tokenizer_config,
+                    trust_remote_code=self.trust_remote_code,
                 )
 
             self._loaded = True

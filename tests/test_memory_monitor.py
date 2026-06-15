@@ -335,7 +335,42 @@ class TestEstimatePrefillPeakBytes:
         expected_sdpa = self._expected_fallback_sdpa(8, 2048, 32768, 256)
         expected_kv = m.estimate_prompt_kv_bytes(32768)
         assert peak == expected_sdpa + expected_kv
-        assert expected_sdpa > 8 * 2048 * 256 * 4
+        assert expected_sdpa > 8 * 2048 * 256 * 2
+
+    def test_sdpa_fallback_scores_track_compute_dtype(self):
+        # The unfused score matrix is materialized at the model's compute
+        # dtype, not fp32 and not the (possibly fractional TurboQuant) KV width.
+        # fp32 model -> 4 bytes/elem; bf16/fp16 -> 2.
+        def _scores(monitor, n_q, chunk, kv, hd):
+            out = n_q * chunk * hd * 4
+            return monitor._estimate_sdpa_activation_bytes(chunk, kv) - out
+
+        n_q, chunk, kv, hd = 8, 2048, 32768, 256
+        m_bf16 = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
+        m_bf16.set_model_info(
+            num_layers=48, num_kv_heads=4, head_dim=hd,
+            num_attention_heads=n_q, compute_dtype_size=2,
+        )
+        m_fp32 = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
+        m_fp32.set_model_info(
+            num_layers=48, num_kv_heads=4, head_dim=hd,
+            num_attention_heads=n_q, compute_dtype_size=4,
+        )
+        assert _scores(m_bf16, n_q, chunk, kv, hd) == n_q * chunk * kv * 2
+        assert _scores(m_fp32, n_q, chunk, kv, hd) == n_q * chunk * kv * 4
+
+    def test_sdpa_score_dtype_ignores_fractional_kv_width(self):
+        # TurboQuant sets a fractional KV dtype_size; the score matrix must
+        # still be charged at the compute dtype, not ~0.5 bytes/elem.
+        n_q, chunk, kv, hd = 8, 2048, 32768, 256
+        m = MemoryMonitor(max_kv_cache_memory=10 * 1024**3)
+        m.set_model_info(
+            num_layers=48, num_kv_heads=4, head_dim=hd, dtype_size=0.5,
+            num_attention_heads=n_q, compute_dtype_size=2,
+        )
+        out = n_q * chunk * hd * 4
+        scores = m._estimate_sdpa_activation_bytes(chunk, kv) - out
+        assert scores == n_q * chunk * kv * 2
 
     def test_sdpa_fallback_accounts_for_cached_kv_span(self):
         """Regression for M3: SDPA fallback spans the FULL prompt (cached + new),

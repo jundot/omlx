@@ -19,13 +19,13 @@ import logging
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -408,6 +408,165 @@ class _PrefillState:
 # After _original_step returns, self._next_tokens holds the freshly sampled
 # tokens.  We eval them synchronously and accept in grammar processors.
 # ---------------------------------------------------------------------------
+# Authoritative per-uid row state for the generation batch.
+#
+# mlx-lm keeps ``samplers`` / ``logits_processors`` as positional lists that
+# must stay aligned with ``uids``.  Heterogeneous continuous batching
+# (extend/filter/split across prompt and generation batches) can leave stale
+# or offset row slots behind; #1799 made the step crash-safe by normalising
+# ``None`` slots, but a misaligned row silently runs the WRONG sampler and
+# logits processors (e.g. a grammar/thinking-budget request decoding with no
+# constraints at all).  The registry below records, at insert time, what each
+# uid is supposed to run; the step chokepoint realigns the positional lists
+# from it.  Bounded so a missing cleanup can never grow it unbounded.
+class _RegisteredRow(NamedTuple):
+    """What a uid is supposed to run, recorded at request insert."""
+
+    sampler: Any
+    logits_processors: list
+
+
+_UID_ROW_REGISTRY_MAX = 4096
+# Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
+# instance starting at 0, so two engines serving concurrently (or an engine
+# reload) produce colliding uid sequences. The model object is the one
+# identity both the insert sites and the step chokepoint can see.
+_uid_row_registry: "OrderedDict[tuple[int, int], _RegisteredRow]" = OrderedDict()
+# Engines run on separate executor threads and share this module-level
+# registry; a plain OrderedDict is not safe under concurrent mutation.
+_uid_row_registry_lock = threading.Lock()
+# Drift corrections are worth one log line each, but a pathological batching
+# pattern could correct on every merge; cap the WARNING rate and route the
+# rest to DEBUG so the signal survives without flooding the logs.
+_UID_ROW_DRIFT_WARNING_INTERVAL_S = 60.0
+_uid_row_drift_last_warning = float("-inf")
+
+
+def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
+    """Record the sampler and logits processors each freshly-inserted uid must run.
+
+    Each (model, uid) key is inserted exactly once per request, so plain
+    insertion order is enough for the oldest-first backstop eviction.
+    """
+    with _uid_row_registry_lock:
+        for uid, sampler, lps in zip(uids, samplers, lps_rows):
+            _uid_row_registry[(id(model), uid)] = _RegisteredRow(
+                sampler, list(lps or ())
+            )
+        while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
+            _uid_row_registry.popitem(last=False)
+
+
+def _unregister_uid_row(model, uid) -> None:
+    """Drop a finished request's row so heavy processors are not pinned
+    until FIFO eviction; the bounded size stays as the backstop."""
+    with _uid_row_registry_lock:
+        _uid_row_registry.pop((id(model), uid), None)
+
+
+def _unregister_uid_rows_for_model(model) -> None:
+    """Drop every registry row for a model (generator reset, recovery, shutdown).
+
+    The recovery and reset paths clear the uid maps wholesale instead of
+    finishing requests one by one; releasing by model covers them, and leaves
+    nothing behind that a later engine load could match if ``id(model)`` were
+    recycled.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        for key in [key for key in _uid_row_registry if key[0] == model_id]:
+            del _uid_row_registry[key]
+
+
+def _row_drifted(current_lps, expected_lps) -> bool:
+    """True when a slot's processors genuinely differ from the registered row.
+
+    Two distinct empty lists are equivalent — the #1799 normalisation mints
+    fresh ``[]`` objects every step — so only differing content counts. The
+    caller's identity check is the steady-state fast path; this only runs
+    past it.
+    """
+    if not current_lps and not expected_lps:
+        return False
+    return current_lps != expected_lps
+
+
+def _log_drift_correction(uids, slot_count) -> None:
+    """Log a corrected drift: one WARNING per window, the rest at DEBUG."""
+    global _uid_row_drift_last_warning
+    now = time.monotonic()
+    rate_limited = now - _uid_row_drift_last_warning < _UID_ROW_DRIFT_WARNING_INTERVAL_S
+    if not rate_limited:
+        _uid_row_drift_last_warning = now
+    (logger.debug if rate_limited else logger.warning)(
+        "Realigned generation-batch row state from the uid registry "
+        f"(uids={list(uids)}, had {slot_count} processor slots); "
+        "stale or offset slots would have run the wrong sampler/processors."
+    )
+
+
+def _realigned_rows(model, uids, cur_samplers, cur_lps):
+    """Rebuild the positional row lists in uid order from the registry.
+
+    Registered uids take their recorded row; unregistered uids keep their
+    current slot (the #1799 fallback), padding when the lists are shorter
+    than ``uids``. Returns ``(samplers, logits_processors, drift)`` — drift
+    only drives logging, the rebuilt lists are always installed. In steady
+    state the slots already are the registry lists, so the identity check
+    skips any comparison work.
+    """
+    model_id = id(model)
+    with _uid_row_registry_lock:
+        rows = [_uid_row_registry.get((model_id, uid)) for uid in uids]
+
+    drift = len(cur_lps) != len(uids)
+    samplers, lps = [], []
+    for i, row in enumerate(rows):
+        if row is not None:
+            if not drift:
+                if i >= len(cur_samplers):
+                    drift = row.sampler is not None
+                elif cur_samplers[i] is not row.sampler:
+                    drift = True
+            if (
+                not drift
+                and i < len(cur_lps)
+                and cur_lps[i] is not row.logits_processors
+            ):
+                drift = _row_drifted(cur_lps[i], row.logits_processors)
+            samplers.append(row.sampler)
+            lps.append(row.logits_processors)
+        else:
+            samplers.append(cur_samplers[i] if i < len(cur_samplers) else None)
+            lps.append(cur_lps[i] if i < len(cur_lps) else [])
+    return samplers, lps, drift
+
+
+def _omlx_realign_generation_batch_rows(self) -> None:
+    """Realign positional row state with ``uids`` before any decode path reads it."""
+    if self.logits_processors is None:
+        self.logits_processors = []
+    else:
+        self.logits_processors = [
+            procs if procs is not None else [] for procs in self.logits_processors
+        ]
+
+    uids = getattr(self, "uids", None) or []
+    if not uids:
+        return
+
+    new_samplers, new_lps, drift = _realigned_rows(
+        getattr(self, "model", None),
+        uids,
+        getattr(self, "samplers", None) or [],
+        self.logits_processors,
+    )
+    if drift:
+        _log_drift_correction(uids, len(self.logits_processors))
+    self.logits_processors = new_lps
+    self.samplers = new_samplers
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -439,12 +598,7 @@ def _patched_generation_batch_step(self):
     # that is serving a structured json_schema request).  Per-row normalisation
     # at this chokepoint is the only place that covers both insert and merge.
     # See #934 / #1747.
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
+    _omlx_realign_generation_batch_rows(self)
 
     result = _original_generation_batch_step(self)
 
@@ -470,8 +624,48 @@ def _patched_generation_batch_step(self):
     return result
 
 
+GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
 
+
+# ---------------------------------------------------------------------------
+# Monkey-patch GenerationBatch.filter to keep logits_processors aligned with
+# uids.  mlx-lm's filter only reindexes the processor list when at least one
+# row has an active processor:
+#
+#     if any(self.logits_processors):
+#         self.logits_processors = [self.logits_processors[idx] for idx in keep]
+#
+# There is no else branch (unlike the prompt-batch class, which resets to
+# ``[[]] * len(keep)``), so when every slot is empty — the normal state after
+# serving requests without per-request processors — the stale list survives
+# while uids/tokens shrink.  A later extend() then appends the next request's
+# processors BEHIND its own row index: the row reads a leftover empty slot and
+# the real processor (thinking budget, grammar constraint) is silently never
+# applied.  Which requests are affected depends on insertion/removal order,
+# and alignment self-heals once the broken request finishes, so the symptom
+# is an intermittently ignored thinking_budget or grammar.  See #934/#1747
+# for the sibling None-slot collapse handled in _patched_generation_batch_step.
+_original_generation_batch_filter = GenerationBatch.filter
+
+
+def _patched_generation_batch_filter(self, keep):
+    lps = self.logits_processors
+    lps_inert = not lps or not any(lps)
+    if lps is None:
+        # ``any(None)`` inside the original filter raises TypeError.
+        self.logits_processors = []
+    _original_generation_batch_filter(self, keep)
+    if lps_inert:
+        # Original filter skipped the reindex; reset to one empty slot per
+        # surviving row so extend() appends at the correct indices.
+        self.logits_processors = [[] for _ in keep]
+
+
+GenerationBatch.filter = _patched_generation_batch_filter
+
+
+_TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
 
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
 try:
@@ -479,6 +673,7 @@ try:
 
     from .turboquant_kv import BatchTurboQuantKVCache as _BTQCache
 
+    _TQ_SINGLETON_CACHE_TYPE = _TQCache
     if not hasattr(_TQCache, "merge"):
         _TQCache.merge = _BTQCache.merge
 except ImportError:
@@ -541,6 +736,27 @@ def _regular_cache_extend_singleton(self, other):
     )
 
 
+def _turboquant_filter_singleton(self, batch_indices):
+    n = _batch_indices_len(batch_indices)
+    if n == 0:
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if hasattr(self, "_shadow_keys"):
+            self._shadow_keys = None
+        if hasattr(self, "_shadow_values"):
+            self._shadow_values = None
+        return
+    if n == 1:
+        return
+    raise NotImplementedError(
+        f"{type(self).__name__}.filter only supports singleton pass-through; "
+        "convert to a batched cache before keeping multiple rows."
+    )
+
+
 if not hasattr(_MLXKVCache, "filter"):
     _MLXKVCache.filter = _regular_kv_filter_singleton
 if not hasattr(_MLXKVCache, "extract"):
@@ -554,6 +770,14 @@ if not hasattr(_MLXRotatingKVCache, "extract"):
     _MLXRotatingKVCache.extract = _regular_cache_extract_singleton
 if not hasattr(_MLXRotatingKVCache, "extend"):
     _MLXRotatingKVCache.extend = _regular_cache_extend_singleton
+
+if _TQ_SINGLETON_CACHE_TYPE is not None:
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "filter"):
+        _TQ_SINGLETON_CACHE_TYPE.filter = _turboquant_filter_singleton
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extract"):
+        _TQ_SINGLETON_CACHE_TYPE.extract = _regular_cache_extract_singleton
+    if not hasattr(_TQ_SINGLETON_CACHE_TYPE, "extend"):
+        _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
@@ -576,6 +800,11 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
             return cache_obj
         return type(cache_obj)(*converted)
     if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
+        return cache_obj.merge([cache_obj])
+    if (
+        _TQ_SINGLETON_CACHE_TYPE is not None
+        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+    ):
         return cache_obj.merge([cache_obj])
     return cache_obj
 
@@ -798,6 +1027,23 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "ChunkedKVCache",
     }
 )
+
+
+_TURBOQUANT_KV_CACHE_TYPES = frozenset(
+    {
+        "TurboQuantKVCache",
+        "BatchTurboQuantKVCache",
+    }
+)
+
+
+def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
+    return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
+
+
+def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
+    """Cache layer counted by TurboQuant's skip-last full-attention rule."""
+    return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
 
 
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
@@ -1238,6 +1484,8 @@ class Scheduler:
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
+        self._memory_admission_blocked_request_id: str | None = None
+        self._memory_admission_blocked_since: float = 0.0
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -1597,6 +1845,7 @@ class Scheduler:
         extra_keys: tuple[Any, ...] | None,
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+        hot_cache_write_back: bool = True,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -1641,16 +1890,29 @@ class Scheduler:
             with _mx_buffer_access_lock:
                 with self._phase_timer("store_cache_worker_sync"):
                     _safe_sync_stream(self._stream)
-                block_table = self.block_aware_cache.store_cache(
-                    request_id,
-                    token_sequence_to_store,
-                    cache_to_store,
-                    model_cache_config=model_cache_config,
-                    boundary_snapshots=intermediate_snapshots,
-                    extra_keys=extra_keys,
-                    extra_key_token_start=extra_key_token_start,
-                    extra_key_ranges=extra_key_ranges,
-                )
+                if hot_cache_write_back:
+                    block_table = self.block_aware_cache.store_cache(
+                        request_id,
+                        token_sequence_to_store,
+                        cache_to_store,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=intermediate_snapshots,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                    )
+                else:
+                    block_table = self.block_aware_cache.store_cache(
+                        request_id,
+                        token_sequence_to_store,
+                        cache_to_store,
+                        model_cache_config=model_cache_config,
+                        boundary_snapshots=intermediate_snapshots,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                        hot_cache_write_back=False,
+                    )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -1705,6 +1967,7 @@ class Scheduler:
                         e,
                     )
                 # Cleanup uid maps now that the slot is reclaimable.
+                _unregister_uid_row(self.model, uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 if request_id in self.request_id_to_uid:
@@ -2263,24 +2526,76 @@ class Scheduler:
         self._mla_model = detected
         return detected
 
+    def _model_uses_attention_sinks(self) -> bool:
+        """Detect models whose attention path passes sink logits to SDPA.
+
+        TurboQuant's quantized attention kernels currently do not implement the
+        sink term used by attention-sink models. Ignoring it silently changes
+        the model's attention distribution, so these models must keep fp16 KV
+        unless the attention patch falls back to dequantized sink-aware SDPA.
+        """
+        cached = getattr(self, "_attention_sink_model", None)
+        if cached is not None:
+            return cached
+
+        detected = False
+        model = getattr(self, "model", None)
+
+        def _has_real_sink_attr(obj: Any) -> bool:
+            for name in ("sinks", "attention_sink_bias", "attn_sink"):
+                value = None
+                if isinstance(obj, dict):
+                    value = obj.get(name)
+                if value is None:
+                    data = getattr(obj, "__dict__", {})
+                    if isinstance(data, dict):
+                        value = data.get(name)
+                if isinstance(value, mx.array):
+                    return True
+                if value is not None and isinstance(value, (int, float, list, tuple)):
+                    return True
+            return False
+
+        try:
+            modules = getattr(model, "modules", None)
+        except Exception:
+            modules = None
+        if type(modules).__module__.startswith("unittest.mock"):
+            modules = None
+        if not detected and callable(modules):
+            try:
+                for m in modules():
+                    if _has_real_sink_attr(m):
+                        detected = True
+                        break
+            except Exception:
+                pass
+
+        if detected:
+            logger.info(
+                "TurboQuant disabled: model uses attention sinks, which are "
+                "not supported by TurboQuant's quantized attention kernels; "
+                "keeping fp16 KV cache."
+            )
+        self._attention_sink_model = detected
+        return detected
+
     def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
-        """True if every cache layer can be safely TurboQuant-converted for
-        continuous batching.
+        """True if this cache layout can safely mix TQ and pass-through caches.
 
-        Only plain KVCache (and CacheList of KVCache, for VLM) implement the
-        merge/filter/extract/extend batch protocol that the monkey-patched
-        TurboQuantKVCache.merge relies on inside BatchGenerator. Chunked- and
-        rotating-attention caches (Llama-4, sliding-window) need
-        maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
-        not provide, so those models stay fp16 — no crash, no TurboQuant.
+        Plain KVCache layers are TurboQuant-convertible. State-array caches and
+        rotating/sliding-window caches are pass-through: they stay in their
+        native form while adjacent full-attention KVCache layers are converted.
 
-        MLA models (DeepSeek / GLM-4.7-Flash) are also excluded: they keep
-        plain KVCache objects but read fetched cache tensors directly, which
-        TurboQuant's quantized states do not support (#1613).
+        MLA models (DeepSeek / GLM-4.7-Flash) and attention-sink models are
+        excluded because their attention paths need semantics TurboQuant's
+        quantized cache states/kernels do not currently provide.
         """
         from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
         if self._model_uses_mla():
+            return False
+        if self._model_uses_attention_sinks():
             return False
 
         def _ok(c: Any) -> bool:
@@ -2288,7 +2603,15 @@ class Scheduler:
                 return True
             if isinstance(c, ArraysCache):
                 return True
-            if type(c).__name__ == "SizedArraysCache":
+            class_name = type(c).__name__
+            if class_name in (
+                "SizedArraysCache",
+                "RotatingKVCache",
+                "BatchRotatingKVCache",
+                "PrefillReadyRotatingKVCache",
+                "TurboQuantKVCache",
+                "BatchTurboQuantKVCache",
+            ):
                 return True
             if isinstance(c, CacheList):
                 return all(_ok(inner) for inner in c.caches)
@@ -2308,7 +2631,9 @@ class Scheduler:
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        kv_indices = [
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
@@ -2348,7 +2673,9 @@ class Scheduler:
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
 
-        kv_indices = [i for i, c in enumerate(prompt_cache) if isinstance(c, KVCache)]
+        kv_indices = [
+            i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
 
@@ -2427,10 +2754,11 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # TurboQuant runs in fp16 during the prefill loop below and is
-        # quantized once at the end (see the _apply_turboquant_kv_convert call
-        # before the return). Chunked/rotating models are gated out by
-        # _turboquant_eligible and stay fp16.
+        # Fresh TurboQuant requests run fp16 during the cold prefill loop and
+        # are quantized once at the end. Restored TurboQuant prefix caches stay
+        # quantized while pre-filling the uncached suffix, then keep using TQ for
+        # decode. Rotating/sliding-window layers remain native pass-through
+        # caches; only full-attention KVCache layers are converted.
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -2509,6 +2837,9 @@ class Scheduler:
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
             n_to_process = min(prefill_step_size, remaining)
+
+            if processed_tokens == 0:
+                _sync_and_clear_cache(self._stream)
 
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
@@ -2739,6 +3070,7 @@ class Scheduler:
     # scales with query_len * kv_len, so per-token cost grows with context
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
+    _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3113,6 +3445,107 @@ class Scheduler:
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
 
+    def get_active_hot_cache_block_hashes(self) -> set[bytes]:
+        """Return hot-cache block hashes owned by active in-flight requests."""
+        manager = getattr(self, "paged_cache_manager", None)
+        if manager is None:
+            return set()
+
+        hashes: set[bytes] = set()
+        active_requests = list(self.running.values()) + list(self.prefilling)
+        for request in active_requests:
+            block_table = getattr(request, "block_table", None)
+            if block_table is None:
+                continue
+            for block_id in getattr(block_table, "block_ids", []) or []:
+                try:
+                    block = manager.blocks[block_id]
+                    block_hash = getattr(block, "block_hash", None)
+                except Exception:
+                    continue
+                if block_hash is not None:
+                    hashes.add(bytes(block_hash))
+        return hashes
+
+    def _clear_memory_admission_blocker(self, request_id: str | None = None) -> None:
+        if (
+            request_id is not None
+            and request_id != self._memory_admission_blocked_request_id
+        ):
+            return
+        self._memory_admission_blocked_request_id = None
+        self._memory_admission_blocked_since = 0.0
+
+    def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
+        """Fail one head-of-line request after persistent memory admission stall."""
+        if not self.waiting:
+            self._clear_memory_admission_blocker()
+            return None
+
+        request = self.waiting[0]
+        request_id = request.request_id
+        now = time.monotonic()
+        if request_id != self._memory_admission_blocked_request_id:
+            self._memory_admission_blocked_request_id = request_id
+            self._memory_admission_blocked_since = now
+            return None
+
+        timeout = getattr(
+            self,
+            "_MEMORY_ADMISSION_STALL_TIMEOUT_S",
+            Scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S,
+        )
+        if now - self._memory_admission_blocked_since < timeout:
+            return None
+
+        stalled_for = now - self._memory_admission_blocked_since
+        self.waiting.popleft()
+        self._release_paged_cache_for_request(request_id)
+        self.requests.pop(request_id, None)
+        get_prefill_tracker().remove(request_id)
+        self._clear_memory_admission_blocker(request_id)
+
+        message = (
+            "Request could not be admitted because memory pressure persisted "
+            f"for {stalled_for:.1f}s ({reason}). Reduce context length, free "
+            "memory, lower hot_cache_max_size, or loosen memory_guard_tier."
+        )
+        logger.warning("Memory admission stalled for %s: %s", request_id, message)
+        return RequestOutput(
+            request_id=request_id,
+            finished=True,
+            finish_reason="error",
+            error=message,
+            error_code="memory_admission_stalled",
+            error_metadata={
+                "request_id": request_id,
+                "reason": reason,
+                "stalled_seconds": int(stalled_for),
+            },
+        )
+
+    def _bypass_hot_cache_under_pressure(self) -> bool:
+        """Return True when SSD-backed hot-cache acceleration should be bypassed."""
+        if not self._prefill_memory_guard:
+            return False
+        if self._memory_limit_bytes <= 0:
+            return False
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        if getattr(config, "hot_cache_only", False):
+            return False
+        if int(getattr(config, "hot_cache_max_size", 0) or 0) <= 0:
+            return False
+        if getattr(self, "paged_ssd_cache_manager", None) is None:
+            return False
+        try:
+            current = self._current_usage_bytes()
+        except Exception:
+            logger.debug("Failed to sample memory for hot-cache pressure bypass")
+            return False
+        return current >= self._memory_limit_bytes
+
     def _record_chunk_transient(
         self,
         n_tokens: int,
@@ -3124,6 +3557,18 @@ class Scheduler:
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker."""
         delta = post_bytes - pre_bytes
+        min_chunk = max(1, self._prefill_min_chunk_tokens)
+        if n_tokens < min_chunk:
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "(skipped: tail < min_chunk=%d)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta / 1024**2,
+                min_chunk,
+            )
+            return
         if delta <= 0:
             logger.debug(
                 "[throttle:%s] measure rid=%s n=%d delta=%dB (skipped: <=0)",
@@ -3248,6 +3693,9 @@ class Scheduler:
             return True
 
         n = min(self.config.prefill_step_size, state.tokens_remaining.shape[1])
+
+        if state.tokens_processed == 0:
+            _sync_and_clear_cache(self._stream)
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -3442,8 +3890,8 @@ class Scheduler:
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
         )
-
         if uids:
+            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
@@ -4932,12 +5380,27 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
-                self.block_aware_cache.preload_blocks(block_table)
+                bypass_hot_cache = self._bypass_hot_cache_under_pressure()
+                if bypass_hot_cache:
+                    logger.info(
+                        "Skipping hot-cache preload for %s under memory pressure",
+                        request.request_id,
+                    )
+                else:
+                    self.block_aware_cache.preload_blocks(block_table)
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
                 original_tokens = block_table.num_tokens
-                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
+                if bypass_hot_cache:
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table,
+                        promote_to_hot_cache=False,
+                    )
+                else:
+                    reconstructed = self.block_aware_cache.reconstruct_cache(
+                        block_table
+                    )
                 if reconstructed:
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
@@ -5181,6 +5644,7 @@ class Scheduler:
                 request.request_id,
             )
             return None
+        target_model = self.model
 
         if not last_tokens:
             logger.warning(
@@ -5193,7 +5657,10 @@ class Scheduler:
         last_arr = mx.array(last_tokens)[None]  # (1, len_last)
         try:
             with mx.stream(self._stream):
-                out = lm(
+                set_batch_rope = getattr(target_model, "set_batch_rope_deltas", None)
+                if callable(set_batch_rope):
+                    set_batch_rope(mx.array([request.rope_deltas]))
+                out = target_model(
                     last_arr,
                     cache=prefilled_cache,
                     return_hidden=True,
@@ -5238,7 +5705,7 @@ class Scheduler:
 
         try:
             generator = run_vlm_mtp_decode(
-                target_language_model=lm,
+                target_language_model=target_model,
                 drafter=drafter,
                 prompt_cache=prefilled_cache,
                 hidden=hidden,
@@ -5786,6 +6253,13 @@ class Scheduler:
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
+            if uid < 0:
+                mtp_state = self._vlm_mtp_active.pop(uid, None)
+                if mtp_state is not None:
+                    close = getattr(mtp_state.generator, "close", None)
+                    if callable(close):
+                        close()
+            _unregister_uid_row(self.model, uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -5951,7 +6425,9 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
-        # Reset batch generator only (cache is not corrupted)
+        # Reset batch generator only (cache is not corrupted). Every row dies
+        # with it; survivors re-register at re-insert.
+        _unregister_uid_rows_for_model(self.model)
         self.batch_generator = None
         self._current_sampler_params = None
         # Reclaim fragmented Metal buffers after generation failure.
@@ -6327,6 +6803,9 @@ class Scheduler:
                     "Admission paused by memory pressure, %d admitted",
                     admitted,
                 )
+                stalled = self._memory_admission_stall_output("admission_paused")
+                if stalled is not None:
+                    rejected_outputs.append(stalled)
                 break
 
             # Store-cache backpressure: when the post-completion pipeline is
@@ -6350,6 +6829,24 @@ class Scheduler:
                     gate.cap,
                     len(self.running),
                 )
+                memory_related_gate = self._admission_paused
+                if (
+                    not memory_related_gate
+                    and self._prefill_memory_guard
+                    and self._memory_limit_bytes > 0
+                ):
+                    try:
+                        memory_related_gate = (
+                            self._current_usage_bytes() >= self._memory_limit_bytes
+                        )
+                    except Exception:
+                        memory_related_gate = False
+                if memory_related_gate:
+                    stalled = self._memory_admission_stall_output(
+                        "store_cache_backpressure"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
                 break
 
             # Generation memory guard: when requests are already admitted,
@@ -6366,9 +6863,15 @@ class Scheduler:
                         self._memory_limit_bytes,
                         admitted,
                     )
+                    stalled = self._memory_admission_stall_output(
+                        "generation_memory_guard"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
                     break
 
             request = self.waiting.popleft()
+            self._clear_memory_admission_blocker(request.request_id)
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -6984,8 +7487,8 @@ class Scheduler:
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
             )
-
             if uids:
+                _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
@@ -7425,6 +7928,16 @@ class Scheduler:
                                         # completion fence moves onto this thread.
                                         mx.eval(*pre_eval_arrays)
 
+                            hot_cache_write_back = (
+                                not self._bypass_hot_cache_under_pressure()
+                            )
+                            if not hot_cache_write_back:
+                                logger.info(
+                                    "Using SSD write-through for %s "
+                                    "under memory pressure",
+                                    request_id,
+                                )
+
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
@@ -7451,6 +7964,7 @@ class Scheduler:
                                         request.vlm_extra_keys_for_cache,
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
+                                        hot_cache_write_back,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -7468,6 +7982,7 @@ class Scheduler:
                                     request.vlm_extra_keys_for_cache,
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
+                                    hot_cache_write_back,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
@@ -7521,6 +8036,7 @@ class Scheduler:
                     self._remove_uid_from_active_batch(uid)
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
+                    _unregister_uid_row(self.model, uid)
                     if uid in self.uid_to_request_id:
                         del self.uid_to_request_id[uid]
                     del self.request_id_to_uid[request_id]
@@ -7638,6 +8154,7 @@ class Scheduler:
         self._cache_rate_tracker.clear()
 
         # Clear UID mappings
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
 
@@ -7667,6 +8184,7 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._deferred_clear_at = None
@@ -8208,6 +8726,7 @@ class Scheduler:
         self.running.clear()
         self.requests.clear()
         self.finished_req_ids.clear()
+        _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
         self._generation_overflow_recovery_ids.clear()
@@ -8322,6 +8841,9 @@ class Scheduler:
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+        # Release whatever the per-path unregisters did not reach, so nothing
+        # survives this engine in the module-level row registry.
+        _unregister_uid_rows_for_model(self.model)
         logger.info("Scheduler shutdown completed")
 
     def adjust_store_cache_cap(self, pressure_level: str) -> None:
@@ -8465,7 +8987,9 @@ class Scheduler:
                 and (
                     self._turboquant_eligible(cache_list_for_tq)
                     if cache_list_for_tq is not None
-                    else not self._model_uses_mla()
+                    else not (
+                        self._model_uses_mla() or self._model_uses_attention_sinks()
+                    )
                 )
             ):
                 tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
@@ -8496,6 +9020,9 @@ class Scheduler:
                     dtype_size=dtype_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
+                    # SDPA scores are materialized at the compute/activation
+                    # dtype, not the (possibly fractional TurboQuant) KV width.
+                    compute_dtype_size=base_dtype_size,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
@@ -8550,12 +9077,13 @@ class Scheduler:
         try:
             if not self._turboquant_eligible(cache_list):
                 return layer_cache_types
-            from mlx_lm.models.cache import KVCache
         except Exception as e:
             logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
             return layer_cache_types
 
-        kv_indices = [i for i, c in enumerate(cache_list) if isinstance(c, KVCache)]
+        kv_indices = [
+            i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
+        ]
         skip_last = self._turboquant_skip_last and len(kv_indices) > 1
         last_kv_idx = kv_indices[-1] if skip_last else -1
         for idx in kv_indices:

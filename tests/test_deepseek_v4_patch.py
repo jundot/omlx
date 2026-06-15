@@ -52,6 +52,12 @@ class TestPatchOrchestration:
         # the loaded file resolve through the real mlx_lm package.
         assert mod.__package__ == "mlx_lm.models"
 
+    def test_deepseek_v4_mtp_alias_registered(self, applied_patch):
+        assert (
+            sys.modules["mlx_lm.models.deepseek_v4_mtp"]
+            is sys.modules["mlx_lm.models.deepseek_v4"]
+        )
+
 
 class TestCacheInjection:
     """PoolingCache / BatchPoolingCache injected into mlx_lm.models.cache."""
@@ -583,6 +589,61 @@ class TestModelClassResolution:
         assert model_class.__name__ == "Model"
         assert args_class.__name__ == "ModelArgs"
 
+    def test_get_classes_returns_injected_module_for_mtp_variant(self, applied_patch):
+        from mlx_lm.utils import _get_classes
+
+        model_class, args_class = _get_classes({"model_type": "deepseek_v4_mtp"})
+        assert model_class.__module__ == "mlx_lm.models.deepseek_v4"
+        assert args_class.__module__ == "mlx_lm.models.deepseek_v4"
+
+
+class TestPatchedLoadModelTrustRemoteCode:
+    """DeepSeek's patched load_model must mirror mlx-lm's custom-code gate."""
+
+    def test_signature_accepts_trust_remote_code(self, applied_patch):
+        from mlx_lm.utils import load_model
+
+        assert "trust_remote_code" in inspect.signature(load_model).parameters
+
+    def test_model_file_requires_trust_remote_code(self, tmp_path, applied_patch):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            '{"model_type": "custom", "model_file": "custom_arch.py"}'
+        )
+        (tmp_path / "custom_arch.py").write_text(
+            "\n".join(
+                [
+                    "from pathlib import Path",
+                    "import mlx.nn as nn",
+                    "Path(__file__).with_name('executed.txt').write_text('yes')",
+                    "",
+                    "class ModelArgs:",
+                    "    @classmethod",
+                    "    def from_dict(cls, config):",
+                    "        return cls()",
+                    "",
+                    "class Model(nn.Module):",
+                    "    def __init__(self, args):",
+                    "        super().__init__()",
+                ]
+            )
+        )
+
+        from mlx_lm.utils import load_model
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            load_model(tmp_path, strict=False, lazy=True)
+
+        assert not (tmp_path / "executed.txt").exists()
+
+        load_model(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            trust_remote_code=True,
+        )
+        assert (tmp_path / "executed.txt").read_text() == "yes"
+
 
 class TestCacheHandlerRegistration:
     """omlx CacheTypeRegistry resolves the new cache types to their handlers."""
@@ -753,6 +814,16 @@ class TestPreLoadDispatch:
 
         maybe_apply_pre_load_patches(str(tmp_path))
         # Patch must be applied after this dispatch (or already applied).
+        assert is_applied() is True
+
+    def test_dispatch_for_deepseek_v4_mtp_variant(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text('{"model_type": "deepseek_v4_mtp"}')
+
+        from omlx.patches.deepseek_v4 import is_applied
+        from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+        maybe_apply_pre_load_patches(str(tmp_path))
         assert is_applied() is True
 
 
@@ -929,20 +1000,14 @@ class TestPoolingCacheTrimRollback:
         else:
             pl = getattr(cache, "_pool_lengths", None)
             n = pl[0] if pl is not None else out.shape[1]
-            ref_n = (
-                ref._pool_lengths[0]
-                if pl is not None
-                else ref_out.shape[1]
-            )
+            ref_n = ref._pool_lengths[0] if pl is not None else ref_out.shape[1]
             assert n == ref_n
             assert mx.allclose(out[:, :n], ref_out[:, :n]).item()
         assert (
-            cache.remainder if isinstance(cache.remainder, int)
+            cache.remainder
+            if isinstance(cache.remainder, int)
             else list(cache.remainder)
-        ) == (
-            ref.remainder if isinstance(ref.remainder, int)
-            else list(ref.remainder)
-        )
+        ) == (ref.remainder if isinstance(ref.remainder, int) else list(ref.remainder))
 
     def test_easy_case_draft_in_buffer(self, applied_patch):
         from mlx_lm.models.cache import PoolingCache
@@ -975,9 +1040,7 @@ class TestPoolingCacheTrimRollback:
     def test_batch_easy_case(self, applied_patch):
         from mlx_lm.models.cache import BatchPoolingCache
 
-        self._equivalence(
-            BatchPoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch
-        )
+        self._equivalence(BatchPoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch)
 
     def test_batch_boundary_case(self, applied_patch):
         from mlx_lm.models.cache import BatchPoolingCache

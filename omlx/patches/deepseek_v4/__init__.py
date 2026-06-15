@@ -9,7 +9,9 @@ without modifying the pinned mlx-lm. The patch:
 2. Registers ``mlx_lm.models.hyper_connection`` and
    ``mlx_lm.models.deepseek_v4`` modules in ``sys.modules`` so the
    built-in ``importlib.import_module(f"mlx_lm.models.{model_type}")``
-   path used by ``_get_classes`` finds them.
+   path used by ``_get_classes`` finds them. Also aliases
+   ``deepseek_v4_mtp`` to the same module for converted checkpoints that
+   encode the MTP variant in ``model_type``.
 3. Replaces ``mlx_lm.utils.load_model`` with a copy that handles
    ``F8_E8M0`` dtype fallback and the DeepSeek V4 ``fp8`` quant_method.
 4. Replaces ``mlx_lm.generate._make_cache`` with a copy aware of
@@ -23,7 +25,7 @@ without modifying the pinned mlx-lm. The patch:
    prefix-cache / SSD-cache state extraction does not silently fall
    through to ``DefaultCacheHandler``.
 
-The whole patch is gated on ``model_type == "deepseek_v4"`` in
+The whole patch is gated on ``model_type.startswith("deepseek_v4")`` in
 ``config.json``; other models pay zero cost.
 
 Once mlx-lm merges PR 1192 upstream this package can be removed in a
@@ -111,6 +113,22 @@ def _register_cache_handlers() -> None:
     logger.info("PoolingCacheHandler + BatchPoolingCacheHandler registered")
 
 
+def _register_model_type_aliases() -> None:
+    """Map DeepSeek V4 variant model_types to the injected base module."""
+    try:
+        import mlx_lm.utils as _utils
+
+        remapping = getattr(_utils, "MODEL_REMAPPING", None)
+        if isinstance(remapping, dict):
+            remapping.setdefault("deepseek_v4_mtp", "deepseek_v4")
+    except Exception as e:
+        logger.debug("DeepSeek V4 model_type remapping skipped: %s", e)
+
+    base_module = sys.modules.get("mlx_lm.models.deepseek_v4")
+    if base_module is not None:
+        sys.modules.setdefault("mlx_lm.models.deepseek_v4_mtp", base_module)
+
+
 def apply_deepseek_v4_patch() -> bool:
     """Apply the DeepSeek V4 patch to mlx-lm. Idempotent.
 
@@ -138,8 +156,9 @@ def apply_deepseek_v4_patch() -> bool:
     #    HyperConnection / HyperHead / hc_expand from it).
     _register_module("mlx_lm.models.hyper_connection", "hyper_connection.py")
 
-    # 3. Register deepseek_v4 itself.
+    # 3. Register deepseek_v4 itself and aliases for known variants.
     _register_module("mlx_lm.models.deepseek_v4", "deepseek_v4_model.py")
+    _register_model_type_aliases()
 
     # 4. Patch utils.load_model (F8_E8M0 fallback + fp8 quant branch).
     from .utils_patch import apply_utils_patch

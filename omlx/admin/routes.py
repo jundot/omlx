@@ -16,7 +16,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import time
 from collections import deque
@@ -211,6 +210,7 @@ class GlobalSettingsRequest(BaseModel):
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
+    preserve_mid_system_cache: bool | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -450,14 +450,18 @@ def _entry_is_diffusion_model(entry) -> bool:
 
 
 def _sanitize_diffusion_settings_dict(settings: dict) -> None:
-    """Clear unsupported diffusion-lane settings before ModelSettings parsing."""
+    """Clear unsupported diffusion-lane settings before ModelSettings parsing.
+
+    Tool-calling settings (``max_tool_result_tokens``) are intentionally NOT
+    cleared: tool calling is prompt-driven plus output parsing and works on
+    the diffusion lane when a tool parser matches the chat template.
+    """
     unsupported_none_fields = (
         "top_p",
         "top_k",
         "min_p",
         "repetition_penalty",
         "presence_penalty",
-        "max_tool_result_tokens",
         "enable_thinking",
         "preserve_thinking",
         "thinking_budget_tokens",
@@ -519,14 +523,17 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
 
 
 def _sanitize_diffusion_model_settings(settings) -> None:
-    """Clear settings that the serial diffusion lane does not implement."""
+    """Clear settings that the serial diffusion lane does not implement.
+
+    ``max_tool_result_tokens`` is intentionally preserved — tool calling
+    works on the diffusion lane (prompt-driven + output parsing).
+    """
     settings.top_p = None
     settings.top_k = None
     settings.min_p = None
     settings.repetition_penalty = None
     settings.presence_penalty = None
     settings.force_sampling = False
-    settings.max_tool_result_tokens = None
     settings.enable_thinking = None
     settings.preserve_thinking = None
     settings.thinking_budget_enabled = False
@@ -1250,22 +1257,11 @@ def get_system_memory_info() -> dict:
         and auto_limit_formatted (80% of total).
     """
     try:
-        # macOS: use sysctl to get physical memory. Invoke by absolute path —
-        # sysctl lives in /usr/sbin, which isn't on PATH in some headless
-        # launchd contexts (brew services). See issue #1322.
-        result = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        total_bytes = int(result.stdout.strip())
+        from ..utils import psutil_compat
+
+        total_bytes = int(psutil_compat.get_total_memory())
     except Exception:
-        # Fallback: try os.sysconf (works on some Unix systems)
-        try:
-            total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        except Exception:
-            total_bytes = 0
+        total_bytes = 0
 
     auto_limit_bytes = int(total_bytes * 0.8)
 
@@ -1273,9 +1269,9 @@ def get_system_memory_info() -> dict:
     # tier (static_ceiling + dynamic_ceiling depend on these). Read on each
     # call — never cached.
     try:
-        import psutil
+        from ..utils import psutil_compat
 
-        available_bytes = int(psutil.virtual_memory().available)
+        available_bytes = int(psutil_compat.virtual_memory().available)
     except Exception:
         available_bytes = 0
     try:
@@ -1314,9 +1310,9 @@ def get_system_memory_info() -> dict:
     inactive_memory_bytes = 0
     active_memory_bytes = 0
     try:
-        from ..process_memory_enforcer import get_macos_vm_stats
+        from ..utils import psutil_compat
 
-        vm = get_macos_vm_stats()
+        vm = psutil_compat.get_macos_vm_stats()
         if vm is not None:
             free_memory_bytes = int(vm.get("free", 0))
             inactive_memory_bytes = int(vm.get("inactive", 0))
@@ -2169,7 +2165,9 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     # DFlash settings
     if "dflash_enabled" in sent:
-        new_dflash_enabled = False if is_diffusion_model else bool(request.dflash_enabled)
+        new_dflash_enabled = (
+            False if is_diffusion_model else bool(request.dflash_enabled)
+        )
         if new_dflash_enabled:
             from ..engine.dflash import is_dflash_compatible
 
@@ -3007,6 +3005,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "preserve_mid_system_cache": getattr(
+                global_settings.server,
+                "preserve_mid_system_cache",
+                True,
+            ),
         },
         "model": {
             "model_dirs": [
@@ -3226,6 +3229,11 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.preserve_mid_system_cache is not None:
+        global_settings.server.preserve_mid_system_cache = (
+            request.preserve_mid_system_cache
+        )
+        runtime_applied.append("preserve_mid_system_cache")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
@@ -4676,7 +4684,9 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             rate_tracker.clear()
         executor = getattr(core, "_mlx_executor", None)
         if executor is not None:
-            reclaim_targets.append((model_id, executor, getattr(scheduler, "_stream", None)))
+            reclaim_targets.append(
+                (model_id, executor, getattr(scheduler, "_stream", None))
+            )
 
     # Also clear managers orphaned by an abnormal teardown: they hold live
     # hot cache but are no longer attached to a loaded scheduler, so the loop

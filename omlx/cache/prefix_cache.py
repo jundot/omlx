@@ -407,6 +407,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        hot_cache_write_back: bool = True,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -427,6 +428,8 @@ class BlockAwarePrefixCache(CacheManager):
             boundary_snapshots: Optional mapping of token_count -> extracted cache
                 states for intermediate block boundaries. Used to store per-block
                 ArraysCache state instead of placeholders in hybrid models.
+            hot_cache_write_back: When False, SSD-backed hot cache is bypassed
+                for newly stored dirty blocks.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -688,14 +691,25 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
-                    saved = self.paged_ssd_cache.save_block(
-                        block_hash=block.block_hash,
-                        cache_data=block_kv_data,
-                        token_count=block.token_count,
-                        model_name=self.paged_cache.model_name,
-                        layer_cache_types=layer_cache_types,
-                        layer_meta_states=block_meta,
-                    )
+                    if hot_cache_write_back:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                        )
+                    else:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                            hot_cache_write_back=False,
+                        )
                     if saved:
                         blocks_saved_to_ssd += 1
                         if is_last_block:
@@ -1582,6 +1596,7 @@ class BlockAwarePrefixCache(CacheManager):
     def reconstruct_cache(
         self,
         block_table: BlockTable,
+        promote_to_hot_cache: bool = True,
     ) -> list[Any] | None:
         """
         Reconstruct cache objects from paged SSD-stored block data.
@@ -1600,7 +1615,9 @@ class BlockAwarePrefixCache(CacheManager):
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from.
-                        Will be modified in-place if partial reconstruction.
+                Will be modified in-place if partial reconstruction.
+            promote_to_hot_cache: When False, SSD-loaded blocks are not retained
+                in hot cache after active KV reconstruction.
 
         Returns:
             List of reconstructed cache objects (one per layer),
@@ -1671,9 +1688,19 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
-                block_data, block_metadata = (
-                    self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
-                )
+                if promote_to_hot_cache:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash
+                        )
+                    )
+                else:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash,
+                            promote_to_hot_cache=False,
+                        )
+                    )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "
@@ -2091,7 +2118,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
                     from ..turboquant_kv import (
-                        _concat_state,
+                        _concat_state_token_axis,
                         _rebuild_codecs,
                         _state_length,
                     )
@@ -2112,14 +2139,9 @@ class BlockAwarePrefixCache(CacheManager):
                         logger.debug(f"TQ layer {layer_idx}: no block data")
                         return None
                     # Concatenate along token dimension
-                    cat_ks = key_states[0]
-                    for s in key_states[1:]:
-                        cat_ks = _concat_state(cat_ks, s)
-                    cat_vs = value_states[0]
-                    for s in value_states[1:]:
-                        cat_vs = _concat_state(cat_vs, s)
+                    cat_ks = _concat_state_token_axis(key_states)
+                    cat_vs = _concat_state_token_axis(value_states)
                     try:
-                        from mlx_lm.models.cache import KVCache
                         from mlx_vlm.turboquant import TurboQuantKVCache
 
                         tq_bits = 4.0
@@ -2132,19 +2154,12 @@ class BlockAwarePrefixCache(CacheManager):
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
                             tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
-                        # TQ will be re-applied at decode start (lazy quantization).
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
                         _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+                        reconstructed_caches.append(tq)
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"

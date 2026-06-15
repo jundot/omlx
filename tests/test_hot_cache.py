@@ -47,8 +47,7 @@ class TestHotCacheDisabled:
         """Save/load should work even when hot cache is disabled."""
         block_hash = b"disabled_hot_cache_test"
         cache_data = [
-            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))
-            for _ in range(4)
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))) for _ in range(4)
         ]
         result = manager.save_block(
             block_hash=block_hash,
@@ -119,8 +118,8 @@ class TestHotCacheEnabled:
         # Verify hot cache has the entry
         entry = manager._hot_cache_get(block_hash)
         assert entry is not None
-        assert 'tensors_raw' in entry
-        assert entry['num_layers'] == 4
+        assert "tensors_raw" in entry
+        assert entry["num_layers"] == 4
 
     def test_load_from_hot_cache(self, manager):
         """load_block() should return data from hot cache without SSD I/O."""
@@ -355,6 +354,81 @@ class TestHotCachePromotion:
         finally:
             mgr.close()
 
+    def test_ssd_load_can_skip_hot_cache_promotion(self, tmp_path):
+        """SSD loads can reconstruct a request without retaining a hot RAM copy."""
+        mgr_cold = PagedSSDCacheManager(
+            cache_dir=tmp_path / "skip_promote_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+
+        block_hash = b"skip_promote_blk_1"
+        cache_data = self._make_cache_data()
+        mgr_cold.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test",
+            layer_cache_types=["KVCache"] * 4,
+        )
+        mgr_cold.close()
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "skip_promote_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+
+        try:
+            loaded, metadata = mgr.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
+
+            assert loaded is not None
+            assert metadata is not None
+            assert mgr._hot_cache_get(block_hash) is None
+
+            loaded_again, _ = mgr.load_block_with_metadata(block_hash)
+            assert loaded_again is not None
+            assert mgr._hot_cache_get(block_hash) is not None
+        finally:
+            mgr.close()
+
+    def test_write_through_save_bypasses_hot_cache_retention(self, tmp_path):
+        """Pressure write-through keeps SSD durability without hot-cache RAM."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "write_through_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+
+        try:
+            block_hash = b"write_through_blk1"
+            cache_data = self._make_cache_data()
+            result = mgr.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=64,
+                model_name="test",
+                layer_cache_types=["KVCache"] * 4,
+                hot_cache_write_back=False,
+            )
+
+            assert result is True
+            assert mgr.has_block(block_hash)
+            assert mgr._hot_cache_get(block_hash) is None
+
+            loaded, metadata = mgr.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
+            assert loaded is not None
+            assert metadata is not None
+            assert mgr._hot_cache_get(block_hash) is None
+        finally:
+            mgr.close()
+
     def test_promotion_does_not_happen_when_disabled(self, tmp_path):
         """No promotion when hot cache is disabled."""
         mgr = PagedSSDCacheManager(
@@ -463,14 +537,14 @@ class TestHotCacheConcurrency:
                     # Create a fake hot cache entry with raw bytes
                     raw_data = bytes(1024)  # 1KB of zeros
                     entry = {
-                        'tensors_raw': {
-                            'layer_0_keys': (raw_data, 'float32', [1, 2, 16, 8]),
-                            'layer_0_values': (raw_data, 'float32', [1, 2, 16, 8]),
+                        "tensors_raw": {
+                            "layer_0_keys": (raw_data, "float32", [1, 2, 16, 8]),
+                            "layer_0_values": (raw_data, "float32", [1, 2, 16, 8]),
                         },
-                        'file_metadata': {},
-                        'num_layers': 1,
-                        'layer_cache_types': ['KVCache'],
-                        'block_metadata': None,
+                        "file_metadata": {},
+                        "num_layers": 1,
+                        "layer_cache_types": ["KVCache"],
+                        "block_metadata": None,
                     }
                     mgr._hot_cache_put(block_hash, entry)
 
@@ -664,6 +738,77 @@ class TestHotCacheByteAccounting:
             mgr_a.close()
             mgr_b.close()
 
+    def test_shared_budget_shrink_respects_lru_and_protected_hashes(self, tmp_path):
+        """Pressure shrink should skip protected active-request chains."""
+        _, entry_size = self._make_raw_entry(tmp_path, b"budget_shrink_probe")
+        budget = SharedHotCacheBudget(entry_size * 3)
+        mgr_a = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_shrink_a",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+        mgr_b = PagedSSDCacheManager(
+            cache_dir=tmp_path / "budget_shrink_b",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=budget.max_bytes,
+            hot_cache_only=True,
+            hot_cache_budget=budget,
+        )
+
+        try:
+            a0, _ = self._make_raw_entry(tmp_path, b"budget_shrink_a0")
+            b0, _ = self._make_raw_entry(tmp_path, b"budget_shrink_b0")
+            b1, _ = self._make_raw_entry(tmp_path, b"budget_shrink_b1")
+            mgr_a._hot_cache_put(b"budget_shrink_a0", a0)
+            mgr_b._hot_cache_put(b"budget_shrink_b0", b0)
+            mgr_b._hot_cache_put(b"budget_shrink_b1", b1)
+
+            freed = budget.shrink_to(
+                entry_size,
+                protected_hashes={b"budget_shrink_b0"},
+            )
+
+            assert freed == entry_size * 2
+            assert budget.total_bytes == entry_size
+            assert mgr_a._hot_cache_get(b"budget_shrink_a0") is None
+            assert mgr_b._hot_cache_get(b"budget_shrink_b0") is not None
+            assert mgr_b._hot_cache_get(b"budget_shrink_b1") is None
+        finally:
+            mgr_a.close()
+            mgr_b.close()
+
+    def test_local_hot_cache_shrink_respects_protected_hashes(self, tmp_path):
+        _, entry_size = self._make_raw_entry(tmp_path, b"local_shrink_probe")
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "local_shrink",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=entry_size * 3,
+            hot_cache_only=True,
+        )
+
+        try:
+            h0 = b"local_shrink_0"
+            h1 = b"local_shrink_1"
+            h2 = b"local_shrink_2"
+            e0, _ = self._make_raw_entry(tmp_path, h0)
+            e1, _ = self._make_raw_entry(tmp_path, h1)
+            e2, _ = self._make_raw_entry(tmp_path, h2)
+            mgr._hot_cache_put(h0, e0)
+            mgr._hot_cache_put(h1, e1)
+            mgr._hot_cache_put(h2, e2)
+
+            freed = mgr.shrink_hot_cache_to(entry_size, protected_hashes={h1})
+
+            assert freed == entry_size * 2
+            assert mgr.get_stats().hot_cache_size_bytes == entry_size
+            assert mgr._hot_cache_get(h0) is None
+            assert mgr._hot_cache_get(h1) is not None
+            assert mgr._hot_cache_get(h2) is None
+        finally:
+            mgr.close()
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheStatsAccuracy:
@@ -840,9 +985,9 @@ class TestHotCacheWriteBack:
         mgr.close()
 
         ssd_files = list((tmp_path / "wb_flush_test").rglob("*.safetensors"))
-        assert len(ssd_files) == 3, (
-            f"Expected 3 SSD files after flush, got {len(ssd_files)}"
-        )
+        assert (
+            len(ssd_files) == 3
+        ), f"Expected 3 SSD files after flush, got {len(ssd_files)}"
 
     def test_close_flushes_all_blocks_with_small_queue(self, tmp_path):
         """close() must flush all hot cache blocks even when more blocks
@@ -930,13 +1075,13 @@ class TestPendingWriteBuffer:
 
             # Block 0 should still be loadable (from pending buffer, not SSD)
             with mgr._hot_cache_lock:
-                assert b"pending_buf_blk0" not in mgr._hot_cache, (
-                    "Block 0 should have been evicted from hot cache"
-                )
+                assert (
+                    b"pending_buf_blk0" not in mgr._hot_cache
+                ), "Block 0 should have been evicted from hot cache"
             loaded = mgr.load_block(b"pending_buf_blk0")
-            assert loaded is not None, (
-                "Evicted block should be readable from pending write buffer"
-            )
+            assert (
+                loaded is not None
+            ), "Evicted block should be readable from pending write buffer"
             assert len(loaded) == 2
         finally:
             mgr.close()
@@ -990,9 +1135,9 @@ class TestPendingWriteBuffer:
             with mgr._hot_cache_lock:
                 assert b"has_block_test_b0" not in mgr._hot_cache
 
-            assert mgr.has_block(b"has_block_test_b0") is True, (
-                "has_block should find blocks in the pending write buffer"
-            )
+            assert (
+                mgr.has_block(b"has_block_test_b0") is True
+            ), "has_block should find blocks in the pending write buffer"
         finally:
             mgr.close()
 
@@ -1021,9 +1166,9 @@ class TestPendingWriteBuffer:
 
             # Should no longer be loadable
             loaded = mgr.load_block(b"del_pending_blk_0")
-            assert loaded is None, (
-                "Deleted block should not be readable from pending buffer"
-            )
+            assert (
+                loaded is None
+            ), "Deleted block should not be readable from pending buffer"
         finally:
             mgr.close()
 
@@ -1080,9 +1225,9 @@ class TestPendingWriteBuffer:
             self._save_block(mgr, b"meta_load_blk_02")
 
             cache_data, metadata = mgr.load_block_with_metadata(b"meta_load_blk_00")
-            assert cache_data is not None, (
-                "load_block_with_metadata should serve evicted block from pending buffer"
-            )
+            assert (
+                cache_data is not None
+            ), "load_block_with_metadata should serve evicted block from pending buffer"
             assert metadata is not None
             assert metadata["num_layers"] == 2
             assert metadata["token_count"] == 16

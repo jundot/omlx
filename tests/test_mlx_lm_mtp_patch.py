@@ -511,9 +511,7 @@ class TestDeepseekV4Model:
 
         from omlx.patches.mlx_lm_mtp import deepseek_v4_model
 
-        call_source = inspect.getsource(
-            deepseek_v4_model._patch_deepseek_v4_model_call
-        )
+        call_source = inspect.getsource(deepseek_v4_model._patch_deepseek_v4_model_call)
         model_source = inspect.getsource(deepseek_v4_model._patch_model)
 
         assert "materialize_cache_arrays(cache)" in call_source
@@ -534,6 +532,82 @@ class TestBatchGeneratorDispatch:
 
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
         assert hasattr(BatchGenerator, "_omlx_mtp_patched")
+
+    def test_next_realigns_rows_before_mtp_eligibility(self, monkeypatch):
+        """Native MTP must not read stale row slots before scheduler realignment."""
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        calls = []
+        batch = SimpleNamespace(
+            uids=[],
+            _omlx_realign_rows=lambda: calls.append("realign"),
+        )
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_is_mtp_batch_eligible",
+            lambda _: calls.append("batch_eligible") or False,
+        )
+        monkeypatch.setattr(
+            batch_generator,
+            "_is_mtp_eligible",
+            lambda _: calls.append("single_eligible") or False,
+        )
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+        monkeypatch.setattr(
+            batch_generator,
+            "_mark_standard_multirow_decode",
+            lambda _: calls.append("standard"),
+        )
+
+        assert GenerationBatch.next(batch) == []
+        assert calls[:3] == ["realign", "batch_eligible", "single_eligible"]
+
+    def test_realign_can_make_grammar_rows_disable_mtp(self, monkeypatch):
+        """If realignment reveals processors, MTP must not activate first."""
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        processor = object()
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *_, **__: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        batch = SimpleNamespace(
+            model=model,
+            uids=[1],
+            logits_processors=[],
+            _omlx_mtp_activation_safe=True,
+        )
+
+        def realign_rows():
+            batch.logits_processors = [[processor]]
+
+        batch._omlx_realign_rows = realign_rows
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_has_grammar_processors",
+            lambda b: bool(b.logits_processors and b.logits_processors[0]),
+        )
+        monkeypatch.setattr(
+            batch_generator,
+            "_prepare_mtp_state_for_next",
+            lambda _: pytest.fail("MTP activated before row realignment"),
+        )
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+        monkeypatch.setattr(
+            batch_generator,
+            "_mark_standard_multirow_decode",
+            lambda b: setattr(b, "uids", []),
+        )
+
+        assert GenerationBatch.next(batch) == []
+        assert batch.logits_processors == [[processor]]
 
     def test_decode_eligibility_reads_model_instance_flag_not_global(self):
         from omlx.patches.mlx_lm_mtp import (
@@ -585,9 +659,7 @@ class TestBatchGeneratorDispatch:
         assert (
             batch_generator._model_mtp_decode_enabled(
                 SimpleNamespace(
-                    language_model=SimpleNamespace(
-                        _omlx_mtp_decode_enabled=False
-                    )
+                    language_model=SimpleNamespace(_omlx_mtp_decode_enabled=False)
                 )
             )
             is False
@@ -641,9 +713,7 @@ class TestBatchGeneratorDispatch:
             # (e.g. VLM runtime patches attach unconditionally so weight
             # load matches, while inference-time MTP stays disabled).
             assert (
-                _is_mtp_eligible(
-                    _GenBatch(_MtpModel(decode_enabled=False), uids=[1])
-                )
+                _is_mtp_eligible(_GenBatch(_MtpModel(decode_enabled=False), uids=[1]))
                 is False
             )
 

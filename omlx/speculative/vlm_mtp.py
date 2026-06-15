@@ -49,6 +49,12 @@ from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 # the symbols are still ``_``-prefixed but this is now their canonical home.
 from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch  # noqa: SLF001
 
+try:
+    from mlx_vlm.speculative.mtp import _buffer_mtp_target_cache  # noqa: SLF001
+except Exception:  # pragma: no cover - compatibility with older mlx-vlm
+    def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
 from ..utils.model_loading import materialize_lazy_state
 
 logger = logging.getLogger(__name__)
@@ -184,6 +190,63 @@ class VLMMTPDrafter:
         self.source_path = source_path
 
 
+class _VLMAdapterMTPProxy:
+    """Expose VLM adapter calls while letting Qwen drafters bind embeddings.
+
+    mlx-vlm's MTP loop calls ``model.language_model`` when that attribute is
+    present, which would bypass oMLX's VLM adapter and lose mRoPE position
+    handling. Qwen's external drafter, however, needs a ``language_model``
+    attribute during ``bind()`` to find ``embed_tokens``. This proxy only
+    exposes ``language_model`` while ``draft_model.reset(model)`` runs.
+    """
+
+    def __init__(self, adapter: nn.Module, language_model: Any) -> None:
+        self._adapter = adapter
+        self._language_model = language_model
+        self._expose_language_model = False
+        self._allow_language_model_fast_paths = not bool(
+            getattr(adapter, "_uses_mrope", False)
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "language_model":
+            if self._expose_language_model:
+                return self._language_model
+            raise AttributeError(name)
+        try:
+            return getattr(self._adapter, name)
+        except AttributeError:
+            if (
+                not self._allow_language_model_fast_paths
+                and (name == "model" or name.startswith("speculative_"))
+            ):
+                raise
+            return getattr(self._language_model, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._adapter(*args, **kwargs)
+
+
+class _MTPResetBindingProxy:
+    """Temporarily expose ``language_model`` during drafter reset."""
+
+    def __init__(self, drafter: nn.Module, target_proxy: _VLMAdapterMTPProxy) -> None:
+        self._drafter = drafter
+        self._target_proxy = target_proxy
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._drafter, name)
+
+    def reset(self, target_model: Any, *args: Any, **kwargs: Any) -> Any:
+        if target_model is self._target_proxy:
+            self._target_proxy._expose_language_model = True
+            try:
+                return self._drafter.reset(target_model, *args, **kwargs)
+            finally:
+                self._target_proxy._expose_language_model = False
+        return self._drafter.reset(target_model, *args, **kwargs)
+
+
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     """Load an MTP drafter (gemma4_assistant or qwen3_5_mtp); return None
     and log if the artifact is the wrong kind. Soft-fails so a misconfigured
@@ -250,6 +313,7 @@ def run_vlm_mtp_decode(
     first_bonus: Union[int, mx.array],
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
+    prompt_tokens: Optional[mx.array] = None,
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
@@ -267,6 +331,13 @@ def run_vlm_mtp_decode(
     already emitted the bonus token before the round loop starts
     (``emitted = 1`` baked in at the top of both helpers).
     """
+    target_for_rounds = target_language_model
+    drafter_model = drafter.model
+    adapter_lm = getattr(target_language_model, "_language_model", None)
+    if adapter_lm is not None:
+        target_for_rounds = _VLMAdapterMTPProxy(target_language_model, adapter_lm)
+        drafter_model = _MTPResetBindingProxy(drafter.model, target_for_rounds)
+
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
 
     if is_batch:
@@ -274,8 +345,8 @@ def run_vlm_mtp_decode(
         yield [int(x) for x in first_bonus_list]
         eos_set = set(eos_token_ids) if eos_token_ids else None
         for tokens, _ in _mtp_rounds_batch(
-            target_language_model,
-            drafter.model,
+            target_for_rounds,
+            drafter_model,
             prompt_cache,
             hidden,
             shared_kv_states,
@@ -302,12 +373,14 @@ def run_vlm_mtp_decode(
 
     yield first_bonus_int
 
+    _buffer_mtp_target_cache(prompt_cache, drafter_model, draft_block_size)
     for tok, _ in _mtp_rounds(
-        target_language_model,
-        drafter.model,
+        target_for_rounds,
+        drafter_model,
         prompt_cache,
         hidden,
         shared_kv_states,
+        prompt_tokens=prompt_tokens,
         first_bonus=first_bonus_int,
         max_tokens=max_tokens,
         sampler=sampler,
