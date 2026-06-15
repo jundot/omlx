@@ -381,10 +381,9 @@ class ThinkingBudgetProcessor:
     a no-op for the rest of generation.
 
     Includes a soft budget zone over the last 30% of the token budget:
-    instead of a single hard cut, the close-think logit is progressively
-    boosted relative to the model's own logit distribution, encouraging a
-    natural stopping point before the hard force at 100%. Mirrors vLLM's
-    soft thinking budget (vllm-project/vllm#38277).
+    instead of a single hard cut, a plausible close-think token is
+    progressively boosted, encouraging a natural stopping point before the
+    hard force at 100%.
 
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
@@ -403,6 +402,13 @@ class ThinkingBudgetProcessor:
     # Multiplier on the measured gap; 2.0 makes the close-think logit
     # dominate at 50% of the zone, 1.0 only reaches the top at 100%.
     _SOFT_BIAS_FACTOR = 2.0
+    # Only nudge the close-think token if it is already close to the model's
+    # preferred next token. Otherwise a very large gap would create a very
+    # large boost and behave like an early hard force.
+    _SOFT_BIAS_MAX_GAP = 5.0
+    # Once eligible, allow a small push above the top logit, but cap it so
+    # the soft zone remains a nudge instead of a deterministic force.
+    _SOFT_BIAS_MAX_OVERSHOOT = 1.0
 
     def __init__(
         self,
@@ -486,15 +492,14 @@ class ThinkingBudgetProcessor:
         """Progressively boost the close-think logit through the soft zone.
 
         At each step, measure the gap between the top logit and the
-        close-think token, then raise the close-think logit toward (and
-        past) the top as the budget runs out::
+        close-think token. If the close-think token is already plausible,
+        raise it toward the top as the budget runs out::
 
             target = end_logit + 2 * gap * progress
 
-        progress=0 leaves logits unchanged, 0.5 makes close-think equal to
-        the top logit, and 1.0 makes it dominate — so the model can close
-        the thinking block at a natural boundary instead of being cut
-        mid-sentence by the hard force.
+        Tokens that are too far below the top are left unchanged. Eligible
+        tokens can overtake the top by a small fixed margin only, so a large
+        gap does not become a large artificial boost.
 
         The whole path stays in lazy MLX array ops — no ``.item()``/eval,
         so the decode loop never syncs on this bias (``progress`` comes
@@ -507,9 +512,12 @@ class ThinkingBudgetProcessor:
         next_id = self._next_close_token_id()
         top_logit = mx.max(logits, axis=-1, keepdims=True)
         end_logit = logits[..., next_id : next_id + 1]
-        gap = mx.maximum(top_logit - end_logit, 1.0)
-        target = end_logit + self._SOFT_BIAS_FACTOR * progress * gap
-        logits[..., next_id : next_id + 1] = mx.maximum(end_logit, target)
+        gap_to_top = top_logit - end_logit
+        eligible = gap_to_top <= self._SOFT_BIAS_MAX_GAP
+        boost_gap = mx.maximum(gap_to_top, 1.0)
+        boosted = end_logit + self._SOFT_BIAS_FACTOR * progress * boost_gap
+        capped = mx.minimum(boosted, top_logit + self._SOFT_BIAS_MAX_OVERSHOOT)
+        logits[..., next_id : next_id + 1] = mx.where(eligible, capped, end_logit)
         return logits
 
     def _next_close_token_id(self) -> int:
