@@ -399,13 +399,12 @@ class ThinkingBudgetProcessor:
     # Tuned on local validation: 0.7 stays closer to the requested budget while
     # still avoiding abrupt hard-wall cuts; see the PR for the sweep.
     _SOFT_ZONE_START_FRAC = 0.7
-    # Multiplier on the measured gap; 2.0 makes the close-think logit
-    # dominate at 50% of the zone, 1.0 only reaches the top at 100%.
+    # Multiplier on the soft-zone ramp; 2.0 can reach the cap halfway through
+    # the zone when the close-think token is already very near the top.
     _SOFT_BIAS_FACTOR = 2.0
-    # Only nudge the close-think token if it is within the observed useful
-    # gap range. Otherwise a very large gap would create a very large boost
-    # and behave like an early hard force.
-    _SOFT_BIAS_MAX_GAP = 30.0
+    # Only nudge the close-think token if it is already in the candidate set.
+    # This keeps the bias model-driven while avoiding a full vocabulary sort.
+    _SOFT_BIAS_TOP_K = 32
     # Once eligible, allow a small push above the top logit, but cap it so
     # the soft zone remains a nudge instead of a deterministic force.
     _SOFT_BIAS_MAX_OVERSHOOT = 1.0
@@ -491,15 +490,14 @@ class ThinkingBudgetProcessor:
     def _apply_soft_bias(self, logits, mx):
         """Progressively boost the close-think logit through the soft zone.
 
-        At each step, measure the gap between the top logit and the
-        close-think token. If the close-think token is already plausible,
-        raise it toward the top as the budget runs out::
+        At each step, look at the model's top-k candidates. If the next valid
+        close-think token is in that set, raise it toward the top as the
+        budget runs out. The closer it is to the top within the top-k span,
+        the stronger the ramp.
 
-            target = end_logit + 2 * gap * progress
-
-        Tokens that are too far below the top are left unchanged. Eligible
-        tokens can overtake the top by a small fixed margin only, so a large
-        gap does not become a large artificial boost.
+        Tokens outside the top-k set are left unchanged. Eligible tokens can
+        overtake the top by a small fixed margin only, so the soft zone remains
+        a nudge instead of a deterministic force.
 
         The whole path stays in lazy MLX array ops — no ``.item()``/eval,
         so the decode loop never syncs on this bias (``progress`` comes
@@ -510,14 +508,23 @@ class ThinkingBudgetProcessor:
         """
         progress = (self._thinking_tokens - self._soft_start) / self._soft_span
         next_id = self._next_close_token_id()
-        top_logit = mx.max(logits, axis=-1, keepdims=True)
+        top_k = min(self._SOFT_BIAS_TOP_K, logits.shape[-1])
+        top_values = mx.topk(logits, k=top_k, axis=-1)
+        # MLX returns the selected values sorted ascending: kth ... top.
+        kth_logit = top_values[..., :1]
+        top_logit = top_values[..., -1:]
         end_logit = logits[..., next_id : next_id + 1]
-        gap_to_top = top_logit - end_logit
-        eligible = gap_to_top <= self._SOFT_BIAS_MAX_GAP
-        boost_gap = mx.maximum(gap_to_top, 1.0)
-        boosted = end_logit + self._SOFT_BIAS_FACTOR * progress * boost_gap
-        capped = mx.minimum(boosted, top_logit + self._SOFT_BIAS_MAX_OVERSHOOT)
-        logits[..., next_id : next_id + 1] = mx.where(eligible, capped, end_logit)
+
+        eligible = end_logit >= kth_logit
+        gap_to_top = mx.maximum(top_logit - end_logit, 0.0)
+        topk_span = mx.maximum(top_logit - kth_logit, 1e-6)
+        normalized_gap = gap_to_top / topk_span
+        proximity = 1.0 / mx.square(1.0 + normalized_gap)
+        ramp = mx.minimum(self._SOFT_BIAS_FACTOR * progress * proximity, 1.0)
+        target = end_logit + ramp * (
+            (top_logit + self._SOFT_BIAS_MAX_OVERSHOOT) - end_logit
+        )
+        logits[..., next_id : next_id + 1] = mx.where(eligible, target, end_logit)
         return logits
 
     def _next_close_token_id(self) -> int:

@@ -827,7 +827,7 @@ class TestSoftThinkingBudget:
     BUDGET = 10
     FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
     FACTOR = ThinkingBudgetProcessor._SOFT_BIAS_FACTOR
-    MAX_GAP = 30.0
+    TOP_K = 32
     MAX_OVERSHOOT = 1.0
     SOFT_START = int(BUDGET * FRAC)
     SPAN = BUDGET - SOFT_START
@@ -853,22 +853,60 @@ class TestSoftThinkingBudget:
         logits[0, self.THINK_END_ID] = end
         return logits
 
+    def _ranked_logits(
+        self,
+        *,
+        end: float,
+        top: float = 40.0,
+        above_end_count: int = 31,
+        vocab_size: int = 100,
+    ):
+        """Logits where the close token has a controlled top-k rank."""
+        logits = mx.zeros((1, vocab_size))
+        for rank in range(above_end_count):
+            logits[0, rank] = top - (top - end) * rank / max(above_end_count, 1)
+        logits[0, self.THINK_END_ID] = end
+        return logits
+
+    def _outside_topk_logits(
+        self,
+        *,
+        end: float = 20.0,
+        top: float = 40.0,
+        step: float = 0.5,
+        vocab_size: int = 100,
+    ):
+        """Close token is within a fixed gap, but outside the top-k set."""
+        logits = mx.zeros((1, vocab_size))
+        for rank in range(self.TOP_K):
+            logits[0, rank] = top - step * rank
+        logits[0, self.THINK_END_ID] = end
+        return logits
+
     def _step(self, proc, n_tokens: int, logits=None):
         """Run proc for a history of n_tokens generated tokens."""
         tokens = _make_tokens(*range(10, 10 + n_tokens))
         return proc(tokens, logits if logits is not None else _make_logits())
 
-    def _expected_end_logit(self, step: int, top: float = 5.0, end: float = 0.0) -> float:
+    def _expected_end_logit(
+        self,
+        step: int,
+        top: float = 5.0,
+        end: float = 0.0,
+        kth: float = 0.0,
+    ) -> float:
         """Expected close-think logit at a given think step."""
         if step <= self.SOFT_START:
             return end
-        gap_to_top = top - end
-        if gap_to_top > self.MAX_GAP:
+        if end < kth:
             return end
         progress = (step - self.SOFT_START) / max(1, self.SPAN)
-        boost_gap = max(gap_to_top, 1.0)
-        boosted = end + self.FACTOR * boost_gap * progress
-        return min(boosted, top + self.MAX_OVERSHOOT)
+        gap_to_top = max(top - end, 0.0)
+        topk_span = max(top - kth, 1e-6)
+        normalized_gap = gap_to_top / topk_span
+        proximity = 1.0 / (1.0 + normalized_gap) ** 2
+        ramp = min(self.FACTOR * progress * proximity, 1.0)
+        return end + ramp * ((top + self.MAX_OVERSHOOT) - end)
 
     def test_no_bias_before_soft_zone(self):
         """Up to the zone boundary, logits pass through unchanged."""
@@ -895,17 +933,39 @@ class TestSoftThinkingBudget:
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, self._ramp_logits(top=5.0))
+            logits = self._step(proc, step, self._ramp_logits(top=5.0, end=4.5))
         assert logits[0, self.THINK_END_ID].item() > 5.0
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(6.0)
 
     def test_soft_zone_does_not_boost_implausible_close_token(self):
-        """A close-think token far below the top logit is not promoted."""
+        """A close-think token outside the top-k set is not promoted."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, self._ramp_logits(top=60.0, end=0.0))
-        assert logits[0, self.THINK_END_ID].item() == 0.0
+            logits = self._step(proc, step, self._outside_topk_logits())
+        assert logits[0, self.THINK_END_ID].item() == 20.0
+
+    def test_soft_zone_prefers_near_top_close_token_over_topk_edge(self):
+        """A close token near the top gets a stronger final rank than one at
+        the edge of the top-k set."""
+        near_proc = self._make_processor()
+        edge_proc = self._make_processor()
+        near_logits = edge_logits = None
+        for step in range(1, self.BUDGET):
+            near_logits = self._step(
+                near_proc,
+                step,
+                self._ranked_logits(end=39.0, top=40.0, above_end_count=10),
+            )
+            edge_logits = self._step(
+                edge_proc,
+                step,
+                self._ranked_logits(end=10.0, top=40.0, above_end_count=31),
+            )
+        assert near_logits[0, self.THINK_END_ID].item() > edge_logits[
+            0, self.THINK_END_ID
+        ].item()
+        assert edge_logits[0, self.THINK_END_ID].item() > 10.0
 
     def test_hard_force_still_applies_at_budget(self):
         """The 100% hard force stays as the safety net."""
@@ -968,11 +1028,11 @@ class TestSoftThinkingBudget:
         assert logits[0, 42].item() == 0.0  # first id no longer targeted
 
     def test_min_gap_floor_when_end_already_near_top_is_capped(self):
-        """gap is floored at 1.0 so the ramp still progresses on flat logits."""
+        """Flat logits are maximally close and can use the overshoot cap."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, _make_logits())  # all zeros, gap->1.0
+            logits = self._step(proc, step, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.MAX_OVERSHOOT)
 
     def test_multi_token_wrong_prefix_falls_back_to_first_id(self):
@@ -1022,13 +1082,13 @@ class TestSoftThinkingBudget:
 
     def test_soft_zone_policy_constants(self):
         """The zone boundaries are product choices, not incidental values:
-        the soft zone covers the last 30% of the budget, only near-top close
+        the soft zone covers the last 30% of the budget, only top-k close
         tokens are eligible, and eligible tokens can only overtake the top by
         a small margin. Changing these values changes when models stop
         thinking; update the PR narrative together with this test."""
         assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
         assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
-        assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_GAP == 30.0
+        assert ThinkingBudgetProcessor._SOFT_BIAS_TOP_K == 32
         assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_OVERSHOOT == 1.0
 
     def test_degenerate_budgets_keep_the_hard_cut_contract(self):
@@ -1053,16 +1113,16 @@ class TestSoftThinkingBudget:
 
     def test_budget_four_gets_one_soft_step(self):
         """budget=4 is the smallest budget with a live soft step: step 3
-        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 4
+        runs the ramp at progress 1/2, step 4
         is the hard wall."""
         proc = self._make_processor(budget=4)
         logits = self._step(proc, 1, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == 0.0
         logits = self._step(proc, 2, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == 0.0
-        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
+        # Flat logits: proximity is maximal, so the boost reaches the cap.
         logits = self._step(proc, 3, _make_logits())
         assert not proc._forcing
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * 0.5)
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.MAX_OVERSHOOT)
         self._step(proc, 4, _make_logits())
         assert proc._forcing
