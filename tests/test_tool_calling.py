@@ -1998,6 +1998,32 @@ class TestParseToolCallsGemma4Integration:
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
 
+    def test_fallback_parses_parenthesized_variant(self):
+        """End-to-end: the paren kwargs variant (#1846) reaches the Gemma 4
+        fallback (native parser raises) and is extracted instead of stripped.
+
+        Before the fix the block was deleted: native parser fails, the
+        curly-only fallback also fails, and the client gets empty content.
+        """
+        tok = self._make_gemma4_tokenizer()
+        text = (
+            '<|tool_call>\n'
+            'call:todo(todos=[{content:<|"|>Draft the plan<|"|>,'
+            'id:<|"|>todo-1<|"|>,status:<|"|>pending<|"|>}])\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "todo"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["todos"][0]["content"] == "Draft the plan"
+        assert args["todos"][0]["status"] == "pending"
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
     def test_brace_in_json_string_survives_remap(self):
         """A ``}`` inside a JSON double-quoted value must not truncate the
         args span, even when the parse then remaps onto a registered tool
@@ -2234,6 +2260,157 @@ class TestGemma4SingleQuotedArgs:
             "call:bad{:::}\ncall:good{x: 1}"
         )
         assert result == {"name": "good", "arguments": {"x": 1}}
+
+
+class TestGemma4ParenthesizedArgs:
+    """Tests for the parenthesized ``call:name(key=value, ...)`` variant.
+
+    Gemma 4 26B reproducibly degrades to this Python-kwargs form under
+    instruction-dense agentic load (#1846).  The nested grammar is identical
+    to the canonical curly form, so these tests focus on the new outer shell
+    (``()`` instead of ``{}``, ``=`` instead of ``:``) and on confirming the
+    #1854 security invariants hold on the new path.
+    """
+
+    def test_issue_1846_exact_format(self):
+        """The reporter's verbatim emission (3/3 captured samples)."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:todo(todos=[{content:<|"|>Clarify goal and draft labor '
+            'graph for t_77d3100f<|"|>,id:<|"|>todo-1<|"|>,'
+            'status:<|"|>pending<|"|>}])'
+        )
+        assert result == {
+            "name": "todo",
+            "arguments": {
+                "todos": [
+                    {
+                        "content": (
+                            "Clarify goal and draft labor graph "
+                            "for t_77d3100f"
+                        ),
+                        "id": "todo-1",
+                        "status": "pending",
+                    }
+                ]
+            },
+        }
+
+    def test_simple_kwargs_with_trailing_bare_value(self):
+        # The trailing bare value must not swallow the closing ``)``.
+        result = _parse_gemma4_tool_call_fallback(
+            'call:get_weather(location=<|"|>Tokyo<|"|>, units=metric)'
+        )
+        assert result == {
+            "name": "get_weather",
+            "arguments": {"location": "Tokyo", "units": "metric"},
+        }
+
+    def test_empty_paren_call(self):
+        result = _parse_gemma4_tool_call_fallback("call:ping()")
+        assert result == {"name": "ping", "arguments": {}}
+
+    def test_scalar_value_mix(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:f(a=1, b=<|"|>two<|"|>, c=true, d=null, e=3.5)'
+        )
+        assert result == {
+            "name": "f",
+            "arguments": {
+                "a": 1, "b": "two", "c": True, "d": None, "e": 3.5
+            },
+        }
+
+    def test_array_of_scalars(self):
+        result = _parse_gemma4_tool_call_fallback("call:f(items=[1, 2, 3])")
+        assert result == {"name": "f", "arguments": {"items": [1, 2, 3]}}
+
+    def test_namespaced_name_with_paren(self):
+        # Name grammar is shared with the curly head; remap is a later step.
+        result = _parse_gemma4_tool_call_fallback("call:google:mcp:todo(x=1)")
+        assert result == {"name": "google:mcp:todo", "arguments": {"x": 1}}
+
+    def test_mixed_curly_and_paren_siblings(self):
+        result = _parse_gemma4_tool_call_fallback("call:a{x: 1}\ncall:b(y=2)")
+        assert result == [
+            {"name": "a", "arguments": {"x": 1}},
+            {"name": "b", "arguments": {"y": 2}},
+        ]
+
+    def test_close_paren_inside_string_does_not_close_span(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:note(text=<|"|>smile :) and (parens)<|"|>)'
+        )
+        assert result == {
+            "name": "note",
+            "arguments": {"text": "smile :) and (parens)"},
+        }
+
+    def test_equals_inside_string_value_preserved(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:f(expr=<|"|>a=b=c<|"|>)'
+        )
+        assert result == {"name": "f", "arguments": {"expr": "a=b=c"}}
+
+    def test_curly_value_with_parens_unaffected(self):
+        # Regression guard: ``)`` is ordinary content in the curly form, so a
+        # value may contain parentheses.  This is why ``)`` is a bare-value
+        # terminator only when a paren container is open.
+        result = _gemma4_args_to_json_robust("{expr: f(x)}")
+        assert result == {"expr": "f(x)"}
+
+    def test_single_quoted_value_before_close_paren(self):
+        # The degeneration is a Python-kwargs shell, so single-quoted strings
+        # are its native string form (observed live on gemma-4-26b).  When such
+        # a value is the last argument its closing quote sits right before the
+        # call's ``)``, so ``)`` must anchor a single-quote close exactly as
+        # ``,``/``}``/``]`` do; otherwise the quotes leak into the value.
+        result = _parse_gemma4_tool_call_fallback(
+            "call:create_todo(content='clarify the goal')"
+        )
+        assert result == {
+            "name": "create_todo",
+            "arguments": {"content": "clarify the goal"},
+        }
+
+    def test_single_quoted_values_parity_curly_and_paren(self):
+        # Both shells normalize single-quoted values identically; the paren
+        # form must not retain the quotes the curly form strips.
+        curly = _gemma4_args_to_json_robust("{a: 'x', b: 'y'}")
+        paren = _parse_gemma4_tool_call_fallback("call:f(a='x', b='y')")
+        assert curly == {"a": "x", "b": "y"}
+        assert paren == {"name": "f", "arguments": {"a": "x", "b": "y"}}
+
+    def test_oversized_paren_args_fail_cleanly(self):
+        """Args beyond the length cap are a clean no-match, not a hang.
+
+        Guards the #1854 ReDoS: the paren head's optional/tolerant prefix on
+        the ``re`` module would backtrack O(n^2) hunting an opening ``(``.
+        """
+        huge = "call:f(a=" + "x" * 300_000 + ")"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(huge)
+
+    def test_deep_paren_nesting_fails_cleanly(self):
+        """Depth bound surfaces as ValueError, never RecursionError."""
+        deep = "call:f(" + "a={" * 80 + "1" + "}" * 80 + ")"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_nul_bytes_cannot_forge_references_paren(self):
+        """The NUL-placeholder forge vector stays closed on the paren path."""
+        result = _gemma4_args_to_json_robust(
+            '(a=<|"|>captured<|"|>, b=\x000\x00)'
+        )
+        assert result["a"] == "captured"
+        assert result["b"] == "\x000\x00"  # literal, NOT a copy of a
+
+    def test_paren_call_inside_quoted_value_not_double_parsed(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:a(x=1)\ncall:b(note=<|"|>use call:c(y=2) later<|"|>)'
+        )
+        assert isinstance(result, list)
+        assert [r["name"] for r in result] == ["a", "b"]
+        assert result[1]["arguments"]["note"] == "use call:c(y=2) later"
 
 
 class TestRemapToolCallNames:

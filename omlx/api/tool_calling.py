@@ -486,15 +486,37 @@ class _Gemma4ArgsTooComplexError(ValueError):
 # linear.  See test_oversized_args_fail_cleanly.
 _GEMMA4_CALL_HEAD = regex.compile(r"(?:call)?:?([\w.-]+(?::[\w.-]+)*)\{")
 
+# The parenthesized variant of the head (#1846): under instruction-dense
+# agentic load (large system prompt + many tool schemas + a big tool result)
+# Gemma 4 26B reproducibly degrades from ``call:name{...}`` to a Python-kwargs
+# shell ``call:name(key=value, ...)`` — same name grammar and same ``<|"|>``
+# string quoting, only the OUTER ``{}`` becomes ``()`` and the top-level
+# ``:`` separator becomes ``=``.  The nested grammar (objects, arrays, strings)
+# is unchanged, so the hardened transcoder is reused for the inner content; only
+# the outer shell needs a separate head + span scan.  Compiled with ``regex``,
+# not ``re``, for the SAME reason as ``_GEMMA4_CALL_HEAD``: the optional/tolerant
+# prefix makes ``re`` backtrack O(n^2) on a long bare value hunting an opening
+# ``(`` that never comes (the #1854 ReDoS).  See test_oversized_paren_args.
+_GEMMA4_CALL_HEAD_PAREN = regex.compile(r"(?:call)?:?([\w.-]+(?::[\w.-]+)*)\(")
+
+# Matching close character for each balanced opener the parsers track.
+_GEMMA4_CLOSE_CHAR = {"{": "}", "[": "]", "(": ")"}
+
 
 def _squote_close_positions(s: str) -> list:
     """Indices of single quotes that can CLOSE a single-quoted value.
 
     A closing quote is one whose next non-whitespace character is ``,``,
-    ``}``, ``]`` or end of input.  Anchoring closes this way (rather than
-    taking the first quote) keeps apostrophes inside values from pairing
-    across values: in ``{a: 'it's ok', b: 1}`` the quote in ``it's`` is
-    followed by ``s`` so it cannot close the string.
+    ``}``, ``]``, ``)`` or end of input.  ``)`` is an anchor for the
+    parenthesized variant (#1846): a single-quoted value can be the last
+    argument right before the call's closing paren, as in
+    ``call:f(msg='hi')`` where the quote is followed immediately by ``)``.
+    The curly form never closes a value with ``)`` (its values end at
+    ``,``/``}``/``]``), so adding it does not change curly parsing.
+    Anchoring closes this way (rather than taking the first quote) keeps
+    apostrophes inside values from pairing across values: in
+    ``{a: 'it's ok', b: 1}`` the quote in ``it's`` is followed by ``s`` so
+    it cannot close the string.
 
     Computed in one reverse pass so each lookup is O(log n) via bisect; a
     forward scan that peeks past whitespace at every quote would be
@@ -504,7 +526,7 @@ def _squote_close_positions(s: str) -> list:
     next_sig = ""  # next non-whitespace char AFTER the current index
     for idx in range(len(s) - 1, -1, -1):
         ch = s[idx]
-        if ch == "'" and (next_sig == "" or next_sig in ",}]"):
+        if ch == "'" and (next_sig == "" or next_sig in ",}])"):
             closes.append(idx)
         if not ch.isspace():
             next_sig = ch
@@ -513,10 +535,17 @@ def _squote_close_positions(s: str) -> list:
 
 
 def _scan_gemma4_args_span(
-    text: str, open_idx: int, squote_closes: list
+    text: str, open_idx: int, squote_closes: list,
+    open_ch: str = "{", close_ch: str = "}",
 ) -> int:
-    """Return the end index (exclusive) of the balanced ``{...}`` starting at
-    ``open_idx``, or -1 if no balanced span exists within bounds.
+    """Return the end index (exclusive) of the balanced ``open_ch...close_ch``
+    span starting at ``open_idx``, or -1 if no balanced span exists within
+    bounds.  Defaults to braces (the canonical ``call:name{...}`` form); the
+    parenthesized variant (#1846) passes ``(``/``)`` to find the call's outer
+    span — nested ``{}``/``[]`` then pass through as ordinary characters for
+    depth purposes (only the tracked pair is counted), while the string-skip
+    logic below is character-agnostic so a ``)`` inside any string still
+    cannot close the span.
 
     Iterative single-pass walk that counts brace depth only OUTSIDE string
     literals (``<|"|>``-paired strings, standard JSON double-quoted strings,
@@ -569,16 +598,16 @@ def _scan_gemma4_args_span(
             i = j + 1
             last_sig = '"'
             continue
-        if ch == "'" and last_sig in ":,[":
+        if ch == "'" and last_sig in ":=,[":
             k = bisect.bisect_right(squote_closes, i)
             if k < len(squote_closes):
                 i = squote_closes[k] + 1
                 last_sig = "'"
                 continue
             # No valid close ahead: treat the quote as ordinary content.
-        if ch == "{":
+        if ch == open_ch:
             depth += 1
-        elif ch == "}":
+        elif ch == close_ch:
             depth -= 1
             if depth == 0:
                 return i + 1
@@ -688,17 +717,22 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
     while True:
         i = _skip_ws(i)
         if expect == "object":
-            if i >= n or args_str[i] != "{":
-                raise ValueError("Gemma 4 args must start with '{'")
+            # The outer container is ``{`` for the canonical form and ``(`` for
+            # the parenthesized variant (#1846).  Either way it is an object;
+            # we always emit ``{`` to JSON and remember the real opener on the
+            # stack so its matching closer (``}`` or ``)``) is accepted below.
+            if i >= n or args_str[i] not in "{(":
+                raise ValueError("Gemma 4 args must start with '{' or '('")
             out.append("{")
-            stack.append("{")
+            stack.append(args_str[i])
             i += 1
             expect = "key"
         elif expect == "key":
             if i >= n:
                 raise ValueError("unterminated object")
-            if args_str[i] == "}":
-                # Empty object, or tolerated trailing comma.
+            if args_str[i] == _GEMMA4_CLOSE_CHAR[stack[-1]]:
+                # Empty object, or tolerated trailing comma.  Closer is ``}``
+                # for a ``{`` opener and ``)`` for the paren variant's ``(``.
                 if out and out[-1] == ", ":
                     out.pop()
                 out.append("}")
@@ -714,17 +748,27 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 if marked is not None:
                     key, i = marked
                 else:
-                    # Bare key: everything up to the colon.
+                    # Bare key: everything up to the separator.  ``=`` is a
+                    # separator too for the parenthesized kwargs variant
+                    # (#1846), so it bounds the key just like ``:``.
                     j = i
-                    while j < n and args_str[j] not in ":,{}[]'\"":
+                    while j < n and args_str[j] not in ":=,{}[]'\"":
                         j += 1
                     key = args_str[i:j].strip()
                     if not key:
                         raise ValueError("malformed object key")
                     i = j
             i = _skip_ws(i)
-            if i >= n or args_str[i] != ":":
-                raise ValueError("expected ':' after object key")
+            # Accept ``=`` as well as ``:`` — the parenthesized variant (#1846)
+            # uses ``key=value``.  This is applied universally (not only at top
+            # level), so it does widen the curly grammar to also accept ``=``
+            # separators; that is a strict superset, so every valid ``:``-based
+            # curly parse is unchanged and a previously-rejected ``{a = 1}`` now
+            # succeeds rather than corrupting anything.  ``=`` inside a value is
+            # untouched: strings are read atomically and bare values stop only
+            # at ``,``/``}``/``]`` (plus ``)`` when a paren container is open).
+            if i >= n or args_str[i] not in ":=":
+                raise ValueError("expected ':' or '=' after object key")
             out.append(json.dumps(key))
             out.append(": ")
             i += 1
@@ -766,9 +810,17 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
                 out.append(json.dumps(content))
                 expect = "delim"
                 continue
-            # Bare value: runs to the next structural separator.
+            # Bare value: runs to the next structural separator.  When the
+            # call uses the parenthesized outer shell (#1846), ``)`` also
+            # terminates a bare value so the closing paren of the call is not
+            # swallowed (``call:f(units=metric)`` — the value is ``metric``,
+            # not ``metric)``).  For the curly form ``)`` stays ordinary
+            # content so a value may legitimately contain parentheses
+            # (``{expr: f(x)}``).  ``(`` is only ever the outermost container,
+            # so its presence on the stack is the reliable signal.
+            stops = ",)}]" if "(" in stack else ",}]"
             j = i
-            while j < n and args_str[j] not in ",}]":
+            while j < n and args_str[j] not in stops:
                 j += 1
             value = args_str[i:j].strip()
             i = j
@@ -795,8 +847,11 @@ def _gemma4_transcode_to_json(args_str: str) -> dict:
             if ch == ",":
                 out.append(", ")
                 i += 1
-                expect = "key" if stack[-1] == "{" else "value"
-            elif ch == "}" and stack[-1] == "{":
+                # After a comma, an object (``{`` or the paren outer ``(``)
+                # expects a key; an array expects a value.
+                expect = "key" if stack[-1] in "{(" else "value"
+            elif stack[-1] in "{(" and ch == _GEMMA4_CLOSE_CHAR[stack[-1]]:
+                # Object close: ``}`` for ``{``, ``)`` for the paren outer.
                 out.append("}")
                 stack.pop()
                 i += 1
@@ -914,6 +969,11 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     - bare string values without ``<|"|>`` delimiters
     - single-quoted values, including commas, colons, braces and
       apostrophes inside them (#1830)
+    - the parenthesized kwargs variant ``call:name(key=value, ...)`` that
+      Gemma 4 26B degrades to under instruction-dense agentic load (#1846).
+      The nested grammar is identical to the curly form, so only the outer
+      ``()`` shell and the ``=`` separator are new; both head forms are
+      collected and processed in document order (see below).
     - degenerate ``call:`` prefixes from the diffusion lane's parallel
       denoising, which can drop a token from the opening (observed live:
       ``calldone{...}`` — missing colon — and ``:done{...}`` — missing
@@ -927,15 +987,30 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     recovery, thinking-content promotion), not just this one.
     """
     squote_closes = _squote_close_positions(text)
+
+    # Collect heads from both the canonical curly form and the parenthesized
+    # variant (#1846), then process them in document order so the consumed-span
+    # dedup below holds across BOTH forms: a curly head that falls inside an
+    # already-consumed paren span (the inner ``{...}`` of ``call:f(a={...})``)
+    # is string/structure content, not a sibling call, and must be skipped.
+    heads = [(m.start(), m, "{", "}") for m in _GEMMA4_CALL_HEAD.finditer(text)]
+    heads += [
+        (m.start(), m, "(", ")")
+        for m in _GEMMA4_CALL_HEAD_PAREN.finditer(text)
+    ]
+    heads.sort(key=lambda h: h[0])
+
     results = []
     consumed_until = 0
-    for m in _GEMMA4_CALL_HEAD.finditer(text):
-        # A "call:" inside an already-consumed args span is string content
+    for start, m, open_ch, close_ch in heads:
+        # A head inside an already-consumed args span is string content
         # (e.g. quoted prose mentioning a tool call), not a sibling call.
-        if m.start() < consumed_until:
+        if start < consumed_until:
             continue
         open_idx = m.end() - 1
-        end = _scan_gemma4_args_span(text, open_idx, squote_closes)
+        end = _scan_gemma4_args_span(
+            text, open_idx, squote_closes, open_ch, close_ch
+        )
         if end == -1:
             continue
         args_str = text[open_idx:end]
