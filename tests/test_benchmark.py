@@ -641,3 +641,69 @@ class TestSanitizeUploadError:
         from omlx.admin.benchmark import _sanitize_upload_error
         resp = self._resp(status=503, text="")
         assert _sanitize_upload_error(resp) == "HTTP 503"
+
+
+# =============================================================================
+# Throughput history persistence tests
+# =============================================================================
+
+
+class TestThroughputHistory:
+    """Persisted throughput history must survive restarts and tolerate a
+    partially-written log, since the file is appended to live during runs."""
+
+    def _settings(self, tmp_path):
+        s = MagicMock()
+        s.base_path = tmp_path
+        return s
+
+    def test_empty_when_no_file(self, tmp_path):
+        from omlx.admin.benchmark import get_throughput_history
+
+        with patch("omlx.settings.get_settings", return_value=self._settings(tmp_path)):
+            assert get_throughput_history() == []
+
+    def test_append_then_read_newest_first(self, tmp_path):
+        from omlx.admin.benchmark import (
+            _append_throughput_run,
+            get_throughput_history,
+        )
+
+        with patch("omlx.settings.get_settings", return_value=self._settings(tmp_path)):
+            _append_throughput_run({"timestamp": "2026-06-15T10:00:00Z", "model_id": "m1"})
+            _append_throughput_run({"timestamp": "2026-06-15T11:00:00Z", "model_id": "m2"})
+            hist = get_throughput_history()
+
+        assert [r["model_id"] for r in hist] == ["m2", "m1"]
+
+    def test_corrupt_line_is_skipped(self, tmp_path):
+        from omlx.admin.benchmark import (
+            _append_throughput_run,
+            _throughput_history_path,
+            get_throughput_history,
+        )
+
+        with patch("omlx.settings.get_settings", return_value=self._settings(tmp_path)):
+            _append_throughput_run({"timestamp": "2026-06-15T10:00:00Z", "model_id": "m1"})
+            with open(_throughput_history_path(), "a") as f:
+                f.write("{ not valid json\n")
+            _append_throughput_run({"timestamp": "2026-06-15T12:00:00Z", "model_id": "m3"})
+            hist = get_throughput_history()
+
+        # The corrupt middle line must not break the read of the valid runs.
+        assert {r["model_id"] for r in hist} == {"m1", "m3"}
+
+    def test_reset_clears_and_is_idempotent(self, tmp_path):
+        from omlx.admin.benchmark import (
+            _append_throughput_run,
+            get_throughput_history,
+            reset_throughput_history,
+        )
+
+        with patch("omlx.settings.get_settings", return_value=self._settings(tmp_path)):
+            _append_throughput_run({"timestamp": "2026-06-15T10:00:00Z", "model_id": "m1"})
+            reset_throughput_history()
+            assert get_throughput_history() == []
+            # Resetting again with no file must not raise.
+            reset_throughput_history()
+            assert get_throughput_history() == []
