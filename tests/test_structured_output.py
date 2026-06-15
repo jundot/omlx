@@ -6,7 +6,7 @@ These tests cover the _inject_json_instruction function from server.py
 which is used for injecting JSON schema instructions into messages.
 """
 
-from omlx.server import _inject_json_instruction
+from omlx.server import _inject_json_instruction, _inject_thinking_budget_instruction
 
 
 class TestInjectJsonInstruction:
@@ -192,3 +192,45 @@ class TestInjectJsonInstructionEdgeCases:
         result = _inject_json_instruction(messages, instruction)
 
         assert "\u4e2d\u6587" in result[0]["content"]
+
+
+class TestInjectThinkingBudgetInstruction:
+    """Tests for thinking-budget prompt guidance."""
+
+    def test_appends_budget_to_leading_system_message(self):
+        messages = [
+            {"role": "system", "content": "You solve carefully."},
+            {"role": "user", "content": "2+2?"},
+        ]
+
+        result = _inject_thinking_budget_instruction(messages, 100)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert "You solve carefully." in result[0]["content"]
+        assert "fewer than 100 reasoning tokens" in result[0]["content"]
+
+    def test_prepends_system_message_when_missing(self):
+        messages = [{"role": "user", "content": "2+2?"}]
+
+        result = _inject_thinking_budget_instruction(messages, 50)
+
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert "fewer than 50 reasoning tokens" in result[0]["content"]
+        assert result[1]["role"] == "user"
+
+    def test_can_reference_final_json_answer(self):
+        messages = [{"role": "user", "content": "2+2?"}]
+
+        result = _inject_thinking_budget_instruction(messages, 50, final_json=True)
+
+        assert "fewer than 50 reasoning tokens" in result[0]["content"]
+        assert "final JSON answer" in result[0]["content"]
+
+    def test_does_not_inject_for_zero_budget(self):
+        messages = [{"role": "user", "content": "2+2?"}]
+
+        result = _inject_thinking_budget_instruction(messages, 0)
+
+        assert result == messages

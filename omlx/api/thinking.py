@@ -9,6 +9,7 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import math
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
@@ -399,14 +400,11 @@ class ThinkingBudgetProcessor:
     # Tuned on local validation: 0.7 stays closer to the requested budget while
     # still avoiding abrupt hard-wall cuts; see the PR for the sweep.
     _SOFT_ZONE_START_FRAC = 0.7
-    # Multiplier on the soft-zone ramp; 2.0 can reach the cap halfway through
-    # the zone when the close-think token is already very near the top.
-    _SOFT_BIAS_FACTOR = 2.0
-    # Use the top-k values to estimate the local candidate span without a full
-    # vocabulary sort.
-    _SOFT_BIAS_TOP_K = 32
-    # Allow a small push above the top logit, but cap it so the soft zone
-    # remains a nudge instead of a deterministic force.
+    # Sigmoid ramp shape for the soft zone. The close-token logit is pulled
+    # toward the current top logit near the hard wall, so the absolute boost
+    # naturally scales with how implausible the close token currently is.
+    _SOFT_SIGMOID_CENTER = 0.8
+    _SOFT_SIGMOID_SHARPNESS = 10.0
     _SOFT_BIAS_MAX_OVERSHOOT = 1.0
 
     def __init__(
@@ -433,7 +431,7 @@ class ThinkingBudgetProcessor:
         self._soft_start = int(budget * self._SOFT_ZONE_START_FRAC) if budget > 0 else 0
         # Invariant after construction; floored at 1 so tiny budgets cannot
         # divide by zero in the progress computation.
-        self._soft_span = max(1, budget - self._soft_start)
+        self._soft_span = max(1, budget - self._soft_start - 1)
 
         # State
         self._thinking_tokens: int = 0
@@ -490,14 +488,9 @@ class ThinkingBudgetProcessor:
     def _apply_soft_bias(self, logits, mx):
         """Progressively boost the close-think logit through the soft zone.
 
-        At each step, look at the model's top-k candidates to estimate the
-        local logit span, then raise the next valid close-think token toward
-        the top as the budget runs out. The closer it is to the top relative
-        to that span, the stronger the ramp.
-
-        Far-away close tokens get a weaker boost. The target can overtake
-        the top by a small fixed margin only, so the soft zone remains a nudge
-        instead of a deterministic force.
+        At each step, pull the next valid close-think token toward the current
+        top logit with a normalized sigmoid ramp. The absolute boost scales
+        with the gap, but only becomes strong late in the soft zone.
 
         The whole path stays in lazy MLX array ops — no ``.item()``/eval,
         so the decode loop never syncs on this bias (``progress`` comes
@@ -507,24 +500,28 @@ class ThinkingBudgetProcessor:
         marker fragment into the thinking text.
         """
         progress = (self._thinking_tokens - self._soft_start) / self._soft_span
+        ramp = self._normalized_soft_ramp(progress)
         next_id = self._next_close_token_id()
-        top_k = min(self._SOFT_BIAS_TOP_K, logits.shape[-1])
-        top_values = mx.topk(logits, k=top_k, axis=-1)
-        # MLX returns the selected values sorted ascending: kth ... top.
-        kth_logit = top_values[..., :1]
-        top_logit = top_values[..., -1:]
+        top_logit = mx.max(logits, axis=-1, keepdims=True)
         end_logit = logits[..., next_id : next_id + 1]
-
-        gap_to_top = mx.maximum(top_logit - end_logit, 0.0)
-        topk_span = mx.maximum(top_logit - kth_logit, 1e-6)
-        normalized_gap = gap_to_top / topk_span
-        proximity = 1.0 / (1.0 + normalized_gap)
-        ramp = mx.minimum(self._SOFT_BIAS_FACTOR * progress * proximity, 1.0)
-        target = end_logit + ramp * (
-            (top_logit + self._SOFT_BIAS_MAX_OVERSHOOT) - end_logit
+        logits[..., next_id : next_id + 1] = (
+            end_logit
+            + ramp * ((top_logit + self._SOFT_BIAS_MAX_OVERSHOOT) - end_logit)
         )
-        logits[..., next_id : next_id + 1] = target
         return logits
+
+    @classmethod
+    def _normalized_soft_ramp(cls, progress: float) -> float:
+        """Map soft-zone progress [0, 1] to a late-rising sigmoid [0, 1]."""
+        progress = min(max(progress, 0.0), 1.0)
+
+        def sigmoid(x: float) -> float:
+            return 1.0 / (1.0 + math.exp(-cls._SOFT_SIGMOID_SHARPNESS * x))
+
+        start = sigmoid(0.0 - cls._SOFT_SIGMOID_CENTER)
+        finish = sigmoid(1.0 - cls._SOFT_SIGMOID_CENTER)
+        value = sigmoid(progress - cls._SOFT_SIGMOID_CENTER)
+        return min(max((value - start) / (finish - start), 0.0), 1.0)
 
     def _next_close_token_id(self) -> int:
         """The only close-marker token that is valid to sample next.
