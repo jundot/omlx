@@ -401,11 +401,11 @@ class ThinkingBudgetProcessor:
     # still avoiding abrupt hard-wall cuts; see the PR for the sweep.
     _SOFT_ZONE_START_FRAC = 0.7
     # Sigmoid ramp shape for the soft zone. The close-token logit is pulled
-    # toward the current top logit near the hard wall, so the absolute boost
-    # naturally scales with how implausible the close token currently is.
+    # toward just below the current top logit near the hard wall, so the
+    # soft path nudges without becoming a deterministic force before 100%.
     _SOFT_SIGMOID_CENTER = 0.8
     _SOFT_SIGMOID_SHARPNESS = 10.0
-    _SOFT_BIAS_MAX_OVERSHOOT = 1.0
+    _SOFT_TARGET_MARGIN = 0.25
 
     def __init__(
         self,
@@ -488,9 +488,10 @@ class ThinkingBudgetProcessor:
     def _apply_soft_bias(self, logits, mx):
         """Progressively boost the close-think logit through the soft zone.
 
-        At each step, pull the next valid close-think token toward the current
-        top logit with a normalized sigmoid ramp. The absolute boost scales
-        with the gap, but only becomes strong late in the soft zone.
+        At each step, pull the next valid close-think token toward just below
+        the current top logit with a normalized sigmoid ramp. The absolute
+        boost scales with the gap, but only becomes strong late in the soft
+        zone and never overtakes the model's preferred token.
 
         The whole path stays in lazy MLX array ops — no ``.item()``/eval,
         so the decode loop never syncs on this bias (``progress`` comes
@@ -504,10 +505,9 @@ class ThinkingBudgetProcessor:
         next_id = self._next_close_token_id()
         top_logit = mx.max(logits, axis=-1, keepdims=True)
         end_logit = logits[..., next_id : next_id + 1]
-        logits[..., next_id : next_id + 1] = (
-            end_logit
-            + ramp * ((top_logit + self._SOFT_BIAS_MAX_OVERSHOOT) - end_logit)
-        )
+        target_logit = top_logit - self._SOFT_TARGET_MARGIN
+        boosted_logit = end_logit + ramp * (target_logit - end_logit)
+        logits[..., next_id : next_id + 1] = mx.maximum(end_logit, boosted_logit)
         return logits
 
     @classmethod

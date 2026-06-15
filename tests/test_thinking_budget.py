@@ -829,7 +829,7 @@ class TestSoftThinkingBudget:
     FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
     CENTER = 0.8
     SHARPNESS = 10.0
-    MAX_OVERSHOOT = 1.0
+    TARGET_MARGIN = 0.25
     SOFT_START = int(BUDGET * FRAC)
 
     def _make_processor(self, budget: int = None, soft_budget: bool = True, end_ids=None):
@@ -906,7 +906,8 @@ class TestSoftThinkingBudget:
         finish = 1.0 / (1.0 + math.exp(-self.SHARPNESS * (1.0 - self.CENTER)))
         value = 1.0 / (1.0 + math.exp(-self.SHARPNESS * (progress - self.CENTER)))
         ramp = (value - start) / max(finish - start, 1e-6)
-        return end + ramp * ((top + self.MAX_OVERSHOOT) - end)
+        target = end + ramp * ((top - self.TARGET_MARGIN) - end)
+        return max(end, target)
 
     def test_no_bias_before_soft_zone(self):
         """Up to the zone boundary, logits pass through unchanged."""
@@ -928,15 +929,16 @@ class TestSoftThinkingBudget:
             assert boosts[step - 1] == pytest.approx(self._expected_end_logit(step))
         assert boosts[self.BUDGET - 2] > boosts[self.SOFT_START]
 
-    def test_soft_zone_uses_sigmoid_gap_aware_target(self):
-        """The soft nudge pulls toward the top logit near the hard wall."""
+    def test_soft_zone_uses_sigmoid_top_margin_target(self):
+        """The soft nudge pulls near, but not above, the top logit."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits(top=5.0, end=0.0))
         target = self._expected_end_logit(self.BUDGET - 1, top=5.0, end=0.0)
-        assert target == pytest.approx(6.0)
+        assert target == pytest.approx(4.75)
         assert logits[0, self.THINK_END_ID].item() == pytest.approx(target)
+        assert logits[0, self.THINK_END_ID].item() < logits[0, 7].item()
 
     def test_soft_zone_boost_scales_with_gap_to_top(self):
         """Far-away close tokens get a larger absolute boost."""
@@ -971,8 +973,17 @@ class TestSoftThinkingBudget:
         near_boost = near_logits[0, self.THINK_END_ID].item() - 20.0
         far_boost = far_logits[0, self.THINK_END_ID].item() - 5.0
         assert far_boost > near_boost
-        assert near_logits[0, self.THINK_END_ID].item() == pytest.approx(41.0)
-        assert far_logits[0, self.THINK_END_ID].item() == pytest.approx(41.0)
+        assert near_logits[0, self.THINK_END_ID].item() == pytest.approx(39.75)
+        assert far_logits[0, self.THINK_END_ID].item() == pytest.approx(39.75)
+
+    def test_soft_zone_never_overtakes_top_before_hard_cut(self):
+        """The soft path must not become a temperature-0 hard force."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits(top=10.0, end=-20.0))
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(9.75)
+        assert logits[0, self.THINK_END_ID].item() < logits[0, 7].item()
 
     def test_soft_zone_prefers_near_top_close_token_before_saturation(self):
         """Before the ramp saturates, near-top close tokens stay more natural."""
@@ -1055,15 +1066,13 @@ class TestSoftThinkingBudget:
         assert logits[0, 43].item() > 0.0  # continuation id boosted
         assert logits[0, 42].item() == 0.0  # first id no longer targeted
 
-    def test_flat_logits_receive_the_overshoot_cap_near_hard_wall(self):
-        """Flat logits can overtake the top by the configured cap."""
+    def test_flat_logits_are_not_penalized_or_forced_by_soft_zone(self):
+        """Flat logits already leave the close token tied with the top."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
             logits = self._step(proc, step, _make_logits())
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(
-            self._expected_end_logit(self.BUDGET - 1, top=0.0)
-        )
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(0.0)
 
     def test_multi_token_wrong_prefix_falls_back_to_first_id(self):
         """A generated tail that matches a LATER marker id (not a proper
@@ -1118,7 +1127,7 @@ class TestSoftThinkingBudget:
         assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
         assert ThinkingBudgetProcessor._SOFT_SIGMOID_CENTER == 0.8
         assert ThinkingBudgetProcessor._SOFT_SIGMOID_SHARPNESS == 10.0
-        assert ThinkingBudgetProcessor._SOFT_BIAS_MAX_OVERSHOOT == 1.0
+        assert ThinkingBudgetProcessor._SOFT_TARGET_MARGIN == 0.25
 
     def test_degenerate_budgets_keep_the_hard_cut_contract(self):
         """Tiny budgets must degrade to the hard cut without a crash or a
@@ -1149,9 +1158,10 @@ class TestSoftThinkingBudget:
         assert logits[0, self.THINK_END_ID].item() == 0.0
         logits = self._step(proc, 2, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == 0.0
-        # Flat logits reach the midpoint of the normalized ramp.
+        # Flat logits already tie the close token with the top, so the soft
+        # path leaves them unchanged rather than manufacturing a forced close.
         logits = self._step(proc, 3, _make_logits())
         assert not proc._forcing
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(1.0)
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(0.0)
         self._step(proc, 4, _make_logits())
         assert proc._forcing
