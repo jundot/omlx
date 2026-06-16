@@ -103,7 +103,8 @@ private struct APIKeyEditorRow: View {
                           comment: "Row label for the API key editor"),
             sublabel: sublabel, isLast: true) {
             HStack(spacing: 6) {
-                field
+                TextInput("security.api_key.row_label", text: $draft, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: 260)
+                    .onSubmit { Task { await save() } }
                 iconButton(systemName: showKey ? "eye.slash" : "eye",
                            help: showKey
                                 ? String(localized: "security.api_key.hide",
@@ -121,7 +122,7 @@ private struct APIKeyEditorRow: View {
                     draft = APIKeyGenerator.random()
                     showKey = true
                 }
-                iconButton(systemName: copied ? "checkmark" : "doc.on.doc",
+                iconButton(systemName: copied ? "checkmark" : "document.on.document",
                            help: String(localized: "security.api_key.copy",
                                         defaultValue: "Copy to clipboard",
                                         comment: "Tooltip on the API key copy button"),
@@ -147,34 +148,6 @@ private struct APIKeyEditorRow: View {
         .task(id: loaded) {
             if !focused { draft = loaded }
         }
-    }
-
-    @ViewBuilder
-    private var field: some View {
-        Group {
-            if showKey {
-                TextField("sk-omlx-…", text: $draft)
-            } else {
-                SecureField("sk-omlx-…", text: $draft)
-            }
-        }
-        .focused($focused)
-        .textFieldStyle(.plain)
-        .font(.omlxMono(13, weight: .medium))
-        .foregroundStyle(theme.text)
-        .padding(.horizontal, 10)
-        .frame(height: 28)
-        .frame(width: 260)
-        .background(theme.inputBg)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(
-                    focused ? theme.inputBorderFocus : theme.inputBorder,
-                    lineWidth: 0.5
-                )
-        )
-        .onSubmit { Task { await save() } }
     }
 
     @ViewBuilder

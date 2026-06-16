@@ -133,46 +133,6 @@ private struct ProjectSection: View {
     }
 }
 
-private struct LinkRow: View {
-    let label: String
-    let sublabel: String
-    let icon: String
-    let url: URL
-    var isLast: Bool = false
-
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        FreeRow(isLast: isLast) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 14))
-                    .foregroundStyle(theme.textSecondary)
-                    .frame(width: 18, alignment: .center)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(label)
-                        .font(.omlxText(13, weight: .medium))
-                        .foregroundStyle(theme.text)
-                    Text(sublabel)
-                        .font(.omlxText(11))
-                        .foregroundStyle(theme.textSecondary)
-                }
-                Spacer(minLength: 8)
-                Button {
-                    NSWorkspace.shared.open(url)
-                } label: {
-                    Label(String(localized: "common.open",
-                                 defaultValue: "Open",
-                                 comment: "Button label that opens the linked URL in the default browser"),
-                          systemImage: "arrow.up.right.square")
-                        .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.omlx(.normal, size: .small))
-            }
-        }
-    }
-}
-
 // MARK: - License
 
 private struct LicenseSection: View {
@@ -265,29 +225,15 @@ private struct CreditsSection: View {
 
         ListGroup {
             ForEach(Array(credits.enumerated()), id: \.element.id) { idx, credit in
-                FreeRow(isLast: idx == credits.count - 1) {
-                    HStack(spacing: 10) {
-                        Squircle(systemSymbol: "cpu",
-                                 size: 26,
-                                 gradient: SquircleGradient.models)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(credit.name)
-                                .font(.omlxText(13, weight: .medium))
-                                .foregroundStyle(theme.text)
-                            Text(credit.role)
-                                .font(.omlxText(11))
-                                .foregroundStyle(theme.textSecondary)
-                                .lineLimit(2)
-                        }
-                        Spacer(minLength: 8)
-                        Button {
-                            NSWorkspace.shared.open(credit.url)
-                        } label: {
-                            Image(systemName: "arrow.up.right.square")
-                                .font(.system(size: 12))
-                        }
-                        .buttonStyle(.omlx(.plain, size: .small))
-                    }
+                LinkRow(
+                    label: credit.name,
+                    sublabel: credit.role,
+                    url: credit.url,
+                    isLast: idx == credits.count - 1
+                ) {
+                    Squircle(systemSymbol: "cpu",
+                             size: 26,
+                             gradient: SquircleGradient.models)
                 }
             }
         }

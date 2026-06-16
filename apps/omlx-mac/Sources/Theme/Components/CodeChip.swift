@@ -19,7 +19,7 @@ struct CodeChip: View {
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                Image(systemName: copied ? "checkmark" : "document.on.document")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(copied ? theme.successText : theme.textSecondary)
                     .animation(.easeOut(duration: 0.12), value: copied)
@@ -59,7 +59,7 @@ struct CopyIconButton: View {
 
     var body: some View {
         Button(action: copy) {
-            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+            Image(systemName: copied ? "checkmark" : "document.on.document")
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(copied ? theme.successText : theme.textSecondary)
                 .frame(width: 22, height: 22)

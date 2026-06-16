@@ -70,7 +70,6 @@ private struct ClaudeCodeSection: View {
                                           comment: "Claude Code mode option: route to local server")),
                     ]
                 )
-                .frame(width: 160)
             }
             if vm.claudeMode == "local" {
                 Row(label: String(localized: "integrations.claude.opus",
@@ -260,7 +259,7 @@ private struct CopyButton: View {
                 copied = false
             }
         } label: {
-            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+            Image(systemName: copied ? "checkmark" : "document.on.document")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(copied ? theme.successText : theme.textSecondary)
                 .padding(5)

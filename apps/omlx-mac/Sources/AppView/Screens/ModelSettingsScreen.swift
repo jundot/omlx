@@ -27,7 +27,7 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model, onBack: { services.modelDetailID = nil })
+            Header(model: vm.model)
 
             SectionPicker(selection: $vm.section)
 
@@ -61,7 +61,25 @@ struct ModelSettingsScreen: View {
                     .padding(.top, 8)
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                backButton
+            }
+        }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+    }
+
+    @ViewBuilder
+    private var backButton: some View {
+        Button {
+            services.modelDetailID = nil
+        } label: {
+            Label(String(localized: "settings.header.back_to_models",
+                         defaultValue: "Back to Models",
+                         comment: "Back button label at the top of the per-model settings screen"),
+                  systemImage: "chevron.left")
+                .labelStyle(.iconOnly)
+        }
     }
 }
 
@@ -69,8 +87,6 @@ struct ModelSettingsScreen: View {
 
 private struct Header: View {
     let model: ModelDTO?
-    let onBack: () -> Void
-
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -96,17 +112,7 @@ private struct Header: View {
                 }
             }
             .layoutPriority(1)
-            Spacer(minLength: 8)
-            Button {
-                onBack()
-            } label: {
-                Label(String(localized: "settings.header.back_to_models",
-                             defaultValue: "Back to Models",
-                             comment: "Back button label at the top of the per-model settings screen"),
-                      systemImage: "chevron.left")
-                    .labelStyle(.titleAndIcon)
-            }
-            .buttonStyle(.omlx(.plain, size: .small))
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
@@ -126,7 +132,6 @@ private struct SectionPicker: View {
                     ($0, $0.label)
                 }
             )
-            .frame(width: 320)
             Spacer()
         }
         .padding(.horizontal, 14)
@@ -1544,12 +1549,6 @@ final class ModelSettingsScreenVM: ObservableObject {
     static let diffusionConfigModelTypes: Set<String> = [
         "diffusion_gemma",
     ]
-    /// `config_model_type` values accepted by the HTML admin's VLM MTP
-    /// assistant-drafter picker. Mirrored from `dashboard.js`
-    /// (`VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES`).
-    static let vlmMtpDrafterConfigModelTypes: Set<String> = [
-        "gemma4_assistant", "gemma4_unified_assistant", "qwen3_5_mtp",
-    ]
     static let diffusionUnsupportedCtKwargKeys: Set<String> = [
         "enable_thinking", "reasoning_effort", "preserve_thinking",
     ]
@@ -2035,9 +2034,9 @@ final class ModelSettingsScreenVM: ObservableObject {
     }
 
     /// Draft-model options for VLM MTP. mlx-vlm's MTP loop takes an
-    /// assistant drafter. Match the HTML editor by accepting known
-    /// config-derived drafter types first, then falling back to names that
-    /// contain "assistant" or a standalone "mtp" token.
+    /// "assistant" drafter, so the picker filters to model ids containing
+    /// "assistant" (case-insensitive), matching the HTML editor's filter,
+    /// and drops the current model so it can't draft for itself.
     ///
     /// The stored value is the model **id**, not its path: the server
     /// resolves the drafter by registry id (`engine_pool` looks it up in
@@ -2050,30 +2049,11 @@ final class ModelSettingsScreenVM: ObservableObject {
                         comment: "Initial placeholder option in the VLM MTP draft-model picker")),
         ]
         for m in allModels
-        where Self.isVlmMtpDraftModelCandidate(m, currentModelID: modelID) {
+        where m.id != modelID
+            && m.id.range(of: "assistant", options: .caseInsensitive) != nil {
             out.append((m.id, m.id))
         }
         return out
-    }
-
-    static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
-        guard model.id != currentModelID else { return false }
-
-        if let type = model.configModelType?.lowercased(),
-           vlmMtpDrafterConfigModelTypes.contains(type) {
-            return true
-        }
-
-        let searchText = [model.id, model.modelPath]
-            .compactMap { $0 }
-            .joined(separator: " ")
-        if searchText.range(of: "assistant", options: .caseInsensitive) != nil {
-            return true
-        }
-        return searchText.range(
-            of: #"(^|[-_/\s])mtp($|[-_/\s])"#,
-            options: [.regularExpression, .caseInsensitive]
-        ) != nil
     }
 
     var isDSAConfigModel: Bool {

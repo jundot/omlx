@@ -4,43 +4,20 @@ import SwiftUI
 
 struct Segmented<Value: Hashable>: View {
     @Binding var selection: Value
+    let titleKey: LocalizedStringKey = ""
     let options: [(value: Value, label: String)]
 
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(options.indices, id: \.self) { i in
-                let opt = options[i]
-                let isSelected = opt.value == selection
-                Button {
-                    selection = opt.value
-                } label: {
-                    Text(opt.label)
-                        .font(.omlxText(11.5, weight: .medium))
-                        .foregroundStyle(isSelected ? theme.text : theme.textSecondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .frame(maxWidth: .infinity)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(isSelected ? theme.controlBg : Color.clear)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                        .strokeBorder(
-                                            isSelected ? theme.inputBorder : Color.clear,
-                                            lineWidth: 0.5
-                                        )
-                                )
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+        Picker(titleKey, selection: $selection) {
+            ForEach(options, id: \.value) { opt in
+                Text(opt.label)
+                    .tag(opt.value)
             }
         }
-        .padding(2)
-        .background(theme.inputBg)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .pickerStyle(.segmented)
+        .labelsHidden()
     }
 }
 

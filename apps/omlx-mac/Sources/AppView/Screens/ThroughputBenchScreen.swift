@@ -771,7 +771,7 @@ private struct UploadRow: View {
                 Spacer(minLength: 0)
             } else if let urlString = result.url, let url = URL(string: urlString) {
                 Image(systemName: result.duplicate == true
-                      ? "doc.on.doc"
+                      ? "document.on.document"
                       : "checkmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(result.duplicate == true ? theme.textTertiary : theme.greenDot)

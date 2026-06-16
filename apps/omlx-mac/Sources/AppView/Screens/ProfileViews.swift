@@ -470,7 +470,6 @@ struct SaveAsPopover: View {
                                      comment: "Scope label for per-model profiles")),
                 ]
             )
-            .frame(width: 140)
             TextInput(text: $name,
                       placeholder: String(localized: "profile.save_as.name.placeholder",
                                           defaultValue: "profile-name",

@@ -15,48 +15,13 @@ struct LogsScreen: View {
                                   defaultValue: "Server Logs",
                                   comment: "Section header above the log tail pane on the Logs screen"),
                           subtitle: vm.subtitle) {
-                HStack(spacing: 6) {
-                    Popup(
-                        selection: $vm.lines,
-                        width: 110,
-                        options: [
-                            (100,
-                             String(localized: "logs.lines.100",
-                                    defaultValue: "Last 100",
-                                    comment: "Popup option to show the most recent 100 log lines")),
-                            (500,
-                             String(localized: "logs.lines.500",
-                                    defaultValue: "Last 500",
-                                    comment: "Popup option to show the most recent 500 log lines")),
-                            (1000,
-                             String(localized: "logs.lines.1000",
-                                    defaultValue: "Last 1,000",
-                                    comment: "Popup option to show the most recent 1,000 log lines")),
-                            (5000,
-                             String(localized: "logs.lines.5000",
-                                    defaultValue: "Last 5,000",
-                                    comment: "Popup option to show the most recent 5,000 log lines")),
-                            (20000,
-                             String(localized: "logs.lines.20000",
-                                    defaultValue: "Last 20,000",
-                                    comment: "Popup option to show the most recent 20,000 log lines")),
-                        ]
-                    )
-                    Button {
-                        Task { await vm.reload() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .buttonStyle(.omlx(.normal, size: .small))
-                    .disabled(vm.isLoading)
-                    Button(String(localized: "common.copy",
-                                  defaultValue: "Copy",
-                                  comment: "Button label to copy the visible log text to the pasteboard")) {
-                        vm.copyToPasteboard()
-                    }
-                        .buttonStyle(.omlx(.normal, size: .small))
-                        .disabled(vm.lines == 0 || vm.logText.isEmpty)
+                Button(String(localized: "common.copy",
+                              defaultValue: "Copy",
+                              comment: "Button label to copy the visible log text to the pasteboard")) {
+                    vm.copyToPasteboard()
                 }
+                              .buttonStyle(.omlx(.normal, size: .small))
+                              .disabled(vm.lines == 0 || vm.logText.isEmpty)
             }
 
             if vm.availableFiles.count > 1 {
@@ -89,12 +54,60 @@ struct LogsScreen: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                logLinesPicker
+                reloadButton
+            }
+        }
         .task(id: vm.refreshKey) {
             await vm.start(client: services.client)
         }
         .onChange(of: vm.lines) { _, _ in vm.bumpRefreshKey() }
         .onChange(of: vm.selectedFile) { _, _ in vm.bumpRefreshKey() }
         .onDisappear { vm.stop() }
+    }
+
+    @ViewBuilder
+    private var logLinesPicker: some View {
+        let lineOptions = [
+            (100,
+             String(localized: "logs.lines.100",
+                    defaultValue: "Last 100",
+                    comment: "Popup option to show the most recent 100 log lines")),
+            (500,
+             String(localized: "logs.lines.500",
+                    defaultValue: "Last 500",
+                    comment: "Popup option to show the most recent 500 log lines")),
+            (1000,
+             String(localized: "logs.lines.1000",
+                    defaultValue: "Last 1,000",
+                    comment: "Popup option to show the most recent 1,000 log lines")),
+            (5000,
+             String(localized: "logs.lines.5000",
+                    defaultValue: "Last 5,000",
+                    comment: "Popup option to show the most recent 5,000 log lines")),
+            (20000,
+             String(localized: "logs.lines.20000",
+                    defaultValue: "Last 20,000",
+                    comment: "Popup option to show the most recent 20,000 log lines")),
+        ]
+
+        Popup(
+            selection: $vm.lines,
+            width: 110,
+            options: lineOptions
+        )
+    }
+
+    @ViewBuilder
+    private var reloadButton: some View {
+        Button {
+            Task { await vm.reload() }
+        } label: {
+            Image(systemName: "arrow.clockwise")
+        }
+        .disabled(vm.isLoading)
     }
 }
 

@@ -38,7 +38,6 @@ struct StatusScreen: View {
                                             defaultValue: "All Time",
                                             comment: "Segmented control option: all-time stats")),
                     ])
-                    .frame(width: 160)
                     Button {
                         showingClearStatsConfirm = true
                     } label: {
@@ -442,26 +441,6 @@ private struct AverageSpeedTilesRow: View {
 
 // MARK: - System rows
 
-/// Horizontal usage bar shared by the GPU memory + system RAM rows.
-/// 140pt × 4pt to match the JSX `.metric-bar` block in the redesign.
-private struct UsageBar: View {
-    let progress: Double
-    let tint: Color
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(theme.codeBg)
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(tint)
-                .frame(width: 140 * max(0, min(progress, 1)))
-                .animation(.easeOut(duration: 0.4), value: progress)
-        }
-        .frame(width: 140, height: 4)
-    }
-}
-
 private struct GpuMemoryTrailing: View {
     let stats: StatsDTO?
     @Environment(\.omlxTheme) private var theme
@@ -470,7 +449,8 @@ private struct GpuMemoryTrailing: View {
         let used = stats?.activeModels.modelMemoryUsed
         let max = stats?.activeModels.modelMemoryMax
         HStack(spacing: 10) {
-            UsageBar(progress: progress, tint: theme.blueDot)
+            ProgressBar(progress: progress, tint: theme.blueDot)
+                .frame(width: 140)
             Text(labelText(used: used, max: max))
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)
@@ -501,7 +481,8 @@ private struct SystemRamTrailing: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            UsageBar(progress: progress, tint: theme.text.opacity(0.7))
+            ProgressBar(progress: progress, tint: theme.text.opacity(0.7))
+                .frame(width: 140)
             Text(labelText)
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)

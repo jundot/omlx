@@ -149,7 +149,6 @@ private struct SourceSwitcher: View {
                 selection: $source,
                 options: DownloadSource.allCases.map { ($0, $0.label) }
             )
-            .frame(width: 280)
             .disabled(!msAvailable)
             if !msAvailable {
                 Text(String(localized: "downloads.source.ms_unavailable",
@@ -664,7 +663,7 @@ private struct ActiveDownloadsSection: View {
                                              defaultValue: "Cancel",
                                              comment: "Tooltip on the X button that cancels or removes a download task"))
                             }
-                            ProgressBar(progress: task.progress / 100)
+                            ProgressBar(progress: task.progress / 100, colors: [Color(rgb24: 0x0A84FF), Color(rgb24: 0x5E5CE6)])
                             HStack(spacing: 12) {
                                 StatusChip(task: task)
                                 if !task.error.isEmpty {
@@ -717,31 +716,6 @@ private struct StatusChip: View {
             }
         }()
         StatusPill(status: .custom(color: cfg.0, label: cfg.1, fillBg: true))
-    }
-}
-
-private struct ProgressBar: View {
-    let progress: Double
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(theme.codeBg)
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(LinearGradient(
-                        colors: [
-                            Color(rgb24: 0x0A84FF),
-                            Color(rgb24: 0x5E5CE6),
-                        ],
-                        startPoint: .leading, endPoint: .trailing
-                    ))
-                    .frame(width: geo.size.width * max(0, min(progress, 1)))
-                    .animation(.easeOut(duration: 0.4), value: progress)
-            }
-        }
-        .frame(height: 4)
     }
 }
 

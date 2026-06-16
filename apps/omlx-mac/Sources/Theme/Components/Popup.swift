@@ -10,67 +10,35 @@ struct PopupOption<Value: Hashable>: Identifiable {
 
 struct Popup<Value: Hashable>: View {
     @Binding var selection: Value
+    var titleKey: LocalizedStringKey
     let options: [PopupOption<Value>]
     let width: CGFloat?
 
     @Environment(\.omlxTheme) private var theme
 
-    init(selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
+        self.titleKey = titleKey
         self._selection = selection
         self.options = options
         self.width = width
     }
 
-    init(
-        selection: Binding<Value>,
-        width: CGFloat? = nil,
-        options: [(Value, String)]
-    ) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [(Value, String)]) {
+        self.titleKey = titleKey
         self._selection = selection
         self.options = options.map { PopupOption(value: $0.0, label: $0.1) }
         self.width = width
     }
 
     var body: some View {
-        Menu {
+        Picker(titleKey, selection: $selection) {
             ForEach(options) { opt in
-                Button {
-                    selection = opt.value
-                } label: {
-                    HStack {
-                        Text(opt.label)
-                        if opt.value == selection {
-                            Spacer()
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                }
+                Text(opt.label)
+                    .tag(opt.value)
             }
-        } label: {
-            HStack(spacing: 8) {
-                Text(currentLabel)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 4)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 28)
-            .frame(maxWidth: width)
-            .background(theme.inputBg)
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(theme.inputBorder, lineWidth: 0.5)
-            )
-            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .labelsHidden()
+        .pickerStyle(.menu)
     }
 
     private var currentLabel: String {
@@ -81,7 +49,8 @@ struct Popup<Value: Hashable>: View {
 #Preview("Popup") {
     @Previewable @State var host = "127.0.0.1"
     @Previewable @State var quant = "q4"
-    return VStack(alignment: .leading, spacing: 14) {
+
+    VStack(alignment: .leading, spacing: 14) {
         Popup(selection: $host, width: 220, options: [
             ("127.0.0.1", "127.0.0.1 (Local only)"),
             ("0.0.0.0", "0.0.0.0 (All networks)"),
