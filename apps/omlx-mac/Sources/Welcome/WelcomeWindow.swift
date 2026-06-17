@@ -384,7 +384,11 @@ final class WelcomeViewModel: ObservableObject {
     @discardableResult
     func openWebDashboard() -> Bool {
         guard let services else { return false }
-        guard let url = URL(string: "http://\(services.config.host):\(services.config.port)/admin/dashboard") else {
+        guard let url = AppConfig.httpURL(
+            host: services.config.host,
+            port: services.config.port,
+            path: "/admin/dashboard"
+        ) else {
             return false
         }
         NSWorkspace.shared.open(url)
