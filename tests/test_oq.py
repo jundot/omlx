@@ -2840,8 +2840,8 @@ class TestBuildProxyForSensitivityMtpPatch:
         monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", mtp_mod)
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(convert=mock_convert))
 
-    def test_happy_path_with_active_patch(self, tmp_path, monkeypatch):
-        """MTP patch applied → state toggled → convert called with correct kwargs → state restored."""
+    def test_no_mtp_config_no_weights(self, tmp_path, monkeypatch):
+        """No MTP config → set_mtp_active(False), convert called with correct kwargs."""
         mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
             self._make_mocks()
         )
@@ -2860,7 +2860,8 @@ class TestBuildProxyForSensitivityMtpPatch:
 
         mock_apply.assert_called_once()
         assert mock_set_active.call_count == 2
-        assert mock_set_active.call_args_list[0] == ((True,),)
+        # Without MTP config or weights, mtp is set to False (not True)
+        assert mock_set_active.call_args_list[0] == ((False,),)
         assert mock_set_active.call_args_list[-1] == ((False,),)
 
         kw = mock_convert.call_args.kwargs
@@ -2871,6 +2872,101 @@ class TestBuildProxyForSensitivityMtpPatch:
         assert kw["q_mode"] == "affine"
         assert kw["dtype"] == "bfloat16"
         assert kw["trust_remote_code"] is True
+
+    def test_mtp_config_with_weights(self, tmp_path, monkeypatch):
+        """MTP config + MTP weights → set_mtp_active(True), convert called."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
+            self._make_mocks()
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        # Create a model directory with MTP config and weights index
+        model_dir = tmp_path / "mtp_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5", "mtp_num_hidden_layers": 1})
+        )
+        (model_dir / "model.safetensors.index.json").write_text(
+            json.dumps({
+                "weight_map": {
+                    "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                    "mtp.0.hc_head.weight": "model-00001-of-00001.safetensors",
+                }
+            })
+        )
+
+        result = _build_proxy_for_sensitivity(
+            str(model_dir),
+            dtype="bfloat16",
+            working_dir=str(tmp_path / "work"),
+            trust_remote_code=True,
+        )
+
+        assert isinstance(result, Path)
+        mock_apply.assert_called_once()
+        # With MTP config AND weights, mtp is set to True
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((True,),)
+        assert mock_set_active.call_args_list[-1] == ((False,),)
+
+        kw = mock_convert.call_args.kwargs
+        assert kw["hf_path"] == str(model_dir)
+        assert kw["quantize"] is True
+        assert kw["q_bits"] == _PROXY_QUANT_BITS
+        assert kw["q_group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert kw["q_mode"] == "affine"
+        assert kw["dtype"] == "bfloat16"
+        assert kw["trust_remote_code"] is True
+
+    def test_mtp_config_no_weights(self, tmp_path, monkeypatch):
+        """MTP config but no MTP weights → set_mtp_active(False) (Nex-N2-mini case)."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
+            self._make_mocks()
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        # Create a model directory with MTP config but NO weights (Nex-N2-mini case)
+        model_dir = tmp_path / "mtp_config_no_weights_model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5", "mtp_num_hidden_layers": 1})
+        )
+        # No index.json, so no MTP weights are found
+
+        result = _build_proxy_for_sensitivity(
+            str(model_dir),
+            dtype="bfloat16",
+            working_dir=str(tmp_path / "work"),
+        )
+
+        assert isinstance(result, Path)
+        mock_apply.assert_called_once()
+        # MTP config present but no weights → mtp is set to False
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((False,),)
+
+    def test_config_read_fails_logs_warning(self, tmp_path, monkeypatch):
+        """Config.json read failure → warning logged and MTP disabled."""
+        mtp_mod, mock_apply, mock_is_active, mock_set_active, mock_convert = (
+            self._make_mocks()
+        )
+        self._patch(monkeypatch, mtp_mod, mock_convert)
+
+        # Create a model directory with no config.json
+        model_dir = tmp_path / "no_config_model"
+        model_dir.mkdir()
+
+        result = _build_proxy_for_sensitivity(
+            str(model_dir),
+            dtype="bfloat16",
+            working_dir=str(tmp_path / "work"),
+        )
+
+        assert isinstance(result, Path)
+        mock_apply.assert_called_once()
+        # No config → mtp is set to False
+        assert mock_set_active.call_count == 2
+        assert mock_set_active.call_args_list[0] == ((False,),)
 
     @pytest.mark.parametrize("prev_state", [False, True])
     def test_state_restored_on_error(self, tmp_path, monkeypatch, prev_state):

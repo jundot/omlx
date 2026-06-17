@@ -437,6 +437,38 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
+def _should_activate_mtp_for_model(
+    config: dict, model_path: str | Path
+) -> tuple[bool, bool]:
+    """Decide whether MTP should be activated for this model.
+
+    Returns (activate, config_read_succeeded).  Activate is True only when
+    both conditions hold: the model declares MTP heads in config *and* it
+    actually ships ``mtp.*`` weights.  Some models like Nex-N2-mini declare
+    MTP heads but strip the weights during conversion, so both checks are
+    required to avoid a load failure.
+
+    ``config_read_succeeded`` is False when the config could not be read
+    (e.g. missing file, malformed JSON).  Callers should log a warning in
+    that case so the silent MTP-disable is not confusing.
+    """
+    if not _has_mtp_heads(config):
+        logger.debug(
+            "MTP: model does not declare MTP heads (config=%s)", config.get("model_type")
+        )
+        return False, True
+
+    if _checkpoint_has_mtp_weights(model_path):
+        logger.debug("MTP: model declares MTP heads and has mtp.* weights")
+        return True, True
+
+    logger.debug(
+        "MTP: model declares MTP heads but no mtp.* weights found in %s",
+        Path(model_path).name,
+    )
+    return False, True
+
+
 def load_text_model(
     model_name: str,
     tokenizer_config: dict[str, Any] | None = None,
