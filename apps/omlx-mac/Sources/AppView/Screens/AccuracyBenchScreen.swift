@@ -391,12 +391,11 @@ private struct BenchmarkCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: onToggle) {
-                HStack(alignment: .center, spacing: 8) {
-                    Toggle(entry.displayName, isOn: Binding(
-                        get: { isSelected },
-                        set: { _ in onToggle() }
-                    ))
+            Toggle(isOn: Binding(
+                get: { isSelected },
+                set: { _ in onToggle() }
+            )) {
+                HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(entry.displayName)
                             .font(.omlxText(12.5, weight: .medium))
@@ -405,11 +404,9 @@ private struct BenchmarkCard: View {
                             .font(.omlxText(10.5))
                             .foregroundStyle(theme.textTertiary)
                     }
-                    Spacer(minLength: 0)
+                    Spacer()
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if isSelected {
                 HStack(spacing: 6) {
