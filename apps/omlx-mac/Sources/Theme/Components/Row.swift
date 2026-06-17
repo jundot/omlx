@@ -145,7 +145,7 @@ struct LinkRow<Icon: View>: View {
             HStack(spacing: 10) {
                 iconView
                     .foregroundStyle(theme.textSecondary)
-                
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
                         .font(.omlxText(13, weight: .medium))
@@ -155,9 +155,9 @@ struct LinkRow<Icon: View>: View {
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(2)
                 }
-                
+
                 Spacer(minLength: 8)
-                
+
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {

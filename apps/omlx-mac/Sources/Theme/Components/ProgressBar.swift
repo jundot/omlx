@@ -20,7 +20,7 @@ struct ProgressBar: View {
         self.progress = progress
         self._colors = State(initialValue: colors)
     }
-    
+
     var body: some View {
         ProgressView(value: progress)
             .progressViewStyle(OMLXLinearProgressViewStyle(colors: colors))
@@ -67,7 +67,7 @@ struct OMLXLinearProgressViewStyle: ProgressViewStyle {
         ProgressBar(progress: progress, tint: .red)
         ProgressBar(progress: progress, colors: downloadsColors)
         ProgressBar(progress: progress, colors: quantizationColors)
-    
+
         Slider(value: $progress, in: 0.0...1.0)
     }
     .padding()
