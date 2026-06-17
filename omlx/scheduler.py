@@ -6099,7 +6099,7 @@ class Scheduler:
             return
         total_accepted = sum(lens)
         block_size = self._vlm_mtp_draft_block_size or int(
-            getattr(drafter.model.config, "block_size", 4)
+            getattr(drafter.model.config, "block_size", 3)
         )
         max_per_round = max(1, block_size - 1)
         acceptance_rate = total_accepted / (rounds * max_per_round)
