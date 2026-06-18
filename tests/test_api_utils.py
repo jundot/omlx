@@ -2369,6 +2369,44 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["system", "user"]
         assert result[0]["content"] == "Runtime tip"
 
+    def test_user_note_policy_merges_leading_system_messages(self):
+        """Multiple leading system messages must be merged even when a
+        mid-system message triggers the user_note_safe downgrade path.
+
+        Regression test for: Codex App Desktop sends ``instructions`` plus a
+        system/developer message in ``input``, producing two leading system
+        messages.  When a later mid-system message triggers
+        ``_downgrade_mid_system_to_user_notes``, the leading block was
+        preserved as-is (two separate system messages), causing strict
+        templates like Qwen3.6 to reject with
+        "System message must be at the beginning."
+        """
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "system", "content": "Be concise"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Remember this"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        # All leading system messages must be merged into one
+        assert result[0]["role"] == "system"
+        assert "You are a helpful assistant" in result[0]["content"]
+        assert "Be concise" in result[0]["content"]
+        # No second system message at position 1 — strict templates
+        # (Qwen3.6) require a single system message at the beginning.
+        assert result[1]["role"] != "system", (
+            "Leading system messages were not merged — Qwen3.6-style "
+            "templates would reject this with "
+            "'System message must be at the beginning.'"
+        )
+
     def test_falls_back_for_unsupported_mid_system_placement(self):
         messages = [
             {"role": "user", "content": "Hello"},
