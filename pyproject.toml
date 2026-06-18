@@ -94,6 +94,10 @@ grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
     "xgrammar>=0.1.32",
 ]
+jang = [
+    # JANG mixed-precision quantization for MoE models
+    "jang[mlx]>=0.1.0",
+]
 mcp = [
     "mcp>=1.0.0",
 ]

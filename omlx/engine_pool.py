@@ -29,6 +29,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.jang import JANGLoader
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
 from .engine.sts import STSEngine
@@ -56,7 +57,7 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "jang", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
@@ -400,9 +401,18 @@ class EnginePool:
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
                 entry.model_type = settings.model_type_override
-                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
-                    settings.model_type_override, "batched"
-                )
+                # JANG models must keep the jang engine even with a persisted
+                # model_type override — _MODEL_TYPE_TO_ENGINE has no 'jang' key,
+                # so deriving from it clobbers jang -> batched and the turboquant
+                # (tq_*) tensors fail to load ("Received N parameters not in model").
+                # resolve_jang_engine_type handles the "llm/vlm only" guard so that
+                # an embedding/audio model with a stray jang_config.json is not
+                # mis-routed to the jang engine.
+                from pathlib import Path as _Path
+                from .model_discovery import resolve_jang_engine_type as _resolve_jang
+                entry.engine_type = _resolve_jang(
+                    _Path(entry.model_path), settings.model_type_override
+                ) or self._MODEL_TYPE_TO_ENGINE.get(settings.model_type_override, "batched")
                 logger.info(
                     f"Applied model_type override for {model_id}: "
                     f"type={entry.model_type}, engine={entry.engine_type}"
@@ -1083,6 +1093,13 @@ class EnginePool:
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")
+            # NOTE: force_lm does NOT downgrade JANG VLMs.  JANG models with
+            # engine_type="jang" stay on the JANGLoader path regardless of
+            # force_lm; JANGLoader internally picks the VLM or LLM loader via
+            # _should_use_vlm_loader().  Downgrading a jang VLM to "batched"
+            # would send it to BatchedEngine (mlx-lm), which cannot load
+            # turboquant tensors.  Known limitation: text-only benchmarks on
+            # jang VLM models will still run the vision loader path.
             else:
                 logger.info(f"Loading model: {model_id}")
 
@@ -1116,6 +1133,17 @@ class EnginePool:
                     logger.warning(
                         "DFlash is not supported for diffusion models; "
                         "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif dflash_enabled and dflash_draft and effective_type == "jang":
+                    # DFlash is unsupported for JANG models: DFlashEngine uses the
+                    # generic mlx-lm/mlx-vlm load path which cannot handle JANG
+                    # turboquant (tq_*) tensors.  Skip dflash and fall through to
+                    # JANGLoader so the mixed-precision quantization is loaded correctly.
+                    logger.warning(
+                        "DFlash is not supported for JANG models (turboquant tensors "
+                        "require JANGLoader); ignoring dflash settings and loading %s "
+                        "with JANGLoader",
                         model_id,
                     )
                 elif dflash_enabled and dflash_draft:
@@ -1190,6 +1218,12 @@ class EnginePool:
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "jang":
+                    engine = JANGLoader(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(

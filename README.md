@@ -276,6 +276,7 @@ Models are auto-detected by type. You can also download models directly from the
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
+| JANG / JANGTQ | Mixed-precision MoE models (JANG v2 and mxtq TurboQuant formats); requires `pip install omlx[jang]` (engine_type: `jang`) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
