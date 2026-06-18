@@ -1847,12 +1847,12 @@ class TestEffectiveMaxSize:
             max_size_bytes=110 * 1024**3,  # 110GB configured
         )
 
-        # Simulate: cache currently has 10GB, disk free is 90GB
-        # So disk_available = 10GB + 90GB = 100GB
+        # Simulate: total disk is 100GB, configured max is 110GB
+        # disk_limit = int(100GB * 0.99) = 99GB
         manager._index._total_size = 10 * 1024**3
 
         mock_usage = self._make_disk_usage(
-            total=500 * 1024**3, used=410 * 1024**3, free=90 * 1024**3
+            total=100 * 1024**3, used=10 * 1024**3, free=90 * 1024**3
         )
         with patch("shutil.disk_usage", return_value=mock_usage):
             effective = manager._get_effective_max_size()
@@ -1907,12 +1907,13 @@ class TestEffectiveMaxSize:
             max_size_bytes=100 * 1024**3,
         )
 
-        # Simulate: cache has 50GB, but disk only has 10GB free
-        # So disk_available = 50GB + 10GB = 60GB, disk_limit = ~59.4GB
+        # Simulate: total disk is 60GB, cache has 50GB indexed
+        # disk_limit = int(60GB * 0.99) = ~59.4GB
+        # effective_max = min(100GB, 59.4GB) = 59.4GB
         manager._index._total_size = 50 * 1024**3
 
         mock_usage = self._make_disk_usage(
-            total=200 * 1024**3, used=190 * 1024**3, free=10 * 1024**3
+            total=60 * 1024**3, used=50 * 1024**3, free=10 * 1024**3
         )
         with patch("shutil.disk_usage", return_value=mock_usage):
             stats = manager.get_stats_dict()
@@ -1949,9 +1950,9 @@ class TestEffectiveMaxSize:
             max_size_bytes=200 * 1024**3,
         )
 
-        # disk_available = 0 + 50GB = 50GB, disk_limit = ~49.5GB
+        # total disk = 50GB, disk_limit = int(50GB * 0.99) = ~49.5GB
         mock_usage = self._make_disk_usage(
-            total=500 * 1024**3, used=450 * 1024**3, free=50 * 1024**3
+            total=50 * 1024**3, used=0, free=50 * 1024**3
         )
         with patch("shutil.disk_usage", return_value=mock_usage):
             assert manager.max_size < 200 * 1024**3
@@ -1982,9 +1983,10 @@ class TestEffectiveMaxSize:
             max_size_bytes=100 * 1024**3,
         )
 
-        # Simulate nearly full disk: only 5GB free, cache has 0 bytes
+        # Simulate a tiny disk: total=10GB, so disk_limit = int(10GB * 0.99)
+        # = ~9.9GB which is < 10% of configured 100GB → triggers warning.
         mock_usage = self._make_disk_usage(
-            total=500 * 1024**3, used=495 * 1024**3, free=5 * 1024**3
+            total=10 * 1024**3, used=5 * 1024**3, free=5 * 1024**3
         )
         with (
             patch("shutil.disk_usage", return_value=mock_usage),

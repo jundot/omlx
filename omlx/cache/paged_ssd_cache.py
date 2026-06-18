@@ -1332,9 +1332,16 @@ class PagedSSDCacheManager(CacheManager):
         """Scan cache directory for existing files and build the compatible index.
 
         Only blocks compatible with the currently loaded model/layout are
-        indexed. Incompatible blocks are left on disk so a shared SSD cache
+        indexed.  Incompatible blocks are left on disk so a shared SSD cache
         directory can safely serve multiple loaded models without one model's
         startup scan deleting another model's cache.
+
+        When the total disk usage of the cache directory exceeds the
+        configured limit, incompatible blocks are evicted (oldest first)
+        to reclaim space.  This prevents the runaway growth reported in
+        https://github.com/jundot/omlx/issues/1915 where switching models
+        causes the cache to exceed its configured limit because each model's
+        manager only tracks its own compatible blocks.
         """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
@@ -1343,6 +1350,8 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        # Collect incompatible blocks for potential cleanup (oldest first).
+        incompatible: list[PagedSSDBlockMetadata] = []
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -1358,6 +1367,7 @@ class PagedSSDCacheManager(CacheManager):
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
                         skipped_incompatible_bytes += metadata.file_size
+                        incompatible.append(metadata)
                         continue
                     self._index.add(metadata)
                     indexed += 1
@@ -1375,6 +1385,74 @@ class PagedSSDCacheManager(CacheManager):
                 f"({format_bytes(skipped_incompatible_bytes)})"
             )
         logger.info(log_msg)
+
+        # If incompatible blocks push the cache directory over the configured
+        # limit, evict them (oldest last_access first) until within budget.
+        if incompatible:
+            self._cleanup_incompatible_blocks(incompatible)
+
+    def _cleanup_incompatible_blocks(
+        self,
+        incompatible: list[PagedSSDBlockMetadata],
+    ) -> None:
+        """Remove incompatible blocks when the cache directory is over limit.
+
+        Incompatible blocks are files left on disk by other models that are
+        not tracked in this manager's index.  Without cleanup they are
+        invisible to the LRU eviction logic and accumulate unboundedly when
+        switching between models (issue #1915).
+
+        Blocks are removed oldest-first (by ``last_access``) until the
+        on-disk usage drops to within the configured limit.
+        """
+        if self._cache_dir is None:
+            return
+
+        effective_max = self._get_effective_max_size()
+        # Derive total on-disk cache size: compatible blocks (in index)
+        # + incompatible blocks (from other models, passed in as argument).
+        total_on_disk = self._index.total_size + sum(
+            m.file_size for m in incompatible
+        )
+
+        if total_on_disk <= effective_max:
+            return  # Within budget, nothing to do.
+
+        # Sort incompatible blocks oldest-first so we evict the least
+        # recently used from other models first.
+        incompatible.sort(key=lambda m: m.last_access)
+
+        bytes_to_free = total_on_disk - effective_max
+        freed = 0
+        removed = 0
+        for metadata in incompatible:
+            if freed >= bytes_to_free:
+                break
+            try:
+                if metadata.file_path.exists():
+                    metadata.file_path.unlink()
+                    freed += metadata.file_size
+                    removed += 1
+                    logger.debug(
+                        f"Evicted incompatible SSD cache block: "
+                        f"{metadata.file_path.name} "
+                        f"({format_bytes(metadata.file_size)})"
+                    )
+            except OSError as e:
+                logger.warning(
+                    f"Failed to delete incompatible cache file "
+                    f"{metadata.file_path}: {e}"
+                )
+
+        if removed > 0:
+            logger.info(
+                f"Cleaned up {removed} incompatible SSD cache blocks, "
+                f"freed {format_bytes(freed)}"
+            )
+            # Invalidate disk usage cache so next effective_max reflects
+            # the reclaimed space.
+            with self._lock:
+                self._disk_usage_cache = None
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a block can be indexed for this manager."""
@@ -2932,9 +3010,10 @@ class PagedSSDCacheManager(CacheManager):
         """Get effective max size considering actual disk free space.
 
         Returns the minimum of configured max_size and 99% of disk space
-        available for cache (current cache size + disk free). This ensures
-        eviction triggers before the disk fills up even when other processes
-        consume disk space after the server started.
+        available for cache.  Uses ``shutil.disk_usage().used`` to account
+        for *all* files in the cache directory (including blocks from other
+        models that are not in this manager's index), so the limit is
+        enforced correctly even after switching models.
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
@@ -2960,10 +3039,14 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     return self._max_size
                 self._disk_usage_cache_time = now
-            disk_free = self._disk_usage_cache.free
+            usage = self._disk_usage_cache
 
-        disk_available = self._index.total_size + disk_free
-        disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
+        # ``disk_limit`` is the largest the cache is allowed to grow.
+        # Using ``used`` instead of ``index.total_size`` means blocks from
+        # other models that are on disk but not in *this* index are counted
+        # against the budget, preventing the runaway growth described in
+        # https://github.com/jundot/omlx/issues/1915.
+        disk_limit = int((usage.used + usage.free) * self._DISK_SAFE_RATIO)
         return min(self._max_size, disk_limit)
 
     def _enforce_size_limit_for_new_block(
