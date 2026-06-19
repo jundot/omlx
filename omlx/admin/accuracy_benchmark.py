@@ -13,7 +13,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -39,6 +39,11 @@ VALID_BENCHMARKS = [
     "bbq", "safetybench",
 ]
 
+# Sampling profile for an accuracy run. "deterministic" (default) runs greedy
+# (temperature 0) so saved scores stay reproducible; "model_settings" opts in to
+# the model's configured sampling (temperature, top_p, …) for a real-world score.
+SamplingProfile = Literal["deterministic", "model_settings"]
+
 
 class AccuracyBenchmarkRequest(BaseModel):
     """Request model for starting an accuracy benchmark."""
@@ -47,6 +52,7 @@ class AccuracyBenchmarkRequest(BaseModel):
     benchmarks: dict[str, int]  # name -> sample_size (0 = full dataset)
     batch_size: int = 1
     enable_thinking: bool = False
+    sampling_profile: SamplingProfile = "deterministic"
 
     @field_validator("batch_size")
     @classmethod
@@ -351,10 +357,18 @@ async def run_accuracy_benchmark(
         # don't need VLM and the VLM adapter can produce empty responses.
         engine = await engine_pool.get_engine(request.model_id, force_lm=True)
 
-        # Load model sampling settings
+        # Load model sampling settings. Under the default "deterministic" profile
+        # we read nothing — the benchmark runs greedy (temperature 0) so saved
+        # scores stay reproducible. Only the explicit "model_settings" opt-in
+        # honors the model's configured sampling.
         sampling_kwargs = {}
-        if engine_pool._settings_manager is not None:
+        if (
+            request.sampling_profile == "model_settings"
+            and engine_pool._settings_manager is not None
+        ):
             ms = engine_pool._settings_manager.get_settings(request.model_id)
+            if ms.temperature is not None:
+                sampling_kwargs["temperature"] = ms.temperature
             if ms.top_p is not None:
                 sampling_kwargs["top_p"] = ms.top_p
             if ms.top_k is not None:

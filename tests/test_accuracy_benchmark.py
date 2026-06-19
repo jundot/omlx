@@ -20,6 +20,7 @@ from omlx.admin.accuracy_benchmark import (
     reset_accumulated_results,
     run_accuracy_benchmark,
 )
+from omlx.model_settings import ModelSettings
 
 
 class TestAccuracyBenchmarkRequest:
@@ -74,6 +75,29 @@ class TestAccuracyBenchmarkRequest:
             enable_thinking=True,
         )
         assert req.enable_thinking is True
+
+    def test_sampling_profile_default_deterministic(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+        )
+        assert req.sampling_profile == "deterministic"
+
+    def test_sampling_profile_model_settings_accepted(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 100},
+            sampling_profile="model_settings",
+        )
+        assert req.sampling_profile == "model_settings"
+
+    def test_sampling_profile_invalid_rejected(self):
+        with pytest.raises(Exception):
+            AccuracyBenchmarkRequest(
+                model_id="test-model",
+                benchmarks={"mmlu": 100},
+                sampling_profile="wild",
+            )
 
 
 class TestQueueAndResults:
@@ -241,3 +265,56 @@ class TestRunAccuracyBenchmark:
 
         # Should have stopped early
         assert len(run.results) == 0
+
+
+class TestSamplingProfile:
+    """sampling_profile gates whether per-model sampling reaches the evaluator.
+
+    Default "deterministic" must read nothing (reproducible greedy scores);
+    "model_settings" must forward the model's configured sampling. See #606 /
+    the #1254 deterministic-default request.
+    """
+
+    def _mock_pool(self, model_settings):
+        mock_engine = AsyncMock()
+        mock_engine.chat = AsyncMock(return_value=MagicMock(text="A"))
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
+        mock_pool.get_engine = AsyncMock(return_value=mock_engine)
+        mock_pool._unload_engine = AsyncMock()
+        mock_pool._settings_manager.get_settings = MagicMock(return_value=model_settings)
+        return mock_pool
+
+    async def _captured_sampling_kwargs(self, req, mock_pool):
+        run = create_run(req)
+        mock_result = MagicMock(
+            benchmark_name="mmlu", accuracy=0.5, total_questions=1,
+            correct_count=1, time_seconds=0.1, category_scores=None,
+            thinking_used=False,
+        )
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=mock_result)
+        mock_bench_cls = MagicMock(return_value=mock_evaluator)
+        with patch.dict("omlx.eval.BENCHMARKS", {"mmlu": mock_bench_cls}, clear=True):
+            await run_accuracy_benchmark(run, mock_pool)
+        return mock_evaluator.run.call_args.kwargs["sampling_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_deterministic_ignores_model_settings(self):
+        # Default profile is "deterministic".
+        req = AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 1})
+        mock_pool = self._mock_pool(ModelSettings(temperature=0.9, top_p=0.95))
+        assert await self._captured_sampling_kwargs(req, mock_pool) == {}
+
+    @pytest.mark.asyncio
+    async def test_model_settings_forwards_sampling(self):
+        req = AccuracyBenchmarkRequest(
+            model_id="test-model",
+            benchmarks={"mmlu": 1},
+            sampling_profile="model_settings",
+        )
+        mock_pool = self._mock_pool(ModelSettings(temperature=0.9, top_p=0.95))
+        sampling_kwargs = await self._captured_sampling_kwargs(req, mock_pool)
+        assert sampling_kwargs["temperature"] == 0.9
+        assert sampling_kwargs["top_p"] == 0.95

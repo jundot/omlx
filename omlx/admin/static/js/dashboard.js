@@ -510,6 +510,7 @@
             ],
             accBatchSize: 1,
             accEnableThinking: false,
+            accSamplingProfile: 'deterministic',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -3233,6 +3234,7 @@
                             ),
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accEnableThinking,
+                            sampling_profile: this.accSamplingProfile,
                         }),
                     });
                     if (!resp.ok) {
