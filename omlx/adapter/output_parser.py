@@ -404,6 +404,19 @@ def _create_cohere2_moe_filter():
     return PyFilter(PyFilterOptions().cmd4().stream_tool_actions())
 
 
+def _reserialize_cohere_tool_arguments(args: str) -> str:
+    if not args:
+        return "{}"
+    try:
+        return json.dumps(
+            json.loads(args, strict=False),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (json.JSONDecodeError, ValueError):
+        return args or "{}"
+
+
 class Cohere2MoeOutputParserSession:
     """Parser session for Cohere2 MoE / Command-style Melody output."""
 
@@ -506,7 +519,7 @@ class Cohere2MoeOutputParserSession:
             {
                 "id": value["id"],
                 "name": value["name"],
-                "arguments": value["arguments"] or "{}",
+                "arguments": _reserialize_cohere_tool_arguments(value["arguments"]),
             }
             for _, value in sorted(self._tool_calls.items())
             if value["name"]
