@@ -42,6 +42,33 @@ SETTINGS_VERSION = "1.0"
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
+# One-line bootstrap file the macOS app writes when the user moves their data root
+BASE_PATH_BOOTSTRAP_FILE = (
+    Path.home() / "Library" / "Application Support" / "oMLX" / "base-path"
+)
+
+
+def resolve_default_base_path() -> Path:
+    """
+    Resolve the base path to use when none was passed explicitly.
+
+    Priority: ``OMLX_BASE_PATH`` env var > the macOS app's bootstrap file >
+    ``~/.omlx``. This matches AppConfig.currentBasePath() in the Swift app
+    so the CLI and GUI agree on where settings.json lives.
+    """
+    env_value = os.environ.get("OMLX_BASE_PATH")
+    if env_value:
+        return Path(env_value).expanduser().resolve()
+
+    try:
+        raw = BASE_PATH_BOOTSTRAP_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    return DEFAULT_BASE_PATH
+
 
 def get_system_memory() -> int:
     """
@@ -785,7 +812,9 @@ class GlobalSettings:
         Load settings with priority hierarchy: CLI > env > file > defaults.
 
         Args:
-            base_path: Base directory for oMLX (default: ~/.omlx).
+            base_path: Base directory for oMLX (default: resolved via
+                OMLX_BASE_PATH env var, the macOS app's bootstrap file,
+                then ~/.omlx).
             cli_args: Argparse namespace with CLI arguments.
 
         Returns:
@@ -795,7 +824,7 @@ class GlobalSettings:
         if base_path:
             resolved_base = Path(base_path).expanduser().resolve()
         else:
-            resolved_base = DEFAULT_BASE_PATH
+            resolved_base = resolve_default_base_path()
 
         # Start with defaults
         settings = cls(base_path=resolved_base)
@@ -1450,7 +1479,9 @@ def init_settings(
     Initialize global settings (call once at startup).
 
     Args:
-        base_path: Base directory for oMLX (default: ~/.omlx).
+        base_path: Base directory for oMLX (default: resolved via
+                OMLX_BASE_PATH env var, the macOS app's bootstrap file,
+                then ~/.omlx).
         cli_args: Argparse namespace with CLI arguments.
 
     Returns:
