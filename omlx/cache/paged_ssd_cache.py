@@ -1759,7 +1759,12 @@ class PagedSSDCacheManager(CacheManager):
             def _store_nstate_elements(prefix: str, elements):
                 """Write N elements as ``{prefix}_state_{k}`` keys with a
                 ``{prefix}_state_count`` count marker. Zero-dim shapes are
-                preserved via ``{prefix}_state_{k}_zero_dim``."""
+                preserved via ``{prefix}_state_{k}_zero_dim``. Composite
+                elements (a bare tuple/list or a nested ``__nstate__``
+                marker) recurse under a ``{elem_key}`` sub-prefix and record
+                a ``{elem_key}_nested`` marker; the flat ``{elem_key}``
+                tensor is deliberately omitted so an older reader hits its
+                ``Missing {elem_key} in arrays`` path and skips the block."""
                 cache_list_meta[f"{prefix}_state_count"] = str(len(elements))
                 for k, elem in enumerate(elements):
                     elem_key = f"{prefix}_state_{k}"
@@ -1774,7 +1779,31 @@ class PagedSSDCacheManager(CacheManager):
                         cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(
                             elem.shape
                         )
+                    elif (
+                        isinstance(elem, tuple)
+                        and len(elem) >= 2
+                        and isinstance(elem[0], str)
+                        and elem[0] == "__nstate__"
+                    ):
+                        # Nested ``('__nstate__', class_name, [sub...])``
+                        # marker — recurse, no flat tensor written.
+                        cache_list_meta[f"{elem_key}_nested"] = "nstate"
+                        sub_class = elem[1] if len(elem) >= 2 else None
+                        sub_elements = elem[2] if len(elem) >= 3 else []
+                        if sub_class:
+                            cache_list_meta[f"{elem_key}_state_class_name"] = sub_class
+                        _store_nstate_elements(elem_key, sub_elements)
+                    elif isinstance(elem, (tuple, list)):
+                        # Bare tuple/list of sub-elements — recurse, no flat
+                        # tensor written.
+                        cache_list_meta[f"{elem_key}_nested"] = "tuple"
+                        _store_nstate_elements(elem_key, list(elem))
                     else:
+                        if not isinstance(elem, mx.array):
+                            raise TypeError(
+                                f"unsupported non-array nstate element "
+                                f"{elem_key}: {type(elem).__name__}"
+                            )
                         arrays[elem_key] = elem
 
             for i, layer_data in enumerate(cache_data):
@@ -2085,7 +2114,12 @@ class PagedSSDCacheManager(CacheManager):
         # downstream code must dispatch on.
         def _maybe_unwrap_legacy(marker: tuple) -> Any:
             _, _, elements = marker
-            if len(elements) == 2:
+            # Only the legacy plain ``(keys, values)`` shape unwraps. If
+            # either element is itself composite (a recursed sub-state), the
+            # ``__nstate__`` wrapper must survive so the shape matches save.
+            if len(elements) == 2 and not any(
+                isinstance(e, (tuple, list)) for e in elements
+            ):
                 return (elements[0], elements[1])
             return marker
 
@@ -2111,8 +2145,26 @@ class PagedSSDCacheManager(CacheManager):
                     elem_key = f"{prefix}_state_{k}"
                     none_marker = f"{elem_key}_none"
                     zd_marker = f"{elem_key}_zero_dim"
+                    nested_marker = f"{elem_key}_nested"
                     if file_metadata and none_marker in file_metadata:
                         elements.append(None)
+                        continue
+                    if file_metadata and nested_marker in file_metadata:
+                        # Composite element — recurse, then restore the same
+                        # shape it had on save (bare tuple vs __nstate__).
+                        sub = _load_nstate(elem_key, fallback_class=None)
+                        if sub is None:
+                            return None
+                        if file_metadata[nested_marker] == "tuple":
+                            elements.append(tuple(sub[2]))
+                        elif file_metadata[nested_marker] == "nstate":
+                            # Explicit marker on write — preserve the full
+                            # ('__nstate__', class_name, elements) as-is;
+                            # never unwrap (would drop the marker/class_name).
+                            elements.append(sub)
+                        else:
+                            # Corrupt/unknown nested marker — fail closed.
+                            return None
                         continue
                     if elem_key not in arrays:
                         logger.error(f"Missing {elem_key} in arrays")
