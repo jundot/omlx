@@ -23,10 +23,10 @@
 
 ## 4. Rescue Parsers
 
-- [ ] 4.1 Add rehearsal syntax parser `_parse_rehearsal_tool_calls(text)` to `omlx/api/tool_calling.py` — regex `r"(\w+)\[ARGS\](\{.*?\})"` with `re.DOTALL`, validate brace content as JSON, return list of parsed tool calls or empty list
-- [ ] 4.2 Add improved Mistral bracket-tag parser using brace-balance scanner (track `in_string` and `escape` flags for nested JSON) — reference `../forge/src/forge/prompts/templates.py:206-234`
-- [ ] 4.3 Integrate both parsers into `_parse_tool_calls_impl` chain at `tool_calling.py:1108` as last-resort fallbacks (after existing parsers, before final marker-strip at line 1275)
-- [ ] 4.4 Unit tests: rehearsal syntax with single/multiple/invalid-JSON cases; Mistral parser with nested objects, string-escaped braces, escaped quotes
+- [x] 4.1 Add rehearsal syntax parser `_parse_rehearsal_tool_calls(text)` to `omlx/api/tool_calling.py` — regex `r"(\w+)\[ARGS\](\{.*?\})"` with `re.DOTALL`, validate brace content as JSON, return list of parsed tool calls or empty list
+- [x] 4.2 Add improved Mistral bracket-tag parser using brace-balance scanner (track `in_string` and `escape` flags for nested JSON) — reference `../forge/src/forge/prompts/templates.py:206-234`
+- [x] 4.3 Integrate both parsers into `_parse_tool_calls_impl` chain at `tool_calling.py:1108` as last-resort fallbacks (after existing parsers, before final marker-strip at line 1275)
+- [x] 4.4 Unit tests: rehearsal syntax with single/multiple/invalid-JSON cases; Mistral parser with nested objects, string-escaped braces, escaped quotes
 
 ## 5. Strict Args Mode
 
