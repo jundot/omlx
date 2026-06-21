@@ -1,0 +1,16 @@
+{
+  "change": "add-forge-guardrails",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "f63064b9df13f10eabcdada375b3d2b6ceae595f9d694d656cbd5c3d9402a9d3",
+  "files": [
+    { "path": "openspec/changes/add-forge-guardrails/proposal.md", "sha256": "06e5df3df147122333de2316b10be4fdcca48a230c66853c7edbb7f09c3625f3" },
+    { "path": "openspec/changes/add-forge-guardrails/design.md", "sha256": "e5117d89c79f65dd7f629eea01759a212715458b768cc9d371529d7ee6b673b0" },
+    { "path": "openspec/changes/add-forge-guardrails/tasks.md", "sha256": "bed5ce2a688bd989f246b0d98175551e050a3b22b9ef9341b3ba1419691e1a1b" },
+    { "path": "openspec/changes/add-forge-guardrails/specs/tool-call-rescue-parsing/spec.md", "sha256": "85f2f65d00d583fcca4d0a79793b2dff798ee96cb6f66cf88d84ff2c50622d55" },
+    { "path": "openspec/changes/add-forge-guardrails/specs/tool-call-validation/spec.md", "sha256": "4a60998964b3aba341a4b9fc4f9132a624567ad7a04ce361867d172e0322f0bb" },
+    { "path": "openspec/changes/add-forge-guardrails/specs/tool-choice-enforcement/spec.md", "sha256": "58a9e0d877e910f2f361ada4734a4aa56b1c1e22938b2af8c859a471d1e45852" }
+  ]
+}
