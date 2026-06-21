@@ -1,8 +1,8 @@
 ## 1. Guardrails Package Foundation
 
-- [ ] 1.1 Create `omlx/api/guardrails/__init__.py` with public API exports (`GuardrailValidator`, `ValidationResult`, `Nudge`, `CheckResult`)
-- [ ] 1.2 Create `omlx/api/guardrails/types.py` with frozen dataclasses: `ValidationResult` (checks list, nudge, passed bool), `CheckResult` (check name, passed, detail), `Nudge` (role, content, kind)
-- [ ] 1.3 Define nudge kind constants: `KIND_RETRY="retry"`, `KIND_UNKNOWN_TOOL="unknown_tool"`, `KIND_TOOL_ARG_VALIDATION="tool_arg_validation"` and role/channel mapping (`TOOL_CHANNEL_KINDS`, `TOOL_ERROR_KINDS`)
+- [x] 1.1 Create `omlx/api/guardrails/__init__.py` with public API exports (`GuardrailValidator`, `ValidationResult`, `Nudge`, `CheckResult`)
+- [x] 1.2 Create `omlx/api/guardrails/types.py` with frozen dataclasses: `ValidationResult` (checks list, nudge, passed bool), `CheckResult` (check name, passed, detail), `Nudge` (role, content, kind)
+- [x] 1.3 Define nudge kind constants: `KIND_RETRY="retry"`, `KIND_UNKNOWN_TOOL="unknown_tool"`, `KIND_TOOL_ARG_VALIDATION="tool_arg_validation"` and role/channel mapping (`TOOL_CHANNEL_KINDS`, `TOOL_ERROR_KINDS`)
 
 ## 2. Nudge Generation
 
