@@ -30,10 +30,10 @@
 
 ## 5. Strict Args Mode
 
-- [ ] 5.1 Modify `_serialize_tool_call_arguments()` at `tool_calling.py:94` — accept `strict: bool = False` parameter; when `strict=True`, preserve original args (don't coerce to `"{}"`) and return a tuple `(serialized, is_malformed)` or attach validation flag
-- [ ] 5.2 Thread the `strict` flag from `ForgeGuardrailsSettings.strict_tool_args` through `extract_tool_calls_with_thinking()` and the parser chain
-- [ ] 5.3 Ensure backward compatibility: when `strict=False` (default), behavior is identical to current (coerce to `"{}"`)
-- [ ] 5.4 Unit tests: strict mode preserves malformed args; default mode coerces as before
+- [x] 5.1 Modify `_serialize_tool_call_arguments()` at `tool_calling.py:94` — accept `strict: bool = False` parameter; when `strict=True`, preserve original args (don't coerce to `"{}"`) and return a tuple `(serialized, is_malformed)` or attach validation flag
+- [x] 5.2 Thread the `strict` flag from `ForgeGuardrailsSettings.strict_tool_args` through `extract_tool_calls_with_thinking()` and the parser chain
+- [x] 5.3 Ensure backward compatibility: when `strict=False` (default), behavior is identical to current (coerce to `"{}"`)
+- [x] 5.4 Unit tests: strict mode preserves malformed args; default mode coerces as before
 
 ## 6. tool_choice Enforcement Module
 
@@ -56,7 +56,7 @@
 
 ## 8. Server Wiring (Single Chokepoint)
 
-- [ ] 8.1 Modify `extract_tool_calls_with_thinking()` at `tool_calling.py:1339` — accept `tools` and `validator` optional params; when validator is provided, run validation on extracted tool calls; return extended `ToolCallExtraction` with optional `validation_result` field
+- [x] 8.1 Modify `extract_tool_calls_with_thinking()` at `tool_calling.py:1339` — accept `tools` and `validator` optional params; when validator is provided, run validation on extracted tool calls; return extended `ToolCallExtraction` with optional `validation_result` field
 - [ ] 8.2 Verify all 6 call sites in `server.py` (lines 3567, 4418, 4850, 5292, 5776, 6232) pass through the `tools` param (most already do) and consume the new validation result
 - [ ] 8.3 Wire `enforce_tool_choice()` after validation, before response construction — non-streaming chat at line 3600, streaming at line 4418+
 - [ ] 8.4 Build `x_omlx_validation` response extension for non-streaming responses (when `include_validation_metadata=True`) — include `checks` array and `nudge` object
