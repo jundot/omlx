@@ -91,7 +91,7 @@ def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
     return value
 
 
-def _serialize_tool_call_arguments(arguments: Any) -> str:
+def _serialize_tool_call_arguments(arguments: Any, strict: bool = False) -> str:
     """Serialize parser output to a JSON-object arguments string.
 
     Chat templates for models with native tool calling (Qwen 3.5/3.6 XML,
@@ -99,6 +99,9 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
     in history. Anything that does not represent a JSON object must be
     coerced to "{}" here so we never hand the client a non-JSON value that
     the next turn's template would crash on.
+
+    When strict=True (guardrails enabled), preserve the original value
+    instead of coercing — validation will flag it separately.
     """
     if isinstance(arguments, dict):
         return json.dumps(arguments, ensure_ascii=False)
@@ -111,6 +114,10 @@ def _serialize_tool_call_arguments(arguments: Any) -> str:
             parsed = None
         if isinstance(parsed, dict):
             return json.dumps(parsed, ensure_ascii=False)
+
+    if strict:
+        return str(arguments) if arguments is not None else "null"
+
     logger.warning(
         "Tool parser returned non-dict arguments (type=%s, repr=%.200r); "
         "coercing to empty object to keep downstream template safe.",
@@ -128,6 +135,7 @@ class ToolCallExtraction:
     tool_calls: Optional[List[ToolCall]]
     cleaned_thinking: str
     tool_calls_from_thinking: bool = False
+    validation_result: Any = None
 
 
 def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1528,6 +1536,50 @@ def extract_tool_calls_with_thinking(
         tool_calls=tool_calls,
         cleaned_thinking=cleaned_thinking,
         tool_calls_from_thinking=tool_calls_from_thinking,
+    )
+
+
+def extract_and_validate_tool_calls(
+    thinking_content: str,
+    regular_content: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+    tool_choice: Any = None,
+    strict_tool_args: bool = False,
+    validation_enabled: bool = False,
+) -> ToolCallExtraction:
+    """Wrapper: extract tool calls, then validate if enabled.
+
+    When validation_enabled is False (default), this is a pure passthrough
+    to extract_tool_calls_with_thinking() — zero behavioral change.
+
+    When validation_enabled is True and tools are provided, runs
+    GuardrailValidator on the extraction and attaches the result.
+    """
+    extraction = extract_tool_calls_with_thinking(
+        thinking_content, regular_content, tokenizer, tools
+    )
+
+    validation_result = None
+    if validation_enabled and tools:
+        try:
+            from omlx.api.guardrails.validator import GuardrailValidator
+
+            validator = GuardrailValidator(tools)
+            validation_result = validator.validate(
+                extraction, tool_choice=tool_choice, has_tools=bool(tools)
+            )
+        except Exception:
+            logger.exception(
+                "Guardrail validation failed; returning extraction without validation"
+            )
+
+    return ToolCallExtraction(
+        cleaned_text=extraction.cleaned_text,
+        tool_calls=extraction.tool_calls,
+        cleaned_thinking=extraction.cleaned_thinking,
+        tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+        validation_result=validation_result,
     )
 
 
