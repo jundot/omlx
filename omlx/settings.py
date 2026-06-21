@@ -769,6 +769,34 @@ class CompressionSettings:
 
 
 @dataclass
+class ForgeGuardrailsSettings:
+    """Guardrail validation settings (opt-in by default).
+
+    Follows the CompressionSettings pattern. All flags default to False
+    for full backward compatibility.
+    """
+
+    validation_enabled: bool = False
+    strict_tool_args: bool = False
+    include_validation_metadata: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "validation_enabled": self.validation_enabled,
+            "strict_tool_args": self.strict_tool_args,
+            "include_validation_metadata": self.include_validation_metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ForgeGuardrailsSettings":
+        return cls(
+            validation_enabled=data.get("validation_enabled", False),
+            strict_tool_args=data.get("strict_tool_args", False),
+            include_validation_metadata=data.get("include_validation_metadata", False),
+        )
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -797,6 +825,9 @@ class GlobalSettings:
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
     compression: CompressionSettings = field(default_factory=CompressionSettings)
+    forge_guardrails: ForgeGuardrailsSettings = field(
+        default_factory=ForgeGuardrailsSettings
+    )
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
@@ -893,6 +924,10 @@ class GlobalSettings:
                 self.ui = UISettings.from_dict(data["ui"])
             if "compression" in data:
                 self.compression = CompressionSettings.from_dict(data["compression"])
+            if "forge_guardrails" in data:
+                self.forge_guardrails = ForgeGuardrailsSettings.from_dict(
+                    data["forge_guardrails"]
+                )
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
@@ -1179,6 +1214,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "compression": self.compression.to_dict(),
+            "forge_guardrails": self.forge_guardrails.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
@@ -1450,6 +1486,52 @@ class GlobalSettings:
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GlobalSettings":
+        """Create a GlobalSettings instance from a dictionary."""
+        settings = cls()
+        if "server" in data:
+            settings.server = ServerSettings.from_dict(data["server"])
+        if "model" in data:
+            settings.model = ModelSettings.from_dict(data["model"])
+        if "memory" in data:
+            settings.memory = MemorySettings.from_dict(data["memory"])
+        if "scheduler" in data:
+            settings.scheduler = SchedulerSettings.from_dict(data["scheduler"])
+        if "cache" in data:
+            settings.cache = CacheSettings.from_dict(data["cache"])
+        if "auth" in data:
+            settings.auth = AuthSettings.from_dict(data["auth"])
+        if "mcp" in data:
+            settings.mcp = MCPSettings.from_dict(data["mcp"])
+        if "huggingface" in data:
+            settings.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
+        if "modelscope" in data:
+            settings.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
+        if "network" in data:
+            settings.network = NetworkSettings.from_dict(data["network"])
+        if "sampling" in data:
+            settings.sampling = SamplingSettings.from_dict(data["sampling"])
+        if "logging" in data:
+            settings.logging = LoggingSettings.from_dict(data["logging"])
+        if "claude_code" in data:
+            settings.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+        if "integrations" in data:
+            settings.integrations = IntegrationSettings.from_dict(data["integrations"])
+        if "ui" in data:
+            settings.ui = UISettings.from_dict(data["ui"])
+        if "compression" in data:
+            settings.compression = CompressionSettings.from_dict(data["compression"])
+        if "forge_guardrails" in data:
+            settings.forge_guardrails = ForgeGuardrailsSettings.from_dict(
+                data["forge_guardrails"]
+            )
+        if "idle_timeout" in data:
+            settings.idle_timeout = ModelIdleTimeoutSettings.from_dict(
+                data["idle_timeout"]
+            )
+        return settings
+
     def to_dict(self) -> dict[str, Any]:
         """Convert all settings to a dictionary."""
         return {
@@ -1471,6 +1553,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "compression": self.compression.to_dict(),
+            "forge_guardrails": self.forge_guardrails.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 

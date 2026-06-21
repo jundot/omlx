@@ -276,6 +276,11 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
 
+    # Forge Guardrails settings
+    forge_guardrails_validation_enabled: bool | None = None
+    forge_guardrails_strict_tool_args: bool | None = None
+    forge_guardrails_include_validation_metadata: bool | None = None
+
     # Other integrations settings
     integrations_copilot_model: str | None = None
     integrations_codex_model: str | None = None
@@ -3687,6 +3692,33 @@ async def update_global_settings(
             f"haiku={global_settings.claude_code.haiku_model}"
         )
 
+    # Apply Forge Guardrails settings (Live - immediately applied)
+    forge_guardrails_changed = False
+    if request.forge_guardrails_validation_enabled is not None:
+        global_settings.forge_guardrails.validation_enabled = (
+            request.forge_guardrails_validation_enabled
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_strict_tool_args is not None:
+        global_settings.forge_guardrails.strict_tool_args = (
+            request.forge_guardrails_strict_tool_args
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_include_validation_metadata is not None:
+        global_settings.forge_guardrails.include_validation_metadata = (
+            request.forge_guardrails_include_validation_metadata
+        )
+        forge_guardrails_changed = True
+
+    if forge_guardrails_changed:
+        runtime_applied.append("forge_guardrails")
+        logger.info(
+            f"Forge Guardrails settings updated: "
+            f"validation_enabled={global_settings.forge_guardrails.validation_enabled}, "
+            f"strict_tool_args={global_settings.forge_guardrails.strict_tool_args}, "
+            f"include_validation_metadata={global_settings.forge_guardrails.include_validation_metadata}"
+        )
+
     # Apply integrations settings (Live - immediately applied)
     integrations_changed = False
     if "integrations_copilot_model" in request.model_fields_set:
@@ -4372,6 +4404,21 @@ async def get_server_stats(
             global_settings.claude_code.target_context_size
             if global_settings
             else 200000
+        ),
+        "forge_guardrails_validation_enabled": (
+            global_settings.forge_guardrails.validation_enabled
+            if global_settings
+            else False
+        ),
+        "forge_guardrails_strict_tool_args": (
+            global_settings.forge_guardrails.strict_tool_args
+            if global_settings
+            else False
+        ),
+        "forge_guardrails_include_validation_metadata": (
+            global_settings.forge_guardrails.include_validation_metadata
+            if global_settings
+            else False
         ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
