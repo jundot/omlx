@@ -6,9 +6,9 @@
 
 ## 2. Nudge Generation
 
-- [ ] 2.1 Create `omlx/api/guardrails/nudge.py` with 4 nudge generator functions: `retry_nudge()`, `unknown_tool_nudge(tool_name, available_tools)`, `tool_arg_validation_nudge(tool_name, args)`, `missing_params_nudge(tool_name, missing_params)`
-- [ ] 2.2 Each nudge function returns a `Nudge` with appropriate `role` ("user" for retry, "tool" for tool errors) and `kind` — reference forge's `prompts/nudges.py` for message text patterns
-- [ ] 2.3 Unit tests for all 4 nudge generators (verify role, kind, and message content for representative inputs)
+- [x] 2.1 Create `omlx/api/guardrails/nudge.py` with 4 nudge generator functions: `retry_nudge()`, `unknown_tool_nudge(tool_name, available_tools)`, `tool_arg_validation_nudge(tool_name, args)`, `missing_params_nudge(tool_name, missing_params)`
+- [x] 2.2 Each nudge function returns a `Nudge` with appropriate `role` ("user" for retry, "tool" for tool errors) and `kind` — reference forge's `prompts/nudges.py` for message text patterns
+- [x] 2.3 Unit tests for all 4 nudge generators (verify role, kind, and message content for representative inputs)
 
 ## 3. Response Validator (4 Checks)
 
