@@ -37,13 +37,13 @@
 
 ## 6. tool_choice Enforcement Module
 
-- [ ] 6.1 Create `omlx/api/tool_choice.py` with `enforce_tool_choice(tool_calls, tool_choice, has_text, tools) -> tuple[list[ToolCall], ValidationResult | None]`
-- [ ] 6.2 Implement `"none"` mode: suppress all tool calls (also enforced upstream at `server.py:3307`, but duplicate here for layering consistency)
-- [ ] 6.3 Implement `"auto"` mode: pass through (no-op)
-- [ ] 6.4 Implement `"required"` mode: if `not tool_calls and has_text`, return nudge `kind="retry"`
-- [ ] 6.5 Implement named-tool mode `{"type":"function","function":{"name":"X"}}`: filter `tool_calls` to only calls to `X`, flag rejected calls with `unknown_tool` nudge
-- [ ] 6.6 Add request-time validation in `omlx/api/openai_models.py:292` — reject malformed `tool_choice` values (strings other than the 4 valid modes, dicts missing required structure) with HTTP 400
-- [ ] 6.7 Unit tests for all 5 modes + invalid-value rejection
+- [x] 6.1 Create `omlx/api/tool_choice.py` with `enforce_tool_choice(tool_calls, tool_choice, has_text, tools) -> tuple[list[ToolCall], ValidationResult | None]`
+- [x] 6.2 Implement `"none"` mode: suppress all tool calls (also enforced upstream at `server.py:3307`, but duplicate here for layering consistency)
+- [x] 6.3 Implement `"auto"` mode: pass through (no-op)
+- [x] 6.4 Implement `"required"` mode: if `not tool_calls and has_text`, return nudge `kind="retry"`
+- [x] 6.5 Implement named-tool mode `{"type":"function","function":{"name":"X"}}`: filter `tool_calls` to only calls to `X`, flag rejected calls with `unknown_tool` nudge
+- [x] 6.6 Add request-time validation in `omlx/api/openai_models.py:292` — reject malformed `tool_choice` values (strings other than the 4 valid modes, dicts missing required structure) with HTTP 400
+- [x] 6.7 Unit tests for all 5 modes + invalid-value rejection
 
 ## 7. Settings Integration
 
