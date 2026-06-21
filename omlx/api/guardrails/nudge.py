@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Nudge message generators for validation failures.
+
+Each function returns a Nudge with the correct role and kind.
+Message patterns follow Forge's prompts/nudges.py.
+"""
+from __future__ import annotations
+
+from omlx.api.guardrails.types import (
+    KIND_RETRY,
+    KIND_TOOL_ARG_VALIDATION,
+    KIND_UNKNOWN_TOOL,
+    Nudge,
+)
+
+
+def retry_nudge() -> Nudge:
+    """Nudge for bare-text when tools were expected.
+
+    Uses role='user' because bare-text correction is an instruction
+    to the model, not a tool-result error.
+    """
+    return Nudge(
+        role="user",
+        content=(
+            "You provided a text response instead of making a tool call. "
+            "Please use the available tools to answer the request."
+        ),
+        kind=KIND_RETRY,
+    )
+
+
+def unknown_tool_nudge(tool_name: str, available_tools: list[str]) -> Nudge:
+    """Nudge for calling a tool that does not exist.
+
+    Uses role='tool' because models attend well to the 'tool call failed'
+    wire shape.
+    """
+    tools_str = ", ".join(sorted(available_tools)) if available_tools else "(none)"
+    return Nudge(
+        role="tool",
+        content=(
+            f"Tool '{tool_name}' does not exist. "
+            f"Available: {tools_str}. Call one of them."
+        ),
+        kind=KIND_UNKNOWN_TOOL,
+    )
+
+
+def tool_arg_validation_nudge(
+    tool_name: str, args_repr: str, received_type: str
+) -> Nudge:
+    """Nudge for malformed (non-dict) arguments."""
+    return Nudge(
+        role="tool",
+        content=(
+            f"Tool '{tool_name}' had malformed arguments. "
+            f"Got type: {received_type}. Required: JSON object (dict). "
+            f"Received value: {args_repr[:200]}"
+        ),
+        kind=KIND_TOOL_ARG_VALIDATION,
+    )
+
+
+def missing_params_nudge(tool_name: str, missing_params: list[str]) -> Nudge:
+    """Nudge for missing required parameters."""
+    params_str = ", ".join(missing_params)
+    return Nudge(
+        role="tool",
+        content=(
+            f"Tool '{tool_name}' is missing required parameter(s): {params_str}. "
+            f"Please provide all required parameters."
+        ),
+        kind=KIND_TOOL_ARG_VALIDATION,
+    )
