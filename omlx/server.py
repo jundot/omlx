@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
@@ -196,6 +196,86 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+
+# Compression statistics (module-level for admin API access).
+# Per-worker: under multi-worker uvicorn each worker has its own dict.
+_compression_stats: dict[str, Any] = {
+    "total_requests": 0,
+    "compressed_requests": 0,
+    "total_tokens_before": 0,
+    "total_tokens_after": 0,
+    "total_tokens_saved": 0,
+    "last_compression_ratio": 0.0,
+    "last_compression_time": None,
+}
+
+try:
+    from headroom import CompressConfig
+    from headroom import compress as _hr_compress
+
+    _HEADROOM_AVAILABLE = True
+except ImportError:
+    _HEADROOM_AVAILABLE = False
+    _hr_compress = None  # type: ignore[assignment]
+    CompressConfig = None  # type: ignore[assignment]
+
+
+def _apply_compression(messages: list) -> list:
+    """Apply headroom context compression to *messages* if enabled.
+
+    Returns the (possibly compressed) message list.  Updates
+    ``_compression_stats`` in place.  Never raises.
+    """
+    if not _HEADROOM_AVAILABLE:
+        return messages
+
+    try:
+        _gs = _server_state.global_settings
+        if _gs is None or not _gs.compression.enabled:
+            return messages
+
+        # Quick pre-check: estimate tokens via ~4 chars/token heuristic so
+        # we don't invoke headroom for trivially short prompts.  This must
+        # be a *token* estimate — comparing raw char count against
+        # min_tokens_to_compress would trigger ~4× too eagerly.
+        total_chars = sum(
+            len(m.get("content", "")) if isinstance(m, dict) else 0
+            for m in messages
+        )
+        estimated_tokens = total_chars // 4
+        _compression_stats["total_requests"] += 1
+
+        if estimated_tokens < _gs.compression.min_tokens_to_compress:
+            return messages
+
+        result = _hr_compress(
+            messages,
+            config=CompressConfig(
+                min_tokens_to_compress=_gs.compression.min_tokens_to_compress,
+            ),
+        )
+        if result.tokens_saved > 0:
+            logger.info(
+                "Context compression: %d -> %d tokens (%.1f%% reduction, %d transforms)",
+                result.tokens_before,
+                result.tokens_after,
+                result.compression_ratio * 100,
+                len(result.transforms_applied),
+            )
+            _compression_stats["compressed_requests"] += 1
+            _compression_stats["total_tokens_before"] += result.tokens_before
+            _compression_stats["total_tokens_after"] += result.tokens_after
+            _compression_stats["total_tokens_saved"] += result.tokens_saved
+            _compression_stats["last_compression_ratio"] = result.compression_ratio
+            _compression_stats["last_compression_time"] = time.time()
+            return result.messages
+
+        return messages
+    except Exception as e:
+        # Defense-in-depth: headroom has its own internal try/except, but
+        # guard against unexpected ABI/runtime failures.
+        logger.warning("Context compression failed, using original messages: %s", e)
+        return messages
 
 
 def _convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
@@ -3078,6 +3158,7 @@ async def create_chat_completion(
         )
 
     lease = _LLMEngineLease()
+
     try:
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
@@ -3176,6 +3257,8 @@ async def create_chat_completion(
         # before any chat template application.  The boolean result is forwarded
         # as an explicit parameter so the engine never has to re-derive it.
         is_partial = detect_and_strip_partial(messages)
+
+        messages = _apply_compression(messages)
 
         # Compile grammar for structured output (logit-level enforcement).
         # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
