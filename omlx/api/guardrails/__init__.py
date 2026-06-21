@@ -16,6 +16,7 @@ from omlx.api.guardrails.types import (
     TOOL_CHANNEL_KINDS,
     TOOL_ERROR_KINDS,
 )
+from omlx.api.guardrails.validator import GuardrailValidator
 
 __all__ = [
     "CheckResult",
@@ -26,6 +27,7 @@ __all__ = [
     "KIND_TOOL_ARG_VALIDATION",
     "TOOL_CHANNEL_KINDS",
     "TOOL_ERROR_KINDS",
+    "GuardrailValidator",
     "missing_params_nudge",
     "retry_nudge",
     "tool_arg_validation_nudge",
