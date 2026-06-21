@@ -115,9 +115,10 @@ paroquant = [
     "paroquant==0.1.15; python_version >= '3.11'",
 ]
 compression = [
-    # Context compression via headroom-ai (ONNX-based, ~50MB).
+    # Context compression via headroom-ai. Pulls litellm, onnxruntime,
+    # transformers, and other ML deps transitively (~hundreds of MB).
     # Reduces prompt token count by compressing messages before tokenization.
-    "headroom-ai[proxy]>=0.1.0",
+    "headroom-ai[proxy]>=0.23,<0.25",
 ]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the

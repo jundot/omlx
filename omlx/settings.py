@@ -974,7 +974,8 @@ class GlobalSettings:
                 markitdown_pdf_processing_engine.strip() or "markitdown"
             )
 
-        # Compression settings
+        # Compression settings — if both env vars are set, DISABLED takes
+        # precedence (fail-safe: when in doubt, don't compress).
         if compression_enabled := os.getenv("OMLX_COMPRESSION_ENABLED"):
             self.compression.enabled = compression_enabled.lower() in (
                 "true",

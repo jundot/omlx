@@ -5937,10 +5937,13 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     success = _hf_uploader.remove_task(task_id)
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
+    return {"success": True}
 
 
 @router.get("/api/compression/stats")
-async def get_compression_stats(request: Request):
+async def get_compression_stats(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
     from ..server import _compression_stats
 
     stats = dict(_compression_stats)
@@ -5953,4 +5956,3 @@ async def get_compression_stats(request: Request):
     else:
         stats["avg_compression_ratio"] = 0.0
     return JSONResponse(content=stats)
-    return {"success": True}
