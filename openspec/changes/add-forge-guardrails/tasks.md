@@ -12,14 +12,14 @@
 
 ## 3. Response Validator (4 Checks)
 
-- [ ] 3.1 Create `omlx/api/guardrails/validator.py` with `GuardrailValidator` class, constructor takes `tools: list[ToolDef]` and builds a name→schema lookup
-- [ ] 3.2 Implement Check 1 (bare-text-when-tools-expected): if no tool calls parsed AND tools were provided AND `tool_choice != "none"`, return `ValidationResult` with `retry_nudge()`
-- [ ] 3.3 Implement Check 2 (unknown tool name): for each parsed tool call, if name not in tools lookup, return `ValidationResult` with `unknown_tool_nudge()`
-- [ ] 3.4 Implement Check 3 (malformed args / non-dict): for each tool call with non-dict arguments, return `ValidationResult` with `tool_arg_validation_nudge()` (adapted from forge `response_validator.py:100-110`)
-- [ ] 3.5 Implement Check 4 (missing required params / oMLX-original): for each tool call, load `json.loads(tc.function.arguments)`, look up the tool's JSON Schema, extract `required` array, check each required param exists; on failure return `ValidationResult` with `missing_params_nudge()` — uses existing `validate_json_schema()` at `tool_calling.py:1948`
-- [ ] 3.6 Check ordering: bare-text → unknown-tool → malformed-args → missing-params (first failure wins; remaining checks skipped)
-- [ ] 3.7 Handle edge case: tool with `parameters={}` or no `required` field → Check 4 passes trivially (no false positives)
-- [ ] 3.8 Unit tests for each check independently + integration test for check ordering
+- [x] 3.1 Create `omlx/api/guardrails/validator.py` with `GuardrailValidator` class, constructor takes `tools: list[ToolDef]` and builds a name→schema lookup
+- [x] 3.2 Implement Check 1 (bare-text-when-tools-expected): if no tool calls parsed AND tools were provided AND `tool_choice != "none"`, return `ValidationResult` with `retry_nudge()`
+- [x] 3.3 Implement Check 2 (unknown tool name): for each parsed tool call, if name not in tools lookup, return `ValidationResult` with `unknown_tool_nudge()`
+- [x] 3.4 Implement Check 3 (malformed args / non-dict): for each tool call with non-dict arguments, return `ValidationResult` with `tool_arg_validation_nudge()` (adapted from forge `response_validator.py:100-110`)
+- [x] 3.5 Implement Check 4 (missing required params / oMLX-original): for each tool call, load `json.loads(tc.function.arguments)`, look up the tool's JSON Schema, extract `required` array, check each required param exists; on failure return `ValidationResult` with `missing_params_nudge()` — uses existing `validate_json_schema()` at `tool_calling.py:1948`
+- [x] 3.6 Check ordering: bare-text → unknown-tool → malformed-args → missing-params (first failure wins; remaining checks skipped)
+- [x] 3.7 Handle edge case: tool with `parameters={}` or no `required` field → Check 4 passes trivially (no false positives)
+- [x] 3.8 Unit tests for each check independently + integration test for check ordering
 
 ## 4. Rescue Parsers
 
