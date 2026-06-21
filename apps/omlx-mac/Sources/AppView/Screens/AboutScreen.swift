@@ -116,7 +116,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Setup, model management, integrations",
                                  comment: "Sublabel under the Documentation link on the About screen"),
                 icon: "book.closed",
-                url: URL(string: "https://omlx.app/docs")!
+                url: URL(string: "https://github.com/jundot/omlx")!
             )
             LinkRow(
                 label: String(localized: "about.project.issue.label",
