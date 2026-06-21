@@ -5,6 +5,8 @@ from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.codex_app import CodexAppIntegration
 from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.goose_cli import GooseCliIntegration
+from omlx.integrations.goose_desktop import GooseDesktopIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
@@ -14,6 +16,8 @@ INTEGRATIONS: dict[str, Integration] = {
     "claude": ClaudeCodeIntegration(),
     "codex": CodexIntegration(),
     "codex_app": CodexAppIntegration(),
+    "goose_cli": GooseCliIntegration(),
+    "goose_desktop": GooseDesktopIntegration(),
     "opencode": OpenCodeIntegration(),
     "openclaw": OpenClawIntegration(),
     "hermes": HermesIntegration(),
@@ -38,6 +42,8 @@ __all__ = [
     "ClaudeCodeIntegration",
     "CodexAppIntegration",
     "CopilotIntegration",
+    "GooseCliIntegration",
+    "GooseDesktopIntegration",
     "HermesIntegration",
     "INTEGRATIONS",
     "get_integration",

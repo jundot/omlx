@@ -2,11 +2,12 @@
 //
 // Routes Claude Code requests to local models or to the cloud, exposes the
 // other named integrations (Codex / OpenCode / OpenClaw / Hermes / Pi /
-// Copilot) as model popups with per-tool launch commands, and renders the
-// Claude Code setup command — both the simple `omlx launch claude` form and
-// an "Advanced" env-var recipe that targets the real `claude` binary
-// directly. The model popups read their options from /admin/api/models so
-// the user can only pick something the server actually has on disk.
+// Copilot / Goose CLI / Goose Desktop) as model popups with per-tool launch
+// commands, and renders the Claude Code setup command — both the simple
+// `omlx launch claude` form and an "Advanced" env-var recipe that targets
+// the real `claude` binary directly. The model popups read their options
+// from /admin/api/models so the user can only pick something the server
+// actually has on disk.
 //
 // The OpenAI Compatibility section + Connected Apps from the design canvas
 // are skipped: there are no matching server fields. We keep every shipped
@@ -359,6 +360,28 @@ private struct OtherIntegrationsSection: View {
                 }),
                 modelOptions: vm.modelOptions,
                 command: vm.copilotCommand,
+                isLast: false
+            )
+            IntegrationRow(
+                name: String(localized: "integrations.tool.goose_cli",
+                             defaultValue: "Goose CLI",
+                             comment: "Display name for the Goose CLI integration"),
+                modelBinding: vm.bind($vm.gooseCliModel, save: {
+                    Task { await vm.save(.gooseCliModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.gooseCliCommand,
+                isLast: false
+            )
+            IntegrationRow(
+                name: String(localized: "integrations.tool.goose_desktop",
+                             defaultValue: "Goose Desktop",
+                             comment: "Display name for the Goose Desktop integration"),
+                modelBinding: vm.bind($vm.gooseDesktopModel, save: {
+                    Task { await vm.save(.gooseDesktopModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.gooseDesktopCommand,
                 isLast: true
             )
         }
@@ -504,7 +527,7 @@ final class IntegrationsScreenVM: ObservableObject {
     enum Field: Sendable {
         case claudeMode, opusModel, sonnetModel, haikuModel, contextScaling, targetContextSize
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
-        case hermesModel, copilotModel
+        case hermesModel, copilotModel, gooseCliModel, gooseDesktopModel
         case mcpConfig
     }
 
@@ -533,6 +556,8 @@ final class IntegrationsScreenVM: ObservableObject {
     @Published var openclawToolsProfile: String = "coding"
     @Published var hermesModel: String = ""
     @Published var copilotModel: String = ""
+    @Published var gooseCliModel: String = ""
+    @Published var gooseDesktopModel: String = ""
 
     // MCP
     @Published var mcpConfigPath: String = ""
@@ -610,6 +635,8 @@ final class IntegrationsScreenVM: ObservableObject {
     var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
     var piCommand: String       { "\(cliCommandPrefix) launch pi" }
     var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
+    var gooseCliCommand: String     { "\(cliCommandPrefix) launch goose_cli" }
+    var gooseDesktopCommand: String { "\(cliCommandPrefix) launch goose_desktop" }
 
     var hasPendingMCPChanges: Bool {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
@@ -660,6 +687,8 @@ final class IntegrationsScreenVM: ObservableObject {
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
+                self.gooseCliModel        = it.gooseCliModel ?? ""
+                self.gooseDesktopModel    = it.gooseDesktopModel ?? ""
             }
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
@@ -712,6 +741,8 @@ final class IntegrationsScreenVM: ObservableObject {
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
         case .hermesModel:          patch.integrationsHermesModel = hermesModel
         case .copilotModel:         patch.integrationsCopilotModel = copilotModel
+        case .gooseCliModel:        patch.integrationsGooseCliModel = gooseCliModel
+        case .gooseDesktopModel:    patch.integrationsGooseDesktopModel = gooseDesktopModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
         }

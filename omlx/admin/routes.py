@@ -283,6 +283,8 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_goose_cli_model: str | None = None
+    integrations_goose_desktop_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -3199,6 +3201,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "goose_cli_model": global_settings.integrations.goose_cli_model,
+            "goose_desktop_model": global_settings.integrations.goose_desktop_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -3711,6 +3715,16 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_goose_cli_model" in request.model_fields_set:
+        global_settings.integrations.goose_cli_model = (
+            request.integrations_goose_cli_model
+        )
+        integrations_changed = True
+    if "integrations_goose_desktop_model" in request.model_fields_set:
+        global_settings.integrations.goose_desktop_model = (
+            request.integrations_goose_desktop_model
+        )
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -3772,6 +3786,8 @@ async def update_global_settings(
             f"openclaw={global_settings.integrations.openclaw_model}, "
             f"hermes={global_settings.integrations.hermes_model}, "
             f"pi={global_settings.integrations.pi_model}, "
+            f"goose_cli={global_settings.integrations.goose_cli_model}, "
+            f"goose_desktop={global_settings.integrations.goose_desktop_model}, "
             f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
             f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
             f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
