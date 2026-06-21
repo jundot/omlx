@@ -1105,6 +1105,131 @@ def parse_tool_calls(
     return cleaned_text, tool_calls
 
 
+def _extract_balanced_json(text: str, start: int) -> Optional[str]:
+    if start >= len(text) or text[start] != "{":
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        i += 1
+
+    return None
+
+
+def _parse_rehearsal_tool_calls(
+    text: str,
+) -> Optional[List[ToolCall]]:
+    """Rescue parser for rehearsal-syntax tool calls (reasoning models).
+
+    Extracts patterns like ``search[ARGS]{"query": "hello"}`` that some
+    reasoning models emit inside thinking tokens. Last-resort fallback
+    invoked only when all primary parsers return nothing.
+    """
+    pattern = re.compile(r"(\w+)\[ARGS\](\{.*?\})", re.DOTALL)
+    matches = pattern.findall(text)
+    if not matches:
+        return None
+
+    tool_calls: list[ToolCall] = []
+    for name, brace_content in matches:
+        try:
+            parsed = json.loads(brace_content, strict=False)
+            if isinstance(parsed, dict):
+                tc = ToolCall(
+                    id=f"rehearsal_{len(tool_calls)}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=json.dumps(parsed, ensure_ascii=False),
+                    ),
+                )
+                tool_calls.append(tc)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return tool_calls if tool_calls else None
+
+
+def _parse_mistral_bracket_tool_calls(
+    text: str,
+) -> Optional[List[ToolCall]]:
+    """Rescue parser for Mistral ``[TOOL_CALLS]`` using brace-balance scan.
+
+    Handles nested JSON objects, literal braces inside string values, and
+    escaped quotes — cases the regex-based parser cannot handle.
+    """
+    marker = "[TOOL_CALLS]"
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+
+    body = text[idx + len(marker):]
+    tool_calls: list[ToolCall] = []
+    pos = 0
+
+    while pos < len(body):
+        while pos < len(body) and body[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(body):
+            break
+
+        name_start = pos
+        while pos < len(body) and (body[pos].isalnum() or body[pos] in "_-"):
+            pos += 1
+        name = body[name_start:pos]
+        if not name:
+            break
+
+        while pos < len(body) and body[pos] in " \t":
+            pos += 1
+        if pos >= len(body) or body[pos] != "{":
+            break
+
+        obj_str = _extract_balanced_json(body, pos)
+        if obj_str is None:
+            break
+
+        try:
+            parsed = json.loads(obj_str)
+            if isinstance(parsed, dict):
+                tc = ToolCall(
+                    id=f"mistral_{len(tool_calls)}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=json.dumps(parsed, ensure_ascii=False),
+                    ),
+                )
+                tool_calls.append(tc)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        pos += len(obj_str)
+
+    return tool_calls if tool_calls else None
+
+
 def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
@@ -1266,6 +1391,13 @@ def _parse_tool_calls_impl(
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
+
+    # --- Rescue parsers (last resort) ---
+    tool_calls = _parse_rehearsal_tool_calls(cleaned_text)
+    if tool_calls is None:
+        tool_calls = _parse_mistral_bracket_tool_calls(cleaned_text)
+    if tool_calls is not None:
+        return cleaned_text, tool_calls
 
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers
