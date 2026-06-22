@@ -2,6 +2,7 @@
 change: add-forge-guardrails
 design-doc: docs/superpowers/specs/2026-06-21-forge-guardrails-design.md
 base-ref: fd45ed3d33acecf41156e50d3d87d4e39f4f13a7
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 # Forge Guardrails Implementation Plan
@@ -56,6 +57,7 @@ Wave 7 (after Task 8):
 
 **Critical path**: Task 1 → Task 2 → Task 3 → Task 6 → Task 7 → Task 8 → Task 9 (7 tasks).
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ## File Structure
@@ -81,6 +83,7 @@ Wave 7 (after Task 8):
 | `tests/test_guardrail_e2e.py` | Integration/E2E through FastAPI TestClient |
 | `docs/tool-call-guardrails.md` | User-facing documentation |
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 1: Guardrails Types & Package Foundation
@@ -335,6 +338,7 @@ git add omlx/api/guardrails/__init__.py omlx/api/guardrails/types.py tests/test_
 git commit -m "feat(guardrails): add core type definitions (CheckResult, Nudge, ValidationResult)"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 2: Nudge Generation
@@ -549,6 +553,7 @@ git add omlx/api/guardrails/nudge.py omlx/api/guardrails/__init__.py tests/test_
 git commit -m "feat(guardrails): add nudge generators for 4 validation failure types"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 3: GuardrailValidator (4 Checks + Ordering)
@@ -1078,6 +1083,7 @@ git add omlx/api/guardrails/validator.py omlx/api/guardrails/__init__.py tests/t
 git commit -m "feat(guardrails): implement GuardrailValidator with 4 checks and nudge selection"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 4: Rescue Parsers (Rehearsal + Improved Mistral)
@@ -1378,6 +1384,7 @@ git add omlx/api/tool_calling.py tests/test_rescue_parsers.py
 git commit -m "feat(guardrails): add rehearsal + improved Mistral rescue parsers"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 5: tool_choice Enforcement Module
@@ -1630,6 +1637,7 @@ git add omlx/api/tool_choice.py omlx/api/openai_models.py tests/test_tool_choice
 git commit -m "feat(guardrails): add tool_choice enforcement module + request validation"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 6: Strict Args Mode + Wrapper Function
@@ -1864,6 +1872,7 @@ git add omlx/api/tool_calling.py tests/test_strict_args.py
 git commit -m "feat(guardrails): add strict args mode + extract_and_validate wrapper"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 7: Settings Integration
@@ -2047,6 +2056,7 @@ git add omlx/settings.py omlx/admin/routes.py tests/test_guardrail_settings.py
 git commit -m "feat(guardrails): add ForgeGuardrailsSettings + admin panel wiring"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 8: Server Wiring (All 3 Endpoints)
@@ -2242,6 +2252,7 @@ git add omlx/server.py tests/test_guardrail_server_wiring.py
 git commit -m "feat(guardrails): wire validation + tool_choice enforcement into all 3 endpoints"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 9: Full Test Suite + E2E Tests
@@ -2382,6 +2393,7 @@ git add tests/test_guardrail_e2e.py
 git commit -m "test(guardrails): add E2E test skeleton + backward compatibility tests"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ### Task 10: Documentation
@@ -2514,6 +2526,7 @@ git add docs/tool-call-guardrails.md
 git commit -m "docs(guardrails): add user-facing tool call guardrails documentation"
 ```
 
+archived-with: 2026-06-22-add-forge-guardrails
 ---
 
 ## Self-Review Summary
