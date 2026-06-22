@@ -154,11 +154,16 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.guardrail_wiring import (
+    apply_guardrails,
+    guardrail_validation_payload,
+)
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
+    extract_and_validate_tool_calls,
     extract_tool_calls_with_thinking,
     parse_json_output,
     restore_gemma4_param_names,
@@ -3560,15 +3565,26 @@ async def create_chat_completion(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            extraction = None
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
+                )
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    tools_for_template,
+                    validation_enabled=_fg.validation_enabled,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
@@ -3597,7 +3613,7 @@ async def create_chat_completion(
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-            return ChatCompletionResponse(
+            _result = ChatCompletionResponse(
                 model=request.model,
                 choices=[
                     ChatCompletionChoice(
@@ -3627,9 +3643,16 @@ async def create_chat_completion(
                 ),
             ).model_dump_json(exclude_none=True)
 
-        json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
-        )
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(
+                    extraction, include_validation_metadata=True
+                )
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
         return StreamingResponse(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_chat_completion()),
@@ -4415,11 +4438,21 @@ async def stream_chat_completion(
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
+        )
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
@@ -4847,11 +4880,21 @@ async def stream_anthropic_messages(
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
+        )
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
         )
         tool_calls = extraction.tool_calls
 
@@ -5285,15 +5328,26 @@ async def create_anthropic_message(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            extraction = None
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
+                )
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    internal_tools,
+                    validation_enabled=_fg.validation_enabled,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
@@ -5769,15 +5823,26 @@ async def create_response(
             thinking_content, regular_content = extract_thinking(raw_text)
 
             # Parse tool calls
+            extraction = None
             if output.tool_calls:
                 tool_calls = output.tool_calls
                 cleaned_text = regular_content
             else:
-                extraction = extract_tool_calls_with_thinking(
+                _fg = _server_state.global_settings.forge_guardrails
+                extraction = extract_and_validate_tool_calls(
                     thinking_content,
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    tool_choice=request.tool_choice,
+                    strict_tool_args=_fg.strict_tool_args,
+                    validation_enabled=_fg.validation_enabled,
+                )
+                extraction = apply_guardrails(
+                    extraction,
+                    request.tool_choice,
+                    tools_for_template,
+                    validation_enabled=_fg.validation_enabled,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
@@ -6229,11 +6294,21 @@ async def stream_responses_api(
         cleaned_text = ""
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(accumulated_text)
-        extraction = extract_tool_calls_with_thinking(
+        _fg = _server_state.global_settings.forge_guardrails
+        extraction = extract_and_validate_tool_calls(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            tool_choice=request.tool_choice,
+            strict_tool_args=_fg.strict_tool_args,
+            validation_enabled=_fg.validation_enabled,
+        )
+        extraction = apply_guardrails(
+            extraction,
+            request.tool_choice,
+            kwargs.get("tools"),
+            validation_enabled=_fg.validation_enabled,
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
