@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from omlx.api.guardrails.budget import ErrorBudget
 from omlx.api.guardrails.types import CheckResult, ValidationResult
 from omlx.api.tool_calling import ToolCallExtraction
 from omlx.api.tool_choice import enforce_tool_choice
@@ -28,6 +29,7 @@ def apply_guardrails(
         checks=existing.checks + [tc_check],
         nudge=existing.nudge,
         passed=existing.passed and tc_check.passed,
+        budget=existing.budget,
     )
 
     return ToolCallExtraction(
@@ -43,7 +45,27 @@ def guardrail_validation_payload(
     extraction: ToolCallExtraction,
     *,
     include_validation_metadata: bool = False,
+    max_retries: int = 3,
+    max_tool_errors: int = 2,
 ) -> Optional[dict]:
+    """Build the x_omlx_validation payload, attaching an ErrorBudget.
+
+    When the ValidationResult does not already carry a budget, one is
+    constructed from *max_retries* / *max_tool_errors* so clients can
+    implement bounded retry loops.
+    """
     if not include_validation_metadata or extraction.validation_result is None:
         return None
-    return {"x_omlx_validation": extraction.validation_result.to_dict()}
+
+    existing: ValidationResult = extraction.validation_result
+    if existing.budget is not None:
+        return {"x_omlx_validation": existing.to_dict()}
+
+    budget = ErrorBudget(max_retries=max_retries, max_tool_errors=max_tool_errors)
+    with_budget = ValidationResult(
+        checks=existing.checks,
+        nudge=existing.nudge,
+        passed=existing.passed,
+        budget=budget,
+    )
+    return {"x_omlx_validation": with_budget.to_dict()}

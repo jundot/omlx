@@ -12,6 +12,7 @@ import json
 import logging
 from typing import Any
 
+from omlx.api.guardrails.budget import ErrorBudget
 from omlx.api.guardrails.nudge import (
     missing_params_nudge,
     retry_nudge,
@@ -33,9 +34,10 @@ _NUDGE_PRIORITY = [
 class GuardrailValidator:
     """Validate parsed tool-call responses against the provided tool schemas."""
 
-    def __init__(self, tools: list[dict] | None):
+    def __init__(self, tools: list[dict] | None, *, budget: ErrorBudget | None = None):
         self._tool_schemas: dict[str, dict] = {}
         self._tool_names: set[str] = set()
+        self._budget: ErrorBudget | None = budget
         if tools:
             for tool in tools:
                 func = tool.get("function", tool)
@@ -82,11 +84,15 @@ class GuardrailValidator:
 
             passed = all(c.passed for c in checks) if checks else True
             nudge = self._select_nudge(checks, tool_calls) if not passed else None
-            return ValidationResult(checks=checks, nudge=nudge, passed=passed)
+            return ValidationResult(
+                checks=checks, nudge=nudge, passed=passed, budget=self._budget
+            )
 
         except Exception:
             logger.exception("GuardrailValidator.validate failed unexpectedly")
-            return ValidationResult(checks=[], nudge=None, passed=True)
+            return ValidationResult(
+                checks=[], nudge=None, passed=True, budget=self._budget
+            )
 
     def _check_bare_text(
         self, extraction: Any, tool_choice: Any, has_tools: bool
