@@ -384,7 +384,11 @@ final class WelcomeViewModel: ObservableObject {
     @discardableResult
     func openWebDashboard() -> Bool {
         guard let services else { return false }
-        guard let url = URL(string: "http://\(services.config.host):\(services.config.port)/admin/dashboard") else {
+        guard let url = AppConfig.httpURL(
+            host: services.config.host,
+            port: services.config.port,
+            path: "/admin/dashboard"
+        ) else {
             return false
         }
         NSWorkspace.shared.open(url)
@@ -610,15 +614,14 @@ private struct WelcomeSetupBody: View {
                                          defaultValue: "This key is also your Web Dashboard login password.",
                                          comment: "Sublabel explaining API key usage")
                     ) {
-                        HStack(spacing: 8) {
-                            keyField($vm.apiKey)
+                        HStack(spacing: 0) {
+                            TextInput("welcome.api_key.placeholder", text: $vm.apiKey, placeholder: "sk-omlx-…", isSecure: !keyVisible, mono: true, width: 210)
                             Button {
                                 keyVisible.toggle()
                             } label: {
                                 Image(systemName: keyVisible ? "eye.slash" : "eye")
                                     .font(.system(size: 13, weight: .semibold))
                             }
-                            .buttonStyle(.omlx(.plain, size: .small))
                             .disabled(vm.isStarting)
                             .help(keyVisible
                                   ? String(localized: "welcome.api_key.hide",
@@ -627,7 +630,18 @@ private struct WelcomeSetupBody: View {
                                   : String(localized: "welcome.api_key.show",
                                            defaultValue: "Show key",
                                            comment: "Tooltip on the eye button that unmasks the API key field"))
+
+                            Button {
+                                vm.apiKey = APIKeyGenerator.random()
+                                keyVisible = true
+                            } label: {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
+                            .help(String(localized: "security.api_key.generate",
+                                         defaultValue: "Generate a random key",
+                                         comment: "Tooltip on the API key regenerate button"))
                         }
+                        .buttonStyle(.omlx(.plain, size: .small))
                     }
                 }
                 .background(WelcomeStyle.panel)
@@ -650,19 +664,6 @@ private struct WelcomeSetupBody: View {
         .padding(.top, 18)
         .padding(.bottom, 6)
         .disabled(vm.isStarting)
-    }
-
-    @ViewBuilder
-    private func keyField(_ binding: Binding<String>) -> some View {
-        let placeholder = String(localized: "welcome.api_key.placeholder",
-                                 defaultValue: "Create an API key",
-                                 comment: "Placeholder text inside the API key text field")
-        if keyVisible {
-            TextInput(text: binding, placeholder: placeholder, mono: true, width: 210)
-        } else {
-            TextInput(text: binding, placeholder: placeholder,
-                      isSecure: true, mono: true, width: 210)
-        }
     }
 }
 

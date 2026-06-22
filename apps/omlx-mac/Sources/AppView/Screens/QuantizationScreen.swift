@@ -393,7 +393,6 @@ private struct AdvancedSection: View {
                             ("bfloat16", "bfloat16"),
                             ("float16",  "float16"),
                         ])
-                        .frame(width: 180)
                     }
                 }
             }
@@ -516,7 +515,7 @@ private struct QueueRow: View {
                                comment: "Tooltip on the X button for a terminal quant task"))
             }
             if task.isActive {
-                ProgressBar(progress: max(0, min(task.progress / 100, 1)))
+                ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     if !task.phase.isEmpty {
                         Text(task.phase)
@@ -600,28 +599,6 @@ private struct StatusChip: View {
             .padding(.vertical, 1)
             .background(cfg.0.opacity(0.12))
             .clipShape(Capsule())
-    }
-}
-
-private struct ProgressBar: View {
-    let progress: Double
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(theme.codeBg)
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(LinearGradient(
-                        colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)],
-                        startPoint: .leading, endPoint: .trailing
-                    ))
-                    .frame(width: geo.size.width * progress)
-                    .animation(.easeOut(duration: 0.4), value: progress)
-            }
-        }
-        .frame(height: 4)
     }
 }
 
@@ -718,7 +695,7 @@ private struct UploadRow: View {
                                comment: "Tooltip on the X button for a terminal upload task"))
             }
             if task.isActive {
-                ProgressBar(progress: max(0, min(task.progress / 100, 1)))
+                ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     Text(task.repoId)
                         .font(.omlxMono(11))

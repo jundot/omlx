@@ -3,7 +3,7 @@
 // State machine
 //   stopped ─start()→ starting ─/health 200→ running ─/health fail×3→ unresponsive
 //                       │                       │ ↑                       │
-//                       │                       │ └─/health 200───────────┘
+//                       │                       │ └─/health or status OK──┘
 //                       │                       │
 //                       │                       └─process exit → auto-restart
 //                       └─process exit during startup → auto-restart
@@ -104,6 +104,7 @@ final class ServerProcess: @unchecked Sendable {
 
     private let healthCheckInterval: TimeInterval = 5
     private let maxHealthFailures = 3
+    private let auxiliaryHealthFreshness: TimeInterval = 15
     private let maxAutoRestarts   = 3
     private let stableThreshold: TimeInterval = 60   // seconds before counter resets
     private let stopGraceSeconds: TimeInterval = 10
@@ -117,6 +118,7 @@ final class ServerProcess: @unchecked Sendable {
     private var consecutiveFailures = 0
     private var autoRestartCount    = 0
     private var lastHealthyAt: Date?
+    private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
     private let logURL: URL
 
@@ -205,6 +207,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         expectingExit = false
         process = nil
+        lastAuxiliaryHealthyAt = nil
         closeLog()
     }
 
@@ -225,9 +228,31 @@ final class ServerProcess: @unchecked Sendable {
         closeLog()
         autoRestartCount = 0
         consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
         expectingExit = false
         update(.stopped)
         return try start()
+    }
+
+    /// Called by lightweight menubar status polling when the server answers
+    /// `/api/status`. Under heavy generation load this keeps the UI from
+    /// declaring the managed process unresponsive solely because `/health`
+    /// was delayed.
+    @MainActor
+    func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
+        lastAuxiliaryHealthyAt = date
+        lastHealthyAt = date
+        consecutiveFailures = 0
+        switch state {
+        case .starting:
+            if let pid = process?.processIdentifier {
+                update(.running(pid: pid))
+            }
+        case .unresponsive(let pid):
+            update(.running(pid: pid))
+        default:
+            break
+        }
     }
 
     /// Synchronous SIGTERM-then-SIGKILL of the child, used by signal
@@ -250,6 +275,8 @@ final class ServerProcess: @unchecked Sendable {
     private func doStart() throws {
         try ensureDir(basePath)
         try ensureDir(logURL.deletingLastPathComponent())
+        consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
 
         if !FileManager.default.fileExists(atPath: logURL.path) {
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -318,6 +345,7 @@ final class ServerProcess: @unchecked Sendable {
 
         autoRestartCount += 1
         consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
         let attempt = autoRestartCount
         let backoff = TimeInterval(5 * (1 << (attempt - 1)))   // 5, 10, 20s
 
@@ -359,22 +387,31 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     private func tickHealth() async {
         switch state {
+        case .starting, .running, .unresponsive:
+            break
+        default:
+            return
+        }
+
+        let probe = await resolver.probeHealth()
+        let now = Date()
+        switch state {
         case .starting:
-            if await resolver.isHealthy() {
+            if probe.ok || hasRecentAuxiliaryHealth(now: now) {
                 let pid = process?.processIdentifier ?? 0
-                consecutiveFailures = 0
-                lastHealthyAt = Date()
-                update(.running(pid: pid))
+                markHealthy(pid: pid, at: now)
+            } else {
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
             }
         case .running(let pid), .unresponsive(let pid):
-            if await resolver.isHealthy() {
-                consecutiveFailures = 0
-                lastHealthyAt = Date()
-                if case .unresponsive = state {
-                    update(.running(pid: pid))
-                }
+            if probe.ok {
+                markHealthy(pid: pid, at: now)
+            } else if hasRecentAuxiliaryHealth(now: now) {
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: true)
+                markHealthy(pid: pid, at: now)
             } else {
                 consecutiveFailures += 1
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
                 if consecutiveFailures >= maxHealthFailures,
                    case .running = state {
                     update(.unresponsive(pid: pid))
@@ -383,6 +420,35 @@ final class ServerProcess: @unchecked Sendable {
         default:
             return
         }
+    }
+
+    @MainActor
+    private func markHealthy(pid: Int32, at date: Date) {
+        consecutiveFailures = 0
+        lastHealthyAt = date
+        switch state {
+        case .starting, .unresponsive:
+            update(.running(pid: pid))
+        default:
+            break
+        }
+    }
+
+    private func hasRecentAuxiliaryHealth(now: Date) -> Bool {
+        guard let lastAuxiliaryHealthyAt else { return false }
+        return now.timeIntervalSince(lastAuxiliaryHealthyAt) <= auxiliaryHealthFreshness
+    }
+
+    private func logHealthProbeFailure(
+        _ result: HealthProbeResult,
+        failures: Int,
+        suppressed: Bool
+    ) {
+        let status = result.statusCode.map(String.init) ?? "none"
+        let error = result.errorDescription ?? "none"
+        NSLog(
+            "oMLX: health probe failed url=\(result.url) latency_ms=\(result.latencyMs) status=\(status) error=\(error) failures=\(failures) suppressed_by_recent_status=\(suppressed)"
+        )
     }
 
     // MARK: - Internal — helpers

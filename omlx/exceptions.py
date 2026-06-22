@@ -427,6 +427,18 @@ class ModelLoadingError(EnginePoolError):
         super().__init__(f"Model '{model_id}' is already being loaded")
 
 
+class ModelBusyError(EnginePoolError):
+    """Raised when an operation would unload a model that is currently in use."""
+
+    def __init__(self, model_id: str, operation: str):
+        self.model_id = model_id
+        self.operation = operation
+        super().__init__(
+            f"Model '{model_id}' is busy; cannot {operation} until active "
+            "requests finish or are aborted"
+        )
+
+
 # =============================================================================
 # MCP Errors
 # =============================================================================

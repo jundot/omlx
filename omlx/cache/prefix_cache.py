@@ -35,6 +35,11 @@ from .type_registry import CacheTypeRegistry
 
 logger = logging.getLogger(__name__)
 
+# Cap on the supersede-on-extend lineage map (tip hash -> previous tip hash).
+# Each entry is two 32-byte hashes; the cap only guards against unbounded
+# growth from many distinct conversation chains over a long-lived process.
+_TIP_LINEAGE_MAX_ENTRIES = 4096
+
 
 @dataclass
 class BlockCacheEntry:
@@ -107,6 +112,13 @@ class BlockAwarePrefixCache(CacheManager):
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
 
+        # Supersede-on-extend lineage for rotating (sliding-window) models:
+        # newest tip block hash -> previous tip block hash. When a chain is
+        # extended again, the entry two generations back is stripped of its
+        # rotating payload (see _strip_rotating_payload); the immediate
+        # previous tip is kept intact as the walk-back fallback.
+        self._rotating_tip_lineage: dict[bytes, bytes] = {}
+
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
         self._cold_restore_callback: Callable[[int, bytes], bool] | None = None
@@ -176,21 +188,62 @@ class BlockAwarePrefixCache(CacheManager):
         """
         self.paged_ssd_cache = paged_ssd_cache_manager
         if paged_ssd_cache_manager is not None:
+            # If the manager already knows its layer-cache signature (e.g.,
+            # eager scheduler plumb-through), purge any indexed blocks left
+            # over from a prior cache-config run for the current model.
+            # When the signature is unset, this is a no-op; the manager
+            # adopts on the first save and sweeps then.
+            try:
+                paged_ssd_cache_manager.invalidate_stale_layer_signature()
+            except Exception as e:
+                logger.warning(
+                    "Stale-signature sweep on manager attach failed: %s", e
+                )
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
-    def _forget_incompatible_ssd_block(self, block_hash: bytes | None) -> None:
+    def _forget_incompatible_ssd_block(
+        self,
+        block_hash: bytes | None,
+        block_id: int | None = None,
+    ) -> None:
         """Remove an incompatible block from this manager without unlinking it.
 
         The SSD cache directory can be shared by multiple loaded models. A
         block that is stale for this prefix cache may still be valid for
         another model, so mismatch handling must clear local indexes only.
         """
-        if self.paged_ssd_cache is None or block_hash is None:
+        if block_hash is None:
+            return
+        try:
+            if block_id is None:
+                block = self.paged_cache.cached_block_hash_to_block.get_block(
+                    block_hash
+                )
+                block_id = block.block_id if block is not None else None
+            if block_id is not None:
+                self.paged_cache.cached_block_hash_to_block.pop(block_hash, block_id)
+        except Exception as e:
+            logger.debug(f"Failed to forget incompatible paged block: {e}")
+        if self.paged_ssd_cache is None:
             return
         try:
             self.paged_ssd_cache.forget_block(block_hash)
         except Exception as e:
             logger.debug(f"Failed to forget incompatible SSD block: {e}")
+
+    @staticmethod
+    def _canonical_layer_cache_types(
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> list[str] | None:
+        """Normalize wrapper class names for metadata compatibility checks.
+
+        Thin wrapper around the canonical implementation in
+        :mod:`omlx.cache.paged_ssd_cache` so the two sites that compare
+        signatures stay in lock-step.
+        """
+        from .paged_ssd_cache import _canonicalize_layer_cache_types
+
+        return _canonicalize_layer_cache_types(layer_cache_types)
 
     def _detect_window_padding_from_blocks(
         self,
@@ -226,7 +279,9 @@ class BlockAwarePrefixCache(CacheManager):
         # window padding. CacheList uses last-block-only storage with reject-on-partial
         # strategy, so the sliding window state is either fully restored (exact match)
         # or the entire cache is rejected (partial match).
-        if not layer_cache_types or "RotatingKVCache" not in layer_cache_types:
+        if not layer_cache_types or not any(
+            CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
+        ):
             return None
 
         model_cache_config = ModelCacheConfig.from_type_list(
@@ -240,9 +295,8 @@ class BlockAwarePrefixCache(CacheManager):
             if not meta or len(meta) < 2:
                 continue
             # Check if this layer is RotatingKVCache
-            if (
-                idx < len(layer_cache_types)
-                and layer_cache_types[idx] == "RotatingKVCache"
+            if idx < len(layer_cache_types) and CacheTypeRegistry.is_rotating_family(
+                layer_cache_types[idx]
             ):
                 # RotatingKVCache meta_state: (keep, max_size, offset, _idx)
                 window_size = int(meta[1])
@@ -353,6 +407,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        hot_cache_write_back: bool = True,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -373,6 +428,8 @@ class BlockAwarePrefixCache(CacheManager):
             boundary_snapshots: Optional mapping of token_count -> extracted cache
                 states for intermediate block boundaries. Used to store per-block
                 ArraysCache state instead of placeholders in hybrid models.
+            hot_cache_write_back: When False, SSD-backed hot cache is bypassed
+                for newly stored dirty blocks.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -460,6 +517,9 @@ class BlockAwarePrefixCache(CacheManager):
             )
 
         blocks_saved_to_ssd = 0
+        # Supersede-on-extend tracking (rotating models only, see below).
+        first_new_block_idx: int | None = None
+        tip_block_saved = False
 
         for i in range(num_new_blocks):
             start_idx = i * self.block_size
@@ -500,6 +560,8 @@ class BlockAwarePrefixCache(CacheManager):
                     continue
 
             # Allocate new block
+            if first_new_block_idx is None:
+                first_new_block_idx = len(block_table.block_ids)
             block = self.paged_cache.allocate_block()
             if not block:
                 # Handle memory pressure
@@ -629,16 +691,29 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
-                    saved = self.paged_ssd_cache.save_block(
-                        block_hash=block.block_hash,
-                        cache_data=block_kv_data,
-                        token_count=block.token_count,
-                        model_name=self.paged_cache.model_name,
-                        layer_cache_types=layer_cache_types,
-                        layer_meta_states=block_meta,
-                    )
+                    if hot_cache_write_back:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                        )
+                    else:
+                        saved = self.paged_ssd_cache.save_block(
+                            block_hash=block.block_hash,
+                            cache_data=block_kv_data,
+                            token_count=block.token_count,
+                            model_name=self.paged_cache.model_name,
+                            layer_cache_types=layer_cache_types,
+                            layer_meta_states=block_meta,
+                            hot_cache_write_back=False,
+                        )
                     if saved:
                         blocks_saved_to_ssd += 1
+                        if is_last_block:
+                            tip_block_saved = True
                         logger.debug(
                             f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
@@ -663,6 +738,40 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+        # Supersede-on-extend: on rotating (sliding-window) models every store
+        # of a growing conversation writes one tip block carrying the full
+        # sliding-window state of all rotating layers (hundreds of MB fp16 on
+        # a gemma3-class model). Restore only ever consumes the newest such
+        # block, and the immediate previous tip is kept intact as the
+        # walk-back fallback — so the tip two generations back is dead
+        # weight. Without stripping it, those blocks fill the hot cache after
+        # ~10-20 turns and LRU eviction breaks the prefix chain (multi-turn
+        # cache hit collapses to 0%). Steady state after stripping: two heavy
+        # blocks per chain.
+        if (
+            tip_block_saved
+            and first_new_block_idx is not None
+            and 0 < first_new_block_idx < len(block_table.block_ids)
+            and layer_cache_types
+            and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
+        ):
+            prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
+            new_tip_id = block_table.block_ids[-1]
+            prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
+            new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
+            if (
+                prev_tip is not None
+                and prev_tip.block_hash is not None
+                and new_tip is not None
+                and new_tip.block_hash is not None
+            ):
+                superseded = self._rotating_tip_lineage.pop(prev_tip.block_hash, None)
+                if superseded is not None:
+                    self._strip_rotating_payload(superseded)
+                self._rotating_tip_lineage[new_tip.block_hash] = prev_tip.block_hash
+                if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                    self._rotating_tip_lineage.clear()
 
         # Update prefix index
         self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
@@ -702,7 +811,11 @@ class BlockAwarePrefixCache(CacheManager):
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
         # ArraysCache: no traditional sequence dimension
-        non_sliceable_types = {"RotatingKVCache", "ArraysCache", "CacheList"}
+        non_sliceable_types = {
+            "ArraysCache",
+            "CacheList",
+            "MiniMaxM3BatchKVCache",
+        }
 
         # Step 1: Search for a sliceable KVCache layer (full attention)
         for layer_idx, layer_state in enumerate(cache_data):
@@ -716,6 +829,8 @@ class BlockAwarePrefixCache(CacheManager):
                 if (
                     cache_type in non_sliceable_types
                     or class_name in non_sliceable_types
+                    or CacheTypeRegistry.is_rotating_family(cache_type)
+                    or CacheTypeRegistry.is_rotating_family(class_name)
                 ):
                     continue
 
@@ -754,7 +869,11 @@ class BlockAwarePrefixCache(CacheManager):
         # Only skip cache types that do not expose a sequence dimension here.
         # RotatingKVCache must be included because pure RotatingKVCache models
         # have no sliceable KVCache layers for Step 1 to find.
-        step2_skip_types = {"ArraysCache", "CacheList"}
+        step2_skip_types = {
+            "ArraysCache",
+            "CacheList",
+            "MiniMaxM3BatchKVCache",
+        }
         max_seq_len = 0
         for layer_idx, layer_state in enumerate(cache_data):
             try:
@@ -808,6 +927,79 @@ class BlockAwarePrefixCache(CacheManager):
                             return seq_len
 
         return 0
+
+    def _strip_rotating_payload(self, block_hash: bytes) -> bool:
+        """Replace a superseded tip block's rotating payload with placeholders.
+
+        Sliceable layers (KVCache/TurboQuant slices) in the block are kept —
+        only RotatingKVCache-family layer states are replaced with the same
+        ``(mx.zeros((1,)), mx.zeros((1,)))`` placeholder that non-tip blocks
+        receive at store time, so restore treats the stripped block exactly
+        like any other placeholder block (walk-back or reject).
+
+        The rewrite goes through ``forget_block()`` + ``save_block()``: the
+        hot-cache entry is removed via ``_hot_cache_remove`` (which also
+        forgets the shared-budget accounting) and the slim payload re-enters
+        via ``_hot_cache_put`` (which re-registers it), so the hot-cache and
+        shared-budget byte counters stay consistent. In SSD mode the slim
+        payload is re-enqueued and overwrites the same hash-derived file
+        path.
+
+        Returns:
+            True if the block was rewritten with at least one layer stripped.
+        """
+        if self.paged_ssd_cache is None or not HAS_MLX:
+            return False
+        try:
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            if not data or not meta:
+                return False
+            types = meta.get("layer_cache_types") or []
+            new_data: list[Any] = []
+            stripped = 0
+            for i, layer in enumerate(data):
+                type_name = types[i] if i < len(types) else "KVCache"
+                if (
+                    CacheTypeRegistry.is_rotating_family(type_name)
+                    and isinstance(layer, (list, tuple))
+                    and len(layer) >= 2
+                    and hasattr(layer[0], "shape")
+                    and tuple(layer[0].shape) != (1,)
+                ):
+                    new_data.append((mx.zeros((1,)), mx.zeros((1,))))
+                    stripped += 1
+                else:
+                    new_data.append(layer)
+            if stripped == 0:
+                return False
+            # save_block dedups on an existing hash, so drop the old entry
+            # (hot cache, pending writes, SSD index) first. The brief gap is
+            # benign: a concurrent restore either already loaded the old
+            # payload or sees the placeholder version, which the
+            # walk-back/reject path handles like any partial match.
+            self.paged_ssd_cache.forget_block(block_hash)
+            saved = self.paged_ssd_cache.save_block(
+                block_hash=block_hash,
+                cache_data=new_data,
+                token_count=int(meta.get("token_count") or self.block_size),
+                model_name=meta.get("model_name", self.paged_cache.model_name),
+                layer_cache_types=types or None,
+                layer_meta_states=meta.get("layer_meta_states"),
+            )
+            if saved:
+                logger.debug(
+                    "Stripped rotating payload from superseded tip block %s "
+                    "(%d of %d layers)",
+                    block_hash.hex()[:16],
+                    stripped,
+                    len(data),
+                )
+            return bool(saved)
+        except Exception as e:
+            logger.debug(
+                "Rotating payload strip failed for %s: %s", block_hash.hex()[:16], e
+            )
+            return False
 
     def _extract_block_tensor_slice(
         self,
@@ -905,6 +1097,43 @@ class BlockAwarePrefixCache(CacheManager):
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
                         # Placeholder from boundary snapshot (skipped sliceable layer).
                         continue
+
+                    axis_info = handler.get_state_axis_info()
+                    if len(state) != 2 or len(axis_info) != 2:
+                        seq_len = handler.get_state_seq_len_from_tuple(tuple(state))
+                        actual_end = min(end_idx, seq_len)
+                        if seq_len <= 0 or start_idx >= actual_end:
+                            continue
+
+                        sliced_elements = []
+                        for info, elem in zip(axis_info, state):
+                            if elem is None:
+                                sliced_elements.append(None)
+                                continue
+                            if (
+                                info.sliceable
+                                and info.sequence_axis is not None
+                                and hasattr(elem, "shape")
+                                and info.sequence_axis < len(elem.shape)
+                            ):
+                                slices = [slice(None)] * len(elem.shape)
+                                slices[info.sequence_axis] = slice(
+                                    start_idx, actual_end
+                                )
+                                sliced_elements.append(
+                                    self._clone_tensor(elem[tuple(slices)])
+                                )
+                            else:
+                                sliced_elements.append(
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                        block_slices.append(
+                            ("__nstate__", cache_type_name, sliced_elements)
+                        )
+                        continue
+
                     keys, values = state
 
                     # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
@@ -945,7 +1174,7 @@ class BlockAwarePrefixCache(CacheManager):
                             self._clone_tensor(values_slice),
                         )
                     )
-                elif cache_type_name == "RotatingKVCache":
+                elif CacheTypeRegistry.is_rotating_family(cache_type_name):
                     # RotatingKVCache: last-block-only or boundary-snapshot strategy
                     has_valid_state = is_last_block or (
                         snapshot_cache_data is not None
@@ -1098,7 +1327,9 @@ class BlockAwarePrefixCache(CacheManager):
                         else:
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                 else:
-                    # Other non-sliceable cache (ArraysCache/MambaCache)
+                    # Other non-sliceable cache (ArraysCache/MambaCache or
+                    # model-specific caches such as MiniMax M3). N-tuple
+                    # caches keep every element via the SSD V3 marker format.
                     # GDN recurrent state summarizes the ENTIRE sequence in a
                     # fixed-size matrix. Each block boundary snapshot captures
                     # the state at that point in the sequence. Without a snapshot,
@@ -1118,7 +1349,17 @@ class BlockAwarePrefixCache(CacheManager):
                             state = snapshot_cache_data[layer_idx]["state"]
                         else:
                             state = layer_state["state"]
-                        if isinstance(state, (list, tuple)) and len(state) >= 2:
+                        if isinstance(state, (list, tuple)) and len(state) > 2:
+                            cloned = [
+                                (
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                                for elem in state
+                            ]
+                            block_slices.append(("__nstate__", cache_type_name, cloned))
+                        elif isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = (
                                 state[0] if state[0] is not None else mx.array([])
                             )
@@ -1412,6 +1653,7 @@ class BlockAwarePrefixCache(CacheManager):
     def reconstruct_cache(
         self,
         block_table: BlockTable,
+        promote_to_hot_cache: bool = True,
     ) -> list[Any] | None:
         """
         Reconstruct cache objects from paged SSD-stored block data.
@@ -1430,7 +1672,9 @@ class BlockAwarePrefixCache(CacheManager):
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from.
-                        Will be modified in-place if partial reconstruction.
+                Will be modified in-place if partial reconstruction.
+            promote_to_hot_cache: When False, SSD-loaded blocks are not retained
+                in hot cache after active KV reconstruction.
 
         Returns:
             List of reconstructed cache objects (one per layer),
@@ -1455,8 +1699,28 @@ class BlockAwarePrefixCache(CacheManager):
             valid_block_count = 0
             valid_token_count = 0
 
-            # Cache type information from blocks
-            layer_cache_types = None
+            # Cache type information from blocks.
+            # Anchor the per-block comparison to the live model's signature
+            # rather than block 0's metadata. Bootstrapping from block 0
+            # means a stale block (saved before TurboQuant/MTP toggled)
+            # silently becomes the truth and every newer, correctly-typed
+            # block trips the mismatch warning forever. With the live
+            # signature as the reference, the stale block 0 itself gets
+            # forgotten on the first failed comparison and reuse can
+            # extend past it on the next request.
+            manager_expected = (
+                getattr(self.paged_ssd_cache, "_expected_layer_cache_types", None)
+                if self.paged_ssd_cache is not None
+                else None
+            )
+            # Only adopt when the manager really has a concrete signature.
+            # Guard against MagicMock auto-attrs in tests and empty lists
+            # (which would unanimously trip the mismatch check); fall back
+            # to the historical block-0 bootstrap in those cases.
+            if isinstance(manager_expected, (list, tuple)) and manager_expected:
+                layer_cache_types = list(manager_expected)
+            else:
+                layer_cache_types = None
             first_block_meta_states = None  # meta_states from first block
             last_block_meta_states = (
                 None  # meta_states from last block (for non-sliceable caches)
@@ -1481,9 +1745,19 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
-                block_data, block_metadata = (
-                    self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
-                )
+                if promote_to_hot_cache:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash
+                        )
+                    )
+                else:
+                    block_data, block_metadata = (
+                        self.paged_ssd_cache.load_block_with_metadata(
+                            block.block_hash,
+                            promote_to_hot_cache=False,
+                        )
+                    )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "
@@ -1553,8 +1827,26 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # Extract type info from block metadata
                 if block_metadata:
+                    block_layer_cache_types = block_metadata.get("layer_cache_types")
                     if layer_cache_types is None:
-                        layer_cache_types = block_metadata.get("layer_cache_types")
+                        layer_cache_types = block_layer_cache_types
+                    elif (
+                        block_layer_cache_types is not None
+                        and self._canonical_layer_cache_types(block_layer_cache_types)
+                        != self._canonical_layer_cache_types(layer_cache_types)
+                    ):
+                        logger.warning(
+                            "Cache layer type mismatch at block %s: got %s, "
+                            "expected %s. Truncating cached prefix before this "
+                            "block.",
+                            block_id,
+                            block_layer_cache_types,
+                            layer_cache_types,
+                        )
+                        self._forget_incompatible_ssd_block(
+                            block.block_hash, block.block_id
+                        )
+                        break
 
                     # Track meta_states from first and last blocks
                     # Non-sliceable caches (RotatingKVCache) need last block's meta_state
@@ -1646,13 +1938,6 @@ class BlockAwarePrefixCache(CacheManager):
                         f"{new_count} block(s) ({valid_token_count} tokens)"
                     )
 
-            # Build model cache config if we have type info
-            model_cache_config = None
-            if layer_cache_types and len(layer_cache_types) == num_layers:
-                model_cache_config = ModelCacheConfig.from_type_list(
-                    layer_cache_types, model_name=""
-                )
-
             # Reconstruct caches for each layer
             reconstructed_caches = []
 
@@ -1740,13 +2025,17 @@ class BlockAwarePrefixCache(CacheManager):
                             last_block_meta_states[layer_idx][0]
                         )
 
-                    NON_SLICEABLE_SUB_CLASSES = {
-                        "RotatingKVCache",
+                    non_sliceable_sub_classes = {
                         "PoolingCache",
                         "ArraysCache",
                         "BatchPoolingCache",
-                        "BatchRotatingKVCache",
                     }
+
+                    def _is_non_sliceable_sub_class(class_name: str) -> bool:
+                        return (
+                            class_name in non_sliceable_sub_classes
+                            or CacheTypeRegistry.is_rotating_family(class_name)
+                        )
 
                     if len(cl_block_data) > 1:
                         # Per-block storage: concatenate sliceable sub-caches
@@ -1758,7 +2047,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 if j < len(sub_class_names_for_layer)
                                 else ""
                             )
-                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                            if _is_non_sliceable_sub_class(sub_class):
                                 # Each saved block already snapshots the
                                 # full state at its boundary — pick the
                                 # last block, which corresponds to the
@@ -1837,7 +2126,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 if j < len(sub_class_names_for_layer)
                                 else ""
                             )
-                            if sub_class in NON_SLICEABLE_SUB_CLASSES:
+                            if _is_non_sliceable_sub_class(sub_class):
                                 adjusted_sub_metas.append(
                                     orig_sub_meta if orig_sub_meta else ""
                                 )
@@ -1879,7 +2168,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
                 if cache_type_name in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
                     from ..turboquant_kv import (
-                        _concat_state,
+                        _concat_state_token_axis,
                         _rebuild_codecs,
                         _state_length,
                     )
@@ -1900,14 +2189,9 @@ class BlockAwarePrefixCache(CacheManager):
                         logger.debug(f"TQ layer {layer_idx}: no block data")
                         return None
                     # Concatenate along token dimension
-                    cat_ks = key_states[0]
-                    for s in key_states[1:]:
-                        cat_ks = _concat_state(cat_ks, s)
-                    cat_vs = value_states[0]
-                    for s in value_states[1:]:
-                        cat_vs = _concat_state(cat_vs, s)
+                    cat_ks = _concat_state_token_axis(key_states)
+                    cat_vs = _concat_state_token_axis(value_states)
                     try:
-                        from mlx_lm.models.cache import KVCache
                         from mlx_vlm.turboquant import TurboQuantKVCache
 
                         tq_bits = 4.0
@@ -1920,24 +2204,95 @@ class BlockAwarePrefixCache(CacheManager):
                         if isinstance(ms, (list, tuple)) and len(ms) >= 3:
                             tq_bits = float(ms[1])
                             tq_seed = int(ms[2])
-                        # Dequantize back to fp16 KVCache for merge compatibility.
-                        # TQ will be re-applied at decode start (lazy quantization).
                         tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
                         _rebuild_codecs(tq, cat_ks, cat_vs)
-                        keys, values = tq.dequantize()
-                        cache = KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                        reconstructed_caches.append(cache)
+                        reconstructed_caches.append(tq)
                     except Exception as e:
                         logger.error(
                             f"TQ layer {layer_idx}: reconstruction failed: {e}"
                         )
                         return None
+                    continue
+
+                # === Generic N-tuple sliceable cache: concatenate block slices ===
+                last_block_layer_data = all_block_data[-1][layer_idx]
+                if (
+                    handler.supports_block_slicing
+                    and isinstance(last_block_layer_data, tuple)
+                    and len(last_block_layer_data) >= 3
+                    and last_block_layer_data[0] == "__nstate__"
+                ):
+                    marker_class = last_block_layer_data[1] or cache_type_name
+                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
+                        marker_class
+                    )
+                    axis_info = marker_handler.get_state_axis_info()
+                    layer_states = []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            logger.debug(
+                                f"Layer {layer_idx}: missing block data for "
+                                f"{marker_class}"
+                            )
+                            return None
+                        block_layer_data = block_data[layer_idx]
+                        if (
+                            not isinstance(block_layer_data, tuple)
+                            or len(block_layer_data) < 3
+                            or block_layer_data[0] != "__nstate__"
+                        ):
+                            logger.debug(
+                                f"Layer {layer_idx}: expected N-tuple block data "
+                                f"for {marker_class}"
+                            )
+                            return None
+                        elements = tuple(block_layer_data[2])
+                        state_dict = {
+                            "states": elements,
+                            "cache_type": marker_class,
+                        }
+                        for info, elem in zip(axis_info, elements):
+                            state_dict[info.name] = elem
+                        layer_states.append(state_dict)
+
+                    concat_state = marker_handler.concatenate_states(layer_states)
+                    cache = marker_handler.reconstruct_cache(concat_state, None)
+                    if cache is None:
+                        logger.error(
+                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
+                        )
+                        return None
+                    reconstructed_caches.append(cache)
+                    continue
+
+                # === Generic N-tuple non-sliceable cache: use latest boundary ===
+                if (
+                    isinstance(last_block_layer_data, tuple)
+                    and len(last_block_layer_data) >= 3
+                    and last_block_layer_data[0] == "__nstate__"
+                ):
+                    marker_class = last_block_layer_data[1] or cache_type_name
+                    elements = last_block_layer_data[2]
+                    marker_handler = CacheTypeRegistry.get_handler_by_class_name(
+                        marker_class
+                    )
+                    meta_state = None
+                    if last_block_meta_states and layer_idx < len(
+                        last_block_meta_states
+                    ):
+                        meta_state = last_block_meta_states[layer_idx]
+                    cache = marker_handler.deserialize_state(
+                        tuple(elements), meta_state
+                    )
+                    if cache is None:
+                        logger.error(
+                            f"Layer {layer_idx}: failed to reconstruct {marker_class}"
+                        )
+                        return None
+                    reconstructed_caches.append(cache)
                     continue
 
                 # Collect layer data from all blocks
@@ -1986,7 +2341,7 @@ class BlockAwarePrefixCache(CacheManager):
                     latest_keys = layer_states[-1].get("keys")
                     latest_values = layer_states[-1].get("values")
 
-                    if cache_type_name == "RotatingKVCache":
+                    if CacheTypeRegistry.is_rotating_family(cache_type_name):
                         # RotatingKVCache: strict last-block restore.
                         # If the last matched block is a placeholder, we only
                         # had a partial prefix hit and must reject.
@@ -2298,12 +2653,14 @@ class BlockAwarePrefixCache(CacheManager):
             "BatchKVCache",
             "TurboQuantKVCache",
             "BatchTurboQuantKVCache",
+            "MiniMaxM3KVCache",
         }
         non_sliceable_types = {
             "ArraysCache",
             "RotatingKVCache",
             "BatchRotatingKVCache",
             "CacheList",
+            "MiniMaxM3BatchKVCache",
         }
 
         expected_seq_len = None
@@ -2329,14 +2686,21 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     return False
 
-                keys, values = layer_data[0], layer_data[1]
-
-                # Check for None
-                if keys is None or values is None:
-                    logger.debug(
-                        f"Block validation failed: layer {layer_idx} has None keys/values"
-                    )
-                    return False
+                if (
+                    isinstance(layer_data, tuple)
+                    and len(layer_data) >= 3
+                    and layer_data[0] == "__nstate__"
+                ):
+                    elements = layer_data[2]
+                    if not isinstance(elements, (list, tuple)) or len(elements) < 2:
+                        logger.debug(
+                            f"Block validation failed: layer {layer_idx} has "
+                            "invalid N-tuple state"
+                        )
+                        return False
+                    keys, values = elements[0], elements[1]
+                else:
+                    keys, values = layer_data[0], layer_data[1]
 
                 # Skip seq_len check for non-sliceable types (e.g., ArraysCache, RotatingKVCache)
                 # This includes placeholder entries (1D tensors from non-last blocks)
@@ -2345,6 +2709,15 @@ class BlockAwarePrefixCache(CacheManager):
                     continue
                 if layer_cache_types and cache_type not in sliceable_types:
                     continue
+
+                # Check for None after non-sliceable N-tuple caches have been
+                # accepted. Pooling-style states can legitimately store None
+                # in their first elements.
+                if keys is None or values is None:
+                    logger.debug(
+                        f"Block validation failed: layer {layer_idx} has None keys/values"
+                    )
+                    return False
 
                 # Check shape consistency for sliceable types (KVCache, RotatingKVCache)
                 if hasattr(keys, "shape") and len(keys.shape) >= 3:

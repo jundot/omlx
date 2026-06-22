@@ -69,7 +69,8 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
         data = admin_routes._build_active_models_data()
 
     model = data["models"][0]
-    assert data["total_active_requests"] == 3
+    assert data["total_active_requests"] == 2
+    assert model["active_requests"] == 2
     assert model["waiting_requests"] == 1
     assert model["prefilling"] == [
         {"request_id": "prefill-1", "processed": 10, "total": 20}
@@ -93,6 +94,37 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
             "max_tokens": 64,
         }
     ]
+
+
+def test_active_models_does_not_count_waiting_collectors_as_active():
+    waiting_request = SimpleNamespace(
+        request_id="wait-1",
+        arrival_time=105.0,
+        num_prompt_tokens=30,
+    )
+    scheduler = SimpleNamespace(
+        snapshot_for_admin=lambda: {
+            "running_by_id": {},
+            "waiting": [waiting_request],
+        },
+    )
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=FakePool(scheduler)),
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=EmptyPrefillTracker()),
+        patch("time.monotonic", return_value=110.0),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 0
+    assert data["total_waiting_requests"] == 1
+    assert model["active_requests"] == 0
+    assert model["waiting_requests"] == 1
+    assert model["generating"] == []
 
 
 def test_active_models_loading_includes_elapsed_and_percent_estimate():

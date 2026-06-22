@@ -503,53 +503,28 @@ private struct ContentScaffold<Content: View>: View {
     @Environment(\.omlxTheme) private var theme
     @EnvironmentObject private var services: AppServices
 
-    /// Resolved section title, rendered as content (not via .navigationTitle)
-    /// because the window toolbar is hidden — Settings.app pattern.
     private var titleText: String { detailTitle ?? section.title }
-
-    @ViewBuilder
-    private func sectionTitleHeader() -> some View {
-        Text(titleText)
-            .font(.omlxText(28, weight: .bold))
-            .foregroundStyle(theme.text)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // Match the 14pt horizontal padding screen cards apply
-            // internally so the title's left edge aligns with the
-            // cards' left edge inside the 720pt centered frame.
-            .padding(.horizontal, 14)
-            .padding(.top, 36)
-            .padding(.bottom, 6)
-    }
 
     var body: some View {
         Group {
             if section.fillsContentArea {
-                // Skip the outer ScrollView so the screen can claim the
-                // available height (Logs uses this for its monospace pane).
-                VStack(alignment: .leading, spacing: 0) {
-                    sectionTitleHeader()
-                    content()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                }
-                .frame(maxWidth: 720, alignment: .topLeading)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.bottom, 18)
-                .background(theme.windowBg)
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .frame(maxWidth: 720, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.bottom, 18)
+                    .background(theme.windowBg)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            sectionTitleHeader()
-                            content()
-                                .padding(.top, 8)
-                        }
+                        content()
                         // Wrap title + content together in a single max-width
                         // frame so the section title and the cards share the
                         // same left edge (Settings.app pattern: large title
                         // sits flush with content, not offset).
-                        .frame(maxWidth: 720, alignment: .topLeading)
-                        .frame(maxWidth: .infinity, alignment: .top)
-                        .padding(.bottom, 36)
+                            .frame(maxWidth: 720, alignment: .topLeading)
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .padding(.bottom, 36)
                     }
                     // Deep-link scroll: when another screen (e.g. the
                     // per-model "Edit on Server →" link) requested a
@@ -575,11 +550,8 @@ private struct ContentScaffold<Content: View>: View {
                 }
             }
         }
+        .navigationTitle(titleText)
         .background(theme.windowBg)
-        // Title is rendered as content via sectionTitleHeader() — no
-        // .navigationTitle here because the window toolbar is hidden in
-        // AppView (matches the Settings.app pattern of inline titles on
-        // floating-glass sidebar layouts).
     }
 }
 

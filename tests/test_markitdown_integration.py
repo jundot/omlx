@@ -70,10 +70,30 @@ class _EmptyPool:
         }
 
 
-def test_openai_models_includes_markitdown_when_enabled():
+def _settings_with_markitdown_model() -> GlobalSettings:
+    settings = GlobalSettings()
+    settings.integrations.markitdown_expose_model = True
+    return settings
+
+
+def test_openai_models_hides_markitdown_by_default():
     state = ServerState()
     state.engine_pool = _EmptyPool()
     state.global_settings = GlobalSettings()
+
+    with patch("omlx.server._server_state", state):
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = [m["id"] for m in response.json()["data"]]
+    assert MARKITDOWN_MODEL_ID not in ids
+
+
+def test_openai_models_includes_markitdown_when_exposed():
+    state = ServerState()
+    state.engine_pool = _EmptyPool()
+    state.global_settings = _settings_with_markitdown_model()
 
     with patch("omlx.server._server_state", state):
         client = TestClient(app, raise_server_exceptions=False)
@@ -87,7 +107,7 @@ def test_openai_models_includes_markitdown_when_enabled():
 def test_openai_models_hides_markitdown_when_disabled():
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     state.global_settings.integrations.markitdown_enabled = False
 
     with patch("omlx.server._server_state", state):
@@ -117,7 +137,7 @@ def test_openai_models_hides_markitdown_when_not_exposed():
 def test_markitdown_chat_completion_converts_file(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
 
     def fake_convert(file: MarkItDownFile, **kwargs) -> str:
         assert file.filename == "sample.pdf"
@@ -144,7 +164,7 @@ def test_markitdown_chat_completion_converts_file(monkeypatch):
 def test_markitdown_chat_completion_uses_latest_user_turn(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
 
     def fake_convert(file: MarkItDownFile, **kwargs) -> str:
         return f"# Converted {file.filename}"
@@ -219,7 +239,7 @@ def test_markitdown_chat_completion_hidden_model_returns_404():
 def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     started = False
 
     async def fake_stream_messages(*args, **kwargs):
@@ -268,7 +288,7 @@ def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
 def test_markitdown_non_stream_response_starts_before_conversion(monkeypatch):
     state = ServerState()
     state.engine_pool = _EmptyPool()
-    state.global_settings = GlobalSettings()
+    state.global_settings = _settings_with_markitdown_model()
     started = False
 
     async def fake_convert_messages(*args, **kwargs):
@@ -426,6 +446,145 @@ def test_preprocess_file_parts_does_not_create_mixed_content_warning(monkeypatch
     ]
 
 
+def test_preprocess_allows_missing_historical_file_parts(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("missing historical files should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    processed = preprocess_markitdown_file_parts(
+        [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Summarize this."},
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "mime_type": "application/pdf",
+                            "data": "",
+                        },
+                    },
+                ],
+            ),
+            Message(role="assistant", content="Done."),
+            Message(role="user", content="Continue."),
+        ],
+        global_settings=GlobalSettings(),
+        allow_missing_historical_files=True,
+    )
+
+    parts = processed[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert parts[1].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[1].text or "")
+    assert processed[2].content == "Continue."
+
+
+def test_preprocess_still_rejects_missing_latest_file_part():
+    with pytest.raises(MarkItDownRequestError, match="file_data"):
+        preprocess_markitdown_file_parts(
+            [
+                Message(
+                    role="user",
+                    content=[
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "paper.pdf",
+                                "mime_type": "application/pdf",
+                                "data": "",
+                            },
+                        }
+                    ],
+                )
+            ],
+            global_settings=GlobalSettings(),
+            allow_missing_historical_files=True,
+        )
+
+
+def test_async_preprocess_allows_missing_historical_file_parts(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("missing historical files should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    async def exercise():
+        return await preprocess_markitdown_file_parts_async(
+            [
+                Message(
+                    role="user",
+                    content=[
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "paper.pdf",
+                                "mime_type": "application/pdf",
+                                "data": "",
+                            },
+                        }
+                    ],
+                ),
+                Message(role="assistant", content="Done."),
+                Message(role="user", content="Continue."),
+            ],
+            global_settings=GlobalSettings(),
+            allow_missing_historical_files=True,
+        )
+
+    processed = asyncio.run(exercise())
+
+    parts = processed[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[0].text or "")
+
+
+def test_server_llm_preprocess_allows_stored_document_placeholders(monkeypatch):
+    def fake_convert(file: MarkItDownFile, **kwargs) -> str:
+        raise AssertionError("stored document placeholders should not be converted")
+
+    monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
+
+    state = ServerState()
+    state.engine_pool = _EmptyPool()
+    state.global_settings = GlobalSettings()
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            Message(
+                role="user",
+                content=[
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "mime_type": "application/pdf",
+                            "data": "",
+                        },
+                    }
+                ],
+            ),
+            Message(role="assistant", content="Done."),
+            Message(role="user", content="Continue."),
+        ],
+    )
+
+    async def exercise():
+        with patch("omlx.server._server_state", state):
+            return await server_module._preprocess_markitdown_files_for_llm(request)
+
+    processed = asyncio.run(exercise())
+
+    parts = processed.messages[0].content
+    assert isinstance(parts, list)
+    assert parts[0].type == "text"
+    assert "Attached file unavailable: paper.pdf" in (parts[0].text or "")
+
+
 def test_preprocess_file_parts_rejects_when_disabled():
     settings = GlobalSettings()
     settings.integrations.markitdown_enabled = False
@@ -515,9 +674,7 @@ def test_empty_pdf_conversion_logs_warning(monkeypatch, caplog):
 
 def test_pdf_parser_debug_loggers_are_quieted():
     logger_names = ("pdfminer", "pdfminer.psparser", "pdfminer.pdfinterp")
-    original_levels = {
-        name: logging.getLogger(name).level for name in logger_names
-    }
+    original_levels = {name: logging.getLogger(name).level for name in logger_names}
     try:
         for name in logger_names:
             logging.getLogger(name).setLevel(logging.DEBUG)
@@ -550,12 +707,13 @@ def test_ocr_pdf_engine_converts_pages_in_order_limits_concurrency_and_unloads(
 
         def acquire(self, model_id):
             assert model_id == "OCR-Model"
+            pool = self
 
             class Lease:
-                async def __aenter__(lease_self):
-                    return self.engine
+                async def __aenter__(self):
+                    return pool.engine
 
-                async def __aexit__(lease_self, exc_type, exc, tb):
+                async def __aexit__(self, exc_type, exc, tb):
                     return None
 
             return Lease()
@@ -636,11 +794,13 @@ def test_ocr_pdf_engine_streams_ready_prefix_in_page_order(monkeypatch):
             )
 
         def acquire(self, model_id):
-            class Lease:
-                async def __aenter__(lease_self):
-                    return self.engine
+            pool = self
 
-                async def __aexit__(lease_self, exc_type, exc, tb):
+            class Lease:
+                async def __aenter__(self):
+                    return pool.engine
+
+                async def __aexit__(self, exc_type, exc, tb):
                     return None
 
             return Lease()

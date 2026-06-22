@@ -46,6 +46,17 @@ class ServerMetrics:
         self.total_generation_duration: float = 0.0
         self._per_model: Dict[str, Dict[str, Any]] = {}
 
+        # Preflight rejections — split by reason so operators can tell
+        # "user fed an oversize prompt" (hard_limit) apart from "system
+        # under memory pressure, admission paused" (admission_paused).
+        # This is the only operator-visible signal for the prefill-peak
+        # memory guard; the guard was previously dead and shipping it
+        # without telemetry repeats that mistake.
+        self.preflight_rejections: Dict[str, int] = {
+            "hard_limit": 0,
+            "admission_paused": 0,
+        }
+
         # All-time totals (persisted across restarts)
         self._alltime_prompt_tokens: int = 0
         self._alltime_completion_tokens: int = 0
@@ -197,6 +208,19 @@ class ServerMetrics:
 
             # Periodic save
             self._maybe_save_alltime()
+
+    def record_preflight_rejection(self, reason: str) -> None:
+        """Increment the preflight-rejection counter for ``reason``.
+
+        Unknown reasons are bucketed under ``"other"`` rather than
+        silently dropped so an operator notices when a new reject path
+        is added without updating the metric.
+        """
+        with self._lock:
+            if reason not in self.preflight_rejections:
+                reason = "other"
+                self.preflight_rejections.setdefault("other", 0)
+            self.preflight_rejections[reason] += 1
 
     def _build_snapshot(
         self,

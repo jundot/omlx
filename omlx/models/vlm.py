@@ -53,6 +53,7 @@ class VLMModelAdapter(nn.Module):
         super().__init__()
         self._vlm_model = vlm_model
         self._language_model = vlm_model.language_model
+        self._uses_minimax_m3_positions = self._detect_minimax_m3(vlm_model)
         self._uses_mrope = self._detect_mrope(vlm_model)
 
         # Pending vision embeddings state (set before prefill, cleared after)
@@ -149,8 +150,22 @@ class VLMModelAdapter(nn.Module):
         self._embed_offset = 0
 
     @staticmethod
+    def _detect_minimax_m3(vlm_model) -> bool:
+        """Check if VLM model uses MiniMax M3 position-id semantics."""
+        config = getattr(vlm_model, "config", None)
+        if config is None:
+            return False
+        minimax_types = {"minimax_m3", "minimax_m3_vl"}
+        if getattr(config, "model_type", None) in minimax_types:
+            return True
+        text_config = getattr(config, "text_config", None)
+        return getattr(text_config, "model_type", None) in minimax_types
+
+    @staticmethod
     def _detect_mrope(vlm_model) -> bool:
         """Check if VLM model uses multi-dimensional RoPE (mRoPE)."""
+        if VLMModelAdapter._detect_minimax_m3(vlm_model):
+            return True
         config = getattr(vlm_model, "config", None)
         if config is None:
             return False
@@ -197,6 +212,45 @@ class VLMModelAdapter(nn.Module):
         """
         self._batch_rope_deltas = deltas
 
+    def _batch_rope_deltas_for_size(self, batch_size: int) -> Optional[mx.array]:
+        """Return rope deltas aligned to the current model input batch size."""
+        if self._batch_rope_deltas is None:
+            return None
+        deltas = self._batch_rope_deltas.reshape(-1)
+        if deltas.size == batch_size:
+            return deltas
+        if not self._uses_minimax_m3_positions:
+            logger.debug(
+                "Skipping mRoPE batch deltas with %d rows for %d-row input",
+                deltas.size,
+                batch_size,
+            )
+            return None
+        if deltas.size > batch_size:
+            logger.debug(
+                "Truncating mRoPE batch deltas from %d to %d rows",
+                deltas.size,
+                batch_size,
+            )
+            return deltas[:batch_size]
+        logger.debug(
+            "Padding mRoPE batch deltas from %d to %d rows",
+            deltas.size,
+            batch_size,
+        )
+        pad = mx.zeros((batch_size - deltas.size,), dtype=deltas.dtype)
+        return mx.concatenate([deltas, pad], axis=0)
+
+    def _position_ids_from_starts(
+        self, starts: mx.array, batch_size: int, seq_len: int
+    ) -> mx.array:
+        """Build model-specific decode position_ids from per-row start offsets."""
+        starts = starts.reshape(-1)[:batch_size]
+        if self._uses_minimax_m3_positions:
+            steps = mx.arange(seq_len, dtype=starts.dtype)
+            return starts[:, None] + steps[None, :]
+        return mx.broadcast_to(starts[None, :, None], (3, batch_size, seq_len))
+
     def get_last_rope_deltas(self) -> float:
         """Extract rope_deltas from language model after VLM prefill.
 
@@ -239,6 +293,7 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
+        return_hidden = bool(kwargs.get("return_hidden", False))
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
         vlm_extra.pop("_captured_rope_deltas", None)
@@ -260,13 +315,21 @@ class VLMModelAdapter(nn.Module):
                     if hasattr(c, "offset"):
                         offsets = c.offset
                         break
-                B, L = input_ids.shape
-                deltas = self._batch_rope_deltas
-                if (offsets is not None and isinstance(offsets, mx.array)
-                        and deltas.size == B):
-                    positions = offsets + deltas
-                    position_ids = mx.broadcast_to(
-                        positions[None, :, None], (3, B, L)
+                batch_size, seq_len = input_ids.shape
+                deltas = self._batch_rope_deltas_for_size(batch_size)
+                base_offsets = None
+                if isinstance(offsets, mx.array):
+                    if offsets.ndim == 0:
+                        base_offsets = mx.broadcast_to(offsets, (batch_size,))
+                    elif offsets.size >= batch_size:
+                        base_offsets = offsets[:batch_size]
+                elif isinstance(offsets, (int, float)):
+                    base_offsets = mx.broadcast_to(mx.array(offsets), (batch_size,))
+
+                if base_offsets is not None and deltas is not None:
+                    positions = base_offsets + deltas.astype(base_offsets.dtype)
+                    position_ids = self._position_ids_from_starts(
+                        positions, batch_size, seq_len
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
@@ -282,9 +345,9 @@ class VLMModelAdapter(nn.Module):
                         offsets = c.offset
                         break
                 if offsets is not None:
-                    B, L = input_ids.shape
-                    position_ids = mx.broadcast_to(
-                        offsets[None, :, None], (3, B, L)
+                    batch_size, seq_len = input_ids.shape
+                    position_ids = self._position_ids_from_starts(
+                        offsets, batch_size, seq_len
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
@@ -298,6 +361,8 @@ class VLMModelAdapter(nn.Module):
                     self._vlm_model._set_position_state(input_ids)
                 result = self._language_model(input_ids, cache=cache, **kwargs)
 
+        if return_hidden and hasattr(result, "logits"):
+            return result
         if hasattr(result, "logits"):
             return result.logits
         return result

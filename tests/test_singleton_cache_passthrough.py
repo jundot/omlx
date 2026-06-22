@@ -3,10 +3,12 @@
 import importlib
 
 import mlx.core as mx
-
-import omlx.scheduler  # noqa: F401  (applies BatchGenerator cache patches)
 from mlx_lm.generate import PromptProcessingBatch, SequenceStateMachine
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+from mlx_vlm.turboquant import TurboQuantKVCache
+
+import omlx.scheduler  # noqa: F401  (applies BatchGenerator cache patches)
+from omlx.turboquant_kv import BatchTurboQuantKVCache
 
 
 def _kv_cache(length: int) -> KVCache:
@@ -23,6 +25,13 @@ def _arrays_cache(value: float = 1.0) -> ArraysCache:
     cache = ArraysCache(1)
     cache[0] = mx.full((1, 2, 3), value)
     mx.eval(cache[0])
+    return cache
+
+
+def _tq_cache(length: int) -> TurboQuantKVCache:
+    fp_cache = _kv_cache(length)
+    cache = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    mx.eval(cache.keys, cache.values)
     return cache
 
 
@@ -49,6 +58,29 @@ def test_extend_converts_singleton_kv_to_batched_cache():
     assert isinstance(batch_kv, BatchKVCache)
     assert batch_kv.offset.tolist() == [4, 2]
     assert batch_kv.left_padding.tolist() == [0, 2]
+
+
+def test_singleton_merge_preserves_plain_turboquant_cache():
+    gen = importlib.import_module("mlx_lm.generate")
+    tq = _tq_cache(4)
+
+    merged = gen._merge_caches([[tq]])
+
+    assert merged[0] is tq
+
+
+def test_extend_converts_plain_turboquant_to_batched_cache():
+    gen = importlib.import_module("mlx_lm.generate")
+    tq_a = _tq_cache(4)
+    tq_b = _tq_cache(2)
+
+    extended = gen._extend_cache([tq_a], [tq_b])
+    batch_tq = extended[0]
+    mx.eval(batch_tq.offset, batch_tq.left_padding)
+
+    assert isinstance(batch_tq, BatchTurboQuantKVCache)
+    assert batch_tq.offset.tolist() == [4, 2]
+    assert batch_tq.left_padding.tolist() == [0, 2]
 
 
 def test_extend_keeps_arrays_cache_in_place():

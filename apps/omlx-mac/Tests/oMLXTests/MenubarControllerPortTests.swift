@@ -106,8 +106,21 @@ final class MenubarControllerPortTests: XCTestCase {
         try server.reconfigure(bindAddress: "localhost")
         XCTAssertEqual(
             MenubarController.displayHost(server: server, fallback: "127.0.0.1"),
-            "localhost",
-            "Listen Address changes propagate to the server via saveHost → applyServerEndpoint → server.reconfigure(bindAddress:); the menubar must reflect that."
+            "127.0.0.1",
+            "Listen Address changes propagate through ServerProcess.host, which returns the connectable loopback host."
+        )
+    }
+
+    func testDisplayHostHandlesCommaSeparatedBindAddress() throws {
+        let server = ServerProcess(
+            runtime: makeRuntime(),
+            bindAddress: "0.0.0.0,127.0.0.1",
+            port: 8080
+        )
+        XCTAssertEqual(
+            MenubarController.displayHost(server: server, fallback: "127.0.0.1"),
+            "127.0.0.1",
+            "The menubar should use the first configured bind host and normalize wildcards before building URLs."
         )
     }
 
@@ -130,6 +143,13 @@ final class MenubarControllerPortTests: XCTestCase {
         let items = comps.queryItems ?? []
         XCTAssertEqual(items.first { $0.name == "redirect" }?.value, "/admin/dashboard")
         XCTAssertEqual(items.first { $0.name == "key" }?.value, "secret")
+    }
+
+    func testWebAdminURLBuildsIPv6Host() throws {
+        let url = try XCTUnwrap(
+            MenubarController.webAdminURL(host: "[::1]", port: 8000, apiKey: nil)
+        )
+        XCTAssertTrue(url.absoluteString.hasPrefix("http://[::1]:8000/admin/auto-login"))
     }
 
     func testWebAdminURLPercentEncodesKey() throws {

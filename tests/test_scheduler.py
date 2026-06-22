@@ -19,7 +19,7 @@ import concurrent.futures
 import json
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
@@ -33,6 +33,7 @@ from omlx.scheduler import (
     SchedulingPolicy,
     _PrefillState,
     _StoreCacheGate,
+    _VLMMTPDecodeState,
 )
 
 
@@ -266,6 +267,17 @@ class TestSchedulerInitialization:
 
         assert scheduler.config.max_num_seqs == 64
 
+    def test_llama4_effective_cap_is_serial(self, mock_model, mock_tokenizer):
+        """Llama 4 uses ChunkedKVCache layers that are serialized for now."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=8),
+        )
+
+        assert scheduler._effective_max_num_seqs() == 1
+
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
     ):
@@ -334,6 +346,30 @@ class TestSchedulerInitialization:
 
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""
+
+    def _scheduler_with_mock_block_cache(
+        self,
+        mock_model,
+        mock_tokenizer,
+        *,
+        hot_cache_max_size: int = 1024,
+        hot_cache_only: bool = False,
+    ):
+        config = SchedulerConfig(
+            hot_cache_max_size=hot_cache_max_size,
+            hot_cache_only=hot_cache_only,
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=config,
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_ssd_cache_manager = MagicMock()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        return scheduler
 
     def test_add_request_with_string_prompt(self, mock_model, mock_tokenizer):
         """Test adding a request with string prompt."""
@@ -436,6 +472,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 3
         assert request.remaining_tokens == [14]
@@ -469,6 +506,7 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 0
         assert request.remaining_tokens == [21, 22, 23, 24]
@@ -506,12 +544,387 @@ class TestSchedulerAddRequest:
         )
 
         scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
 
         assert request.cached_tokens == 0
         assert request.remaining_tokens == [31, 32, 33, 34]
         assert request.prompt_cache is None
         scheduler.paged_cache_manager.delete_block_table.assert_called_once_with(
             "req-rotating"
+        )
+
+    def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
+        self, mock_model, mock_tokenizer
+    ):
+        """Memory pressure should bypass optional SSD hot-cache RAM copies."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=100)
+
+        block_table = BlockTable(
+            request_id="req-pressure",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-pressure",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table,
+            promote_to_hot_cache=False,
+        )
+        scheduler._current_usage_bytes.assert_called_once_with()
+
+    def test_add_request_below_pressure_keeps_hot_cache_preload_and_promotion(
+        self, mock_model, mock_tokenizer
+    ):
+        """Normal memory state should preserve existing hot-cache acceleration."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=99)
+
+        block_table = BlockTable(
+            request_id="req-normal",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-normal",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table
+        )
+
+    def test_add_request_hot_cache_only_ignores_pressure_bypass(
+        self, mock_model, mock_tokenizer
+    ):
+        """hot_cache_only mode must keep RAM hot-cache behavior unchanged."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+            hot_cache_only=True,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=100)
+
+        block_table = BlockTable(
+            request_id="req-hot-only",
+            block_ids=[1],
+            num_tokens=2,
+        )
+        scheduler.block_aware_cache.fetch_cache.return_value = (
+            block_table,
+            [13, 14],
+        )
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        request = Request(
+            request_id="req-hot-only",
+            prompt=[11, 12, 13, 14],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+        scheduler._prepare_prefix_cache_for_request(request)
+
+        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+            block_table
+        )
+        scheduler._current_usage_bytes.assert_not_called()
+
+    def test_admission_defers_for_relevant_inflight_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A same-conversation request should defer lookup until store finishes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert request.request_id in scheduler._cache_freshness_waits
+
+        future.done.return_value = True
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        scheduler._prepare_prefix_cache_for_request(request)
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+
+    def test_admission_defers_for_ratio_relevant_inflight_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """A large prompt should defer when the shared prefix is a high ratio."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_below_common_and_ratio_thresholds(
+        self, mock_model, mock_tokenizer
+    ):
+        """A moderate shared prefix should not defer below both relevance gates."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(30000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(7000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_does_not_defer_for_short_prompt_even_with_high_ratio(
+        self, mock_model, mock_tokenizer
+    ):
+        """Prompts below the freshness minimum should never wait on store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(7000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(6000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_admission_defers_for_relevant_store_during_active_work(
+        self, mock_model, mock_tokenizer
+    ):
+        """Active decode/prefill rows should not skip a highly relevant store."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+        scheduler.running["req-running"] = MagicMock()
+        scheduler.prefilling.append(MagicMock())
+
+        future = MagicMock()
+        future.done.return_value = False
+        future.result.return_value = None
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+
+    def test_schedule_waiting_defers_cache_freshness_without_blocking(
+        self, mock_model, mock_tokenizer
+    ):
+        """Freshness waits must defer admission, not block scheduler execution."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(9000)))
+        )
+        scheduler._ensure_batch_generator = MagicMock()
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+        scheduler.add_request(request)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert request.request_id in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+        scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_admission_does_not_defer_for_mismatched_extra_keys(
+        self, mock_model, mock_tokenizer
+    ):
+        """Token-only overlap must not delay VLM requests with different cache keys."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        prompt = list(range(9001))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(
+                tokens=list(range(9000)),
+                extra_keys=("image-a",),
+                extra_key_token_start=0,
+            )
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+            vlm_image_hash="image-b",
+            vlm_cache_key_start=0,
+        )
+
+        scheduler.add_request(request)
+
+        future.result.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        scheduler._prepare_prefix_cache_for_request(request)
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+
+    def test_async_store_cache_worker_forwards_hot_cache_write_back_flag(
+        self, mock_model, mock_tokenizer
+    ):
+        """The async store worker must pass pressure mode to store_cache."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = None
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.paged_cache_manager.get_block_table.return_value = None
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            scheduler._async_store_cache_worker(
+                "req-store",
+                [1, 2, 3, 4],
+                [],
+                None,
+                None,
+                None,
+                None,
+                None,
+                hot_cache_write_back=False,
+            )
+
+        scheduler.block_aware_cache.store_cache.assert_called_once_with(
+            "req-store",
+            [1, 2, 3, 4],
+            [],
+            model_cache_config=None,
+            boundary_snapshots=None,
+            extra_keys=None,
+            extra_key_token_start=None,
+            extra_key_ranges=None,
+            hot_cache_write_back=False,
         )
 
 
@@ -634,6 +1047,53 @@ class TestSchedulerAbortRequest:
 
         scheduler.batch_generator.remove.assert_called_once_with([uid])
 
+    def test_abort_vlm_mtp_request_clears_active_generator(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aborting negative vlm_mtp UIDs must release the serialized drafter."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-vlm-mtp",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1]
+        request.num_prompt_tokens = 1
+        request.status = RequestStatus.RUNNING
+
+        class ClosableGenerator:
+            closed = False
+
+            def __next__(self):
+                return 1
+
+            def close(self):
+                self.closed = True
+
+        generator = ClosableGenerator()
+        uid = -1
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        scheduler._vlm_mtp_active[uid] = _VLMMTPDecodeState(
+            generator=generator,
+            request=request,
+            prompt_cache=[],
+            sampler=MagicMock(),
+            state_machine=MagicMock(),
+            max_tokens=16,
+        )
+        scheduler.batch_generator = MagicMock()
+
+        scheduler.abort_request(request.request_id)
+        scheduler._process_pending_aborts()
+
+        assert uid not in scheduler._vlm_mtp_active
+        assert generator.closed is True
+        scheduler.batch_generator.remove.assert_not_called()
+
     def test_abort_cleans_all_scheduler_state(self, mock_model, mock_tokenizer):
         """Abort must clean running, uid mappings, and requests dict.
 
@@ -732,7 +1192,10 @@ class TestPrefillAbortInterrupt:
                     cache,
                 )
 
-        clear_cache.assert_called_once_with(scheduler._stream)
+        assert clear_cache.call_args_list == [
+            call(scheduler._stream),
+            call(scheduler._stream),
+        ]
         assert request._prefill_saved_rope_deltas is None
 
     def test_prefill_abort_cleanup_removes_temp_uid_and_pending_abort(
@@ -937,14 +1400,11 @@ class TestSchedulerReset:
     ):
         """reset() must drop _pending_async_removes and _inflight_store_futures.
 
-        Regression for #1459: when a slow async store_cache worker finishes
-        between scheduler.shutdown()'s 30s wait timeout and the subsequent
-        executor.shutdown(wait=True), the deferred _drain_pending_async_removes
-        step that nulls req._extracted_cache never runs again. If reset()
-        leaves these two containers populated, the futures keep Request
-        references alive and the KV cache stays pinned for the rest of the
-        process lifetime. Clearing them in reset() is the second line of
-        defense after shutdown()'s final drain.
+        Regression for #1459: a slow async store_cache worker can leave the
+        deferred _drain_pending_async_removes step that nulls req._extracted_cache
+        pending. If reset() leaves these two containers populated, the futures
+        keep Request references alive and the KV cache stays pinned for the rest
+        of the process lifetime.
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
@@ -957,17 +1417,15 @@ class TestSchedulerReset:
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
 
-    def test_shutdown_drains_after_executor_join(self, mock_model, mock_tokenizer):
-        """shutdown() must drain pending removes again after executor join.
+    def test_shutdown_drains_after_bounded_wait(self, mock_model, mock_tokenizer):
+        """shutdown() must drain pending removes after the bounded wait.
 
-        Regression for #1459. When the 30s `wait()` times out, the first
-        drain skips not-yet-done futures (deque break on `not future.done()`).
-        `executor.shutdown(wait=True)` then joins all workers — by the time
-        it returns, every future is done — but without a second drain those
-        skipped entries stay pinned, keeping the request's KV cache alive
-        for the rest of the process lifetime.
+        Regression for #1459. If the bounded wait completes, every future is
+        done and the second drain releases skipped entries. If it does not
+        complete, shutdown takes the fatal-exit path instead of leaving a
+        partially torn-down engine alive.
 
-        Asserts: drain runs both before and after executor.shutdown.
+        Asserts: drain runs both before and after executor.shutdown(wait=False).
         """
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
@@ -991,7 +1449,7 @@ class TestSchedulerReset:
         fake_executor.shutdown.side_effect = record_executor_shutdown
         scheduler._drain_pending_async_removes = record_drain
 
-        with patch("concurrent.futures.wait"):
+        with patch("concurrent.futures.wait", return_value=({object()}, set())):
             scheduler.shutdown()
 
         assert call_order == [
@@ -999,6 +1457,29 @@ class TestSchedulerReset:
             "executor_shutdown",
             "drain",
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        fake_executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_shutdown_fatal_exits_when_store_cache_worker_times_out(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store-cache worker is fatal during scheduler shutdown."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        fake_executor = MagicMock()
+        scheduler._store_cache_executor = fake_executor
+        scheduler._store_cache_gate = MagicMock()
+        future = MagicMock()
+        scheduler._inflight_store_futures["req-stuck"] = future
+
+        with (
+            patch("concurrent.futures.wait", return_value=(set(), {future})),
+            patch("omlx.scheduler.fatal_exit", side_effect=SystemExit) as fatal,
+            pytest.raises(SystemExit),
+        ):
+            scheduler.shutdown()
+
+        assert "Scheduler shutdown timed out after 60s" in fatal.call_args.args[0]
+        fake_executor.shutdown.assert_not_called()
 
 
 class TestSchedulerStopTokens:
@@ -1103,12 +1584,28 @@ class TestSchedulerSuppressTokens:
                     shared_kv_states={},
                 )
 
-        mock_model._language_model = FakeLanguageModel()
+        class FakeVLMAdapter:
+            def __init__(self):
+                self._language_model = FakeLanguageModel()
+                self.calls = []
+                self.batch_rope_deltas = None
+
+            def set_batch_rope_deltas(self, deltas):
+                self.batch_rope_deltas = deltas
+
+            def __call__(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return self._language_model(*args, **kwargs)
+
+        mock_model = FakeVLMAdapter()
+        scheduler.model = mock_model
         request = Request(
             request_id="req-mtp",
             prompt=[1],
             sampling_params=SamplingParams(max_tokens=4),
         )
+        request.prompt_token_ids = [1]
+        request.rope_deltas = 123.0
         cache = [SimpleNamespace(state=mx.array([0]))]
 
         def sampler(logits):
@@ -1138,7 +1635,11 @@ class TestSchedulerSuppressTokens:
             )
 
         assert uid is not None
+        assert mock_model.calls
+        assert captured["target_language_model"] is mock_model
+        assert float(mock_model.batch_rope_deltas.item()) == 123.0
         assert captured["first_bonus"] == 2
+        assert "prompt_tokens" not in captured
 
         round_logits = mx.array([[0.0, 0.0, 1.0, 99.0, 0.0]])
         round_token = captured["sampler"](round_logits)
@@ -2181,6 +2682,81 @@ class TestExtractCacheStatesRotatingNormalization:
         assert normalized_meta == ("0", "128", "1280", "128")
 
 
+class TestSchedulerSSDLayerSignature:
+    """Tests for pre-lookup SSD layer signature refresh."""
+
+    def test_refresh_uses_final_turboquant_layout_and_sweeps(
+        self, mock_tokenizer, tmp_path
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+
+        class TwoLayerModel:
+            config = SimpleNamespace(
+                num_hidden_layers=2,
+                num_key_value_heads=2,
+                num_attention_heads=2,
+                head_dim=32,
+            )
+
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        scheduler = Scheduler(
+            model=TwoLayerModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=4,
+                model_name="test-model",
+            ),
+        )
+        try:
+            manager = scheduler.paged_ssd_cache_manager
+            assert manager is not None
+            assert manager._expected_layer_cache_types is None
+
+            stale = PagedSSDBlockMetadata(
+                block_hash=b"stale".ljust(32, b"\0"),
+                file_path=tmp_path / "stale.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["KVCache", "KVCache"],
+            )
+            fresh = PagedSSDBlockMetadata(
+                block_hash=b"fresh".ljust(32, b"\0"),
+                file_path=tmp_path / "fresh.safetensors",
+                file_size=1024,
+                token_count=4,
+                created_at=0.0,
+                last_access=0.0,
+                num_layers=2,
+                model_name="test-model",
+                block_size=4,
+                layer_cache_types=["TurboQuantKVCache", "KVCache"],
+            )
+            manager._index.add(stale)
+            manager._index.add(fresh)
+
+            scheduler._turboquant_kv_bits = 4.0
+            scheduler._turboquant_skip_last = True
+
+            layer_cache_types = scheduler.refresh_ssd_layer_signature()
+
+            assert layer_cache_types == ["TurboQuantKVCache", "KVCache"]
+            assert manager._expected_layer_cache_types == layer_cache_types
+            assert manager._index.get(stale.block_hash) is None
+            assert manager._index.get(fresh.block_hash) is not None
+        finally:
+            scheduler.shutdown()
+
+
 class TestCacheCorruptionRecovery:
     """Tests for cache corruption detection and recovery."""
 
@@ -2399,6 +2975,118 @@ class TestCacheCorruptionRecovery:
         assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
 
 
+class TestGenerationOverflowRecovery:
+    """Tests for MLX __next_prime overflow recovery."""
+
+    def _make_scheduler(self, mock_model, mock_tokenizer, count: int = 2):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = OverflowError(
+            "__next_prime overflow"
+        )
+        for i in range(count):
+            request = Request(
+                request_id=f"req-overflow-{i}",
+                prompt=f"prompt {i}",
+                sampling_params=SamplingParams(max_tokens=4),
+                prompt_token_ids=[1, 2, 3],
+                num_prompt_tokens=3,
+                status=RequestStatus.RUNNING,
+                batch_uid=i,
+                remaining_tokens=[1, 2, 3],
+            )
+            request.output_token_ids = [10, 11]
+            request.output_text = "partial"
+            request.num_computed_tokens = 2
+            scheduler.running[request.request_id] = request
+            scheduler.requests[request.request_id] = request
+            scheduler.request_id_to_uid[request.request_id] = i
+            scheduler.uid_to_request_id[i] = request.request_id
+        return scheduler
+
+    def test_generation_overflow_detection(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        assert scheduler._is_generation_overflow_error(
+            OverflowError("__next_prime overflow")
+        )
+        assert not scheduler._is_generation_overflow_error(
+            OverflowError("integer conversion overflow")
+        )
+        assert not scheduler._is_generation_overflow_error(
+            RuntimeError("__next_prime overflow")
+        )
+
+    def test_generation_overflow_reschedules_for_serial_retry(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer, count=3)
+        scheduler.config.max_num_seqs = 8
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            output = scheduler.step()
+
+        assert output.outputs == []
+        assert output.has_work is True
+        assert scheduler.batch_generator is None
+        assert scheduler.running == {}
+        assert list(scheduler.request_id_to_uid) == []
+        waiting_ids = [request.request_id for request in scheduler.waiting]
+        assert waiting_ids == [
+            "req-overflow-0",
+            "req-overflow-1",
+            "req-overflow-2",
+        ]
+        for request in scheduler.waiting:
+            assert request.generation_overflow_retries == 1
+            assert request.output_token_ids == []
+            assert request.output_text == ""
+            assert request.num_computed_tokens == 0
+        assert scheduler._effective_max_num_seqs() == 1
+
+    def test_generation_overflow_fails_after_serial_retry(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer, count=1)
+        request = next(iter(scheduler.running.values()))
+        request.generation_overflow_retries = 1
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            output = scheduler.step()
+
+        assert len(output.outputs) == 1
+        error_output = output.outputs[0]
+        assert error_output.request_id == request.request_id
+        assert error_output.finished is True
+        assert error_output.finish_reason == "error"
+        assert "Generation overflow not recoverable" in error_output.error
+        assert request.request_id in output.finished_request_ids
+        assert scheduler.running == {}
+        assert scheduler.waiting == deque()
+        assert request.request_id not in scheduler.requests
+        assert scheduler.has_requests() is False
+
+    def test_unrelated_overflow_still_raises(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = OverflowError(
+            "integer conversion overflow"
+        )
+        request = Request(
+            request_id="req-other-overflow",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        with pytest.raises(OverflowError, match="integer conversion overflow"):
+            scheduler.step()
+
+
 class TestStoreCacheAdmissionBackpressure:
     """Tests for store-cache admission backpressure (#1684)."""
 
@@ -2435,6 +3123,109 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
+    def test_memory_guard_fails_persistent_admission_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = self._make_request("req-stalled")
+        self._queue_request(scheduler, request)
+        running = self._make_request("req-running")
+        scheduler.running[running.request_id] = running
+        scheduler.requests[running.request_id] = running
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=101)
+        scheduler._memory_admission_blocked_request_id = request.request_id
+        scheduler._memory_admission_blocked_since = 0.0
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "memory_admission_stalled"
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        assert scheduler.running[running.request_id] is running
+
+    def test_store_cache_gate_fails_persistent_non_memory_stall(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stuck store-cache gate must not leave admission waiting forever."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=1)
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-stalled")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._store_cache_admission_blocked_request_id = request.request_id
+        scheduler._store_cache_admission_blocked_since = 0.0
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert len(rejected) == 1
+        assert rejected[0].request_id == request.request_id
+        assert rejected[0].finish_reason == "error"
+        assert rejected[0].error_code == "store_cache_admission_stalled"
+        assert rejected[0].error_metadata["store_cache_in_flight"] == 1
+        assert request.request_id not in scheduler.requests
+        assert list(scheduler.waiting) == []
+        scheduler._ensure_batch_generator.assert_not_called()
+
+    def test_store_cache_stall_timer_clears_when_gate_recovers_before_freshness_wait(
+        self, mock_model, mock_tokenizer
+    ):
+        """A recovered store-cache gate must not accumulate stale stall time."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        gate = _StoreCacheGate(cap=2)
+        gate.note_submitted()
+        gate.note_submitted()
+        scheduler._store_cache_gate = gate
+        request = self._make_request("req-store-recovered")
+        self._queue_request(scheduler, request)
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_limit_bytes = 100
+        scheduler._current_usage_bytes = MagicMock(return_value=50)
+        scheduler._ensure_batch_generator = MagicMock()
+
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+
+        gate.note_done()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=True)
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id is None
+
+        gate.note_submitted()
+        scheduler._should_defer_for_cache_freshness = MagicMock(return_value=False)
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert scheduler._store_cache_admission_blocked_request_id == request.request_id
+        assert scheduler._store_cache_admission_blocked_since == 61.0
+        scheduler._ensure_batch_generator.assert_not_called()
+
     def test_schedule_waiting_allows_when_gate_has_capacity(
         self, mock_model, mock_tokenizer
     ):
@@ -2465,6 +3256,39 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._ensure_batch_generator.assert_called_once_with(
             request.sampling_params
         )
+
+    def test_llama4_admission_serializes_waiting_requests(
+        self, mock_model, mock_tokenizer
+    ):
+        """A second Llama 4 request stays queued instead of forming a batch."""
+        mock_model.config.model_type = "llama4"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(max_num_seqs=4),
+        )
+        first = self._make_request("req-llama4-1")
+        second = self._make_request("req-llama4-2")
+        self._queue_request(scheduler, first)
+        self._queue_request(scheduler, second)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._build_sampler_and_processors = MagicMock(
+            return_value=(MagicMock(), [])
+        )
+        scheduler._build_state_machine = MagicMock(return_value=MagicMock())
+        scheduler._preflight_memory_check = MagicMock(return_value=None)
+
+        scheduled, rejected = scheduler._schedule_waiting()
+
+        assert rejected == []
+        assert scheduled == [first]
+        assert list(scheduler.waiting) == [second]
+        assert list(scheduler.running) == [first.request_id]
+        assert batch_generator.insert.call_count == 1
 
     def test_schedule_waiting_defers_when_pending_cleanups_reach_cap(
         self, mock_model, mock_tokenizer
@@ -2512,6 +3336,12 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler.requests[done_request.request_id] = done_request
         scheduler._inflight_store_futures[slow_request.request_id] = slow_future
         scheduler._inflight_store_futures[done_request.request_id] = done_future
+        scheduler._inflight_store_info[slow_request.request_id] = (
+            scheduler_module._InflightStoreInfo(tokens=[1, 2, 3])
+        )
+        scheduler._inflight_store_info[done_request.request_id] = (
+            scheduler_module._InflightStoreInfo(tokens=[1, 2, 3])
+        )
         scheduler.request_id_to_uid[slow_request.request_id] = 1
         scheduler.request_id_to_uid[done_request.request_id] = 2
         scheduler.uid_to_request_id[1] = slow_request.request_id
@@ -2533,6 +3363,8 @@ class TestStoreCacheAdmissionBackpressure:
         assert slow_request.request_id in scheduler.requests
         assert done_request.request_id not in scheduler.requests
         assert done_request.request_id not in scheduler._inflight_store_futures
+        assert done_request.request_id not in scheduler._inflight_store_info
+        assert slow_request.request_id in scheduler._inflight_store_info
         assert done_request.request_id not in scheduler.request_id_to_uid
         assert 2 not in scheduler.uid_to_request_id
         assert gate.in_flight == 1
@@ -2636,9 +3468,7 @@ class TestBatchGeneratorAllTokens:
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert call_kwargs["all_tokens"] == [[]]
 
-    def test_concurrent_inserts_keep_per_request_seed(
-        self, mock_model, mock_tokenizer
-    ):
+    def test_concurrent_inserts_keep_per_request_seed(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         first = Request(
             request_id="req-concurrent-a",
@@ -2705,6 +3535,122 @@ class TestBatchGeneratorAllTokens:
 
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert call_kwargs["all_tokens"] == [[11, 12, 13]]
+        assert scheduled == [request]
+
+    def test_chunked_prefill_converts_turboquant_cache_before_insert(
+        self, mock_model, mock_tokenizer
+    ):
+        """Chunked prefill must mirror external prefill's TQ epilogue."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._turboquant_skip_last = False
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+
+        request = Request(
+            request_id="req-chunked-tq",
+            prompt=[11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14, 15]
+        request.num_prompt_tokens = 5
+        request.cached_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[kv_cache],
+            tokens_remaining=mx.array([[]]),
+            last_token=[15],
+            tokens_processed=4,
+            base_size=4,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        with patch("omlx.scheduler._materialize_cache_storage") as materialize:
+            with patch("omlx.scheduler._sync_and_clear_cache") as sync_clear:
+                scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        inserted_cache = call_kwargs["caches"][0][0]
+        assert isinstance(inserted_cache, TurboQuantKVCache)
+        assert state.cache[0] is inserted_cache
+        materialize.assert_called_once_with(state.cache)
+        sync_clear.assert_called_once_with(scheduler._stream)
+        assert scheduled == [request]
+
+    def test_chunked_prefill_converts_after_sized_arrays_restore(
+        self, mock_model, mock_tokenizer
+    ):
+        """Restored ArraysCache wrappers must not skip the TQ epilogue."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler._turboquant_skip_last = False
+
+        arrays_cache = ArraysCache(size=2)
+        arrays_cache.cache[0] = mx.random.normal((1, 3, 16))
+        arrays_cache.cache[1] = mx.random.normal((1, 2, 16, 16))
+        sized_arrays_cache = SizedArraysCache(arrays_cache, token_count=4)
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+
+        request = Request(
+            request_id="req-chunked-tq-sized-arrays",
+            prompt=[11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        request.prompt_token_ids = [11, 12, 13, 14, 15]
+        request.num_prompt_tokens = 5
+        request.cached_tokens = 4
+        state = _PrefillState(
+            request=request,
+            cache=[sized_arrays_cache, kv_cache],
+            tokens_remaining=mx.array([[]]),
+            last_token=[15],
+            tokens_processed=4,
+            base_size=4,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        scheduled = []
+
+        with patch("omlx.scheduler._materialize_cache_storage") as materialize:
+            with patch("omlx.scheduler._sync_and_clear_cache") as sync_clear:
+                scheduler._insert_prefilled_request(request, state, scheduled)
+
+        call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
+        inserted_cache = call_kwargs["caches"][0]
+        assert inserted_cache[0] is sized_arrays_cache
+        assert isinstance(inserted_cache[1], TurboQuantKVCache)
+        assert state.cache[1] is inserted_cache[1]
+        materialize.assert_called_once_with(state.cache)
+        sync_clear.assert_called_once_with(scheduler._stream)
         assert scheduled == [request]
 
 
@@ -3223,3 +4169,57 @@ class TestTurboQuantMLAGuard:
         assert scheduler._model_uses_mla() is False
         assert scheduler._model_uses_mla() is False
         assert calls["n"] == 1  # walked once, then cached
+
+
+class TestTurboQuantAttentionSinkGuard:
+    """Attention-sink models must not use TQ kernels that drop sink logits."""
+
+    def test_attention_sink_model_ineligible_by_module_mapping(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(),
+            modules=lambda: [{"sinks": mx.zeros((8,))}],
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_attention_sink_model_ineligible_by_module_attribute(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        attn = SimpleNamespace(sinks=mx.zeros((8,)))
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(), modules=lambda: [attn]
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_standard_model_without_sinks_still_eligible(
+        self, mock_model, mock_tokenizer
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(model_type="llama"), modules=lambda: []
+        )
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        assert scheduler._model_uses_attention_sinks() is False
+        assert scheduler._turboquant_eligible([KVCache()]) is True

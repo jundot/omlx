@@ -115,6 +115,16 @@ def make_quantization_config(model):
     attn = {
         k: mxfp8 for k, _ in flat_modules if ".attn.w" in k or ".attn.indexer.wq" in k
     }
+    # MTP fusion projections (oMLX MTP patch attaches them as mtp.<i>.e_proj /
+    # mtp.<i>.h_proj). The fp8 checkpoint ships them as e4m3 weight + e8m0
+    # block scale, i.e. mxfp8 after sanitize. Without an explicit entry they
+    # fall through to the affine default, whose QuantizedLinear expects a
+    # .biases tensor the checkpoint doesn't have, and strict load fails.
+    mtp_projs = {
+        k: mxfp8
+        for k, _ in flat_modules
+        if k.startswith("mtp.") and (k.endswith(".e_proj") or k.endswith(".h_proj"))
+    }
 
     return {
         "group_size": 64,
@@ -123,6 +133,7 @@ def make_quantization_config(model):
         **experts,
         **shared_experts,
         **attn,
+        **mtp_projs,
     }
 
 

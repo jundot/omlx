@@ -23,7 +23,7 @@ pinned mlx-lm v0.31.3 (`ed1fca4`) without modifying the upstream package.
 
 ## Activation
 
-The patch is gated on `model_type == "deepseek_v4"` in the model's
+The patch is gated on `model_type.startswith("deepseek_v4")` in the model's
 `config.json`, dispatched from:
 
 - `omlx/utils/model_loading.py::load_text_model`

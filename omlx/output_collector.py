@@ -149,6 +149,8 @@ class RequestOutputCollector:
             tool_calls=new.tool_calls,  # Preserve tool_calls for Harmony models
             cached_tokens=new.cached_tokens,
             error=new.error or existing.error,
+            error_code=new.error_code or existing.error_code,
+            error_metadata=new.error_metadata or existing.error_metadata,
         )
 
     def clear(self) -> None:

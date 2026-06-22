@@ -1345,6 +1345,54 @@ class TestNativeEmbeddingLoading:
         mock_validate_weights.assert_called_once()
         assert mock_load_weights.call_args.kwargs["strict"] is False
 
+    def test_load_native_supports_bfloat16_safetensors(self, tmp_path):
+        """Native embedding load must not route bf16 safetensors through NumPy."""
+        import mlx.core as mx
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "vocab_size": 16,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "max_position_embeddings": 8,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {
+                "embeddings.word_embeddings.weight": mx.ones(
+                    (16, 4), dtype=mx.bfloat16
+                )
+            },
+        )
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ), patch(
+            "omlx.models.embedding.MLXEmbeddingModel._validate_native_weights",
+            return_value=None,
+        ) as mock_validate_weights, patch(
+            "omlx.models.xlm_roberta.Model.load_weights",
+            return_value=None,
+        ) as mock_load_weights:
+            result = model._load_native()
+
+        assert result is True
+        mock_validate_weights.assert_called_once()
+        loaded_weights = dict(mock_load_weights.call_args.args[0])
+        assert loaded_weights["embeddings.word_embeddings.weight"].dtype == mx.bfloat16
+
     def test_load_native_rejects_missing_required_weights(self, tmp_path):
         """Native loading must fail when core transformer weights are missing."""
         from safetensors.numpy import save_file
@@ -1487,3 +1535,27 @@ class TestNativeEmbeddingLoading:
         emb = output.embeddings[0]
         norm = math.sqrt(sum(x * x for x in emb))
         assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"
+
+
+class TestGetEmbeddingMaxLength:
+    """The server helper that resolves the per-request embedding token cap."""
+
+    def test_request_override_wins(self):
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=32768):
+            assert server.get_embedding_max_length("m", 4096) == 4096
+
+    def test_uses_configured_context_window(self):
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=32768):
+            assert server.get_embedding_max_length("m", None) == 32768
+
+    def test_returns_none_without_window_so_model_resolves(self):
+        # No request override and no configured window: defer to the model's
+        # own context-length resolution instead of a hard 512 cap (#1687).
+        from omlx import server
+
+        with patch.object(server, "get_max_context_window", return_value=None):
+            assert server.get_embedding_max_length("m", None) is None

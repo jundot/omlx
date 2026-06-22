@@ -259,18 +259,66 @@ enum ReleasesChecker {
     }
 
     /// Pick the DMG asset whose filename embeds the current macOS major
-    /// version (e.g. `-macos15-` / `-macos26-` / `-macos15_`). Falls back
-    /// to the single DMG when there's only one.
+    /// version (e.g. `-macos15-` / `-macos26-` / `-macos15_`). Version
+    /// ranges such as `-macos26-27.` are accepted after exact matches.
+    /// Falls back to the single DMG when there's only one.
     static func findMatchingDMG(assets: [GitHubRelease.Asset]) -> GitHubRelease.Asset? {
+        findMatchingDMG(assets: assets, macOSMajor: currentMacOSMajor())
+    }
+
+    static func findMatchingDMG(
+        assets: [GitHubRelease.Asset],
+        macOSMajor: Int
+    ) -> GitHubRelease.Asset? {
         let dmgs = assets.filter { $0.name.lowercased().hasSuffix(".dmg") }
         guard !dmgs.isEmpty else { return nil }
 
-        let osMajor = currentMacOSMajor()
-        let tag = "macos\(osMajor)"
-        if let exact = dmgs.first(where: { $0.name.contains("-\(tag)-") || $0.name.contains("-\(tag)_") }) {
+        let candidates = dmgs.map {
+            (asset: $0, ranges: macOSMajorRanges(in: $0.name))
+        }
+        if let exact = candidates.first(where: { candidate in
+            candidate.ranges.contains { range in
+                range.lowerBound == macOSMajor && range.upperBound == macOSMajor
+            }
+        })?.asset {
             return exact
         }
+        if let ranged = candidates.first(where: { candidate in
+            candidate.ranges.contains { $0.contains(macOSMajor) }
+        })?.asset {
+            return ranged
+        }
         return dmgs.count == 1 ? dmgs[0] : nil
+    }
+
+    private static func macOSMajorRanges(in assetName: String) -> [ClosedRange<Int>] {
+        let normalized = assetName.lowercased()
+        let pattern = #"(?:^|[-_])macos(\d+)(?:-(\d+))?(?=$|[-_.])"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+        let fullRange = NSRange(
+            normalized.startIndex..<normalized.endIndex,
+            in: normalized
+        )
+        return regex.matches(in: normalized, range: fullRange).compactMap { match in
+            guard let lowerRange = Range(match.range(at: 1), in: normalized),
+                  let lower = Int(normalized[lowerRange])
+            else {
+                return nil
+            }
+
+            var upper = lower
+            let upperNSRange = match.range(at: 2)
+            if upperNSRange.location != NSNotFound,
+               let upperRange = Range(upperNSRange, in: normalized),
+               let parsedUpper = Int(normalized[upperRange]) {
+                upper = parsedUpper
+            }
+
+            guard upper >= lower else { return nil }
+            return lower...upper
+        }
     }
 
     /// Reads the host macOS major version (e.g. "15", "26"). Uses

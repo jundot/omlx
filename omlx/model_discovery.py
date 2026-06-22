@@ -38,6 +38,7 @@ VLM_MODEL_TYPES = {
     "gemma3",
     "gemma4",
     "gemma4_unified",
+    "diffusion_gemma",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -58,10 +59,19 @@ VLM_MODEL_TYPES = {
     "deepseekocr_2",
     "dots_ocr",
     "glm_ocr",
+    "minimax_m3_vl",
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+}
+
+# Text-only model families that are implemented in mlx-vlm rather than
+# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# models and adapts their language model to oMLX's scheduler.
+VLM_NATIVE_TEXT_MODEL_TYPES = {
+    "cohere2_moe",
+    "minimax_m3",
 }
 
 # Known VLM architectures
@@ -390,6 +400,47 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     )
 
 
+def _looks_like_nemo_asr_config(config: dict) -> bool:
+    """Return True for NeMo ASR exports that omit HF ``model_type``.
+
+    NVIDIA Parakeet TDT/CTC MLX conversions keep the original NeMo ASR
+    training config instead of a HuggingFace-style ``model_type`` or
+    ``architectures`` field.  mlx-audio can load these models by name, but
+    oMLX must still classify them as STT during discovery or they fall through
+    to the LLM engine and fail with a misleading ``'model_type'`` error.
+
+    Only top-level NeMo ASR module targets are considered so multimodal models
+    with nested ``audio_config`` sections are not misclassified.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    module_targets: list[str] = []
+    for key in ("preprocessor", "encoder", "decoder", "joint"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            target = value.get("_target_")
+            if isinstance(target, str):
+                module_targets.append(target.lower())
+
+    if not any("nemo.collections.asr" in target for target in module_targets):
+        return False
+
+    # NeMo ASR configs include an audio preprocessor plus tokenizer/decoder
+    # metadata.  Requiring these keeps the heuristic narrow while covering
+    # Parakeet TDT exports whose config has no model_type at all.
+    preprocessor = config.get("preprocessor")
+    has_audio_preprocessor = isinstance(preprocessor, dict) and (
+        "audio" in str(preprocessor.get("_target_", "")).lower()
+        or "melspectrogram" in str(preprocessor.get("_target_", "")).lower()
+    )
+    has_asr_head = isinstance(config.get("decoder"), dict) or isinstance(
+        config.get("joint"), dict
+    )
+    has_tokenizer = isinstance(config.get("tokenizer"), dict)
+    return has_audio_preprocessor and has_asr_head and has_tokenizer
+
+
 def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
@@ -515,6 +566,12 @@ def detect_model_type(model_path: Path) -> ModelType:
             "— treating as LLM"
         )
 
+    if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
+        logger.info(
+            f"{model_type} detected as mlx-vlm native text model"
+        )
+        return "vlm"
+
     # Check for VLM: architectures field
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
     # architecture name but strip vision_config and vision weights.
@@ -535,8 +592,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified and
+    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
+    # vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+            logger.info(
+                f"{model_type} detected as VLM (mlx-vlm native model)"
+            )
+            return "vlm"
         if _has_vision_subconfig(config):
             return "vlm"
         logger.info(
@@ -558,6 +622,12 @@ def detect_model_type(model_path: Path) -> ModelType:
     for arch in architectures:
         if arch in AUDIO_STT_ARCHITECTURES:
             return "audio_stt"
+
+    # NeMo ASR exports such as mlx-community/parakeet-tdt-0.6b-v3 ship a
+    # NeMo training config without HF model_type/architectures.  They are
+    # still STT models and mlx-audio can load them by directory/repo name.
+    if _looks_like_nemo_asr_config(config):
+        return "audio_stt"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"

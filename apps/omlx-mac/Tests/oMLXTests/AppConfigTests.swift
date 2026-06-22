@@ -152,6 +152,35 @@ final class AppConfigTests: XCTestCase {
         XCTAssertNil(server["bind_address"])
     }
 
+    func testConnectableHostNormalizesLocalAndWildcardHosts() {
+        XCTAssertEqual(AppConfig.connectableHost(for: ""), "127.0.0.1")
+        XCTAssertEqual(AppConfig.connectableHost(for: "0.0.0.0"), "127.0.0.1")
+        XCTAssertEqual(AppConfig.connectableHost(for: "::"), "127.0.0.1")
+        XCTAssertEqual(AppConfig.connectableHost(for: "localhost"), "127.0.0.1")
+        XCTAssertEqual(AppConfig.connectableHost(for: "127.0.0.1"), "127.0.0.1")
+    }
+
+    func testConnectableHostUsesFirstConfiguredBindHost() {
+        XCTAssertEqual(
+            AppConfig.connectableHost(for: "0.0.0.0,127.0.0.1"),
+            "127.0.0.1"
+        )
+        XCTAssertEqual(
+            AppConfig.connectableHost(for: "192.168.1.10,127.0.0.1"),
+            "192.168.1.10"
+        )
+    }
+
+    func testConnectableHostPreservesIPv6Loopback() {
+        XCTAssertEqual(AppConfig.connectableHost(for: "::1"), "::1")
+        XCTAssertEqual(AppConfig.connectableHost(for: "[::1]"), "::1")
+    }
+
+    func testHTTPURLBuildsIPv6URL() throws {
+        let url = try XCTUnwrap(AppConfig.httpURL(host: "::1", port: 9000, path: "/health"))
+        XCTAssertEqual(url.absoluteString, "http://[::1]:9000/health")
+    }
+
     func testLoadAcceptsBindAddressFallback() throws {
         let url = AppConfig.settingsURL(basePath: tempBase)
         let original: [String: Any] = [

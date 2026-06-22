@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for models/vlm.py — VLMModelAdapter for BatchGenerator compatibility."""
 
-from unittest.mock import MagicMock, PropertyMock, patch
-
-import pytest
-
-# Mock mlx before importing the module
-import sys
+from unittest.mock import MagicMock
 
 
 # Create mock mlx modules
@@ -155,7 +150,7 @@ class TestVLMModelAdapter:
         expected = MagicMock()
         vlm.language_model.__call__ = MagicMock(return_value=expected)
 
-        result = adapter(input_ids, cache=cache)
+        adapter(input_ids, cache=cache)
         vlm.language_model.assert_called_once()
         call_args = vlm.language_model.call_args
         assert call_args[0][0] is input_ids
@@ -337,6 +332,16 @@ class TestMRoPEDetection:
         vlm = MagicMock(spec=[])
         assert VLMModelAdapter._detect_mrope(vlm) is False
 
+    def test_detect_mrope_true_for_minimax_m3_vl(self):
+        """MiniMax M3 uses per-row decode positions even without mrope_section."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = MagicMock(spec=[])
+        vlm.config = MagicMock(spec=[])
+        vlm.config.model_type = "minimax_m3_vl"
+        assert VLMModelAdapter._detect_mrope(vlm) is True
+        assert VLMModelAdapter._detect_minimax_m3(vlm) is True
+
 
 class TestPerRequestMRoPEDecode:
     """Tests for per-request mRoPE position_ids computation during decode."""
@@ -358,9 +363,19 @@ class TestPerRequestMRoPEDecode:
         vlm.config.model_type = "qwen3_vl_moe"
         return vlm
 
+    def _make_minimax_m3_vlm_model(self):
+        """Create a mock MiniMax M3 VLM model."""
+        vlm = self._make_mrope_vlm_model()
+        vlm.config.model_type = "minimax_m3_vl"
+        vlm.config.text_config.model_type = "minimax_m3_vl"
+        vlm.config.text_config.rope_scaling = None
+        vlm.config.text_config.rope_parameters = None
+        return vlm
+
     def test_mrope_decode_uses_language_model_with_position_ids(self):
         """mRoPE decode with batch_rope_deltas should use language_model with position_ids."""
         import mlx.core as mx
+
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
@@ -384,6 +399,7 @@ class TestPerRequestMRoPEDecode:
     def test_mrope_always_uses_language_model(self):
         """mRoPE model always uses vlm language_model with position_ids."""
         import mlx.core as mx
+
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
@@ -400,6 +416,7 @@ class TestPerRequestMRoPEDecode:
     def test_position_ids_shape_and_values(self):
         """Verify position_ids = (3, batch, seq) with correct offset+delta values."""
         import mlx.core as mx
+
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
@@ -426,9 +443,82 @@ class TestPerRequestMRoPEDecode:
         assert pos_ids[0, 0, 0].item() == 50.0
         assert pos_ids[0, 1, 0].item() == 80.0
 
+    def test_mrope_decode_scalar_cache_offset_uses_position_ids(self):
+        """Singleton KVCache offset should not rely on stale language-model state."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_batch_rope_deltas(mx.array([0.0]))
+
+        input_ids = mx.zeros((1, 1), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = 16384
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        pos_ids = call_kwargs["position_ids"]
+        assert pos_ids.shape == (3, 1, 1)
+        assert pos_ids[0, 0, 0].item() == 16384.0
+
+    def test_non_minimax_mrope_mismatched_delta_size_keeps_existing_path(self):
+        """Non-MiniMax mRoPE models keep prior no-position_ids mismatch behavior."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_minimax_m3_positions is False
+
+        adapter.set_batch_rope_deltas(mx.array([10.0, 0.0]))
+
+        input_ids = mx.zeros((3, 1), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([50, 30, 20])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        assert "position_ids" not in call_kwargs
+
+    def test_minimax_m3_decode_uses_2d_position_ids(self):
+        """MiniMax M3 expects position_ids = (batch, seq), not Qwen-style rank 3."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_minimax_m3_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_mrope is True
+        assert adapter._uses_minimax_m3_positions is True
+
+        adapter.set_batch_rope_deltas(mx.array([-50.0, 0.0]))
+
+        input_ids = mx.zeros((2, 2), dtype=mx.int32)
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([100, 80])
+        cache = [cache_layer]
+
+        adapter(input_ids, cache=cache)
+
+        call_kwargs = vlm.language_model.call_args[1]
+        pos_ids = call_kwargs["position_ids"]
+        assert pos_ids.shape == (2, 2)
+        assert pos_ids[0, 0].item() == 50.0
+        assert pos_ids[0, 1].item() == 51.0
+        assert pos_ids[1, 0].item() == 80.0
+        assert pos_ids[1, 1].item() == 81.0
+
     def test_get_last_rope_deltas(self):
         """get_last_rope_deltas extracts value from language model."""
         import mlx.core as mx
+
         from omlx.models.vlm import VLMModelAdapter
 
         vlm = self._make_mrope_vlm_model()
@@ -470,6 +560,26 @@ class TestLogitsExtraction:
         result = adapter(MockMXArray(shape=(2, 10)), cache=[MagicMock()])
         assert result is lm_output.logits
 
+    def test_return_hidden_preserves_language_model_output(self):
+        """MTP backbone calls must keep hidden_states/gdn_states intact."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        lm_output = MagicMock()
+        lm_output.logits = MockMXArray(shape=(2, 10, 32000))
+        lm_output.hidden_states = [MockMXArray(shape=(2, 10, 128))]
+        lm_output.gdn_states = [{"state": "mock"}]
+        vlm.language_model.return_value = lm_output
+
+        result = adapter(
+            MockMXArray(shape=(2, 10)),
+            cache=[MagicMock()],
+            return_hidden=True,
+        )
+        assert result is lm_output
+
 
 class TestVLMModelAdapterModelProperty:
     """Tests for VLMModelAdapter.model property (for nested access)."""
@@ -485,6 +595,3 @@ class TestVLMModelAdapterModelProperty:
 
         # BatchGenerator accesses model.layers
         assert adapter.layers is vlm.language_model.model.layers
-
-
-

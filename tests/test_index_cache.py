@@ -3,8 +3,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 class TestBuildLayerPattern:
     """Test _build_layer_pattern function."""
@@ -84,6 +82,15 @@ class TestApplyIndexCache:
         from omlx.patches.index_cache import apply_index_cache
 
         model = MagicMock(spec=[])
+        assert apply_index_cache(model, 4) is False
+
+    def test_glm_moe_dsa_returns_false(self):
+        """GLM-5.2 uses its native indexer_types schedule, not IndexCache."""
+        from omlx.patches.index_cache import apply_index_cache
+
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+        model.args.model_type = "glm_moe_dsa"
         assert apply_index_cache(model, 4) is False
 
     def test_freq_less_than_2_returns_false(self):

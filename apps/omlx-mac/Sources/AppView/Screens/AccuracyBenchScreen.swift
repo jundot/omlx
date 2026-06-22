@@ -212,7 +212,6 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Accuracy Bench batch-size selector")
             ) {
                 Segmented(selection: $batchSize, options: batchSizeOptions)
-                    .frame(width: 260)
             }
 
             Row(
@@ -320,15 +319,23 @@ private struct BenchmarkGrid: View {
     @Binding var selected: Set<String>
     @Binding var sampleSizes: [String: Int]
 
+    @State private var calculatedHeight: CGFloat = 334
+
+    private struct GridHeightKey: PreferenceKey {
+        static let defaultValue: CGFloat = 334
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
     var body: some View {
-        // 3-column grid on width > 600, 2-column otherwise. GeometryReader
-        // gives us the live width so we don't need a fixed window size.
         GeometryReader { geo in
             let cols = geo.size.width > 600 ? 3 : 2
             let layout = Array(
                 repeating: GridItem(.flexible(), spacing: 8),
                 count: cols
             )
+
             LazyVGrid(columns: layout, alignment: .leading, spacing: 8) {
                 ForEach(benchmarkCatalog) { entry in
                     BenchmarkCard(
@@ -337,26 +344,32 @@ private struct BenchmarkGrid: View {
                         sampleSize: binding(for: entry.key),
                         onToggle: { toggle(entry.key) }
                     )
+                    .frame(maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .background {
+                GeometryReader { contentGeo in
+                    Color.clear
+                        .preference(key: GridHeightKey.self, value: contentGeo.size.height)
                 }
             }
         }
-        .frame(minHeight: gridHeight)
-    }
-
-    /// LazyVGrid inside a GeometryReader needs an explicit frame height —
-    /// otherwise it collapses to zero. Estimate generously: 8 rows × 64 pt
-    /// covers both 2-column (8 rows) and 3-column (6 rows) layouts.
-    private var gridHeight: CGFloat {
-        let rows = Double(benchmarkCatalog.count) / 2.0
-        return CGFloat((rows.rounded(.up)) * 66)
+        .frame(height: calculatedHeight)
+        .onPreferenceChange(GridHeightKey.self) { height in
+            withAnimation {
+                self.calculatedHeight = height
+            }
+        }
     }
 
     private func toggle(_ key: String) {
-        if selected.contains(key) {
-            selected.remove(key)
-        } else {
-            selected.insert(key)
-            if sampleSizes[key] == nil { sampleSizes[key] = 100 }
+        withAnimation {
+            if selected.contains(key) {
+                selected.remove(key)
+            } else {
+                selected.insert(key)
+                if sampleSizes[key] == nil { sampleSizes[key] = 100 }
+            }
         }
     }
 
@@ -378,11 +391,11 @@ private struct BenchmarkCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: onToggle) {
-                HStack(alignment: .center, spacing: 8) {
-                    Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                        .font(.system(size: 13))
-                        .foregroundStyle(isSelected ? theme.accent : theme.textTertiary)
+            Toggle(isOn: Binding(
+                get: { isSelected },
+                set: { _ in onToggle() }
+            )) {
+                HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(entry.displayName)
                             .font(.omlxText(12.5, weight: .medium))
@@ -391,11 +404,9 @@ private struct BenchmarkCard: View {
                             .font(.omlxText(10.5))
                             .foregroundStyle(theme.textTertiary)
                     }
-                    Spacer(minLength: 0)
+                    Spacer()
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if isSelected {
                 HStack(spacing: 6) {
@@ -825,7 +836,7 @@ private struct TextExportSection: View {
                                   : String(localized: "common.copy",
                                            defaultValue: "Copy",
                                            comment: "Generic Copy button label"),
-                                  systemImage: copied ? "checkmark" : "doc.on.doc")
+                                  systemImage: copied ? "checkmark" : "document.on.document")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.normal, size: .small))

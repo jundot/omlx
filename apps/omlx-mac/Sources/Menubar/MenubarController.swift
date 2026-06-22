@@ -16,8 +16,9 @@
 //   • Quit oMLX       (Cmd-Q)
 //
 // Icon templates: MenubarOutline (stopped) / MenubarFilled (running). Stats
-// poll runs at 1Hz against /admin/api/stats; visibility watcher probes once
-// at +3 s post-launch with a single recreate-and-retry before alerting.
+// poll uses lightweight /api/status with occasional all-time admin stats;
+// visibility watcher probes once at +3 s post-launch with a single
+// recreate-and-retry before alerting.
 
 import AppKit
 
@@ -490,12 +491,11 @@ final class MenubarController: NSObject {
     private func liveBaseURL() -> URL? {
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        return URL(string: "http://\(host):\(port)")
+        return AppConfig.httpURL(host: host, port: port)
     }
 
     private func startStatsPoller() {
-        guard let baseURL = liveBaseURL(),
-              let key = config.apiKey, !key.isEmpty else { return }
+        guard let baseURL = liveBaseURL() else { return }
         // Tear down any existing poller (and its observer) first so a
         // re-point doesn't leave a second instance polling the old endpoint.
         if let existing = statsPoller {
@@ -506,7 +506,7 @@ final class MenubarController: NSObject {
                 object: existing
             )
         }
-        let p = MenubarStatsPoller(baseURL: baseURL, apiKey: key)
+        let p = MenubarStatsPoller(baseURL: baseURL, apiKey: config.apiKey)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(statsDidUpdate(_:)),
@@ -570,6 +570,10 @@ final class MenubarController: NSObject {
     }
 
     @objc private func statsDidUpdate(_ note: Notification) {
+        if let poller = note.object as? MenubarStatsPoller,
+           let lastStatusSuccessAt = poller.lastStatusSuccessAt {
+            server?.recordAuxiliaryHealthSuccess(at: lastStatusSuccessAt)
+        }
         // Stats only need to redraw if the submenu is open or about to open;
         // menuWillOpen (NSMenuDelegate) handles the latter, so for now we
         // rebuild eagerly — the next render will pick up fresh values.
@@ -714,7 +718,7 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = URL(string: "http://\(host):\(port)/admin/chat") else { return }
+        guard let url = AppConfig.httpURL(host: host, port: port, path: "/admin/chat") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -832,10 +836,14 @@ extension MenubarController {
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
     static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
-        var comps = URLComponents()
-        comps.scheme = "http"
-        comps.host = host
-        comps.port = port
+        guard let baseURL = AppConfig.httpURL(
+            host: AppConfig.connectableHost(for: host),
+            port: port
+        ),
+              var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
         comps.path = "/admin/auto-login"
         var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
         if let key = apiKey, !key.isEmpty {

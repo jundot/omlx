@@ -451,6 +451,31 @@ class TestChatCompletionRequest:
         assert len(req.tools) == 1
         assert req.tool_choice == "auto"
 
+    def test_max_completion_tokens_alias(self):
+        """Test OpenAI max_completion_tokens maps to max_tokens."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 65536
+
+    def test_max_tokens_preferred_over_alias(self):
+        """Test canonical max_tokens wins when both aliases are present."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4096,
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 4096
+
     def test_request_validation_requires_model(self):
         """Test that model is required."""
         with pytest.raises(ValidationError):

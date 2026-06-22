@@ -15,6 +15,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 import uuid
 from contextlib import suppress
@@ -27,23 +28,42 @@ from typing import (
     Dict,
     List,
     Optional,
-    Set,
     Tuple,
     Union,
 )
 
 import mlx.core as mx
 
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .exceptions import PrefillMemoryExceededError
+from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .request import Request, RequestOutput, SamplingParams
+from .scheduler import Scheduler, SchedulerConfig
 from .utils.compile_cache import (
     clear_thread_compile_cache,
     compile_cache_clear_available,
 )
+from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 
 logger = logging.getLogger(__name__)
+
+
+def _raise_request_output_error(output: RequestOutput) -> None:
+    if output.error_code == "prefill_memory_exceeded":
+        metadata = output.error_metadata or {}
+        request_id = metadata.get("request_id")
+        estimated_bytes = metadata.get("estimated_bytes")
+        limit_bytes = metadata.get("limit_bytes")
+        raise PrefillMemoryExceededError(
+            message=output.error or "Prefill memory exceeded",
+            request_id=str(request_id) if request_id is not None else output.request_id,
+            estimated_bytes=(
+                int(estimated_bytes) if estimated_bytes is not None else None
+            ),
+            limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
+        )
+    raise RuntimeError(output.error)
+
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -72,6 +92,7 @@ def _init_mlx_thread() -> None:
     ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
     """
     import sys
+
     import mlx.core as mx
 
     stream = mx.new_thread_local_stream(mx.default_device())
@@ -114,6 +135,36 @@ class EngineConfig:
     step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
+    # Decode burst: run several scheduler.step() calls per run_in_executor
+    # hand-off instead of one. Each decode token otherwise bounces back to the
+    # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the
+    # main thread; bursting keeps the MLX thread holding the GIL continuously.
+    # scheduler.step() services aborts/admission/finish every step, so
+    # correctness is unchanged and memory is identical (same tokens decoded,
+    # same KV cache; only a small list of K SchedulerOutputs is held per
+    # burst). The budget is a TIME ceiling so the event-loop pause (and thus
+    # new-request admission / abort / HTTP latency) is bounded consistently
+    # across hardware, and a slow prefill-chunk step ends the burst.
+    #
+    # Adaptive: with a single active request (the common local/single-user
+    # case) there is no concurrent request to stay responsive to, so we burst
+    # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
+    # tight decode_burst_budget_s to keep admission/abort latency low.
+    # max_steps is a safety cap (bounds the host-side output list), NOT a
+    # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
+    decode_burst_max_steps: int = field(
+        default_factory=lambda: int(os.environ.get("OMLX_DECODE_BURST_MAX_STEPS", "64"))
+    )
+    decode_burst_budget_single_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S", "0.1")
+        )
+    )
+    decode_burst_budget_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_S", "0.03")
+        )
+    )
 
 
 class EngineCore:
@@ -183,6 +234,13 @@ class EngineCore:
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
         self._finished_events: Dict[str, asyncio.Event] = {}
+        # Finish timestamps for orphan-collector reaping (#1154).
+        # Normally a consumer drains and removes its own collector, but if the
+        # client disconnects mid-stream the SSE generator chain is abandoned and
+        # its cleanup finally only runs at GC time, so the collector lingers and
+        # the dashboard keeps showing the request as "Generating".
+        self._finished_at: Dict[str, float] = {}
+        self._last_reap = 0.0
 
         # Engine state
         self._running = False
@@ -239,6 +297,51 @@ class EngineCore:
         else:
             loop.call_soon_threadsafe(event.set)
 
+    def _step_burst(self) -> list:
+        """Run scheduler.step() several times in one executor hand-off.
+
+        Each decode token otherwise bounces back to the event loop, which
+        ping-pongs the GIL with the asyncio loop + uvicorn on the main thread
+        (~1ms/token of contention). Chaining a few steps lets the MLX thread
+        hold the GIL continuously (in-process sync loop hits ~80 tok/s vs ~74
+        through the per-token async hand-off).
+
+        scheduler.step() services aborts/admission/finish every step, so
+        correctness is unchanged; the only cost is event-loop responsiveness,
+        bounded by decode_burst_budget_s. Stops early when no work remains, a
+        prefill eviction needs the (async) callback, or the budget elapses —
+        the budget also ends the burst when a slow prefill-chunk step lands.
+
+        Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
+        """
+        max_steps = self.config.decode_burst_max_steps
+        outputs = [self.scheduler.step()]
+        if max_steps <= 1:
+            return outputs
+        # Adaptive budget: single active request -> aggressive (nothing else to
+        # stay responsive to); concurrent -> tight to keep admission/abort low.
+        running = getattr(self.scheduler, "running", None)
+        single = running is None or len(running) <= 1
+        budget = (
+            self.config.decode_burst_budget_single_s
+            if single
+            else self.config.decode_burst_budget_s
+        )
+        if budget <= 0:
+            return outputs
+        deadline = time.monotonic() + budget
+        while len(outputs) < max_steps:
+            last = outputs[-1]
+            if (
+                not last.has_work  # throttled/idle: stop and let the loop wait
+                or not self.scheduler.has_requests()
+                or last.prefill_eviction_request is not None
+                or time.monotonic() >= deadline
+            ):
+                break
+            outputs.append(self.scheduler.step())
+        return outputs
+
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
@@ -255,19 +358,38 @@ class EngineCore:
 
         while self._running:
             try:
-                if self.scheduler.has_requests():
-                    output = await loop.run_in_executor(
-                        self._mlx_executor, self.scheduler.step
-                    )
-                    self._steps_executed += 1
-                    eviction_request = output.prefill_eviction_request
+                # Sweep collectors orphaned by client disconnects (throttled).
+                now = time.monotonic()
+                if now - self._last_reap >= 1.0:
+                    self._last_reap = now
+                    self._reap_orphaned_collectors(now)
 
-                    # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
+                if self.scheduler.has_requests():
+                    step_outputs = await loop.run_in_executor(
+                        self._mlx_executor, self._step_burst
+                    )
+                    self._steps_executed += len(step_outputs)
+
+                    # Distribute every step's outputs to collectors (one or
+                    # more decode tokens per burst). collector.put() runs on the
+                    # loop thread, keeping the asyncio.Event signalling
+                    # thread-safe and per-token streaming intact.
+                    collectors = self._output_collectors
+                    states = self._stream_states
+                    eviction_request = None
+                    distributed = False
+
+                    for output in step_outputs:
+                        if (
+                            eviction_request is None
+                            and output.prefill_eviction_request is not None
+                        ):
+                            eviction_request = output.prefill_eviction_request
+
+                        outputs = output.outputs
+                        if not outputs:
+                            continue
+                        distributed = True
 
                         for req_output in outputs:
                             rid = req_output.request_id
@@ -287,12 +409,13 @@ class EngineCore:
                                         state.mark_sent(req_output.completion_tokens)
 
                             if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
-                                # Note: cleanup is handled by stream_outputs() finally block
-                                # _delayed_cleanup() was causing double cleanup race condition
+                                self._mark_request_finished(rid)
+                                # Cleanup normally happens in the consumer
+                                # (stream_outputs()/generate()); collectors left
+                                # behind by a disconnected client are swept by
+                                # _reap_orphaned_collectors() via _finished_at.
 
+                    if distributed:
                         # Always yield to prevent event loop starvation.
                         # Without this, orphaned requests (client disconnected but
                         # request still in scheduler) block the entire event loop,
@@ -325,7 +448,7 @@ class EngineCore:
                                 eviction_request.request_id,
                             )
                         continue
-                    if not output.has_work:
+                    if not step_outputs[-1].has_work:
                         # Requests may be queued while scheduler admission is
                         # intentionally throttled by async cache cleanup. Avoid
                         # spinning the engine loop, but still let new requests
@@ -350,9 +473,7 @@ class EngineCore:
                         if self.scheduler.has_requests():
                             continue
                         with suppress(TimeoutError):
-                            await asyncio.wait_for(
-                                event.wait(), timeout=step_interval
-                            )
+                            await asyncio.wait_for(event.wait(), timeout=step_interval)
 
             except asyncio.CancelledError:
                 break
@@ -376,9 +497,7 @@ class EngineCore:
                                 error=str(e),
                             )
                         )
-                    event = self._finished_events.get(rid)
-                    if event:
-                        event.set()
+                    self._mark_request_finished(rid)
                 await asyncio.sleep(0.1)
 
     async def add_request(
@@ -460,10 +579,38 @@ class EngineCore:
         # Add to scheduler — route through the MLX executor so that
         # prefix cache reconstruction (mx.load, mx.concatenate) never
         # races with scheduler.step() on the Metal stream.  See #95.
+        #
+        # The scheduler may raise (PrefillMemoryExceededError, or other
+        # validation errors) before the request enters self.waiting. In
+        # that case the consumer in stream_outputs / generate never sees
+        # the request_id and its finally-block cleanup never fires —
+        # without the explicit cleanup below the per-rejection leak
+        # accumulates one collector + one stream_state + one
+        # asyncio.Event per refused request. Re-raise after cleanup so
+        # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            self._mlx_executor, self.scheduler.add_request, request
-        )
+        try:
+            await loop.run_in_executor(
+                self._mlx_executor, self.scheduler.add_request, request
+            )
+        except BaseException:
+            # If the caller is cancelled here (e.g. the client disconnected
+            # before the SSE stream began) — or the insert fails — the request
+            # never reaches stream_outputs()/generate()'s try/finally, so
+            # nothing would mark it finished or clean it up. The collector
+            # created above would then linger forever as a phantom the reaper
+            # cannot see (it was never stamped _finished_at), and the dashboard
+            # would show it as "Generating" indefinitely (#1154).
+            # Drop the tracking and abort any partial scheduler insert (the
+            # deferred abort is idempotent and harmless if it never landed).
+            try:
+                self.scheduler.abort_request(request_id)
+            except Exception as abort_exc:  # noqa: BLE001
+                logger.debug(
+                    f"Abort of partial insert for {request_id} failed: {abort_exc}"
+                )
+            self._cleanup_request(request_id)
+            raise
         self._wake_engine_loop()
 
         return request_id
@@ -504,9 +651,7 @@ class EngineCore:
                     error="Request aborted",
                 )
             )
-        event = self._finished_events.get(request_id)
-        if event is not None:
-            event.set()
+        self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
         return result
@@ -553,15 +698,61 @@ class EngineCore:
                         error=error_msg,
                     )
                 )
-            event = self._finished_events.get(rid)
-            if event is not None:
-                event.set()
+            self._mark_request_finished(rid)
         if request_ids:
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
             )
             self._wake_engine_loop()
         return len(request_ids)
+
+    def _mark_request_finished(self, request_id: str) -> None:
+        """Signal the consumer a request finished and stamp the finish time.
+
+        The timestamp lets _reap_orphaned_collectors() drop collectors whose
+        consumer never cleaned up (e.g. the client disconnected mid-stream and
+        the SSE generator chain was abandoned rather than closed).
+        """
+        self._finished_at.setdefault(request_id, time.monotonic())
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
+    def _reap_orphaned_collectors(self, now: float, grace: float = 5.0) -> int:
+        """Drop tracking for finished requests whose consumer never cleaned up.
+
+        stream_outputs()/generate() normally remove their own collector via
+        _cleanup_request() once the final output is drained. But when a client
+        disconnects mid-stream the SSE generator chain is abandoned instead of
+        closed, so that finally block only runs at non-deterministic GC time —
+        the collector lingers in _output_collectors and the request shows as
+        "Generating" forever on the dashboard (#1154).
+
+        This sweep removes the dict tracking for any request finished more than
+        ``grace`` seconds ago. It is intentionally pop-only and never calls
+        ``collector.clear()``: stream_outputs()/generate() hold their own
+        reference to the collector object, so dropping the dict entry cannot
+        truncate a slow-but-live consumer's output — only an over-eager clear()
+        could (which is what made the earlier _delayed_cleanup() approach race).
+        The grace period guarantees a live consumer (which drains in the same
+        event-loop turn the request finishes) has already self-cleaned.
+        """
+        if not self._finished_at:
+            return 0
+        stale = [rid for rid, ts in self._finished_at.items() if now - ts >= grace]
+        for rid in stale:
+            # pop-only — see docstring; never clear() the collector object.
+            self._output_collectors.pop(rid, None)
+            self._stream_states.pop(rid, None)
+            self._finished_events.pop(rid, None)
+            self._finished_at.pop(rid, None)
+        if stale:
+            logger.debug(
+                "Reaped %d orphaned output collector(s) after disconnect: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
 
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking.
@@ -575,6 +766,7 @@ class EngineCore:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+        self._finished_at.pop(request_id, None)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """
@@ -629,7 +821,7 @@ class EngineCore:
                     yield output
 
                     if output.error:
-                        raise RuntimeError(output.error)
+                        _raise_request_output_error(output)
 
                     if output.finished:
                         break
@@ -675,6 +867,15 @@ class EngineCore:
         if event is None:
             raise RuntimeError(f"No event for request {request_id}")
 
+        # Capture the collector reference BEFORE awaiting, mirroring
+        # stream_outputs(): the orphan reaper is pop-only and may drop the dict
+        # entry once the request is finished, but a held reference still drains.
+        # Re-fetching after the await would race the reaper if this coroutine is
+        # starved past the grace window under heavy load (#1154).
+        collector = self._output_collectors.get(request_id)
+        if collector is None:
+            raise RuntimeError(f"No collector for request {request_id}")
+
         try:
             # Wait for the request to finish
             await event.wait()
@@ -686,12 +887,7 @@ class EngineCore:
             self._cleanup_request(request_id)
             raise
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
-
-        # Drain all outputs and get the last one
+        # Drain all outputs and get the last one (using the captured reference)
         final_output = None
         while True:
             output = collector.get_nowait()
@@ -706,7 +902,7 @@ class EngineCore:
             raise RuntimeError(f"No output for request {request_id}")
 
         if final_output.error:
-            raise RuntimeError(final_output.error)
+            _raise_request_output_error(final_output)
 
         return final_output
 
@@ -729,8 +925,9 @@ class EngineCore:
         Returns:
             List of RequestOutput in same order as prompts
         """
-        from .request import Request
         import uuid as uuid_module
+
+        from .request import Request
 
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -814,8 +1011,15 @@ class EngineCore:
         # through the executor; fall back to a direct call if the executor
         # is already shut down.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+            fn_name = getattr(fn, "__name__", repr(fn))
             try:
-                self._mlx_executor.submit(fn).result()
+                self._mlx_executor.submit(fn).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                fatal_exit(
+                    f"Engine teardown timed out after "
+                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while running "
+                    f"{fn_name} for engine {self._engine_id}"
+                )
             except RuntimeError:
                 try:
                     fn()
@@ -862,13 +1066,22 @@ class EngineCore:
             # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
             # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
             # held) before the thread is torn down so the destructor runs on an
-            # empty cache, then shut down normally. See utils/compile_cache.py.
+            # empty cache, then request shutdown without waiting indefinitely.
+            # See utils/compile_cache.py.
             if compile_cache_clear_available():
                 try:
-                    self._mlx_executor.submit(clear_thread_compile_cache).result()
+                    self._mlx_executor.submit(clear_thread_compile_cache).result(
+                        timeout=FATAL_TEARDOWN_TIMEOUT_S
+                    )
+                except concurrent.futures.TimeoutError:
+                    fatal_exit(
+                        f"Engine teardown timed out after "
+                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while clearing "
+                        f"MLX compile cache for engine {self._engine_id}"
+                    )
                 except RuntimeError:
                     pass
-                self._mlx_executor.shutdown(wait=True)
+                self._mlx_executor.shutdown(wait=False)
             else:
                 # Fallback: the clear symbol is unavailable, so do NOT exit the
                 # worker thread (that would run the unsafe destructor). Keep it
@@ -883,6 +1096,7 @@ class EngineCore:
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
+        self._finished_at.clear()
 
         # Release model and tokenizer references for GC
         self.model = None

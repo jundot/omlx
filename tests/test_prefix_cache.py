@@ -6,17 +6,15 @@ This module tests the block-aware prefix caching system that uses
 PagedCacheManager for block-based storage with SSD persistence.
 """
 
+import sys
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch, PropertyMock
+import types
+from unittest.mock import MagicMock
 
 import pytest
 
 from omlx.cache.paged_cache import (
-    BlockHash,
     BlockTable,
-    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
 )
@@ -500,6 +498,101 @@ class TestBlockAwarePrefixCacheWithSSD:
             block.block_hash
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
+
+    def test_minimax_m3_sliceable_nstate_blocks_round_trip(self, monkeypatch):
+        """MiniMax M3 single-cache blocks store K/V/index slices, not snapshots."""
+        mx = pytest.importorskip("mlx.core")
+
+        module = types.ModuleType("mlx_vlm.models.minimax_m3_vl.language")
+
+        class FakeInnerKVCache:
+            def __init__(self):
+                self.state = None
+
+        class MiniMaxM3KVCache:
+            def __init__(self):
+                self.kv_cache = FakeInnerKVCache()
+                self.index_keys = None
+                self.index_offset = 0
+
+        module.MiniMaxM3KVCache = MiniMaxM3KVCache
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_vlm.models.minimax_m3_vl.language",
+            module,
+        )
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        mock_ssd = MagicMock()
+        saved_by_hash = {}
+
+        def save_block(**kwargs):
+            saved_by_hash[kwargs["block_hash"]] = (
+                kwargs["cache_data"],
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "block_size": 4,
+                    "layer_cache_types": kwargs["layer_cache_types"],
+                    "layer_meta_states": kwargs["layer_meta_states"],
+                },
+            )
+            return True
+
+        mock_ssd.save_block.side_effect = save_block
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        keys = mx.arange(1 * 2 * 8 * 3, dtype=mx.float32).reshape(1, 2, 8, 3)
+        values = keys + 100
+        index_keys = mx.arange(1 * 1 * 8 * 3, dtype=mx.float32).reshape(1, 1, 8, 3)
+        mx.eval(keys, values, index_keys)
+        cache_data = [
+            {
+                "state": (keys, values, index_keys),
+                "cache_type": "MiniMaxM3KVCache",
+                "class_name": "MiniMaxM3KVCache",
+                "meta_state": (999,),
+            }
+        ]
+
+        block_table = cache.store_cache("req-minimax", list(range(8)), cache_data)
+
+        assert block_table is not None
+        assert len(block_table.block_ids) == 2
+        assert mock_ssd.save_block.call_count == 2
+        for idx, call in enumerate(mock_ssd.save_block.call_args_list):
+            marker = call.kwargs["cache_data"][0]
+            assert marker[0] == "__nstate__"
+            assert marker[1] == "MiniMaxM3KVCache"
+            saved_keys, saved_values, saved_index = marker[2]
+            start = idx * 4
+            end = start + 4
+            assert saved_keys.tolist() == keys[:, :, start:end, :].tolist()
+            assert saved_values.tolist() == values[:, :, start:end, :].tolist()
+            assert saved_index.tolist() == index_keys[:, :, start:end, :].tolist()
+
+        def load_block_with_metadata(block_hash, **kwargs):
+            return saved_by_hash.get(block_hash, (None, None))
+
+        mock_ssd.load_block_with_metadata.side_effect = load_block_with_metadata
+        restored = cache.reconstruct_cache(block_table)
+
+        assert restored is not None
+        restored_cache = restored[0]
+        restored_keys, restored_values = restored_cache.kv_cache.state
+        assert restored_keys.tolist() == keys.tolist()
+        assert restored_values.tolist() == values.tolist()
+        assert restored_cache.index_keys.tolist() == index_keys.tolist()
+        assert restored_cache.index_offset == 8
 
 
 class TestPrefixIndexOperations:
@@ -2274,6 +2367,245 @@ class TestWalkBackTruncation:
         assert block2.ref_count == 1
 
 
+class TestTurboQuantFormatMismatchRecovery:
+    """Regression tests for TurboQuant/fp16 prefix-chain format mismatches."""
+
+    @pytest.fixture
+    def mx(self):
+        """Import MLX or skip."""
+        try:
+            import mlx.core as mx
+
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def test_reconstruct_truncates_turboquant_chain_at_fp16_tail(self, mx):
+        """A pre-fix fp16 tail after TQ blocks should heal by truncation."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        mock_ssd.forget_block.return_value = True
+
+        model = MockModel(num_layers=1)
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        blocks = []
+        for i in range(2):
+            block = paged_cache.allocate_block()
+            block.block_hash = f"hash-tq-{i}".encode()
+            block.token_count = 4
+            block.ref_count = 2
+            paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+            blocks.append(block)
+
+        block_table = BlockTable(
+            request_id="req-tq-mixed",
+            block_ids=[block.block_id for block in blocks],
+            num_tokens=8,
+        )
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+        tq_cache = TurboQuantKVCache.from_cache(kv_cache, bits=4.0)
+        tq_keys, tq_values = tq_cache.state
+        tq_block = [("__turboquant_v2__", (tq_keys, tq_values))]
+
+        fp16_tail = [
+            (
+                mx.random.normal((1, 2, 4, 32)),
+                mx.random.normal((1, 2, 4, 32)),
+            )
+        ]
+        tq_metadata = {
+            "model_name": "test-model",
+            "num_layers": 1,
+            "block_size": 4,
+            "layer_cache_types": ["TurboQuantKVCache"],
+            "layer_meta_states": [tq_cache.meta_state],
+        }
+        fp16_metadata = {
+            "model_name": "test-model",
+            "num_layers": 1,
+            "block_size": 4,
+            "layer_cache_types": ["KVCache"],
+            "layer_meta_states": [(4,)],
+        }
+        mock_ssd.load_block_with_metadata.side_effect = [
+            (tq_block, tq_metadata),
+            (fp16_tail, fp16_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 1
+        assert isinstance(result[0], TurboQuantKVCache)
+        assert block_table.block_ids == [blocks[0].block_id]
+        assert block_table.num_tokens == 4
+        assert blocks[1].ref_count == 1
+        mock_ssd.forget_block.assert_called_once_with(blocks[1].block_hash)
+        assert paged_cache.cached_block_hash_to_block.get_block(
+            blocks[1].block_hash
+        ) is None
+
+    def test_reconstruct_rejects_stale_first_block_with_manager_signature(self, mx):
+        """A live manager signature must make stale block 0 fail its own check."""
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+        mock_ssd._expected_layer_cache_types = ["TurboQuantKVCache"]
+        mock_ssd.forget_block.return_value = True
+
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        block = paged_cache.allocate_block()
+        block.block_hash = b"stale-first"
+        block.token_count = 4
+        block.ref_count = 2
+        paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+        block_table = BlockTable(
+            request_id="req-stale-first",
+            block_ids=[block.block_id],
+            num_tokens=4,
+        )
+
+        stale_block = [
+            (
+                mx.random.normal((1, 2, 4, 32)),
+                mx.random.normal((1, 2, 4, 32)),
+            )
+        ]
+        stale_metadata = {
+            "model_name": "test-model",
+            "num_layers": 1,
+            "block_size": 4,
+            "layer_cache_types": ["KVCache"],
+            "layer_meta_states": [(4,)],
+        }
+        mock_ssd.load_block_with_metadata.return_value = (
+            stale_block,
+            stale_metadata,
+        )
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is None
+        assert block_table.block_ids == []
+        assert block_table.num_tokens == 0
+        mock_ssd.forget_block.assert_called_once_with(block.block_hash)
+
+    def test_reconstruct_accepts_sized_arrays_metadata_with_turboquant(self, mx):
+        """SizedArraysCache is a restored ArraysCache wrapper, not a mismatch."""
+        from mlx_lm.models.cache import KVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        mock_ssd = MagicMock(spec=PagedSSDCacheManager)
+
+        model = MockModel(num_layers=2)
+        paged_cache = PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+
+        blocks = []
+        for i in range(2):
+            block = paged_cache.allocate_block()
+            block.block_hash = f"hash-arrays-tq-{i}".encode()
+            block.token_count = 4
+            block.ref_count = 2
+            paged_cache.cached_block_hash_to_block.insert(block.block_hash, block)
+            blocks.append(block)
+
+        block_table = BlockTable(
+            request_id="req-arrays-sized-tq",
+            block_ids=[block.block_id for block in blocks],
+            num_tokens=8,
+        )
+
+        arrays_state_1 = (
+            mx.ones((1, 3, 16)),
+            mx.ones((1, 2, 16, 16)),
+        )
+        arrays_state_2 = (
+            mx.ones((1, 3, 16)) * 2,
+            mx.ones((1, 2, 16, 16)) * 2,
+        )
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(
+            mx.random.normal((1, 2, 4, 32)),
+            mx.random.normal((1, 2, 4, 32)),
+        )
+        tq_cache = TurboQuantKVCache.from_cache(kv_cache, bits=4.0)
+        tq_keys, tq_values = tq_cache.state
+        tq_block = ("__turboquant_v2__", (tq_keys, tq_values))
+
+        arrays_metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "block_size": 4,
+            "layer_cache_types": ["ArraysCache", "TurboQuantKVCache"],
+            "layer_meta_states": [(), tq_cache.meta_state],
+        }
+        sized_metadata = {
+            "model_name": "test-model",
+            "num_layers": 2,
+            "block_size": 4,
+            "layer_cache_types": ["SizedArraysCache", "TurboQuantKVCache"],
+            "layer_meta_states": [(), tq_cache.meta_state],
+        }
+        mock_ssd.load_block_with_metadata.side_effect = [
+            ([arrays_state_1, tq_block], arrays_metadata),
+            ([arrays_state_2, tq_block], sized_metadata),
+        ]
+
+        result = cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert len(result) == 2
+        assert isinstance(result[0], SizedArraysCache)
+        assert isinstance(result[1], TurboQuantKVCache)
+        assert block_table.block_ids == [blocks[0].block_id, blocks[1].block_id]
+        assert block_table.num_tokens == 8
+        mock_ssd.forget_block.assert_not_called()
+
+
 class TestPerBlockMetaStates:
     """Tests for per-block meta_states in store_cache with boundary snapshots.
 
@@ -2595,3 +2927,76 @@ class TestPerBlockMetaStates:
             f"Last block should use snapshot offset=8, not shared offset=11, "
             f"got {b2_meta[1]}"
         )
+
+
+class TestSetPagedSSDCacheManagerTriggersSweep:
+    """``set_paged_ssd_cache_manager`` must trigger the one-shot sweep so
+    stale-signature blocks left over from a previous cache-config run for
+    this model are evicted before the first prefix lookup runs."""
+
+    @pytest.fixture
+    def prefix_cache(self):
+        return BlockAwarePrefixCache(
+            model=MockModel(num_layers=4),
+            paged_cache_manager=PagedCacheManager(
+                block_size=4,
+                max_blocks=16,
+                model_name="test",
+                initial_blocks=16,
+            ),
+            paged_ssd_cache_manager=None,
+        )
+
+    def test_attach_calls_invalidate(self, prefix_cache):
+        mock_mgr = MagicMock()
+        mock_mgr.invalidate_stale_layer_signature.return_value = 0
+
+        prefix_cache.set_paged_ssd_cache_manager(mock_mgr)
+
+        mock_mgr.invalidate_stale_layer_signature.assert_called_once_with()
+        assert prefix_cache.paged_ssd_cache is mock_mgr
+
+    def test_attach_survives_sweep_exception(self, prefix_cache):
+        mock_mgr = MagicMock()
+        mock_mgr.invalidate_stale_layer_signature.side_effect = RuntimeError("boom")
+
+        # Must not raise — sweep failure is logged but the manager
+        # connection must still complete.
+        prefix_cache.set_paged_ssd_cache_manager(mock_mgr)
+
+        assert prefix_cache.paged_ssd_cache is mock_mgr
+
+    def test_attach_none_no_call(self, prefix_cache):
+        # Detaching the manager must not invoke anything.
+        prefix_cache.set_paged_ssd_cache_manager(None)
+        assert prefix_cache.paged_ssd_cache is None
+
+
+class TestCanonicalLayerCacheTypes:
+    """The canonicalizer normalizes wrapper class names but must NOT
+    collapse types that change tensor representation (TurboQuantKVCache
+    stores 4-bit packed tensors; KVCache stores fp16) — collapsing those
+    would silently mix incompatible cache blocks."""
+
+    def test_none_passthrough(self):
+        assert BlockAwarePrefixCache._canonical_layer_cache_types(None) is None
+
+    def test_sized_arrays_normalized(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["SizedArraysCache", "SizedArraysCache", "KVCache"]
+        )
+        assert result == ["ArraysCache", "ArraysCache", "KVCache"]
+
+    def test_prefill_ready_rotating_normalized(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["KVCache", "PrefillReadyRotatingKVCache", "RotatingKVCache"]
+        )
+        assert result == ["KVCache", "RotatingKVCache", "RotatingKVCache"]
+
+    def test_turboquant_not_collapsed(self):
+        result = BlockAwarePrefixCache._canonical_layer_cache_types(
+            ["ArraysCache", "TurboQuantKVCache", "KVCache"]
+        )
+        # TurboQuant must remain distinct from plain KVCache.
+        assert "TurboQuantKVCache" in result
+        assert result != ["ArraysCache", "KVCache", "KVCache"]

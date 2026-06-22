@@ -1,174 +1,6 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "profile.detail.acceleration.vlm_mtp" : {
-      "comment" : "Acceleration chip: VLM multi-token prediction",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "VLM MTP"
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.block_size.label" : {
-      "comment" : "Row label for the VLM MTP draft block-size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Draft Block Size"
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.block_size.sub" : {
-      "comment" : "Sublabel for the VLM MTP draft block-size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Tokens drafted per round. Empty uses the mlx-vlm default."
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.draft.label" : {
-      "comment" : "Row label for the VLM MTP draft-model picker",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "VLM Draft Model"
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.draft.sub" : {
-      "comment" : "Sublabel for the VLM MTP draft-model picker",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Assistant drafter sharing the target's tokenizer."
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.label" : {
-      "comment" : "Row label for the VLM MTP toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "VLM MTP"
-          }
-        }
-      }
-    },
-    "settings.experimental.vlm_mtp.sub" : {
-      "comment" : "Default sublabel for the VLM MTP toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
-          }
-        }
-      }
-    },
-    "settings.speculative.conflict.vlm_mtp" : {
-      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable VLM MTP before enabling this feature."
-          }
-        }
-      }
-    },
-    "settings.mtp.conflict.vlm_mtp" : {
-      "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable VLM MTP before enabling Native MTP."
-          }
-        }
-      }
-    },
-    "settings.vlm_mtp.conflict.dflash" : {
-      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable DFlash before enabling VLM MTP."
-          }
-        }
-      }
-    },
-    "settings.vlm_mtp.conflict.mtp" : {
-      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable Native MTP before enabling VLM MTP."
-          }
-        }
-      }
-    },
-    "settings.vlm_mtp.conflict.specprefill" : {
-      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable SpecPrefill before enabling VLM MTP."
-          }
-        }
-      }
-    },
-    "settings.vlm_mtp.conflict.turboquant" : {
-      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Disable TurboQuant KV before enabling VLM MTP."
-          }
-        }
-      }
-    },
-    "settings.vlm_mtp.draft.placeholder" : {
-      "comment" : "Initial placeholder option in the VLM MTP draft-model picker",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Select assistant drafter…"
-          }
-        }
-      }
-    },
     "" : {
 
     },
@@ -1724,6 +1556,21 @@
     "Click to copy" : {
 
     },
+    "Close Window" : {
+
+    },
+    "common.back" : {
+      "comment" : "Back button label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Back"
+          }
+        }
+      }
+    },
     "common.cancel" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1789,18 +1636,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Create"
-          }
-        }
-      }
-    },
-    "common.back" : {
-      "comment" : "Back button label",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Back"
           }
         }
       }
@@ -1947,18 +1782,6 @@
         }
       }
     },
-    "downloads.card.files.empty" : {
-      "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "No files reported."
-          }
-        }
-      }
-    },
     "downloads.card.error" : {
       "comment" : "Title shown in the model card sheet when the fetch failed",
       "extractionState" : "manual",
@@ -1967,6 +1790,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Couldn't load model card"
+          }
+        }
+      }
+    },
+    "downloads.card.files.empty" : {
+      "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No files reported."
           }
         }
       }
@@ -2550,6 +2385,30 @@
         }
       }
     },
+    "integrations.codex.app" : {
+      "comment" : "Label for the Codex desktop app launcher command",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Desktop App"
+          }
+        }
+      }
+    },
+    "integrations.codex.cli" : {
+      "comment" : "Label for the Codex CLI launcher command",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "CLI"
+          }
+        }
+      }
+    },
     "integrations.command.terminal_caption" : {
       "comment" : "Caption above each shell command block",
       "extractionState" : "manual",
@@ -2814,6 +2673,18 @@
         }
       }
     },
+    "integrations.target_context.apply" : {
+      "comment" : "Apply button for the Claude Code target context size field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Apply"
+          }
+        }
+      }
+    },
     "integrations.tool.codex" : {
       "comment" : "Display name for the Codex integration",
       "extractionState" : "manual",
@@ -3006,6 +2877,18 @@
         }
       }
     },
+    "menubar.alert.dismiss" : {
+      "comment" : "Button that dismisses an alert",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Dismiss"
+          }
+        }
+      }
+    },
     "menubar.alert.ok" : {
       "comment" : "Default dismiss button on the port-conflict alert",
       "extractionState" : "manual",
@@ -3018,8 +2901,32 @@
         }
       }
     },
+    "menubar.alert.open_log" : {
+      "comment" : "Button that opens the server log file",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Open Log"
+          }
+        }
+      }
+    },
+    "menubar.alert.open_settings" : {
+      "comment" : "Button that opens the oMLX settings window",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Open Settings"
+          }
+        }
+      }
+    },
     "menubar.alert.pid_known" : {
-      "comment" : "Substring describing a known PID; placeholder is the PID number",
+      "comment" : "Substring describing a known PID; placeholder is the PID number (plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
@@ -3067,13 +2974,61 @@
       }
     },
     "menubar.alert.port_in_use.title" : {
-      "comment" : "Title of the port-conflict alert; placeholder is the port number",
+      "comment" : "Title of the port-conflict alert; placeholder is the port number (plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
             "value" : "Port %@ is in use."
+          }
+        }
+      }
+    },
+    "menubar.alert.server_failed.access_hint" : {
+      "comment" : "Hint shown when the server failure log suggests a model directory permission problem",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Check that the configured model directory is mounted and readable. If it is on an external or protected location, grant oMLX access in macOS Privacy & Security settings."
+          }
+        }
+      }
+    },
+    "menubar.alert.server_failed.body" : {
+      "comment" : "Introductory body text for the server startup failure alert",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "The server process exited before it became healthy."
+          }
+        }
+      }
+    },
+    "menubar.alert.server_failed.log_path" : {
+      "comment" : "Server startup failure alert line that shows the server log path",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Log: %@"
+          }
+        }
+      }
+    },
+    "menubar.alert.server_failed.title" : {
+      "comment" : "Title for the server startup failure alert",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "oMLX Server Failed to Start"
           }
         }
       }
@@ -3115,7 +3070,7 @@
       }
     },
     "menubar.header.running" : {
-      "comment" : "Menubar status header when the server is running; placeholder is the port",
+      "comment" : "Menubar status header when the server is running; placeholder is the port (rendered as a plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
@@ -3198,6 +3153,18 @@
         }
       }
     },
+    "menubar.item.downloading_update" : {
+      "comment" : "Menubar update item while an app update is downloading; placeholder is the percent",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Downloading update… %lld%%"
+          }
+        }
+      }
+    },
     "menubar.item.force_restart" : {
       "comment" : "Menubar item that force-restarts a stuck or failed server",
       "extractionState" : "manual",
@@ -3206,6 +3173,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Force Restart"
+          }
+        }
+      }
+    },
+    "menubar.item.install_update_version" : {
+      "comment" : "Menubar update item when an app update is available; placeholder is the version",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Install oMLX %@…"
           }
         }
       }
@@ -3266,6 +3245,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Stop Server"
+          }
+        }
+      }
+    },
+    "menubar.item.update_available" : {
+      "comment" : "Menubar item shown when an app update is available",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Install Update…"
           }
         }
       }
@@ -3798,6 +3789,9 @@
         }
       }
     },
+    "oMLX" : {
+
+    },
     "performance.button.apply" : {
       "comment" : "Apply button at the bottom of the Performance screen",
       "extractionState" : "manual",
@@ -3954,6 +3948,18 @@
         }
       }
     },
+    "performance.error.custom_ceiling_invalid" : {
+      "comment" : "Performance screen error when custom memory guard ceiling is invalid",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Custom Ceiling must be greater than 0 GB."
+          }
+        }
+      }
+    },
     "performance.error.embedding_batch_size_invalid" : {
       "comment" : "Performance screen error when embedding batch size input is invalid",
       "extractionState" : "manual",
@@ -3998,6 +4004,150 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Max Concurrent Requests must be a positive integer."
+          }
+        }
+      }
+    },
+    "performance.memory.custom_ceiling" : {
+      "comment" : "Row label for memory guard custom ceiling",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Custom Ceiling"
+          }
+        }
+      }
+    },
+    "performance.memory.custom_ceiling.placeholder" : {
+      "comment" : "Placeholder for custom memory guard ceiling",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "GB"
+          }
+        }
+      }
+    },
+    "performance.memory.custom_ceiling.sub" : {
+      "comment" : "Sublabel for memory guard custom ceiling",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Fixed process memory ceiling in GB. Used only with the Custom tier."
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier" : {
+      "comment" : "Row label for memory guard tier popup",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Memory Guard Tier"
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.aggressive" : {
+      "comment" : "Memory guard tier option: aggressive",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Aggressive"
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.aggressive.sub" : {
+      "comment" : "Description for aggressive memory guard tier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Uses more memory before throttling. Best when the Mac has ample headroom."
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.balanced" : {
+      "comment" : "Memory guard tier option: balanced",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Balanced"
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.balanced.sub" : {
+      "comment" : "Description for balanced memory guard tier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Default tier. Balances throughput with process memory safety."
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.custom" : {
+      "comment" : "Memory guard tier option: custom",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Custom"
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.custom.sub" : {
+      "comment" : "Description for custom memory guard tier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Use a fixed GB ceiling instead of the adaptive tier calculation."
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.safe" : {
+      "comment" : "Memory guard tier option: safe",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Safe"
+          }
+        }
+      }
+    },
+    "performance.memory.guard_tier.safe.sub" : {
+      "comment" : "Description for safe memory guard tier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Most conservative. Leaves more headroom before scheduling memory-heavy prefill."
           }
         }
       }
@@ -4562,6 +4712,18 @@
           "stringUnit" : {
             "state" : "new",
             "value" : "TurboQuant KV · %@"
+          }
+        }
+      }
+    },
+    "profile.detail.acceleration.vlm_mtp" : {
+      "comment" : "Acceleration chip: VLM multi-token prediction",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
           }
         }
       }
@@ -6937,7 +7099,7 @@
       }
     },
     "server.hero.subtitle.listening" : {
-      "comment" : "Hero subtitle while server is running; placeholders are host and port",
+      "comment" : "Hero subtitle while server is running; placeholders are host and port (port is plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
@@ -6961,7 +7123,7 @@
       }
     },
     "server.hero.subtitle.starting" : {
-      "comment" : "Hero subtitle while server is starting up; placeholders are host and port",
+      "comment" : "Hero subtitle while server is starting up; placeholders are host and port (port is plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
@@ -7100,6 +7262,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Warning"
+          }
+        }
+      }
+    },
+    "server.model_dirs.add.help" : {
+      "comment" : "Tooltip for the add model directory button",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Add model directory"
+          }
+        }
+      }
+    },
+    "server.model_dirs.browse.help" : {
+      "comment" : "Tooltip for choosing a model directory",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Choose folder"
+          }
+        }
+      }
+    },
+    "server.model_dirs.browse.message" : {
+      "comment" : "NSOpenPanel message for choosing a model directory",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Choose a directory containing MLX model folders."
+          }
+        }
+      }
+    },
+    "server.model_dirs.browse.prompt" : {
+      "comment" : "NSOpenPanel button label for choosing a model directory",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Select"
+          }
+        }
+      }
+    },
+    "server.model_dirs.primary" : {
+      "comment" : "Badge for the first model directory",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Primary"
+          }
+        }
+      }
+    },
+    "server.model_dirs.remove.help" : {
+      "comment" : "Tooltip for removing a model directory",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Remove model directory"
           }
         }
       }
@@ -7476,30 +7710,6 @@
         }
       }
     },
-    "server.row.base_path" : {
-      "comment" : "Row label for the Base Path text input",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Base Path"
-          }
-        }
-      }
-    },
-    "server.row.base_path.sub" : {
-      "comment" : "Sublabel under the Base Path field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "OMLX_BASE_PATH. Files move and the server restarts when this changes."
-          }
-        }
-      }
-    },
     "server.row.auto_start_on_launch" : {
       "comment" : "Row label for the server auto-start on app launch toggle",
       "extractionState" : "manual",
@@ -7524,6 +7734,54 @@
         }
       }
     },
+    "server.row.base_path" : {
+      "comment" : "Row label for the Base Path text input",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Base Path"
+          }
+        }
+      }
+    },
+    "server.row.base_path.sub" : {
+      "comment" : "Sublabel under the Base Path field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OMLX_BASE_PATH. Files move and the server restarts when this changes."
+          }
+        }
+      }
+    },
+    "server.row.hf_cache" : {
+      "comment" : "Row label for enabling standard Hugging Face Hub cache model discovery",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Use Hugging Face local cache"
+          }
+        }
+      }
+    },
+    "server.row.hf_cache.sub" : {
+      "comment" : "Sublabel for enabling Hugging Face local cache discovery",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Discover MLX-compatible models from the standard Hugging Face Hub cache."
+          }
+        }
+      }
+    },
     "server.row.listen_address" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -7542,6 +7800,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Log Level"
+          }
+        }
+      }
+    },
+    "server.row.models_directories" : {
+      "comment" : "Row label for the model directories editor",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Model Directories"
+          }
+        }
+      }
+    },
+    "server.row.models_directories.sub" : {
+      "comment" : "Sublabel under the model directories editor",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "The first path is the download target. All paths are scanned for local models."
           }
         }
       }
@@ -7651,6 +7933,17 @@
         }
       }
     },
+    "server.section.network" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Network"
+          }
+        }
+      }
+    },
     "server.section.startup" : {
       "comment" : "Section heading for server launch behavior settings",
       "extractionState" : "manual",
@@ -7659,17 +7952,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Server Startup"
-          }
-        }
-      }
-    },
-    "server.section.network" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Network"
           }
         }
       }
@@ -8382,6 +8664,42 @@
         }
       }
     },
+    "settings.dflash.quant.activation.16" : {
+      "comment" : "DFlash draft quantization activation bits option",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "16-bit"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.activation.32" : {
+      "comment" : "DFlash draft quantization activation bits option",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "32-bit"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.activation.default" : {
+      "comment" : "DFlash draft quantization activation bits — use server default",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "default"
+          }
+        }
+      }
+    },
     "settings.dflash.quant.bf16" : {
       "comment" : "DFlash draft quantization option for bf16 (no quantization)",
       "extractionState" : "manual",
@@ -8390,6 +8708,114 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "bf16 (default)"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.group.default" : {
+      "comment" : "DFlash draft quantization group size — use server default",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "default"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.weight.2" : {
+      "comment" : "DFlash draft quantization weight bits option",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "2-bit"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.weight.4" : {
+      "comment" : "DFlash draft quantization weight bits option",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "4-bit"
+          }
+        }
+      }
+    },
+    "settings.dflash.quant.weight.8" : {
+      "comment" : "DFlash draft quantization weight bits option",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "8-bit"
+          }
+        }
+      }
+    },
+    "settings.dflash.verify_mode.adaptive" : {
+      "comment" : "DFlash verify mode: shrinks block size when acceptance drops",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "adaptive"
+          }
+        }
+      }
+    },
+    "settings.dflash.verify_mode.ddtree" : {
+      "comment" : "DFlash verify mode: DDTree verifier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "ddtree"
+          }
+        }
+      }
+    },
+    "settings.dflash.verify_mode.default" : {
+      "comment" : "DFlash verify mode option meaning the server default is used",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "default (adaptive)"
+          }
+        }
+      }
+    },
+    "settings.dflash.verify_mode.dflash" : {
+      "comment" : "DFlash verify mode: standard dflash verifier",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "dflash"
+          }
+        }
+      }
+    },
+    "settings.dflash.verify_mode.off" : {
+      "comment" : "DFlash verify mode: disable speculative verify",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "off"
           }
         }
       }
@@ -8406,6 +8832,42 @@
         }
       }
     },
+    "settings.experimental.dflash.draft_quant_activation.label" : {
+      "comment" : "Row label for the DFlash draft quantization activation bits picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Activation Bits"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.draft_quant_group.label" : {
+      "comment" : "Row label for the DFlash draft quantization group size picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Group Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.draft_quant_weight.label" : {
+      "comment" : "Row label for the DFlash draft quantization weight bits picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Weight Bits"
+          }
+        }
+      }
+    },
     "settings.experimental.dflash.draft_quant.label" : {
       "comment" : "Row label for the DFlash draft-quantization picker",
       "extractionState" : "manual",
@@ -8414,6 +8876,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Draft Quantization"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.draft_quant.sub" : {
+      "comment" : "Sublabel for the DFlash draft quantization toggle",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Enable quantization for the draft model (weight, activation bits & group size)."
           }
         }
       }
@@ -8478,6 +8952,30 @@
         }
       }
     },
+    "settings.experimental.dflash.mem_cache_entries.label" : {
+      "comment" : "Row label for the DFlash L1 in-memory cache max entries field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Cache Entries"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.mem_cache_entries.sub" : {
+      "comment" : "Sublabel for the DFlash L1 cache max entries field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state."
+          }
+        }
+      }
+    },
     "settings.experimental.dflash.mem_cache.label" : {
       "comment" : "Row label for the DFlash L1 in-memory cache toggle",
       "extractionState" : "manual",
@@ -8498,6 +8996,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "DFlash L1 prefix snapshot cache in RAM."
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.sink_size.label" : {
+      "comment" : "Row label for the DFlash attention-sink tokens field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Draft Sink Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.sink_size.sub" : {
+      "comment" : "Sublabel for the DFlash draft sink size field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (64)."
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.ssd_cache_size.label" : {
+      "comment" : "Row label for the DFlash L2 SSD cache disk budget field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "SSD Cache Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.ssd_cache_size.sub" : {
+      "comment" : "Sublabel for the DFlash SSD cache size field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Disk budget for L2 spill; oldest entries are evicted when exceeded."
           }
         }
       }
@@ -8558,6 +9104,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Block-diffusion speculative decoding. Single-stream only (requests run one at a time)."
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.verify_mode.label" : {
+      "comment" : "Row label for the DFlash verifier algorithm picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Verify Mode"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.verify_mode.sub" : {
+      "comment" : "Sublabel for the DFlash verify mode picker",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify."
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.window_size.label" : {
+      "comment" : "Row label for the DFlash draft sliding-attention window size field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Draft Window Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.dflash.window_size.sub" : {
+      "comment" : "Sublabel for the DFlash draft window size field",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Draft model sliding-attention window. Empty = dflash default (1024)."
           }
         }
       }
@@ -8718,6 +9312,78 @@
         }
       }
     },
+    "settings.experimental.vlm_mtp.block_size.label" : {
+      "comment" : "Row label for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft Block Size"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.block_size.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft block-size field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens drafted per round. Empty uses the mlx-vlm default."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.label" : {
+      "comment" : "Row label for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM Draft Model"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.draft.sub" : {
+      "comment" : "Sublabel for the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Assistant drafter sharing the target's tokenizer."
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.label" : {
+      "comment" : "Row label for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        }
+      }
+    },
+    "settings.experimental.vlm_mtp.sub" : {
+      "comment" : "Default sublabel for the VLM MTP toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Multi-token prediction for vision-language models via an assistant drafter."
+          }
+        }
+      }
+    },
     "settings.header.back_to_models" : {
       "comment" : "Back button label at the top of the per-model settings screen",
       "extractionState" : "manual",
@@ -8846,6 +9512,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Disable TurboQuant KV before enabling MTP."
+          }
+        }
+      }
+    },
+    "settings.mtp.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling Native MTP."
           }
         }
       }
@@ -9062,6 +9740,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "50% — Minimal (~1.5x)"
+          }
+        }
+      }
+    },
+    "settings.speculative.conflict.vlm_mtp" : {
+      "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable VLM MTP before enabling this feature."
           }
         }
       }
@@ -9290,6 +9980,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Top P must be in (0, 1]."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.dflash" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable DFlash before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.mtp" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable Native MTP before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.specprefill" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable SpecPrefill before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.conflict.turboquant" : {
+      "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Disable TurboQuant KV before enabling VLM MTP."
+          }
+        }
+      }
+    },
+    "settings.vlm_mtp.draft.placeholder" : {
+      "comment" : "Initial placeholder option in the VLM MTP draft-model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select assistant drafter…"
           }
         }
       }
@@ -9725,9 +10475,6 @@
         }
       }
     },
-    "sk-omlx-…" : {
-
-    },
     "status.active_now.badge.generating" : {
       "comment" : "Active Now badge: model currently generating tokens",
       "extractionState" : "manual",
@@ -9844,6 +10591,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Clear"
+          }
+        }
+      }
+    },
+    "status.confirm.clear_hot" : {
+      "comment" : "Confirmation dialog title for clearing the hot (memory) KV cache",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Clear the in-memory KV cache for all loaded models? Subsequent requests will re-fault from SSD or recompute."
           }
         }
       }
@@ -9968,6 +10727,18 @@
         }
       }
     },
+    "status.runtime_cache.clear_hot" : {
+      "comment" : "Destructive button to clear the in-memory KV cache",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Clear Memory Cache"
+          }
+        }
+      }
+    },
     "status.runtime_cache.clear_ssd" : {
       "comment" : "Destructive button to clear all SSD cache files",
       "extractionState" : "manual",
@@ -10024,6 +10795,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Location"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.memory" : {
+      "comment" : "Row label for the in-memory (hot) KV cache size gauge",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Memory Cache"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.memory_entries" : {
+      "comment" : "Row label for the number of in-memory KV cache entries",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Memory Entries"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.memory_entries.one" : {
+      "comment" : "Singular memory cache entry count",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "1 entry"
+          }
+        }
+      }
+    },
+    "status.runtime_cache.memory_entries.other" : {
+      "comment" : "Plural memory cache entry count; placeholder is the number of entries",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%lld entries"
           }
         }
       }
@@ -10253,17 +11072,6 @@
         }
       }
     },
-    "status.tile.cached" : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Cached Tokens"
-          }
-        }
-      }
-    },
     "status.tile.cache_efficiency" : {
       "comment" : "Stat tile label for cache efficiency percentage",
       "extractionState" : "manual",
@@ -10276,14 +11084,13 @@
         }
       }
     },
-    "status.tile.cached.sub" : {
-      "comment" : "Sub-label showing cache efficiency percentage on the cached tile; placeholder is a formatted percentage",
-      "extractionState" : "extracted_with_value",
+    "status.tile.cached" : {
+      "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
-            "state" : "new",
-            "value" : "%@%% efficiency"
+            "state" : "translated",
+            "value" : "Cached Tokens"
           }
         }
       }
@@ -10318,18 +11125,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Requests"
-          }
-        }
-      }
-    },
-    "status.tile.requests.sub" : {
-      "comment" : "Sub-label showing in-flight request count; placeholder is the number of active requests",
-      "extractionState" : "extracted_with_value",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "%lld in flight"
           }
         }
       }
@@ -10424,7 +11219,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "You have the current version · %@"
+            "value" : "Ready to download · %@"
           }
         }
       }
@@ -10460,6 +11255,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Check Now"
+          }
+        }
+      }
+    },
+    "status.updates.checking_button" : {
+      "comment" : "Updates action button label while a check is in progress",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking…"
+          }
+        }
+      }
+    },
+    "status.updates.checking_primary" : {
+      "comment" : "Primary update status line while a check is in progress",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking for updates…"
+          }
+        }
+      }
+    },
+    "status.updates.checking_secondary" : {
+      "comment" : "Secondary update status line while a check is in progress",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking GitHub releases…"
           }
         }
       }
@@ -10508,42 +11339,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Update check failed"
-          }
-        }
-      }
-    },
-    "status.updates.checking_button" : {
-      "comment" : "Updates action button label while a check is in progress",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Checking…"
-          }
-        }
-      }
-    },
-    "status.updates.checking_primary" : {
-      "comment" : "Primary update status line while a check is in progress",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Checking for updates…"
-          }
-        }
-      }
-    },
-    "status.updates.checking_secondary" : {
-      "comment" : "Secondary update status line while a check is in progress",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Checking GitHub releases…"
           }
         }
       }
@@ -10638,6 +11433,66 @@
           "stringUnit" : {
             "state" : "new",
             "value" : "%1$@ · build %2$@"
+          }
+        }
+      }
+    },
+    "update.channel.beta" : {
+      "comment" : "Display name for the Beta update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beta"
+          }
+        }
+      }
+    },
+    "update.channel.dev" : {
+      "comment" : "Display name for the Dev update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dev"
+          }
+        }
+      }
+    },
+    "update.channel.nightly" : {
+      "comment" : "Display name for the Nightly update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nightly"
+          }
+        }
+      }
+    },
+    "update.channel.release_candidate" : {
+      "comment" : "Display name for the Release Candidate update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release Candidate"
+          }
+        }
+      }
+    },
+    "update.channel.stable" : {
+      "comment" : "Display name for the Stable update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stable"
           }
         }
       }
@@ -10770,66 +11625,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Could not find the staged update. Try downloading again."
-          }
-        }
-      }
-    },
-    "update.channel.beta" : {
-      "comment" : "Display name for the Beta update channel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Beta"
-          }
-        }
-      }
-    },
-    "update.channel.dev" : {
-      "comment" : "Display name for the Dev update channel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Dev"
-          }
-        }
-      }
-    },
-    "update.channel.nightly" : {
-      "comment" : "Display name for the Nightly update channel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Nightly"
-          }
-        }
-      }
-    },
-    "update.channel.release_candidate" : {
-      "comment" : "Display name for the Release Candidate update channel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Release Candidate"
-          }
-        }
-      }
-    },
-    "update.channel.stable" : {
-      "comment" : "Display name for the Stable update channel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Stable"
           }
         }
       }
@@ -11170,14 +11965,14 @@
         }
       }
     },
-    "welcome.header.tagline" : {
-      "comment" : "Sub-tagline under the Welcome wizard's main heading",
+    "welcome.header.meta" : {
+      "comment" : "Short metadata line on the Welcome intro page",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90."
+            "value" : "Apple Silicon · macOS-native · Apache 2.0"
           }
         }
       }
@@ -11194,14 +11989,14 @@
         }
       }
     },
-    "welcome.header.meta" : {
-      "comment" : "Short metadata line on the Welcome intro page",
+    "welcome.header.tagline" : {
+      "comment" : "Sub-tagline under the Welcome wizard's main heading",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Apple Silicon · macOS-native · Apache 2.0"
+            "value" : "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90."
           }
         }
       }
@@ -11242,14 +12037,14 @@
         }
       }
     },
-    "welcome.setup.title" : {
-      "comment" : "Heading on the Welcome setup page",
+    "welcome.setup.local.body" : {
+      "comment" : "Body for the local server setup card",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Set up your local server"
+            "value" : "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network."
           }
         }
       }
@@ -11266,14 +12061,14 @@
         }
       }
     },
-    "welcome.setup.local.body" : {
-      "comment" : "Body for the local server setup card",
+    "welcome.setup.title" : {
+      "comment" : "Heading on the Welcome setup page",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network."
+            "value" : "Set up your local server"
           }
         }
       }

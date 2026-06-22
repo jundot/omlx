@@ -11,18 +11,14 @@ All tests run without mlx-audio installed — only config.json parsing is tested
 import json
 from pathlib import Path
 
-import pytest
-
 from omlx.model_discovery import (
-    DiscoveredModel,
+    AUDIO_STS_ARCHITECTURES,
+    AUDIO_STS_MODEL_TYPES,
     _is_unsupported_model,
     detect_model_type,
     discover_models,
     estimate_model_size,
-    AUDIO_STS_MODEL_TYPES,
-    AUDIO_STS_ARCHITECTURES,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,6 +62,34 @@ class TestDetectAudioModelType:
             "architectures": ["Qwen3ASRForConditionalGeneration"],
         })
         assert detect_model_type(tmp_path) == "audio_stt"
+
+    def test_nemo_asr_config_without_model_type_returns_audio_stt(self, tmp_path):
+        """Parakeet/NeMo ASR MLX exports omit HF model_type but are STT."""
+        _write_config(tmp_path, {
+            "sample_rate": 16000,
+            "preprocessor": {
+                "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
+                "features": 128,
+            },
+            "encoder": {"_target_": "nemo.collections.asr.modules.ConformerEncoder"},
+            "decoder": {"_target_": "nemo.collections.asr.modules.RNNTDecoder"},
+            "joint": {"_target_": "nemo.collections.asr.modules.RNNTJoint"},
+            "tokenizer": {"model_path": "nemo:tokenizer.model"},
+        })
+        assert detect_model_type(tmp_path) == "audio_stt"
+
+    def test_nemo_asr_config_without_tokenizer_defaults_to_llm(self, tmp_path):
+        """Partial NeMo-like configs should not be classified as STT."""
+        _write_config(tmp_path, {
+            "sample_rate": 16000,
+            "preprocessor": {
+                "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
+                "features": 128,
+            },
+            "encoder": {"_target_": "nemo.collections.asr.modules.ConformerEncoder"},
+            "decoder": {"_target_": "nemo.collections.asr.modules.RNNTDecoder"},
+        })
+        assert detect_model_type(tmp_path) == "llm"
 
     def test_whisper_model_type_returns_audio_stt(self, tmp_path):
         """model_type="whisper" without known STT architecture -> audio_stt."""
@@ -259,6 +283,25 @@ class TestDiscoverModelsIncludesAudio:
         models = discover_models(tmp_path)
         assert "whisper-small" in models
         assert models["whisper-small"].engine_type in ("stt", "audio_stt")
+
+    def test_discover_nemo_asr_model_without_model_type(self, tmp_path):
+        """Parakeet-style NeMo ASR config is discovered as audio_stt."""
+        stt_dir = tmp_path / "parakeet-tdt-0.6b-v3"
+        _make_model(stt_dir, {
+            "sample_rate": 16000,
+            "preprocessor": {
+                "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
+                "features": 128,
+            },
+            "encoder": {"_target_": "nemo.collections.asr.modules.ConformerEncoder"},
+            "decoder": {"_target_": "nemo.collections.asr.modules.RNNTDecoder"},
+            "joint": {"_target_": "nemo.collections.asr.modules.RNNTJoint"},
+            "tokenizer": {"model_path": "nemo:tokenizer.model"},
+        })
+
+        models = discover_models(tmp_path)
+        assert models["parakeet-tdt-0.6b-v3"].model_type == "audio_stt"
+        assert models["parakeet-tdt-0.6b-v3"].engine_type == "audio_stt"
 
     def test_discover_tts_model(self, tmp_path):
         """TTS model included in discover_models results."""

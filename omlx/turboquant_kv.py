@@ -24,21 +24,21 @@ from mlx_lm.models.cache import (
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
     TurboQuantMSEState,
-    TurboQuantProdState,
-    TurboQuantPolarState,
     TurboQuantPolarProdState,
+    TurboQuantPolarState,
+    TurboQuantProdState,
     TurboQuantSplitState,
+    _allocate_state_like,
     _build_codec,
     _concat_state,
+    _QuantizedStateProxy,
+    _reserve_state_capacity,
     _slice_state,
     _slice_state_range,
     _state_length,
     _state_nbytes,
-    _allocate_state_like,
-    _write_state,
-    _reserve_state_capacity,
-    _QuantizedStateProxy,
     _validate_bits,
+    _write_state,
     turboquant_enabled,
 )
 
@@ -93,6 +93,33 @@ def _rebuild_codecs(tq_cache: TurboQuantKVCache, key_state, value_state) -> None
     dummy = mx.zeros((1, 1, 1, head_dim))
     tq_cache.key_codec = _build_codec(dummy, key_bits, mode="mse", seed=seed)
     tq_cache.value_codec = _build_codec(dummy, val_bits, mode="mse", seed=seed + 1)
+
+
+def _concat_state_token_axis(states):
+    """Concatenate TurboQuant states along token axis with a low-churn fast path."""
+    if not states:
+        return None
+    if len(states) == 1:
+        state = states[0]
+        return state._state if isinstance(state, _QuantizedStateProxy) else state
+
+    unwrapped = [
+        state._state if isinstance(state, _QuantizedStateProxy) else state
+        for state in states
+    ]
+    first = unwrapped[0]
+    if isinstance(first, TurboQuantMSEState) and all(
+        isinstance(state, TurboQuantMSEState) for state in unwrapped
+    ):
+        return TurboQuantMSEState(
+            mx.concatenate([state.norms for state in unwrapped], axis=2),
+            mx.concatenate([state.indices for state in unwrapped], axis=2),
+        )
+
+    result = first
+    for state in unwrapped[1:]:
+        result = _concat_state(result, state)
+    return result
 
 
 # ---------------------------------------------------------------------------

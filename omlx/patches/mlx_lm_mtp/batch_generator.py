@@ -76,6 +76,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from . import cache_rollback as _rollback_mod
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,10 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            realign_rows = getattr(self, "_omlx_realign_rows", None)
+            if callable(realign_rows):
+                realign_rows()
+
             if _is_mtp_batch_eligible(self):
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
@@ -189,6 +195,23 @@ def apply() -> bool:
                 gen_batch._omlx_mtp_activation_safe = (
                     _batch_generator_allows_mtp_activation(self)
                 )
+            if _generation_batch_has_active_mtp(gen_batch):
+                old_completion_batch_size = getattr(
+                    self,
+                    "completion_batch_size",
+                    None,
+                )
+                had_completion_batch_size = hasattr(self, "completion_batch_size")
+                # Force mlx-lm's "hands full" early return after generation,
+                # even if an active row-wise MTP batch shrinks during next().
+                self.completion_batch_size = 0
+                try:
+                    return original_bg_next(self, *args, **kwargs)
+                finally:
+                    if had_completion_batch_size:
+                        self.completion_batch_size = old_completion_batch_size
+                    elif hasattr(self, "completion_batch_size"):
+                        delattr(self, "completion_batch_size")
             return original_bg_next(self, *args, **kwargs)
 
         BatchGenerator._next = patched_bg_next
@@ -210,6 +233,25 @@ def _model_has_mtp_module(model: Any) -> bool:
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
 
 
+def _model_mtp_decode_enabled(model: Any) -> bool:
+    """Return the MTP decode decision captured on the loaded model instance.
+
+    ``mlx_lm_mtp._MTP_ACTIVE`` is a construction-time switch. It is reset
+    before each model load so patched ``__init__`` methods know whether to
+    attach MTP heads, but decode-time eligibility must not read that global:
+    a later non-MTP load would otherwise disable already-loaded MTP models.
+    """
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    return any(
+        bool(getattr(candidate, "_omlx_mtp_decode_enabled", False))
+        for candidate in candidates
+    )
+
+
 def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
     """True when lazy MTP activation cannot race with a pending batch merge."""
     try:
@@ -222,6 +264,28 @@ def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
         return False
 
 
+def _generation_batch_has_active_mtp(gen_batch: Any) -> bool:
+    """True while a generation batch owns Native MTP cache state.
+
+    mlx-lm's ``BatchGenerator._next`` generates first and then may promote
+    pending prompt work into the same ``GenerationBatch`` via ``extend()``. That
+    merge path forces MTP reconciliation, which can re-prefill a long streamed
+    context outside the scheduler's guarded prefill path. Treat active MTP as
+    a temporary full generation batch so late-join requests wait instead.
+    """
+    if gen_batch is None:
+        return False
+    try:
+        if len(gen_batch) == 0:
+            return False
+    except Exception:
+        pass
+    return (
+        getattr(gen_batch, "_omlx_mtp_state", None) is not None
+        or getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None
+    )
+
+
 def _mtp_common_eligible(gen_batch: Any) -> bool:
     if not hasattr(gen_batch, "model"):
         return False
@@ -229,12 +293,7 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     if not _model_has_mtp_module(gen_batch.model):
         return False
-    try:
-        from . import is_mtp_active
-
-        if not is_mtp_active():
-            return False
-    except Exception:
+    if not _model_mtp_decode_enabled(gen_batch.model):
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) == 0:
@@ -287,13 +346,15 @@ def _batch_rows_aligned_for_mtp(gen_batch: Any) -> bool:
 def _is_mtp_eligible(gen_batch: Any) -> bool:
     """``__init__`` and ``next`` only engage MTP for single-sequence batches
     when the model exposes ``mtp_forward``, has an attached MTP head, and
-    the process-wide ``mtp_active`` flag is on.
+    was loaded with MTP decode enabled.
 
     The MTP head may be attached unconditionally (e.g. by the mlx-vlm
     runtime patches, which need it for weight-load matching even when
     inference-time MTP is off) — so head presence alone is not enough
-    to decide whether to run the draft/verify cycle. ``is_mtp_active``
-    reflects the per-load ``model_settings.mtp_enabled`` choice.
+    to decide whether to run the draft/verify cycle. The per-instance
+    ``_omlx_mtp_decode_enabled`` marker reflects the per-load
+    ``model_settings.mtp_enabled`` choice without being affected by later
+    model loads in the same process.
     """
     if not _mtp_common_eligible(gen_batch):
         return False
@@ -313,10 +374,9 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
         return False
-    if (
-        getattr(gen_batch, "_omlx_mtp_batch_state", None) is None
-        and not _batch_rows_aligned_for_mtp(gen_batch)
-    ):
+    if getattr(
+        gen_batch, "_omlx_mtp_batch_state", None
+    ) is None and not _batch_rows_aligned_for_mtp(gen_batch):
         return False
     return True
 
@@ -336,13 +396,11 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         )
     if not _model_has_mtp_module(gen_batch.model):
         return "model has no attached mtp head"
-    try:
-        from . import is_mtp_active
-
-        if not is_mtp_active():
-            return "mtp_active flag is off (model_settings.mtp_enabled was False at load time)"
-    except Exception:
-        return "is_mtp_active import failed"
+    if not _model_mtp_decode_enabled(gen_batch.model):
+        return (
+            "model instance MTP decode flag is off "
+            "(model_settings.mtp_enabled was False when this model was loaded)"
+        )
     uids = getattr(gen_batch, "uids", None)
     if uids is None:
         return "GenerationBatch has no uids"
@@ -964,7 +1022,20 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
     KV cache layers (full-attention) expose ``trim`` and ``is_trimmable``;
     we trim by 1. Layers that support neither cause the entire MTP step to
     fall back to the standard path.
+
+    All layers are checked before anything is mutated: a partial rollback
+    (early layers trimmed, a later layer refusing) leaves per-layer KV
+    lengths desynchronised by one position and corrupts every subsequent
+    forward (the shared attention mask is built from the first layer's
+    cache, so the mismatch surfaces as a broadcast error on DeepSeek-V4
+    compressed-attention layers).
     """
+    for c in prompt_cache:
+        if getattr(c, "rollback_state", None) is not None:
+            continue
+        if hasattr(c, "is_trimmable") and c.is_trimmable():
+            continue
+        return False
     for c in prompt_cache:
         rollback = getattr(c, "rollback_state", None)
         if rollback is not None:
@@ -973,10 +1044,7 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
             c[1] = ssm_snap
             c.rollback_state = None
             continue
-        if hasattr(c, "is_trimmable") and c.is_trimmable():
-            c.trim(1)
-            continue
-        return False
+        c.trim(1)
     return True
 
 
@@ -1026,18 +1094,33 @@ def _call_backbone(
 
     - mlx-lm path returns the 2-tuple ``(logits, hidden)``; ``gdn_states``
       is ``None`` and rollback uses ``cache.rollback_state``.
-    - mlx-vlm path returns the 3-tuple ``(logits, hidden, gdn_states)`` so
-      a rejected draft can be rolled back via
-      ``rollback_speculative_cache``.
+    - mlx-vlm path returns a ``LanguageModelOutput`` or 3-tuple
+      ``(logits, hidden, gdn_states)`` so a rejected draft can be rolled
+      back via ``rollback_speculative_cache``.
 
     ``n_confirmed`` is forwarded so the mlx-lm path can split its
     GatedDeltaNet forward into confirmed and draft chunks. mlx-vlm
     discards it (irrelevant — rollback is post-hoc, not splitwise).
+
+    The rotating-cache undo stash (cache_rollback) is armed for the
+    duration of the forward so a rejected draft can be rolled back even on
+    a rotated RotatingKVCache; non-MTP forwards keep stock trim semantics.
     """
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    result = model(inputs, **kwargs)
+    _rollback_mod.set_undo_armed(True)
+    try:
+        result = model(inputs, **kwargs)
+    finally:
+        _rollback_mod.set_undo_armed(False)
+
+    # LanguageModelOutput (mlx-vlm dataclass)
+    if hasattr(result, "logits") and hasattr(result, "hidden_states"):
+        hidden = result.hidden_states
+        if isinstance(hidden, list):
+            hidden = hidden[-1] if hidden else None
+        return result.logits, hidden, getattr(result, "gdn_states", None)
     if isinstance(result, tuple):
         if len(result) == 3:
             return result
@@ -1047,10 +1130,15 @@ def _call_backbone(
 
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
-    """Drop ``rollback_state`` snapshots after a draft is accepted."""
+    """Drop rollback snapshots after a draft is accepted."""
     for c in prompt_cache:
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
             c.rollback_state = None
+        if getattr(c, "_mtp_undo", None) is not None:
+            c._mtp_undo = None
+        for sub in getattr(c, "caches", ()):
+            if getattr(sub, "_mtp_undo", None) is not None:
+                sub._mtp_undo = None
 
 
 def _ensure_uint32(arr):

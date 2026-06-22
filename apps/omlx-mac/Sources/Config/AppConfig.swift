@@ -27,8 +27,8 @@ import Foundation
 struct AppConfig: Sendable, Equatable, Codable {
     /// The raw bind address the user configured (e.g. `0.0.0.0`, `127.0.0.1`, `localhost`).
     var bindAddress: String
-    /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
-    /// `0.0.0.0` is a bind wildcard, not a connectable address.
+    /// The connectable host — normalises wildcard/local binds to loopback
+    /// because they are bind addresses, not always connectable URL hosts.
     var host: String {
         Self.connectableHost(for: bindAddress)
     }
@@ -114,11 +114,53 @@ struct AppConfig: Sendable, Equatable, Codable {
     }
 
     static func connectableHost(for bindAddress: String) -> String {
-        bindAddress == "0.0.0.0" ? "127.0.0.1" : bindAddress
+        var host = primaryBindHost(for: bindAddress)
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        switch host.lowercased() {
+        case "", "0.0.0.0", "::", "localhost", "127.0.0.1":
+            return "127.0.0.1"
+        default:
+            return host
+        }
+    }
+
+    static func httpURL(host: String, port: Int, path: String = "") -> URL? {
+        let urlHost = normalizedURLHost(host)
+        let urlPath = path.isEmpty ? "" : (path.hasPrefix("/") ? path : "/" + path)
+        if urlHost.contains(":") {
+            let escapedHost = urlHost.replacingOccurrences(of: "%", with: "%25")
+            return URL(string: "http://[\(escapedHost)]:\(port)\(urlPath)")
+        }
+
+        var comps = URLComponents()
+        comps.scheme = "http"
+        comps.host = urlHost
+        comps.port = port
+        if !urlPath.isEmpty {
+            comps.path = urlPath
+        }
+        return comps.url
     }
 
     var baseURL: URL? {
-        URL(string: "http://\(host):\(port)")
+        Self.httpURL(host: host, port: port)
+    }
+
+    private static func primaryBindHost(for bindAddress: String) -> String {
+        bindAddress
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+    }
+
+    private static func normalizedURLHost(_ host: String) -> String {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            return String(trimmed.dropFirst().dropLast())
+        }
+        return trimmed
     }
 
     // MARK: - Path resolution

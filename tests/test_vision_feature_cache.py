@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for VisionFeatureSSDCache (memory LRU + SSD persistence)."""
 
-import shutil
-import tempfile
 import time
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
 
 from omlx.cache.vision_feature_cache import (
     VisionFeatureSSDCache,
-    VisionFeatureSSDEntry,
     _composite_hash,
     _composite_key,
 )
@@ -290,6 +286,36 @@ class TestVLMEngineIntegration:
         engine._vlm_model.encode_image.assert_called_once_with(
             pixel_values, image_position_ids=image_position_ids
         )
+
+    def test_compute_vision_features_encode_image_with_grid_thw(self):
+        """MiniMax-style encode_image should receive image_grid_thw."""
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        expected = mx.ones((10, 16))
+
+        class GridModel:
+            config = SimpleNamespace(model_type="minimax_m3_vl")
+
+            def __init__(self):
+                self.calls = []
+
+            def encode_image(self, pixel_values, image_grid_thw=None):
+                self.calls.append((pixel_values, image_grid_thw))
+                if image_grid_thw is None:
+                    raise ValueError("image_grid_thw required")
+                return expected
+
+        engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+        engine._vlm_model = GridModel()
+
+        pixel_values = mx.zeros((1, 3, 224, 224))
+        image_grid_thw = mx.array([[1, 4, 4]])
+        result = engine._compute_vision_features(
+            pixel_values, {"image_grid_thw": image_grid_thw}
+        )
+
+        assert result is expected
+        assert engine._vlm_model.calls == [(pixel_values, image_grid_thw)]
 
     def test_compute_vision_features_encode_image_without_position_support(self):
         """Models with a pixel-only encode_image signature should still work."""

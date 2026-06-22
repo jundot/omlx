@@ -2,6 +2,7 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,11 +14,14 @@ from omlx.admin.benchmark import (
     BenchmarkRun,
     _clean_model_name,
     _compute_single_metrics,
+    _detect_experimental_features,
     _detect_quantization,
     _generate_prompt,
+    _run_single_test,
     cleanup_old_runs,
     create_run,
     get_run,
+    run_benchmark,
 )
 
 
@@ -83,6 +87,21 @@ class TestBenchmarkRequest:
             prompt_lengths=[1024],
         )
         assert req.generation_length == 128
+
+    def test_force_lm_engine_defaults_to_false(self):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+        )
+        assert req.force_lm_engine is False
+
+    def test_force_lm_engine_can_be_enabled(self):
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[1024],
+            force_lm_engine=True,
+        )
+        assert req.force_lm_engine is True
 
 
 # =============================================================================
@@ -183,6 +202,84 @@ class TestComputeMetrics:
         assert metrics["ttft_ms"] == 0.0
         assert metrics["gen_tps"] > 0  # Protected by max(duration, 1e-9)
 
+    def test_native_duration_overrides(self):
+        """Native engine timings can override streaming timing artifacts."""
+        metrics = _compute_single_metrics(
+            prompt_tokens=1024,
+            completion_tokens=128,
+            start_time=0.0,
+            first_token_time=1.0,
+            end_time=1.0,
+            peak_memory=0,
+            cached_tokens=0,
+            prefill_duration_s=4.0,
+            generation_duration_s=8.0,
+        )
+
+        assert metrics["processing_tps"] == pytest.approx(256.0)
+        assert metrics["gen_tps"] == pytest.approx(16.0)
+        assert metrics["tpot_ms"] == pytest.approx(62.99, abs=0.01)
+
+
+class TestRunSingleTest:
+    @pytest.mark.asyncio
+    async def test_uses_native_diffusion_metrics_for_chunked_stream(self):
+        """Diffusion streams by canvas, so benchmark must not use chunk timing."""
+
+        class ChunkedDiffusionEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x" * 10,
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=256.0,
+                    generation_tps=32.0,
+                )
+
+        metrics = await _run_single_test(
+            ChunkedDiffusionEngine(),
+            prompt="prompt",
+            max_tokens=128,
+            pp_len=1024,
+        )
+
+        assert metrics["processing_tps"] == pytest.approx(256.0)
+        assert metrics["gen_tps"] == pytest.approx(32.0)
+        assert metrics["gen_tps"] < 1000.0
+
+    @pytest.mark.asyncio
+    async def test_uses_diffusion_canvas_metrics_when_eos_stops_early(self):
+        """Diffusion benchmark TG should measure canvas work, not early EOS text."""
+
+        class EarlyStopDiffusionEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=16,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="short answer",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tps=256.0,
+                    generation_tps=2.0,
+                    diffusion_canvas_tokens=128,
+                    diffusion_canvas_tps=64.0,
+                )
+
+        metrics = await _run_single_test(
+            EarlyStopDiffusionEngine(),
+            prompt="prompt",
+            max_tokens=128,
+            pp_len=1024,
+        )
+
+        assert metrics["completion_tokens"] == 128
+        assert metrics["gen_tps"] == pytest.approx(64.0)
+        assert metrics["tpot_ms"] == pytest.approx(15.75, abs=0.01)
+
 
 # =============================================================================
 # BenchmarkRun lifecycle tests
@@ -229,6 +326,198 @@ class TestBenchmarkRunLifecycle:
 
         completed = [r for r in _benchmark_runs.values() if r.status == "completed"]
         assert len(completed) <= 5
+
+
+class _FakeBenchTokenizer:
+    def encode(self, text):
+        return list(range(2048))
+
+    def decode(self, tokens):
+        return "prompt"
+
+
+class _FakeBenchEngine:
+    tokenizer = _FakeBenchTokenizer()
+    _engine = None
+
+    async def stream_generate(self, **kwargs):
+        yield SimpleNamespace(
+            completion_tokens=1,
+            prompt_tokens=1024,
+            cached_tokens=0,
+            new_text="x",
+            finished=True,
+            finish_reason="length",
+        )
+
+
+class _FakeSettingsManager:
+    def __init__(self, settings):
+        self.settings = settings
+
+    def get_settings(self, model_id):
+        return self.settings
+
+
+class _FakeBenchEnginePool:
+    def __init__(self, settings=None, engine=None):
+        self._settings_manager = (
+            _FakeSettingsManager(settings) if settings is not None else None
+        )
+        self._engine = engine or _FakeBenchEngine()
+        self.force_lm_values = []
+
+    def get_loaded_model_ids(self):
+        return []
+
+    async def get_engine(self, model_id, force_lm=False):
+        self.force_lm_values.append(force_lm)
+        return self._engine
+
+    async def _unload_engine(self, model_id):
+        pass
+
+
+class TestBenchmarkEngineSelection:
+    async def _run(self, *, settings=None, force_lm_engine=False):
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                force_lm_engine=force_lm_engine,
+            ),
+        )
+        pool = _FakeBenchEnginePool(settings)
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+        return run, pool
+
+    @pytest.mark.asyncio
+    async def test_auto_uses_vlm_engine_for_vlm_mtp_with_drafter(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="draft-model",
+        )
+
+        run, pool = await self._run(settings=settings)
+
+        assert pool.force_lm_values == [False]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_force_lm_engine_overrides_vlm_mtp_auto(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="draft-model",
+        )
+
+        run, pool = await self._run(settings=settings, force_lm_engine=True)
+
+        assert pool.force_lm_values == [True]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_auto_keeps_lm_engine_without_vlm_mtp_drafter(self):
+        settings = SimpleNamespace(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model=None,
+        )
+
+        run, pool = await self._run(settings=settings)
+
+        assert pool.force_lm_values == [True]
+        assert run.experimental_features == ["vlm_mtp"]
+        assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_batch_request_skips_engine_with_none_scheduler_core(self):
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=1,
+                batch_sizes=[2],
+            ),
+        )
+        pool = _FakeBenchEnginePool(engine=_FakeBenchEngine())
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert [r["test_type"] for r in run.results] == ["single"]
+
+    @pytest.mark.asyncio
+    async def test_diffusion_warmup_uses_benchmark_generation_length(self):
+        class FakeDiffusionEngine(_FakeBenchEngine):
+            is_diffusion_model = True
+
+            def __init__(self):
+                self.calls = []
+
+            async def stream_generate(self, **kwargs):
+                self.calls.append(kwargs)
+                yield SimpleNamespace(
+                    completion_tokens=128,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=256.0,
+                    generation_tps=32.0,
+                    diffusion_canvas_tokens=128,
+                    diffusion_canvas_tps=64.0,
+                )
+
+        engine = FakeDiffusionEngine()
+        run = BenchmarkRun(
+            bench_id="bench-test",
+            request=BenchmarkRequest(
+                model_id="test-model",
+                prompt_lengths=[1024],
+                generation_length=128,
+            ),
+        )
+        pool = _FakeBenchEnginePool(engine=engine)
+
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert engine.calls[0]["max_tokens"] == 128
+
+
+# =============================================================================
+# Experimental feature detection tests
+# =============================================================================
+
+
+class TestExperimentalFeatureDetection:
+    def test_detects_all_upload_skipping_features(self):
+        settings = SimpleNamespace(
+            dflash_enabled=True,
+            specprefill_enabled=True,
+            turboquant_kv_enabled=True,
+            mtp_enabled=True,
+            vlm_mtp_enabled=True,
+        )
+
+        assert _detect_experimental_features(settings) == [
+            "dflash",
+            "specprefill",
+            "turboquant",
+            "mtp",
+            "vlm_mtp",
+        ]
+
+    def test_missing_flags_are_treated_as_disabled(self):
+        assert _detect_experimental_features(SimpleNamespace()) == []
 
 
 # =============================================================================

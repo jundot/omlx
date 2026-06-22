@@ -67,6 +67,7 @@
                                         <option value="ru">{{ t('settings.language.ru') }}</option>
                                         <option value="es">{{ t('settings.language.es') }}</option>
                                         <option value="fr">{{ t('settings.language.fr') }}</option>
+                                        <option value="pt-BR">{{ t('settings.language.pt-BR') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -232,17 +233,21 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
                                         <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
-                                    <div class="flex items-center gap-2">
-                                        <select :value="hostMode"
-                                                @change="setHostMode($event.target.value)"
-                                                class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                            <option value="localhost">{{ t('settings.server.host_localhost') }}</option>
-                                            <option value="public">{{ t('settings.server.host_public') }}</option>
-                                            <option value="custom">{{ t('settings.server.host_custom') }}</option>
-                                        </select>
-                                        <input x-show="hostMode === 'custom'" x-cloak
-                                               type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
-                                               class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <div class="flex flex-col items-end gap-1">
+                                        <div class="flex items-center gap-2">
+                                            <select :value="hostMode"
+                                                    @change="setHostMode($event.target.value)"
+                                                    class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <option value="localhost">{{ t('settings.server.host_localhost') }}</option>
+                                                <option value="public">{{ t('settings.server.host_public') }}</option>
+                                                <option value="custom">{{ t('settings.server.host_custom') }}</option>
+                                            </select>
+                                            <input x-show="hostMode === 'custom'" x-cloak
+                                                   type="text" x-model="globalSettings.server.host" placeholder="{{ t('settings.server.host_placeholder') }}"
+                                                   class="w-full sm:w-40 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <p x-show="hostMode === 'custom'" x-cloak
+                                           class="text-xs text-neutral-400">{{ t('settings.server.host_multi_hint') }}</p>
                                     </div>
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -745,6 +750,42 @@
                             </button>
                             <div x-show="advancedOpen" x-collapse x-cloak>
                                 <div class="border-t border-neutral-200">
+                                    <!-- Performance subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="zap" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.burst_decode') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.burst_decode_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.server.burst_decode_mode"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <option value="off">{{ t('settings.advanced.burst_decode_off') }}</option>
+                                                <option value="light">{{ t('settings.advanced.burst_decode_light') }}</option>
+                                                <option value="balanced">{{ t('settings.advanced.burst_decode_balanced') }}</option>
+                                                <option value="aggressive">{{ t('settings.advanced.burst_decode_aggressive') }}</option>
+                                            </select>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.preserve_mid_system_cache') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.preserve_mid_system_cache_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="globalSettings.server.preserve_mid_system_cache = !globalSettings.server.preserve_mid_system_cache"
+                                                    :class="globalSettings.server.preserve_mid_system_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="globalSettings.server.preserve_mid_system_cache ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+
                                     <!-- Cache subsection -->
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
@@ -1172,14 +1213,17 @@
                                     </div>
 
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
-                                            <!-- 1. Profile pill (emerald) if active_profile_name -->
-                                            <template x-if="model.settings?.active_profile_name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                                    <i data-lucide="settings" class="w-3 h-3"></i>
-                                                    <span x-text="model.settings.active_profile_name"></span>
+                                            <!-- 1. API-exposed profile pills -->
+                                            <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                                      @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
+                                                      @mouseleave="hideTip()">
+                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                                          :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
+                                                    <span x-text="profile.api_name || profile.name"></span>
                                                 </span>
                                             </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->

@@ -6,8 +6,9 @@ This module tests the abstract and concrete handlers for various cache types
 from mlx-lm, enabling type-aware cache operations like slicing and reconstruction.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock, patch, PropertyMock
+import sys
+import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -16,9 +17,10 @@ from omlx.cache.type_handlers import (
     CacheListHandler,
     CacheStateInfo,
     CacheType,
-    CacheTypeHandler,
     DefaultCacheHandler,
     KVCacheHandler,
+    MiniMaxM3BatchKVCacheHandler,
+    MiniMaxM3KVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -233,6 +235,201 @@ class TestKVCacheHandlerWithMLX:
         # not meta_state (meta_state offset can exceed tensor length
         # after partial prefix match or walk-back truncation)
         assert cache.offset == 32  # keys.shape[2]
+
+
+class TestMiniMaxM3CacheHandlers:
+    """Tests for MiniMax M3 sparse cache handler contracts."""
+
+    @staticmethod
+    def _install_fake_minimax_module(monkeypatch):
+        module = types.ModuleType("mlx_vlm.models.minimax_m3_vl.language")
+
+        class FakeInnerKVCache:
+            def __init__(self):
+                self.state = None
+
+        class MiniMaxM3KVCache:
+            def __init__(self):
+                self.kv_cache = FakeInnerKVCache()
+                self.index_keys = None
+                self.index_offset = 0
+
+        class MiniMaxM3BatchKVCache:
+            def __init__(self, left_padding):
+                self.left_padding_arg = left_padding
+                self.state = None
+                self.index_keys = None
+                self.index_offset = 0
+
+        module.MiniMaxM3KVCache = MiniMaxM3KVCache
+        module.MiniMaxM3BatchKVCache = MiniMaxM3BatchKVCache
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_vlm.models.minimax_m3_vl.language",
+            module,
+        )
+
+    def test_registry_detects_minimax_cache_class_names(self):
+        minimax_cache_cls = type("MiniMaxM3KVCache", (), {})
+        minimax_batch_cache_cls = type("MiniMaxM3BatchKVCache", (), {})
+
+        assert (
+            CacheTypeRegistry.detect_cache_type(minimax_cache_cls())
+            == CacheType.MINIMAX_M3_KVCACHE
+        )
+        assert (
+            CacheTypeRegistry.detect_cache_type(minimax_batch_cache_cls())
+            == CacheType.MINIMAX_M3_BATCH_KVCACHE
+        )
+        assert (
+            CacheTypeRegistry.get_handler_by_class_name("MiniMaxM3KVCache").cache_type
+            == CacheType.MINIMAX_M3_KVCACHE
+        )
+
+    def test_single_cache_serializes_nested_state_as_flat_tuple(self):
+        keys = MagicMock()
+        values = MagicMock()
+        index_keys = MagicMock()
+        index_keys.shape = (1, 4, 12, 64)
+        cache = MagicMock()
+        cache.state = ((keys, values), index_keys)
+        cache.index_offset = 12
+
+        handler = MiniMaxM3KVCacheHandler()
+
+        assert handler.supports_block_slicing is True
+        assert handler.serialize_state(cache) == (keys, values, index_keys)
+        assert handler.serialize_meta_state(cache) == (12,)
+
+        extracted = handler.extract_state(cache)
+        assert extracted["states"] == (keys, values, index_keys)
+        assert "is_full_state" not in extracted
+
+    def test_single_cache_axis_info_is_sliceable(self):
+        handler = MiniMaxM3KVCacheHandler()
+
+        info = handler.get_state_axis_info()
+
+        assert [i.name for i in info] == ["keys", "values", "index_keys"]
+        assert [i.sequence_axis for i in info] == [2, 2, 2]
+        assert all(i.sliceable is True for i in info)
+
+    def test_single_cache_slices_and_concatenates_index_keys(self):
+        mx = pytest.importorskip("mlx.core")
+        keys = mx.arange(1 * 2 * 8 * 3, dtype=mx.float32).reshape(1, 2, 8, 3)
+        values = keys + 100
+        index_keys = mx.arange(1 * 1 * 8 * 3, dtype=mx.float32).reshape(1, 1, 8, 3)
+        handler = MiniMaxM3KVCacheHandler()
+
+        first = handler.slice_state(
+            {"keys": keys, "values": values, "index_keys": index_keys}, 0, 4
+        )
+        second = handler.slice_state(
+            {"keys": keys, "values": values, "index_keys": index_keys}, 4, 8
+        )
+        concatenated = handler.concatenate_states([first, second])
+
+        assert concatenated["states"][0].shape == keys.shape
+        assert concatenated["states"][1].shape == values.shape
+        assert concatenated["states"][2].shape == index_keys.shape
+        assert mx.max(mx.abs(concatenated["states"][0] - keys)).item() == 0.0
+        assert mx.max(mx.abs(concatenated["states"][1] - values)).item() == 0.0
+        assert mx.max(mx.abs(concatenated["states"][2] - index_keys)).item() == 0.0
+
+    def test_batch_cache_serializes_kv_metadata_and_index_keys(self):
+        keys = MagicMock()
+        values = MagicMock()
+        offset = MagicMock()
+        left_padding = MagicMock()
+        index_keys = MagicMock()
+        index_keys.shape = (2, 4, 9, 64)
+        cache = MagicMock()
+        cache.state = ((keys, values, offset, left_padding), index_keys)
+        cache.index_offset = 9
+
+        handler = MiniMaxM3BatchKVCacheHandler()
+
+        assert handler.supports_block_slicing is False
+        assert handler.serialize_state(cache) == (
+            keys,
+            values,
+            offset,
+            left_padding,
+            index_keys,
+        )
+        assert handler.serialize_meta_state(cache) == (9,)
+
+    def test_minimax_meta_state_string_is_not_iterated_characterwise(self):
+        class FakeMiniMaxCache:
+            index_offset = 123
+            meta_state = "123"
+
+        assert MiniMaxM3KVCacheHandler().serialize_meta_state(FakeMiniMaxCache()) == (
+            123,
+        )
+
+    def test_single_cache_deserialize_rebuilds_nested_state(self, monkeypatch):
+        self._install_fake_minimax_module(monkeypatch)
+        keys = MagicMock()
+        values = MagicMock()
+        index_keys = MagicMock()
+        index_keys.shape = (1, 4, 12, 64)
+
+        restored = MiniMaxM3KVCacheHandler().deserialize_state(
+            (keys, values, index_keys),
+            meta_state="7",
+        )
+
+        assert restored.kv_cache.state == (keys, values)
+        assert restored.index_keys is index_keys
+        assert restored.index_offset == 12
+
+    def test_batch_cache_deserialize_rebuilds_nested_state(self, monkeypatch):
+        self._install_fake_minimax_module(monkeypatch)
+        keys = MagicMock()
+        values = MagicMock()
+        offset = MagicMock()
+        left_padding = MagicMock()
+        index_keys = MagicMock()
+        index_keys.shape = (2, 4, 9, 64)
+
+        restored = MiniMaxM3BatchKVCacheHandler().deserialize_state(
+            (keys, values, offset, left_padding, index_keys),
+            meta_state=(9,),
+        )
+
+        assert restored.left_padding_arg is left_padding
+        assert restored.state == ((keys, values, offset, left_padding), index_keys)
+        assert restored.index_offset == 9
+
+    def test_restored_single_caches_merge_and_extract_for_batch_requests(self):
+        mx = pytest.importorskip("mlx.core")
+        language = pytest.importorskip("mlx_vlm.models.minimax_m3_vl.language")
+        handler = MiniMaxM3KVCacheHandler()
+
+        restored = []
+        for row, length in enumerate((4, 6)):
+            keys = mx.full((1, 2, length, 3), row + 1, dtype=mx.float32)
+            values = mx.full((1, 2, length, 3), (row + 1) * 10, dtype=mx.float32)
+            index_keys = mx.full((1, 1, length, 3), (row + 1) * 100, dtype=mx.float32)
+            restored.append(
+                handler.deserialize_state((keys, values, index_keys), (999,))
+            )
+
+        batch = language.MiniMaxM3BatchKVCache.merge(restored)
+
+        assert batch.left_padding.tolist() == [2, 0]
+        assert batch.offset.tolist() == [4, 6]
+        assert batch.index_offset == 6
+        for row, length in enumerate((4, 6)):
+            extracted = batch.extract(row)
+            row_keys, row_values = extracted.kv_cache.state
+            assert row_keys.shape[2] == length
+            assert row_values.shape[2] == length
+            assert extracted.index_keys.shape[2] == length
+            assert float(row_keys[0, 0, 0, 0].item()) == row + 1
+            assert float(row_values[0, 0, 0, 0].item()) == (row + 1) * 10
+            assert float(extracted.index_keys[0, 0, 0, 0].item()) == (row + 1) * 100
 
 
 class TestRotatingKVCacheHandler:

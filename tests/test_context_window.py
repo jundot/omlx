@@ -47,7 +47,7 @@ class TestGetMaxContextWindow:
 
         state = self._make_server_state(global_max_ctx=32768)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=4096
         )
         state.settings_manager = mock_manager
@@ -62,7 +62,7 @@ class TestGetMaxContextWindow:
 
         state = self._make_server_state(global_max_ctx=65536)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=None
         )
         state.settings_manager = mock_manager
@@ -90,7 +90,7 @@ class TestGetMaxContextWindow:
             global_max_ctx=32768, policy_cap=policy_cap
         )
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=None
         )
         state.settings_manager = mock_manager
@@ -150,7 +150,7 @@ class TestGetMaxContextWindow:
         )
         # Add a per-model override above both native and policy
         state.settings_manager = MagicMock()
-        state.settings_manager.get_settings.return_value = ModelSettings(
+        state.settings_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=200_000
         )
         with patch("omlx.server._server_state", state):
@@ -223,7 +223,7 @@ class TestValidateContextWindow:
 
         state = self._make_server_state(global_max_ctx=32768)
         mock_manager = MagicMock()
-        mock_manager.get_settings.return_value = ModelSettings(
+        mock_manager.get_settings_for_request.return_value = ModelSettings(
             max_context_window=100
         )
         state.settings_manager = mock_manager

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for thinking/reasoning content parser."""
 
-import pytest
-
 from omlx.api.thinking import ThinkingParser, extract_thinking
 
 
@@ -12,6 +10,12 @@ class TestExtractThinking:
     def test_basic_separation(self):
         """Standard <think>reasoning</think>answer case."""
         thinking, content = extract_thinking("<think>reasoning</think>Answer")
+        assert thinking == "reasoning"
+        assert content == "Answer"
+
+    def test_minimax_m3_tag_separation(self):
+        """MiniMax M3 <mm:think> tags are treated as thinking tags."""
+        thinking, content = extract_thinking("<mm:think>reasoning</mm:think>Answer")
         assert thinking == "reasoning"
         assert content == "Answer"
 
@@ -391,6 +395,11 @@ class TestCleanSpecialTokens:
     def test_removes_special_tokens(self):
         from omlx.api.utils import clean_special_tokens
         result = clean_special_tokens("<|im_end|>Hello<|endoftext|>")
+        assert result == "Hello"
+
+    def test_removes_minimax_m3_special_tokens(self):
+        from omlx.api.utils import clean_special_tokens
+        result = clean_special_tokens("]~!b[]~b]Hello[e~[]!p~[]!d~[")
         assert result == "Hello"
 
     def test_removes_special_preserves_think(self):

@@ -35,6 +35,7 @@
 
                 <!-- Profiles / Templates / Presets section -->
                 <div class="mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
+                     x-show="!modelSettings.is_diffusion_model" x-cloak
                      @input.stop="computeDrift()"
                      @change.stop="computeDrift()">
                     <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
@@ -171,18 +172,22 @@
                             <template x-for="p in profiles" :key="p.name">
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyProfileToForm(p)"
-                                            @mouseenter="showTip($event.currentTarget, p.description)"
+                                            @mouseenter="showTip($event.currentTarget, profileTooltip(p))"
                                             @mouseleave="hideTip()"
                                             :class="activeProfileName === p.name
                                                 ? 'bg-emerald-500 text-white border border-emerald-500'
                                                 : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
                                             class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
+                                        <span x-show="p.expose_as_model"
+                                              class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                              :class="p.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
                                         <span x-text="p.display_name || p.name"></span>
                                         <span x-show="activeProfileName === p.name && profilesDrift"
                                               class="w-1.5 h-1.5 rounded-full bg-white"
                                               :title="t('modal.model_settings.profiles.drift_hint')"></span>
                                     </button>
-                                    <button type="button" @click="editingProfile = p.name"
+                                    <button type="button"
+                                            @click="editingProfile = p.name; p._editDisplayName = p.display_name || p.name; p._editApiName = p.api_name || p.name; p._editDescription = p.description || ''; p._editExposeAsModel = !!p.expose_as_model; profileError = ''"
                                             class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
                                     </button>
@@ -199,7 +204,7 @@
                                 </div>
                             </template>
                             <button type="button"
-                                    @click="showNewProfileForm = true; newProfile = {name:'',display_name:'',description:'',also_as_template:false}"
+                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {display_name:'',api_name:'',api_name_touched:false,description:'',also_as_template:false}"
                                     class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
                                 {{ t('modal.model_settings.profiles.new_profile') }}
                             </button>
@@ -209,7 +214,10 @@
                     <!-- New profile inline form (model scope) -->
                     <div x-show="profileScope === 'model' && showNewProfileForm" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
                         <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
+                               @input="if (!newProfile.api_name_touched) newProfile.api_name = slugifyProfileApiName(newProfile.display_name)"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                        <input type="text" x-model="newProfile.api_name" @input="newProfile.api_name_touched = true" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
@@ -223,19 +231,54 @@
                     <!-- Edit profile inline dialog (model scope) -->
                     <template x-for="p in profiles" :key="'edit-'+p.name">
                         <div x-show="profileScope === 'model' && editingProfile === p.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
-                            <input type="text" :value="p.display_name" @input="p.display_name = $event.target.value"
-                                   class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                            <div class="block">
+                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.display_name_label') }}</span>
+                                <input type="text" :value="p._editDisplayName ?? p.display_name" @input="p._editDisplayName = $event.target.value"
+                                       :placeholder="t('modal.model_settings.profiles.display_name_label')"
+                                       class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                            </div>
+                            <div class="block">
+                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.name_placeholder') }}</span>
+                                <div class="flex gap-2">
+                                    <input type="text" :value="p._editApiName ?? p.api_name" @input="p._editApiName = $event.target.value"
+                                           :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                                           class="min-w-0 flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
+                                    <button type="button"
+                                            @click="p._editExposeAsModel = !(p._editExposeAsModel ?? p.expose_as_model)"
+                                            :title="t('modal.model_settings.profiles.expose_as_model')"
+                                            :class="(p._editExposeAsModel ?? p.expose_as_model)
+                                                ? 'bg-emerald-600 text-white border-emerald-600'
+                                                : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
+                                            class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
+                                        API
+                                        <span x-text="(p._editExposeAsModel ?? p.expose_as_model) ? 'ON' : 'OFF'"></span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="block">
+                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.description_label') }}</span>
+                                <input type="text" :value="p._editDescription ?? p.description" @input="p._editDescription = $event.target.value"
+                                       :placeholder="t('modal.model_settings.profiles.description_label')"
+                                       class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
+                            </div>
                             <div class="flex justify-between gap-2 flex-wrap">
-                                <button type="button"
-                                        @click="updateProfile(p.name, {display_name: p.display_name, settings: formValuesForProfile() })"
-                                        class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">
-                                    {{ t('modal.model_settings.profiles.update_from_form') }}
-                                </button>
-                                <button type="button" x-show="p.source_template"
-                                        @click="(() => { const tmpl = templates.find(t => t.name === p.source_template); if (tmpl) { applyTemplateToForm(tmpl); updateProfile(p.name, {settings: formValuesForProfile()}); } })()"
-                                        class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
-                                    {{ t('modal.model_settings.profiles.resync_template') }}
-                                </button>
+                                <div class="flex gap-2 flex-wrap">
+                                    <button type="button"
+                                            @click="updateProfileFromEdit(p)"
+                                            class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">
+                                        {{ t('modal.model_settings.profiles.save') }}
+                                    </button>
+                                    <button type="button"
+                                            @click="updateProfileSettingsFromForm(p)"
+                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
+                                        {{ t('modal.model_settings.profiles.update_from_form') }}
+                                    </button>
+                                    <button type="button" x-show="p.source_template"
+                                            @click="(() => { const tmpl = templates.find(t => t.name === p.source_template); if (tmpl) { applyTemplateToForm(tmpl); updateProfile(p.name, {settings: formValuesForProfile()}); } })()"
+                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
+                                        {{ t('modal.model_settings.profiles.resync_template') }}
+                                    </button>
+                                </div>
                                 <button type="button" @click="editingProfile = null"
                                         class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">
                                     {{ t('modal.model_settings.profiles.cancel') }}
@@ -245,12 +288,6 @@
                     </template>
                 </div>
 
-                <!-- Floating tooltip for preset/profile pill hover.
-                     position:fixed escapes the scroll container's overflow clipping. -->
-                <div x-show="tip.visible" x-cloak x-text="tip.text"
-                     class="fixed z-50 px-2.5 py-1 text-xs font-medium text-white bg-neutral-800 rounded-md whitespace-nowrap pointer-events-none -translate-x-1/2"
-                     :style="`top: ${tip.y}px; left: ${tip.x}px`"></div>
-
                 <!-- Two-column layout -->
                 <div class="flex flex-col lg:flex-row">
                     <!-- Left: Basic Settings -->
@@ -258,7 +295,7 @@
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
                             <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
-                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
+                            <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
@@ -279,7 +316,7 @@
                                         <option value="audio_sts">Audio STS</option>
                                     </select>
                                 </div>
-                                <div x-show="reasoningParsers.length > 0">
+                                <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Reasoning Parser</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
@@ -295,7 +332,8 @@
                             <template x-if="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                 <div class="space-y-5">
                                     <!-- Row 2: Ctx Window / Max Tokens / Temperature -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4"
+                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
@@ -333,7 +371,8 @@
                                     </div>
 
                                     <!-- Row 4: Repetition Penalty / Presence Penalty -->
-                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4"
+                                         x-show="!modelSettings.is_diffusion_model" x-cloak>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.repetition_penalty') }}</label>
                                             <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -381,7 +420,8 @@
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
                              x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                             <!-- Enable Thinking -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.enable_thinking') }}</span>
@@ -406,7 +446,8 @@
                             </div>
 
                             <!-- Thinking Budget -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
@@ -426,7 +467,8 @@
                             </div>
 
                             <!-- Guided Grammar -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.guided_grammar') }}</span>
@@ -448,7 +490,8 @@
                             </div>
 
                             <!-- Limit Tool Result Tokens -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.limit_tool_result') }}</span>
@@ -468,7 +511,8 @@
                             </div>
 
                             <!-- Force Sampling -->
-                            <div class="p-4 bg-neutral-50 rounded-xl">
+                            <div class="p-4 bg-neutral-50 rounded-xl"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.force_sampling') }}</span>
@@ -513,11 +557,11 @@
                                         <div x-show="addOpen" @click.away="addOpen = false" x-transition
                                              class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                             <button type="button"
-                                                    x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
-                                                    x-show="!modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
@@ -594,8 +638,9 @@
                                 <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                             </div>
 
-                            <!-- Experimental Features -->
-                            <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
+                            <div x-show="!modelSettings.is_diffusion_model" x-cloak>
+                                <!-- Experimental Features -->
+                                <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
                                 <!-- TurboQuant KV Cache -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
@@ -687,7 +732,7 @@
                                             <select x-model="modelSettings.specprefill_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">Select draft model...</option>
-                                                <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
+                                                <template x-for="m in specPrefillDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
@@ -743,7 +788,7 @@
                                             <select x-model="modelSettings.dflash_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">Select draft model...</option>
-                                                <template x-for="m in models.filter(m => m.id !== selectedModel?.id)" :key="m.id">
+                                                <template x-for="m in dflashDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
@@ -939,7 +984,7 @@
                                         <select x-model="modelSettings.vlm_mtp_draft_model"
                                                 class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black bg-white">
                                             <option value="">{{ t('modal.model_settings.vlm_mtp_draft_model_placeholder') }}</option>
-                                            <template x-for="m in models.filter(m => /assistant/i.test(m.id))" :key="m.id">
+                                            <template x-for="m in vlmMtpDraftModelCandidates()" :key="m.id">
                                                 <option :value="m.id" x-text="m.id"></option>
                                             </template>
                                         </select>
@@ -952,6 +997,7 @@
                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-black" />
                                     </div>
                                 </div>
+                            </div>
                         </div>
                     </div>
                 </div>

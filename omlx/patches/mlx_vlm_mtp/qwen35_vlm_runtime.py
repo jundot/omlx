@@ -10,8 +10,8 @@ It adds:
 
 * a Multi-Token Prediction head (``MTPModule``) to
   ``mlx_vlm.models.qwen3_5.language.LanguageModel`` when the config
-  declares ``mtp_num_hidden_layers > 0`` and the process-wide MTP active
-  flag is on;
+  declares ``mtp_num_hidden_layers > 0`` and the checkpoint has MTP
+  weights to bind;
 * a ``return_hidden=True`` mode on ``LanguageModel.__call__`` that
   returns ``(logits, pre_norm_hidden, gdn_states)``.
 
@@ -190,6 +190,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
+        from ..mlx_lm_mtp import is_mtp_active
 
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads so mlx-vlm's
@@ -197,33 +198,40 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # checkpoints) can place the persisted mtp.* tensors. Whether MTP
         # speculative decode is actually invoked at inference time is gated
         # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
-        # which checks the process-wide ``is_mtp_active`` flag.
+        # which checks the per-instance ``_omlx_mtp_decode_enabled`` marker.
         #
         # Gated by ``is_mtp_attach_enabled()`` so checkpoints that declare
         # mtp_num_hidden_layers > 0 but ship no mtp.* weights (unsloth
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0 and is_mtp_attach_enabled():
+        attach_enabled = bool(is_mtp_attach_enabled())
+        self._omlx_mtp_decode_enabled = bool(
+            n_mtp > 0 and attach_enabled and is_mtp_active()
+        )
+        if n_mtp > 0 and attach_enabled:
             self.mtp = q35_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
 
-        With ``return_hidden=True``, returns the triple
-        ``(logits, pre_norm_hidden, gdn_states)`` for the speculative
-        decode cycle. ``n_confirmed`` is accepted and discarded — the
-        mlx-vlm path uses post-hoc ``rollback_speculative_cache`` instead
-        of a confirmed/draft split.
+        With ``return_hidden=True``, returns ``LanguageModelOutput`` with
+        pre-norm hidden states for the speculative decode cycle. ``n_confirmed``
+        is accepted and discarded — the mlx-vlm path uses post-hoc
+        ``rollback_speculative_cache`` instead of a confirmed/draft split.
         """
         return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which the MTP cycle needs.
+        # both of which the MTP cycle needs. Pop any existing value from kwargs
+        # to avoid "got multiple values for keyword argument" when the caller
+        # already passed capture_layer_ids.
+        kwargs.pop("capture_layer_ids", None)
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -234,8 +242,15 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             capture_layer_ids=[last_layer_idx],
             **kwargs,
         )
+        from mlx_vlm.models.base import LanguageModelOutput
+
         hidden_pre_norm = out.hidden_states[0]
-        return out.logits, hidden_pre_norm, out.gdn_states
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[hidden_pre_norm],
+            gdn_states=out.gdn_states,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
     def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         mtp_out = self.mtp(

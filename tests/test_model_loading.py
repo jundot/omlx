@@ -158,6 +158,59 @@ class TestParoquantDispatch:
         assert captured["called"] is True
 
 
+class TestLlama4PreLoadDispatch:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"model_type": "llama4", "text_config": {}}',
+            '{"model_type": "mllama", "text_config": {"model_type": "llama4"}}',
+        ],
+    )
+    def test_llama4_attention_patch_applies(self, tmp_path, monkeypatch, body):
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(set_mtp_active=MagicMock()),
+        )
+        apply_mock = MagicMock(return_value=True)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.llama4_attention",
+            MagicMock(apply_llama4_attention_patch=apply_mock),
+        )
+
+        path = _write_config(tmp_path, body)
+        maybe_apply_pre_load_patches(path)
+
+        apply_mock.assert_called_once_with()
+
+
+class TestLoadTextModel:
+    def test_forwards_trust_remote_code_to_mlx_lm_load(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path, '{"model_type": "llama"}')
+        maybe_apply = MagicMock()
+        monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", maybe_apply)
+
+        load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
+
+        settings = types.SimpleNamespace(trust_remote_code=True)
+        result = model_loading.load_text_model(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            model_settings=settings,
+        )
+
+        assert result == ("MODEL", "TOKENIZER")
+        maybe_apply.assert_called_once_with(path, model_settings=settings)
+        load_mock.assert_called_once_with(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            trust_remote_code=True,
+        )
+
+
 class TestVlmMtpPreLoadDispatch:
     """maybe_apply_pre_load_patches must wire the mlx-vlm MTP sanitize
     patch alongside the runtime patch for MTP-capable VLM checkpoints.

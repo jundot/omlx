@@ -353,6 +353,18 @@ class TestLaunchCommandOptions:
         assert "hermes" in result.stdout
         assert "Hermes Agent" in result.stdout
 
+    def test_launch_lists_codex_app(self):
+        """Test that launch help lists the Codex Desktop App target."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "codex_app" in result.stdout
+        assert "Codex App" in " ".join(result.stdout.split())
+
 
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""
@@ -685,7 +697,9 @@ class TestServeCommandFunctions:
         log_dir = tmp_path / "logs"
         settings = SimpleNamespace()
         settings.base_path = tmp_path
-        settings.server = SimpleNamespace(host=host, port=port, log_level="info")
+        settings.server = SimpleNamespace(
+            host=host, port=port, log_level="info", burst_decode_mode="balanced"
+        )
         settings.huggingface = SimpleNamespace(endpoint=None, hf_cache_enabled=True)
         settings.modelscope = SimpleNamespace(endpoint=None)
         settings.network = SimpleNamespace(

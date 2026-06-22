@@ -27,7 +27,7 @@ struct ModelSettingsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Header(model: vm.model, onBack: { services.modelDetailID = nil })
+            Header(model: vm.model)
 
             SectionPicker(selection: $vm.section)
 
@@ -61,7 +61,25 @@ struct ModelSettingsScreen: View {
                     .padding(.top, 8)
             }
         }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                backButton
+            }
+        }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
+    }
+
+    @ViewBuilder
+    private var backButton: some View {
+        Button {
+            services.modelDetailID = nil
+        } label: {
+            Label(String(localized: "settings.header.back_to_models",
+                         defaultValue: "Back to Models",
+                         comment: "Back button label at the top of the per-model settings screen"),
+                  systemImage: "chevron.left")
+                .labelStyle(.iconOnly)
+        }
     }
 }
 
@@ -69,8 +87,6 @@ struct ModelSettingsScreen: View {
 
 private struct Header: View {
     let model: ModelDTO?
-    let onBack: () -> Void
-
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -96,17 +112,7 @@ private struct Header: View {
                 }
             }
             .layoutPriority(1)
-            Spacer(minLength: 8)
-            Button {
-                onBack()
-            } label: {
-                Label(String(localized: "settings.header.back_to_models",
-                             defaultValue: "Back to Models",
-                             comment: "Back button label at the top of the per-model settings screen"),
-                      systemImage: "chevron.left")
-                    .labelStyle(.titleAndIcon)
-            }
-            .buttonStyle(.omlx(.plain, size: .small))
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
@@ -126,7 +132,6 @@ private struct SectionPicker: View {
                     ($0, $0.label)
                 }
             )
-            .frame(width: 320)
             Spacer()
         }
         .padding(.horizontal, 14)
@@ -328,7 +333,19 @@ private struct ProfilesTab: View {
                         self.preview = nil
                     }
                 },
-                onClosePreview: { self.preview = nil }
+                onClosePreview: { self.preview = nil },
+                exposeAsModel: modelProfile(named: preview.name)?.exposeAsModel ?? false,
+                exposedModelId: modelProfile(named: preview.name)?.modelId,
+                hasEngineFields: modelProfile(named: preview.name)?.hasEngineFields ?? false,
+                onToggleExpose: preview.scope == .model
+                    ? { exposed in
+                        Task {
+                            await vm.setExposeAsModel(
+                                name: preview.name, exposed: exposed, client: client
+                            )
+                        }
+                    }
+                    : nil
             )
         } else {
             // No preview → show the active state's detail.
@@ -358,7 +375,19 @@ private struct ProfilesTab: View {
                     basedOn: nil,
                     isWorkingBase: false,
                     compact: false,
-                    hasWorking: false
+                    hasWorking: false,
+                    exposeAsModel: modelProfile(named: name)?.exposeAsModel ?? false,
+                    exposedModelId: modelProfile(named: name)?.modelId,
+                    hasEngineFields: modelProfile(named: name)?.hasEngineFields ?? false,
+                    onToggleExpose: scope == .model
+                        ? { exposed in
+                            Task {
+                                await vm.setExposeAsModel(
+                                    name: name, exposed: exposed, client: client
+                                )
+                            }
+                        }
+                        : nil
                 )
             case .defaults:
                 ProfileDetailCard(
@@ -376,6 +405,12 @@ private struct ProfilesTab: View {
                 )
             }
         }
+    }
+
+    /// Per-model profile DTO lookup — source of the expose-as-model state
+    /// and the derived model ID shown on the detail card.
+    private func modelProfile(named name: String) -> ProfileDTO? {
+        vm.profiles.first { $0.name == name }
     }
 
     private func previewChip(scope: ProfileScope, name: String) {
@@ -519,45 +554,47 @@ private struct BasicTab: View {
                                  comment: "Sublabel describing the temperature field range")) {
                 TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: 90)
             }
-            Row(label: String(localized: "settings.basic.top_p.label",
-                              defaultValue: "Top P",
-                              comment: "Row label for the top-p nucleus sampling field"),
-                sublabel: String(localized: "settings.basic.top_p.sub",
-                                 defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
-                                 comment: "Sublabel describing the top-p valid range")) {
-                TextInput(text: vm.bindProfile($vm.topP), mono: true, width: 90)
-            }
-            Row(label: String(localized: "settings.basic.top_k.label",
-                              defaultValue: "Top K",
-                              comment: "Row label for the top-k sampling field"),
-                sublabel: String(localized: "settings.basic.top_k.sub",
-                                 defaultValue: "Limit candidates to top K (positive integer).",
-                                 comment: "Sublabel describing the top-k field")) {
-                TextInput(text: vm.bindProfile($vm.topK), mono: true, width: 90)
-            }
-            Row(label: String(localized: "settings.basic.min_p.label",
-                              defaultValue: "Min P",
-                              comment: "Row label for the min-p sampling field"),
-                sublabel: String(localized: "settings.basic.min_p.sub",
-                                 defaultValue: "Minimum probability floor (0 ≤ p ≤ 1).",
-                                 comment: "Sublabel describing the min-p field range")) {
-                TextInput(text: vm.bindProfile($vm.minP), mono: true, width: 90)
-            }
-            Row(label: String(localized: "settings.basic.repetition_penalty.label",
-                              defaultValue: "Repetition Penalty",
-                              comment: "Row label for the repetition-penalty field"),
-                sublabel: String(localized: "settings.basic.repetition_penalty.sub",
-                                 defaultValue: "Penalize repeated tokens (−2 to 2).",
-                                 comment: "Sublabel describing repetition-penalty range")) {
-                TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: 90)
-            }
-            Row(label: String(localized: "settings.basic.presence_penalty.label",
-                              defaultValue: "Presence Penalty",
-                              comment: "Row label for the presence-penalty field"),
-                sublabel: String(localized: "settings.basic.presence_penalty.sub",
-                                 defaultValue: "Penalize tokens already present (−2 to 2).",
-                                 comment: "Sublabel describing presence-penalty range")) {
-                TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: 90)
+            if !vm.isDiffusionModel {
+                Row(label: String(localized: "settings.basic.top_p.label",
+                                  defaultValue: "Top P",
+                                  comment: "Row label for the top-p nucleus sampling field"),
+                    sublabel: String(localized: "settings.basic.top_p.sub",
+                                     defaultValue: "Nucleus sampling cutoff (0 < p ≤ 1).",
+                                     comment: "Sublabel describing the top-p valid range")) {
+                    TextInput(text: vm.bindProfile($vm.topP), mono: true, width: 90)
+                }
+                Row(label: String(localized: "settings.basic.top_k.label",
+                                  defaultValue: "Top K",
+                                  comment: "Row label for the top-k sampling field"),
+                    sublabel: String(localized: "settings.basic.top_k.sub",
+                                     defaultValue: "Limit candidates to top K (positive integer).",
+                                     comment: "Sublabel describing the top-k field")) {
+                    TextInput(text: vm.bindProfile($vm.topK), mono: true, width: 90)
+                }
+                Row(label: String(localized: "settings.basic.min_p.label",
+                                  defaultValue: "Min P",
+                                  comment: "Row label for the min-p sampling field"),
+                    sublabel: String(localized: "settings.basic.min_p.sub",
+                                     defaultValue: "Minimum probability floor (0 ≤ p ≤ 1).",
+                                     comment: "Sublabel describing the min-p field range")) {
+                    TextInput(text: vm.bindProfile($vm.minP), mono: true, width: 90)
+                }
+                Row(label: String(localized: "settings.basic.repetition_penalty.label",
+                                  defaultValue: "Repetition Penalty",
+                                  comment: "Row label for the repetition-penalty field"),
+                    sublabel: String(localized: "settings.basic.repetition_penalty.sub",
+                                     defaultValue: "Penalize repeated tokens (−2 to 2).",
+                                     comment: "Sublabel describing repetition-penalty range")) {
+                    TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: 90)
+                }
+                Row(label: String(localized: "settings.basic.presence_penalty.label",
+                                  defaultValue: "Presence Penalty",
+                                  comment: "Row label for the presence-penalty field"),
+                    sublabel: String(localized: "settings.basic.presence_penalty.sub",
+                                     defaultValue: "Penalize tokens already present (−2 to 2).",
+                                     comment: "Sublabel describing presence-penalty range")) {
+                    TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: 90)
+                }
             }
             Row(
                 label: String(localized: "settings.basic.ttl.label",
@@ -656,63 +693,65 @@ private struct AdvancedTab: View {
         // the working-dirty flag. `isPinned` and `trustRemoteCode` stay
         // per-model (server excludes them from profiles) and auto-save.
         ListGroup {
-            Row(label: String(localized: "settings.advanced.enable_thinking.label",
-                              defaultValue: "Enable Thinking",
-                              comment: "Row label for the enable-thinking toggle"),
-                sublabel: String(localized: "settings.advanced.enable_thinking.sub",
-                                 defaultValue: "Enable reasoning/thinking mode for this model",
-                                 comment: "Sublabel for the enable-thinking toggle")) {
-                Toggle("", isOn: vm.bindProfile($vm.enableThinking))
-                    .labelsHidden().toggleStyle(.switch)
-            }
-            Row(label: String(localized: "settings.advanced.thinking_budget.label",
-                              defaultValue: "Thinking Budget",
-                              comment: "Row label for the thinking budget field"),
-                sublabel: String(localized: "settings.advanced.thinking_budget.sub",
-                                 defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
-                                 comment: "Sublabel for the thinking budget field")) {
-                HStack(spacing: 8) {
-                    if vm.thinkingBudgetEnabled {
-                        TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
-                                  mono: true, suffix: "tk", width: 110)
-                    }
-                    Toggle("", isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
+            if !vm.isDiffusionModel {
+                Row(label: String(localized: "settings.advanced.enable_thinking.label",
+                                  defaultValue: "Enable Thinking",
+                                  comment: "Row label for the enable-thinking toggle"),
+                    sublabel: String(localized: "settings.advanced.enable_thinking.sub",
+                                     defaultValue: "Enable reasoning/thinking mode for this model",
+                                     comment: "Sublabel for the enable-thinking toggle")) {
+                    Toggle("", isOn: vm.bindProfile($vm.enableThinking))
                         .labelsHidden().toggleStyle(.switch)
                 }
-            }
-            Row(label: String(localized: "settings.advanced.tool_result_limit.label",
-                              defaultValue: "Limit Tool Result Tokens",
-                              comment: "Row label for the tool-result token limit field"),
-                sublabel: String(localized: "settings.advanced.tool_result_limit.sub",
-                                 defaultValue: "Truncate large tool results (e.g. file reads) to a token limit",
-                                 comment: "Sublabel for the tool-result token limit field")) {
-                HStack(spacing: 8) {
-                    if vm.limitToolResults {
-                        TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
-                                  placeholder: "4096",
-                                  mono: true, suffix: "tk", width: 110)
+                Row(label: String(localized: "settings.advanced.thinking_budget.label",
+                                  defaultValue: "Thinking Budget",
+                                  comment: "Row label for the thinking budget field"),
+                    sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                                     defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
+                                     comment: "Sublabel for the thinking budget field")) {
+                    HStack(spacing: 8) {
+                        if vm.thinkingBudgetEnabled {
+                            TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
+                                      mono: true, suffix: "tk", width: 110)
+                        }
+                        Toggle("", isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
+                            .labelsHidden().toggleStyle(.switch)
                     }
-                    Toggle("", isOn: vm.bindProfile($vm.limitToolResults))
+                }
+                Row(label: String(localized: "settings.advanced.tool_result_limit.label",
+                                  defaultValue: "Limit Tool Result Tokens",
+                                  comment: "Row label for the tool-result token limit field"),
+                    sublabel: String(localized: "settings.advanced.tool_result_limit.sub",
+                                     defaultValue: "Truncate large tool results (e.g. file reads) to a token limit",
+                                     comment: "Sublabel for the tool-result token limit field")) {
+                    HStack(spacing: 8) {
+                        if vm.limitToolResults {
+                            TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
+                                      placeholder: "4096",
+                                      mono: true, suffix: "tk", width: 110)
+                        }
+                        Toggle("", isOn: vm.bindProfile($vm.limitToolResults))
+                            .labelsHidden().toggleStyle(.switch)
+                    }
+                }
+                Row(label: String(localized: "settings.advanced.force_sampling.label",
+                                  defaultValue: "Force Sampling",
+                                  comment: "Row label for the force-sampling toggle"),
+                    sublabel: String(localized: "settings.advanced.force_sampling.sub",
+                                     defaultValue: "Override request sampling parameters with configured values",
+                                     comment: "Sublabel for the force-sampling toggle")) {
+                    Toggle("", isOn: vm.bindProfile($vm.forceSampling))
                         .labelsHidden().toggleStyle(.switch)
                 }
-            }
-            Row(label: String(localized: "settings.advanced.force_sampling.label",
-                              defaultValue: "Force Sampling",
-                              comment: "Row label for the force-sampling toggle"),
-                sublabel: String(localized: "settings.advanced.force_sampling.sub",
-                                 defaultValue: "Override request sampling parameters with configured values",
-                                 comment: "Sublabel for the force-sampling toggle")) {
-                Toggle("", isOn: vm.bindProfile($vm.forceSampling))
-                    .labelsHidden().toggleStyle(.switch)
-            }
-            Row(label: String(localized: "settings.advanced.reasoning_parser.label",
-                              defaultValue: "Reasoning Parser",
-                              comment: "Row label for the reasoning-parser override field"),
-                sublabel: String(localized: "settings.advanced.reasoning_parser.sub",
-                                 defaultValue: "Override the chain-of-thought parser. Leave empty to use the model's default.",
-                                 comment: "Sublabel for the reasoning-parser override field")) {
-                TextInput(text: vm.bindProfile($vm.reasoningParser),
-                          placeholder: "auto", mono: true, width: 150)
+                Row(label: String(localized: "settings.advanced.reasoning_parser.label",
+                                  defaultValue: "Reasoning Parser",
+                                  comment: "Row label for the reasoning-parser override field"),
+                    sublabel: String(localized: "settings.advanced.reasoning_parser.sub",
+                                     defaultValue: "Override the chain-of-thought parser. Leave empty to use the model's default.",
+                                     comment: "Sublabel for the reasoning-parser override field")) {
+                    TextInput(text: vm.bindProfile($vm.reasoningParser),
+                              placeholder: "auto", mono: true, width: 150)
+                }
             }
             Row(label: String(localized: "settings.advanced.pin_memory.label",
                               defaultValue: "Pin in memory",
@@ -754,15 +793,17 @@ private struct AdvancedTab: View {
         )
         ChatTemplateKwargsEditor(vm: vm, client: client)
 
-        SectionHeader(
-            String(localized: "settings.advanced.experimental.section",
-                   defaultValue: "Experimental",
-                   comment: "Section header above the Experimental settings group"),
-            subtitle: String(localized: "settings.advanced.experimental.subtitle",
-                             defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
-                             comment: "Subtitle for the Experimental settings section")
-        )
-        ExperimentalSection(vm: vm, client: client)
+        if !vm.isDiffusionModel {
+            SectionHeader(
+                String(localized: "settings.advanced.experimental.section",
+                       defaultValue: "Experimental",
+                       comment: "Section header above the Experimental settings group"),
+                subtitle: String(localized: "settings.advanced.experimental.subtitle",
+                                 defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
+                                 comment: "Subtitle for the Experimental settings section")
+            )
+            ExperimentalSection(vm: vm, client: client)
+        }
     }
 }
 
@@ -810,12 +851,14 @@ private struct ChatTemplateKwargsEditor: View {
             // `enable_thinking` and `reasoning_effort` are server-side
             // singletons — once added, the menu hides them so the user
             // can't push duplicate keys into `chat_template_kwargs`.
-            if !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
+            if !vm.isDiffusionModel,
+               !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
                 Button("enable_thinking") {
                     vm.addKwarg(.enableThinking)
                 }
             }
-            if !vm.chatTemplateEntries.contains(where: { $0.kind == .reasoningEffort }) {
+            if !vm.isDiffusionModel,
+               !vm.chatTemplateEntries.contains(where: { $0.kind == .reasoningEffort }) {
                 Button("reasoning_effort") {
                     vm.addKwarg(.reasoningEffort)
                 }
@@ -1533,6 +1576,18 @@ final class ModelSettingsScreenVM: ObservableObject {
     static let dsaConfigModelTypes: Set<String> = [
         "deepseek_v32", "glm_moe_dsa",
     ]
+    static let diffusionConfigModelTypes: Set<String> = [
+        "diffusion_gemma",
+    ]
+    /// `config_model_type` values accepted by the HTML admin's VLM MTP
+    /// assistant-drafter picker. Mirrored from `dashboard.js`
+    /// (`VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES`).
+    static let vlmMtpDrafterConfigModelTypes: Set<String> = [
+        "gemma4_assistant", "gemma4_unified_assistant", "qwen3_5_mtp",
+    ]
+    static let diffusionUnsupportedCtKwargKeys: Set<String> = [
+        "enable_thinking", "reasoning_effort", "preserve_thinking",
+    ]
 
     @Published var section: Section = .basic
 
@@ -1651,6 +1706,68 @@ final class ModelSettingsScreenVM: ObservableObject {
         return .defaults
     }
 
+    var isDiffusionModel: Bool {
+        let type = (model?.configModelType ?? "")
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        return Self.diffusionConfigModelTypes.contains(type)
+    }
+
+    private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
+        switch field {
+        case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
+            return true
+        case .enableThinking, .thinkingBudgetEnabled, .thinkingBudgetTokens:
+            return true
+        case .limitToolResults, .toolResultLimitTokens:
+            return true
+        case .forceSampling, .reasoningParser:
+            return true
+        case .turboquantKvEnabled, .turboquantKvBits:
+            return true
+        case .indexCacheEnabled, .indexCacheFreq:
+            return true
+        case .specprefillEnabled, .specprefillDraftModel:
+            return true
+        case .specprefillKeepPct, .specprefillThreshold:
+            return true
+        case .dflashEnabled, .dflashDraftModel, .dflashMaxCtx:
+            return true
+        case .dflashDraftQuantEnabled, .dflashDraftQuantWeightBits:
+            return true
+        case .dflashDraftQuantActivationBits, .dflashDraftQuantGroupSize:
+            return true
+        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize:
+            return true
+        case .dflashInMemoryCache, .dflashInMemoryCacheGib:
+            return true
+        case .dflashInMemoryCacheMaxEntries:
+            return true
+        case .dflashSsdCache, .dflashSsdCacheGib:
+            return true
+        case .mtpEnabled, .vlmMtpEnabled, .vlmMtpDraftModel:
+            return true
+        case .vlmMtpDraftBlockSize:
+            return true
+        case .alias, .modelType, .contextLength, .maxTokens:
+            return false
+        case .temperature, .ttl, .isPinned, .trustRemoteCode:
+            return false
+        case .chatTemplateKwargs:
+            return false
+        }
+    }
+
+    private func diffusionCompatibleChatTemplateEntries(
+        _ entries: [ChatTemplateKwargEntry]
+    ) -> [ChatTemplateKwargEntry] {
+        guard isDiffusionModel else { return entries }
+        return entries.filter { entry in
+            guard let key = entry.resolvedKey else { return true }
+            return !Self.diffusionUnsupportedCtKwargKeys.contains(key)
+        }
+    }
+
     func bind<T: Equatable>(
         _ binding: Binding<T>,
         save: @escaping () -> Void
@@ -1714,9 +1831,11 @@ final class ModelSettingsScreenVM: ObservableObject {
                     self.isPinned = s.isPinned ?? false
                     self.trustRemoteCode = s.trustRemoteCode ?? false
                     self.reasoningParser = s.reasoningParser ?? ""
-                    self.chatTemplateEntries = ChatTemplateKwargsCodec.decode(
-                        kwargs: s.chatTemplateKwargs,
-                        forced: s.forcedCtKwargs
+                    self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
+                        ChatTemplateKwargsCodec.decode(
+                            kwargs: s.chatTemplateKwargs,
+                            forced: s.forcedCtKwargs
+                        )
                     )
                     self.turboquantKvEnabled = s.turboquantKvEnabled ?? false
                     self.turboquantKvBits = s.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
@@ -1776,6 +1895,9 @@ final class ModelSettingsScreenVM: ObservableObject {
     }
 
     func save(_ field: Field, client: OMLXClient) async {
+        if isDiffusionModel && isDiffusionUnsupportedField(field) {
+            return
+        }
         var patch = ModelSettingsPatch()
         switch field {
         case .alias:                   patch.modelAlias = alias.isEmpty ? nil : alias
@@ -1842,7 +1964,9 @@ final class ModelSettingsScreenVM: ObservableObject {
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser
         case .chatTemplateKwargs:
-            let pair = ChatTemplateKwargsCodec.encode(chatTemplateEntries)
+            let pair = ChatTemplateKwargsCodec.encode(
+                diffusionCompatibleChatTemplateEntries(chatTemplateEntries)
+            )
             patch.chatTemplateKwargs = pair.kwargs ?? [:]
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
@@ -1906,6 +2030,14 @@ final class ModelSettingsScreenVM: ObservableObject {
     // MARK: - Chat-template kwarg list mutation
 
     func addKwarg(_ kind: ChatTemplateKwargEntryKind) {
+        if isDiffusionModel {
+            switch kind {
+            case .enableThinking, .reasoningEffort:
+                return
+            case .custom:
+                break
+            }
+        }
         let defaultValue: String
         switch kind {
         case .enableThinking:  defaultValue = "true"
@@ -1938,9 +2070,9 @@ final class ModelSettingsScreenVM: ObservableObject {
     }
 
     /// Draft-model options for VLM MTP. mlx-vlm's MTP loop takes an
-    /// "assistant" drafter, so the picker filters to model ids containing
-    /// "assistant" (case-insensitive), matching the HTML editor's filter,
-    /// and drops the current model so it can't draft for itself.
+    /// assistant drafter. Match the HTML editor by accepting known
+    /// config-derived drafter types first, then falling back to names that
+    /// contain "assistant" or a standalone "mtp" token.
     ///
     /// The stored value is the model **id**, not its path: the server
     /// resolves the drafter by registry id (`engine_pool` looks it up in
@@ -1953,11 +2085,30 @@ final class ModelSettingsScreenVM: ObservableObject {
                         comment: "Initial placeholder option in the VLM MTP draft-model picker")),
         ]
         for m in allModels
-        where m.id != modelID
-            && m.id.range(of: "assistant", options: .caseInsensitive) != nil {
+        where Self.isVlmMtpDraftModelCandidate(m, currentModelID: modelID) {
             out.append((m.id, m.id))
         }
         return out
+    }
+
+    static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
+        guard model.id != currentModelID else { return false }
+
+        if let type = model.configModelType?.lowercased(),
+           vlmMtpDrafterConfigModelTypes.contains(type) {
+            return true
+        }
+
+        let searchText = [model.id, model.modelPath]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        if searchText.range(of: "assistant", options: .caseInsensitive) != nil {
+            return true
+        }
+        return searchText.range(
+            of: #"(^|[-_/\s])mtp($|[-_/\s])"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     var isDSAConfigModel: Bool {
@@ -2021,6 +2172,7 @@ final class ModelSettingsScreenVM: ObservableObject {
     /// fields are dropped — the server treats absent keys as "use defaults".
     func currentSettingsDict() -> [String: AnyCodable] {
         var out: [String: AnyCodable] = [:]
+        let isDiffusion = isDiffusionModel
 
         func putInt(_ key: String, _ raw: String) {
             let t = raw.trimmingCharacters(in: .whitespaces)
@@ -2045,27 +2197,33 @@ final class ModelSettingsScreenVM: ObservableObject {
         putInt(ProfileSettingsKey.maxContextWindow, contextLength)
         putInt(ProfileSettingsKey.maxTokens, maxTokens)
         putDouble(ProfileSettingsKey.temperature, temperature)
-        putDouble(ProfileSettingsKey.topP, topP)
-        putInt(ProfileSettingsKey.topK, topK)
-        putDouble(ProfileSettingsKey.minP, minP)
-        putDouble(ProfileSettingsKey.repetitionPenalty, repetitionPenalty)
-        putDouble(ProfileSettingsKey.presencePenalty, presencePenalty)
+        if !isDiffusion {
+            putDouble(ProfileSettingsKey.topP, topP)
+            putInt(ProfileSettingsKey.topK, topK)
+            putDouble(ProfileSettingsKey.minP, minP)
+            putDouble(ProfileSettingsKey.repetitionPenalty, repetitionPenalty)
+            putDouble(ProfileSettingsKey.presencePenalty, presencePenalty)
+        }
 
         // Universal — thinking / tool / reasoning
-        putBool(ProfileSettingsKey.enableThinking, enableThinking)
-        putBool(ProfileSettingsKey.thinkingBudgetEnabled, thinkingBudgetEnabled)
-        putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
-        putBool(ProfileSettingsKey.forceSampling, forceSampling)
-        putString(ProfileSettingsKey.reasoningParser, reasoningParser)
-        // Server uses 0 as the "disable" sentinel; encode that exactly.
-        out[ProfileSettingsKey.maxToolResultTokens] = AnyCodable(
-            limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
-        )
+        if !isDiffusion {
+            putBool(ProfileSettingsKey.enableThinking, enableThinking)
+            putBool(ProfileSettingsKey.thinkingBudgetEnabled, thinkingBudgetEnabled)
+            putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
+            putBool(ProfileSettingsKey.forceSampling, forceSampling)
+            putString(ProfileSettingsKey.reasoningParser, reasoningParser)
+            // Server uses 0 as the "disable" sentinel; encode that exactly.
+            out[ProfileSettingsKey.maxToolResultTokens] = AnyCodable(
+                limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
+            )
+        }
 
         // Universal — chat template kwargs. AnyCodable's encode walks a
         // [String: AnyCodable] / [AnyCodable] explicitly, so nest those
         // shapes rather than `Any` so the Sendable check is satisfied.
-        let kwargs = ChatTemplateKwargsCodec.encode(chatTemplateEntries)
+        let kwargs = ChatTemplateKwargsCodec.encode(
+            diffusionCompatibleChatTemplateEntries(chatTemplateEntries)
+        )
         if let dict = kwargs.kwargs {
             out[ProfileSettingsKey.chatTemplateKwargs] = AnyCodable(dict)
         }
@@ -2076,51 +2234,53 @@ final class ModelSettingsScreenVM: ObservableObject {
         }
 
         // Model-specific — experimental
-        putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
-        if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
-            out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
-        }
-        if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
-            out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)
-        }
-        putBool(ProfileSettingsKey.specprefillEnabled, specprefillEnabled)
-        if specprefillEnabled {
-            putString(ProfileSettingsKey.specprefillDraftModel, specprefillDraftModel)
-            putDouble(ProfileSettingsKey.specprefillKeepPct, specprefillKeepPct)
-            putInt(ProfileSettingsKey.specprefillThreshold, specprefillThreshold)
-        }
-        putBool(ProfileSettingsKey.dflashEnabled, dflashEnabled)
-        if dflashEnabled {
-            putString(ProfileSettingsKey.dflashDraftModel, dflashDraftModel)
-            putBool(ProfileSettingsKey.dflashDraftQuantEnabled, dflashDraftQuantEnabled)
-            if dflashDraftQuantEnabled {
-                putInt(ProfileSettingsKey.dflashDraftQuantWeightBits, dflashDraftQuantWeightBits)
-                putInt(ProfileSettingsKey.dflashDraftQuantActivationBits, dflashDraftQuantActivationBits)
-                putInt(ProfileSettingsKey.dflashDraftQuantGroupSize, dflashDraftQuantGroupSize)
+        if !isDiffusion {
+            putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
+            if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
+                out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
             }
-            putInt(ProfileSettingsKey.dflashMaxCtx, dflashMaxCtx)
-            if !dflashVerifyMode.isEmpty {
-                out[ProfileSettingsKey.dflashVerifyMode] = AnyCodable(dflashVerifyMode)
+            if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
+                out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)
             }
-            putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
-            putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
-            putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
-            if dflashInMemoryCache {
-                if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
-                    out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+            putBool(ProfileSettingsKey.specprefillEnabled, specprefillEnabled)
+            if specprefillEnabled {
+                putString(ProfileSettingsKey.specprefillDraftModel, specprefillDraftModel)
+                putDouble(ProfileSettingsKey.specprefillKeepPct, specprefillKeepPct)
+                putInt(ProfileSettingsKey.specprefillThreshold, specprefillThreshold)
+            }
+            putBool(ProfileSettingsKey.dflashEnabled, dflashEnabled)
+            if dflashEnabled {
+                putString(ProfileSettingsKey.dflashDraftModel, dflashDraftModel)
+                putBool(ProfileSettingsKey.dflashDraftQuantEnabled, dflashDraftQuantEnabled)
+                if dflashDraftQuantEnabled {
+                    putInt(ProfileSettingsKey.dflashDraftQuantWeightBits, dflashDraftQuantWeightBits)
+                    putInt(ProfileSettingsKey.dflashDraftQuantActivationBits, dflashDraftQuantActivationBits)
+                    putInt(ProfileSettingsKey.dflashDraftQuantGroupSize, dflashDraftQuantGroupSize)
                 }
-                putInt(ProfileSettingsKey.dflashInMemoryCacheMaxEntries, dflashInMemoryCacheMaxEntries)
+                putInt(ProfileSettingsKey.dflashMaxCtx, dflashMaxCtx)
+                if !dflashVerifyMode.isEmpty {
+                    out[ProfileSettingsKey.dflashVerifyMode] = AnyCodable(dflashVerifyMode)
+                }
+                putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
+                putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
+                putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
+                if dflashInMemoryCache {
+                    if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
+                        out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
+                    }
+                    putInt(ProfileSettingsKey.dflashInMemoryCacheMaxEntries, dflashInMemoryCacheMaxEntries)
+                }
+                putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
+                if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
+                    out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
+                }
             }
-            putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
-            if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
-                out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
+            putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+            putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
+            if vlmMtpEnabled {
+                putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
+                putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
             }
-        }
-        putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
-        putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
-        if vlmMtpEnabled {
-            putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
-            putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
         }
 
         return out
@@ -2196,6 +2356,22 @@ final class ModelSettingsScreenVM: ObservableObject {
                 id: modelID,
                 name: original,
                 body: UpdateProfileRequest(newName: renamed)
+            )
+            await load(modelID: modelID, client: client)
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    /// Flip `expose_as_model` on a per-model profile via PUT. The body
+    /// carries only the flag (absent fields are merge-no-ops server-side);
+    /// reload picks up the derived `model_id` the profile serves under.
+    func setExposeAsModel(name: String, exposed: Bool, client: OMLXClient) async {
+        do {
+            _ = try await client.updateModelProfile(
+                id: modelID,
+                name: name,
+                body: UpdateProfileRequest(exposeAsModel: exposed)
             )
             await load(modelID: modelID, client: client)
         } catch {

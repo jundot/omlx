@@ -470,7 +470,6 @@ struct SaveAsPopover: View {
                                      comment: "Scope label for per-model profiles")),
                 ]
             )
-            .frame(width: 140)
             TextInput(text: $name,
                       placeholder: String(localized: "profile.save_as.name.placeholder",
                                           defaultValue: "profile-name",
@@ -528,6 +527,20 @@ struct ProfileDetailCard: View {
     var onUpdateFromWorking: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
     var onClosePreview: (() -> Void)? = nil
+    /// Server `expose_as_model` state for this profile. Only meaningful
+    /// when `onToggleExpose` is wired (model-scope profiles).
+    var exposeAsModel: Bool = false
+    /// Derived API model ID (`<base-model>:<profile-name>`) shown next to
+    /// the toggle while exposure is on.
+    var exposedModelId: String? = nil
+    /// Server-derived `has_engine_fields` — true when the profile carries
+    /// engine-construction overrides, which the exposed-model overlay
+    /// ignores. Shows a warning under the toggle while exposure is on.
+    var hasEngineFields: Bool = false
+    /// Non-nil renders the "Expose as model" toggle; the callback receives
+    /// the requested state. Pass nil for templates, presets, and the
+    /// defaults card.
+    var onToggleExpose: ((Bool) -> Void)? = nil
 
     @Environment(\.omlxTheme) private var theme
 
@@ -545,6 +558,7 @@ struct ProfileDetailCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
+            exposeRow
             sections
         }
         .padding(compact ? 12 : 14)
@@ -1032,6 +1046,50 @@ struct ProfileDetailCard: View {
             return dict.isEmpty ? nil : dict.count
         }
         return nil
+    }
+
+    /// "Expose as model" toggle — mirrors the web dashboard's checkbox on
+    /// per-model profiles. While on, the profile serves as its own model
+    /// ID on /v1/models, overlaying its settings on the base model.
+    @ViewBuilder
+    private var exposeRow: some View {
+        if let onToggleExpose {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Toggle(isOn: Binding(
+                        get: { exposeAsModel },
+                        set: { onToggleExpose($0) }
+                    )) {
+                        Text(String(localized: "profile.detail.expose_as_model",
+                                    defaultValue: "Expose as model",
+                                    comment: "Toggle on the profile detail card that publishes the profile as its own model ID"))
+                            .font(.omlxText(11.5, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    if exposeAsModel, let exposedModelId {
+                        Text(exposedModelId)
+                            .font(.omlxMono(11))
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .help(String(localized: "profile.detail.expose_as_model.help",
+                             defaultValue: "Serve this profile as its own model ID on /v1/models, sharing the base model's engine",
+                             comment: "Tooltip on the expose-as-model toggle"))
+                if exposeAsModel && hasEngineFields {
+                    Text(String(localized: "profile.detail.expose_as_model.engine_fields_hint",
+                                defaultValue: "Engine-level settings in this profile only take effect when it is applied to the base model — they don't change the exposed model.",
+                                comment: "Warning under the expose-as-model toggle when the profile carries engine-construction settings"))
+                        .font(.omlxText(10.5))
+                        .foregroundStyle(theme.amberDot)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 
     @ViewBuilder

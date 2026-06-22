@@ -33,6 +33,7 @@ class PoolingCache(_BaseCache):
         self.remainder = 0
 
         self.pooled = None
+        self._undo = None
 
     @property
     def offset(self):
@@ -45,6 +46,25 @@ class PoolingCache(_BaseCache):
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, self.ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, self.ratio, D2), dtype=gate.dtype)
+
+        # One-update undo log for MTP draft rejection: trim() needs the
+        # pre-update state plus this update's raw inputs to undo the last
+        # token when it completed a pool window. Only decode / MTP-verify
+        # sized updates (L <= 2) are ever trimmed; skipping the stash for
+        # prompt chunks avoids pinning large prefill projections. Buffer
+        # slices are taken before any mutation, so they reference the
+        # pre-update array node.
+        if L <= 2:
+            self._undo = (
+                self.buf_kv[:, : self.remainder] if self.remainder > 0 else None,
+                self.buf_gate[:, : self.remainder] if self.remainder > 0 else None,
+                self.remainder,
+                self.pooled,
+                kv,
+                gate,
+            )
+        else:
+            self._undo = None
 
         # Prompt mode
         if L > 1:
@@ -142,6 +162,7 @@ class PoolingCache(_BaseCache):
         if buf_kv is not None:
             self.accumulate_windows(buf_kv, buf_gate, 0)
         self.pooled = pooled
+        self._undo = None
 
     @property
     def meta_state(self):
@@ -152,11 +173,43 @@ class PoolingCache(_BaseCache):
         self.ratio = v
 
     def is_trimmable(self):
-        return self.pooled is None
+        # Trim-by-1 contract (MTP draft rejection): possible while the last
+        # token still sits in the remainder buffer, or via the one-update
+        # undo log when it completed a pool window.
+        if self.pooled is None or self.remainder >= 1:
+            return True
+        return self._can_undo(1)
+
+    def _can_undo(self, n):
+        undo = self._undo
+        if undo is None:
+            return False
+        k = undo[4].shape[1] - n
+        # The replayed confirmed prefix must stay inside the buffer (the
+        # original per-token inputs of a completed window are gone, so a
+        # replay that pools again cannot be reconstructed).
+        return k >= 0 and undo[2] + k < self.ratio
 
     def trim(self, n):
-        n = min(self.remainder, n)
-        self.remainder -= n
+        if n <= self.remainder:
+            self.remainder -= n
+            self._undo = None
+            return n
+        if not self._can_undo(n):
+            return 0
+        buf_kv, buf_gate, rem_prev, pooled_prev, kv, gate = self._undo
+        self._undo = None
+        k = kv.shape[1] - n
+        self.pooled = pooled_prev
+        self.remainder = rem_prev
+        if buf_kv is not None:
+            self.buf_kv[:, :rem_prev] = buf_kv
+            self.buf_gate[:, :rem_prev] = buf_gate
+        if k > 0:
+            # Replay the confirmed prefix; _can_undo guarantees it stays in
+            # the buffer, so no window is recompressed.
+            self.accumulate_windows(kv[:, :k], gate[:, :k], 0)
+            self._undo = None
         return n
 
     def size(self):
@@ -199,6 +252,7 @@ class BatchPoolingCache(_BaseCache):
 
         self._lengths = [2**31] * batch_size
         self._processed = [0] * batch_size
+        self._undo = None
 
     @property
     def offset(self):
@@ -221,6 +275,25 @@ class BatchPoolingCache(_BaseCache):
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, ratio, D2), dtype=gate.dtype)
+
+        # One-update undo log for MTP draft rejection (see PoolingCache).
+        # The buffer references are only consulted when a window completed,
+        # in which case this method rebinds self.buf_* to fresh arrays and
+        # the stashed objects keep the pre-update contents. The pooled
+        # tensor needs no snapshot: update_and_fetch only writes beyond the
+        # old _pool_lengths, so restoring the length lists is enough.
+        if L <= 2:
+            self._undo = (
+                self.buf_kv,
+                self.buf_gate,
+                list(self.remainder),
+                list(self._pool_lengths),
+                list(self._processed),
+                kv,
+                gate,
+            )
+        else:
+            self._undo = None
 
         valid_lengths = [min(l - p, L) for l, p in zip(self._lengths, self._processed)]
         if max(valid_lengths) != L:
@@ -371,6 +444,7 @@ class BatchPoolingCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.buf_kv, self.buf_gate, self.pooled = v
+        self._undo = None
 
     @property
     def meta_state(self):
@@ -381,13 +455,48 @@ class BatchPoolingCache(_BaseCache):
         self.ratio, self.remainder, self._pool_lengths, self._processed = v
 
     def is_trimmable(self):
-        return self.pooled is None
+        # Trim-by-1 contract (MTP draft rejection): possible while every
+        # row's last token still sits in the remainder buffer, or via the
+        # one-update undo log when a row completed a pool window.
+        if self.pooled is None or min(self.remainder) >= 1:
+            return True
+        return self._can_undo(1)
+
+    def _can_undo(self, n):
+        undo = self._undo
+        if undo is None:
+            return False
+        k = undo[5].shape[1] - n
+        # The replayed confirmed prefix must stay inside the buffer for
+        # every row (a replay that pools again cannot be reconstructed).
+        return k >= 0 and all(r + k < self.ratio for r in undo[2])
 
     def trim(self, n):
-        n = min(min(self.remainder), n)
-        for i in range(len(self.remainder)):
-            self.remainder[i] -= n
-            self._processed[i] -= n
+        if n <= min(self.remainder):
+            for i in range(len(self.remainder)):
+                self.remainder[i] -= n
+                self._processed[i] -= n
+            self._undo = None
+            return n
+        if not self._can_undo(n):
+            return 0
+        buf_kv, buf_gate, remainder, pool_lengths, processed, kv, gate = self._undo
+        self._undo = None
+        k = kv.shape[1] - n
+        # The undo path only triggers when some row completed a window,
+        # which rebinds self.buf_* to fresh arrays — the stashed objects
+        # still hold the pre-update contents. The pooled tensor keeps any
+        # extra written rows; restoring _pool_lengths masks them out.
+        self.buf_kv = buf_kv
+        self.buf_gate = buf_gate
+        self.remainder = list(remainder)
+        self._pool_lengths = list(pool_lengths)
+        self._processed = list(processed)
+        if k > 0:
+            # Replay the confirmed prefix; _can_undo guarantees it stays in
+            # the buffer, so no window is recompressed.
+            self.accumulate_windows(kv[:, :k], gate[:, :k], 0)
+            self._undo = None
         return n
 
     def size(self):

@@ -12,6 +12,7 @@ allowed keys.
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -71,18 +72,20 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
 )
 
 # Excluded — never stored in a profile or template.
-EXCLUDED_FROM_PROFILES = frozenset({
-    "is_pinned",
-    "is_default",
-    "display_name",
-    "description",
-    "model_alias",
-    "model_type_override",
-    "active_profile_name",
-    "ttl_seconds",
-    # Security flag must be explicit per model — never propagated via profiles.
-    "trust_remote_code",
-})
+EXCLUDED_FROM_PROFILES = frozenset(
+    {
+        "is_pinned",
+        "is_default",
+        "display_name",
+        "description",
+        "model_alias",
+        "model_type_override",
+        "active_profile_name",
+        "ttl_seconds",
+        # Security flag must be explicit per model — never propagated via profiles.
+        "trust_remote_code",
+    }
+)
 
 
 def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -105,6 +108,7 @@ class ModelProfile:
     display_name: str
     created_at: datetime
     updated_at: datetime
+    api_name: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     description: str | None = None
     source_template: str | None = None
@@ -113,6 +117,7 @@ class ModelProfile:
         return {
             "name": self.name,
             "display_name": self.display_name,
+            "api_name": self.api_name,
             "description": self.description,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -125,6 +130,7 @@ class ModelProfile:
         return cls(
             name=data["name"],
             display_name=data["display_name"],
+            api_name=data.get("api_name"),
             description=data.get("description"),
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
@@ -189,3 +195,17 @@ def validate_profile_name(name: str) -> None:
             f"Invalid profile/template name: {name!r}. "
             f"Must match ^[a-z0-9][a-z0-9_-]{{0,31}}$"
         )
+
+
+def slugify_profile_api_name(value: str | None, fallback: str = "profile") -> str:
+    """Derive a stable API-safe profile suffix from user-facing text."""
+    text = unicodedata.normalize("NFKD", value or "")
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+    text = re.sub(r"[^a-z0-9_-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-_")
+    if not text or not re.match(r"^[a-z0-9]", text):
+        text = fallback
+    text = text[:32].rstrip("-_")
+    if not text or not _NAME_RE.match(text):
+        text = fallback[:32].rstrip("-_") or "profile"
+    return text

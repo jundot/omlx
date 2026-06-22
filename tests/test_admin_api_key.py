@@ -152,6 +152,31 @@ class TestValidateApiKey:
         assert is_valid is False
         assert "printable" in msg
 
+    def test_non_ascii_accented(self):
+        # Printable but non-ASCII: passes isprintable(), caught by isascii().
+        # Such a key can never be matched over HTTP (headers are latin-1
+        # decoded), so it must be rejected at configuration time.
+        is_valid, msg = validate_api_key("café-key")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_emoji(self):
+        is_valid, msg = validate_api_key("key-\U0001f511")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_cyrillic(self):
+        is_valid, msg = validate_api_key("ключ-секрет")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_ascii_key_still_valid(self):
+        # Regression guard: ordinary ASCII keys remain valid after the
+        # ASCII-only rule was added.
+        is_valid, msg = validate_api_key("sk-abc123XYZ")
+        assert is_valid is True
+        assert msg == ""
+
 
 class TestVerifyApiKeyAdmin:
     """Tests for verify_api_key() constant-time comparison."""
@@ -356,6 +381,30 @@ class TestSubKeyCRUD:
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
             assert exc_info.value.status_code == 404
+        finally:
+            _restore_getter(original)
+
+    def test_delete_sub_key_lone_surrogate_returns_404(self):
+        """Regression for #1717: a lone-surrogate key must 404, not 500.
+
+        delete_sub_key compares request.key without a validate_api_key
+        gate, so the comparison itself must tolerate any str json.loads
+        can produce, including lone surrogates from escape sequences.
+        """
+        import json
+
+        from fastapi import HTTPException
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="real-sub-key")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key=json.loads('"\\ud800abcd"'))
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 404
+            assert len(mock_settings.auth.sub_keys) == 1
         finally:
             _restore_getter(original)
 
@@ -575,6 +624,28 @@ class TestStatsSecurity:
 
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
+
+    def test_active_models_data_ignores_enforcer_status_error(self):
+        """Admin stats should not fail when memory telemetry is unavailable."""
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [],
+            "current_model_memory": 123,
+            "final_ceiling": 456,
+        }
+        enforcer = MagicMock(spec=["get_status"])
+        enforcer.get_status.side_effect = RuntimeError("host_statistics64 failed")
+        state = SimpleNamespace(process_memory_enforcer=enforcer)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+        ):
+            result = admin_routes._build_active_models_data()
+
+        assert result["model_memory_used"] == 123
+        assert result["model_memory_max"] == 456
+        assert result["memory_pressure"]["enabled"] is False
 
     def test_stats_resolves_alias_on_read(self):
         """Per-model dropdown ID may be an alias; stats endpoint should resolve

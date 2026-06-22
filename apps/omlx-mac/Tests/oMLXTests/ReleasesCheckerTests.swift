@@ -56,6 +56,60 @@ final class ReleasesCheckerTests: XCTestCase {
         XCTAssertEqual(selected?.tagName, "v0.4.1.dev1")
     }
 
+    func testFindMatchingDMGSupportsMacOSRangeAssets() {
+        let sequoia = "oMLX-0.4.4-macos15-sequoia.dmg"
+        let tahoeAndNext = "oMLX-0.4.4-macos26-27.dmg"
+        let assets = [
+            asset(sequoia),
+            asset(tahoeAndNext),
+        ]
+
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 15
+            )?.name,
+            sequoia
+        )
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 26
+            )?.name,
+            tahoeAndNext
+        )
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 27
+            )?.name,
+            tahoeAndNext
+        )
+        XCTAssertNil(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 28
+            )
+        )
+    }
+
+    func testFindMatchingDMGPrefersExactAssetOverRangeAsset() {
+        let range = "oMLX-0.4.4-macos26-27.dmg"
+        let exact = "oMLX-0.4.4-macos27-beta.dmg"
+        let assets = [
+            asset(range),
+            asset(exact),
+        ]
+
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 27
+            )?.name,
+            exact
+        )
+    }
+
     private func release(
         _ tag: String,
         prerelease: Bool = false,
@@ -69,6 +123,14 @@ final class ReleasesCheckerTests: XCTestCase {
             prerelease: prerelease,
             draft: draft,
             assets: []
+        )
+    }
+
+    private func asset(_ name: String) -> GitHubRelease.Asset {
+        GitHubRelease.Asset(
+            name: name,
+            browserDownloadURL: URL(string: "https://example.com/\(name)")!,
+            size: 123
         )
     }
 }

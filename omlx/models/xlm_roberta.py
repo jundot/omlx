@@ -465,8 +465,16 @@ class Model(nn.Module):
             logits = self.classifier(sequence_output)
             pooled_output = self._process_outputs(logits)
 
-        # Normalized features for embeddings
-        text_embeds = mean_pooling(sequence_output, attention_mask)
+        # Normalized features for embeddings. Honor pooling_config.pooling_mode
+        # so models that require CLS pooling (e.g. BAAI bge-m3 dense, which is
+        # trained on the [CLS] token — mean pooling significantly degrades it)
+        # are served faithfully. Default "mean" preserves prior behavior for all
+        # other XLM-RoBERTa / BERT embedding models.
+        pooling_mode = (self.config.pooling_config or {}).get("pooling_mode", "mean")
+        if pooling_mode == "cls":
+            text_embeds = sequence_output[:, 0]
+        else:
+            text_embeds = mean_pooling(sequence_output, attention_mask)
         text_embeds = normalize_embeddings(text_embeds)
 
         return BaseModelOutput(

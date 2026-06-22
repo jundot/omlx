@@ -17,6 +17,7 @@ Also includes structured output (JSON Schema) utilities:
 """
 
 import ast
+import bisect
 import json
 import logging
 import re
@@ -24,11 +25,70 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from jsonschema import validate, ValidationError
+import regex
+from jsonschema import ValidationError, validate
 
-from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
+
+
+def _template_safe_description(value: Any) -> str:
+    """Return a string description safe for strict chat templates."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
+    """Copy JSON Schema data while filling missing schema descriptions."""
+    if isinstance(value, dict):
+        copied = {}
+        for key, child in value.items():
+            if key == "properties" and isinstance(child, dict):
+                copied[key] = {
+                    name: _copy_schema_with_template_defaults(
+                        prop_schema, is_schema=True
+                    )
+                    for name, prop_schema in child.items()
+                }
+            elif key in {
+                "items",
+                "additionalProperties",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+            }:
+                copied[key] = _copy_schema_with_template_defaults(child, is_schema=True)
+            elif key in {"oneOf", "anyOf", "allOf", "prefixItems"} and isinstance(
+                child, list
+            ):
+                copied[key] = [
+                    _copy_schema_with_template_defaults(item, is_schema=True)
+                    for item in child
+                ]
+            else:
+                copied[key] = _copy_schema_with_template_defaults(
+                    child, is_schema=False
+                )
+
+        if is_schema:
+            copied["description"] = _template_safe_description(
+                copied.get("description")
+            )
+        return copied
+
+    if isinstance(value, list):
+        return [
+            _copy_schema_with_template_defaults(item, is_schema=False) for item in value
+        ]
+
+    return value
 
 
 def _serialize_tool_call_arguments(arguments: Any) -> str:
@@ -384,12 +444,442 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
 # Gemma 4 robust fallback parser
 # ---------------------------------------------------------------------------
 
-def _gemma4_args_to_json_robust(args_str: str) -> dict:
-    """Convert Gemma 4 tool call args to a Python dict.
+# Gemma 4's non-standard string delimiter (mlx_lm.tool_parsers.gemma4 uses
+# the same literal in its regex).
+_GEMMA4_STR_DELIM = '<|"|>'
 
-    Handles the common failure cases that mlx-lm's parser cannot:
-    - Bare string values without ``<|"|>`` delimiters (e.g. ``{location: Tokyo}``)
-    - Spaces after commas in key-value pairs
+# Bounds for parsing model-emitted arguments.  Model output is untrusted and
+# attacker-influenceable (prompt injection can steer emissions verbatim), so
+# parsing must stay linear-time and bounded: breaching a bound is a clean
+# parse failure that flows into the existing drop-with-warning path, never an
+# exception that escapes the parse chain.
+_GEMMA4_MAX_ARGS_LEN = 262_144
+_GEMMA4_MAX_DEPTH = 64
+
+
+class _Gemma4ArgsTooComplexError(ValueError):
+    """A defensive bound (length/depth) was breached parsing args.
+
+    Distinct from an ordinary parse failure so the orchestrator can reject
+    hard rather than retry with the legacy parser: the bounds are DoS guards
+    against attacker-influenceable model output, and the legacy parser would
+    happily parse oversized/deeply-nested input and defeat them.  Subclasses
+    ValueError so the public parse chain still treats it as a clean drop.
+    """
+
+# A tool-call head: the name plus its opening ``{``.  Only the head is matched
+# by regex; the argument span is found by _scan_gemma4_args_span, not by a
+# recursive pattern (see that function).  The name segment captures namespaced
+# MCP names (colon/dot/hyphen separated, e.g.
+# call:google:mcp:text_generation:create-pdf-file, #1830).  The ``call:``
+# opener is made optional and tolerant — ``(?:call)?:?`` — so the diffusion
+# lane's degenerate prefixes (``calldone{`` missing the colon, ``:done{``
+# missing ``call``, #1837) still match; the fallback only runs on
+# marker-delimited content, so a permissive prefix cannot misfire on prose.
+#
+# Compiled with the ``regex`` module, NOT ``re``: once the ``call:`` literal
+# anchor became optional (above), ``re``'s engine restarts the greedy
+# ``[\w.-]+`` match at every position of a long bare argument value and
+# backtracks O(n^2) hunting an opening ``{`` that never comes, hanging on
+# adversarial output (a 300 KB bare value pegs a core indefinitely).  The
+# ``regex`` engine fails that same partial match fast, so finditer stays
+# linear.  See test_oversized_args_fail_cleanly.
+_GEMMA4_CALL_HEAD = regex.compile(r"(?:call)?:?([\w.-]+(?::[\w.-]+)*)\{")
+
+# The parenthesized variant of the head (#1846): under instruction-dense
+# agentic load (large system prompt + many tool schemas + a big tool result)
+# Gemma 4 26B reproducibly degrades from ``call:name{...}`` to a Python-kwargs
+# shell ``call:name(key=value, ...)`` — same name grammar and same ``<|"|>``
+# string quoting, only the OUTER ``{}`` becomes ``()`` and the top-level
+# ``:`` separator becomes ``=``.  The nested grammar (objects, arrays, strings)
+# is unchanged, so the hardened transcoder is reused for the inner content; only
+# the outer shell needs a separate head + span scan.  Compiled with ``regex``,
+# not ``re``, for the SAME reason as ``_GEMMA4_CALL_HEAD``: the optional/tolerant
+# prefix makes ``re`` backtrack O(n^2) on a long bare value hunting an opening
+# ``(`` that never comes (the #1854 ReDoS).  See test_oversized_paren_args.
+_GEMMA4_CALL_HEAD_PAREN = regex.compile(r"(?:call)?:?([\w.-]+(?::[\w.-]+)*)\(")
+
+# Matching close character for each balanced opener the parsers track.
+_GEMMA4_CLOSE_CHAR = {"{": "}", "[": "]", "(": ")"}
+
+
+def _squote_close_positions(s: str) -> list:
+    """Indices of single quotes that can CLOSE a single-quoted value.
+
+    A closing quote is one whose next non-whitespace character is ``,``,
+    ``}``, ``]``, ``)`` or end of input.  ``)`` is an anchor for the
+    parenthesized variant (#1846): a single-quoted value can be the last
+    argument right before the call's closing paren, as in
+    ``call:f(msg='hi')`` where the quote is followed immediately by ``)``.
+    The curly form never closes a value with ``)`` (its values end at
+    ``,``/``}``/``]``), so adding it does not change curly parsing.
+    Anchoring closes this way (rather than taking the first quote) keeps
+    apostrophes inside values from pairing across values: in
+    ``{a: 'it's ok', b: 1}`` the quote in ``it's`` is followed by ``s`` so
+    it cannot close the string.
+
+    Computed in one reverse pass so each lookup is O(log n) via bisect; a
+    forward scan that peeks past whitespace at every quote would be
+    quadratic on whitespace-heavy input, and this text is model-emitted.
+    """
+    closes: list[int] = []
+    next_sig = ""  # next non-whitespace char AFTER the current index
+    for idx in range(len(s) - 1, -1, -1):
+        ch = s[idx]
+        if ch == "'" and (next_sig == "" or next_sig in ",}])"):
+            closes.append(idx)
+        if not ch.isspace():
+            next_sig = ch
+    closes.reverse()
+    return closes
+
+
+def _scan_gemma4_args_span(
+    text: str, open_idx: int, squote_closes: list,
+    open_ch: str = "{", close_ch: str = "}",
+) -> int:
+    """Return the end index (exclusive) of the balanced ``open_ch...close_ch``
+    span starting at ``open_idx``, or -1 if no balanced span exists within
+    bounds.  Defaults to braces (the canonical ``call:name{...}`` form); the
+    parenthesized variant (#1846) passes ``(``/``)`` to find the call's outer
+    span — nested ``{}``/``[]`` then pass through as ordinary characters for
+    depth purposes (only the tracked pair is counted), while the string-skip
+    logic below is character-agnostic so a ``)`` inside any string still
+    cannot close the span.
+
+    Iterative single-pass walk that counts brace depth only OUTSIDE string
+    literals (``<|"|>``-paired strings, standard JSON double-quoted strings,
+    and anchored single-quoted values), so a brace inside string content
+    cannot truncate or unbalance the span.
+    This deliberately replaces a recursive regex:
+    - linear time: recursive alternation patterns degrade quadratically on
+      unbalanced model output (measured ~590ms at 80KB), an injection-driven
+      CPU burn on a server,
+    - iterative: RecursionError is a RuntimeError subclass that no except
+      tuple in the parse chain catches, so recursion on deeply nested model
+      output would escape as a 500.
+
+    A single-quoted string OPENS only at a value position (previous
+    significant char is ``:``, ``,`` or ``[``); a bare apostrophe anywhere
+    else (don't, it's) is ordinary content.
+    """
+    n = len(text)
+    depth = 0
+    last_sig = ""
+    i = open_idx
+    limit = min(n, open_idx + _GEMMA4_MAX_ARGS_LEN)
+    while i < limit:
+        if text.startswith(_GEMMA4_STR_DELIM, i):
+            close = text.find(_GEMMA4_STR_DELIM, i + len(_GEMMA4_STR_DELIM))
+            if close == -1:
+                return -1  # unterminated string: malformed, give up cleanly
+            i = close + len(_GEMMA4_STR_DELIM)
+            last_sig = '"'
+            continue
+        ch = text[i]
+        if ch == '"':
+            # Standard JSON double-quoted string. The <|"|> delimiter is
+            # matched by the startswith branch above before we reach here, so
+            # a bare ``"`` is an ordinary JSON string open: skip to its closing
+            # unescaped quote so a ``}`` inside the value cannot truncate the
+            # span (#1854 — without this the suffix remap turned the corrupted
+            # parse into an executable call with silently mangled arguments).
+            # Honors ``\"`` and ``\\`` so an escaped quote never closes early.
+            j = i + 1
+            while j < limit:
+                if text[j] == "\\":
+                    j += 2  # escaped char is literal, never closes the string
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            else:
+                return -1  # unterminated string within bounds: drop cleanly
+            i = j + 1
+            last_sig = '"'
+            continue
+        if ch == "'" and last_sig in ":=,[":
+            k = bisect.bisect_right(squote_closes, i)
+            if k < len(squote_closes):
+                i = squote_closes[k] + 1
+                last_sig = "'"
+                continue
+            # No valid close ahead: treat the quote as ordinary content.
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        if not ch.isspace():
+            last_sig = ch
+        i += 1
+    return -1
+
+
+def _gemma4_args_to_json_robust(args_str: str) -> dict:
+    """Convert Gemma 4 tool-call args to a Python dict.
+
+    Tries the strict single-pass transcoder first
+    (``_gemma4_transcode_to_json``); on failure, falls back to the legacy
+    key-anchored recovery (``_gemma4_args_to_json_legacy``) for the one
+    case the transcoder deliberately rejects: bare values that themselves
+    contain commas, braces, or newlines — long markdown emitted into an
+    ``answer:`` argument, observed live on the diffusion lane (#1837).
+    The transcoder stops bare values at the first structural separator, so
+    only key-anchored capture can recover that shape.
+    """
+    try:
+        return _gemma4_transcode_to_json(args_str)
+    except _Gemma4ArgsTooComplexError:
+        # Defensive bound breached: reject hard.  The legacy parser ignores
+        # these bounds and would parse the input anyway, defeating the DoS
+        # guard, so it must NOT see oversized/deeply-nested args.
+        raise
+    except (ValueError, json.JSONDecodeError):
+        # The legacy path's NUL-placeholder forge vector is reintroduced
+        # ONLY for ambiguous input the strict transcoder could not parse
+        # (e.g. bare multi-comma markdown values, #1837); the common path
+        # keeps the transcoder's no-placeholder, injection-safe guarantee.
+        return _gemma4_args_to_json_legacy(args_str)
+
+
+def _gemma4_transcode_to_json(args_str: str) -> dict:
+    """Transcode Gemma 4 tool-call args to a dict in a single pass.
+
+    Handles what mlx-lm's parser cannot:
+    - bare keys and values (``{location: Tokyo}``)
+    - single-quoted values, including commas/colons/braces/apostrophes
+      inside them (``{content: 'a, b: c'}``, #1830)
+    - ``<|"|>``-delimited strings, arrays, and nested objects
+
+    Implemented as a single-pass transcode to JSON text followed by one
+    ``json.loads`` after local length/depth checks.  Every piece of captured
+    string content is emitted through ``json.dumps`` and structural characters
+    are emitted only by the state machine, so model output cannot inject JSON
+    structure.  The legacy
+    implementation substituted ``\\x00N\\x00`` placeholders, which literal
+    NUL bytes in model output could forge, cross-contaminating argument
+    values; transcoding directly leaves nothing to forge.
+
+    Bare values stop at the first ``,``/``}``/``]`` by design: a bare value
+    that embeds those characters is ambiguous here, and the caller
+    (``_gemma4_args_to_json_robust``) recovers it via the legacy
+    key-anchored fallback.
+    """
+    if len(args_str) > _GEMMA4_MAX_ARGS_LEN:
+        raise _Gemma4ArgsTooComplexError("Gemma 4 args too large to parse")
+
+    squote_closes = _squote_close_positions(args_str)
+    n = len(args_str)
+    out: list[str] = []  # JSON text fragments
+    stack: list[str] = []  # open containers: "{" or "["
+    expect = "object"  # object | key | value | delim
+    i = 0
+
+    def _skip_ws(i: int) -> int:
+        while i < n and args_str[i].isspace():
+            i += 1
+        return i
+
+    def _read_marked_string(i: int):
+        """Read a <|"|>- or single-quoted string at i, or return None."""
+        if args_str.startswith(_GEMMA4_STR_DELIM, i):
+            close = args_str.find(
+                _GEMMA4_STR_DELIM, i + len(_GEMMA4_STR_DELIM)
+            )
+            if close == -1:
+                raise ValueError("unterminated Gemma 4 string")
+            return (
+                args_str[i + len(_GEMMA4_STR_DELIM): close],
+                close + len(_GEMMA4_STR_DELIM),
+            )
+        if args_str[i] == "'":
+            k = bisect.bisect_right(squote_closes, i)
+            if k < len(squote_closes):
+                close = squote_closes[k]
+                return args_str[i + 1: close], close + 1
+            # No anchored close ahead: not a string, treat as bare content.
+        return None
+
+    def _read_json_string(i: int):
+        """Read a standard double-quoted JSON string token verbatim."""
+        j = i + 1
+        while j < n:
+            if args_str[j] == "\\":
+                j += 2
+                continue
+            if args_str[j] == '"':
+                return args_str[i: j + 1], j + 1
+            j += 1
+        raise ValueError("unterminated double-quoted string")
+
+    while True:
+        i = _skip_ws(i)
+        if expect == "object":
+            # The outer container is ``{`` for the canonical form and ``(`` for
+            # the parenthesized variant (#1846).  Either way it is an object;
+            # we always emit ``{`` to JSON and remember the real opener on the
+            # stack so its matching closer (``}`` or ``)``) is accepted below.
+            if i >= n or args_str[i] not in "{(":
+                raise ValueError("Gemma 4 args must start with '{' or '('")
+            out.append("{")
+            stack.append(args_str[i])
+            i += 1
+            expect = "key"
+        elif expect == "key":
+            if i >= n:
+                raise ValueError("unterminated object")
+            if args_str[i] == _GEMMA4_CLOSE_CHAR[stack[-1]]:
+                # Empty object, or tolerated trailing comma.  Closer is ``}``
+                # for a ``{`` opener and ``)`` for the paren variant's ``(``.
+                if out and out[-1] == ", ":
+                    out.pop()
+                out.append("}")
+                stack.pop()
+                i += 1
+                expect = "delim"
+                continue
+            if args_str[i] == '"':
+                tok, i = _read_json_string(i)
+                key = json.loads(tok)
+            else:
+                marked = _read_marked_string(i)
+                if marked is not None:
+                    key, i = marked
+                else:
+                    # Bare key: everything up to the separator.  ``=`` is a
+                    # separator too for the parenthesized kwargs variant
+                    # (#1846), so it bounds the key just like ``:``.
+                    j = i
+                    while j < n and args_str[j] not in ":=,{}[]'\"":
+                        j += 1
+                    key = args_str[i:j].strip()
+                    if not key:
+                        raise ValueError("malformed object key")
+                    i = j
+            i = _skip_ws(i)
+            # Accept ``=`` as well as ``:`` — the parenthesized variant (#1846)
+            # uses ``key=value``.  This is applied universally (not only at top
+            # level), so it does widen the curly grammar to also accept ``=``
+            # separators; that is a strict superset, so every valid ``:``-based
+            # curly parse is unchanged and a previously-rejected ``{a = 1}`` now
+            # succeeds rather than corrupting anything.  ``=`` inside a value is
+            # untouched: strings are read atomically and bare values stop only
+            # at ``,``/``}``/``]`` (plus ``)`` when a paren container is open).
+            if i >= n or args_str[i] not in ":=":
+                raise ValueError("expected ':' or '=' after object key")
+            out.append(json.dumps(key))
+            out.append(": ")
+            i += 1
+            expect = "value"
+        elif expect == "value":
+            if i >= n:
+                raise ValueError("unterminated value")
+            ch = args_str[i]
+            if ch == "{" or ch == "[":
+                # Depth bound, not recursion: a breach must surface as a
+                # clean parse failure on the existing drop path, never as a
+                # RecursionError (uncaught by the parse chain's excepts).
+                if len(stack) >= _GEMMA4_MAX_DEPTH:
+                    raise _Gemma4ArgsTooComplexError(
+                        "Gemma 4 args nested too deeply"
+                    )
+                out.append(ch)
+                stack.append(ch)
+                i += 1
+                expect = "key" if ch == "{" else "value"
+                continue
+            if ch == "]" and stack and stack[-1] == "[":
+                # Empty array, or tolerated trailing comma.
+                if out and out[-1] == ", ":
+                    out.pop()
+                out.append("]")
+                stack.pop()
+                i += 1
+                expect = "delim"
+                continue
+            if ch == '"':
+                tok, i = _read_json_string(i)
+                out.append(tok)
+                expect = "delim"
+                continue
+            marked = _read_marked_string(i)
+            if marked is not None:
+                content, i = marked
+                out.append(json.dumps(content))
+                expect = "delim"
+                continue
+            # Bare value: runs to the next structural separator.  When the
+            # call uses the parenthesized outer shell (#1846), ``)`` also
+            # terminates a bare value so the closing paren of the call is not
+            # swallowed (``call:f(units=metric)`` — the value is ``metric``,
+            # not ``metric)``).  For the curly form ``)`` stays ordinary
+            # content so a value may legitimately contain parentheses
+            # (``{expr: f(x)}``).  ``(`` is only ever the outermost container,
+            # so its presence on the stack is the reliable signal.
+            stops = ",)}]" if "(" in stack else ",}]"
+            j = i
+            while j < n and args_str[j] not in stops:
+                j += 1
+            value = args_str[i:j].strip()
+            i = j
+            if not value:
+                raise ValueError("empty value")
+            low = value.lower()
+            if low in ("true", "false", "null"):
+                out.append(low)  # normalize case (models emit True/False)
+            else:
+                try:
+                    json.loads(value)  # already a valid scalar (number, ...)
+                    out.append(value)
+                except (json.JSONDecodeError, ValueError):
+                    out.append(json.dumps(value))
+            expect = "delim"
+        else:  # expect == "delim"
+            if not stack:
+                if i < n:
+                    raise ValueError("trailing data after args object")
+                break
+            if i >= n:
+                raise ValueError("unterminated args")
+            ch = args_str[i]
+            if ch == ",":
+                out.append(", ")
+                i += 1
+                # After a comma, an object (``{`` or the paren outer ``(``)
+                # expects a key; an array expects a value.
+                expect = "key" if stack[-1] in "{(" else "value"
+            elif stack[-1] in "{(" and ch == _GEMMA4_CLOSE_CHAR[stack[-1]]:
+                # Object close: ``}`` for ``{``, ``)`` for the paren outer.
+                out.append("}")
+                stack.pop()
+                i += 1
+            elif ch == "]" and stack[-1] == "[":
+                out.append("]")
+                stack.pop()
+                i += 1
+            else:
+                raise ValueError("malformed args structure")
+
+    result = json.loads("".join(out))
+    if not isinstance(result, dict):
+        raise ValueError("Gemma 4 args did not parse to an object")
+    return result
+
+
+def _gemma4_args_to_json_legacy(args_str: str) -> dict:
+    """Legacy regex-based Gemma 4 args parser (upstream #1837).
+
+    Kept as the last-resort fallback behind ``_gemma4_transcode_to_json``.
+    Its value over the transcoder is step 6: key-anchored value capture for
+    bare values that themselves contain commas, braces, or newlines (long
+    markdown emitted into an ``answer:`` argument, observed live on the
+    diffusion lane).  The transcoder stops bare values at the first
+    separator, so this is the only path that recovers that shape.
+
+    Carries the placeholder mechanism (``\\x00N\\x00``) the transcoder was
+    written to avoid; it runs only on input the transcoder already rejected.
     """
     import regex
 
@@ -427,43 +917,158 @@ def _gemma4_args_to_json_robust(args_str: str) -> dict:
         except (json.JSONDecodeError, ValueError):
             return f": {json.dumps(value)}{suffix}"
 
+    # Keep the pre-step-5 text: if step 5 fails, its partial quoting has
+    # corrupted multi-line bare values and step 6 must start clean.
+    pre_quote_text = text
     text = regex.sub(
         r"(:\s*)([^\",\[\]{}\s][^,}]*?)(\s*[,}])", _quote_bare, text
     )
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 6. Last resort: key-anchored value capture. Bare values that
+    # themselves contain commas, braces, or newlines (e.g. long markdown
+    # emitted into an ``answer:`` argument — observed live on the
+    # diffusion lane) defeat the per-pair regex in step 5. Anchor on the
+    # quoted keys produced by step 2 and treat everything between a
+    # key's colon and the next key (or the end) as that key's value.
+    # Operates on the pre-step-5 text so step 5's partial quoting cannot
+    # corrupt the captured values.
+    inner = pre_quote_text.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    key_pat = regex.compile(r'"([A-Za-z_]\w*)"\s*:')
+    key_matches = list(key_pat.finditer(inner))
+    if not key_matches:
+        return json.loads(text)  # re-raise original-style error
+    result: dict = {}
+    for i, km in enumerate(key_matches):
+        value_start = km.end()
+        value_end = (
+            key_matches[i + 1].start() if i + 1 < len(key_matches) else len(inner)
+        )
+        raw_value = inner[value_start:value_end].strip()
+        if i + 1 < len(key_matches):
+            raw_value = raw_value.rstrip().rstrip(",").rstrip()
+        try:
+            result[km.group(1)] = json.loads(raw_value)
+        except (json.JSONDecodeError, ValueError):
+            result[km.group(1)] = raw_value
+    return result
 
 
 def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     """Robust fallback parser for Gemma 4 ``call:name{args}`` format.
 
-    Activated only for Gemma 4 models (guarded by ``tool_call_start`` check).
-    Extends mlx-lm's parser to handle:
-    - Bare string values without ``<|"|>`` delimiters
-    - Colons / dots / hyphens in function names
-    """
-    import regex
+    Activated only for Gemma 4 models (guarded by the ``tool_call_start``
+    check at the call site).  Extends mlx-lm's parser to handle:
+    - colons / dots / hyphens in function names (namespaced MCP tools,
+      e.g. ``call:google:mcp:text_generation:create-pdf-file``, #1830)
+    - bare string values without ``<|"|>`` delimiters
+    - single-quoted values, including commas, colons, braces and
+      apostrophes inside them (#1830)
+    - the parenthesized kwargs variant ``call:name(key=value, ...)`` that
+      Gemma 4 26B degrades to under instruction-dense agentic load (#1846).
+      The nested grammar is identical to the curly form, so only the outer
+      ``()`` shell and the ``=`` separator are new; both head forms are
+      collected and processed in document order (see below).
+    - degenerate ``call:`` prefixes from the diffusion lane's parallel
+      denoising, which can drop a token from the opening (observed live:
+      ``calldone{...}`` — missing colon — and ``:done{...}`` — missing
+      ``call``, #1837).  ``_GEMMA4_CALL_HEAD`` matches these; the text is
+      already marker-delimited (between ``<|tool_call>`` and
+      ``<tool_call|>``), so the permissive prefix cannot misfire on prose.
 
-    pattern = regex.compile(
-        r"call:([\w:.-]+)(\{(?:[^{}]|(?2))*\})", regex.DOTALL
-    )
-    matches = list(pattern.finditer(text))
-    if not matches:
-        raise ValueError("No function call found in Gemma 4 format")
+    Name remapping onto registered tools is deliberately NOT done here:
+    that is a post-parse concern handled by ``_remap_tool_call_names`` so
+    it covers every producer path (native parser, this fallback, XML
+    recovery, thinking-content promotion), not just this one.
+    """
+    squote_closes = _squote_close_positions(text)
+
+    # Collect heads from both the canonical curly form and the parenthesized
+    # variant (#1846), then process them in document order so the consumed-span
+    # dedup below holds across BOTH forms: a curly head that falls inside an
+    # already-consumed paren span (the inner ``{...}`` of ``call:f(a={...})``)
+    # is string/structure content, not a sibling call, and must be skipped.
+    heads = [(m.start(), m, "{", "}") for m in _GEMMA4_CALL_HEAD.finditer(text)]
+    heads += [
+        (m.start(), m, "(", ")")
+        for m in _GEMMA4_CALL_HEAD_PAREN.finditer(text)
+    ]
+    heads.sort(key=lambda h: h[0])
 
     results = []
-    for match in matches:
-        func_name = match.group(1)
-        args_str = match.group(2)
-
-        # Try standard JSON first (model may emit valid JSON args)
+    consumed_until = 0
+    for start, m, open_ch, close_ch in heads:
+        # A head inside an already-consumed args span is string content
+        # (e.g. quoted prose mentioning a tool call), not a sibling call.
+        if start < consumed_until:
+            continue
+        open_idx = m.end() - 1
+        end = _scan_gemma4_args_span(
+            text, open_idx, squote_closes, open_ch, close_ch
+        )
+        if end == -1:
+            continue
+        args_str = text[open_idx:end]
         try:
-            arguments = json.loads(args_str)
-        except json.JSONDecodeError:
             arguments = _gemma4_args_to_json_robust(args_str)
+        except (ValueError, json.JSONDecodeError, RecursionError):
+            continue  # one malformed call must not drop its siblings
+        if not isinstance(arguments, dict):
+            continue
+        results.append({"name": m.group(1), "arguments": arguments})
+        consumed_until = end
 
-        results.append({"name": func_name, "arguments": arguments})
-
+    if not results:
+        raise ValueError("No function call found in Gemma 4 format")
     return results[0] if len(results) == 1 else results
+
+
+def _remap_tool_call_names(
+    tool_calls: List[ToolCall], tools: Optional[List]
+) -> None:
+    """Remap namespace-prefixed emitted tool names onto registered tools.
+
+    Gemma 4 emits names like ``google:mcp:text_generation:create-pdf-file``
+    for a tool registered as ``create-pdf-file`` (#1830); clients match by
+    exact name, so the call would be unusable.  Runs post-parse so every
+    producer path is covered and so the behavior survives changes to
+    mlx-lm's native parser (which currently rejects colon names and routes
+    these to the fallback, but may not forever).
+
+    Rule: remap only when the emitted name matches no registered tool AND
+    exactly one registered tool is a ``:``-boundary suffix of it; on zero
+    or several candidates keep the name verbatim.  The comparison is
+    boundary-aligned by construction (split on ':'), never str.endswith:
+    a bare endswith would let a crafted emission like 'evilcreate-pdf-file'
+    coerce into a registered 'create-pdf-file' (model output is
+    attacker-influenceable via prompt injection).
+    """
+    if not tool_calls or not tools:
+        return
+    valid_names = _extract_tool_names(tools)
+    if not valid_names:
+        return
+    for tc in tool_calls:
+        name = tc.function.name if tc.function else ""
+        if not name or name in valid_names or ":" not in name:
+            continue
+        parts = name.split(":")
+        suffixes = {":".join(parts[i:]) for i in range(1, len(parts))}
+        candidates = suffixes & valid_names
+        if len(candidates) == 1:
+            target = next(iter(candidates))
+            logger.info(
+                "Remapped namespaced tool call name %r to registered "
+                "tool %r",
+                name[:200],
+                target,
+            )
+            tc.function.name = target
 
 
 def parse_tool_calls(
@@ -477,6 +1082,13 @@ def parse_tool_calls(
     Uses mlx-lm's TokenizerWrapper tool parser if available, otherwise
     falls back to generic XML tool call parsing for models like GLM.
 
+    Emitted names that match no registered tool are conservatively remapped
+    onto registered tools afterwards (see _remap_tool_call_names); doing it
+    here, at the single post-parse chokepoint, covers every producer path
+    including the thinking-content promotion in
+    extract_tool_calls_with_thinking, whose exact-name validity filter would
+    otherwise silently drop cleanly-parsed namespaced calls (#1830).
+
     Args:
         text: Raw model output text
         tokenizer: mlx-lm's TokenizerWrapper (required)
@@ -487,6 +1099,18 @@ def parse_tool_calls(
         - cleaned_text: Text with tool call tags and thinking tags removed
         - tool_calls: List of ToolCall objects, or None if no tool calls found
     """
+    cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
+    if tool_calls:
+        _remap_tool_call_names(tool_calls, tools)
+    return cleaned_text, tool_calls
+
+
+def _parse_tool_calls_impl(
+    text: str,
+    tokenizer: Any,
+    tools: Optional[List] = None,
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
 
     # Remove thinking tags if present (reasoning models)
@@ -832,6 +1456,7 @@ class ToolCallStreamFilter:
         if marker_end is None:
             marker_end = ""
         self._marker_pairs: List[Tuple[str, str]] = [
+            ("]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>"),
             ("<|tool_call_start|>", "<|tool_call_end|>"),
             ("<tool_call>", "</tool_call>"),
         ]
@@ -1003,6 +1628,11 @@ class ToolCallStreamFilter:
 
         for marker, _close in self._marker_pairs:
             if marker.startswith(tail):
+                # MiniMax M3 markers start with ``]``. A single closing
+                # bracket at end-of-stream is much more likely to be literal
+                # prose than an incomplete MiniMax control marker.
+                if tail == "]":
+                    continue
                 return True
 
         for close_marker in self._orphan_close_markers:
@@ -1150,6 +1780,9 @@ class ToolCallStreamFilter:
 
         if keep:
             buf = self._buffer[:-keep]
+            tail = self._buffer[-keep:]
+            if not self._should_drop_tail_at_finish(tail):
+                buf += tail
         else:
             buf = self._buffer
         self._buffer = ""
@@ -1203,13 +1836,18 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
                     tool_func, "parameters", {"type": "object", "properties": {}}
                 )
 
+            if func_params is None:
+                func_params = {"type": "object", "properties": {}}
+
             converted.append(
                 {
                     "type": "function",
                     "function": {
                         "name": func_name,
-                        "description": func_desc,
-                        "parameters": func_params,
+                        "description": _template_safe_description(func_desc),
+                        "parameters": _copy_schema_with_template_defaults(
+                            func_params, is_schema=False
+                        ),
                     },
                 }
             )

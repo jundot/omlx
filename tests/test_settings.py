@@ -11,6 +11,8 @@ from unittest.mock import patch
 import pytest
 
 from omlx.settings import (
+    BURST_DECODE_MODES,
+    DEFAULT_BURST_DECODE_MODE,
     AuthSettings,
     CacheSettings,
     ClaudeCodeSettings,
@@ -25,11 +27,13 @@ from omlx.settings import (
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
+    burst_decode_env,
     get_settings,
     get_ssd_capacity,
     get_system_memory,
     init_settings,
     reset_settings,
+    resolve_default_base_path,
 )
 
 
@@ -45,6 +49,8 @@ class TestServerSettings:
         assert settings.cors_origins == ["*"]
         assert settings.sse_keepalive_mode == "chunk"
         assert settings.auto_start_on_launch is True
+        assert settings.burst_decode_mode == "balanced"
+        assert settings.preserve_mid_system_cache is True
 
     def test_custom_values(self):
         """Test custom values."""
@@ -71,6 +77,8 @@ class TestServerSettings:
             "server_aliases": [],
             "sse_keepalive_mode": "chunk",
             "auto_start_on_launch": True,
+            "burst_decode_mode": "balanced",
+            "preserve_mid_system_cache": True,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -79,6 +87,29 @@ class TestServerSettings:
             settings = ServerSettings.from_dict({"sse_keepalive_mode": mode})
             assert settings.sse_keepalive_mode == mode
             assert settings.to_dict()["sse_keepalive_mode"] == mode
+
+    def test_from_dict_burst_decode_mode(self):
+        """burst_decode_mode round-trips through from_dict / to_dict."""
+        for mode in BURST_DECODE_MODES:
+            settings = ServerSettings.from_dict({"burst_decode_mode": mode})
+            assert settings.burst_decode_mode == mode
+            assert settings.to_dict()["burst_decode_mode"] == mode
+
+    def test_from_dict_burst_decode_mode_default(self):
+        """A settings.json without burst_decode_mode falls back to the default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.burst_decode_mode == DEFAULT_BURST_DECODE_MODE
+
+    def test_from_dict_preserve_mid_system_cache(self):
+        """preserve_mid_system_cache round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"preserve_mid_system_cache": False})
+        assert settings.preserve_mid_system_cache is False
+        assert settings.to_dict()["preserve_mid_system_cache"] is False
+
+    def test_from_dict_preserve_mid_system_cache_default(self):
+        """Missing preserve_mid_system_cache keeps the cache-friendly default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.preserve_mid_system_cache is True
 
     def test_from_dict_auto_start_on_launch(self):
         """auto_start_on_launch round-trips through from_dict / to_dict."""
@@ -128,6 +159,40 @@ class TestServerSettings:
         assert settings.port == 9000
         assert settings.log_level == "info"  # default
         assert settings.cors_origins == ["*"]  # default
+
+
+class TestBurstDecodeEnv:
+    """Tests for the Burst Decode mode -> OMLX_DECODE_BURST_* env mapping."""
+
+    def test_off_disables_bursting(self):
+        """'off' caps max_steps at 1, which disables bursting in _step_burst."""
+        assert burst_decode_env("off")["OMLX_DECODE_BURST_MAX_STEPS"] == "1"
+
+    def test_levels_set_single_request_budget(self):
+        """light / balanced / aggressive map to the documented budgets."""
+        assert burst_decode_env("light")["OMLX_DECODE_BURST_BUDGET_SINGLE_S"] == "0.05"
+        assert (
+            burst_decode_env("balanced")["OMLX_DECODE_BURST_BUDGET_SINGLE_S"] == "0.1"
+        )
+        assert (
+            burst_decode_env("aggressive")["OMLX_DECODE_BURST_BUDGET_SINGLE_S"] == "0.2"
+        )
+
+    def test_on_levels_keep_burst_enabled(self):
+        """The on-levels keep max_steps above the disable threshold."""
+        for mode in ("light", "balanced", "aggressive"):
+            assert int(burst_decode_env(mode)["OMLX_DECODE_BURST_MAX_STEPS"]) > 1
+
+    def test_unknown_mode_falls_back_to_default(self):
+        """An unknown mode never disables bursting; it uses the default."""
+        assert burst_decode_env("bogus") == burst_decode_env(DEFAULT_BURST_DECODE_MODE)
+
+    def test_keys_match_engine_config_env_vars(self):
+        """The mapping only sets the env vars EngineConfig actually reads."""
+        assert set(burst_decode_env("balanced")) == {
+            "OMLX_DECODE_BURST_MAX_STEPS",
+            "OMLX_DECODE_BURST_BUDGET_SINGLE_S",
+        }
 
 
 class TestModelSettings:
@@ -1550,6 +1615,35 @@ class TestHelperFunctions:
         memory = get_system_memory()
         assert isinstance(memory, int)
 
+    def test_get_system_memory_uses_sysconf_before_compat(self):
+        """macOS should not depend on psutil's HOST_VM_INFO64 adapter."""
+
+        def fake_sysconf(name):
+            if name == "SC_PHYS_PAGES":
+                return 123
+            if name == "SC_PAGE_SIZE":
+                return 4096
+            raise ValueError(name)
+
+        with (
+            patch("omlx.settings.os.sysconf", side_effect=fake_sysconf),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                side_effect=AssertionError("compat should not be called"),
+            ),
+        ):
+            assert get_system_memory() == 123 * 4096
+
+    def test_get_system_memory_falls_back_to_compat_when_sysconf_fails(self):
+        with (
+            patch("omlx.settings.os.sysconf", side_effect=ValueError("unsupported")),
+            patch(
+                "omlx.utils.psutil_compat.get_total_memory",
+                return_value=32 * 1024**3,
+            ),
+        ):
+            assert get_system_memory() == 32 * 1024**3
+
     def test_get_ssd_capacity(self):
         """Test SSD capacity detection."""
         capacity = get_ssd_capacity(Path("/"))
@@ -1576,6 +1670,57 @@ class TestHelperFunctions:
         """Test SSD capacity with tilde path expansion."""
         capacity = get_ssd_capacity("~/")
         assert capacity > 0
+
+
+class TestResolveDefaultBasePath:
+    """Tests for resolve_default_base_path()."""
+
+    def test_falls_back_to_default_when_nothing_configured(self, monkeypatch):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        monkeypatch.setattr(
+            "omlx.settings.BASE_PATH_BOOTSTRAP_FILE",
+            Path("/nonexistent/oMLX/base-path"),
+        )
+        assert resolve_default_base_path() == Path.home() / ".omlx"
+
+    def test_uses_bootstrap_file_when_present(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        custom_base = tmp_path / "external-ssd" / "omlx-data"
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text(f"{custom_base}\n", encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+
+        assert resolve_default_base_path() == custom_base.resolve()
+
+    def test_env_var_wins_over_bootstrap_file(self, monkeypatch, tmp_path):
+        env_base = tmp_path / "env-base"
+        bootstrap_base = tmp_path / "bootstrap-base"
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text(str(bootstrap_base), encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+        monkeypatch.setenv("OMLX_BASE_PATH", str(env_base))
+
+        assert resolve_default_base_path() == env_base.resolve()
+
+    def test_empty_bootstrap_file_falls_back_to_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OMLX_BASE_PATH", raising=False)
+        bootstrap_file = tmp_path / "base-path"
+        bootstrap_file.write_text("   \n", encoding="utf-8")
+        monkeypatch.setattr("omlx.settings.BASE_PATH_BOOTSTRAP_FILE", bootstrap_file)
+
+        assert resolve_default_base_path() == Path.home() / ".omlx"
+
+    def test_global_settings_load_uses_resolver_when_no_base_path_given(
+        self, monkeypatch, tmp_path
+    ):
+        resolved = tmp_path / "resolved-base"
+        monkeypatch.setattr(
+            "omlx.settings.resolve_default_base_path", lambda: resolved
+        )
+
+        settings = GlobalSettings.load()
+
+        assert settings.base_path == resolved
 
 
 class TestSettingsVersionMigration:
@@ -1712,9 +1857,7 @@ class TestSamplingSettings:
         d = unset.to_dict()
         assert d["max_context_window_policy"] is None
         # Setting an explicit value round-trips
-        with_policy = SamplingSettings.from_dict(
-            {"max_context_window_policy": 128_000}
-        )
+        with_policy = SamplingSettings.from_dict({"max_context_window_policy": 128_000})
         assert with_policy.max_context_window_policy == 128_000
         assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
@@ -1815,12 +1958,81 @@ class TestClaudeCodeSettings:
 
 
 class TestIntegrationSettings:
-    """Tests for IntegrationSettings dataclass."""
+    """Tests for IntegrationSettings dataclass.
+
+    Upstream ``tests/test_integrations.py::TestIntegrationSettings`` already
+    covers defaults, basic to_dict, and full/empty from_dict. The local
+    tests below add: exact dict-shape pinning (so a future field
+    addition that forgets to_dict raises a loud test failure — see
+    81dc2d5 for the MemorySettings case), partial-dict fallback,
+    explicit-null override semantics, and round-trip identity. Plus
+    upstream's MarkItDown-integration tests merged in below.
+    """
+
+    def test_to_dict_defaults(self):
+        settings = IntegrationSettings()
+        d = settings.to_dict()
+        # Pin only the integration-model surface — MarkItDown additions
+        # are covered by ``test_markitdown_defaults`` separately, so we
+        # check the model fields exactly and leave the rest free to
+        # grow.
+        assert d["codex_model"] is None
+        assert d["opencode_model"] is None
+        assert d["openclaw_model"] is None
+        assert d["hermes_model"] is None
+        assert d["pi_model"] is None
+        assert d["copilot_model"] is None
+        assert d["openclaw_tools_profile"] == "coding"
+
+    def test_to_dict_custom(self):
+        settings = IntegrationSettings(
+            codex_model="qwen-coder-30b",
+            opencode_model="qwen-coder-7b",
+            openclaw_model="qwen-coder-3b",
+            hermes_model="hermes-3-8b",
+            pi_model="qwen-3-4b",
+            copilot_model="qwen-coder-1.5b",
+            openclaw_tools_profile="creative",
+        )
+        d = settings.to_dict()
+        assert d["codex_model"] == "qwen-coder-30b"
+        assert d["opencode_model"] == "qwen-coder-7b"
+        assert d["openclaw_model"] == "qwen-coder-3b"
+        assert d["hermes_model"] == "hermes-3-8b"
+        assert d["pi_model"] == "qwen-3-4b"
+        assert d["copilot_model"] == "qwen-coder-1.5b"
+        assert d["openclaw_tools_profile"] == "creative"
+
+    def test_from_dict_partial(self):
+        """Missing keys fall back to dataclass defaults."""
+        settings = IntegrationSettings.from_dict({"pi_model": "qwen-3-4b"})
+        assert settings.pi_model == "qwen-3-4b"
+        assert settings.codex_model is None
+        assert settings.copilot_model is None
+        assert settings.openclaw_tools_profile == "coding"
+
+    def test_from_dict_explicit_null_overrides_default(self):
+        """Explicit None for a *_model field must be preserved."""
+        settings = IntegrationSettings.from_dict({"codex_model": None, "pi_model": "x"})
+        assert settings.codex_model is None
+        assert settings.pi_model == "x"
+
+    def test_round_trip(self):
+        """to_dict → from_dict → to_dict is identity."""
+        original = IntegrationSettings(
+            codex_model="m1",
+            pi_model="m2",
+            openclaw_tools_profile="custom",
+        )
+        round_tripped = IntegrationSettings.from_dict(original.to_dict())
+        assert round_tripped.to_dict() == original.to_dict()
+
+    # --- MarkItDown integration tests merged in from upstream ---
 
     def test_markitdown_defaults(self):
         settings = IntegrationSettings()
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"
@@ -1843,7 +2055,7 @@ class TestIntegrationSettings:
     def test_markitdown_from_dict_backward_compat(self):
         settings = IntegrationSettings.from_dict({})
         assert settings.markitdown_enabled is True
-        assert settings.markitdown_expose_model is True
+        assert settings.markitdown_expose_model is False
         assert settings.markitdown_max_file_size_mb == 25
         assert settings.markitdown_max_files_per_request == 5
         assert settings.markitdown_pdf_processing_engine == "markitdown"

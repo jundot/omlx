@@ -2964,6 +2964,24 @@
                 return { ...(this.snapshotGenerationSettings() || {}) };
             },
 
+            buildContentForApi(content) {
+                if (!Array.isArray(content)) return content ?? null;
+                const parts = [];
+                for (const part of content) {
+                    if (part?.type !== 'file') {
+                        parts.push(part);
+                        continue;
+                    }
+                    const file = part.file || {};
+                    const data = file.file_data || file.data;
+                    if (typeof data !== 'string' || !data.trim()) {
+                        continue;
+                    }
+                    parts.push(part);
+                }
+                return parts.length ? parts : '';
+            },
+
             buildMessagesForApi(messages, systemPrompt, opts = {}) {
                 const variantUserIndex = opts.variantUserIndex ?? null;
                 const excludeVariantsAtUserIndex = opts.excludeVariantsAtUserIndex ?? null;
@@ -2974,7 +2992,7 @@
                 const out = this.getApiTurnMessages(messages, excludeVariantsAtUserIndex, regenChainId)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
-                        const m = { role: msg.role, content: msg.content ?? null };
+                        const m = { role: msg.role, content: this.buildContentForApi(msg.content) };
                         if (msg.reasoning_content) {
                             m.reasoning_content = msg.reasoning_content;
                         }

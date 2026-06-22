@@ -32,10 +32,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Process-wide flag read by the patched ``Model.__init__`` (Qwen3.5/3.6 +
-# DeepSeek-V4) to decide whether to attach the MTP head module. Caller
-# (``utils/model_loading.py::maybe_apply_pre_load_patches``) sets this
+# Process-wide construction flag read by the patched ``Model.__init__``
+# (Qwen3.5/3.6 + DeepSeek-V4) to decide whether to attach the MTP head module.
+# Caller (``utils/model_loading.py::maybe_apply_pre_load_patches``) sets this
 # right before ``mlx_lm.load()`` runs based on ``model_settings.mtp_enabled``.
+# Decode-time eligibility is stored on each loaded model instance instead.
 # Default False keeps newly-loaded models MTP-free unless explicitly opted in.
 _MTP_ACTIVE = False
 
@@ -44,9 +45,11 @@ def set_mtp_active(active: bool) -> None:
     """Toggle whether subsequent ``mlx_lm.load()`` calls attach the MTP head.
 
     Affects ``self.mtp`` attachment in patched ``Model.__init__`` (and
-    DeepSeek-V4 equivalent) and is checked by BatchGenerator's
-    ``_is_mtp_eligible`` (via the presence of the ``mtp`` attribute).
-    Single-thread MLX executor serializes loads, so this is race-free.
+    DeepSeek-V4 equivalent). Patched model instances persist the load-time
+    decode decision on ``_omlx_mtp_decode_enabled``; BatchGenerator reads that
+    per-instance marker so later model loads cannot change existing models.
+    Single-thread MLX executor serializes loads, so the construction flag is
+    race-free.
     """
     global _MTP_ACTIVE
     _MTP_ACTIVE = bool(active)

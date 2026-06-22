@@ -7,9 +7,12 @@ Uses real openai_harmony encoding for accurate testing.
 """
 
 import pytest
-from openai_harmony import load_harmony_encoding
 
-from omlx.adapter.harmony import HarmonyStreamingParser, preprocess_harmony_messages
+from omlx.adapter.harmony import (
+    HarmonyStreamingParser,
+    load_harmony_gpt_oss_encoding,
+    preprocess_harmony_messages,
+)
 
 
 class RealTokenizer:
@@ -27,10 +30,10 @@ class RealTokenizer:
             return -1
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def harmony_encoding():
     """Get the real openai_harmony encoding."""
-    return load_harmony_encoding("HarmonyGptOss")
+    return load_harmony_gpt_oss_encoding()
 
 
 @pytest.fixture
@@ -301,23 +304,27 @@ class TestHarmonyEdgeCases:
         # Should have no content tokens
         assert stream_tokens == []
 
-    def test_unknown_channel_buffers_content(self, parser, harmony_encoding):
-        """Test handling of unknown channel names."""
+    def test_unknown_channel_without_recipient_falls_back_to_final(
+        self, parser, harmony_encoding
+    ):
+        """Test handling of malformed channel names."""
         # Note: openai_harmony may handle unknown channels differently
         tokens = harmony_encoding.encode(
             "<|channel|>someunknownchannel<|message|>content<|end|>",
             allowed_special="all",
         )
 
-        results = []
+        stream_tokens = []
+        visible_tokens = []
         for token in tokens:
-            control, stream_token, visible_token, _ = parser.process_token(token)
-            results.append((stream_token, visible_token))
+            _, stream_token, visible_token, _ = parser.process_token(token)
+            if stream_token is not None:
+                stream_tokens.append(stream_token)
+            if visible_token is not None:
+                visible_tokens.append(visible_token)
 
-        # Unknown channel should not output to stream or visible
-        content_outputs = [(s, v) for s, v in results if s is not None or v is not None]
-        # Content from unknown channels should be buffered, not output
-        assert len(content_outputs) == 0
+        assert "content" in harmony_encoding.decode(stream_tokens)
+        assert "content" in harmony_encoding.decode(visible_tokens)
 
     def test_consecutive_analysis_channels(self, parser, harmony_encoding):
         """Test multiple consecutive analysis channels."""

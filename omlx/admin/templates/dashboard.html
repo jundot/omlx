@@ -81,6 +81,11 @@
             </div>
         </div>
     </div>
+
+    <!-- Floating tooltip shared by preset/profile/API pills. -->
+    <div x-show="tip.visible" x-cloak x-text="tip.text"
+         class="fixed z-[60] max-w-sm px-2.5 py-1 text-left text-xs font-medium text-white bg-neutral-800 rounded-md whitespace-pre-line pointer-events-none -translate-x-1/2"
+         :style="`top: ${tip.y}px; left: ${tip.x}px`"></div>
 </div>
 {% endblock %}
 
