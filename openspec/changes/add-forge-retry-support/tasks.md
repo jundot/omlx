@@ -36,6 +36,6 @@
 
 ## 6. Documentation
 
-- [ ] 6.1 Update `docs/tool-call-guardrails.md` — add "Client-Side Retry Loops" section with: budget metadata explanation, clean-batch reset rule, reference retry loop code example
-- [ ] 6.2 Add "Context Compaction" section to docs — explain 3 strategies, when to use each, configuration
-- [ ] 6.3 Update `docs/forge-integration-plan.md` — mark Phase 3+4 as implemented via Change B
+- [x] 6.1 Update `docs/tool-call-guardrails.md` — add "Client-Side Retry Loops" section with: budget metadata explanation, clean-batch reset rule, reference retry loop code example
+- [x] 6.2 Add "Context Compaction" section to docs — explain 3 strategies, when to use each, configuration
+- [x] 6.3 Update `docs/forge-integration-plan.md` — mark Phase 3+4 as implemented via Change B

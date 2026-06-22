@@ -146,9 +146,108 @@ When `strict_tool_args: true`, malformed arguments are preserved as-is in the re
 - `x_omlx_validation` is a non-standard extension field — existing OpenAI/Anthropic clients ignore it
 - All features are opt-in — zero behavior change when disabled
 
+## Client-Side Retry Loops
+
+When validation fails, the `x_omlx_validation` extension includes budget hints that tell clients how many retries are reasonable. The server is stateless — it does NOT track retry counts per session. Clients track counts locally.
+
+### Budget Metadata
+
+```json
+{
+  "x_omlx_validation": {
+    "passed": false,
+    "checks": [...],
+    "nudge": {"role": "tool", "content": "...", "kind": "unknown_tool", "tier": 0},
+    "budget": {
+      "max_retries": 3,
+      "max_tool_errors": 2
+    }
+  }
+}
+```
+
+### Clean-Batch Reset Rule
+
+Only a **fully successful tool-call batch** (all tools succeed) resets the tool-error counter. A single success among failures does NOT reset. This prevents the model from oscillating between success and failure indefinitely.
+
+### Reference Retry Loop
+
+```python
+retry_count = 0
+tool_error_count = 0
+max_retries = 3   # from x_omlx_validation.budget.max_retries
+max_tool_errors = 2  # from x_omlx_validation.budget.max_tool_errors
+
+while retry_count <= max_retries and tool_error_count <= max_tool_errors:
+    response = client.chat.completions.create(
+        model="local-model", messages=messages, tools=tools
+    )
+
+    validation = response.model_extra.get("x_omlx_validation")
+
+    if not validation or validation["passed"]:
+        # Success or no validation — process response normally
+        break
+
+    # Validation failed — append nudge and retry
+    nudge = validation["nudge"]
+    messages.append({"role": "assistant", "content": response.choices[0].message.content})
+    messages.append({"role": nudge["role"], "content": nudge["content"]})
+
+    if nudge["kind"] in ("unknown_tool", "tool_arg_validation"):
+        tool_error_count += 1  # tool-channel errors use tool-error budget
+    else:
+        retry_count += 1  # bare-text/retry errors use retry budget
+
+# After loop: either succeeded or budgets exhausted
+```
+
+### Nudge Escalation Tiers
+
+Nudges include a `tier` field (0 = not applicable, 1 = polite, 2 = direct, 3 = aggressive). Currently all nudges use tier 0. Future step-enforcement nudges (Change C) will escalate tiers on consecutive failures.
+
+## Context Compaction
+
+When conversations grow long (especially with retry messages), they can exceed the model's context window. oMLX provides deterministic, sub-millisecond compaction strategies — no LLM calls needed.
+
+### Strategies
+
+| Strategy | Description | Use Case |
+|----------|-------------|----------|
+| `none` (default) | No compaction — passthrough | Stateless API requests |
+| `sliding_window` | Keep last N messages | Simple truncation |
+| `tiered` | 3-phase priority compaction | Preserves reasoning, drops low-value messages first |
+
+### Tiered Compaction Phases
+
+The `tiered` strategy drops messages in priority order. Each phase triggers only if the previous didn't free enough tokens:
+
+| Phase | Drops | Preserves |
+|-------|-------|-----------|
+| 1 | Nudges, retries; tool results truncated to 200 chars | Everything else |
+| 2 | Tool results dropped entirely | Reasoning, text, tool-call skeletons |
+| 3 | Reasoning + text dropped | Tool-call skeletons only |
+
+**Never compacted**: System prompt (messages[0]) and original user input (messages[1]).
+
+**Protected**: Recent iterations (default: last 2) are always preserved regardless of phase.
+
+### Configuration
+
+```json
+{
+  "forge_guardrails": {
+    "compaction_strategy": "tiered"
+  }
+}
+```
+
+Options: `"none"`, `"sliding_window"`, `"tiered"`. Default: `"none"`.
+
 ## Implementation
 
-This feature is Change A of the Forge integration plan (Phases 1+2). See:
+This feature spans Change A (Phases 1+2) and Change B (Phases 3+4) of the Forge integration plan. See:
 - [Forge Integration Plan](forge-integration-plan.md) — full plan with 6 phases
-- [Design Doc](../docs/superpowers/specs/2026-06-21-forge-guardrails-design.md) — technical design
+- [Change A Design Doc](../docs/superpowers/specs/2026-06-21-forge-guardrails-design.md) — validation + rescue + tool_choice
+- [Change B Design Doc](../docs/superpowers/specs/2026-06-22-forge-retry-support-design.md) — error budgets + compaction
 - Forge source: `../forge/src/forge/guardrails/` — reference implementation
