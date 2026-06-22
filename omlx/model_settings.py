@@ -8,7 +8,6 @@ flags, and metadata.
 import copy
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -32,22 +31,39 @@ TEMPLATES_VERSION = 1
 
 
 def _atomic_write_json(target: Path, data: Any, **dump_kwargs: Any) -> None:
-    """Atomically write ``data`` as JSON to ``target`` (temp file + rename).
+    """Write ``data`` as JSON to ``target``, preserving linked config files.
 
-    If ``target`` is a symlink, write through to its real destination so the
-    link itself is preserved rather than clobbered by the rename (#1958 —
-    settings.json kept symlinks because it wrote in place; the model_settings/
-    profiles/templates files lost them via temp+replace). The temp file is
-    created alongside the resolved destination so the rename stays on one
-    filesystem and remains atomic; on first save (no link yet) this is
-    identical to the previous behavior.
+    Users keep ``~/.omlx`` config in a git repo and ``ln`` it into place (#1958).
+    The default path here is a temp file + atomic rename (crash-safe), but
+    ``os.replace`` swaps the directory entry to a *new* inode, which breaks
+    both a symlink (clobbers the link with a real file) and a hard link
+    (other names keep pointing at the old inode, so the repo file never sees
+    the edit). ``settings.json`` avoided this only because it writes in place.
+
+    So when ``target`` is a symlink or a hard-linked file, write in place
+    instead: an in-place write follows a symlink through to its destination
+    and rewrites a hard link's existing inode, keeping the link intact. This
+    trades atomicity for link preservation on those paths only, the same
+    tradeoff ``settings.json`` already makes, and only for files the user has
+    deliberately linked. The common, unlinked case keeps the atomic rename.
     """
-    dest = Path(os.path.realpath(target)) if target.is_symlink() else target
-    temp_file = dest.with_suffix(".tmp")
+    # st_nlink > 1 means another directory entry shares this inode (a hard
+    # link). On APFS/HFS+ a normal file is always nlink==1, and clones
+    # (clonefile, used by Finder copy/Time Machine local snapshots) get their
+    # own inode, so this does not false-positive on ordinary files.
+    is_linked = target.is_symlink() or (
+        target.exists() and target.stat().st_nlink > 1
+    )
+    if is_linked:
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kwargs)
+        return
+
+    temp_file = target.with_suffix(".tmp")
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, **dump_kwargs)
-        temp_file.replace(dest)
+        temp_file.replace(target)
     except Exception:
         temp_file.unlink(missing_ok=True)
         raise
