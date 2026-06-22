@@ -18,6 +18,7 @@ from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
+    validate_profile_api_name,
     validate_profile_name,
     utcnow,
 )
@@ -547,7 +548,7 @@ class ModelSettingsManager:
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:
-                            validate_profile_name(current_api_name)
+                            validate_profile_api_name(current_api_name)
                             base_api_name = current_api_name
                         except Exception:
                             base_api_name = slugify_profile_api_name(
@@ -591,7 +592,7 @@ class ModelSettingsManager:
 
     @staticmethod
     def _dedupe_profile_api_name(base: str, used: set[str]) -> str:
-        validate_profile_name(base)
+        validate_profile_api_name(base)
         candidate = base
         index = 2
         while candidate in used:
@@ -605,7 +606,7 @@ class ModelSettingsManager:
     @staticmethod
     def _profile_api_name(profile: Dict[str, Any]) -> str:
         api_name = profile.get("api_name") or profile["name"]
-        validate_profile_name(api_name)
+        validate_profile_api_name(api_name)
         return api_name
 
     def _allocate_profile_api_name_locked(
@@ -618,7 +619,7 @@ class ModelSettingsManager:
         exclude_name: str | None = None,
     ) -> str:
         if value:
-            validate_profile_name(value)
+            validate_profile_api_name(value)
             base = value
         else:
             base = slugify_profile_api_name(
