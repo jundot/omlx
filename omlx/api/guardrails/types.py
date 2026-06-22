@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from omlx.api.guardrails.budget import ErrorBudget
 
 # ---------------------------------------------------------------------------
 # Nudge kind constants
@@ -43,6 +46,7 @@ class Nudge:
     role: Literal["user", "tool"]
     content: str
     kind: Literal["retry", "unknown_tool", "tool_arg_validation"]
+    tier: int = 0
 
     def to_message(self) -> dict:
         """Convert to chat message format for client retry."""
@@ -56,6 +60,7 @@ class ValidationResult:
     checks: list[CheckResult]
     nudge: Nudge | None = None
     passed: bool = False
+    budget: ErrorBudget | None = None
 
     def to_dict(self) -> dict:
         """Serialize for x_omlx_validation response extension."""
@@ -71,5 +76,8 @@ class ValidationResult:
                 "role": self.nudge.role,
                 "content": self.nudge.content,
                 "kind": self.nudge.kind,
+                "tier": self.nudge.tier,
             }
+        if self.budget is not None:
+            result["budget"] = self.budget.to_dict()
         return result

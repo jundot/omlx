@@ -90,6 +90,7 @@ class TestValidationResult:
             "role": "tool",
             "content": "retry now",
             "kind": KIND_UNKNOWN_TOOL,
+            "tier": 0,
         }
 
 

@@ -14,7 +14,7 @@ from omlx.api.guardrails.types import (
 )
 
 
-def retry_nudge() -> Nudge:
+def retry_nudge(tier: int = 0) -> Nudge:
     """Nudge for bare-text when tools were expected.
 
     Uses role='user' because bare-text correction is an instruction
@@ -27,10 +27,13 @@ def retry_nudge() -> Nudge:
             "Please use the available tools to answer the request."
         ),
         kind=KIND_RETRY,
+        tier=tier,
     )
 
 
-def unknown_tool_nudge(tool_name: str, available_tools: list[str]) -> Nudge:
+def unknown_tool_nudge(
+    tool_name: str, available_tools: list[str], tier: int = 0
+) -> Nudge:
     """Nudge for calling a tool that does not exist.
 
     Uses role='tool' because models attend well to the 'tool call failed'
@@ -44,11 +47,12 @@ def unknown_tool_nudge(tool_name: str, available_tools: list[str]) -> Nudge:
             f"Available: {tools_str}. Call one of them."
         ),
         kind=KIND_UNKNOWN_TOOL,
+        tier=tier,
     )
 
 
 def tool_arg_validation_nudge(
-    tool_name: str, args_repr: str, received_type: str
+    tool_name: str, args_repr: str, received_type: str, tier: int = 0
 ) -> Nudge:
     """Nudge for malformed (non-dict) arguments."""
     return Nudge(
@@ -59,10 +63,13 @@ def tool_arg_validation_nudge(
             f"Received value: {args_repr[:200]}"
         ),
         kind=KIND_TOOL_ARG_VALIDATION,
+        tier=tier,
     )
 
 
-def missing_params_nudge(tool_name: str, missing_params: list[str]) -> Nudge:
+def missing_params_nudge(
+    tool_name: str, missing_params: list[str], tier: int = 0
+) -> Nudge:
     """Nudge for missing required parameters."""
     params_str = ", ".join(missing_params)
     return Nudge(
@@ -72,4 +79,5 @@ def missing_params_nudge(tool_name: str, missing_params: list[str]) -> Nudge:
             f"Please provide all required parameters."
         ),
         kind=KIND_TOOL_ARG_VALIDATION,
+        tier=tier,
     )
