@@ -16,6 +16,7 @@ from omlx.api.guardrails.budget import ErrorBudget
 from omlx.api.guardrails.nudge import (
     missing_params_nudge,
     retry_nudge,
+    step_nudge,
     tool_arg_validation_nudge,
     unknown_tool_nudge,
 )
@@ -28,6 +29,8 @@ _NUDGE_PRIORITY = [
     "unknown_tool",
     "malformed_args",
     "missing_required_params",
+    "step",
+    "prerequisite",
 ]
 
 
@@ -51,8 +54,24 @@ class GuardrailValidator:
         extraction: Any,
         tool_choice: Any = None,
         has_tools: bool = True,
+        *,
+        step_context: dict | None = None,
+        prerequisite_results: list | None = None,
     ) -> ValidationResult:
-        """Run all 4 checks and return accumulated result."""
+        """Run all checks and return accumulated result.
+
+        Args:
+            extraction: ToolCallExtraction with parsed tool calls.
+            tool_choice: The request's tool_choice value.
+            has_tools: Whether tools were provided in the request.
+            step_context: Optional dict with keys ``terminal_tools``
+                (frozenset[str]), ``pending_steps`` (list[str]),
+                ``premature_attempts`` (int). When provided, runs
+                Check 5 (step enforcement).
+            prerequisite_results: Optional list of CheckResult from
+                PrerequisiteChecker. When provided, runs Check 6
+                (prerequisite validation) by merging these results.
+        """
         try:
             checks: list[CheckResult] = []
 
@@ -82,8 +101,20 @@ class GuardrailValidator:
             for tc in tool_calls:
                 checks.append(self._check_missing_params(tc))
 
+            # Check 5: step enforcement (only when context provided)
+            if step_context is not None:
+                checks.append(self._check_step(tool_calls, step_context))
+
+            # Check 6: prerequisite validation (merge external results)
+            if prerequisite_results is not None:
+                checks.extend(prerequisite_results)
+
             passed = all(c.passed for c in checks) if checks else True
-            nudge = self._select_nudge(checks, tool_calls) if not passed else None
+            nudge = (
+                self._select_nudge(checks, tool_calls, step_context)
+                if not passed
+                else None
+            )
             return ValidationResult(
                 checks=checks, nudge=nudge, passed=passed, budget=self._budget
             )
@@ -160,7 +191,12 @@ class GuardrailValidator:
             )
         return CheckResult(check="missing_required_params", passed=True)
 
-    def _select_nudge(self, checks: list[CheckResult], tool_calls: list) -> Nudge | None:
+    def _select_nudge(
+        self,
+        checks: list[CheckResult],
+        tool_calls: list,
+        step_context: dict | None = None,
+    ) -> Nudge | None:
         failed_checks = [c for c in checks if not c.passed]
         if not failed_checks:
             return None
@@ -168,10 +204,15 @@ class GuardrailValidator:
         for check_name in _NUDGE_PRIORITY:
             for c in failed_checks:
                 if c.check == check_name:
-                    return self._build_nudge(c, tool_calls)
+                    return self._build_nudge(c, tool_calls, step_context)
         return None
 
-    def _build_nudge(self, check: CheckResult, tool_calls: list) -> Nudge:
+    def _build_nudge(
+        self,
+        check: CheckResult,
+        tool_calls: list,
+        step_context: dict | None = None,
+    ) -> Nudge:
         if check.check == "bare_text":
             return retry_nudge()
 
@@ -215,4 +256,58 @@ class GuardrailValidator:
                         return missing_params_nudge(name, missing)
             return missing_params_nudge("unknown", [])
 
+        if check.check == "step" and step_context is not None:
+            terminal_tools = step_context.get("terminal_tools", frozenset())
+            terminal = next(
+                (
+                    getattr(getattr(tc, "function", None), "name", "")
+                    for tc in tool_calls
+                    if getattr(getattr(tc, "function", None), "name", "")
+                    in terminal_tools
+                ),
+                "terminal",
+            )
+            tier = min(step_context.get("premature_attempts", 0) + 1, 3)
+            return step_nudge(
+                terminal,
+                step_context.get("pending_steps", []),
+                tier=tier,
+            )
+
         return retry_nudge()
+
+    def _check_step(
+        self, tool_calls: list, step_context: dict
+    ) -> CheckResult:
+        """Check 5: detect premature terminal tool calls.
+
+        A terminal tool called before all required steps are complete
+        is a step violation.
+        """
+        terminal_tools = step_context.get("terminal_tools", frozenset())
+        pending_steps = step_context.get("pending_steps", [])
+
+        has_terminal = any(
+            getattr(getattr(tc, "function", None), "name", "") in terminal_tools
+            for tc in tool_calls
+        )
+
+        if has_terminal and pending_steps:
+            attempted = next(
+                (
+                    getattr(getattr(tc, "function", None), "name", "")
+                    for tc in tool_calls
+                    if getattr(getattr(tc, "function", None), "name", "")
+                    in terminal_tools
+                ),
+                "unknown",
+            )
+            return CheckResult(
+                check="step",
+                passed=False,
+                detail=(
+                    f"Tool '{attempted}' is terminal but required steps "
+                    f"are incomplete: {', '.join(pending_steps)}"
+                ),
+            )
+        return CheckResult(check="step", passed=True)

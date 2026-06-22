@@ -9,6 +9,7 @@ from __future__ import annotations
 from omlx.api.guardrails.types import (
     KIND_PREREQUISITE,
     KIND_RETRY,
+    KIND_STEP,
     KIND_TOOL_ARG_VALIDATION,
     KIND_UNKNOWN_TOOL,
     Nudge,
@@ -104,3 +105,40 @@ def prerequisite_nudge(
         kind=KIND_PREREQUISITE,
         tier=tier,
     )
+
+
+def step_nudge(
+    terminal_tool: str, pending_steps: list[str], tier: int = 1
+) -> Nudge:
+    """Escalating nudge for premature terminal tool attempts.
+
+    Uses role='user' because this is workflow guidance (complete the
+    required steps first), not a tool-execution error. Adapted from
+    Forge's prompts/nudges.py:step_nudge.
+
+    Args:
+        terminal_tool: The terminal tool the model tried to call early.
+        pending_steps: Required steps that must be completed first.
+        tier: Escalation level (1=polite, 2=direct, 3=aggressive).
+            Clamped to 1-3.
+    """
+    tier = max(1, min(3, tier))
+    steps = ", ".join(pending_steps)
+    if tier == 1:
+        content = (
+            f"You cannot call {terminal_tool} yet. "
+            f"You must first complete these required steps: {steps}. "
+            "Call one of them now."
+        )
+    elif tier == 2:
+        content = (
+            f"You must call one of these tools now: {steps}. "
+            "Pick one."
+        )
+    else:
+        content = (
+            f"STOP. You MUST call one of: {steps}. "
+            f"Do NOT call {terminal_tool}. "
+            f"Your next response MUST be a tool call to one of: {steps}."
+        )
+    return Nudge(role="user", content=content, kind=KIND_STEP, tier=tier)

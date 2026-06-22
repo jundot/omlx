@@ -231,3 +231,87 @@ class TestValidatorConstruction:
         tool = {"name": "direct", "parameters": {}}
         v = GuardrailValidator([tool])
         assert "direct" in v._tool_names
+
+
+class TestStepEnforcementCheck:
+    """Check 5: step enforcement — premature terminal tool calls."""
+
+    def _validator_with_respond(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "respond",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+        return GuardrailValidator(tools)
+
+    def _tc(self, name):
+        return ToolCall(
+            id=f"call_{name}",
+            type="function",
+            function=FunctionCall(name=name, arguments="{}"),
+        )
+
+    def _extraction(self, calls):
+        return ToolCallExtraction(
+            cleaned_text="",
+            tool_calls=calls,
+            cleaned_thinking="",
+        )
+
+    def test_step_check_passes_when_no_step_context(self):
+        v = self._validator_with_respond()
+        ext = self._extraction([self._tc("respond")])
+        result = v.validate(ext, has_tools=True)
+        check_names = [c.check for c in result.checks]
+        assert "step" not in check_names  # no context → check skipped
+
+    def test_step_check_fails_on_premature_terminal(self):
+        v = self._validator_with_respond()
+        ext = self._extraction([self._tc("respond")])
+        step_context = {
+            "terminal_tools": frozenset({"respond"}),
+            "pending_steps": ["search"],
+            "premature_attempts": 0,
+        }
+        result = v.validate(ext, has_tools=True, step_context=step_context)
+        step_checks = [c for c in result.checks if c.check == "step"]
+        assert len(step_checks) == 1
+        assert step_checks[0].passed is False
+
+    def test_step_check_passes_when_steps_satisfied(self):
+        v = self._validator_with_respond()
+        ext = self._extraction([self._tc("respond")])
+        step_context = {
+            "terminal_tools": frozenset({"respond"}),
+            "pending_steps": [],  # all satisfied
+            "premature_attempts": 0,
+        }
+        result = v.validate(ext, has_tools=True, step_context=step_context)
+        step_checks = [c for c in result.checks if c.check == "step"]
+        assert len(step_checks) == 1
+        assert step_checks[0].passed is True
+
+    def test_step_nudge_has_user_role_and_tier(self):
+        v = self._validator_with_respond()
+        ext = self._extraction([self._tc("respond")])
+        step_context = {
+            "terminal_tools": frozenset({"respond"}),
+            "pending_steps": ["search"],
+            "premature_attempts": 1,
+        }
+        result = v.validate(ext, has_tools=True, step_context=step_context)
+        assert result.nudge is not None
+        assert result.nudge.role == "user"
+        assert result.nudge.kind == "step"
+        assert result.nudge.tier == 2  # attempts=1 → tier 2
