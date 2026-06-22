@@ -1,8 +1,8 @@
 ## 1. Error Budget Module
 
-- [ ] 1.1 Create `omlx/api/guardrails/budget.py` with `ErrorBudget` dataclass: `max_retries: int = 3`, `max_tool_errors: int = 2`, `recommended_action: str = "retry"`, plus `to_dict()` and `from_dict()`
-- [ ] 1.2 Implement `should_retry(retry_count, tool_error_count) -> bool` method on `ErrorBudget` — returns False when either budget exhausted
-- [ ] 1.3 Unit tests for ErrorBudget (defaults, exhaustion, to_dict/from_dict round-trip)
+- [x] 1.1 Create `omlx/api/guardrails/budget.py` with `ErrorBudget` dataclass: `max_retries: int = 3`, `max_tool_errors: int = 2`, `recommended_action: str = "retry"`, plus `to_dict()` and `from_dict()`
+- [x] 1.2 Implement `should_retry(retry_count, tool_error_count) -> bool` method on `ErrorBudget` — returns False when either budget exhausted
+- [x] 1.3 Unit tests for ErrorBudget (defaults, exhaustion, to_dict/from_dict round-trip)
 
 ## 2. Nudge Tier Extension
 
