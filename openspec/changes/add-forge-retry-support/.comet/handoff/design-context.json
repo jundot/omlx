@@ -1,0 +1,15 @@
+{
+  "change": "add-forge-retry-support",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "c3cdf6f97f70c645b66d0faa09b932bd3970405d25ea04b87600e287b1c47de5",
+  "files": [
+    { "path": "openspec/changes/add-forge-retry-support/proposal.md", "sha256": "5f05e83123bd0391e2e360cde9a9c59ee690c2c9d17a478f94f27646c73b9b07" },
+    { "path": "openspec/changes/add-forge-retry-support/design.md", "sha256": "8215c5dec3f3aa90876f6541a3866306074d8f990d1b95aa58a34291d839f5d2" },
+    { "path": "openspec/changes/add-forge-retry-support/tasks.md", "sha256": "5da9d3db27938e0d817fd5cb46535e9b202ce6e555e2aa96692fedd95c189cf1" },
+    { "path": "openspec/changes/add-forge-retry-support/specs/context-compaction/spec.md", "sha256": "207d5e6328641a5830111728468ce0c92b2a9c8ccada4fd2243babb9e36cc623" },
+    { "path": "openspec/changes/add-forge-retry-support/specs/tool-call-validation/spec.md", "sha256": "aeef04df7727dcc040bf9cb44022513d1439f23a8d12a267abe3ee06d2c09272" }
+  ]
+}
