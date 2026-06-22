@@ -29,12 +29,12 @@
 
 ## 4. Integration + Tests
 
-- [ ] 4.1 Wire prerequisite validation into `guardrail_wiring.py`
-- [ ] 4.2 Integration test: prerequisites end-to-end
-- [ ] 4.3 Integration test: respond tool end-to-end
-- [ ] 4.4 Run full test suite — 0 regressions across Changes A+B+C
+- [x] 4.1 Wire prerequisite validation into `guardrail_wiring.py`
+- [x] 4.2 Integration test: prerequisites end-to-end
+- [x] 4.3 Integration test: respond tool end-to-end
+- [x] 4.4 Run full test suite — 0 regressions across Changes A+B+C
 
 ## 5. Documentation
 
-- [ ] 5.1 Update `docs/tool-call-guardrails.md` — MCP Prerequisites + Respond Tool sections
-- [ ] 5.2 Update `docs/forge-integration-plan.md` — mark Phase 5+6 as implemented (all 6 phases done)
+- [x] 5.1 Update `docs/tool-call-guardrails.md` — MCP Prerequisites + Respond Tool sections
+- [x] 5.2 Update `docs/forge-integration-plan.md` — mark Phase 5+6 as implemented (all 6 phases done)

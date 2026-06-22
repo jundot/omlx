@@ -251,3 +251,62 @@ This feature spans Change A (Phases 1+2) and Change B (Phases 3+4) of the Forge 
 - [Change A Design Doc](../docs/superpowers/specs/2026-06-21-forge-guardrails-design.md) — validation + rescue + tool_choice
 - [Change B Design Doc](../docs/superpowers/specs/2026-06-22-forge-retry-support-design.md) — error budgets + compaction
 - Forge source: `../forge/src/forge/guardrails/` — reference implementation
+
+## MCP Prerequisites
+
+When MCP tools have ordering dependencies (e.g., `read_file` must precede `edit_file`), declare prerequisites in the MCP config and enable enforcement.
+
+### Declaration
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "...",
+      "args": [],
+      "tools_prerequisites": {
+        "edit_file": {
+          "requires": [
+            "read_file",
+            {"tool": "read_file", "match_arg": "path"}
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Two modes:
+- **Name-only**: `"read_file"` — any prior `read_file` call satisfies
+- **Arg-matched**: `{"tool": "read_file", "match_arg": "path"}` — prior call must have matching `path` value
+
+### Enforcement
+
+When `enforce_mcp_prerequisites: true`, the server scans prior messages for executed tools and validates each new tool call against declared prerequisites. Violations generate a prerequisite nudge (`role: "user"`, `kind: "prerequisite"`) listing what's missing.
+
+## Synthetic Respond Tool
+
+Small models (8B-14B) sometimes emit bare text instead of a tool call when they should respond conversationally. A synthetic `respond(message)` tool gives them a structured alternative — keeping them in tool-calling mode where all guardrails apply.
+
+### How it works
+
+When `inject_respond_tool: true`:
+1. **Before generation**: `respond` tool is appended to the tools list
+2. **After parsing**: `respond` calls are stripped from the response
+   - Pure `respond(message="Hello")` → normal text response
+   - Mixed (`respond` + `search`) → only `search` returned
+3. **Client never sees** the respond tool — it's transparent
+
+## All Forge Features
+
+With Change C, oMLX implements all 6 phases of the Forge integration plan:
+
+| Phase | Feature | Change | Status |
+|-------|---------|--------|--------|
+| 1 | Validation & Rescue | A | ✅ Merged |
+| 2 | tool_choice Enforcement | A | ✅ Merged |
+| 3 | Error Budgets | B | ✅ Merged |
+| 4 | Context Compaction | B | ✅ Merged |
+| 5 | MCP Prerequisites | C | ✅ Implemented |
+| 6 | Synthetic Respond Tool | C | ✅ Implemented |

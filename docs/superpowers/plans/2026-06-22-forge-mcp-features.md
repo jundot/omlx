@@ -91,7 +91,7 @@ Modified files:
 **Interfaces:**
 - Produces: `PrerequisiteCheck(satisfied: bool, missing: list[str])`, `PrerequisiteChecker(prerequisites: dict[str, list])`, `PrerequisiteChecker.check(tool_calls, prior_messages) -> list[CheckResult]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_mcp_prerequisites.py
@@ -144,12 +144,12 @@ class TestPrerequisiteCheckerConstruction:
 
 Add `import pytest` at the top of the test file.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_mcp_prerequisites.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'omlx.mcp.prerequisites'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # omlx/mcp/prerequisites.py
@@ -330,12 +330,12 @@ class PrerequisiteChecker:
         return {}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_mcp_prerequisites.py -v`
 Expected: PASS (all tests in the file so far)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/mcp/prerequisites.py tests/test_mcp_prerequisites.py
@@ -354,7 +354,7 @@ git commit -m "feat(mcp): add PrerequisiteChecker skeleton with PrerequisiteChec
 - Consumes: `PrerequisiteChecker` from Task 1.1
 - Produces: validated name-only behavior
 
-- [ ] **Step 1: Write the failing test (appended to existing test file)**
+- [x] **Step 1: Write the failing test (appended to existing test file)**
 
 ```python
 # Append to tests/test_mcp_prerequisites.py
@@ -413,12 +413,12 @@ class TestNameOnlyPrerequisite:
         assert "edit_file" in (results[0].detail or "")
 ```
 
-- [ ] **Step 2: Run test to verify it passes (implementation already exists from 1.1)**
+- [x] **Step 2: Run test to verify it passes (implementation already exists from 1.1)**
 
 Run: `pytest tests/test_mcp_prerequisites.py::TestNameOnlyPrerequisite -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_mcp_prerequisites.py
@@ -433,7 +433,7 @@ git commit -m "test(mcp): cover name-only prerequisite checking"
 - Modify: `tests/test_mcp_prerequisites.py` (add tests)
 - Verify: `omlx/mcp/prerequisites.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # Append to tests/test_mcp_prerequisites.py
@@ -529,12 +529,12 @@ class TestArgMatchedPrerequisite:
         assert "test" not in (results[0].detail or "")
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_mcp_prerequisites.py::TestArgMatchedPrerequisite -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_mcp_prerequisites.py
@@ -548,7 +548,7 @@ git commit -m "test(mcp): cover arg-matched prerequisite checking"
 **Files:**
 - Modify: `tests/test_mcp_prerequisites.py` (add edge-case tests)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # Append to tests/test_mcp_prerequisites.py
@@ -623,12 +623,12 @@ class TestExecutedToolsFromHistory:
         assert results[0].passed is False  # malformed args can't match
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_mcp_prerequisites.py::TestExecutedToolsFromHistory -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_mcp_prerequisites.py
@@ -646,7 +646,7 @@ git commit -m "test(mcp): cover executed_tools extraction edge cases"
 **Interfaces:**
 - Produces: `prerequisite_nudge(tool_name, missing_prereqs, tier=0) -> Nudge` with `role="user"`, `kind="prerequisite"`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_guardrail_step_prereq_nudges.py
@@ -684,12 +684,12 @@ class TestPrerequisiteNudge:
         assert n.tier == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestPrerequisiteNudge -v`
 Expected: FAIL with `ImportError: cannot import name 'KIND_PREREQUISITE'` (types not yet updated)
 
-- [ ] **Step 3: Add the nudge kind constants to types.py**
+- [x] **Step 3: Add the nudge kind constants to types.py**
 
 In `omlx/api/guardrails/types.py`, add after the existing kind constants (after line 16, `KIND_TOOL_ARG_VALIDATION`):
 
@@ -726,7 +726,7 @@ Then update the `Nudge.kind` Literal (around line 48) to include the new kinds:
 
 Note: `KIND_STEP` and `KIND_PREREQUISITE` are NOT added to `TOOL_CHANNEL_KINDS` or `TOOL_ERROR_KINDS` — they use `role="user"`, not the tool channel.
 
-- [ ] **Step 4: Add `prerequisite_nudge()` to nudge.py**
+- [x] **Step 4: Add `prerequisite_nudge()` to nudge.py**
 
 In `omlx/api/guardrails/nudge.py`, update the import block at the top to include the new constants:
 
@@ -772,12 +772,12 @@ def prerequisite_nudge(
     )
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestPrerequisiteNudge -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/guardrails/types.py omlx/api/guardrails/nudge.py tests/test_guardrail_step_prereq_nudges.py
@@ -792,7 +792,7 @@ git commit -m "feat(guardrails): add prerequisite_nudge + KIND_STEP/KIND_PREREQU
 - Modify: `omlx/api/guardrails/__init__.py`
 - Modify: `tests/test_guardrail_step_prereq_nudges.py` (add re-export test)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # Append to tests/test_guardrail_step_prereq_nudges.py
@@ -815,12 +815,12 @@ class TestPackageExports:
         assert callable(prerequisite_nudge)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestPackageExports -v`
 Expected: FAIL with `ImportError: cannot import name 'KIND_STEP'`
 
-- [ ] **Step 3: Update `__init__.py`**
+- [x] **Step 3: Update `__init__.py`**
 
 In `omlx/api/guardrails/__init__.py`, update imports and `__all__`:
 
@@ -870,12 +870,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/__init__.py tests/test_guardrail_step_prereq_nudges.py
@@ -894,7 +894,7 @@ git commit -m "feat(guardrails): export KIND_STEP, KIND_PREREQUISITE, step/prere
 **Interfaces:**
 - Produces: `MCPConfig.tools_prerequisites: dict[str, list]` field
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_mcp_config.py`:
 
@@ -940,12 +940,12 @@ class TestToolsPrerequisites:
 
 Add `from omlx.mcp.config import validate_config` and `from omlx.mcp.types import MCPConfig` to the imports at the top of the test file if not already present.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_mcp_config.py::TestToolsPrerequisites -v`
 Expected: FAIL with `AttributeError: 'MCPConfig' object has no attribute 'tools_prerequisites'`
 
-- [ ] **Step 3: Add field to `MCPConfig` in types.py**
+- [x] **Step 3: Add field to `MCPConfig` in types.py**
 
 In `omlx/mcp/types.py`, update the `MCPConfig` dataclass (around line 65) to add the new field:
 
@@ -975,7 +975,7 @@ class MCPConfig:
         )
 ```
 
-- [ ] **Step 4: Parse the field in config.py `validate_config`**
+- [x] **Step 4: Parse the field in config.py `validate_config`**
 
 In `omlx/mcp/config.py`, update `validate_config` (around line 144) to parse `tools_prerequisites`:
 
@@ -993,12 +993,12 @@ In `omlx/mcp/config.py`, update `validate_config` (around line 144) to parse `to
     )
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/test_mcp_config.py::TestToolsPrerequisites -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/mcp/types.py omlx/mcp/config.py tests/test_mcp_config.py
@@ -1012,7 +1012,7 @@ git commit -m "feat(mcp): parse tools_prerequisites field in MCP config"
 **Files:**
 - Modify: `mcp.example.json`
 
-- [ ] **Step 1: Update the example file**
+- [x] **Step 1: Update the example file**
 
 Replace the entire contents of `mcp.example.json` with:
 
@@ -1055,12 +1055,12 @@ Replace the entire contents of `mcp.example.json` with:
 }
 ```
 
-- [ ] **Step 2: Verify it parses**
+- [x] **Step 2: Verify it parses**
 
 Run: `python -c "import json; json.load(open('mcp.example.json'))"`
 Expected: no output (valid JSON)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add mcp.example.json
@@ -1074,12 +1074,12 @@ git commit -m "docs(mcp): add tools_prerequisites example declarations"
 **Files:**
 - Verify: `tests/test_mcp_prerequisites.py`
 
-- [ ] **Step 1: Run the full test file**
+- [x] **Step 1: Run the full test file**
 
 Run: `pytest tests/test_mcp_prerequisites.py -v`
 Expected: PASS (all classes: TestPrerequisiteCheckDataclass, TestPrerequisiteCheckerConstruction, TestNameOnlyPrerequisite, TestArgMatchedPrerequisite, TestExecutedToolsFromHistory)
 
-- [ ] **Step 2: Commit (if any test fixes were needed)**
+- [x] **Step 2: Commit (if any test fixes were needed)**
 
 ```bash
 git add tests/test_mcp_prerequisites.py
@@ -1099,7 +1099,7 @@ git commit -m "test(mcp): finalize PrerequisiteChecker unit test coverage"
 **Interfaces:**
 - Produces: `step_nudge(terminal_tool, pending_steps, tier=1) -> Nudge` with `role="user"`, `kind="step"`, 3-tier escalation
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # Append to tests/test_guardrail_step_prereq_nudges.py
@@ -1146,12 +1146,12 @@ class TestStepNudge:
         assert n.tier == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestStepNudge -v`
 Expected: FAIL with `NameError: name 'step_nudge' is not defined` (function not yet added)
 
-- [ ] **Step 3: Add `step_nudge()` to nudge.py**
+- [x] **Step 3: Add `step_nudge()` to nudge.py**
 
 Append to `omlx/api/guardrails/nudge.py`:
 
@@ -1193,12 +1193,12 @@ def step_nudge(
     return Nudge(role="user", content=content, kind=KIND_STEP, tier=tier)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestStepNudge -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/nudge.py tests/test_guardrail_step_prereq_nudges.py
@@ -1219,7 +1219,7 @@ git commit -m "feat(guardrails): add step_nudge with 3-tier escalation"
 
 **Design note:** The validator is constructed with tool schemas. Step context (terminal_tools, required_steps, premature_attempts) is passed to `validate()` as an optional kwarg because it varies per-request and depends on message history.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_guardrail_validator.py`:
 
@@ -1310,12 +1310,12 @@ class TestStepEnforcementCheck:
         assert result.nudge.tier == 2  # attempts=1 → tier 2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_validator.py::TestStepEnforcementCheck -v`
 Expected: FAIL with `TypeError: validate() got an unexpected keyword argument 'step_context'`
 
-- [ ] **Step 3: Add step_context to validate() and Check 5**
+- [x] **Step 3: Add step_context to validate() and Check 5**
 
 In `omlx/api/guardrails/validator.py`, update the imports:
 
@@ -1471,17 +1471,17 @@ Update `_build_nudge` to handle the step check. Add this branch before the final
 
 Note: The `_build_nudge` for step is a fallback. The primary step nudge is built in the wiring layer (`guardrail_wiring.py`) where the premature attempt count is tracked. See Task 2.3.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_validator.py::TestStepEnforcementCheck -v`
 Expected: PASS
 
-- [ ] **Step 5: Run existing validator tests to verify no regressions**
+- [x] **Step 5: Run existing validator tests to verify no regressions**
 
 Run: `pytest tests/test_guardrail_validator.py -v`
 Expected: PASS (all existing tests still pass — step_context defaults to None)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/guardrails/validator.py tests/test_guardrail_validator.py
@@ -1501,7 +1501,7 @@ git commit -m "feat(guardrails): add Check 5 (step enforcement) to GuardrailVali
 - Consumes: `PrerequisiteChecker` from Task 1.1, step_context from server
 - Produces: `apply_guardrails()` accepts optional `prerequisite_checker`, `prior_messages`, `step_context`; `extract_and_validate_tool_calls()` accepts optional `prerequisite_checker`, `prior_messages`, `step_context`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_server_guardrail_wiring.py`:
 
@@ -1575,12 +1575,12 @@ def _make_tool_call(name, args):
     )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestPrerequisiteWiring -v`
 Expected: FAIL with `TypeError: apply_guardrails() got an unexpected keyword argument 'prerequisite_checker'`
 
-- [ ] **Step 3: Update `apply_guardrails` in guardrail_wiring.py**
+- [x] **Step 3: Update `apply_guardrails` in guardrail_wiring.py**
 
 Replace the entire contents of `omlx/api/guardrail_wiring.py`:
 
@@ -1785,7 +1785,7 @@ def guardrail_validation_payload(
     return {"x_omlx_validation": with_budget.to_dict()}
 ```
 
-- [ ] **Step 4: Update `extract_and_validate_tool_calls` to pass step/prereq context**
+- [x] **Step 4: Update `extract_and_validate_tool_calls` to pass step/prereq context**
 
 In `omlx/api/tool_calling.py`, update the `extract_and_validate_tool_calls` function (around line 1559) to accept and forward the new optional parameters:
 
@@ -1844,17 +1844,17 @@ def extract_and_validate_tool_calls(
     )
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestPrerequisiteWiring -v`
 Expected: PASS
 
-- [ ] **Step 6: Run full wiring test suite for regressions**
+- [x] **Step 6: Run full wiring test suite for regressions**
 
 Run: `pytest tests/test_server_guardrail_wiring.py -v`
 Expected: PASS (all existing tests still pass — new params are optional)
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add omlx/api/guardrail_wiring.py omlx/api/tool_calling.py tests/test_server_guardrail_wiring.py
@@ -1868,7 +1868,7 @@ git commit -m "feat(guardrails): wire step + prerequisite checks into apply_guar
 **Files:**
 - Modify: `tests/test_guardrail_step_prereq_nudges.py`
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```python
 # Append to tests/test_guardrail_step_prereq_nudges.py
@@ -1898,12 +1898,12 @@ class TestStepNudgeTierProgression:
         assert len(n3.content) >= len(n1.content)
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_step_prereq_nudges.py::TestStepNudgeTierProgression -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_guardrail_step_prereq_nudges.py
@@ -1923,7 +1923,7 @@ git commit -m "test(guardrails): verify step nudge tier progression"
 **Interfaces:**
 - Produces: `RESPOND_TOOL_NAME = "respond"`, `inject_respond_tool(tools: list) -> list`, `strip_respond_calls(tool_calls) -> tuple[list, str | None]`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_respond_tool.py
@@ -1965,12 +1965,12 @@ class TestRespondToolName:
         assert RESPOND_TOOL_NAME == "respond"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_respond_tool.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'omlx.api.respond'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # omlx/api/respond.py
@@ -2120,12 +2120,12 @@ def _extract_message(tc: Any) -> str:
     return ""
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_respond_tool.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/respond.py tests/test_respond_tool.py
@@ -2139,7 +2139,7 @@ git commit -m "feat(api): add synthetic respond tool module (inject + strip)"
 **Files:**
 - Modify: `tests/test_respond_tool.py` (add comprehensive inject tests)
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```python
 # Append to tests/test_respond_tool.py
@@ -2182,12 +2182,12 @@ class TestInjectRespondTool:
         assert len(tools) == 1  # original unchanged
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_respond_tool.py::TestInjectRespondTool -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_respond_tool.py
@@ -2201,7 +2201,7 @@ git commit -m "test(api): comprehensive inject_respond_tool coverage"
 **Files:**
 - Modify: `tests/test_respond_tool.py` (add comprehensive strip tests)
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```python
 # Append to tests/test_respond_tool.py
@@ -2271,12 +2271,12 @@ class TestStripRespondCalls:
         assert real[1].function.name == "read"
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_respond_tool.py::TestStripRespondCalls -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_respond_tool.py
@@ -2293,7 +2293,7 @@ git commit -m "test(api): comprehensive strip_respond_calls coverage"
 
 **Design note:** The server has 6 call sites (3 API formats × streaming/non-streaming). The respond tool is injected once into `tools_for_template` before generation, and stripped once after parsing. The injection point is after `tools_for_template` is built (~line 3334) but before the generation call. The strip point is right after `extract_and_validate_tool_calls` / `_convert_parser_tool_calls` returns, before building the response.
 
-- [ ] **Step 1: Write the failing test (source inspection)**
+- [x] **Step 1: Write the failing test (source inspection)**
 
 Append to `tests/test_server_guardrail_wiring.py`:
 
@@ -2328,12 +2328,12 @@ class TestRespondToolServerWiring:
         assert len(call_lines) >= 1, "strip_respond_calls not called"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestRespondToolServerWiring -v`
 Expected: FAIL (inject_respond_tool not yet imported/called in server.py)
 
-- [ ] **Step 3: Add imports to server.py**
+- [x] **Step 3: Add imports to server.py**
 
 In `omlx/server.py`, find the import block around line 155-166 (where `apply_guardrails`, `guardrail_validation_payload`, `extract_and_validate_tool_calls` are imported from `omlx.api.tool_calling`). Add after that block:
 
@@ -2341,7 +2341,7 @@ In `omlx/server.py`, find the import block around line 155-166 (where `apply_gua
 from omlx.api.respond import inject_respond_tool, strip_respond_calls
 ```
 
-- [ ] **Step 4: Wire injection + stripping at each call site**
+- [x] **Step 4: Wire injection + stripping at each call site**
 
 There are 6 call sites in server.py (lines ~3573, ~4442, ~4890, ~5349, ~5852, ~6327). At each site, the pattern is:
 
@@ -2388,17 +2388,17 @@ For the first call site (~line 3590), the full context after modification:
 
 Repeat this strip block at all 6 sites (after each `tool_calls = ...` assignment). The injection only needs to happen once (on `tools_for_template`).
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestRespondToolServerWiring -v`
 Expected: PASS
 
-- [ ] **Step 6: Run full wiring test suite**
+- [x] **Step 6: Run full wiring test suite**
 
 Run: `pytest tests/test_server_guardrail_wiring.py -v`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add omlx/server.py tests/test_server_guardrail_wiring.py
@@ -2416,7 +2416,7 @@ git commit -m "feat(server): wire respond tool injection + stripping at all call
 **Interfaces:**
 - Produces: `ForgeGuardrailsSettings.inject_respond_tool: bool = False`, `ForgeGuardrailsSettings.enforce_mcp_prerequisites: bool = False`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_guardrail_settings.py`:
 
@@ -2455,12 +2455,12 @@ class TestNewForgeSettings:
         assert restored == original
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_settings.py::TestNewForgeSettings -v`
 Expected: FAIL with `AttributeError: 'ForgeGuardrailsSettings' object has no attribute 'inject_respond_tool'`
 
-- [ ] **Step 3: Add fields to `ForgeGuardrailsSettings`**
+- [x] **Step 3: Add fields to `ForgeGuardrailsSettings`**
 
 In `omlx/settings.py`, update the `ForgeGuardrailsSettings` class (around line 772). Add the two new fields after `compaction_strategy`:
 
@@ -2508,12 +2508,12 @@ class ForgeGuardrailsSettings:
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_settings.py -v`
 Expected: PASS (all tests including existing ones)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/settings.py tests/test_guardrail_settings.py
@@ -2528,7 +2528,7 @@ git commit -m "feat(settings): add inject_respond_tool + enforce_mcp_prerequisit
 - Modify: `omlx/admin/routes.py`
 - Modify: `tests/test_guardrail_settings.py` (source inspection test)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_guardrail_settings.py`:
 
@@ -2547,12 +2547,12 @@ class TestAdminRoutesWiring:
         assert "forge_guardrails_enforce_mcp_prerequisites" in src
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_settings.py::TestAdminRoutesWiring -v`
 Expected: FAIL
 
-- [ ] **Step 3: Add request fields to admin routes**
+- [x] **Step 3: Add request fields to admin routes**
 
 In `omlx/admin/routes.py`, find the forge_guardrails request fields block (around line 280-285). Add after `forge_guardrails_compaction_strategy`:
 
@@ -2561,7 +2561,7 @@ In `omlx/admin/routes.py`, find the forge_guardrails request fields block (aroun
     forge_guardrails_enforce_mcp_prerequisites: bool | None = None
 ```
 
-- [ ] **Step 4: Add handler block**
+- [x] **Step 4: Add handler block**
 
 In `omlx/admin/routes.py`, find the forge_guardrails handler block (around line 3725-3741). Add after the `compaction_strategy` handler and before the `if forge_guardrails_changed:` block:
 
@@ -2594,12 +2594,12 @@ Also update the logger.info block (around line 3734-3741) to include the new fie
         )
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_settings.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/admin/routes.py tests/test_guardrail_settings.py
@@ -2613,12 +2613,12 @@ git commit -m "feat(admin): wire inject_respond_tool + enforce_mcp_prerequisites
 **Files:**
 - Verify: `tests/test_respond_tool.py`
 
-- [ ] **Step 1: Run full respond tool tests**
+- [x] **Step 1: Run full respond tool tests**
 
 Run: `pytest tests/test_respond_tool.py -v`
 Expected: PASS (all classes: TestRespondToolName, TestInjectRespondTool, TestStripRespondCalls)
 
-- [ ] **Step 2: Commit (if any fixes needed)**
+- [x] **Step 2: Commit (if any fixes needed)**
 
 ```bash
 git add tests/test_respond_tool.py
@@ -2637,7 +2637,7 @@ git commit -m "test(api): finalize respond tool test coverage"
 
 **Design note:** The server builds a `PrerequisiteChecker` from the MCP config's `tools_prerequisites` when `enforce_mcp_prerequisites` is enabled. It passes the checker + `request.messages` (as `prior_messages`) into `apply_guardrails` at each call site. Since `apply_guardrails` already accepts these kwargs (Task 2.3), this task updates the 6 call sites.
 
-- [ ] **Step 1: Write the failing test (source inspection)**
+- [x] **Step 1: Write the failing test (source inspection)**
 
 Append to `tests/test_server_guardrail_wiring.py`:
 
@@ -2661,12 +2661,12 @@ class TestPrerequisiteServerWiring:
         assert len(lines) >= 1, "prerequisite_checker not passed to apply_guardrails"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestPrerequisiteServerWiring -v`
 Expected: FAIL
 
-- [ ] **Step 3: Build PrerequisiteChecker + pass to apply_guardrails in server.py**
+- [x] **Step 3: Build PrerequisiteChecker + pass to apply_guardrails in server.py**
 
 In `omlx/server.py`, add the import near the top (after the existing MCP imports):
 
@@ -2714,17 +2714,17 @@ At each of the 6 `apply_guardrails` call sites, update the call to pass the prer
 
 Repeat this pattern at all 6 call sites. Note: `request.messages` contains Pydantic models — convert to dicts with `.model_dump()` for the checker.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestPrerequisiteServerWiring -v`
 Expected: PASS
 
-- [ ] **Step 5: Run full server wiring test suite**
+- [x] **Step 5: Run full server wiring test suite**
 
 Run: `pytest tests/test_server_guardrail_wiring.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/server.py tests/test_server_guardrail_wiring.py
@@ -2738,7 +2738,7 @@ git commit -m "feat(server): wire PrerequisiteChecker into all 6 validation call
 **Files:**
 - Create: `tests/test_forge_mcp_features_e2e.py`
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```python
 # tests/test_forge_mcp_features_e2e.py
@@ -2864,12 +2864,12 @@ class TestPrerequisiteEndToEnd:
         assert prereq_checks == []
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_forge_mcp_features_e2e.py::TestPrerequisiteEndToEnd -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_forge_mcp_features_e2e.py
@@ -2883,7 +2883,7 @@ git commit -m "test(e2e): prerequisites end-to-end integration tests"
 **Files:**
 - Modify: `tests/test_forge_mcp_features_e2e.py`
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```python
 # Append to tests/test_forge_mcp_features_e2e.py
@@ -2971,12 +2971,12 @@ class TestRespondToolEndToEnd:
         # text would replace cleaned_text in the server response
 ```
 
-- [ ] **Step 2: Run test to verify it passes**
+- [x] **Step 2: Run test to verify it passes**
 
 Run: `pytest tests/test_forge_mcp_features_e2e.py::TestRespondToolEndToEnd -v`
 Expected: PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_forge_mcp_features_e2e.py
@@ -2990,17 +2990,17 @@ git commit -m "test(e2e): respond tool end-to-end integration tests"
 **Files:**
 - Verify only
 
-- [ ] **Step 1: Run the complete guardrail + MCP test suite**
+- [x] **Step 1: Run the complete guardrail + MCP test suite**
 
 Run: `pytest tests/test_guardrail_types.py tests/test_guardrail_budget.py tests/test_guardrail_validator.py tests/test_guardrail_settings.py tests/test_server_guardrail_wiring.py tests/test_guardrail_nudges.py tests/test_guardrail_step_prereq_nudges.py tests/test_guardrail_e2e.py tests/test_mcp_prerequisites.py tests/test_mcp_config.py tests/test_respond_tool.py tests/test_forge_mcp_features_e2e.py -v`
 Expected: PASS — 0 failures
 
-- [ ] **Step 2: Run the full project test suite (non-slow)**
+- [x] **Step 2: Run the full project test suite (non-slow)**
 
 Run: `pytest -m "not slow" -x -q`
 Expected: PASS — 0 failures across Changes A+B+C
 
-- [ ] **Step 3: Commit (only if test fixes were needed)**
+- [x] **Step 3: Commit (only if test fixes were needed)**
 
 ```bash
 git add -A
@@ -3016,7 +3016,7 @@ git commit -m "test: verify 0 regressions across Changes A+B+C"
 **Files:**
 - Modify: `docs/tool-call-guardrails.md`
 
-- [ ] **Step 1: Add MCP Prerequisites section + Respond Tool section + update settings table**
+- [x] **Step 1: Add MCP Prerequisites section + Respond Tool section + update settings table**
 
 In `docs/tool-call-guardrails.md`, make the following updates:
 
@@ -3129,7 +3129,7 @@ Step enforcement detects premature terminal tool calls — when the model tries 
 This feature requires workflow configuration (required steps + terminal tools) and is currently exposed via the validation API for client-side enforcement. Nudges use `role="user"` and `kind="step"` with a `tier` field (1=polite, 2=direct, 3=aggressive).
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/tool-call-guardrails.md
@@ -3143,7 +3143,7 @@ git commit -m "docs: add MCP Prerequisites, Respond Tool, and Step Enforcement s
 **Files:**
 - Modify: `docs/forge-integration-plan.md`
 
-- [ ] **Step 1: Update the status header and phase markers**
+- [x] **Step 1: Update the status header and phase markers**
 
 In `docs/forge-integration-plan.md`:
 
@@ -3169,7 +3169,7 @@ In `docs/forge-integration-plan.md`:
 > **Status**: Implemented in Change C (`add-forge-mcp-features`). See `omlx/api/respond.py`.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/forge-integration-plan.md

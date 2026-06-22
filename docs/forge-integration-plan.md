@@ -8,7 +8,8 @@
 > Phase 3 (Error Budgets) + Phase 4 (Context Compaction) are **implemented** via OpenSpec change
 > `add-forge-retry-support` (branch `feature/20260622/add-forge-retry-support`).
 > See [Tool Call Guardrails](tool-call-guardrails.md) for user-facing docs.
-> Phase 5 (MCP Prerequisites) + Phase 6 (Synthetic Respond Tool) are planned as Change C.
+> Phase 5 (MCP Prerequisites) + Phase 6 (Synthetic Respond Tool) are **implemented** via OpenSpec change `add-forge-mcp-features`.
+> All 6 phases of the Forge integration plan are now complete.
 
 ---
 
