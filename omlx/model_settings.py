@@ -373,12 +373,10 @@ class ModelSettingsManager:
         }
 
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
+            # Write in-place so symlinks and hard links are preserved, consistent
+            # with how settings.json is saved via GlobalSettings.save.
+            with open(self.settings_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-
-            temp_file.replace(self.settings_file)
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
