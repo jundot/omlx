@@ -57,12 +57,12 @@
 ## 8. Server Wiring (Single Chokepoint)
 
 - [x] 8.1 Modify `extract_tool_calls_with_thinking()` at `tool_calling.py:1339` — accept `tools` and `validator` optional params; when validator is provided, run validation on extracted tool calls; return extended `ToolCallExtraction` with optional `validation_result` field
-- [ ] 8.2 Verify all 6 call sites in `server.py` (lines 3567, 4418, 4850, 5292, 5776, 6232) pass through the `tools` param (most already do) and consume the new validation result
-- [ ] 8.3 Wire `enforce_tool_choice()` after validation, before response construction — non-streaming chat at line 3600, streaming at line 4418+
-- [ ] 8.4 Build `x_omlx_validation` response extension for non-streaming responses (when `include_validation_metadata=True`) — include `checks` array and `nudge` object
-- [ ] 8.5 Build streaming SSE event for validation metadata — emit as final event before `data: [DONE]`
-- [ ] 8.6 Repeat wiring for `/v1/messages` (Anthropic, lines 4850, 5292) and `/v1/responses` (Responses API, lines 5776, 6232) — adapt extension location to endpoint convention (Anthropic may use `metadata` field)
-- [ ] 8.7 Integration tests: send real tool-call requests with deliberately malformed model output, verify validation metadata + enforcement + nudges
+- [x] 8.2 Verify all 6 call sites in `server.py` (lines 3567, 4418, 4850, 5292, 5776, 6232) pass through the `tools` param (most already do) and consume the new validation result
+- [x] 8.3 Wire `enforce_tool_choice()` after validation, before response construction — non-streaming chat at line 3600, streaming at line 4418+
+- [x] 8.4 Build `x_omlx_validation` response extension for non-streaming responses (when `include_validation_metadata=True`) — include `checks` array and `nudge` object
+- [x] 8.5 Build streaming SSE event for validation metadata — emit as final event before `data: [DONE]`
+- [x] 8.6 Repeat wiring for `/v1/messages` (Anthropic, lines 4850, 5292) and `/v1/responses` (Responses API, lines 5776, 6232) — adapt extension location to endpoint convention (Anthropic may use `metadata` field)
+- [x] 8.7 Integration tests: send real tool-call requests with deliberately malformed model output, verify validation metadata + enforcement + nudges
 
 ## 9. Test Suite
 
