@@ -8,6 +8,7 @@ flags, and metadata.
 import copy
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -28,6 +29,28 @@ logger = logging.getLogger(__name__)
 SETTINGS_VERSION = 1
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
+
+
+def _atomic_write_json(target: Path, data: Any, **dump_kwargs: Any) -> None:
+    """Atomically write ``data`` as JSON to ``target`` (temp file + rename).
+
+    If ``target`` is a symlink, write through to its real destination so the
+    link itself is preserved rather than clobbered by the rename (#1958 —
+    settings.json kept symlinks because it wrote in place; the model_settings/
+    profiles/templates files lost them via temp+replace). The temp file is
+    created alongside the resolved destination so the rename stays on one
+    filesystem and remains atomic; on first save (no link yet) this is
+    identical to the previous behavior.
+    """
+    dest = Path(os.path.realpath(target)) if target.is_symlink() else target
+    temp_file = dest.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kwargs)
+        temp_file.replace(dest)
+    except Exception:
+        temp_file.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -373,12 +396,9 @@ class ModelSettingsManager:
         }
 
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-            temp_file.replace(self.settings_file)
+            _atomic_write_json(
+                self.settings_file, data, indent=2, ensure_ascii=False
+            )
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
@@ -580,15 +600,12 @@ class ModelSettingsManager:
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
-        temp_file = self.profiles_file.with_suffix(".tmp")
         try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-            temp_file.replace(self.profiles_file)
+            _atomic_write_json(
+                self.profiles_file, data, indent=2, ensure_ascii=False, default=str
+            )
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
             raise
 
     @staticmethod
@@ -1079,10 +1096,9 @@ class ModelSettingsManager:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
         try:
-            temp_file = self.templates_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-            temp_file.replace(self.templates_file)
+            _atomic_write_json(
+                self.templates_file, data, indent=2, ensure_ascii=False, default=str
+            )
         except Exception as e:
             logger.error(f"Failed to save templates file: {e}")
             raise
