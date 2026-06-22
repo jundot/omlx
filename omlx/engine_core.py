@@ -234,6 +234,13 @@ class EngineCore:
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
         self._finished_events: Dict[str, asyncio.Event] = {}
+        # Finish timestamps for orphan-collector reaping (#1154).
+        # Normally a consumer drains and removes its own collector, but if the
+        # client disconnects mid-stream the SSE generator chain is abandoned and
+        # its cleanup finally only runs at GC time, so the collector lingers and
+        # the dashboard keeps showing the request as "Generating".
+        self._finished_at: Dict[str, float] = {}
+        self._last_reap = 0.0
 
         # Engine state
         self._running = False
@@ -351,6 +358,12 @@ class EngineCore:
 
         while self._running:
             try:
+                # Sweep collectors orphaned by client disconnects (throttled).
+                now = time.monotonic()
+                if now - self._last_reap >= 1.0:
+                    self._last_reap = now
+                    self._reap_orphaned_collectors(now)
+
                 if self.scheduler.has_requests():
                     step_outputs = await loop.run_in_executor(
                         self._mlx_executor, self._step_burst
@@ -363,7 +376,6 @@ class EngineCore:
                     # thread-safe and per-token streaming intact.
                     collectors = self._output_collectors
                     states = self._stream_states
-                    events = self._finished_events
                     eviction_request = None
                     distributed = False
 
@@ -397,11 +409,11 @@ class EngineCore:
                                         state.mark_sent(req_output.completion_tokens)
 
                             if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
-                                # Note: cleanup is handled by stream_outputs() finally block
-                                # _delayed_cleanup() was causing double cleanup race condition
+                                self._mark_request_finished(rid)
+                                # Cleanup normally happens in the consumer
+                                # (stream_outputs()/generate()); collectors left
+                                # behind by a disconnected client are swept by
+                                # _reap_orphaned_collectors() via _finished_at.
 
                     if distributed:
                         # Always yield to prevent event loop starvation.
@@ -485,9 +497,7 @@ class EngineCore:
                                 error=str(e),
                             )
                         )
-                    event = self._finished_events.get(rid)
-                    if event:
-                        event.set()
+                    self._mark_request_finished(rid)
                 await asyncio.sleep(0.1)
 
     async def add_request(
@@ -584,6 +594,21 @@ class EngineCore:
                 self._mlx_executor, self.scheduler.add_request, request
             )
         except BaseException:
+            # If the caller is cancelled here (e.g. the client disconnected
+            # before the SSE stream began) — or the insert fails — the request
+            # never reaches stream_outputs()/generate()'s try/finally, so
+            # nothing would mark it finished or clean it up. The collector
+            # created above would then linger forever as a phantom the reaper
+            # cannot see (it was never stamped _finished_at), and the dashboard
+            # would show it as "Generating" indefinitely (#1154).
+            # Drop the tracking and abort any partial scheduler insert (the
+            # deferred abort is idempotent and harmless if it never landed).
+            try:
+                self.scheduler.abort_request(request_id)
+            except Exception as abort_exc:  # noqa: BLE001
+                logger.debug(
+                    f"Abort of partial insert for {request_id} failed: {abort_exc}"
+                )
             self._cleanup_request(request_id)
             raise
         self._wake_engine_loop()
@@ -626,9 +651,7 @@ class EngineCore:
                     error="Request aborted",
                 )
             )
-        event = self._finished_events.get(request_id)
-        if event is not None:
-            event.set()
+        self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
         return result
@@ -675,15 +698,61 @@ class EngineCore:
                         error=error_msg,
                     )
                 )
-            event = self._finished_events.get(rid)
-            if event is not None:
-                event.set()
+            self._mark_request_finished(rid)
         if request_ids:
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
             )
             self._wake_engine_loop()
         return len(request_ids)
+
+    def _mark_request_finished(self, request_id: str) -> None:
+        """Signal the consumer a request finished and stamp the finish time.
+
+        The timestamp lets _reap_orphaned_collectors() drop collectors whose
+        consumer never cleaned up (e.g. the client disconnected mid-stream and
+        the SSE generator chain was abandoned rather than closed).
+        """
+        self._finished_at.setdefault(request_id, time.monotonic())
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
+    def _reap_orphaned_collectors(self, now: float, grace: float = 5.0) -> int:
+        """Drop tracking for finished requests whose consumer never cleaned up.
+
+        stream_outputs()/generate() normally remove their own collector via
+        _cleanup_request() once the final output is drained. But when a client
+        disconnects mid-stream the SSE generator chain is abandoned instead of
+        closed, so that finally block only runs at non-deterministic GC time —
+        the collector lingers in _output_collectors and the request shows as
+        "Generating" forever on the dashboard (#1154).
+
+        This sweep removes the dict tracking for any request finished more than
+        ``grace`` seconds ago. It is intentionally pop-only and never calls
+        ``collector.clear()``: stream_outputs()/generate() hold their own
+        reference to the collector object, so dropping the dict entry cannot
+        truncate a slow-but-live consumer's output — only an over-eager clear()
+        could (which is what made the earlier _delayed_cleanup() approach race).
+        The grace period guarantees a live consumer (which drains in the same
+        event-loop turn the request finishes) has already self-cleaned.
+        """
+        if not self._finished_at:
+            return 0
+        stale = [rid for rid, ts in self._finished_at.items() if now - ts >= grace]
+        for rid in stale:
+            # pop-only — see docstring; never clear() the collector object.
+            self._output_collectors.pop(rid, None)
+            self._stream_states.pop(rid, None)
+            self._finished_events.pop(rid, None)
+            self._finished_at.pop(rid, None)
+        if stale:
+            logger.debug(
+                "Reaped %d orphaned output collector(s) after disconnect: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
 
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking.
@@ -697,6 +766,7 @@ class EngineCore:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+        self._finished_at.pop(request_id, None)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """
@@ -797,6 +867,15 @@ class EngineCore:
         if event is None:
             raise RuntimeError(f"No event for request {request_id}")
 
+        # Capture the collector reference BEFORE awaiting, mirroring
+        # stream_outputs(): the orphan reaper is pop-only and may drop the dict
+        # entry once the request is finished, but a held reference still drains.
+        # Re-fetching after the await would race the reaper if this coroutine is
+        # starved past the grace window under heavy load (#1154).
+        collector = self._output_collectors.get(request_id)
+        if collector is None:
+            raise RuntimeError(f"No collector for request {request_id}")
+
         try:
             # Wait for the request to finish
             await event.wait()
@@ -808,12 +887,7 @@ class EngineCore:
             self._cleanup_request(request_id)
             raise
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
-
-        # Drain all outputs and get the last one
+        # Drain all outputs and get the last one (using the captured reference)
         final_output = None
         while True:
             output = collector.get_nowait()
@@ -1022,6 +1096,7 @@ class EngineCore:
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
+        self._finished_at.clear()
 
         # Release model and tokenizer references for GC
         self.model = None

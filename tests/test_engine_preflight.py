@@ -578,6 +578,7 @@ async def test_engine_core_add_request_cleans_up_on_scheduler_raise(
     core._output_collectors = {}
     core._stream_states = {}
     core._finished_events = {}
+    core._finished_at = {}
 
     class _Cfg:
         stream_interval = 1

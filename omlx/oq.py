@@ -2109,7 +2109,16 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
 
             def _vlm_sanitize(weights):
                 class _Proxy:
+                    # The audio-presence guard differs by arch: gemma4 checks
+                    # ``self.audio_tower``; gemma4_unified checks
+                    # ``self.embed_audio``. Expose BOTH (sentinel iff the source
+                    # config carries audio) so sanitize keeps the audio modality
+                    # for either. Missing ``embed_audio`` made gemma4_unified's
+                    # sanitize raise AttributeError, silently dropping the whole
+                    # sanitize pass → oQ shipped raw ``model.``-prefixed keys
+                    # that omlx could not load.
                     audio_tower = _AUDIO_SENTINEL
+                    embed_audio = _AUDIO_SENTINEL
 
                 proxy = _Proxy()
                 proxy.config = model_config

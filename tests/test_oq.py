@@ -3010,6 +3010,77 @@ class TestBuildModelSanitizerTextOnly:
 
 
 # =============================================================================
+# Test _vlm_sanitize proxy exposes the gemma-4 audio-guard attributes
+# =============================================================================
+
+
+class TestVlmSanitizeProxyAudioAttrs:
+    """oq's _vlm_sanitize _Proxy must expose BOTH audio-guard attributes the
+    gemma-4 family reads: gemma4 guards audio weights on ``self.audio_tower``,
+    gemma4_unified on ``self.embed_audio``. A proxy missing the attribute a
+    model's ``sanitize()`` reads raises AttributeError, aborting sanitize so oQ
+    ships raw ``model.``-prefixed VLM keys that mlx-vlm cannot load.
+    """
+
+    @pytest.mark.parametrize("audio_attr", ["audio_tower", "embed_audio"])
+    def test_proxy_exposes_audio_guard_attr(self, monkeypatch, audio_attr):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        from omlx.oq import _build_model_sanitizer
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _FakeModel:
+            @staticmethod
+            def sanitize(proxy, weights):
+                # The real Gemma4(Unified).sanitize reads this guard attr off
+                # self; the proxy must expose it or getattr raises AttributeError
+                # and oq's whole sanitize pass is silently dropped.
+                getattr(proxy, audio_attr)
+                return weights
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+            VisionModel=object,
+            LanguageModel=object,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.get_model_and_args",
+            lambda config: (fake_module, None),
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.sanitize_weights",
+            lambda _model, weights, _config: weights,
+        )
+
+        config = {
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "model_type": "gemma4_unified",
+            "text_config": {"num_hidden_layers": 4, "hidden_size": 64},
+            "vision_config": {"hidden_size": 32},
+            "audio_config": {"hidden_size": 16},
+        }
+
+        sanitize = _build_model_sanitizer(config, text_only=False)
+        assert sanitize is not None
+
+        # Before the fix the proxy lacked ``embed_audio`` → this call raised
+        # AttributeError for the gemma4_unified guard, dropping the sanitize pass.
+        weights = {"model.embed_audio.proj.weight": 1}
+        assert sanitize(weights) == weights
+
+
+# =============================================================================
 # Test _build_proxy_for_sensitivity MTP patch integration
 # =============================================================================
 

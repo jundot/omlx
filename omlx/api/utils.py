@@ -666,6 +666,10 @@ def prepare_system_messages_for_template(
         if unsupported_mid_system_policy == "user_note_safe":
             prepared = _downgrade_mid_system_to_user_notes(messages)
             if prepared is not None:
+                # _downgrade preserves leading system blocks as-is; merge
+                # consecutive system messages so strict templates (Qwen3.6+)
+                # that require a single leading system message don't fail.
+                prepared = _merge_consecutive_system_messages(prepared)
                 if merge_consecutive_roles:
                     prepared = _merge_consecutive_roles(prepared)
                 return prepared

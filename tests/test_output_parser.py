@@ -233,6 +233,59 @@ class TestCohere2MoeOutputParserSession:
         ]
         assert final.finish_reason == "tool_calls"
 
+    def test_literal_newline_in_arguments_is_reescaped(self, monkeypatch):
+        """Melody may stream literal control chars when the model emits them inside
+        JSON string values (e.g. newlines inside code arguments).  finalize() must
+        re-serialize the accumulated arguments so they are valid JSON."""
+        # Build a fake Melody that returns arguments containing a literal newline
+        # (U+000A) inside the JSON string value, as the real model sometimes does.
+        literal_newline_args = '{"path":"f.py","code":"line1\nline2"}'  # literal \n
+
+        class _FakeMelodyFilterLiteralNewline:
+            def __init__(self, options):
+                pass
+
+            def write_decoded(self, decoded_text: str):
+                if decoded_text == "TC":
+                    tc = SimpleNamespace(
+                        index=0,
+                        id="call_1",
+                        name="edit",
+                        arguments=literal_newline_args,
+                    )
+                    return SimpleNamespace(content=None, reasoning=None, tool_calls=[tc])
+                return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+            def flush_partials(self):
+                return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+        import types, json as _json
+        module = types.ModuleType("cohere_melody")
+        module.PyFilter = _FakeMelodyFilterLiteralNewline
+        module.PyFilterOptions = _FakeMelodyOptions
+        monkeypatch.setitem(__import__("sys").modules, "cohere_melody", module)
+
+        tokenizer = CohereTokenizer({"TC": "TC"})
+        from omlx.adapter.output_parser import Cohere2MoeOutputParserSession
+        session = Cohere2MoeOutputParserSession.__new__(Cohere2MoeOutputParserSession)
+        session._tokenizer = tokenizer
+        session._melody = _FakeMelodyFilterLiteralNewline(None)
+        session._detokenizer = None
+        session._thinking_started = False
+        session._thinking_closed = False
+        session._tool_calls = {}
+
+        session.process_token("TC")
+        final = session.finalize()
+
+        assert len(final.tool_calls) == 1
+        args_str = final.tool_calls[0]["arguments"]
+        # Must be valid strict JSON (no literal control characters)
+        parsed = _json.loads(args_str)
+        assert parsed["code"] == "line1\nline2"
+        # The literal newline must have been escaped
+        assert "\n" not in args_str or "\\n" in args_str
+
 
 class TestGemma4OutputParserSession:
     def test_normal_reasoning_block(self):
