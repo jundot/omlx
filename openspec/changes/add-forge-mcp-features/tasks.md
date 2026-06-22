@@ -1,14 +1,14 @@
 ## 1. MCP Prerequisites
 
-- [ ] 1.1 Create `omlx/mcp/prerequisites.py` with `PrerequisiteChecker` class: `__init__(prerequisites: dict)`, `check(tool_calls, prior_messages) -> list[CheckResult]`
-- [ ] 1.2 Implement name-only prerequisite checking: `"edit_file": {"requires": ["read_file"]}` — any prior `read_file` call satisfies
-- [ ] 1.3 Implement arg-matched prerequisite checking: `{"tool": "read_file", "match_arg": "path"}` — prior call must have matching arg value
-- [ ] 1.4 Build `executed_tools` set by scanning prior messages for tool calls (stateless per-request)
-- [ ] 1.5 Add `prerequisite_nudge(tool_name, missing_prereqs)` to `omlx/api/guardrails/nudge.py` — role="user", kind="prerequisite"
-- [ ] 1.6 Add `"step"` and `"prerequisite"` to nudge kind literals in `omlx/api/guardrails/types.py`
-- [ ] 1.7 Add prerequisite declaration parsing to `omlx/mcp/config.py` — `tools_prerequisites` field
-- [ ] 1.8 Update `mcp.example.json` with example prerequisite declarations
-- [ ] 1.9 Unit tests for PrerequisiteChecker (name-only, arg-matched, satisfied, missing, no-prereqs)
+- [x] 1.1 Create `omlx/mcp/prerequisites.py` with `PrerequisiteChecker` class: `__init__(prerequisites: dict)`, `check(tool_calls, prior_messages) -> list[CheckResult]`
+- [x] 1.2 Implement name-only prerequisite checking: `"edit_file": {"requires": ["read_file"]}` — any prior `read_file` call satisfies
+- [x] 1.3 Implement arg-matched prerequisite checking: `{"tool": "read_file", "match_arg": "path"}` — prior call must have matching arg value
+- [x] 1.4 Build `executed_tools` set by scanning prior messages for tool calls (stateless per-request)
+- [x] 1.5 Add `prerequisite_nudge(tool_name, missing_prereqs)` to `omlx/api/guardrails/nudge.py` — role="user", kind="prerequisite"
+- [x] 1.6 Add `"step"` and `"prerequisite"` to nudge kind literals in `omlx/api/guardrails/types.py`
+- [x] 1.7 Add prerequisite declaration parsing to `omlx/mcp/config.py` — `tools_prerequisites` field
+- [x] 1.8 Update `mcp.example.json` with example prerequisite declarations
+- [x] 1.9 Unit tests for PrerequisiteChecker (name-only, arg-matched, satisfied, missing, no-prereqs)
 
 ## 2. Step Enforcement + Nudges
 
