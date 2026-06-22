@@ -27,12 +27,12 @@
 
 ## 5. Context Compaction Package
 
-- [ ] 5.1 Create `omlx/context/__init__.py` with public API exports
-- [ ] 5.2 Create `omlx/context/compaction.py` with `CompactStrategy` ABC (abstract `compact(messages, budget_tokens) -> tuple[list, int]`)
-- [ ] 5.3 Implement `NoCompact` — passthrough strategy
-- [ ] 5.4 Implement `SlidingWindowCompact` — keep last N messages
-- [ ] 5.5 Implement `TieredCompact` — 3-phase priority compaction (Phase 1: drop nudges + truncate tool results; Phase 2: drop tool results; Phase 3: drop reasoning + text). Protected: system prompt, user input, recent iterations.
-- [ ] 5.6 Unit tests for all 3 strategies (phase transitions, protection rules, truncation markers)
+- [x] 5.1 Create `omlx/context/__init__.py` with public API exports
+- [x] 5.2 Create `omlx/context/compaction.py` with `CompactStrategy` ABC (abstract `compact(messages, budget_tokens) -> tuple[list, int]`)
+- [x] 5.3 Implement `NoCompact` — passthrough strategy
+- [x] 5.4 Implement `SlidingWindowCompact` — keep last N messages
+- [x] 5.5 Implement `TieredCompact` — 3-phase priority compaction (Phase 1: drop nudges + truncate tool results; Phase 2: drop tool results; Phase 3: drop reasoning + text). Protected: system prompt, user input, recent iterations.
+- [x] 5.6 Unit tests for all 3 strategies (phase transitions, protection rules, truncation markers)
 
 ## 6. Documentation
 
