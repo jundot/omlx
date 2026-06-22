@@ -7,6 +7,7 @@ Message patterns follow Forge's prompts/nudges.py.
 from __future__ import annotations
 
 from omlx.api.guardrails.types import (
+    KIND_PREREQUISITE,
     KIND_RETRY,
     KIND_TOOL_ARG_VALIDATION,
     KIND_UNKNOWN_TOOL,
@@ -79,5 +80,27 @@ def missing_params_nudge(
             f"Please provide all required parameters."
         ),
         kind=KIND_TOOL_ARG_VALIDATION,
+        tier=tier,
+    )
+
+
+def prerequisite_nudge(
+    tool_name: str, missing_prereqs: list[str], tier: int = 0
+) -> Nudge:
+    """Nudge for calling a tool without its declared prerequisites.
+
+    Uses role='user' because this is workflow guidance (call the
+    prerequisite first), not a tool-execution error. Adapted from
+    Forge's prompts/nudges.py:prerequisite_nudge.
+    """
+    prereqs = ", ".join(missing_prereqs)
+    return Nudge(
+        role="user",
+        content=(
+            f"You cannot call {tool_name} yet. "
+            f"You must first call: {prereqs}. "
+            "Call the prerequisite tool now."
+        ),
+        kind=KIND_PREREQUISITE,
         tier=tier,
     )

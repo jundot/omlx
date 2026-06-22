@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 KIND_RETRY = "retry"
 KIND_UNKNOWN_TOOL = "unknown_tool"
 KIND_TOOL_ARG_VALIDATION = "tool_arg_validation"
+KIND_STEP = "step"
+KIND_PREREQUISITE = "prerequisite"
 
 # Kinds that use the tool-result channel (role="tool").
 TOOL_CHANNEL_KINDS = frozenset({KIND_UNKNOWN_TOOL, KIND_TOOL_ARG_VALIDATION})
@@ -27,6 +29,8 @@ CheckName = Literal[
     "malformed_args",
     "missing_required_params",
     "tool_choice_enforcement",
+    "step",
+    "prerequisite",
 ]
 
 
@@ -45,7 +49,7 @@ class Nudge:
 
     role: Literal["user", "tool"]
     content: str
-    kind: Literal["retry", "unknown_tool", "tool_arg_validation"]
+    kind: Literal["retry", "unknown_tool", "tool_arg_validation", "step", "prerequisite"]
     tier: int = 0
 
     def to_message(self) -> dict:
