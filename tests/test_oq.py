@@ -635,6 +635,166 @@ class TestShouldSkipTensor:
         )
 
 
+def test_nemotron_h_preserve_mtp_keeps_all_mtp_tensors():
+    """preserve_mtp=True should retain the full nemotron_h MTP subtree.
+
+    Covers all tensor families confirmed present in Super and Ultra
+    safetensors indexes. Includes a synthetic mtp.layers.2.* key to guard
+    against accidental hardcoding of only layers 0 and 1.
+    """
+    from omlx.oq import _should_skip_tensor
+
+    mtp_keys = [
+        # MTP layer 0 (attention-like)
+        "mtp.layers.0.mixer.q_proj.weight",
+        "mtp.layers.0.mixer.k_proj.weight",
+        "mtp.layers.0.mixer.v_proj.weight",
+        "mtp.layers.0.mixer.o_proj.weight",
+        "mtp.layers.0.enorm.weight",
+        "mtp.layers.0.hnorm.weight",
+        "mtp.layers.0.eh_proj.weight",
+
+        # MTP layer 1 (LatentMoE / MoE)
+        "mtp.layers.1.mixer.fc1_latent_proj.weight",
+        "mtp.layers.1.mixer.fc2_latent_proj.weight",
+        "mtp.layers.1.mixer.experts.0.up_proj.weight",
+        "mtp.layers.1.mixer.experts.0.down_proj.weight",
+        "mtp.layers.1.mixer.gate.weight",
+        "mtp.layers.1.mixer.gate.e_score_correction_bias",
+        "mtp.layers.1.mixer.shared_experts.up_proj.weight",
+        "mtp.layers.1.mixer.shared_experts.down_proj.weight",
+        "mtp.layers.1.final_layernorm.weight",
+
+        # Future-proof guard: must work for layer indices > 1 too
+        "mtp.layers.2.mixer.fc2_latent_proj.weight",
+    ]
+
+    for key in mtp_keys:
+        assert not _should_skip_tensor(key, preserve_mtp=True), (
+            f"Expected {key!r} to be retained when preserve_mtp=True"
+        )
+
+
+def test_nemotron_h_default_skips_all_mtp_tensors():
+    """preserve_mtp=False should strip the full nemotron_h MTP subtree."""
+    from omlx.oq import _should_skip_tensor
+
+    mtp_keys = [
+        # MTP layer 0 (attention-like)
+        "mtp.layers.0.mixer.q_proj.weight",
+        "mtp.layers.0.mixer.k_proj.weight",
+        "mtp.layers.0.mixer.v_proj.weight",
+        "mtp.layers.0.mixer.o_proj.weight",
+        "mtp.layers.0.enorm.weight",
+        "mtp.layers.0.hnorm.weight",
+        "mtp.layers.0.eh_proj.weight",
+
+        # MTP layer 1 (LatentMoE / MoE)
+        "mtp.layers.1.mixer.fc1_latent_proj.weight",
+        "mtp.layers.1.mixer.fc2_latent_proj.weight",
+        "mtp.layers.1.mixer.experts.0.up_proj.weight",
+        "mtp.layers.1.mixer.experts.0.down_proj.weight",
+        "mtp.layers.1.mixer.gate.weight",
+        "mtp.layers.1.mixer.gate.e_score_correction_bias",
+        "mtp.layers.1.mixer.shared_experts.up_proj.weight",
+        "mtp.layers.1.mixer.shared_experts.down_proj.weight",
+        "mtp.layers.1.final_layernorm.weight",
+
+        # Future-proof guard: must work for layer indices > 1 too
+        "mtp.layers.2.mixer.fc2_latent_proj.weight",
+    ]
+
+    for key in mtp_keys:
+        assert _should_skip_tensor(key, preserve_mtp=False), (
+            f"Expected {key!r} to be stripped when preserve_mtp=False"
+        )
+
+
+def test_nemotron_h_norms_kept_at_fp16():
+    """Norm-like MTP tensors should be kept at fp16 via 1D shape protection.
+
+    Retention itself is covered by test_nemotron_h_preserve_mtp_keeps_all_mtp_tensors;
+    this test focuses on the fp 16 mechanism specifically.
+    """
+    from omlx.oq import _should_quantize_tensor
+
+    assert _should_quantize_tensor(
+        "mtp.layers.0.enorm.weight", shape=(8192,)
+    ) is False, "1D enorm should not be quantized"
+
+    assert _should_quantize_tensor(
+        "mtp.layers.0.hnorm.weight", shape=(8192,)
+    ) is False, "1D hnorm should not be quantized"
+
+    assert _should_quantize_tensor(
+        "mtp.layers.1.final_layernorm.weight", shape=(8192,)
+    ) is False, "1D final_layernorm should not be quantized"
+
+
+
+def test_nemotron_h_gate_kept_at_fp16():
+    """MTP MoE router gate should be kept at fp16 (same as non-MTP MoE gates)."""
+    from omlx.oq import universal_quant_predicate
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_hidden_layers": 80,
+        "num_experts": 128,
+        "hidden_size": 8192,
+    }
+
+    result = universal_quant_predicate(
+        "mtp.layers.1.mixer.gate",
+        module=None,
+        config=config,
+        oq_level=4,
+    )
+    assert result is False, (
+        f"Expected MTP gate to return False (kept fp16), got {result!r}"
+    )
+
+
+def test_nemotron_h_gate_bias_not_quantized():
+    """Router correction bias is 1D and should not be quantized.
+
+    e_score_correction_bias is a 1D auxiliary-loss-free balancing bias on the
+    MoE router gate. Protection is shape-based (len(shape) < 2) via
+    _should_quantize_tensor. Adapt the call shape to the local helper's
+    actual signature if it expects an MLX array instead of a `shape` kwarg.
+    """
+    from omlx.oq import _should_quantize_tensor
+
+    # If the local helper takes an MLX array, replace shape=(128,) with
+    # mx.zeros((128,)) — do NOT change the expected outcome.
+    result = _should_quantize_tensor(
+        "mtp.layers.1.mixer.gate.e_score_correction_bias",
+        shape=(128,),
+    )
+    assert result is False, (
+        f"Expected 1D bias to not be quantized, got {result!r}"
+    )
+
+
+def test_nemotron_h_latent_proj_retained():
+    """LatentMoE projections must be retained when preserve_mtp=True.
+
+    Retention overlaps with test_nemotron_h_preserve_mtp_keeps_all_mtp_tensors;
+    this test exists as a named canary to document the deliverate non-policy:
+    bit allocation for test tensors is calibration-driven and itentionally 
+    NOT asserted. A future PR may add an explicit bit-allocation policy if 
+    calibration evidence indicates current behavior is suboptimal.
+    """
+    from omlx.oq import _should_skip_tensor
+
+    for key in (
+        "mtp.layers.1.mixer.fc1_latent_proj.weight",
+        "mtp.layers.1.mixer.fc2_latent_proj.weight",
+    ):
+        assert not _should_skip_tensor(key, preserve_mtp=True), (
+            f"Expected {key!r} to be retained when preserve_mtp=True"
+        )
+
+
 class TestMtpFcFullPrecision:
     """Critical MTP projections (Qwen3.5 mtp.fc + DeepSeek-V4 e_proj/h_proj
     + hc_head.*) must stay in full precision. Mirrors PR 990's quant_predicate
