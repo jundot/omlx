@@ -86,7 +86,7 @@ Group 6 (Docs)            ─── Last (after all code groups)
 **Interfaces:**
 - Produces: `ErrorBudget` class with `max_retries: int`, `max_tool_errors: int`, `should_retry(retry_count, tool_error_count) -> bool`, `recommended_action(retry_count, tool_error_count) -> str`, `to_dict() -> dict`, `from_dict(dict) -> ErrorBudget`
 
-- [ ] **Step 1: Write failing tests for ErrorBudget creation and serialization**
+- [x] **Step 1: Write failing tests for ErrorBudget creation and serialization**
 
 Create `tests/test_guardrail_budget.py`:
 
@@ -184,12 +184,12 @@ class TestSerialization:
         assert restored.max_tool_errors == original.max_tool_errors
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_budget.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'omlx.api.guardrails.budget'`
 
-- [ ] **Step 3: Implement ErrorBudget**
+- [x] **Step 3: Implement ErrorBudget**
 
 Create `omlx/api/guardrails/budget.py`:
 
@@ -250,12 +250,12 @@ class ErrorBudget:
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_budget.py -v`
 Expected: PASS — all 14 tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/budget.py tests/test_guardrail_budget.py
@@ -272,7 +272,7 @@ git commit -m "feat(guardrails): add ErrorBudget dataclass for client retry budg
 **Interfaces:**
 - Produces: `ErrorBudget` importable from `omlx.api.guardrails`
 
-- [ ] **Step 1: Add export**
+- [x] **Step 1: Add export**
 
 In `omlx/api/guardrails/__init__.py`, add the import after line 6 (after the nudge imports block):
 
@@ -291,12 +291,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 2: Verify import works**
+- [x] **Step 2: Verify import works**
 
 Run: `python -c "from omlx.api.guardrails import ErrorBudget; print(ErrorBudget())"`
 Expected: prints `ErrorBudget(max_retries=3, max_tool_errors=2)`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add omlx/api/guardrails/__init__.py
@@ -315,7 +315,7 @@ git commit -m "feat(guardrails): export ErrorBudget from package __init__"
 - Produces: `Nudge.tier: int = 0` field; `Nudge.to_dict()` includes `"tier"` key
 - Consumes: nothing new
 
-- [ ] **Step 1: Write failing tests for Nudge.tier**
+- [x] **Step 1: Write failing tests for Nudge.tier**
 
 Append to `tests/test_guardrail_types.py`:
 
@@ -342,12 +342,12 @@ class TestNudgeTier:
         assert n.tier == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_types.py::TestNudgeTier -v`
 Expected: FAIL — `TypeError: __init__() got an unexpected keyword argument 'tier'`
 
-- [ ] **Step 3: Add tier field to Nudge**
+- [x] **Step 3: Add tier field to Nudge**
 
 In `omlx/api/guardrails/types.py`, modify the `Nudge` dataclass (currently lines 39–49):
 
@@ -366,12 +366,12 @@ class Nudge:
         return {"role": self.role, "content": self.content}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_types.py::TestNudgeTier -v`
 Expected: PASS — all 4 tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/types.py tests/test_guardrail_types.py
@@ -389,7 +389,7 @@ git commit -m "feat(guardrails): add tier field to Nudge for escalation levels"
 **Interfaces:**
 - Produces: all 4 nudge generators accept optional `tier: int = 0` parameter
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_guardrail_nudges.py`:
 
@@ -426,12 +426,12 @@ class TestNudgeTier:
         assert n.tier == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_nudges.py::TestNudgeTier -v`
 Expected: FAIL — `TypeError: retry_nudge() got an unexpected keyword argument 'tier'`
 
-- [ ] **Step 3: Add tier parameter to all 4 generators**
+- [x] **Step 3: Add tier parameter to all 4 generators**
 
 In `omlx/api/guardrails/nudge.py`, update each function signature and `Nudge(...)` construction:
 
@@ -493,12 +493,12 @@ def missing_params_nudge(tool_name: str, missing_params: list[str], tier: int = 
     )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_nudges.py -v`
 Expected: PASS — all existing + 6 new tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/nudge.py tests/test_guardrail_nudges.py
@@ -516,7 +516,7 @@ git commit -m "feat(guardrails): add optional tier param to all nudge generators
 **Interfaces:**
 - Produces: `ValidationResult.budget: ErrorBudget | None = None` field; `to_dict()` includes `"budget"` when present and `"tier"` in nudge serialization
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_guardrail_types.py`:
 
@@ -563,12 +563,12 @@ class TestNudgeTierSerialization:
         assert d["nudge"]["tier"] == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_types.py::TestValidationResultBudget tests/test_guardrail_types.py::TestNudgeTierSerialization -v`
 Expected: FAIL — `TypeError: ValidationResult.__init__() got an unexpected keyword argument 'budget'`
 
-- [ ] **Step 3: Add budget field to ValidationResult and update to_dict**
+- [x] **Step 3: Add budget field to ValidationResult and update to_dict**
 
 In `omlx/api/guardrails/types.py`:
 
@@ -611,12 +611,12 @@ class ValidationResult:
         return result
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_types.py -v`
 Expected: PASS — all existing + 5 new tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrails/types.py tests/test_guardrail_types.py
@@ -635,7 +635,7 @@ git commit -m "feat(guardrails): add budget field to ValidationResult and tier i
 - Consumes: `ErrorBudget` from Task 1, `ValidationResult.budget` from Task 5
 - Produces: `apply_guardrails()` accepts optional `max_retries`/`max_tool_errors` kwargs and attaches `ErrorBudget` to the merged `ValidationResult`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_server_guardrail_wiring.py`:
 
@@ -686,12 +686,12 @@ class TestBudgetWiring:
         assert payload["x_omlx_validation"]["budget"]["max_tool_errors"] == 2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_server_guardrail_wiring.py::TestBudgetWiring -v`
 Expected: FAIL — `TypeError: guardrail_validation_payload() got an unexpected keyword argument 'max_retries'`
 
-- [ ] **Step 3: Update guardrail_wiring.py**
+- [x] **Step 3: Update guardrail_wiring.py**
 
 Replace the entire contents of `omlx/api/guardrail_wiring.py`:
 
@@ -769,12 +769,12 @@ def guardrail_validation_payload(
     return {"x_omlx_validation": existing.to_dict()}
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_server_guardrail_wiring.py -v`
 Expected: PASS — all existing + 3 new tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/api/guardrail_wiring.py tests/test_server_guardrail_wiring.py
@@ -792,7 +792,7 @@ git commit -m "feat(guardrails): wire ErrorBudget into validation payload"
 **Interfaces:**
 - Produces: `ForgeGuardrailsSettings.max_retries: int = 3`, `.max_tool_errors: int = 2`, `.compaction_strategy: str = "none"`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_guardrail_settings.py`:
 
@@ -848,12 +848,12 @@ class TestNewForgeGuardrailsFields:
         assert restored.compaction_strategy == "sliding_window"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_guardrail_settings.py::TestNewForgeGuardrailsFields -v`
 Expected: FAIL — `AttributeError: 'ForgeGuardrailsSettings' object has no attribute 'max_retries'`
 
-- [ ] **Step 3: Add new fields to ForgeGuardrailsSettings**
+- [x] **Step 3: Add new fields to ForgeGuardrailsSettings**
 
 In `omlx/settings.py`, replace the `ForgeGuardrailsSettings` class (currently lines 771–796):
 
@@ -895,12 +895,12 @@ class ForgeGuardrailsSettings:
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_guardrail_settings.py -v`
 Expected: PASS — all existing + 7 new tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/settings.py tests/test_guardrail_settings.py
@@ -918,7 +918,7 @@ git commit -m "feat(settings): add max_retries, max_tool_errors, compaction_stra
 **Interfaces:**
 - Produces: 3 new optional fields on `GlobalSettingsRequest` Pydantic model; wired into settings update + retrieval
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_admin_guardrail_fields.py`:
 
@@ -954,12 +954,12 @@ class TestGlobalSettingsRequestNewFields:
         assert req.forge_guardrails_compaction_strategy == "tiered"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_admin_guardrail_fields.py -v`
 Expected: FAIL — `AttributeError: 'GlobalSettingsRequest' object has no attribute 'forge_guardrails_max_retries'`
 
-- [ ] **Step 3: Add fields to GlobalSettingsRequest model**
+- [x] **Step 3: Add fields to GlobalSettingsRequest model**
 
 In `omlx/admin/routes.py`, after line 282 (after `forge_guardrails_include_validation_metadata`):
 
@@ -969,7 +969,7 @@ In `omlx/admin/routes.py`, after line 282 (after `forge_guardrails_include_valid
     forge_guardrails_compaction_strategy: str | None = None
 ```
 
-- [ ] **Step 4: Wire new fields into the PUT handler**
+- [x] **Step 4: Wire new fields into the PUT handler**
 
 In `omlx/admin/routes.py`, after line 3711 (after the `include_validation_metadata` block, before the `forge_guardrails_changed` check), add:
 
@@ -991,7 +991,7 @@ In `omlx/admin/routes.py`, after line 3711 (after the `include_validation_metada
         forge_guardrails_changed = True
 ```
 
-- [ ] **Step 5: Wire new fields into the GET handler**
+- [x] **Step 5: Wire new fields into the GET handler**
 
 In `omlx/admin/routes.py`, after line 4421 (after the `forge_guardrails_include_validation_metadata` block), add:
 
@@ -1013,17 +1013,17 @@ In `omlx/admin/routes.py`, after line 4421 (after the `forge_guardrails_include_
         ),
 ```
 
-- [ ] **Step 6: Run test to verify it passes**
+- [x] **Step 6: Run test to verify it passes**
 
 Run: `pytest tests/test_admin_guardrail_fields.py -v`
 Expected: PASS — all 6 tests green
 
-- [ ] **Step 7: Run full guardrail suite for regression check**
+- [x] **Step 7: Run full guardrail suite for regression check**
 
 Run: `pytest tests/test_guardrail*.py tests/test_server_guardrail_wiring.py tests/test_admin_guardrail_fields.py -v`
 Expected: PASS — no regressions
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add omlx/admin/routes.py tests/test_admin_guardrail_fields.py
@@ -1043,7 +1043,7 @@ git commit -m "feat(admin): wire max_retries, max_tool_errors, compaction_strate
 **Interfaces:**
 - Produces: `CompactStrategy` ABC with abstract `compact(messages, budget_tokens) -> tuple[list[dict], int]`
 
-- [ ] **Step 1: Create the compaction module with ABC**
+- [x] **Step 1: Create the compaction module with ABC**
 
 Create `omlx/context/compaction.py`:
 
@@ -1092,12 +1092,12 @@ from omlx.context.compaction import CompactStrategy
 __all__ = ["CompactStrategy"]
 ```
 
-- [ ] **Step 2: Verify import works**
+- [x] **Step 2: Verify import works**
 
 Run: `python -c "from omlx.context import CompactStrategy; print(CompactStrategy)"`
 Expected: prints `<class 'omlx.context.compaction.CompactStrategy'>`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add omlx/context/__init__.py omlx/context/compaction.py
@@ -1116,7 +1116,7 @@ git commit -m "feat(context): create compaction package with CompactStrategy ABC
 **Interfaces:**
 - Produces: `NoCompact` — passthrough strategy, always returns `(messages, 0)`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_context_compaction.py`:
 
@@ -1157,12 +1157,12 @@ class TestNoCompact:
         assert phase == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_context_compaction.py::TestNoCompact -v`
 Expected: FAIL — `ImportError: cannot import name 'NoCompact'`
 
-- [ ] **Step 3: Implement NoCompact**
+- [x] **Step 3: Implement NoCompact**
 
 In `omlx/context/compaction.py`, add after the `CompactStrategy` class:
 
@@ -1186,12 +1186,12 @@ from omlx.context.compaction import CompactStrategy, NoCompact
 __all__ = ["CompactStrategy", "NoCompact"]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_context_compaction.py::TestNoCompact -v`
 Expected: PASS — 3 tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_compaction.py
@@ -1210,7 +1210,7 @@ git commit -m "feat(context): implement NoCompact passthrough strategy"
 **Interfaces:**
 - Produces: `SlidingWindowCompact(keep_recent=10)` — keeps first 2 + last N messages
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_context_compaction.py`:
 
@@ -1252,12 +1252,12 @@ class TestSlidingWindowCompact:
         assert phase == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_context_compaction.py::TestSlidingWindowCompact -v`
 Expected: FAIL — `ImportError: cannot import name 'SlidingWindowCompact'`
 
-- [ ] **Step 3: Implement SlidingWindowCompact**
+- [x] **Step 3: Implement SlidingWindowCompact**
 
 In `omlx/context/compaction.py`, add after `NoCompact`:
 
@@ -1288,12 +1288,12 @@ from omlx.context.compaction import CompactStrategy, NoCompact, SlidingWindowCom
 __all__ = ["CompactStrategy", "NoCompact", "SlidingWindowCompact"]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_context_compaction.py -v`
 Expected: PASS — NoCompact + SlidingWindow tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_compaction.py
@@ -1312,7 +1312,7 @@ git commit -m "feat(context): implement SlidingWindowCompact strategy"
 **Interfaces:**
 - Produces: `TieredCompact(keep_recent=2, thresholds=(0.75, 0.85, 0.95))` with Phase 1 logic
 
-- [ ] **Step 1: Write failing tests for Phase 1**
+- [x] **Step 1: Write failing tests for Phase 1**
 
 Append to `tests/test_context_compaction.py`:
 
@@ -1380,12 +1380,12 @@ class TestTieredCompactPhase1:
         assert result[1] == msgs[1]  # user input
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_context_compaction.py::TestTieredCompactPhase1 -v`
 Expected: FAIL — `ImportError: cannot import name 'TieredCompact'`
 
-- [ ] **Step 3: Implement TieredCompact with Phase 1**
+- [x] **Step 3: Implement TieredCompact with Phase 1**
 
 In `omlx/context/compaction.py`, add after `SlidingWindowCompact`:
 
@@ -1551,12 +1551,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_context_compaction.py -v`
 Expected: PASS — all Phase 1 tests green
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_compaction.py
@@ -1573,7 +1573,7 @@ git commit -m "feat(context): implement TieredCompact with 3-phase priority comp
 **Interfaces:**
 - No new code — validates existing Phase 2/3 implementation from Task 12
 
-- [ ] **Step 1: Write Phase 2 and Phase 3 tests**
+- [x] **Step 1: Write Phase 2 and Phase 3 tests**
 
 Append to `tests/test_context_compaction.py`:
 
@@ -1673,12 +1673,12 @@ class TestTieredCompactProtection:
         assert "result-9" in last_contents  # last message preserved
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 Run: `pytest tests/test_context_compaction.py -v`
 Expected: PASS — all Phase 2, Phase 3, and protection tests green. If any fail, fix the implementation in `compaction.py` (not the tests).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_context_compaction.py
@@ -1697,7 +1697,7 @@ git commit -m "test(context): add Phase 2/3 and protection tests for TieredCompa
 **Interfaces:**
 - Produces: `get_compact_strategy(name: str) -> CompactStrategy` — maps `"none"`, `"sliding_window"`, `"tiered"` to strategy instances
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Append to `tests/test_context_compaction.py`:
 
@@ -1729,12 +1729,12 @@ class TestGetCompactStrategy:
         assert isinstance(s, NoCompact)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_context_compaction.py::TestGetCompactStrategy -v`
 Expected: FAIL — `ImportError: cannot import name 'get_compact_strategy'`
 
-- [ ] **Step 3: Implement factory function**
+- [x] **Step 3: Implement factory function**
 
 In `omlx/context/compaction.py`, add at the bottom:
 
@@ -1776,12 +1776,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_context_compaction.py -v`
 Expected: PASS — all tests green including factory tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_compaction.py
@@ -1797,11 +1797,11 @@ git commit -m "feat(context): add get_compact_strategy factory for config-driven
 **Files:**
 - Modify: `docs/tool-call-guardrails.md`
 
-- [ ] **Step 1: Read current doc structure**
+- [x] **Step 1: Read current doc structure**
 
 Run: `head -50 docs/tool-call-guardrails.md` to find the insertion point (end of the existing content).
 
-- [ ] **Step 2: Add retry loops section**
+- [x] **Step 2: Add retry loops section**
 
 Append the following section to `docs/tool-call-guardrails.md`:
 
@@ -1894,7 +1894,7 @@ The budget defaults are configurable via the admin panel (Global Settings → Fo
 ```
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/tool-call-guardrails.md
@@ -1908,7 +1908,7 @@ git commit -m "docs: add Client-Side Retry Loops section to tool-call-guardrails
 **Files:**
 - Modify: `docs/tool-call-guardrails.md`
 
-- [ ] **Step 1: Add compaction section**
+- [x] **Step 1: Add compaction section**
 
 Append the following section to `docs/tool-call-guardrails.md` (after the retry loops section):
 
@@ -1963,7 +1963,7 @@ print(f"Compacted to phase {phase}, {len(compacted_messages)} messages remaining
 ```
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/tool-call-guardrails.md
@@ -1977,11 +1977,11 @@ git commit -m "docs: add Context Compaction section to tool-call-guardrails.md"
 **Files:**
 - Modify: `docs/forge-integration-plan.md`
 
-- [ ] **Step 1: Read current content to find Phase 3+4 section**
+- [x] **Step 1: Read current content to find Phase 3+4 section**
 
 Run: `grep -n "Phase 3\|Phase 4" docs/forge-integration-plan.md` to find the relevant section.
 
-- [ ] **Step 2: Add implementation status note**
+- [x] **Step 2: Add implementation status note**
 
 At the top of the Phase 3+4 section (or at the top of the file if no clear section exists), add:
 
@@ -1992,7 +1992,7 @@ At the top of the Phase 3+4 section (or at the top of the file if no clear secti
 > - `docs/tool-call-guardrails.md` — "Client-Side Retry Loops" and "Context Compaction" sections
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/forge-integration-plan.md
@@ -2005,23 +2005,23 @@ git commit -m "docs: mark Phase 3+4 as implemented in forge-integration-plan.md"
 
 ### Task 18: Full test suite regression run
 
-- [ ] **Step 1: Run all guardrail + context tests**
+- [x] **Step 1: Run all guardrail + context tests**
 
 Run: `pytest tests/test_guardrail_budget.py tests/test_guardrail_types.py tests/test_guardrail_nudges.py tests/test_guardrail_validator.py tests/test_guardrail_settings.py tests/test_guardrail_e2e.py tests/test_server_guardrail_wiring.py tests/test_admin_guardrail_fields.py tests/test_context_compaction.py -v`
 
 Expected: ALL PASS — zero failures, zero errors.
 
-- [ ] **Step 2: Run broader smoke test (if available)**
+- [x] **Step 2: Run broader smoke test (if available)**
 
 Run: `pytest -m "not slow" --tb=short -q`
 Expected: No new failures compared to pre-change baseline.
 
-- [ ] **Step 3: Verify no import regressions**
+- [x] **Step 3: Verify no import regressions**
 
 Run: `python -c "from omlx.api.guardrails import ErrorBudget, ValidationResult, Nudge; from omlx.context import CompactStrategy, NoCompact, SlidingWindowCompact, TieredCompact, get_compact_strategy; print('All imports OK')"`
 Expected: prints `All imports OK`
 
-- [ ] **Step 4: Final commit (if any cleanup needed)**
+- [x] **Step 4: Final commit (if any cleanup needed)**
 
 If all tests pass, no commit needed. If fixes were made:
 
