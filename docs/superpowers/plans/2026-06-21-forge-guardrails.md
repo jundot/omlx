@@ -96,7 +96,7 @@ Wave 7 (after Task 8):
 - Consumes: nothing (leaf package)
 - Produces: `CheckResult`, `Nudge`, `ValidationResult` dataclasses; `Nudge` has `.to_message() -> dict`; `ValidationResult` has `.to_dict() -> dict`; constants `KIND_RETRY`, `KIND_UNKNOWN_TOOL`, `KIND_TOOL_ARG_VALIDATION`, `TOOL_CHANNEL_KINDS`, `TOOL_ERROR_KINDS`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_guardrail_types.py
@@ -210,12 +210,12 @@ class TestConstants:
         assert KIND_TOOL_ARG_VALIDATION in TOOL_ERROR_KINDS
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_guardrail_types.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'omlx.api.guardrails'`
 
-- [ ] **Step 3: Create the types module**
+- [x] **Step 3: Create the types module**
 
 ```python
 # omlx/api/guardrails/types.py
@@ -295,7 +295,7 @@ class ValidationResult:
         return result
 ```
 
-- [ ] **Step 4: Create the package init**
+- [x] **Step 4: Create the package init**
 
 ```python
 # omlx/api/guardrails/__init__.py
@@ -323,12 +323,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_guardrail_types.py -v`
 Expected: PASS — all tests green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/guardrails/__init__.py omlx/api/guardrails/types.py tests/test_guardrail_types.py
@@ -350,7 +350,7 @@ git commit -m "feat(guardrails): add core type definitions (CheckResult, Nudge, 
 - Consumes: `Nudge`, `KIND_RETRY`, `KIND_UNKNOWN_TOOL`, `KIND_TOOL_ARG_VALIDATION`, `TOOL_CHANNEL_KINDS` from Task 1
 - Produces: `retry_nudge() -> Nudge`, `unknown_tool_nudge(tool_name: str, available_tools: list[str]) -> Nudge`, `tool_arg_validation_nudge(tool_name: str, args_repr: str, received_type: str) -> Nudge`, `missing_params_nudge(tool_name: str, missing_params: list[str]) -> Nudge`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_guardrail_nudges.py
@@ -432,12 +432,12 @@ class TestMissingParamsNudge:
         assert "search" in n.content
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_guardrail_nudges.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'omlx.api.guardrails.nudge'`
 
-- [ ] **Step 3: Implement the nudge generators**
+- [x] **Step 3: Implement the nudge generators**
 
 ```python
 # omlx/api/guardrails/nudge.py
@@ -517,7 +517,7 @@ def missing_params_nudge(tool_name: str, missing_params: list[str]) -> Nudge:
     )
 ```
 
-- [ ] **Step 4: Update package __init__.py exports**
+- [x] **Step 4: Update package __init__.py exports**
 
 Add to `omlx/api/guardrails/__init__.py`:
 
@@ -537,12 +537,12 @@ from omlx.api.guardrails.nudge import (
 #   "missing_params_nudge",
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_guardrail_nudges.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/guardrails/nudge.py omlx/api/guardrails/__init__.py tests/test_guardrail_nudges.py
@@ -564,7 +564,7 @@ git commit -m "feat(guardrails): add nudge generators for 4 validation failure t
 - Consumes: `CheckResult`, `ValidationResult`, `Nudge`, all 4 nudge generators from Tasks 1-2; `ToolCallExtraction` from `tool_calling.py:123` (fields: `cleaned_text`, `tool_calls`, `cleaned_thinking`); `ToolCall`/`FunctionCall` Pydantic models from `openai_models.py`
 - Produces: `GuardrailValidator` class with `__init__(self, tools: list[dict] | None)` and `validate(self, extraction: ToolCallExtraction, tool_choice: Any = None, has_tools: bool = True) -> ValidationResult`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_guardrail_validator.py
@@ -809,12 +809,12 @@ class TestValidatorConstruction:
         assert "direct" in v._tool_names
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_guardrail_validator.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'omlx.api.guardrails.validator'`
 
-- [ ] **Step 3: Implement the validator**
+- [x] **Step 3: Implement the validator**
 
 ```python
 # omlx/api/guardrails/validator.py
@@ -1057,7 +1057,7 @@ class GuardrailValidator:
         return retry_nudge()
 ```
 
-- [ ] **Step 4: Update package __init__.py exports**
+- [x] **Step 4: Update package __init__.py exports**
 
 Add to `omlx/api/guardrails/__init__.py`:
 
@@ -1066,12 +1066,12 @@ from omlx.api.guardrails.validator import GuardrailValidator
 # Add "GuardrailValidator" to __all__
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_guardrail_validator.py -v`
 Expected: PASS — all tests green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/guardrails/validator.py omlx/api/guardrails/__init__.py tests/test_guardrail_validator.py
@@ -1094,7 +1094,7 @@ git commit -m "feat(guardrails): implement GuardrailValidator with 4 checks and 
 - Consumes: existing `_parse_tool_calls_impl` and tool-call parsing infrastructure
 - Produces: `_parse_rehearsal_tool_calls(text) -> list[ToolCall] | None`, `_parse_mistral_bracket_tool_calls(text) -> list[ToolCall] | None`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_rescue_parsers.py
@@ -1184,16 +1184,16 @@ class TestMistralBracketParser:
         assert len(result) >= 2
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_rescue_parsers.py -v`
 Expected: FAIL — `ImportError: cannot import name '_parse_rehearsal_tool_calls'`
 
-- [ ] **Step 3: Read the existing parser chain to understand integration point**
+- [x] **Step 3: Read the existing parser chain to understand integration point**
 
 Read `omlx/api/tool_calling.py` around lines 1080-1280 to understand `_parse_tool_calls_impl` and where rescue parsers should be inserted (after existing parsers, before the final marker-strip at ~line 1275).
 
-- [ ] **Step 4: Implement the rehearsal syntax parser**
+- [x] **Step 4: Implement the rehearsal syntax parser**
 
 Add this function before `_parse_tool_calls_impl` (around line 1100) in `omlx/api/tool_calling.py`:
 
@@ -1238,7 +1238,7 @@ def _parse_rehearsal_tool_calls(
     return tool_calls if tool_calls else None
 ```
 
-- [ ] **Step 5: Implement the improved Mistral bracket-tag parser**
+- [x] **Step 5: Implement the improved Mistral bracket-tag parser**
 
 Add this function below the rehearsal parser in `omlx/api/tool_calling.py`:
 
@@ -1344,7 +1344,7 @@ def _extract_balanced_json(text: str, start: int) -> Optional[str]:
     return None  # unbalanced
 ```
 
-- [ ] **Step 6: Integrate rescue parsers into the parser chain**
+- [x] **Step 6: Integrate rescue parsers into the parser chain**
 
 In `_parse_tool_calls_impl` at `tool_calling.py:1108`, find the section where existing parsers are tried (after all existing parsers like XML, namespaced, Hermes, bracket, before the final marker-strip at ~line 1275). Add the rescue parser calls there:
 
@@ -1361,17 +1361,17 @@ if tool_calls is None:
 
 Place these lines right before the existing final marker-strip logic (around line 1275). The exact insertion point must be after all existing parser attempts and before any final cleanup.
 
-- [ ] **Step 7: Run tests to verify they pass**
+- [x] **Step 7: Run tests to verify they pass**
 
 Run: `pytest tests/test_rescue_parsers.py -v`
 Expected: PASS
 
-- [ ] **Step 8: Run full existing test suite to verify no regressions**
+- [x] **Step 8: Run full existing test suite to verify no regressions**
 
 Run: `pytest -m "not slow" -x`
 Expected: PASS — no regressions in existing parsing tests
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add omlx/api/tool_calling.py tests/test_rescue_parsers.py
@@ -1396,7 +1396,7 @@ git commit -m "feat(guardrails): add rehearsal + improved Mistral rescue parsers
 - Consumes: `CheckResult`, `ValidationResult`, `Nudge` from Task 1; `retry_nudge`, `unknown_tool_nudge` from Task 2
 - Produces: `enforce_tool_choice(tool_calls: list[ToolCall] | None, tool_choice: Any, has_text: bool, tools: list[dict] | None) -> tuple[list[ToolCall] | None, CheckResult | None]`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_tool_choice_enforcement.py
@@ -1480,12 +1480,12 @@ class TestInvalidToolChoice:
         assert check.passed is True
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_tool_choice_enforcement.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'omlx.api.tool_choice'`
 
-- [ ] **Step 3: Implement the enforcement module**
+- [x] **Step 3: Implement the enforcement module**
 
 ```python
 # omlx/api/tool_choice.py
@@ -1578,7 +1578,7 @@ def enforce_tool_choice(
     )
 ```
 
-- [ ] **Step 4: Add request-time validation for tool_choice**
+- [x] **Step 4: Add request-time validation for tool_choice**
 
 In `omlx/api/openai_models.py`, find the `ChatCompletionRequest` class (around line 292 where `tool_choice` is defined). Add a field validator:
 
@@ -1618,12 +1618,12 @@ def _validate_tool_choice(cls, v):
     )
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/test_tool_choice_enforcement.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omlx/api/tool_choice.py omlx/api/openai_models.py tests/test_tool_choice_enforcement.py
@@ -1646,7 +1646,7 @@ git commit -m "feat(guardrails): add tool_choice enforcement module + request va
 - Consumes: `GuardrailValidator` from Task 3
 - Produces: `_serialize_tool_call_arguments(arguments, strict=False) -> str`, `ToolCallExtraction` with `validation_result` field, `extract_and_validate_tool_calls(...)` wrapper
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_strict_args.py
@@ -1701,12 +1701,12 @@ class TestToolCallExtractionValidationField:
         assert ext.validation_result is None  # default
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_strict_args.py -v`
 Expected: FAIL — `TypeError: _serialize_tool_call_arguments() got an unexpected keyword argument 'strict'`
 
-- [ ] **Step 3: Modify `_serialize_tool_call_arguments` to accept `strict`**
+- [x] **Step 3: Modify `_serialize_tool_call_arguments` to accept `strict`**
 
 Replace the function at `omlx/api/tool_calling.py:94` with:
 
@@ -1748,7 +1748,7 @@ def _serialize_tool_call_arguments(arguments: Any, strict: bool = False) -> str:
     return "{}"
 ```
 
-- [ ] **Step 4: Add `validation_result` field to `ToolCallExtraction`**
+- [x] **Step 4: Add `validation_result` field to `ToolCallExtraction`**
 
 Replace the dataclass at `omlx/api/tool_calling.py:123`:
 
@@ -1764,7 +1764,7 @@ class ToolCallExtraction:
     validation_result: Any = None  # ValidationResult | None (avoid circular import)
 ```
 
-- [ ] **Step 5: Add the wrapper function**
+- [x] **Step 5: Add the wrapper function**
 
 Add below `extract_tool_calls_with_thinking` (after line ~1340) in `omlx/api/tool_calling.py`:
 
@@ -1847,17 +1847,17 @@ def extract_and_validate_tool_calls(
     )
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `pytest tests/test_strict_args.py -v`
 Expected: PASS
 
-- [ ] **Step 7: Run full test suite for regressions**
+- [x] **Step 7: Run full test suite for regressions**
 
 Run: `pytest -m "not slow" -x`
 Expected: PASS — the default `strict=False` preserves existing behavior
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add omlx/api/tool_calling.py tests/test_strict_args.py
@@ -1879,7 +1879,7 @@ git commit -m "feat(guardrails): add strict args mode + extract_and_validate wra
 - Consumes: nothing new
 - Produces: `ForgeGuardrailsSettings` dataclass; `GlobalSettings.forge_guardrails` field; admin API fields `forge_guardrails_validation_enabled`, `forge_guardrails_strict_tool_args`, `forge_guardrails_include_validation_metadata`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_guardrail_settings.py
@@ -1947,12 +1947,12 @@ class TestGlobalSettingsIntegration:
         assert gs.forge_guardrails.validation_enabled is True
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_guardrail_settings.py -v`
 Expected: FAIL — `ImportError: cannot import name 'ForgeGuardrailsSettings'`
 
-- [ ] **Step 3: Add `ForgeGuardrailsSettings` dataclass**
+- [x] **Step 3: Add `ForgeGuardrailsSettings` dataclass**
 
 In `omlx/settings.py`, add after `CompressionSettings` (line ~768):
 
@@ -1984,7 +1984,7 @@ class ForgeGuardrailsSettings:
         )
 ```
 
-- [ ] **Step 4: Compose into `GlobalSettings`**
+- [x] **Step 4: Compose into `GlobalSettings`**
 
 In `omlx/settings.py`, add the field to `GlobalSettings` after `compression` (line ~799):
 
@@ -2006,7 +2006,7 @@ In `to_dict()` (near line ~1181 where compression is serialized), add:
             "forge_guardrails": self.forge_guardrails.to_dict(),
 ```
 
-- [ ] **Step 5: Wire admin panel request/response**
+- [x] **Step 5: Wire admin panel request/response**
 
 In `omlx/admin/routes.py`, add to `GlobalSettingsRequest` (line ~206, near `claude_code_context_scaling_enabled`):
 
@@ -2035,12 +2035,12 @@ In the GET response (line ~4366, near `claude_code_context_scaling_enabled`), ad
         "forge_guardrails_include_validation_metadata": settings.forge_guardrails.include_validation_metadata,
 ```
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run: `pytest tests/test_guardrail_settings.py -v`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add omlx/settings.py omlx/admin/routes.py tests/test_guardrail_settings.py
@@ -2061,7 +2061,7 @@ git commit -m "feat(guardrails): add ForgeGuardrailsSettings + admin panel wirin
 - Consumes: `extract_and_validate_tool_calls()` from Task 6, `enforce_tool_choice()` from Task 5, `settings.forge_guardrails` from Task 7
 - Produces: `x_omlx_validation` field on all 3 chat endpoint responses
 
-- [ ] **Step 1: Write the failing integration tests**
+- [x] **Step 1: Write the failing integration tests**
 
 ```python
 # tests/test_guardrail_server_wiring.py
@@ -2114,7 +2114,7 @@ Note: Full integration tests requiring a running engine are in the E2E test file
 2. Grepping that all 6 call sites use it
 3. Running the existing test suite to confirm no regressions
 
-- [ ] **Step 2: Update server.py imports**
+- [x] **Step 2: Update server.py imports**
 
 In `omlx/server.py` at line ~162, update the import:
 
@@ -2134,7 +2134,7 @@ from omlx.api.tool_calling import (
 from omlx.api.tool_choice import enforce_tool_choice
 ```
 
-- [ ] **Step 3: Switch all 6 call sites to the wrapper**
+- [x] **Step 3: Switch all 6 call sites to the wrapper**
 
 At each of the 6 call sites (lines 3567, 4418, 4850, 5292, 5776, 6232), replace:
 
@@ -2162,7 +2162,7 @@ extraction = extract_and_validate_tool_calls(
 
 **Important**: `settings` must be accessible at each call site. Check that `settings` (the `GlobalSettings` instance) is in scope. In `server.py`, the settings instance is typically available as a module-level or app-state variable — verify the exact variable name used at each site.
 
-- [ ] **Step 4: Attach `x_omlx_validation` to non-streaming responses**
+- [x] **Step 4: Attach `x_omlx_validation` to non-streaming responses**
 
 After building the response object at each non-streaming endpoint, add (for `/v1/chat/completions`, `/v1/messages`, `/v1/responses`):
 
@@ -2189,7 +2189,7 @@ if gg.include_validation_metadata and extraction.validation_result is not None:
 return JSONResponse(content=response_data)
 ```
 
-- [ ] **Step 5: Attach `x_omlx_validation` to streaming responses (final SSE event)**
+- [x] **Step 5: Attach `x_omlx_validation` to streaming responses (final SSE event)**
 
 In each streaming endpoint, after the stream completes (all tool calls parsed), emit a final SSE event before `data: [DONE]`:
 
@@ -2204,7 +2204,7 @@ if (
 yield "data: [DONE]\n\n"
 ```
 
-- [ ] **Step 6: Wire `enforce_tool_choice` after validation**
+- [x] **Step 6: Wire `enforce_tool_choice` after validation**
 
 After the extraction and before response construction at each endpoint:
 
@@ -2230,12 +2230,12 @@ if settings.forge_guardrails.validation_enabled:
 
 Note: Since `ToolCallExtraction` and `ValidationResult` are frozen, use `dataclasses.replace` or reconstruct. This wiring is the most complex part — read the existing response construction at each site carefully before modifying.
 
-- [ ] **Step 7: Run existing tests for regressions**
+- [x] **Step 7: Run existing tests for regressions**
 
 Run: `pytest -m "not slow" -x`
 Expected: PASS — all 6 call sites work with `validation_enabled=False` (passthrough)
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add omlx/server.py tests/test_guardrail_server_wiring.py
@@ -2261,7 +2261,7 @@ git commit -m "feat(guardrails): wire validation + tool_choice enforcement into 
 - Consumes: all previous tasks
 - Produces: complete E2E test coverage
 
-- [ ] **Step 1: Write the E2E test file**
+- [x] **Step 1: Write the E2E test file**
 
 ```python
 # tests/test_guardrail_e2e.py
@@ -2365,17 +2365,17 @@ class TestBackwardCompatibility:
         assert _serialize_tool_call_arguments(None) == "{}"
 ```
 
-- [ ] **Step 2: Run the full test suite**
+- [x] **Step 2: Run the full test suite**
 
 Run: `pytest tests/test_guardrail_types.py tests/test_guardrail_nudges.py tests/test_guardrail_validator.py tests/test_rescue_parsers.py tests/test_tool_choice_enforcement.py tests/test_guardrail_settings.py tests/test_guardrail_server_wiring.py tests/test_guardrail_e2e.py -v`
 Expected: All unit tests PASS; E2E tests SKIP (no loaded model)
 
-- [ ] **Step 3: Run complete existing test suite for regressions**
+- [x] **Step 3: Run complete existing test suite for regressions**
 
 Run: `pytest -m "not slow" -x`
 Expected: PASS — zero regressions
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/test_guardrail_e2e.py
@@ -2395,7 +2395,7 @@ git commit -m "test(guardrails): add E2E test skeleton + backward compatibility 
 - Modify: `docs/forge-integration-plan.md` (if it exists)
 - Modify: admin panel help text (if applicable)
 
-- [ ] **Step 1: Create user-facing documentation**
+- [x] **Step 1: Create user-facing documentation**
 
 ```markdown
 <!-- docs/tool-call-guardrails.md -->
@@ -2498,7 +2498,7 @@ When validation is enabled, `tool_choice` is enforced:
 Invalid `tool_choice` values are rejected with HTTP 400 at request time.
 ```
 
-- [ ] **Step 2: Update forge-integration-plan.md (if it exists)**
+- [x] **Step 2: Update forge-integration-plan.md (if it exists)**
 
 ```bash
 # Check if file exists:
@@ -2507,7 +2507,7 @@ ls docs/forge-integration-plan.md
 
 If it exists, add a status note marking Phase 1 + Phase 2 as in progress via change `add-forge-guardrails`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/tool-call-guardrails.md
