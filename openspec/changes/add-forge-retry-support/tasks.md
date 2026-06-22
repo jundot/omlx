@@ -13,10 +13,10 @@
 
 ## 3. Budget Metadata in Response Extension
 
-- [ ] 3.1 Modify `omlx/api/guardrails/validator.py` — add `budget: ErrorBudget | None` field to `ValidationResult`
-- [ ] 3.2 Modify `ValidationResult.to_dict()` — include `budget` object when present
-- [ ] 3.3 Modify `omlx/api/guardrail_wiring.py` — construct `ErrorBudget` from settings and attach to `ValidationResult`
-- [ ] 3.4 Unit tests for budget serialization in validation result
+- [x] 3.1 Modify `omlx/api/guardrails/validator.py` — add `budget: ErrorBudget | None` field to `ValidationResult`
+- [x] 3.2 Modify `ValidationResult.to_dict()` — include `budget` object when present
+- [x] 3.3 Modify `omlx/api/guardrail_wiring.py` — construct `ErrorBudget` from settings and attach to `ValidationResult`
+- [x] 3.4 Unit tests for budget serialization in validation result
 
 ## 4. Settings Extension
 
