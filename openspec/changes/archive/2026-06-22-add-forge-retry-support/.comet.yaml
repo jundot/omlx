@@ -1,5 +1,5 @@
 workflow: full
-phase: build
+phase: archive
 context_compression: off
 build_mode: subagent-driven-development
 build_pause: null
@@ -12,11 +12,11 @@ auto_transition: true
 base_ref: d187055972236d12b492a58de31c52fb31d41571
 design_doc: docs/superpowers/specs/2026-06-22-forge-retry-support-design.md
 plan: docs/superpowers/plans/2026-06-22-forge-retry-support.md
-verify_result: pending
-verification_report: null
-branch_status: pending
+verify_result: pass
+verification_report: docs/superpowers/reports/2026-06-22-add-forge-retry-support-verify.md
+branch_status: handled
 created_at: 2026-06-22
-verified_at: null
-archived: false
+verified_at: 2026-06-22
+archived: true
 handoff_context: openspec/changes/add-forge-retry-support/.comet/handoff/design-context.json
 handoff_hash: c3cdf6f97f70c645b66d0faa09b932bd3970405d25ea04b87600e287b1c47de5

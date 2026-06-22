@@ -2,6 +2,8 @@
 comet_change: add-forge-retry-support
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-06-22-add-forge-retry-support
+status: final
 ---
 
 # Design Doc: Client-Driven Retry Support

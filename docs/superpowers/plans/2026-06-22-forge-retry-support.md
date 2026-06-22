@@ -2,6 +2,7 @@
 change: add-forge-retry-support
 design-doc: docs/superpowers/specs/2026-06-22-forge-retry-support-design.md
 base-ref: 1ce701b2382597b2444c94946eeb2af72e20b4ed
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 # Client-Driven Retry Support Implementation Plan
@@ -30,6 +31,7 @@ base-ref: 1ce701b2382597b2444c94946eeb2af72e20b4ed
 
 **Resolution:** Use the **method** approach (design doc is technically correct — a frozen dataclass can't track runtime state). `recommended_action()` is a method taking counts. `to_dict()` serializes a static `"recommended_action": "retry"` since the server doesn't know client-side counts. The client calls `should_retry()` / `recommended_action(counts)` locally for dynamic decisions.
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## File Structure
@@ -56,6 +58,7 @@ base-ref: 1ce701b2382597b2444c94946eeb2af72e20b4ed
 | `docs/tool-call-guardrails.md` | Modify | Add "Client-Side Retry Loops" and "Context Compaction" sections |
 | `docs/forge-integration-plan.md` | Modify | Mark Phase 3+4 as implemented |
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Execution Order
@@ -73,6 +76,7 @@ Group 6 (Docs)            ─── Last (after all code groups)
 
 **Parallelization:** Groups 1–4 and Group 5 can be developed simultaneously by different engineers. Group 6 waits for all code to land.
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Track A: Budget + Types + Wiring + Settings (Sequential)
@@ -262,6 +266,7 @@ git add omlx/api/guardrails/budget.py tests/test_guardrail_budget.py
 git commit -m "feat(guardrails): add ErrorBudget dataclass for client retry budgets"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 2: Export ErrorBudget from package __init__
@@ -303,6 +308,7 @@ git add omlx/api/guardrails/__init__.py
 git commit -m "feat(guardrails): export ErrorBudget from package __init__"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 3: Nudge Tier Extension — Add tier field
@@ -378,6 +384,7 @@ git add omlx/api/guardrails/types.py tests/test_guardrail_types.py
 git commit -m "feat(guardrails): add tier field to Nudge for escalation levels"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 4: Nudge Tier Extension — Add tier param to nudge generators
@@ -505,6 +512,7 @@ git add omlx/api/guardrails/nudge.py tests/test_guardrail_nudges.py
 git commit -m "feat(guardrails): add optional tier param to all nudge generators"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 5: Budget + Tier Serialization in ValidationResult.to_dict
@@ -623,6 +631,7 @@ git add omlx/api/guardrails/types.py tests/test_guardrail_types.py
 git commit -m "feat(guardrails): add budget field to ValidationResult and tier in nudge serialization"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 6: Budget Wiring in guardrail_wiring.py
@@ -781,6 +790,7 @@ git add omlx/api/guardrail_wiring.py tests/test_server_guardrail_wiring.py
 git commit -m "feat(guardrails): wire ErrorBudget into validation payload"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 7: Settings Extension — Add new fields to ForgeGuardrailsSettings
@@ -907,6 +917,7 @@ git add omlx/settings.py tests/test_guardrail_settings.py
 git commit -m "feat(settings): add max_retries, max_tool_errors, compaction_strategy to ForgeGuardrailsSettings"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 8: Admin Route Wiring — GlobalSettingsRequest + PUT/GET endpoints
@@ -1030,6 +1041,7 @@ git add omlx/admin/routes.py tests/test_admin_guardrail_fields.py
 git commit -m "feat(admin): wire max_retries, max_tool_errors, compaction_strategy into global settings API"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Track B: Context Compaction Package (Parallel with Track A)
@@ -1104,6 +1116,7 @@ git add omlx/context/__init__.py omlx/context/compaction.py
 git commit -m "feat(context): create compaction package with CompactStrategy ABC"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 10: NoCompact strategy
@@ -1198,6 +1211,7 @@ git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_c
 git commit -m "feat(context): implement NoCompact passthrough strategy"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 11: SlidingWindowCompact strategy
@@ -1300,6 +1314,7 @@ git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_c
 git commit -m "feat(context): implement SlidingWindowCompact strategy"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 12: TieredCompact strategy — Phase 1 (drop nudges + truncate tool results)
@@ -1563,6 +1578,7 @@ git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_c
 git commit -m "feat(context): implement TieredCompact with 3-phase priority compaction"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 13: TieredCompact Phase 2 + Phase 3 tests
@@ -1685,6 +1701,7 @@ git add tests/test_context_compaction.py
 git commit -m "test(context): add Phase 2/3 and protection tests for TieredCompact"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 14: Compaction strategy factory + config integration
@@ -1788,6 +1805,7 @@ git add omlx/context/compaction.py omlx/context/__init__.py tests/test_context_c
 git commit -m "feat(context): add get_compact_strategy factory for config-driven strategy selection"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Track C: Documentation (After all code)
@@ -1901,6 +1919,7 @@ git add docs/tool-call-guardrails.md
 git commit -m "docs: add Client-Side Retry Loops section to tool-call-guardrails.md"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 16: Add "Context Compaction" section to tool-call-guardrails.md
@@ -1970,6 +1989,7 @@ git add docs/tool-call-guardrails.md
 git commit -m "docs: add Context Compaction section to tool-call-guardrails.md"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ### Task 17: Update forge-integration-plan.md — mark Phase 3+4 as implemented
@@ -1999,6 +2019,7 @@ git add docs/forge-integration-plan.md
 git commit -m "docs: mark Phase 3+4 as implemented in forge-integration-plan.md"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Final Integration Verification
@@ -2030,6 +2051,7 @@ git add -A
 git commit -m "test: fix integration issues from retry/compaction change"
 ```
 
+archived-with: 2026-06-22-add-forge-retry-support
 ---
 
 ## Self-Review Summary
