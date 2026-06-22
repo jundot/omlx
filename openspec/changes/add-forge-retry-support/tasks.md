@@ -20,10 +20,10 @@
 
 ## 4. Settings Extension
 
-- [ ] 4.1 Modify `omlx/settings.py` — add `max_retries: int = 3`, `max_tool_errors: int = 2`, `compaction_strategy: str = "none"` to `ForgeGuardrailsSettings`
-- [ ] 4.2 Update `ForgeGuardrailsSettings.to_dict()` and `from_dict()` for new fields
-- [ ] 4.3 Wire new fields into `GlobalSettingsRequest` in `admin/routes.py` (admin panel)
-- [ ] 4.4 Unit tests for settings round-trip with new fields
+- [x] 4.1 Modify `omlx/settings.py` — add `max_retries: int = 3`, `max_tool_errors: int = 2`, `compaction_strategy: str = "none"` to `ForgeGuardrailsSettings`
+- [x] 4.2 Update `ForgeGuardrailsSettings.to_dict()` and `from_dict()` for new fields
+- [x] 4.3 Wire new fields into `GlobalSettingsRequest` in `admin/routes.py` (admin panel)
+- [x] 4.4 Unit tests for settings round-trip with new fields
 
 ## 5. Context Compaction Package
 
