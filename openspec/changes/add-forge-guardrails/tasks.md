@@ -76,6 +76,6 @@
 
 ## 10. Documentation
 
-- [ ] 10.1 Add `docs/tool-call-guardrails.md` — user-facing docs: what the flags do, how to enable, how to use `x_omlx_validation` for client-side retry, example nudge messages
-- [ ] 10.2 Add server setting descriptions to admin panel help text (if applicable)
-- [ ] 10.3 Update `docs/forge-integration-plan.md` — mark Phase 1 + Phase 2 as "in progress via change `add-forge-guardrails`" and note Change B/C as follow-ups
+- [x] 10.1 Add `docs/tool-call-guardrails.md` — user-facing docs: what the flags do, how to enable, how to use `x_omlx_validation` for client-side retry, example nudge messages
+- [x] 10.2 Add server setting descriptions to admin panel help text (if applicable)
+- [x] 10.3 Update `docs/forge-integration-plan.md` — mark Phase 1 + Phase 2 as "in progress via change `add-forge-guardrails`" and note Change B/C as follow-ups

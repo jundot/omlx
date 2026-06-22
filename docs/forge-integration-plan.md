@@ -3,6 +3,13 @@
 > Analysis of [forge-guardrails](https://github.com/jundot/forge) v0.7.4 features applicable to oMLX,
 > with concrete integration strategies, code impact, and phased rollout.
 
+> **Status (2026-06-21):** Phase 1 (Validation & Rescue) + Phase 2 (tool_choice Enforcement) are
+> **implemented** via OpenSpec change `add-forge-guardrails` (branch `feature/20260621/add-forge-guardrails`).
+> See [Tool Call Guardrails](tool-call-guardrails.md) for user-facing docs.
+> Phase 3 (Error Budgets) + Phase 4 (Context Compaction) are planned as Change B (client-driven retry
+> via response extensions). Phase 5 (MCP Prerequisites) + Phase 6 (Synthetic Respond Tool) are planned
+> as Change C.
+
 ---
 
 ## 1. Executive Summary
