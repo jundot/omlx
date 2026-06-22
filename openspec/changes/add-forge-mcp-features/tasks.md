@@ -19,13 +19,13 @@
 
 ## 3. Synthetic Respond Tool
 
-- [ ] 3.1 Create `omlx/api/respond.py` with `inject_respond_tool(tools)` and `strip_respond_calls(tool_calls)`
-- [ ] 3.2 `inject_respond_tool`: append respond tool spec if not already present
-- [ ] 3.3 `strip_respond_calls`: pure respond → text, mixed → real calls only, none → passthrough
-- [ ] 3.4 Wire injection into `server.py` — inject before generation, strip after parsing
-- [ ] 3.5 Add `inject_respond_tool: bool = False` and `enforce_mcp_prerequisites: bool = False` to `ForgeGuardrailsSettings`
-- [ ] 3.6 Wire new settings into admin panel
-- [ ] 3.7 Unit tests for inject + strip
+- [x] 3.1 Create `omlx/api/respond.py` with `inject_respond_tool(tools)` and `strip_respond_calls(tool_calls)`
+- [x] 3.2 `inject_respond_tool`: append respond tool spec if not already present
+- [x] 3.3 `strip_respond_calls`: pure respond → text, mixed → real calls only, none → passthrough
+- [x] 3.4 Wire injection into `server.py` — inject before generation, strip after parsing
+- [x] 3.5 Add `inject_respond_tool: bool = False` and `enforce_mcp_prerequisites: bool = False` to `ForgeGuardrailsSettings`
+- [x] 3.6 Wire new settings into admin panel
+- [x] 3.7 Unit tests for inject + strip
 
 ## 4. Integration + Tests
 
