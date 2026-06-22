@@ -138,7 +138,9 @@ class ToolCallExtraction:
     validation_result: Any = None
 
 
-def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def _parse_xml_tool_calls(
+    text: str, strict: bool = False
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for XML-based tool call formats.
 
@@ -167,7 +169,9 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     type="function",
                     function=FunctionCall(
                         name=name,
-                        arguments=_serialize_tool_call_arguments(arguments),
+                        arguments=_serialize_tool_call_arguments(
+                            arguments, strict=strict
+                        ),
                     ),
                 )
             )
@@ -240,7 +244,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
 
 def _parse_namespaced_tool_calls(
-    text: str, namespace: str
+    text: str, namespace: str, strict: bool = False
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse namespaced tool call tags like <minimax:tool_call>...</minimax:tool_call>.
@@ -328,7 +332,9 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                         type="function",
                         function=FunctionCall(
                             name=name,
-                            arguments=_serialize_tool_call_arguments(arguments),
+                            arguments=_serialize_tool_call_arguments(
+                                arguments, strict=strict
+                            ),
                         ),
                     )
                 )
@@ -1083,6 +1089,7 @@ def parse_tool_calls(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
@@ -1107,7 +1114,9 @@ def parse_tool_calls(
         - cleaned_text: Text with tool call tags and thinking tags removed
         - tool_calls: List of ToolCall objects, or None if no tool calls found
     """
-    cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
+    cleaned_text, tool_calls = _parse_tool_calls_impl(
+        text, tokenizer, tools, strict=strict
+    )
     if tool_calls:
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
@@ -1242,6 +1251,7 @@ def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
@@ -1289,7 +1299,9 @@ def _parse_tool_calls_impl(
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
-                                    arguments=_serialize_tool_call_arguments(arguments),
+                                    arguments=_serialize_tool_call_arguments(
+                                        arguments, strict=strict
+                                    ),
                                 ),
                             )
                         )
@@ -1320,10 +1332,10 @@ def _parse_tool_calls_impl(
                                         id=f"call_{uuid.uuid4().hex[:8]}",
                                         type="function",
                                         function=FunctionCall(
-                                            name=name,
-                                            arguments=_serialize_tool_call_arguments(
-                                                arguments
-                                            ),
+                                        name=name,
+                                        arguments=_serialize_tool_call_arguments(
+                                            arguments, strict=strict
+                                        ),
                                         ),
                                     )
                                 )
@@ -1345,7 +1357,7 @@ def _parse_tool_calls_impl(
                     # drop when the native parser raises (e.g. ast.literal_eval
                     # SyntaxError on non-Python-literal parameter values).
                     fb_wrapped = f"<tool_call>{match}</tool_call>"
-                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped)
+                    _, fb_calls = _parse_xml_tool_calls(fb_wrapped, strict=strict)
                     if fb_calls:
                         tool_calls.extend(fb_calls)
                         logger.warning(
@@ -1382,13 +1394,13 @@ def _parse_tool_calls_impl(
 
     # Fallback: parse XML <tool_call> tags (GLM, Qwen, generic formats)
     if "<tool_call>" in cleaned_text:
-        return _parse_xml_tool_calls(cleaned_text)
+        return _parse_xml_tool_calls(cleaned_text, strict=strict)
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
     if ns_match:
         ns = ns_match.group(1)
-        return _parse_namespaced_tool_calls(cleaned_text, ns)
+        return _parse_namespaced_tool_calls(cleaned_text, ns, strict=strict)
 
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
@@ -1481,6 +1493,7 @@ def extract_tool_calls_with_thinking(
     regular_content: str,
     tokenizer: Any,
     tools: Optional[List] = None,
+    strict: bool = False,
 ) -> ToolCallExtraction:
     """Extract tool calls while keeping a sanitized reasoning transcript.
 
@@ -1497,12 +1510,16 @@ def extract_tool_calls_with_thinking(
       Calls whose name matches a provided tool are promoted regardless
       of whether regular text was also produced.
     """
-    cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+    cleaned_text, tool_calls = parse_tool_calls(
+        regular_content, tokenizer, tools, strict=strict
+    )
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
 
     if not tool_calls and thinking_content:
-        _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
+        _, tool_calls = parse_tool_calls(
+            thinking_content, tokenizer, tools, strict=strict
+        )
         tool_calls_from_thinking = bool(tool_calls)
 
         # Guard: validate thinking-embedded tool calls.
@@ -1557,7 +1574,8 @@ def extract_and_validate_tool_calls(
     GuardrailValidator on the extraction and attaches the result.
     """
     extraction = extract_tool_calls_with_thinking(
-        thinking_content, regular_content, tokenizer, tools
+        thinking_content, regular_content, tokenizer, tools,
+        strict=strict_tool_args,
     )
 
     validation_result = None

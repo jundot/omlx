@@ -82,3 +82,42 @@ class TestExtractAndValidateWrapper:
             validation_enabled=True,
         )
         assert result.validation_result is None
+
+
+class TestStrictToolArgsThreading:
+    """Verify strict_tool_args flows through the full parser chain."""
+
+    def test_strict_preserves_non_dict_via_wrapper(self):
+        """extract_and_validate_tool_calls(strict_tool_args=True) must NOT
+        coerce malformed arguments to '{}'. The preserved value surfaces
+        in the Pydantic ValidationError — proving strict threading works."""
+        import pytest
+        from pydantic import ValidationError
+        from omlx.api.tool_calling import extract_and_validate_tool_calls
+
+        class FakeTokenizer:
+            has_tool_calling = False
+
+        regular = '<tool_call>{"name": "search", "arguments": 42}</tool_call>'
+
+        # Default: coerced to '{}' — no error
+        result_default = extract_and_validate_tool_calls(
+            thinking_content="",
+            regular_content=regular,
+            tokenizer=FakeTokenizer(),
+            tools=[],
+            strict_tool_args=False,
+        )
+        assert result_default.tool_calls[0].function.arguments == "{}"
+
+        # Strict: preserved as "42" → Pydantic catches it with the raw value
+        with pytest.raises(ValidationError) as exc_info:
+            extract_and_validate_tool_calls(
+                thinking_content="",
+                regular_content=regular,
+                tokenizer=FakeTokenizer(),
+                tools=[],
+                strict_tool_args=True,
+            )
+        error_msg = str(exc_info.value)
+        assert "42" in error_msg, "strict=True should preserve '42', not '{}'"

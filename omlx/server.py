@@ -2088,6 +2088,7 @@ async def _with_sse_keepalive(
                             "error": {"message": str(e), "type": "server_error"}
                         }
                     yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
                     return
                 if result is _KEEPALIVE_SENTINEL:
                     return
