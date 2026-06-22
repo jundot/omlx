@@ -2,6 +2,7 @@
 change: add-forge-mcp-features
 design-doc: docs/superpowers/specs/2026-06-22-forge-mcp-features-design.md
 base-ref: dd676d69f0dd2f883dd33300fbb7a09ca6adc3b3
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 # MCP Features (Prerequisites + Respond Tool) Implementation Plan
@@ -78,6 +79,7 @@ Modified files:
 - `docs/tool-call-guardrails.md` — MCP Prerequisites + Respond Tool sections
 - `docs/forge-integration-plan.md` — mark Phase 5+6 as implemented
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Group 1: MCP Prerequisites
@@ -342,6 +344,7 @@ git add omlx/mcp/prerequisites.py tests/test_mcp_prerequisites.py
 git commit -m "feat(mcp): add PrerequisiteChecker skeleton with PrerequisiteCheck dataclass"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.2: Implement name-only prerequisite checking
@@ -425,6 +428,7 @@ git add tests/test_mcp_prerequisites.py
 git commit -m "test(mcp): cover name-only prerequisite checking"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.3: Implement arg-matched prerequisite checking
@@ -541,6 +545,7 @@ git add tests/test_mcp_prerequisites.py
 git commit -m "test(mcp): cover arg-matched prerequisite checking"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.4: Verify `executed_tools` built from message history (stateless)
@@ -635,6 +640,7 @@ git add tests/test_mcp_prerequisites.py
 git commit -m "test(mcp): cover executed_tools extraction edge cases"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.5: Add `prerequisite_nudge()` to nudge.py
@@ -784,6 +790,7 @@ git add omlx/api/guardrails/types.py omlx/api/guardrails/nudge.py tests/test_gua
 git commit -m "feat(guardrails): add prerequisite_nudge + KIND_STEP/KIND_PREREQUISITE constants"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.6: Export new constants from `__init__.py`
@@ -882,6 +889,7 @@ git add omlx/api/guardrails/__init__.py tests/test_guardrail_step_prereq_nudges.
 git commit -m "feat(guardrails): export KIND_STEP, KIND_PREREQUISITE, step/prerequisite nudges"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.7: Add prerequisite declaration parsing to MCP config
@@ -1005,6 +1013,7 @@ git add omlx/mcp/types.py omlx/mcp/config.py tests/test_mcp_config.py
 git commit -m "feat(mcp): parse tools_prerequisites field in MCP config"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.8: Update `mcp.example.json` with prerequisite declarations
@@ -1067,6 +1076,7 @@ git add mcp.example.json
 git commit -m "docs(mcp): add tools_prerequisites example declarations"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 1.9: Full PrerequisiteChecker unit test suite review
@@ -1086,6 +1096,7 @@ git add tests/test_mcp_prerequisites.py
 git commit -m "test(mcp): finalize PrerequisiteChecker unit test coverage"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Group 2: Step Enforcement + Nudges
@@ -1205,6 +1216,7 @@ git add omlx/api/guardrails/nudge.py tests/test_guardrail_step_prereq_nudges.py
 git commit -m "feat(guardrails): add step_nudge with 3-tier escalation"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 2.2: Add step enforcement check (Check 5) to GuardrailValidator
@@ -1488,6 +1500,7 @@ git add omlx/api/guardrails/validator.py tests/test_guardrail_validator.py
 git commit -m "feat(guardrails): add Check 5 (step enforcement) to GuardrailValidator"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 2.3: Wire step + prerequisite checks into validation flow
@@ -1861,6 +1874,7 @@ git add omlx/api/guardrail_wiring.py omlx/api/tool_calling.py tests/test_server_
 git commit -m "feat(guardrails): wire step + prerequisite checks into apply_guardrails"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 2.4: Step nudge tier correctness tests
@@ -1910,6 +1924,7 @@ git add tests/test_guardrail_step_prereq_nudges.py
 git commit -m "test(guardrails): verify step nudge tier progression"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Group 3: Synthetic Respond Tool
@@ -2132,6 +2147,7 @@ git add omlx/api/respond.py tests/test_respond_tool.py
 git commit -m "feat(api): add synthetic respond tool module (inject + strip)"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.2: `inject_respond_tool` — append if not present
@@ -2194,6 +2210,7 @@ git add tests/test_respond_tool.py
 git commit -m "test(api): comprehensive inject_respond_tool coverage"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.3: `strip_respond_calls` — three cases
@@ -2283,6 +2300,7 @@ git add tests/test_respond_tool.py
 git commit -m "test(api): comprehensive strip_respond_calls coverage"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.4: Wire respond tool into server.py
@@ -2405,6 +2423,7 @@ git add omlx/server.py tests/test_server_guardrail_wiring.py
 git commit -m "feat(server): wire respond tool injection + stripping at all call sites"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.5: Add `inject_respond_tool` + `enforce_mcp_prerequisites` settings
@@ -2520,6 +2539,7 @@ git add omlx/settings.py tests/test_guardrail_settings.py
 git commit -m "feat(settings): add inject_respond_tool + enforce_mcp_prerequisites to ForgeGuardrailsSettings"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.6: Wire new settings into admin panel
@@ -2606,6 +2626,7 @@ git add omlx/admin/routes.py tests/test_guardrail_settings.py
 git commit -m "feat(admin): wire inject_respond_tool + enforce_mcp_prerequisites into settings UI"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 3.7: Full respond tool test suite review
@@ -2625,6 +2646,7 @@ git add tests/test_respond_tool.py
 git commit -m "test(api): finalize respond tool test coverage"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Group 4: Integration + Tests
@@ -2731,6 +2753,7 @@ git add omlx/server.py tests/test_server_guardrail_wiring.py
 git commit -m "feat(server): wire PrerequisiteChecker into all 6 validation call sites"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 4.2: Integration test — prerequisites end-to-end
@@ -2876,6 +2899,7 @@ git add tests/test_forge_mcp_features_e2e.py
 git commit -m "test(e2e): prerequisites end-to-end integration tests"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 4.3: Integration test — respond tool end-to-end
@@ -2983,6 +3007,7 @@ git add tests/test_forge_mcp_features_e2e.py
 git commit -m "test(e2e): respond tool end-to-end integration tests"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 4.4: Run full test suite — verify 0 regressions
@@ -3007,6 +3032,7 @@ git add -A
 git commit -m "test: verify 0 regressions across Changes A+B+C"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Group 5: Documentation
@@ -3136,6 +3162,7 @@ git add docs/tool-call-guardrails.md
 git commit -m "docs: add MCP Prerequisites, Respond Tool, and Step Enforcement sections"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ### Task 5.2: Update `docs/forge-integration-plan.md`
@@ -3176,6 +3203,7 @@ git add docs/forge-integration-plan.md
 git commit -m "docs: mark Phase 5+6 as implemented (all 6 Forge phases done)"
 ```
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Self-Review Checklist
@@ -3210,6 +3238,7 @@ After completing all tasks, verify:
 - [x] `prerequisite_nudge(tool_name, missing_prereqs, tier) -> Nudge` — consistent
 - [x] `KIND_STEP = "step"`, `KIND_PREREQUISITE = "prerequisite"` — consistent across types.py, nudge.py, __init__.py
 
+archived-with: 2026-06-22-add-forge-mcp-features
 ---
 
 ## Execution Handoff

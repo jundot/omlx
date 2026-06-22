@@ -2,6 +2,8 @@
 comet_change: add-forge-mcp-features
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-06-22-add-forge-mcp-features
+status: final
 ---
 
 # Design Doc: MCP Features (Prerequisites + Respond Tool)

@@ -4,31 +4,15 @@
 TBD - created by archiving change add-forge-guardrails. Update Purpose after archive.
 ## Requirements
 ### Requirement: Tool-call response validation
-The system SHALL validate every parsed tool-call response before returning it to the client, when `guardrail_validation` setting is enabled. Validation SHALL perform four checks in order: bare-text-when-tools-expected, unknown tool name, malformed arguments (non-dict), and missing required parameters.
+The system SHALL validate every parsed tool-call response. **Modified**: adds Check 5 (step enforcement) and Check 6 (prerequisite validation) when MCP prerequisite data is available. Adds "step" and "prerequisite" nudge kinds.
 
-#### Scenario: Valid tool call passes all checks
-- **WHEN** the model emits a well-formed tool call to a known tool with valid dict arguments satisfying all required parameters
-- **THEN** the system returns the tool call normally with validation result `passed=True` and no nudge
+#### Scenario: Step nudge uses user-role with tier
+- **WHEN** step enforcement detects a premature terminal tool call
+- **THEN** the nudge has `role="user"`, `kind="step"`, and `tier` (1-3) based on consecutive failure count
 
-#### Scenario: Unknown tool name is detected
-- **WHEN** the model emits a tool call to a tool name not present in the request's `tools` list
-- **THEN** the system flags the validation check `unknown_tool` as failed and generates a nudge with `kind="unknown_tool"`, `role="tool"`, listing the available tool names
-
-#### Scenario: Malformed arguments (non-dict) are detected
-- **WHEN** the model emits a tool call whose arguments cannot be parsed as a JSON object (e.g., a bare string, number, or array)
-- **THEN** the system flags the validation check `malformed_args` as failed and generates a nudge with `kind="tool_arg_validation"`, `role="tool"`, indicating the received type and the required dict shape
-
-#### Scenario: Missing required parameters are detected
-- **WHEN** the model emits a tool call to a known tool with dict arguments, but one or more parameters listed in the tool's JSON Schema `required` array are absent
-- **THEN** the system flags the validation check `missing_required_params` as failed and generates a nudge with `kind="tool_arg_validation"`, `role="tool"`, listing the missing parameter names
-
-#### Scenario: Bare text when tools are expected is detected
-- **WHEN** the model emits only text content (no tool calls) and `tools` were provided in the request and `tool_choice` is not `"none"`
-- **THEN** the system flags the validation check `bare_text` as failed and generates a nudge with `kind="retry"`, `role="user"`, instructing the model to emit a tool call
-
-#### Scenario: Validation disabled by default
-- **WHEN** `guardrail_validation` setting is `False` (default)
-- **THEN** the system performs no validation and returns responses identical to current behavior
+#### Scenario: Prerequisite nudge uses user-role
+- **WHEN** prerequisite validation detects a missing prerequisite
+- **THEN** the nudge has `role="user"`, `kind="prerequisite"`, listing the missing prerequisite tool
 
 ### Requirement: Corrective nudge generation
 The system SHALL generate a structured nudge message for each failed validation check. Each nudge SHALL specify `role` (either `"user"` for bare-text corrections or `"tool"` for tool-call corrections), `content` (the corrective message text), and `kind` (one of `"retry"`, `"unknown_tool"`, `"tool_arg_validation"`).
