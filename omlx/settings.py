@@ -782,6 +782,8 @@ class ForgeGuardrailsSettings:
     max_retries: int = 3
     max_tool_errors: int = 2
     compaction_strategy: str = "none"
+    inject_respond_tool: bool = False
+    enforce_mcp_prerequisites: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -791,6 +793,8 @@ class ForgeGuardrailsSettings:
             "max_retries": self.max_retries,
             "max_tool_errors": self.max_tool_errors,
             "compaction_strategy": self.compaction_strategy,
+            "inject_respond_tool": self.inject_respond_tool,
+            "enforce_mcp_prerequisites": self.enforce_mcp_prerequisites,
         }
 
     @classmethod
@@ -802,6 +806,8 @@ class ForgeGuardrailsSettings:
             max_retries=data.get("max_retries", 3),
             max_tool_errors=data.get("max_tool_errors", 2),
             compaction_strategy=data.get("compaction_strategy", "none"),
+            inject_respond_tool=data.get("inject_respond_tool", False),
+            enforce_mcp_prerequisites=data.get("enforce_mcp_prerequisites", False),
         )
 
 

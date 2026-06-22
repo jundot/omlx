@@ -283,6 +283,8 @@ class GlobalSettingsRequest(BaseModel):
     forge_guardrails_max_retries: int | None = Field(default=None, ge=0, le=20)
     forge_guardrails_max_tool_errors: int | None = Field(default=None, ge=0, le=20)
     forge_guardrails_compaction_strategy: str | None = None
+    forge_guardrails_inject_respond_tool: bool | None = None
+    forge_guardrails_enforce_mcp_prerequisites: bool | None = None
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -3727,6 +3729,16 @@ async def update_global_settings(
             request.forge_guardrails_compaction_strategy
         )
         forge_guardrails_changed = True
+    if request.forge_guardrails_inject_respond_tool is not None:
+        global_settings.forge_guardrails.inject_respond_tool = (
+            request.forge_guardrails_inject_respond_tool
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_enforce_mcp_prerequisites is not None:
+        global_settings.forge_guardrails.enforce_mcp_prerequisites = (
+            request.forge_guardrails_enforce_mcp_prerequisites
+        )
+        forge_guardrails_changed = True
 
     if forge_guardrails_changed:
         runtime_applied.append("forge_guardrails")
@@ -3737,7 +3749,9 @@ async def update_global_settings(
             f"include_validation_metadata={global_settings.forge_guardrails.include_validation_metadata}, "
             f"max_retries={global_settings.forge_guardrails.max_retries}, "
             f"max_tool_errors={global_settings.forge_guardrails.max_tool_errors}, "
-            f"compaction_strategy={global_settings.forge_guardrails.compaction_strategy}"
+            f"compaction_strategy={global_settings.forge_guardrails.compaction_strategy}, "
+            f"inject_respond_tool={global_settings.forge_guardrails.inject_respond_tool}, "
+            f"enforce_mcp_prerequisites={global_settings.forge_guardrails.enforce_mcp_prerequisites}"
         )
 
     # Apply integrations settings (Live - immediately applied)
