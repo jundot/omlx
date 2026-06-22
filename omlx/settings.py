@@ -779,12 +779,18 @@ class ForgeGuardrailsSettings:
     validation_enabled: bool = False
     strict_tool_args: bool = False
     include_validation_metadata: bool = False
+    max_retries: int = 3
+    max_tool_errors: int = 2
+    compaction_strategy: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "validation_enabled": self.validation_enabled,
             "strict_tool_args": self.strict_tool_args,
             "include_validation_metadata": self.include_validation_metadata,
+            "max_retries": self.max_retries,
+            "max_tool_errors": self.max_tool_errors,
+            "compaction_strategy": self.compaction_strategy,
         }
 
     @classmethod
@@ -793,6 +799,9 @@ class ForgeGuardrailsSettings:
             validation_enabled=data.get("validation_enabled", False),
             strict_tool_args=data.get("strict_tool_args", False),
             include_validation_metadata=data.get("include_validation_metadata", False),
+            max_retries=data.get("max_retries", 3),
+            max_tool_errors=data.get("max_tool_errors", 2),
+            compaction_strategy=data.get("compaction_strategy", "none"),
         )
 
 

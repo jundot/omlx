@@ -280,6 +280,9 @@ class GlobalSettingsRequest(BaseModel):
     forge_guardrails_validation_enabled: bool | None = None
     forge_guardrails_strict_tool_args: bool | None = None
     forge_guardrails_include_validation_metadata: bool | None = None
+    forge_guardrails_max_retries: int | None = Field(default=None, ge=0, le=20)
+    forge_guardrails_max_tool_errors: int | None = Field(default=None, ge=0, le=20)
+    forge_guardrails_compaction_strategy: str | None = None
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -3709,6 +3712,21 @@ async def update_global_settings(
             request.forge_guardrails_include_validation_metadata
         )
         forge_guardrails_changed = True
+    if request.forge_guardrails_max_retries is not None:
+        global_settings.forge_guardrails.max_retries = (
+            request.forge_guardrails_max_retries
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_max_tool_errors is not None:
+        global_settings.forge_guardrails.max_tool_errors = (
+            request.forge_guardrails_max_tool_errors
+        )
+        forge_guardrails_changed = True
+    if request.forge_guardrails_compaction_strategy is not None:
+        global_settings.forge_guardrails.compaction_strategy = (
+            request.forge_guardrails_compaction_strategy
+        )
+        forge_guardrails_changed = True
 
     if forge_guardrails_changed:
         runtime_applied.append("forge_guardrails")
@@ -3716,7 +3734,10 @@ async def update_global_settings(
             f"Forge Guardrails settings updated: "
             f"validation_enabled={global_settings.forge_guardrails.validation_enabled}, "
             f"strict_tool_args={global_settings.forge_guardrails.strict_tool_args}, "
-            f"include_validation_metadata={global_settings.forge_guardrails.include_validation_metadata}"
+            f"include_validation_metadata={global_settings.forge_guardrails.include_validation_metadata}, "
+            f"max_retries={global_settings.forge_guardrails.max_retries}, "
+            f"max_tool_errors={global_settings.forge_guardrails.max_tool_errors}, "
+            f"compaction_strategy={global_settings.forge_guardrails.compaction_strategy}"
         )
 
     # Apply integrations settings (Live - immediately applied)
@@ -4419,6 +4440,17 @@ async def get_server_stats(
             global_settings.forge_guardrails.include_validation_metadata
             if global_settings
             else False
+        ),
+        "forge_guardrails_max_retries": (
+            global_settings.forge_guardrails.max_retries if global_settings else 3
+        ),
+        "forge_guardrails_max_tool_errors": (
+            global_settings.forge_guardrails.max_tool_errors if global_settings else 2
+        ),
+        "forge_guardrails_compaction_strategy": (
+            global_settings.forge_guardrails.compaction_strategy
+            if global_settings
+            else "none"
         ),
         "engines": _get_engine_info(),
         "active_models": active_models_data,
