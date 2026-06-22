@@ -47,12 +47,12 @@
 
 ## 7. Settings Integration
 
-- [ ] 7.1 Add `ForgeGuardrailsSettings` dataclass to `omlx/settings.py` (near `CompressionSettings` at line 746) with fields: `validation_enabled: bool = False`, `strict_tool_args: bool = False`, `include_validation_metadata: bool = False`, plus `to_dict()`/`from_dict()` methods
-- [ ] 7.2 Compose `forge_guardrails: ForgeGuardrailsSettings` field into `GlobalSettings` (near line 799), wire into `GlobalSettings.to_dict()` (line 1453), `from_dict()`/load (near line 888), and `validate()` (line 1237)
-- [ ] 7.3 Add fields to `GlobalSettingsRequest` in `omlx/admin/routes.py:206`: `forge_guardrails_validation_enabled`, `forge_guardrails_strict_tool_args`, `forge_guardrails_include_validation_metadata`
-- [ ] 7.4 Wire application in `update_global_settings` handler at `routes.py:3234` (mirror the Claude Code block at lines 3650-3679)
-- [ ] 7.5 Expose in GET response (around line 4366 where `claude_code_context_scaling_enabled` is returned)
-- [ ] 7.6 Unit tests for settings round-trip (set → get → verify)
+- [x] 7.1 Add `ForgeGuardrailsSettings` dataclass to `omlx/settings.py` (near `CompressionSettings` at line 746) with fields: `validation_enabled: bool = False`, `strict_tool_args: bool = False`, `include_validation_metadata: bool = False`, plus `to_dict()`/`from_dict()` methods
+- [x] 7.2 Compose `forge_guardrails: ForgeGuardrailsSettings` field into `GlobalSettings` (near line 799), wire into `GlobalSettings.to_dict()` (line 1453), `from_dict()`/load (near line 888), and `validate()` (line 1237)
+- [x] 7.3 Add fields to `GlobalSettingsRequest` in `omlx/admin/routes.py:206`: `forge_guardrails_validation_enabled`, `forge_guardrails_strict_tool_args`, `forge_guardrails_include_validation_metadata`
+- [x] 7.4 Wire application in `update_global_settings` handler at `routes.py:3234` (mirror the Claude Code block at lines 3650-3679)
+- [x] 7.5 Expose in GET response (around line 4366 where `claude_code_context_scaling_enabled` is returned)
+- [x] 7.6 Unit tests for settings round-trip (set → get → verify)
 
 ## 8. Server Wiring (Single Chokepoint)
 
