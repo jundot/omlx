@@ -66,13 +66,13 @@
 
 ## 9. Test Suite
 
-- [ ] 9.1 `tests/test_guardrail_validator.py` — 4 checks independently + ordering + edge cases (loose schemas, empty args)
-- [ ] 9.2 `tests/test_guardrail_nudges.py` — all 4 nudge generators (role, kind, content)
-- [ ] 9.3 `tests/test_rescue_parsers.py` — rehearsal + Mistral + integration with existing parser chain
-- [ ] 9.4 `tests/test_tool_choice_enforcement.py` — all 5 modes + invalid value rejection
-- [ ] 9.5 `tests/test_guardrail_settings.py` — settings round-trip + admin handler
-- [ ] 9.6 `tests/test_guardrail_e2e.py` — end-to-end through the API: enable flags via settings, send request with malformed tool output (mocked model), verify response extension
-- [ ] 9.7 Run existing test suite (`pytest -m "not slow"`) and verify no regressions
+- [x] 9.1 `tests/test_guardrail_validator.py` — 4 checks independently + ordering + edge cases (loose schemas, empty args)
+- [x] 9.2 `tests/test_guardrail_nudges.py` — all 4 nudge generators (role, kind, content)
+- [x] 9.3 `tests/test_rescue_parsers.py` — rehearsal + Mistral + integration with existing parser chain
+- [x] 9.4 `tests/test_tool_choice_enforcement.py` — all 5 modes + invalid value rejection
+- [x] 9.5 `tests/test_guardrail_settings.py` — settings round-trip + admin handler
+- [x] 9.6 `tests/test_guardrail_e2e.py` — end-to-end through the API: enable flags via settings, send request with malformed tool output (mocked model), verify response extension
+- [x] 9.7 Run existing test suite (`pytest -m "not slow"`) and verify no regressions
 
 ## 10. Documentation
 
