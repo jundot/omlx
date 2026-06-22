@@ -12,10 +12,10 @@
 
 ## 2. Step Enforcement + Nudges
 
-- [ ] 2.1 Add `step_nudge(terminal_tool, pending_steps, tier=1)` to `omlx/api/guardrails/nudge.py` — 3-tier escalation text, role="user", kind="step"
-- [ ] 2.2 Add step enforcement check (Check 5) to `GuardrailValidator` — detects premature terminal tool calls
-- [ ] 2.3 Wire step + prerequisite checks into validation flow (Checks 5-6)
-- [ ] 2.4 Unit tests for step nudges (3 tiers, content correctness)
+- [x] 2.1 Add `step_nudge(terminal_tool, pending_steps, tier=1)` to `omlx/api/guardrails/nudge.py` — 3-tier escalation text, role="user", kind="step"
+- [x] 2.2 Add step enforcement check (Check 5) to `GuardrailValidator` — detects premature terminal tool calls
+- [x] 2.3 Wire step + prerequisite checks into validation flow (Checks 5-6)
+- [x] 2.4 Unit tests for step nudges (3 tiers, content correctness)
 
 ## 3. Synthetic Respond Tool
 
