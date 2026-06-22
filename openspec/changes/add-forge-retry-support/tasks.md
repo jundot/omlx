@@ -6,10 +6,10 @@
 
 ## 2. Nudge Tier Extension
 
-- [ ] 2.1 Modify `omlx/api/guardrails/types.py` — add `tier: int = 0` field to `Nudge` dataclass (frozen, backward compatible)
-- [ ] 2.2 Modify `omlx/api/guardrails/nudge.py` — existing nudge generators stay tier=0; add optional `tier` param for future step nudges
-- [ ] 2.3 Update `Nudge.to_dict()` serialization to include `tier` field
-- [ ] 2.4 Unit tests for tier field (default 0, explicit tier, serialization)
+- [x] 2.1 Modify `omlx/api/guardrails/types.py` — add `tier: int = 0` field to `Nudge` dataclass (frozen, backward compatible)
+- [x] 2.2 Modify `omlx/api/guardrails/nudge.py` — existing nudge generators stay tier=0; add optional `tier` param for future step nudges
+- [x] 2.3 Update `Nudge.to_dict()` serialization to include `tier` field
+- [x] 2.4 Unit tests for tier field (default 0, explicit tier, serialization)
 
 ## 3. Budget Metadata in Response Extension
 
