@@ -2088,7 +2088,6 @@ async def _with_sse_keepalive(
                             "error": {"message": str(e), "type": "server_error"}
                         }
                     yield f"data: {json.dumps(error_data)}\n\n"
-                    yield "data: [DONE]\n\n"
                     return
                 if result is _KEEPALIVE_SENTINEL:
                     return
@@ -4429,9 +4428,9 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    extraction = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
-        # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
@@ -4631,6 +4630,12 @@ async def stream_chat_completion(
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield f"data: {json.dumps(_payload, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -4873,8 +4878,8 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    extraction = None
     if last_output and last_output.tool_calls:
-        # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
@@ -4989,6 +4994,12 @@ async def stream_anthropic_messages(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield format_sse_event("x_omlx_validation", _payload)
 
     # 7. Send message_stop
     yield create_message_stop_event()
@@ -5382,7 +5393,15 @@ async def create_anthropic_message(
                 request_uses_cache_control=request_has_cache_control(request),
             )
 
-            return response.model_dump_json()
+            _result = response.model_dump_json()
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
 
         return StreamingResponse(
             _release_after_stream(
@@ -5930,7 +5949,15 @@ async def create_response(
                     input_messages=current_input_messages,
                 )
 
-            return response_obj.model_dump_json()
+            _result = response_obj.model_dump_json()
+            _fg_meta = _server_state.global_settings.forge_guardrails
+            if _fg_meta.include_validation_metadata and extraction is not None:
+                _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+                if _payload:
+                    _resp = json.loads(_result)
+                    _resp.update(_payload)
+                    _result = json.dumps(_resp, ensure_ascii=False)
+            return _result
 
         return StreamingResponse(
             _release_after_stream(
@@ -6288,6 +6315,7 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    extraction = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = last_output.tool_calls
@@ -6539,6 +6567,12 @@ async def stream_responses_api(
             "input_tokens_details": {"cached_tokens": last_output.cached_tokens},
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
+
+    _fg_meta = _server_state.global_settings.forge_guardrails
+    if _fg_meta.include_validation_metadata and extraction is not None:
+        _payload = guardrail_validation_payload(extraction, include_validation_metadata=True)
+        if _payload:
+            yield format_sse_event("response.x_omlx_validation", _payload)
 
     # 13. response.completed — MUST always be sent
     final_response = {
