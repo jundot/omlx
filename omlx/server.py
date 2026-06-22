@@ -158,6 +158,8 @@ from .api.guardrail_wiring import (
     apply_guardrails,
     guardrail_validation_payload,
 )
+from .api.respond import inject_respond_tool, strip_respond_calls
+from .mcp.prerequisites import PrerequisiteChecker
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -385,6 +387,40 @@ def get_engine_pool() -> EnginePool:
 def get_mcp_manager():
     """Get the MCP manager instance (may be None)."""
     return _server_state.mcp_manager
+
+
+def _build_prereq_checker():
+    _fg = _server_state.global_settings.forge_guardrails
+    if (
+        _fg.enforce_mcp_prerequisites
+        and _server_state.mcp_manager is not None
+        and getattr(_server_state.mcp_manager.config, "tools_prerequisites", {})
+    ):
+        return PrerequisiteChecker(
+            _server_state.mcp_manager.config.tools_prerequisites
+        )
+    return None
+
+
+def _prior_messages_for_request(request) -> list[dict] | None:
+    msgs = getattr(request, "messages", None)
+    if msgs is None:
+        return None
+    out: list[dict] = []
+    for m in msgs:
+        d = m.model_dump() if hasattr(m, "model_dump") else m
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def _maybe_inject_respond_tool(tools):
+    if not tools:
+        return tools
+    _fg = _server_state.global_settings.forge_guardrails
+    if not _fg.inject_respond_tool:
+        return tools
+    return inject_respond_tool(tools)
 
 
 async def verify_api_key(
@@ -3329,6 +3365,7 @@ async def create_chat_completion(
             effective_tools = _server_state.mcp_manager.get_merged_tools(
                 user_tools_dicts
             )
+        effective_tools = _maybe_inject_respond_tool(effective_tools)
 
         # Validate context window before sending to model
         tools_for_template = (
@@ -3580,12 +3617,39 @@ async def create_chat_completion(
                     strict_tool_args=_fg.strict_tool_args,
                     validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
                 extraction = apply_guardrails(
                     extraction,
                     request.tool_choice,
                     tools_for_template,
                     validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
                 )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
@@ -4448,12 +4512,39 @@ async def stream_chat_completion(
             strict_tool_args=_fg.strict_tool_args,
             validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
         extraction = apply_guardrails(
             extraction,
             request.tool_choice,
             kwargs.get("tools"),
             validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
         )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
@@ -4896,12 +4987,39 @@ async def stream_anthropic_messages(
             strict_tool_args=_fg.strict_tool_args,
             validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
         extraction = apply_guardrails(
             extraction,
             request.tool_choice,
             kwargs.get("tools"),
             validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
         )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         tool_calls = extraction.tool_calls
 
     # 4. Close open blocks
@@ -5355,12 +5473,39 @@ async def create_anthropic_message(
                     strict_tool_args=_fg.strict_tool_args,
                     validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
                 extraction = apply_guardrails(
                     extraction,
                     request.tool_choice,
                     internal_tools,
                     validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
                 )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
@@ -5456,6 +5601,7 @@ async def count_anthropic_tokens(
 
         # Convert tools if present
         internal_tools = convert_anthropic_tools_to_internal(request.tools)
+        internal_tools = _maybe_inject_respond_tool(internal_tools)
 
         # Apply chat template to get prompt
         tokenizer = engine.tokenizer
@@ -5670,6 +5816,7 @@ async def create_response(
         )
         if _server_state.mcp_manager and effective_tools:
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+        effective_tools = _maybe_inject_respond_tool(effective_tools)
 
         # Convert tools for chat template
         tools_for_template = (
@@ -5858,12 +6005,39 @@ async def create_response(
                     strict_tool_args=_fg.strict_tool_args,
                     validation_enabled=_fg.validation_enabled,
                 )
+                _prereq = _build_prereq_checker()
                 extraction = apply_guardrails(
                     extraction,
                     request.tool_choice,
                     tools_for_template,
                     validation_enabled=_fg.validation_enabled,
+                    prerequisite_checker=_prereq,
+                    prior_messages=(
+                        _prior_messages_for_request(request)
+                        if _prereq is not None
+                        else None
+                    ),
                 )
+                if extraction.tool_calls:
+                    _real_calls, _resp_text = strip_respond_calls(
+                        extraction.tool_calls
+                    )
+                    if _resp_text is not None:
+                        extraction = ToolCallExtraction(
+                            cleaned_text=_resp_text,
+                            tool_calls=[],
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
+                    elif len(_real_calls) != len(extraction.tool_calls or []):
+                        extraction = ToolCallExtraction(
+                            cleaned_text=extraction.cleaned_text,
+                            tool_calls=_real_calls,
+                            cleaned_thinking=extraction.cleaned_thinking,
+                            tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                            validation_result=extraction.validation_result,
+                        )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
 
@@ -6333,12 +6507,39 @@ async def stream_responses_api(
             strict_tool_args=_fg.strict_tool_args,
             validation_enabled=_fg.validation_enabled,
         )
+        _prereq = _build_prereq_checker()
         extraction = apply_guardrails(
             extraction,
             request.tool_choice,
             kwargs.get("tools"),
             validation_enabled=_fg.validation_enabled,
+            prerequisite_checker=_prereq,
+            prior_messages=(
+                _prior_messages_for_request(request)
+                if _prereq is not None
+                else None
+            ),
         )
+        if extraction.tool_calls:
+            _real_calls, _resp_text = strip_respond_calls(
+                extraction.tool_calls
+            )
+            if _resp_text is not None:
+                extraction = ToolCallExtraction(
+                    cleaned_text=_resp_text,
+                    tool_calls=[],
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
+            elif len(_real_calls) != len(extraction.tool_calls or []):
+                extraction = ToolCallExtraction(
+                    cleaned_text=extraction.cleaned_text,
+                    tool_calls=_real_calls,
+                    cleaned_thinking=extraction.cleaned_thinking,
+                    tool_calls_from_thinking=extraction.tool_calls_from_thinking,
+                    validation_result=extraction.validation_result,
+                )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         if not stream_content and cleaned_text:

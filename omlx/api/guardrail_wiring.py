@@ -15,6 +15,8 @@ def apply_guardrails(
     tools: Optional[list[dict]] = None,
     *,
     validation_enabled: bool = False,
+    prerequisite_checker: Any = None,
+    prior_messages: Optional[list[dict]] = None,
 ) -> ToolCallExtraction:
     if not validation_enabled or extraction.validation_result is None:
         return extraction
@@ -24,11 +26,24 @@ def apply_guardrails(
         extraction.tool_calls, tool_choice, has_text, tools
     )
 
+    new_checks: list[CheckResult] = [tc_check]
+
+    if (
+        prerequisite_checker is not None
+        and extraction.tool_calls
+        and prior_messages is not None
+    ):
+        new_checks.extend(
+            prerequisite_checker.check(
+                extraction.tool_calls, prior_messages
+            )
+        )
+
     existing: ValidationResult = extraction.validation_result
     merged = ValidationResult(
-        checks=existing.checks + [tc_check],
+        checks=existing.checks + new_checks,
         nudge=existing.nudge,
-        passed=existing.passed and tc_check.passed,
+        passed=existing.passed and all(c.passed for c in new_checks),
         budget=existing.budget,
     )
 
