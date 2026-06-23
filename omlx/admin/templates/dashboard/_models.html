@@ -1344,6 +1344,15 @@
                                                 </button>
                                             </div>
                                         </div>
+                                        <!-- Sensitivity micro-batch -->
+                                        <div class="flex items-center justify-between gap-4">
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">Sensitivity micro-batch</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">Process the sensitivity calibration in sample-chunks of this size to bound peak memory on a smaller machine. 0 keeps the single-batch default.</p>
+                                            </div>
+                                            <input type="number" min="0" step="1" x-model.number="oqMicroBatch"
+                                                   class="w-20 shrink-0 px-3 py-1.5 text-sm bg-white border border-neutral-300 rounded-xl text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->
