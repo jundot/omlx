@@ -121,6 +121,8 @@ class ResponsesRequest(BaseModel):
     conversation: Optional[Any] = None
     max_tool_calls: Optional[int] = None
     stream_options: Optional[Dict[str, Any]] = None
+    # VLM image soft-token budget per image (Gemma-style variable resolution)
+    vision_soft_tokens_per_image: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 

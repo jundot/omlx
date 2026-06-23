@@ -1400,6 +1400,15 @@ def get_model_settings_for_request(model_id: str | None):
     )
 
 
+def _resolve_vision_soft_tokens_per_image(request, settings) -> int | None:
+    """Resolve VLM image soft-token budget: request > model setting > None."""
+    value = getattr(settings, "vision_soft_tokens_per_image", None)
+    request_value = getattr(request, "vision_soft_tokens_per_image", None)
+    if request_value is not None:
+        value = request_value
+    return int(value) if value is not None else None
+
+
 def resolve_model_id(model_id: str | None) -> str | None:
     """Resolve a model alias to its real model ID.
 
@@ -3093,6 +3102,9 @@ async def create_chat_completion(
         reasoning_parser = None
         settings_guided_grammar = None
         ms = get_model_settings_for_request(request.model)
+        vision_soft_tokens_per_image = _resolve_vision_soft_tokens_per_image(
+            request, ms
+        )
         if ms:
             max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
@@ -3367,6 +3379,8 @@ async def create_chat_completion(
         # Add chat template kwargs
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+        if vision_soft_tokens_per_image is not None:
+            chat_kwargs["vision_soft_tokens_per_image"] = vision_soft_tokens_per_image
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
@@ -4917,6 +4931,9 @@ async def create_anthropic_message(
         merged_ct_kwargs = {}
         forced_keys: set[str] = set()
         ms = get_model_settings_for_request(request.model)
+        vision_soft_tokens_per_image = _resolve_vision_soft_tokens_per_image(
+            request, ms
+        )
         if ms:
             max_tool_result_tokens = ms.max_tool_result_tokens
             if ms.chat_template_kwargs:
@@ -5103,6 +5120,8 @@ async def create_anthropic_message(
         # Add chat template kwargs
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+        if vision_soft_tokens_per_image is not None:
+            chat_kwargs["vision_soft_tokens_per_image"] = vision_soft_tokens_per_image
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
@@ -5448,6 +5467,9 @@ async def create_response(
         merged_ct_kwargs = {}
         reasoning_parser = None
         ms = get_model_settings_for_request(request.model)
+        vision_soft_tokens_per_image = _resolve_vision_soft_tokens_per_image(
+            request, ms
+        )
         if ms:
             reasoning_parser = ms.reasoning_parser
             if ms.chat_template_kwargs:
@@ -5624,6 +5646,8 @@ async def create_response(
             chat_kwargs["tools"] = tools_for_template
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+        if vision_soft_tokens_per_image is not None:
+            chat_kwargs["vision_soft_tokens_per_image"] = vision_soft_tokens_per_image
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.

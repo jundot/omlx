@@ -9,7 +9,7 @@ import copy
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -46,6 +46,7 @@ class ModelSettings:
         force_sampling: Force sampling even with temperature=0.
         max_tool_result_tokens: Maximum tokens in tool result (None = use global default).
         chat_template_kwargs: Extra chat template keyword arguments.
+        vision_soft_tokens_per_image: Optional VLM image soft-token budget per image.
         forced_ct_kwargs: Keys in chat_template_kwargs that cannot be overridden.
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
         model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
@@ -114,6 +115,7 @@ class ModelSettings:
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    vision_soft_tokens_per_image: Optional[int] = None
     forced_ct_kwargs: Optional[list[str]] = (
         None  # Keys that cannot be overridden by API requests
     )

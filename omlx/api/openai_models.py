@@ -298,6 +298,14 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # VLM image soft-token budget per image (Gemma-style variable resolution)
+    vision_soft_tokens_per_image: Optional[int] = Field(
+        default=None,
+        ge=1,
+        validation_alias=AliasChoices(
+            "vision_soft_tokens_per_image", "max_soft_tokens"
+        ),
+    )
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)

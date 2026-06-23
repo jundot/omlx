@@ -288,6 +288,41 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_vlm_preflight_chat_uses_requested_vision_soft_token_budget(monkeypatch):
+    """Explicit Gemma-style soft-token budgets must raise the image-token bound."""
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler = _make_scheduler()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    engine._tokenizer.encode = MagicMock(return_value=list(range(1000)))
+
+    seen: dict = {}
+
+    def _capture(num_prompt_tokens, **kwargs):
+        seen["num_prompt_tokens"] = num_prompt_tokens
+
+    scheduler.preflight_or_raise = _capture  # type: ignore[assignment]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,..."},
+                },
+            ],
+        }
+    ]
+    await engine.preflight_chat(
+        messages=messages,
+        vision_soft_tokens_per_image=2048,
+    )
+    assert seen["num_prompt_tokens"] == 1000 + 2048
+
+
+@pytest.mark.asyncio
 async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
     """Modern HF chat templates (Qwen2.5-VL, Gemma-Vision, Llama-3.2-Vision)
     render image content parts as literal placeholder strings inline with

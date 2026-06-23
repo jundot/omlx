@@ -60,6 +60,26 @@ class MockVLMTokenizer:
         return "decoded text"
 
 
+class VisionSoftTokenProcessor:
+    """Processor stub whose signature advertises soft-token budget support."""
+
+    def __init__(self, tokenizer=None):
+        self.tokenizer = tokenizer or MockVLMTokenizer()
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "<vision prompt>"
+
+    def __call__(self, *args, vision_soft_tokens_per_image=None, **kwargs):
+        return {}
+
+
+class KwargsOnlyProcessor(VisionSoftTokenProcessor):
+    """Processor stub that accepts arbitrary kwargs but advertises no support."""
+
+    def __call__(self, *args, **kwargs):
+        return {}
+
+
 def _make_engine(**overrides):
     """Create a VLMBatchedEngine instance without loading a model."""
     from omlx.engine.vlm import VLMBatchedEngine
@@ -986,7 +1006,29 @@ class TestProcessChatMessages:
             audio=None,
             chat_template_kwargs=None,
             tools=None,
+            vision_soft_tokens_per_image=None,
         )
+
+    def test_vision_soft_tokens_forwarded_to_prepare_vision(self):
+        """Request-level vision soft-token budget reaches VLM preprocessing."""
+        from omlx.engine import vlm as vlm_module
+
+        text_msgs = [{"role": "user", "content": "Hello"}]
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+
+        with patch.object(vlm_module, "extract_images_from_messages") as mock_extract:
+            mock_extract.return_value = (text_msgs, [], [])
+            engine._process_chat_messages(
+                [{"role": "user", "content": "Hello"}],
+                tools=None,
+                kwargs={"vision_soft_tokens_per_image": 2048},
+            )
+
+        call_kwargs = engine._prepare_vision_inputs.call_args[1]
+        assert call_kwargs["vision_soft_tokens_per_image"] == 2048
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
@@ -1124,6 +1166,74 @@ class TestPrepareVisionInputs:
         engine._processor = mock_processor
 
         return engine
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_vision_soft_tokens_passed_to_prepare_inputs(
+        self, mock_vlm_act, mock_prepare
+    ):
+        """Compatible processors receive the explicit image soft-token budget."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        engine._processor = VisionSoftTokenProcessor(engine._tokenizer)
+
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        from PIL import Image
+
+        images = [Image.new("RGB", (4, 4), "red")]
+        engine._prepare_vision_inputs(
+            [{"role": "user", "content": "Describe"}],
+            images,
+            vision_soft_tokens_per_image=2048,
+        )
+
+        call_kwargs = mock_prepare.call_args[1]
+        assert call_kwargs["vision_soft_tokens_per_image"] == 2048
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_vision_soft_tokens_rejected_without_explicit_processor_support(
+        self, mock_vlm_act, mock_prepare
+    ):
+        """Do not silently accept the knob on old mlx-vlm processors."""
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        engine._processor = KwargsOnlyProcessor(engine._tokenizer)
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        from PIL import Image
+
+        images = [Image.new("RGB", (4, 4), "red")]
+        with pytest.raises(InvalidRequestError, match="newer mlx-vlm"):
+            engine._prepare_vision_inputs(
+                [{"role": "user", "content": "Describe"}],
+                images,
+                vision_soft_tokens_per_image=2048,
+            )
+
+        mock_prepare.assert_not_called()
+
+    def test_vision_soft_tokens_namespace_cache_hashes(self):
+        """Feature cache keys vary with explicit soft-token budgets."""
+        from omlx.engine.vlm import _namespace_vision_cache_hash
+
+        raw_hash = "abc123"
+        assert _namespace_vision_cache_hash(raw_hash, None) == raw_hash
+        assert _namespace_vision_cache_hash(raw_hash, 1024) != raw_hash
+        assert _namespace_vision_cache_hash(raw_hash, 1024) != (
+            _namespace_vision_cache_hash(raw_hash, 2048)
+        )
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")

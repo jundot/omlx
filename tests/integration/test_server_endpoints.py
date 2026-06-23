@@ -902,6 +902,43 @@ class TestChatCompletionEndpoint:
 
         assert response.status_code == 200
 
+    def test_chat_completion_forwards_vision_soft_tokens_override(
+        self, client, mock_llm_engine, tmp_path
+    ):
+        """Request vision soft-token budget overrides model settings."""
+        from omlx.model_settings import ModelSettings, ModelSettingsManager
+        from omlx.server import _server_state
+
+        manager = ModelSettingsManager(tmp_path)
+        manager.set_settings(
+            "test-model", ModelSettings(vision_soft_tokens_per_image=1024)
+        )
+
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+        original_settings_manager = _server_state.settings_manager
+        try:
+            _server_state.settings_manager = manager
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "vision_soft_tokens_per_image": 2048,
+                },
+            )
+        finally:
+            _server_state.settings_manager = original_settings_manager
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        assert recorded_chat_kwargs[0]["vision_soft_tokens_per_image"] == 2048
+
     def test_chat_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
     ):
