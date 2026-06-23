@@ -1229,7 +1229,7 @@
                                         </select>
                                     </div>
                                     <!-- Sensitivity Model (optional, all models) -->
-                                    <div class="flex-1" x-show="oqSelectedModelPath && oqSensitivityModelCandidates().length > 0" x-cloak>
+                                    <div class="flex-1" x-show="oqSelectedModelPath" x-cloak>
                                         <div class="flex items-center gap-1.5 mb-1.5">
                                             <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider">Sensitivity Model</label>
                                             <span class="cursor-help" @mouseenter="$refs.sensTip.style.display='block'" @mouseleave="$refs.sensTip.style.display='none'">
@@ -1248,6 +1248,9 @@
                                                 <option :value="m.path" x-text="m.name + ' (' + m.size_formatted + ')'"></option>
                                             </template>
                                         </select>
+                                        <p x-show="oqSensitivityModelCandidates().length === 0" x-cloak class="mt-1.5 text-xs text-neutral-400 leading-relaxed">
+                                            No quantized version of this model was found on disk. Leave this as "None": oQ measures sensitivity on the source, or auto-builds a proxy when the source cannot be loaded directly (for example an embedding model).
+                                        </p>
                                     </div>
                                     <!-- oQ Level Selector -->
                                     <div class="w-40 shrink-0">

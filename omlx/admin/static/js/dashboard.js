@@ -4368,10 +4368,16 @@
                 if (!this.oqSelectedModelPath) return [];
                 const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 if (!source) return [];
+                // A usable proxy is a quantized build of the SAME base model.
+                // Matching model_type alone was too loose: it offered a quantized
+                // generative Qwen3 as a proxy for Qwen3-Embedding. Also require the
+                // candidate name to start with the source name (the standard
+                // "<base>-<quant>" layout), so only real siblings are listed.
                 return this.oqAllModels.filter(m =>
                     m.path !== this.oqSelectedModelPath &&
                     m.is_quantized &&
-                    m.model_type === source.model_type
+                    m.model_type === source.model_type &&
+                    m.name.startsWith(source.name)
                 );
             },
 
