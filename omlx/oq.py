@@ -2909,6 +2909,7 @@ def quantize_oq_streaming(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     auto_proxy_sensitivity: bool = True,
+    sensitivity_micro_batch: int = 0,
     trust_remote_code: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
@@ -2941,6 +2942,12 @@ def quantize_oq_streaming(
             False, the quantization aborts on RAM-exceeding models with a
             RuntimeError so callers always get a real sensitivity-driven
             output. Ignored if sensitivity_model_path is set explicitly.
+        sensitivity_micro_batch: When > 0, process the sensitivity
+            calibration set in sample-chunks of this size instead of all at
+            once, bounding peak activation memory so the measurement fits a
+            smaller machine. The per-layer score is a mean over samples, so
+            chunking is numerically equivalent; only peak memory differs.
+            0 (default) keeps the single-batch behaviour.
         trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads when a
             checkpoint requires custom model code.
     """
@@ -3022,6 +3029,7 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                micro_batch=sensitivity_micro_batch,
                 trust_remote_code=trust_remote_code,
             )
         elif (
@@ -3045,6 +3053,7 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                micro_batch=sensitivity_micro_batch,
                 trust_remote_code=trust_remote_code,
             )
         elif _model_exceeds_ram and auto_proxy_sensitivity:
@@ -3072,6 +3081,7 @@ def quantize_oq_streaming(
                     oq_level,
                     num_samples=128,
                     seq_length=256,
+                    micro_batch=sensitivity_micro_batch,
                     trust_remote_code=trust_remote_code,
                 )
             except Exception as e:
@@ -3103,6 +3113,7 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                micro_batch=sensitivity_micro_batch,
                 trust_remote_code=trust_remote_code,
             )
 
@@ -3935,6 +3946,7 @@ def _measure_sensitivity_from_model(
     calib_dataset="code_multilingual",
     num_samples=32,
     seq_length=256,
+    micro_batch=0,
 ):
     """Measure per-layer quantization sensitivity on an already-loaded model.
 
@@ -3956,6 +3968,11 @@ def _measure_sensitivity_from_model(
     embed_fn, layers = _find_model_layers(model)
     if embed_fn is None or layers is None:
         return {}
+
+    if micro_batch and micro_batch > 0:
+        return _measure_sensitivity_from_model_microbatched(
+            model, config, oq_level, embed_fn, layers, calib_data, micro_batch
+        )
 
     inputs = embed_fn(calib_data)
     inputs, layer_masks, position_ids = _prepare_layer_inputs(
@@ -4014,6 +4031,101 @@ def _measure_sensitivity_from_model(
     return sensitivity
 
 
+def _measure_sensitivity_from_model_microbatched(
+    model,
+    config,
+    oq_level,
+    embed_fn,
+    layers,
+    calib_data,
+    micro_batch,
+):
+    """Memory-bounded variant of the _measure_sensitivity_from_model loop.
+
+    Runs the calibration set through the layers in sample-chunks of
+    ``micro_batch``, accumulating each layer's squared-error and magnitude sums
+    and dividing at the end. A per-layer score is a mean over samples and a mean
+    is associative, so the result matches the single-batch loop within float
+    noise; only peak activation memory differs.
+    """
+    err_sum: dict = {}
+    mag_sum: dict = {}
+    count: dict = {}
+    n_total = int(calib_data.shape[0])
+    n_chunks = (n_total + micro_batch - 1) // micro_batch
+
+    for chunk_idx, start in enumerate(range(0, n_total, micro_batch)):
+        chunk = calib_data[start : start + micro_batch]
+        inputs = embed_fn(chunk)
+        inputs, layer_masks, position_ids = _prepare_layer_inputs(
+            model, layers, chunk, inputs
+        )
+        logger.info(f"oQ{oq_level:g}: sensitivity chunk {chunk_idx + 1}/{n_chunks}")
+
+        for layer_idx, block in enumerate(layers):
+            layer_mask = (
+                layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
+            )
+            prev_aux = (
+                position_ids.get("prev_topk_indices")
+                if isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+                else None
+            )
+            out_float, baseline_aux = _forward_layer_result(
+                block, inputs, layer_mask, position_ids
+            )
+            if out_float is None:
+                continue
+
+            saved = _temporary_quantize_block(
+                block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
+            )
+            if (
+                isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+            ):
+                position_ids["prev_topk_indices"] = prev_aux
+            out_quant, _ = _forward_layer_result(
+                block, inputs, layer_mask, position_ids
+            )
+            if out_quant is not None:
+                # float32 reduction: float16 squared sums overflow on long runs.
+                of32 = out_float.astype(mx.float32)
+                oq32 = out_quant.astype(mx.float32)
+                err = ((of32 - oq32) ** 2).sum()
+                mag = (of32**2).sum()
+                mx.eval(err, mag)
+                err_sum[layer_idx] = err_sum.get(layer_idx, 0.0) + err.item()
+                mag_sum[layer_idx] = mag_sum.get(layer_idx, 0.0) + mag.item()
+                count[layer_idx] = count.get(layer_idx, 0) + int(of32.size)
+
+            _restore_saved_weights(block, saved)
+            if (
+                isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+            ):
+                position_ids["prev_topk_indices"] = baseline_aux
+            inputs = out_float
+            mx.synchronize()
+            mx.clear_cache()
+
+    sensitivity = {}
+    for layer_idx, total_err in err_sum.items():
+        n = max(count.get(layer_idx, 0), 1)
+        mean_mag = mag_sum.get(layer_idx, 0.0) / n
+        sensitivity[layer_idx] = (total_err / n) / max(mean_mag, 1e-10)
+
+    if sensitivity:
+        ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
+        logger.info(
+            f"oQ{oq_level:g}: layer sensitivity (descending): "
+            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+        )
+
+    return sensitivity
+
+
 def _measure_sensitivity(
     model_path: str,
     config: dict,
@@ -4021,6 +4133,7 @@ def _measure_sensitivity(
     calib_dataset="code_multilingual",
     num_samples=32,
     seq_length=256,
+    micro_batch=0,
     trust_remote_code: bool = False,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
@@ -4103,6 +4216,7 @@ def _measure_sensitivity(
         calib_dataset,
         num_samples,
         seq_length,
+        micro_batch,
     )
 
     del model, tokenizer
@@ -4376,6 +4490,7 @@ def _measure_sensitivity_from_quantized_model(
     calib_dataset="code_multilingual",
     num_samples=32,
     seq_length=256,
+    micro_batch=0,
     trust_remote_code: bool = False,
 ):
     """Measure sensitivity via re-quantization on a quantized model.
@@ -4459,6 +4574,15 @@ def _measure_sensitivity_from_quantized_model(
         mx.synchronize()
         mx.clear_cache()
         return {}
+
+    if micro_batch and micro_batch > 0:
+        sensitivity = _measure_sensitivity_from_quantized_model_microbatched(
+            model, config, oq_level, embed_fn, layers, calib_data, micro_batch
+        )
+        del model, tokenizer
+        mx.synchronize()
+        mx.clear_cache()
+        return sensitivity
 
     inputs = embed_fn(calib_data)
     inputs, layer_masks, position_ids = _prepare_layer_inputs(
@@ -4568,6 +4692,149 @@ def _measure_sensitivity_from_quantized_model(
     del model, tokenizer
     mx.synchronize()
     mx.clear_cache()
+
+    if sensitivity:
+        ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
+        logger.info(
+            f"oQ{oq_level:g}: proxy sensitivity (descending): "
+            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+        )
+
+    return sensitivity
+
+
+def _measure_sensitivity_from_quantized_model_microbatched(
+    model,
+    config,
+    oq_level,
+    embed_fn,
+    layers,
+    calib_data,
+    micro_batch,
+):
+    """Memory-bounded variant of the _measure_sensitivity_from_quantized_model loop.
+
+    Same per-layer re-quantization perturbation as the single-batch loop, but the
+    calibration set runs through the layers in sample-chunks of ``micro_batch``,
+    accumulating each layer's squared-error and magnitude sums and dividing at the
+    end. The score is a mean over samples and a mean is associative, so the result
+    matches the single-batch loop within float noise; only peak activation memory
+    differs.
+    """
+    err_sum: dict = {}
+    mag_sum: dict = {}
+    count: dict = {}
+    n_total = int(calib_data.shape[0])
+    n_chunks = (n_total + micro_batch - 1) // micro_batch
+
+    for chunk_idx, start in enumerate(range(0, n_total, micro_batch)):
+        chunk = calib_data[start : start + micro_batch]
+        inputs = embed_fn(chunk)
+        inputs, layer_masks, position_ids = _prepare_layer_inputs(
+            model, layers, chunk, inputs
+        )
+        logger.info(
+            f"oQ{oq_level:g}: proxy sensitivity chunk {chunk_idx + 1}/{n_chunks}"
+        )
+
+        for layer_idx, block in enumerate(layers):
+            layer_mask = (
+                layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
+            )
+            prev_aux = (
+                position_ids.get("prev_topk_indices")
+                if isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+                else None
+            )
+            out_baseline, baseline_aux = _forward_layer_result(
+                block, inputs, layer_mask, position_ids
+            )
+            if out_baseline is None:
+                continue
+            mx.eval(out_baseline)
+
+            saved = {}
+            for p, m in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
+                if not hasattr(m, "scales") or not hasattr(m, "weight"):
+                    continue
+                bits = getattr(m, "bits", 4)
+                gs = getattr(m, "group_size", 64)
+                mode = getattr(m, "mode", "affine")
+                perturb_bits = _perturb_bits_for(bits)
+                if perturb_bits is None:
+                    continue
+                w_float = mx.dequantize(
+                    m.weight,
+                    m.scales,
+                    getattr(m, "biases", None),
+                    group_size=gs,
+                    bits=bits,
+                    mode=mode,
+                )
+                saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode)
+                qw, sc, *rest = mx.quantize(
+                    w_float, group_size=gs, bits=perturb_bits, mode="affine"
+                )
+                m.weight = qw
+                m.scales = sc
+                m.biases = rest[0] if rest else None
+                m.bits = perturb_bits
+                m.mode = "affine"
+                if m.biases is not None:
+                    mx.eval(m.weight, m.scales, m.biases)
+                else:
+                    mx.eval(m.weight, m.scales)
+
+            if (
+                isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+            ):
+                position_ids["prev_topk_indices"] = prev_aux
+            out_perturbed, _ = _forward_layer_result(
+                block, inputs, layer_mask, position_ids
+            )
+
+            modules_by_path = dict(
+                tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
+            )
+            for p, (w, s, b, orig_bits, orig_mode) in saved.items():
+                if p in modules_by_path:
+                    mod = modules_by_path[p]
+                    mod.weight = w
+                    mod.scales = s
+                    if b is not None:
+                        mod.biases = b
+                    elif hasattr(mod, "biases"):
+                        del mod.biases
+                    mod.bits = orig_bits
+                    mod.mode = orig_mode
+
+            if out_perturbed is not None:
+                ob32 = out_baseline.astype(mx.float32)
+                op32 = out_perturbed.astype(mx.float32)
+                err = ((ob32 - op32) ** 2).sum()
+                mag = (ob32**2).sum()
+                mx.eval(err, mag)
+                err_sum[layer_idx] = err_sum.get(layer_idx, 0.0) + err.item()
+                mag_sum[layer_idx] = mag_sum.get(layer_idx, 0.0) + mag.item()
+                count[layer_idx] = count.get(layer_idx, 0) + int(ob32.size)
+
+            if (
+                isinstance(position_ids, dict)
+                and position_ids.get("kind") == "glm_moe_dsa"
+            ):
+                position_ids["prev_topk_indices"] = baseline_aux
+            inputs = out_baseline
+            mx.eval(inputs)
+            mx.synchronize()
+            mx.clear_cache()
+
+    sensitivity = {}
+    for layer_idx, total_err in err_sum.items():
+        n = max(count.get(layer_idx, 0), 1)
+        mean_mag = mag_sum.get(layer_idx, 0.0) / n
+        sensitivity[layer_idx] = (total_err / n) / max(mean_mag, 1e-10)
 
     if sensitivity:
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
