@@ -400,6 +400,21 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     )
 
 
+def _has_embedding_config_markers(config: dict) -> bool:
+    """Detect embedding models from config keys when ``architectures`` is absent.
+
+    Some MLX conversions of CausalLM embedding models (e.g.
+    ``jina-code-embeddings-*-mlx``) drop the ``architectures`` field, so the
+    architecture-based CausalLM-embedding checks can't fire and the model falls
+    through to the LLM engine — which then fails to load it as a chat model.
+    These configs still carry embedding-exclusive keys (Matryoshka dimensions
+    and the jina task menu) that no chat/VLM/audio checkpoint sets.
+    """
+    if not isinstance(config, dict):
+        return False
+    return bool(config.get("matryoshka_dims")) or bool(config.get("task_names"))
+
+
 def _looks_like_nemo_asr_config(config: dict) -> bool:
     """Return True for NeMo ASR exports that omit HF ``model_type``.
 
@@ -538,6 +553,13 @@ def detect_model_type(model_path: Path) -> ModelType:
             return "embedding"
 
     if _has_sentence_transformers_embedding_pipeline(model_path):
+        return "embedding"
+
+    # CausalLM embedding conversions (e.g. jina-code-embeddings-*-mlx) may ship
+    # without an architectures field, so the CausalLM-embedding checks above
+    # can't fire. Only trust embedding-exclusive config markers when there is no
+    # architecture to contradict them, so chat/VLM models are never affected.
+    if not architectures and _has_embedding_config_markers(config):
         return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid

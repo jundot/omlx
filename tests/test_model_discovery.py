@@ -163,6 +163,40 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen2_embedding_without_architectures_via_markers(self, tmp_path):
+        """Architecture-less embedding conversions classify via config markers (#686).
+
+        jina-code-embeddings-*-mlx drop the architectures field, so the
+        CausalLM-embedding architecture check can't fire. Embedding-exclusive
+        keys (matryoshka_dims / task_names) are used as a fallback, regardless of
+        the directory name.
+        """
+        embed_dir = tmp_path / "renamed-model"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "hidden_size": 896,
+            "matryoshka_dims": [128, 256, 512, 896],
+            "task_names": ["nl2code", "code2code"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_qwen2_chat_without_markers_is_llm_even_without_architectures(
+        self, tmp_path
+    ):
+        """Regression guard: the marker fallback must not catch chat models.
+
+        A Qwen2 config with neither an architecture nor embedding markers stays
+        an LLM, so the matryoshka/task_names fallback can't reclassify ordinary
+        chat checkpoints.
+        """
+        llm_dir = tmp_path / "Qwen2.5-0.5B-Instruct"
+        llm_dir.mkdir()
+        config = {"model_type": "qwen2", "hidden_size": 896}
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_lfm2_text_model_is_llm(self, tmp_path):
         """LFM2 text checkpoints share model_type with non-text variants."""
         llm_dir = tmp_path / "LFM2-1.2B"

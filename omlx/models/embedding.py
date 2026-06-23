@@ -19,6 +19,7 @@ from mlx.utils import tree_flatten
 
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
+    register_qwen2_embedding_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,7 @@ class MLXEmbeddingModel:
         # 2. Fallback to mlx-embeddings
         try:
             patch_qwen3_vl_processor_for_torch_free_image_loading()
+            register_qwen2_embedding_model()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")

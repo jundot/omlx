@@ -174,3 +174,26 @@ def test_qwen3_vl_build_processor_gets_multimodal_token_id_fields(monkeypatch):
     assert processor.image_ids == [151655]
     assert processor.video_ids == [151656]
     assert processor.audio_ids == [None]
+
+
+def test_register_qwen2_embedding_model_resolves_and_is_idempotent(monkeypatch):
+    """Qwen2 embedding model should be importable as mlx_embeddings.models.qwen2."""
+    import importlib
+
+    from omlx.models import mlx_embeddings_compat
+
+    monkeypatch.delitem(sys.modules, "mlx_embeddings.models.qwen2", raising=False)
+    monkeypatch.setattr(mlx_embeddings_compat, "_QWEN2_EMBEDDING_REGISTERED", False)
+
+    mlx_embeddings_compat.register_qwen2_embedding_model()
+
+    # mlx-embeddings' loader resolves architectures via this import path.
+    module = importlib.import_module("mlx_embeddings.models.qwen2")
+    assert hasattr(module, "Model")
+    assert hasattr(module, "ModelArgs")
+    assert module.ModelArgs().model_type == "qwen2"
+
+    # A second call must be a no-op and keep the already-registered module.
+    sentinel = sys.modules["mlx_embeddings.models.qwen2"]
+    mlx_embeddings_compat.register_qwen2_embedding_model()
+    assert sys.modules["mlx_embeddings.models.qwen2"] is sentinel

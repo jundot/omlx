@@ -2,10 +2,40 @@
 """Compatibility patches for mlx-embeddings."""
 
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 
 _QWEN3_VL_PROCESSOR_PATCHED = False
+_QWEN2_EMBEDDING_REGISTERED = False
+
+
+def register_qwen2_embedding_model() -> None:
+    """Expose oMLX's Qwen2 embedding model as ``mlx_embeddings.models.qwen2``.
+
+    mlx-embeddings has no Qwen2 architecture, so Qwen2-backbone embedding models
+    (jina-code-embeddings, gte-Qwen2, ...) raise ``Model type qwen2 not supported``
+    from ``_get_model_arch``. That loader resolves architectures via
+    ``importlib.import_module("mlx_embeddings.models.<model_type>")``, which checks
+    ``sys.modules`` first, so registering our module there makes Qwen2 loadable
+    without patching the installed mlx-embeddings package.
+    """
+    global _QWEN2_EMBEDDING_REGISTERED
+    if _QWEN2_EMBEDDING_REGISTERED:
+        return
+
+    module_name = "mlx_embeddings.models.qwen2"
+    if module_name not in sys.modules:
+        try:
+            from . import qwen2_embedding
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Qwen2 embedding registration skipped: %s", exc)
+            _QWEN2_EMBEDDING_REGISTERED = True
+            return
+        sys.modules[module_name] = qwen2_embedding
+        logger.debug("Registered oMLX Qwen2 embedding model as %s", module_name)
+
+    _QWEN2_EMBEDDING_REGISTERED = True
 
 
 def _ensure_qwen3_vl_mm_token_ids(processor):

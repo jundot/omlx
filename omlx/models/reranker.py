@@ -28,6 +28,7 @@ from ..model_discovery import (
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
+    register_qwen2_embedding_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -639,6 +640,7 @@ class MLXRerankerModel:
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 patch_qwen3_vl_processor_for_torch_free_image_loading()
+                register_qwen2_embedding_model()
                 from mlx_embeddings import load
 
                 self.model, self.processor = load(
