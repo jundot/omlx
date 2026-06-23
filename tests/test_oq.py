@@ -3619,3 +3619,72 @@ class TestQuantizeOqStreamingOq25:
             tensors.update(mx.load(str(sf)))
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
+
+
+class TestBuildEmbeddingProxyForSensitivity:
+    """Tests for the embedding-aware sensitivity proxy.
+
+    Embedding checkpoints (e.g. Qwen3-Embedding) cannot be loaded by mlx-lm, so
+    the uniform proxy in _build_proxy_for_sensitivity fails on them. The
+    embedding proxy is built with mlx-embeddings' converter, which re-keys the
+    weights so the proxy loads through the normal sensitivity path, and is tied
+    so mlx-lm does not reject the missing lm_head.
+    """
+
+    def test_builds_via_mlx_embeddings_and_ties(self, tmp_path, monkeypatch):
+        """Uses mlx-embeddings' converter (not mlx-lm) and ties the output."""
+        from omlx import oq as _oq
+
+        calls = {}
+
+        def _fake_convert(
+            hf_path, mlx_path, quantize, q_bits, q_group_size, q_mode, dtype
+        ):
+            calls.update(
+                hf_path=hf_path,
+                quantize=quantize,
+                q_bits=q_bits,
+                q_group_size=q_group_size,
+                q_mode=q_mode,
+                dtype=dtype,
+            )
+            Path(mlx_path).mkdir(parents=True, exist_ok=True)
+            # An embedding source ships tie_word_embeddings False and no lm_head.
+            (Path(mlx_path) / "config.json").write_text(
+                json.dumps({"tie_word_embeddings": False})
+            )
+
+        monkeypatch.setattr("mlx_embeddings.convert", _fake_convert)
+        proxy_dir = _oq._build_embedding_proxy_for_sensitivity(
+            "/src/embed-model", dtype="bfloat16", working_dir=str(tmp_path)
+        )
+
+        # The embedding-aware converter is used, with affine quantization at the
+        # proxy bit width (not mlx-lm's converter, which cannot load the source).
+        assert calls["hf_path"] == "/src/embed-model"
+        assert calls["quantize"] is True
+        assert calls["q_bits"] == _oq._PROXY_QUANT_BITS
+        assert calls["q_group_size"] == _oq._PROXY_QUANT_GROUP_SIZE
+        assert calls["q_mode"] == "affine"
+        assert calls["dtype"] == "bfloat16"
+        # The proxy is tied so mlx-lm loads it without the missing lm_head.
+        cfg = json.loads((proxy_dir / "config.json").read_text())
+        assert cfg["tie_word_embeddings"] is True
+
+    def test_preserves_an_already_tied_config(self, tmp_path, monkeypatch):
+        """A source that is already tied is left tied (no spurious rewrite)."""
+        from omlx import oq as _oq
+
+        def _fake_convert(hf_path, mlx_path, **_kwargs):
+            Path(mlx_path).mkdir(parents=True, exist_ok=True)
+            (Path(mlx_path) / "config.json").write_text(
+                json.dumps({"tie_word_embeddings": True, "marker": 1})
+            )
+
+        monkeypatch.setattr("mlx_embeddings.convert", _fake_convert)
+        proxy_dir = _oq._build_embedding_proxy_for_sensitivity(
+            "/src/embed-model", dtype="float16", working_dir=str(tmp_path)
+        )
+        cfg = json.loads((proxy_dir / "config.json").read_text())
+        assert cfg["tie_word_embeddings"] is True
+        assert cfg["marker"] == 1

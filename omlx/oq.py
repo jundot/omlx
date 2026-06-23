@@ -3002,6 +3002,15 @@ def quantize_oq_streaming(
             "OOM-prone paths will be skipped"
         )
 
+    # Embedding models (e.g. Qwen3-Embedding) ship as CausalLM checkpoints with
+    # no lm_head and bare weight keys, which mlx-lm cannot load. Both full-fp16
+    # measurement and the uniform mlx-lm proxy load through mlx-lm, so neither
+    # can rank an embedding model's sensitivity. They always need an
+    # embedding-aware proxy, regardless of how much RAM is available.
+    from omlx.model_discovery import detect_model_type as _detect_model_type
+
+    _is_embedding = _detect_model_type(source) == "embedding"
+
     cb("loading", 12.0)
 
     if sensitivity_map_path.exists():
@@ -3047,22 +3056,37 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-        elif _model_exceeds_ram and auto_proxy_sensitivity:
-            logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
-                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
-                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
-                f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
-                "measurement stays data-driven."
-            )
+        elif (_model_exceeds_ram or _is_embedding) and auto_proxy_sensitivity:
+            if _is_embedding:
+                logger.info(
+                    f"oQ{oq_level:g}: embedding model. mlx-lm cannot load the "
+                    "source checkpoint for sensitivity measurement, so "
+                    f"auto-building an embedding-aware {_PROXY_QUANT_BITS}-bit "
+                    "proxy on disk to keep oQ data-driven."
+                )
+            else:
+                logger.warning(
+                    f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
+                    f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
+                    f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                    f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
+                    "measurement stays data-driven."
+                )
             _proxy_dir: Path | None = None
             try:
-                _proxy_dir = _build_proxy_for_sensitivity(
-                    model_path,
-                    dtype=dtype,
-                    working_dir=str(output.parent),
-                    trust_remote_code=trust_remote_code,
-                )
+                if _is_embedding:
+                    _proxy_dir = _build_embedding_proxy_for_sensitivity(
+                        model_path,
+                        dtype=dtype,
+                        working_dir=str(output.parent),
+                    )
+                else:
+                    _proxy_dir = _build_proxy_for_sensitivity(
+                        model_path,
+                        dtype=dtype,
+                        working_dir=str(output.parent),
+                        trust_remote_code=trust_remote_code,
+                    )
                 logger.info(
                     f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
                 )
@@ -3085,13 +3109,18 @@ def quantize_oq_streaming(
                 if _proxy_dir is not None and _proxy_dir.exists():
                     shutil.rmtree(_proxy_dir, ignore_errors=True)
                     logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
-        elif _model_exceeds_ram:
+        elif _model_exceeds_ram or _is_embedding:
+            _reason = (
+                "is an embedding model mlx-lm cannot load for full-fp16 "
+                "sensitivity measurement"
+                if _is_embedding
+                else f"exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM"
+            )
             raise RuntimeError(
-                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
-                "of system RAM and auto_proxy_sensitivity is disabled. "
-                "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
-                "with a pre-quantized version of this model, or run on a "
-                "machine with enough RAM."
+                f"oQ{oq_level:g}: model {_reason} and auto_proxy_sensitivity is "
+                "disabled. Enable auto_proxy_sensitivity, or pass "
+                "sensitivity_model_path with a pre-quantized version of this "
+                "model."
             )
         else:
             logger.info(
@@ -4152,6 +4181,56 @@ def _build_proxy_for_sensitivity(
         dtype=dtype,
         trust_remote_code=trust_remote_code,
     )
+    return proxy_dir
+
+
+def _build_embedding_proxy_for_sensitivity(
+    model_path: str,
+    *,
+    dtype: str,
+    working_dir: str | None = None,
+) -> Path:
+    """Build a temporary quantized proxy for an embedding model's sensitivity.
+
+    Embedding checkpoints (e.g. Qwen3-Embedding) ship as CausalLM models with
+    no lm_head and bare weight keys, so mlx-lm cannot load them and the uniform
+    mlx-lm proxy from ``_build_proxy_for_sensitivity`` fails at conversion. This
+    builds the proxy with mlx-embeddings' converter instead, which is
+    embedding-aware: it re-keys the weights to the layout mlx-lm expects, so the
+    proxy loads through the normal ``_measure_sensitivity_from_quantized_model``
+    path. The proxy is tied (lm_head -> embed_tokens) so mlx-lm does not reject
+    the missing lm_head at load; sensitivity only reads the decoder layers, so
+    the tie is load-only and harmless.
+
+    mlx-embeddings' converter loads lazily and donates weights as it writes, so
+    its peak memory stays near half the source size, matching the OOM-safety the
+    uniform proxy provides for the RAM-exceeding case.
+
+    The caller is responsible for deleting the returned directory.
+    """
+    from mlx_embeddings import convert as _mlx_embeddings_convert
+
+    proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_emb_proxy_", dir=working_dir))
+    shutil.rmtree(proxy_dir)
+    _mlx_embeddings_convert(
+        hf_path=model_path,
+        mlx_path=str(proxy_dir),
+        quantize=True,
+        q_bits=_PROXY_QUANT_BITS,
+        q_group_size=_PROXY_QUANT_GROUP_SIZE,
+        q_mode="affine",
+        dtype=dtype,
+    )
+
+    config_path = proxy_dir / "config.json"
+    with open(config_path) as f:
+        proxy_config = json.load(f)
+    if not proxy_config.get("tie_word_embeddings"):
+        proxy_config["tie_word_embeddings"] = True
+        tmp_path = config_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(proxy_config, f, indent=2)
+        tmp_path.replace(config_path)
     return proxy_dir
 
 
