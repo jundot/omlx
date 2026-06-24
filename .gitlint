@@ -1,0 +1,11 @@
+# gitlint configuration for conventional commit enforcement.
+# See https://jorisroovers.github.io/gitlint/configuration/ for options.
+
+[general]
+contrib = contrib-title-conventional-commits
+
+[title-match-regex]
+regex = ^(feat|fix|perf|refactor|docs|test|ci|build|chore|revert)(\(.+\))?!?: .{1,72}
+
+[body-max-line-length]
+line-length = 100

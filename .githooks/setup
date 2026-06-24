@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# One-command bootstrap for git hooks and dev tooling.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOOKS_DIR="$REPO_ROOT/.githooks"
+
+echo "Setting core.hooksPath to $HOOKS_DIR"
+git config core.hooksPath "$HOOKS_DIR"
+
+echo "Making hooks executable"
+chmod +x "$HOOKS_DIR"/*
+
+echo "Installing dev dependencies"
+pip install gitlint
+
+echo "Done. Commit messages will be validated via gitlint."

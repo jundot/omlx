@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# commit-msg hook — validates conventional commit format via gitlint.
+# Auto-installs itself by setting core.hooksPath if not configured.
+set -euo pipefail
+
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HOOKS_DIR/.." && git rev-parse --show-toplevel 2>/dev/null || echo "$HOOKS_DIR/..")"
+
+# Ensure core.hooksPath points to this directory so the hook stays active
+# after fresh clones.
+CURRENT_HOOKS_PATH="$(git config --get core.hooksPath 2>/dev/null || true)"
+if [ "$CURRENT_HOOKS_PATH" != "$HOOKS_DIR" ] && [ "$CURRENT_HOOKS_PATH" != ".githooks" ]; then
+    git config core.hooksPath "$HOOKS_DIR"
+fi
+
+# Gracefully skip if gitlint is not yet installed (fresh clone before dev deps).
+if ! command -v gitlint &>/dev/null; then
+    echo "gitlint not found — skipping commit message validation."
+    echo "Install dev deps to enable: pip install gitlint"
+    exit 0
+fi
+
+gitlint --msg-filename "$1"

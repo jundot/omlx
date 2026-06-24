@@ -160,6 +160,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "gitlint>=0.19.1",
     "venvstacks>=0.7.0",
     # The torch-stub smoke test (tests/test_torch_stub.py) gates
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
@@ -179,6 +180,7 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "mcp>=1.0.0",
+    "gitlint>=0.19.1",
     "venvstacks>=0.7.0",
     "xgrammar==0.2.0",
     "apache-tvm-ffi==0.1.11",
