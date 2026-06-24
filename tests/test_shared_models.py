@@ -9,6 +9,7 @@ import pytest
 from omlx.api.shared_models import (
     IDPrefix,
     generate_id,
+    generate_tool_call_id,
     get_unix_timestamp,
     BaseUsage,
 )
@@ -243,3 +244,29 @@ class TestBaseUsage:
         data = usage.model_dump()
         assert data["input_tokens"] == 100
         assert data["output_tokens"] == 50
+
+
+class TestGenerateToolCallId:
+    """Tool-call ids must satisfy Mistral/tekken: exactly 9 alphanumeric chars."""
+
+    def test_length_is_nine(self):
+        assert len(generate_tool_call_id()) == 9
+
+    def test_matches_mistral_constraint(self):
+        # Mistral rejects any tool_call_id not matching [a-zA-Z0-9] of length 9.
+        for _ in range(1000):
+            tid = generate_tool_call_id()
+            assert len(tid) == 9
+            assert tid.isascii() and tid.isalnum()
+
+    def test_no_underscore(self):
+        # The legacy "call_<8hex>" form (underscore, length 13) is what broke.
+        assert "_" not in generate_tool_call_id()
+
+    def test_has_call_prefix(self):
+        assert generate_tool_call_id().startswith("call")
+
+    def test_ids_are_unique(self):
+        ids = {generate_tool_call_id() for _ in range(1000)}
+        # 16**5 ~= 1M space; collisions across 1000 draws are vanishingly rare.
+        assert len(ids) >= 995

@@ -153,6 +153,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
+from .api.shared_models import generate_tool_call_id
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
@@ -207,7 +208,7 @@ def _convert_parser_tool_calls(tool_calls: list[dict] | None) -> list[ToolCall]:
             ToolCall(
                 id=tool_call.get("id")
                 or tool_call.get("call_id")
-                or f"call_{uuid.uuid4().hex[:8]}",
+                or generate_tool_call_id(),
                 type="function",
                 function=FunctionCall(
                     name=tool_call.get("name", ""),
@@ -5738,7 +5739,7 @@ async def create_response(
                         arguments = tc.function.arguments
                     elif isinstance(tc, dict):
                         call_id = tc.get(
-                            "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                            "call_id", tc.get("id", generate_tool_call_id())
                         )
                         name = tc.get("name", "")
                         arguments = tc.get("arguments", "{}")
@@ -6273,7 +6274,7 @@ async def stream_responses_api(
                 arguments = tc.function.arguments
             elif isinstance(tc, dict):
                 call_id = tc.get(
-                    "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                    "call_id", tc.get("id", generate_tool_call_id())
                 )
                 name = tc.get("name", "")
                 arguments = tc.get("arguments", "{}")

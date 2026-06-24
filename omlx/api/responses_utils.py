@@ -4,7 +4,6 @@
 import copy
 import json
 import logging
-import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -17,7 +16,7 @@ from .responses_models import (
     ResponsesTool,
     ResponseUsage,
 )
-from .shared_models import IDPrefix, generate_id
+from .shared_models import IDPrefix, generate_id, generate_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +258,7 @@ def convert_responses_input_to_messages(
 
         elif item.type == "function_call":
             # Assistant's tool call — accumulate for grouping
-            call_id = item.call_id or item.id or f"call_{uuid.uuid4().hex[:8]}"
+            call_id = item.call_id or item.id or generate_tool_call_id()
             pending_tool_calls.append(
                 {
                     "id": call_id,
@@ -664,7 +663,7 @@ def normalize_response_output_to_messages(
                 pending_reasoning = ""
             messages.append(msg_dict)
         elif item_type == "function_call":
-            call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:8]}")
+            call_id = item.get("call_id", generate_tool_call_id())
             pending_tool_calls.append(
                 {
                     "id": call_id,

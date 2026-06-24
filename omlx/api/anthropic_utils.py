@@ -23,6 +23,7 @@ from .anthropic_models import (
     SystemContent,
 )
 from .openai_models import ToolCall
+from .shared_models import generate_tool_call_id
 
 _PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
 logger = logging.getLogger(__name__)
@@ -271,7 +272,7 @@ def convert_anthropic_to_internal(
                             tool_calls.append(
                                 {
                                     "id": block_dict.get(
-                                        "id", f"call_{uuid.uuid4().hex[:8]}"
+                                        "id", generate_tool_call_id()
                                     ),
                                     "function": {
                                         "name": block_dict.get("name", ""),
@@ -513,7 +514,7 @@ def convert_anthropic_to_internal_harmony(
 
                 elif block_type == "tool_use":
                     # Tool use in assistant message - preserve as tool_calls
-                    tool_id = block_dict.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                    tool_id = block_dict.get("id", generate_tool_call_id())
                     tool_name = block_dict.get("name", "")
                     tool_input = block_dict.get("input", {})
                     # input should be dict for chat_template |tojson
