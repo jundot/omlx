@@ -8,6 +8,7 @@ flags, and metadata.
 import copy
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -23,6 +24,67 @@ from .model_profiles import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(target: Path, data: Any, **json_kwargs: Any) -> None:
+    """Atomically write ``data`` as JSON to ``target``, preserving links.
+
+    The default temp-file + ``os.replace`` pattern is atomic but swaps the
+    inode at ``target``.  When the user has linked the config file into
+    place (``ln -s`` or ``ln``) — a common dotfile/Git-managed setup — that
+    rename silently breaks the link: the symlink is replaced by a regular
+    file and the link target is never updated (see issue #1958).  ``settings.json``
+    avoided this only because it is written in place.
+
+    To keep both properties we:
+
+    - resolve a symlink and atomically replace its *real* target, so the link
+      keeps pointing at the now-updated file;
+    - write in place (truncate) for a hard link (st_nlink > 1), since there is
+      no separate path to rename onto and ``os.replace`` would detach it;
+    - fall back to the historical temp-file + replace for a normal file.
+    """
+    payload = json.dumps(data, **json_kwargs)
+
+    try:
+        is_symlink = target.is_symlink()
+    except OSError:
+        is_symlink = False
+
+    if is_symlink:
+        # Replace the link's resolved target so the symlink survives.
+        real_target = target.resolve()
+        temp_file = real_target.with_name(real_target.name + ".tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(temp_file, real_target)
+        finally:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+        return
+
+    # Detect hard links (more than one name points at this inode).
+    is_hardlink = False
+    try:
+        is_hardlink = target.exists() and target.stat().st_nlink > 1
+    except OSError:
+        is_hardlink = False
+
+    if is_hardlink:
+        # Truncate-in-place so the other hard-linked names see the update.
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(payload)
+        return
+
+    temp_file = target.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(temp_file, target)
+    finally:
+        if temp_file.exists():
+            temp_file.unlink(missing_ok=True)
 
 # Current settings file format version
 SETTINGS_VERSION = 1
@@ -373,12 +435,10 @@ class ModelSettingsManager:
         }
 
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-            temp_file.replace(self.settings_file)
+            # Atomic write that also preserves symlinks/hard links (#1958).
+            _atomic_write_json(
+                self.settings_file, data, indent=2, ensure_ascii=False
+            )
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
@@ -580,15 +640,17 @@ class ModelSettingsManager:
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
-        temp_file = self.profiles_file.with_suffix(".tmp")
         try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-            temp_file.replace(self.profiles_file)
+            # Atomic write that also preserves symlinks/hard links (#1958).
+            _atomic_write_json(
+                self.profiles_file,
+                data,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
             raise
 
     @staticmethod
@@ -1079,10 +1141,14 @@ class ModelSettingsManager:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
         try:
-            temp_file = self.templates_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-            temp_file.replace(self.templates_file)
+            # Atomic write that also preserves symlinks/hard links (#1958).
+            _atomic_write_json(
+                self.templates_file,
+                data,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
         except Exception as e:
             logger.error(f"Failed to save templates file: {e}")
             raise
