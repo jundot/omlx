@@ -700,6 +700,59 @@ def _make_tokenizer(tool_call_start=""):
     return tok
 
 
+def _make_disabled_tokenizer():
+    """Mock tokenizer with tool-call extraction disabled (tool_call_parser=none).
+
+    Mirrors the state ``VLMBatchedEngine._inject_tool_calling`` leaves the
+    tokenizer in when the operator passes ``--tool-call-parser none``: no
+    ``has_tool_calling`` / parser attributes are injected and the
+    ``tool_calls_disabled`` sentinel is set.
+    """
+    tok = MagicMock(spec=[])
+    tok.tool_calls_disabled = True
+    return tok
+
+
+class TestToolCallParserNone:
+    """tool_call_parser='none' opt-out (issue #906).
+
+    When the operator disables the parser, oMLX must pass the raw model
+    tokens through to the assistant content unchanged on every path:
+
+    * streaming  -> ToolCallStreamFilter must go inactive so the built-in
+      ``<tool_call>`` fallback envelopes are NOT suppressed;
+    * non-streaming -> parse_tool_calls() must be a no-op (no
+      ``has_tool_calling``) so the structured ``tool_calls`` field stays
+      empty and the raw text is returned verbatim.
+    """
+
+    def test_disabled_filter_is_inactive(self):
+        """A disabled tokenizer makes the stream filter inactive."""
+        f = ToolCallStreamFilter(_make_disabled_tokenizer())
+        assert f.active is False
+
+    def test_disabled_filter_passes_raw_tool_call_markup(self):
+        """Raw <tool_call> markup streams through untouched when disabled."""
+        f = ToolCallStreamFilter(_make_disabled_tokenizer())
+        raw = 'Answer<tool_call>{"name":"func","arguments":{}}</tool_call>'
+        out = f.feed(raw) + f.finish()
+        assert out == raw
+
+    def test_default_filter_still_suppresses_markup(self):
+        """Regression: without the opt-out the fallback envelope is suppressed."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        assert f.active is True
+        out = f.feed('Answer<tool_call>{"name":"func"}</tool_call>') + f.finish()
+        assert out == "Answer"
+
+    def test_disabled_non_streaming_extraction_is_noop(self):
+        """parse_tool_calls() leaves content untouched and finds no tool calls."""
+        raw = 'Answer<tool_call>{"name":"func","arguments":{}}</tool_call>'
+        cleaned, tool_calls = parse_tool_calls(raw, _make_disabled_tokenizer())
+        assert cleaned == raw
+        assert tool_calls is None
+
+
 class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
 

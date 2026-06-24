@@ -1288,6 +1288,12 @@ class SchedulerConfig:
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
 
+    # Tool-call parser selection. None means auto-select from the chat template
+    # (the default). "none"/"off" disables tool-call extraction entirely so the
+    # raw model tokens pass straight through to the assistant message content
+    # (for downstream systems that own their own tool-call parsing).
+    tool_call_parser: str | None = None
+
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls

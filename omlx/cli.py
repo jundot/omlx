@@ -851,6 +851,20 @@ Example directory structure:
         default=None,
         help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        metavar="{auto,none,<name>}",
+        help=(
+            "Tool-call parser to use. 'auto' (default) selects a parser from "
+            "the model's chat template and extracts tool calls into the "
+            "structured OpenAI tool_calls field. 'none' (or 'off') disables "
+            "extraction so the raw model tokens pass through to the assistant "
+            "message content unchanged -- useful when a downstream system does "
+            "its own tool-call parsing."
+        ),
+    )
 
     # Memory guard options
     serve_parser.add_argument(

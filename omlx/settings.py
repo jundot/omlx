@@ -263,6 +263,10 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # Tool-call parser selection. None = auto-select from the chat template
+    # (default). "none"/"off" disables tool-call extraction so raw model
+    # tokens pass through to the assistant message content unchanged.
+    tool_call_parser: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -284,6 +288,7 @@ class SchedulerSettings:
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            tool_call_parser=data.get("tool_call_parser"),
         )
 
 
@@ -944,6 +949,8 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
+        if tool_call_parser := os.getenv("OMLX_TOOL_CALL_PARSER"):
+            self.scheduler.tool_call_parser = tool_call_parser
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1053,6 +1060,11 @@ class GlobalSettings:
             and args.embedding_batch_size is not None
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
+        if (
+            hasattr(args, "tool_call_parser")
+            and args.tool_call_parser is not None
+        ):
+            self.scheduler.tool_call_parser = args.tool_call_parser
 
         # Memory guard settings
         if hasattr(args, "memory_guard") and args.memory_guard is not None:
@@ -1425,6 +1437,7 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            tool_call_parser=self.scheduler.tool_call_parser,
         )
 
     def to_dict(self) -> dict[str, Any]:

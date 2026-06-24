@@ -1111,6 +1111,14 @@ def _parse_tool_calls_impl(
     tools: Optional[List] = None,
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
+    # Operator opt-out (tool_call_parser=none): return the raw text untouched
+    # so no tool-call markup is extracted or stripped. The generic XML / Hermes
+    # / bracket fallbacks below run even without an injected parser, so the
+    # disabled sentinel must short-circuit before any of them. See
+    # https://github.com/jundot/omlx/issues/906.
+    if getattr(tokenizer, "tool_calls_disabled", False):
+        return text, None
+
     cleaned_text = text
 
     # Remove thinking tags if present (reasoning models)
@@ -1448,6 +1456,11 @@ class ToolCallStreamFilter:
     """
 
     def __init__(self, tokenizer: Any):
+        # Operator opt-out (tool_call_parser=none): when no parser was injected
+        # the filter must NOT suppress the built-in fallback envelopes
+        # (<tool_call> etc.) -- the raw tokens have to reach the client. See
+        # https://github.com/jundot/omlx/issues/906.
+        self._disabled = bool(getattr(tokenizer, "tool_calls_disabled", False))
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
         # Normalize None-like values but preserve empty strings.
@@ -1498,7 +1511,7 @@ class ToolCallStreamFilter:
     @property
     def active(self) -> bool:
         """Whether this filter should run for tool-enabled streams."""
-        return True
+        return not self._disabled
 
     def _find_start_envelope(
         self, text: str
