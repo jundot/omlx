@@ -781,3 +781,127 @@ class TestApplyChatTemplatePartialMode:
         # continue_final_message=True (not add_generation_prompt=True).
         assert count_kwargs["continue_final_message"] is True
         assert count_kwargs["add_generation_prompt"] is False
+
+
+class TestBatchedEngineMistralCommon:
+    """Tool-calling support for MistralCommon (tekken) tokenizers (#1992)."""
+
+    def _mistral_tokenizer(self, **attrs):
+        """Build a fake tokenizer whose inner backend is 'MistralCommonBackend'."""
+        MistralCommonBackend = type("MistralCommonBackend", (), {})
+        return SimpleNamespace(_tokenizer=MistralCommonBackend(), **attrs)
+
+    def test_is_mistral_common_true(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._tokenizer = self._mistral_tokenizer()
+        assert engine._is_mistral_common() is True
+
+    def test_is_mistral_common_false_for_regular(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._tokenizer = SimpleNamespace(_tokenizer=object())
+        assert engine._is_mistral_common() is False
+
+    def test_is_mistral_common_false_when_none(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._tokenizer = None
+        assert engine._is_mistral_common() is False
+
+    def test_prompt_ids_returns_ids_for_mistral_common(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = self._mistral_tokenizer()
+        tok.apply_chat_template = MagicMock(return_value=[1, 5, 1091])
+        engine._tokenizer = tok
+
+        result = engine._prompt_ids_for_mistral_common(
+            [{"role": "user", "content": "hi"}], None, None, False, "FALLBACK"
+        )
+
+        assert result == [1, 5, 1091]
+        kw = tok.apply_chat_template.call_args[1]
+        assert kw["tokenize"] is True
+        assert kw["add_generation_prompt"] is True
+
+    def test_prompt_ids_passes_tools(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = self._mistral_tokenizer()
+        tok.apply_chat_template = MagicMock(return_value=[1, 5])
+        engine._tokenizer = tok
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+        engine._prompt_ids_for_mistral_common(
+            [{"role": "user", "content": "hi"}], tools, None, False, "FALLBACK"
+        )
+
+        assert tok.apply_chat_template.call_args[1]["tools"] == tools
+
+    def test_prompt_ids_passthrough_for_non_mistral(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._tokenizer = SimpleNamespace(_tokenizer=object())
+
+        result = engine._prompt_ids_for_mistral_common(
+            [{"role": "user", "content": "hi"}], None, None, False, "FALLBACK"
+        )
+
+        assert result == "FALLBACK"
+
+    def test_prompt_ids_falls_back_on_error(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = self._mistral_tokenizer()
+        tok.apply_chat_template = MagicMock(side_effect=RuntimeError("boom"))
+        engine._tokenizer = tok
+
+        result = engine._prompt_ids_for_mistral_common(
+            [{"role": "user", "content": "hi"}], None, None, False, "FALLBACK"
+        )
+
+        assert result == "FALLBACK"
+
+    def test_ensure_mistral_tool_parser_attaches(self):
+        mp = pytest.importorskip("mlx_lm.tool_parsers.mistral")
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = self._mistral_tokenizer(has_tool_calling=False)
+        engine._tokenizer = tok
+
+        engine._ensure_mistral_tool_parser()
+
+        assert tok._tool_parser is mp.parse_tool_call
+        assert tok._tool_call_start == mp.tool_call_start
+        assert tok._tool_call_end == mp.tool_call_end
+
+    def test_ensure_mistral_tool_parser_skips_when_enabled(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = self._mistral_tokenizer(has_tool_calling=True)
+        engine._tokenizer = tok
+
+        engine._ensure_mistral_tool_parser()
+
+        assert not hasattr(tok, "_tool_parser")
+
+    def test_ensure_mistral_tool_parser_noop_for_non_mistral(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        tok = SimpleNamespace(_tokenizer=object(), has_tool_calling=False)
+        engine._tokenizer = tok
+
+        engine._ensure_mistral_tool_parser()
+
+        assert not hasattr(tok, "_tool_parser")

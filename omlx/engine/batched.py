@@ -274,6 +274,11 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
+        # MistralCommon (tekken) tokenizers expose no jinja chat_template, so
+        # mlx_lm's load() can't infer a tool parser and has_tool_calling stays
+        # False -> the server never parses [TOOL_CALLS]. Attach it explicitly.
+        self._ensure_mistral_tool_parser()
+
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
             apply_post_load_transforms,
@@ -476,6 +481,81 @@ class BatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _is_mistral_common(self) -> bool:
+        """True if the loaded tokenizer is backed by mistral-common (tekken)."""
+        if self._tokenizer is None:
+            return False
+        inner = getattr(self._tokenizer, "_tokenizer", self._tokenizer)
+        return type(inner).__name__ == "MistralCommonBackend"
+
+    def _ensure_mistral_tool_parser(self) -> None:
+        """Attach mlx_lm's mistral tool parser for MistralCommon tokenizers.
+
+        MistralCommon exposes no jinja ``chat_template``, so mlx_lm's ``load()``
+        cannot infer a tool parser and ``has_tool_calling`` stays ``False``. The
+        model still emits ``[TOOL_CALLS]``; without a parser the server returns it
+        as raw text instead of structured ``tool_calls``.
+        """
+        tokenizer = self._tokenizer
+        if tokenizer is None or not self._is_mistral_common():
+            return
+        if getattr(tokenizer, "has_tool_calling", False):
+            return
+        try:
+            from mlx_lm.tool_parsers import mistral as mistral_parser
+        except ImportError:
+            logger.warning(
+                "mlx_lm.tool_parsers.mistral not found; tool calling "
+                "disabled for MistralCommon tokenizer"
+            )
+            return
+        tokenizer._tool_call_start = mistral_parser.tool_call_start
+        tokenizer._tool_call_end = mistral_parser.tool_call_end
+        tokenizer._tool_parser = mistral_parser.parse_tool_call
+        logger.info("LLM tool calling enabled: parser=mistral (MistralCommon)")
+
+    def _prompt_ids_for_mistral_common(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        is_partial: bool | None,
+        fallback_prompt,
+    ):
+        """Tokenize directly to ids for MistralCommon tokenizers.
+
+        ``apply_chat_template(..., tokenize=False)`` renders control tokens
+        (``[INST]``, ``[AVAILABLE_TOOLS]``, ``[TOOL_CALLS]``, ...) as literal text;
+        re-encoding that string turns them into ASCII brackets, so the model sees an
+        out-of-distribution prompt and emits EOS immediately. Tokenizing directly to
+        ids preserves the control tokens. Returns ``fallback_prompt`` unchanged for
+        every other tokenizer.
+        """
+        if not self._is_mistral_common():
+            return fallback_prompt
+        kw = {"tokenize": True, "add_generation_prompt": not bool(is_partial)}
+        if is_partial:
+            kw["continue_final_message"] = True
+        if tools:
+            kw["tools"] = tools
+        if chat_template_kwargs:
+            kw.update(chat_template_kwargs)
+        try:
+            ids = self._tokenizer.apply_chat_template(messages, **kw)
+        except TypeError:
+            # Older mistral-common rejects unknown kwargs (e.g. enable_thinking).
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    kw.pop(key, None)
+            ids = self._tokenizer.apply_chat_template(messages, **kw)
+        except Exception as e:
+            logger.warning(
+                f"MistralCommon direct tokenize failed ({e}); "
+                "falling back to string prompt"
+            )
+            return fallback_prompt
+        return list(ids)
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -553,9 +633,9 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
+            thinking_budget=kwargs.get("thinking_budget"),
+            compiled_grammar=kwargs.get("compiled_grammar"),
+            seed=kwargs.get("seed"),
         )
 
         output = await self._engine.generate(
@@ -622,9 +702,9 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
+            thinking_budget=kwargs.get("thinking_budget"),
+            compiled_grammar=kwargs.get("compiled_grammar"),
+            seed=kwargs.get("seed"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -738,6 +818,11 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+        )
+        # MistralCommon: tokenize directly to ids so control tokens survive
+        # (no-op string passthrough for every other tokenizer).
+        prompt = self._prompt_ids_for_mistral_common(
+            messages, template_tools, ct_kwargs, partial, prompt
         )
 
         return await self.generate(
@@ -915,6 +1000,12 @@ class BatchedEngine(BaseEngine):
                         kwargs["specprefill_system_end"] = system_end
                 except Exception as e:
                     logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
+        # MistralCommon: tokenize directly to ids so control tokens survive.
+        # Done after SpecPrefill's string-based token counting above.
+        prompt = self._prompt_ids_for_mistral_common(
+            messages, template_tools, ct_kwargs, partial, prompt
+        )
 
         async for output in self.stream_generate(
             prompt=prompt,
