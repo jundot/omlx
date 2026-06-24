@@ -263,10 +263,12 @@
     .user-message {
         max-width: min(768px, 100%);
         align-self: flex-end;
+        padding-bottom: 32px;
     }
 
     .user-message.is-editing {
         width: min(768px, 100%);
+        padding-bottom: 0;
     }
 
     .user-message-bubble {
@@ -583,8 +585,10 @@
 
     .user-message-actions {
         position: absolute;
-        left: -96px;
-        top: 4px;
+        right: 0;
+        bottom: 0;
+        left: auto;
+        top: auto;
         display: flex;
         flex-direction: row;
         gap: 4px;
@@ -801,7 +805,8 @@
         }
 
         .user-message-actions {
-            left: -28px;
+            right: 0;
+            left: auto;
         }
 
         /* Prevent iOS auto-zoom on input focus (requires >= 16px) */
