@@ -976,16 +976,17 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
-            "the running oMLX server."
+            "Codex, Codex App, Goose CLI, Goose Desktop, OpenCode, OpenClaw, "
+            "Hermes Agent, Pi) to use the running oMLX server."
         ),
     )
     launch_parser.add_argument(
         "tool",
         type=str,
         help=(
-            "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "Tool to launch: claude, copilot, codex, codex_app, goose_cli, "
+            "goose_desktop, opencode, openclaw, hermes, pi, or 'list' to show "
+            "available"
         ),
     )
     launch_parser.add_argument(

@@ -723,6 +723,8 @@ class IntegrationSettings:
     hermes_model: str | None = None
     pi_model: str | None = None
     copilot_model: str | None = None
+    goose_cli_model: str | None = None
+    goose_desktop_model: str | None = None
     openclaw_tools_profile: str = "coding"
     markitdown_enabled: bool = True
     markitdown_expose_model: bool = False
@@ -739,6 +741,8 @@ class IntegrationSettings:
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
+            "goose_cli_model": self.goose_cli_model,
+            "goose_desktop_model": self.goose_desktop_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
             "markitdown_enabled": self.markitdown_enabled,
             "markitdown_expose_model": self.markitdown_expose_model,
@@ -757,6 +761,8 @@ class IntegrationSettings:
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
+            goose_cli_model=data.get("goose_cli_model"),
+            goose_desktop_model=data.get("goose_desktop_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
             markitdown_enabled=data.get("markitdown_enabled", True),
             markitdown_expose_model=data.get("markitdown_expose_model", False),

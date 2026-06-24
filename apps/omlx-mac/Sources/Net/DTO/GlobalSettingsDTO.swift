@@ -128,6 +128,8 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let openclawToolsProfile: String?
         let hermesModel: String?
         let copilotModel: String?
+        let gooseCliModel: String?
+        let gooseDesktopModel: String?
     }
 
     /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
@@ -191,6 +193,8 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsOpenclawToolsProfile: String? = nil
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
+    var integrationsGooseCliModel: String? = nil
+    var integrationsGooseDesktopModel: String? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across

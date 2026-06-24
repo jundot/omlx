@@ -104,6 +104,8 @@
                     openclaw_model: null,
                     hermes_model: null,
                     pi_model: null,
+                    goose_cli_model: null,
+                    goose_desktop_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
                     markitdown_expose_model: false,
@@ -2428,6 +2430,14 @@
                 return this._launchCmd('pi');
             },
 
+            get gooseCliCommand() {
+                return this._launchCmd('goose_cli');
+            },
+
+            get gooseDesktopCommand() {
+                return this._launchCmd('goose_desktop');
+            },
+
             get markitdownOcrModels() {
                 return (this.models || []).filter((model) => {
                     const configType = String(model.config_model_type || '').toLowerCase();
@@ -2447,6 +2457,8 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_goose_cli_model: this.globalSettings.integrations.goose_cli_model,
+                            integrations_goose_desktop_model: this.globalSettings.integrations.goose_desktop_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                             markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
                             markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,

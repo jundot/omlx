@@ -12,6 +12,8 @@ from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import CodexIntegration
 from omlx.integrations.codex_app import CodexAppIntegration
 from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.goose_cli import GooseCliIntegration
+from omlx.integrations.goose_desktop import GooseDesktopIntegration
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
@@ -32,13 +34,15 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 8
+        assert len(integrations) == 10
         names = {i.name for i in integrations}
         assert names == {
             "claude",
             "codex",
             "codex_app",
             "copilot",
+            "goose_cli",
+            "goose_desktop",
             "opencode",
             "openclaw",
             "hermes",
@@ -50,6 +54,8 @@ class TestIntegrationRegistry:
         assert get_integration("codex") is not None
         assert get_integration("codex_app") is not None
         assert get_integration("copilot") is not None
+        assert get_integration("goose_cli") is not None
+        assert get_integration("goose_desktop") is not None
         assert get_integration("opencode") is not None
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
@@ -1481,6 +1487,278 @@ class TestCopilotIntegration:
         assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
 
 
+class TestGooseCliIntegration:
+    def test_get_command(self):
+        goose = GooseCliIntegration()
+        cmd = goose.get_command(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+        assert "omlx launch goose_cli" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        goose = GooseCliIntegration()
+        cmd = goose.get_command(ctx(port=8000, api_key="", model=""))
+        assert "select-a-model" in cmd
+
+    def test_type(self):
+        goose = GooseCliIntegration()
+        assert goose.type == "env_var"
+        assert goose.display_name == "Goose CLI"
+        assert goose.install_check == "goose"
+
+    def test_launch_sets_openai_env(self):
+        goose = GooseCliIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.goose_cli.os.environ", base_env),
+            patch("omlx.integrations.goose_cli.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="qwen3.5",
+                )
+            )
+
+        env = captured["env"]
+        assert captured["binary"] == "goose"
+        assert captured["argv"] == ["goose"]
+        assert env["OPENAI_API_BASE"] == "http://127.0.0.1:8000/v1"
+        assert env["OPENAI_API_KEY"] == "secret"
+        assert env["GOOSE_MODEL"] == "qwen3.5"
+        assert env["GOOSE_TELEMETRY"] == "0"
+        assert "PYTHONHOME" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_without_model(self):
+        goose = GooseCliIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.goose_cli.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.goose_cli.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(ctx(port=8000, api_key="key", model=""))
+
+        env = captured["env"]
+        assert "GOOSE_MODEL" not in env
+        assert env["OPENAI_API_BASE"] == "http://127.0.0.1:8000/v1"
+        assert env["OPENAI_API_KEY"] == "key"
+
+    def test_launch_with_context_window(self):
+        goose = GooseCliIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.goose_cli.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.goose_cli.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", context_window=131072)
+            )
+
+        env = captured["env"]
+        assert env["OPENAI_MAX_TOKENS"] == "131072"
+
+    def test_launch_with_max_tokens(self):
+        goose = GooseCliIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.goose_cli.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.goose_cli.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", max_tokens=8192)
+            )
+
+        env = captured["env"]
+        assert env["OPENAI_MAX_COMPLETION_TOKENS"] == "8192"
+
+    def test_launch_forwards_extra_args(self):
+        goose = GooseCliIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.goose_cli.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.goose_cli.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", extra_args=("--yolo",))
+            )
+
+        assert captured["argv"] == ["goose", "--yolo"]
+
+
+class TestGooseDesktopIntegration:
+    def test_get_command(self):
+        goose = GooseDesktopIntegration()
+        cmd = goose.get_command(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+        assert "omlx launch goose_desktop" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        goose = GooseDesktopIntegration()
+        cmd = goose.get_command(ctx(port=8000, api_key="", model=""))
+        assert "select-a-model" in cmd
+
+    def test_type(self):
+        goose = GooseDesktopIntegration()
+        assert goose.type == "config_file"
+        assert goose.display_name == "Goose Desktop"
+
+    def test_is_installed(self, tmp_path, monkeypatch):
+        goose = GooseDesktopIntegration()
+
+        # Not installed when app doesn't exist
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+        assert goose.is_installed() is False
+
+        # Installed when app exists
+        fake_app = tmp_path / "Applications" / "Goose.app"
+        fake_app.mkdir(parents=True)
+        (fake_app / "Contents").mkdir(parents=True)
+
+        original_exists = Path.exists
+
+        def patched_exists(self):
+            if str(self).endswith("/Applications/Goose.app"):
+                return True
+            return original_exists(self)
+
+        with patch.object(Path, "exists", patched_exists):
+            assert goose.is_installed() is True
+
+    def test_configure(self, tmp_path):
+        goose = GooseDesktopIntegration()
+        config_path = tmp_path / ".config" / "goose" / "config.yaml"
+
+        goose.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+
+        # The real path is used; patch it for testing
+        with patch.object(GooseDesktopIntegration, "CONFIG_PATH", config_path):
+            goose.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+
+        assert config_path.exists()
+        content = yaml.safe_load(config_path.read_text())
+        assert content["api"]["url"] == "http://127.0.0.1:8000/v1"
+        assert content["api"]["key"] == "test-key"
+        assert content["model"] == "qwen3.5"
+
+    def test_configure_custom_host(self, tmp_path):
+        config_path = tmp_path / ".config" / "goose" / "config.yaml"
+        goose = GooseDesktopIntegration()
+
+        with patch.object(GooseDesktopIntegration, "CONFIG_PATH", config_path):
+            goose.configure(
+                ctx(port=9000, api_key="key", model="test", host="192.168.1.100")
+            )
+
+        content = yaml.safe_load(config_path.read_text())
+        assert content["api"]["url"] == "http://192.168.1.100:9000/v1"
+
+    def test_configure_creates_backup(self, tmp_path):
+        config_path = tmp_path / ".config" / "goose" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        existing = "api:\n  url: http://old\n"
+        config_path.write_text(existing)
+
+        goose = GooseDesktopIntegration()
+        with patch.object(GooseDesktopIntegration, "CONFIG_PATH", config_path):
+            goose.configure(ctx(port=8000, api_key="key", model="new"))
+
+        backups = list(tmp_path.glob("**/*.bak"))
+        assert len(backups) == 1
+
+    def test_configure_preserves_existing(self, tmp_path):
+        config_path = tmp_path / ".config" / "goose" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        existing = {
+            "api": {"url": "http://old", "key": "old-key"},
+            "model": "old-model",
+            "custom_key": "preserve-me",
+        }
+        config_path.write_text(yaml.safe_dump(existing))
+
+        goose = GooseDesktopIntegration()
+        with patch.object(GooseDesktopIntegration, "CONFIG_PATH", config_path):
+            goose.configure(ctx(port=8000, api_key="new-key", model="new-model"))
+
+        content = yaml.safe_load(config_path.read_text())
+        assert content["api"]["url"] == "http://127.0.0.1:8000/v1"
+        assert content["api"]["key"] == "new-key"
+        assert content["model"] == "new-model"
+        assert content["custom_key"] == "preserve-me"
+
+    def test_launch_sets_env(self):
+        goose = GooseDesktopIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+        }
+        with (
+            patch("omlx.integrations.goose_desktop.os.environ", base_env),
+            patch("omlx.integrations.goose_desktop.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(ctx(port=8000, api_key="secret", model="qwen3.5"))
+
+        env = captured["env"]
+        assert captured["binary"] == "open"
+        assert captured["argv"] == ["open", "-a", "Goose"]
+        assert env["OPENAI_API_BASE"] == "http://127.0.0.1:8000/v1"
+        assert env["OPENAI_API_KEY"] == "secret"
+        assert env["GOOSE_MODEL"] == "qwen3.5"
+        assert env["GOOSE_TELEMETRY"] == "0"
+
+    def test_launch_without_model(self):
+        goose = GooseDesktopIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.goose_desktop.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.goose_desktop.os.execvpe", side_effect=fake_execvpe),
+        ):
+            goose.launch(ctx(port=8000, api_key="key", model=""))
+
+        env = captured["env"]
+        assert "GOOSE_MODEL" not in env
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
@@ -1492,18 +1770,22 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model is None
         assert settings.pi_model is None
+        assert settings.goose_cli_model is None
+        assert settings.goose_desktop_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
         from omlx.settings import IntegrationSettings
 
-        settings = IntegrationSettings(codex_model="qwen3.5")
+        settings = IntegrationSettings(codex_model="qwen3.5", goose_cli_model="llama")
         d = settings.to_dict()
         assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["hermes_model"] is None
         assert d["pi_model"] is None
+        assert d["goose_cli_model"] == "llama"
+        assert d["goose_desktop_model"] is None
         assert d["openclaw_tools_profile"] == "coding"
 
     def test_from_dict(self):
@@ -1515,6 +1797,8 @@ class TestIntegrationSettings:
                 "codex_model": "llama",
                 "opencode_model": "qwen",
                 "hermes_model": "hermes-qwen",
+                "goose_cli_model": "qwen3.5",
+                "goose_desktop_model": "llama-3.1",
             }
         )
         assert settings.copilot_model == "gpt-oss"
@@ -1523,6 +1807,8 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
+        assert settings.goose_cli_model == "qwen3.5"
+        assert settings.goose_desktop_model == "llama-3.1"
 
     def test_from_dict_empty(self):
         from omlx.settings import IntegrationSettings
