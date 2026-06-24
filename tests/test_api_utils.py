@@ -3364,3 +3364,99 @@ class TestToolResultWithToolAwareTokenizer:
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # Arguments are parsed into dict for the chat template.
         assert result[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Seoul"}
+
+
+class TestMidSystemProbeLeadingSystem:
+    """Probe must replicate the leading-system precondition (#1966).
+
+    Strict templates (Qwen3.6) accept a system message after a user turn only
+    when there is no leading system block; with a leading block they raise
+    "System message must be at the beginning." The capability probe must build
+    the same shape (system, user, system) or it returns a false positive and
+    the mid-system message is preserved into a request the template rejects.
+    """
+
+    class StrictLeadingSystemTokenizer:
+        """Mimics Qwen3.6: a system message after the beginning is allowed only
+        when there is no leading system block; otherwise the template raises."""
+
+        chat_template = "strict-leading-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            has_leading = bool(messages) and messages[0]["role"] == "system"
+            seen_non_system = False
+            for msg in messages:
+                if msg["role"] == "system":
+                    if seen_non_system and has_leading:
+                        raise ValueError(
+                            "System message must be at the beginning."
+                        )
+                else:
+                    seen_non_system = True
+            return "\n".join(
+                f"{m['role']}:{m.get('content', '')}" for m in messages
+            )
+
+    def test_probe_detects_strict_leading_system_rejection(self):
+        from omlx.api.utils import chat_template_preserves_mid_system
+
+        tokenizer = self.StrictLeadingSystemTokenizer()
+
+        # Without a leading system block the [user, system] shape is accepted.
+        assert (
+            chat_template_preserves_mid_system(
+                tokenizer, has_leading_system=False
+            )
+            is True
+        )
+        # With a leading system block the strict template rejects the
+        # mid-system run, so the probe must report it as unsupported.
+        assert (
+            chat_template_preserves_mid_system(
+                tokenizer, has_leading_system=True
+            )
+            is False
+        )
+
+    def test_downgrades_mid_system_when_leading_block_present(self):
+        from omlx.api.utils import prepare_system_messages_for_template
+
+        # Real Qwen3.6 shape from #1966: a leading developer/system block, a
+        # user turn, then a later developer/system block.
+        messages = [
+            {"role": "system", "content": "Leading context"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "Later context"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.StrictLeadingSystemTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        # The mid-system block must be downgraded into the user turn so the
+        # strict template no longer sees a system message after the beginning.
+        assert [m["role"] for m in result] == ["system", "user"]
+        assert result[0]["content"] == "Leading context"
+        assert "Later context" in result[1]["content"]
+        assert "[System note]" in result[1]["content"]
+
+    def test_no_leading_block_still_preserves_mid_system(self):
+        from omlx.api.utils import prepare_system_messages_for_template
+
+        # Without a leading system block the template accepts the mid-system
+        # turn, so it should still be preserved in place (not downgraded).
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.StrictLeadingSystemTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["user", "system"]
+        assert result[1]["content"] == "Plan mode"

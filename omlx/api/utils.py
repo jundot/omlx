@@ -233,6 +233,7 @@ _TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
 _MID_SYSTEM_USER_MARKER = "__OMLX_MID_SYSTEM_PROBE_USER__"
 _MID_SYSTEM_MARKER = "__OMLX_MID_SYSTEM_PROBE_SYSTEM__"
 _MID_SYSTEM_ASSISTANT_MARKER = "__OMLX_MID_SYSTEM_PROBE_ASSISTANT__"
+_MID_SYSTEM_LEADING_MARKER = "__OMLX_MID_SYSTEM_PROBE_LEADING__"
 _MID_SYSTEM_PROBE_TOOL = [
     {
         "type": "function",
@@ -296,6 +297,7 @@ def _mid_system_probe_cache_key(
     chat_template_kwargs: dict[str, Any] | None,
     placement: str,
     is_partial: bool,
+    has_leading_system: bool,
 ) -> tuple[Any, ...]:
     chat_template = getattr(tokenizer, "chat_template", None)
     if isinstance(chat_template, str):
@@ -309,6 +311,7 @@ def _mid_system_probe_cache_key(
         _freeze_template_value(chat_template_kwargs or {}),
         placement,
         is_partial,
+        has_leading_system,
     )
 
 
@@ -355,12 +358,20 @@ def chat_template_preserves_mid_system(
     chat_template_kwargs: dict[str, Any] | None = None,
     placement: str = "tail",
     is_partial: bool = False,
+    has_leading_system: bool = False,
 ) -> bool:
     """Return whether the chat template renders a mid-system message in-place.
 
     This does not prove model-level semantics. It only verifies that the
     current tokenizer template keeps the system content after the preceding
     user turn instead of raising, dropping it, or moving it to the front.
+
+    When ``has_leading_system`` is True the probe is built with a leading
+    system block (``system, user, system[, assistant]``), matching the real
+    conversation shape. Some strict templates (e.g. Qwen3.6) accept a system
+    message after a user turn *only* when there is no leading system block, and
+    raise "System message must be at the beginning." otherwise. Probing without
+    the leading block hides that rejection and yields a false positive (#1966).
     """
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
         return False
@@ -374,15 +385,19 @@ def chat_template_preserves_mid_system(
         chat_template_kwargs=chat_template_kwargs,
         placement=placement,
         is_partial=is_partial,
+        has_leading_system=has_leading_system,
     )
     cached = _MID_SYSTEM_PROBE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    probe_messages = [
-        {"role": "user", "content": _MID_SYSTEM_USER_MARKER},
-        {"role": "system", "content": _MID_SYSTEM_MARKER},
-    ]
+    probe_messages: list[dict] = []
+    if has_leading_system:
+        probe_messages.append(
+            {"role": "system", "content": _MID_SYSTEM_LEADING_MARKER}
+        )
+    probe_messages.append({"role": "user", "content": _MID_SYSTEM_USER_MARKER})
+    probe_messages.append({"role": "system", "content": _MID_SYSTEM_MARKER})
     if placement == "between":
         probe_messages.append(
             {"role": "assistant", "content": _MID_SYSTEM_ASSISTANT_MARKER}
@@ -407,6 +422,11 @@ def chat_template_preserves_mid_system(
     supported = user_idx >= 0 and system_idx > user_idx
     if placement == "between":
         supported = supported and assistant_idx > system_idx
+    if has_leading_system:
+        # The leading system block must still render first; a strict template
+        # that rejects the mid-system run (or relocates it) is not safe.
+        leading_idx = rendered.find(_MID_SYSTEM_LEADING_MARKER)
+        supported = supported and 0 <= leading_idx < user_idx
 
     _MID_SYSTEM_PROBE_CACHE[cache_key] = supported
     return supported
@@ -684,6 +704,9 @@ def prepare_system_messages_for_template(
     if is_partial:
         return strict_fallback()
 
+    has_leading_system = bool(messages) and _is_system_role(
+        messages[0].get("role")
+    )
     can_preserve = all(
         chat_template_preserves_mid_system(
             tokenizer,
@@ -691,6 +714,7 @@ def prepare_system_messages_for_template(
             chat_template_kwargs=chat_template_kwargs,
             placement=placement,
             is_partial=is_partial,
+            has_leading_system=has_leading_system,
         )
         for placement in placements
     )
