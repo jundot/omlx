@@ -200,6 +200,8 @@ class MessagesRequest(BaseModel):
     thinking: ThinkingConfig | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
+    # VLM image soft-token budget per image (Gemma-style variable resolution)
+    vision_soft_tokens_per_image: int | None = None
 
 
 # =============================================================================

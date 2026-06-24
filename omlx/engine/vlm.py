@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import hashlib
 import importlib
 import inspect
 import json
@@ -843,6 +844,69 @@ def _derive_image_token_upper_bound(processor: Any) -> int:
     return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
 
 
+def _processor_supports_vision_soft_tokens(processor: Any) -> bool:
+    """Return True only when the processor explicitly advertises this knob.
+
+    Older mlx-vlm processors may accept arbitrary ``**kwargs`` while ignoring
+    or failing to forward the budget to the image processor. Treating **kwargs
+    as support would make the request look successful while still using the
+    wrong image-token count.
+    """
+    call = getattr(processor, "__call__", None)
+    if call is None:
+        return False
+    try:
+        params = inspect.signature(call).parameters
+    except (TypeError, ValueError):
+        return False
+    return "vision_soft_tokens_per_image" in params or "max_soft_tokens" in params
+
+
+def _vision_soft_token_prepare_kwargs(
+    processor: Any,
+    vision_soft_tokens_per_image: int | None,
+    *,
+    num_images: int,
+) -> dict[str, int]:
+    if vision_soft_tokens_per_image is None or num_images <= 0:
+        return {}
+    if not _processor_supports_vision_soft_tokens(processor):
+        raise InvalidRequestError(
+            "vision_soft_tokens_per_image requires a newer mlx-vlm build whose "
+            "processor explicitly supports Gemma-style image soft-token budgets.",
+            field="vision_soft_tokens_per_image",
+        )
+    return {"vision_soft_tokens_per_image": int(vision_soft_tokens_per_image)}
+
+
+def _namespace_vision_cache_hash(
+    image_hash: str | None,
+    vision_soft_tokens_per_image: int | None,
+) -> str | None:
+    """Salt vision-feature cache hashes with processor-affecting options."""
+    if image_hash is None or vision_soft_tokens_per_image is None:
+        return image_hash
+    payload = json.dumps(
+        {
+            "image_hash": image_hash,
+            "vision_soft_tokens_per_image": int(vision_soft_tokens_per_image),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _vision_preflight_image_bound(
+    processor: Any,
+    vision_soft_tokens_per_image: int | None,
+) -> int:
+    bound = _derive_image_token_upper_bound(processor)
+    if vision_soft_tokens_per_image is not None:
+        bound = max(bound, int(vision_soft_tokens_per_image))
+    return bound
+
+
 def _count_image_tokens(
     messages: list[dict[str, Any]],
     per_image_upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
@@ -1658,7 +1722,10 @@ class VLMBatchedEngine(BaseEngine):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
                         )
                     ]
-                    if image_position_ids is not None and len(positional_parameters) >= 2:
+                    if (
+                        image_position_ids is not None
+                        and len(positional_parameters) >= 2
+                    ):
                         return model.encode_image(pixel_values, image_position_ids)
 
             return model.encode_image(pixel_values)
@@ -1884,6 +1951,7 @@ class VLMBatchedEngine(BaseEngine):
         audio: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
+        vision_soft_tokens_per_image: int | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -1927,6 +1995,11 @@ class VLMBatchedEngine(BaseEngine):
 
         num_images = len(images)
         num_audios = len(audio) if audio else 0
+        vision_processor_kwargs = _vision_soft_token_prepare_kwargs(
+            self._processor,
+            vision_soft_tokens_per_image,
+            num_images=num_images,
+        )
 
         model_type = self.model_type or ""
         if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
@@ -2050,6 +2123,7 @@ class VLMBatchedEngine(BaseEngine):
             images=images if images else None,
             audio=audio if audio else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
+            **vision_processor_kwargs,
         )
 
         input_ids = inputs["input_ids"]
@@ -2102,6 +2176,7 @@ class VLMBatchedEngine(BaseEngine):
                                 if isinstance(prefix_prompt, str)
                                 else prefix_prompt
                             ),
+                            **vision_processor_kwargs,
                         )
                         prefix_ids = prefix_inputs["input_ids"]
                         boundary_tokens = (
@@ -2111,7 +2186,10 @@ class VLMBatchedEngine(BaseEngine):
                         )
 
                     images_consumed += msg_num_images
-                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    cumulative_hash = _namespace_vision_cache_hash(
+                        compute_image_hash(images[:images_consumed]),
+                        vision_soft_tokens_per_image,
+                    )
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 image_cache_key_start = image_cache_key_ranges[0][0]
@@ -2145,7 +2223,10 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = _namespace_vision_cache_hash(
+                    compute_image_hash(images),
+                    vision_soft_tokens_per_image,
+                )
                 image_token_count = self._image_token_count(input_ids)
 
             if (
@@ -2153,7 +2234,10 @@ class VLMBatchedEngine(BaseEngine):
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
             ):
-                per_hashes = compute_per_image_hashes(images)
+                per_hashes = [
+                    _namespace_vision_cache_hash(h, vision_soft_tokens_per_image)
+                    for h in compute_per_image_hashes(images)
+                ]
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
@@ -2705,6 +2789,7 @@ class VLMBatchedEngine(BaseEngine):
             return
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
+        vision_soft_tokens_per_image = kwargs.get("vision_soft_tokens_per_image")
         partial = kwargs.get("is_partial")
         # Strip image content-parts BEFORE templating. Modern HF chat
         # templates (Qwen2.5-VL, Gemma-Vision, Llama-3.2-Vision) render
@@ -2744,8 +2829,13 @@ class VLMBatchedEngine(BaseEngine):
         # ``text_messages`` no longer has the image content-parts).
         num_tokens += _count_image_tokens(
             messages,
-            per_image_upper_bound=_derive_image_token_upper_bound(
-                getattr(self, "_processor", None)
+            per_image_upper_bound=_vision_preflight_image_bound(
+                (
+                    getattr(self, "_processor", None)
+                    if hasattr(self, "_processor")
+                    else None
+                ),
+                vision_soft_tokens_per_image,
             ),
         )
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
@@ -2969,6 +3059,7 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        vision_soft_tokens_per_image = kwargs.pop("vision_soft_tokens_per_image", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -2988,6 +3079,7 @@ class VLMBatchedEngine(BaseEngine):
             audio=audio if audio else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
+            vision_soft_tokens_per_image=vision_soft_tokens_per_image,
         )
 
         if images:

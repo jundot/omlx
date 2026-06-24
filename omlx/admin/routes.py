@@ -114,6 +114,7 @@ class ModelSettingsRequest(BaseModel):
     force_sampling: bool | None = None
     max_tool_result_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    vision_soft_tokens_per_image: int | None = None
     forced_ct_kwargs: list[str] | None = None
     ttl_seconds: int | None = None
     index_cache_freq: int | None = None
@@ -2152,6 +2153,13 @@ async def update_model_settings(
         )
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs
+    if "vision_soft_tokens_per_image" in sent:
+        current_settings.vision_soft_tokens_per_image = (
+            request.vision_soft_tokens_per_image
+            if request.vision_soft_tokens_per_image
+            and request.vision_soft_tokens_per_image > 0
+            else None
+        )
     if "forced_ct_kwargs" in sent:
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:

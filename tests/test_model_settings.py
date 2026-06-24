@@ -5,8 +5,6 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 
 
@@ -158,6 +156,31 @@ class TestModelSettings:
         assert settings.temperature == 0.8
         assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
 
+    def test_vision_soft_tokens_per_image_default(self):
+        """Test vision_soft_tokens_per_image defaults to None."""
+        settings = ModelSettings()
+        assert settings.vision_soft_tokens_per_image is None
+
+    def test_vision_soft_tokens_per_image_roundtrip(self):
+        """Test vision_soft_tokens_per_image survives to_dict -> from_dict."""
+        original = ModelSettings(vision_soft_tokens_per_image=2048)
+        d = original.to_dict()
+        assert d["vision_soft_tokens_per_image"] == 2048
+        restored = ModelSettings.from_dict(d)
+        assert restored.vision_soft_tokens_per_image == 2048
+
+    def test_chat_completion_request_accepts_vision_soft_tokens_alias(self):
+        """OpenAI chat requests accept max_soft_tokens as a compatibility alias."""
+        from omlx.api.openai_models import ChatCompletionRequest
+
+        request = ChatCompletionRequest.model_validate(
+            {
+                "model": "test-vlm",
+                "messages": [{"role": "user", "content": "describe"}],
+                "max_soft_tokens": 2048,
+            }
+        )
+        assert request.vision_soft_tokens_per_image == 2048
 
     def test_ttl_seconds_default(self):
         """Test ttl_seconds defaults to None."""
