@@ -868,6 +868,118 @@ def _count_image_tokens(
     return image_parts * per_image_upper_bound
 
 
+def _smart_resize_tokens(
+    h: int, w: int, patch_size: int, merge_size: int,
+    min_pixels: int, max_pixels: int,
+) -> int:
+    """Real merged-token count for one image of pixel size (h, w), mirroring
+    the Qwen image processor's ``smart_resize`` -> grid_thw ->
+    ``(t*h*w)//merge**2`` pipeline (t=1 for a still image). Pure arithmetic;
+    no pixel decode. This is the *exact* count the real chat path produces, so
+    it never under-counts the prefill-memory guard."""
+    import math
+
+    factor = patch_size * merge_size
+    if h <= 0 or w <= 0:
+        return 0
+    h_bar = max(factor, round(h / factor) * factor)
+    w_bar = max(factor, round(w / factor) * factor)
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((h * w) / max_pixels)
+        h_bar = max(factor, math.floor(h / beta / factor) * factor)
+        w_bar = max(factor, math.floor(w / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (h * w))
+        h_bar = math.ceil(h * beta / factor) * factor
+        w_bar = math.ceil(w * beta / factor) * factor
+    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
+
+
+def _read_image_dims(part: dict) -> Optional[tuple]:
+    """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
+
+    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
+    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
+    anything that would need a network fetch or that fails to parse, so callers
+    fall back to the conservative per-image upper bound."""
+    import base64 as _b64
+    import binascii
+    import io as _io
+
+    from PIL import Image as _Image
+
+    obj = part.get("image_url")
+    if obj is None:
+        obj = part.get("input_image") or part.get("image")
+    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    if not isinstance(url, str) or not url:
+        return None
+
+    raw = None
+    s = url.strip()
+    if s.startswith("data:"):
+        _, sep, encoded = s.partition(",")
+        if sep == ",":
+            try:
+                raw = _b64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return None
+    elif s.startswith(("http://", "https://")):
+        return None  # no network in preflight
+    else:
+        try:
+            raw = _b64.b64decode(s, validate=True)
+        except (binascii.Error, ValueError):
+            raw = None  # not base64 -> treat as path below
+
+    try:
+        if raw is not None:
+            with _Image.open(_io.BytesIO(raw)) as im:
+                return im.size  # (width, height)
+        with _Image.open(s) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _count_image_tokens_real(
+    messages: list[dict[str, Any]],
+    processor: Any,
+    *,
+    upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+) -> int:
+    """Sum the *real* per-image token contribution from actual image
+    dimensions, instead of charging every image the model's ``max_pixels``
+    ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
+    be read decode-free or the processor isn't a Qwen-style one, so the guard
+    still never under-counts."""
+    ip = getattr(processor, "image_processor", None) or processor
+    ps = getattr(ip, "patch_size", None)
+    ms = getattr(ip, "merge_size", None)
+    minp = getattr(ip, "min_pixels", None)
+    maxp = getattr(ip, "max_pixels", None)
+    qwen_ok = all(
+        isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp)
+    )
+
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image_url", "image", "input_image"):
+                continue
+            wh = _read_image_dims(part) if qwen_ok else None
+            if wh is None:
+                total += upper_bound
+            else:
+                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+    return total
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -2742,9 +2854,10 @@ class VLMBatchedEngine(BaseEngine):
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens(
+        num_tokens += _count_image_tokens_real(
             messages,
-            per_image_upper_bound=_derive_image_token_upper_bound(
+            getattr(self, "_processor", None),
+            upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
         )

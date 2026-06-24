@@ -10,6 +10,7 @@ Tests cover:
 - Engine stop safety (close() exception guard)
 """
 
+import base64
 import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1865,3 +1866,120 @@ class TestStopSafety:
         await engine.stop()
 
         mock_inner_engine.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestPreflightImageTokenCount
+# ---------------------------------------------------------------------------
+
+
+# Qwen3.x-VL / Qwen2.5-VL image-processor defaults used across these tests.
+_QWEN_IP = SimpleNamespace(
+    patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+)
+_QWEN_PROC = SimpleNamespace(image_processor=_QWEN_IP)
+
+
+def _png_data_uri(width: int, height: int) -> str:
+    """Build a ``data:`` base64 PNG of the given pixel size."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _image_part(width: int, height: int) -> dict:
+    return {"type": "image_url", "image_url": {"url": _png_data_uri(width, height)}}
+
+
+class TestSmartResizeTokens:
+    """`_smart_resize_tokens` must match the Qwen processor's grid -> token math."""
+
+    @pytest.mark.parametrize(
+        "w,h,expected",
+        [
+            (512, 512, 256),     # exact multiple of patch*merge (32)
+            (336, 336, 100),     # 336 -> 336 grid 21x21 -> 441//4... rounds via factor
+            (510, 680, 336),     # non-multiple, rounded to nearest factor
+            (100, 100, 64),      # below min_pixels -> upscaled to min
+            (4000, 3000, 11750),  # above max_pixels -> downscaled to cap
+        ],
+    )
+    def test_matches_known_grid(self, w, h, expected):
+        from omlx.engine.vlm import _smart_resize_tokens
+
+        got = _smart_resize_tokens(
+            h, w, _QWEN_IP.patch_size, _QWEN_IP.merge_size,
+            _QWEN_IP.min_pixels, _QWEN_IP.max_pixels,
+        )
+        assert got == expected
+
+    def test_zero_dims_return_zero(self):
+        from omlx.engine.vlm import _smart_resize_tokens
+
+        assert _smart_resize_tokens(0, 512, 16, 2, 65536, 16777216) == 0
+
+
+class TestReadImageDims:
+    """`_read_image_dims` reads dimensions decode-free, or returns None safely."""
+
+    def test_reads_data_uri(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        assert _read_image_dims(_image_part(640, 480)) == (640, 480)
+
+    def test_http_url_returns_none(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url",
+                "image_url": {"url": "https://example.com/x.jpg"}}
+        assert _read_image_dims(part) is None
+
+    def test_garbage_returns_none(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url",
+                "image_url": {"url": "data:image/png;base64,not-base64!!"}}
+        assert _read_image_dims(part) is None
+
+
+class TestCountImageTokensReal:
+    """`_count_image_tokens_real` charges actual size, not the max_pixels ceiling."""
+
+    def test_counts_real_size_not_upper_bound(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        # 20 down-sized 512x512 frames (livestream client shape).
+        content = [_image_part(512, 512) for _ in range(20)]
+        content.append({"type": "text", "text": "describe"})
+        messages = [{"role": "user", "content": content}]
+
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 20 * 256  # 5120, not 20 * 16384 = 327680
+
+    def test_falls_back_to_upper_bound_for_unreadable(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": "https://example.com/x.jpg"}},
+            {"type": "text", "text": "hi"},
+        ]}]
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 16384
+
+    def test_falls_back_when_processor_not_qwen_style(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        # Processor missing patch/merge/min/max -> never under-count.
+        messages = [{"role": "user", "content": [_image_part(512, 512)]}]
+        total = _count_image_tokens_real(messages, SimpleNamespace(),
+                                         upper_bound=16384)
+        assert total == 16384
+
+    def test_no_images_returns_zero(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": "just text"}]
+        assert _count_image_tokens_real(messages, _QWEN_PROC) == 0
