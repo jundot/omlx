@@ -23,6 +23,7 @@ import mlx.core as mx
 
 from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
+from ..prefill_progress import get_prefill_tracker
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..memory_monitor import (
     MemoryMonitor,
@@ -166,6 +167,9 @@ class DFlashEngine(BaseEngine):
         self._executor_tokenizer = None
         self._loaded = False
         self._active_request = False
+        self._activity_request_id: str | None = None
+        self._activity_started_at: float | None = None
+        self._activity_last_activity_at: float | None = None
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
@@ -887,6 +891,16 @@ class DFlashEngine(BaseEngine):
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
         event_iter = None
+        request_id = self._activity_request_id or "dflash"
+        prompt_len = len(prompt_tokens)
+        tracker = get_prefill_tracker()
+        tracker.update(
+            request_id=request_id,
+            processed=0,
+            total=prompt_len,
+            model_id=self._model_name,
+            phase="prefill",
+        )
         try:
             self._record_prefill_guard_active_memory()
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -894,6 +908,14 @@ class DFlashEngine(BaseEngine):
                 max_tokens=max_tokens,
             )
             self._record_prefill_guard_active_memory()
+            # DFlash prefill is complete after _stream_dflash_events returns
+            tracker.update(
+                request_id=request_id,
+                processed=prompt_len,
+                total=prompt_len,
+                model_id=self._model_name,
+                phase="prefill",
+            )
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
             # harmony channels → <think>/visible split). When active it owns
@@ -1007,6 +1029,13 @@ class DFlashEngine(BaseEngine):
                 loop,
             )
             self._active_request = False
+            self._activity_request_id = None
+            self._activity_started_at = None
+            self._activity_last_activity_at = None
+            try:
+                get_prefill_tracker().remove(request_id)
+            except Exception:
+                pass
 
     async def generate(
         self,
@@ -1069,6 +1098,15 @@ class DFlashEngine(BaseEngine):
                 if self._output_parser_factory is not None
                 else None
             )
+            tracker = get_prefill_tracker()
+            rid = self._activity_request_id or "dflash"
+            tracker.update(
+                request_id=rid,
+                processed=0,
+                total=len(prompt_tokens),
+                model_id=self._model_name,
+                phase="prefill",
+            )
             try:
                 self._record_prefill_guard_active_memory()
                 event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
@@ -1076,6 +1114,13 @@ class DFlashEngine(BaseEngine):
                     max_tokens=max_tokens,
                 )
                 self._record_prefill_guard_active_memory()
+                tracker.update(
+                    request_id=rid,
+                    processed=len(prompt_tokens),
+                    total=len(prompt_tokens),
+                    model_id=self._model_name,
+                    phase="prefill",
+                )
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
                 summary: SummaryEvent | None = None
@@ -1109,8 +1154,17 @@ class DFlashEngine(BaseEngine):
                         except Exception as exc:
                             logger.debug(f"event_iter.close() raised: {exc}")
                 self._active_request = False
+                self._activity_request_id = None
+                self._activity_started_at = None
+                self._activity_last_activity_at = None
+                try:
+                    get_prefill_tracker().remove(rid)
+                except Exception:
+                    pass
 
         self._active_request = True
+        self._activity_started_at = time.monotonic()
+        self._activity_last_activity_at = self._activity_started_at
         future = loop.run_in_executor(get_mlx_executor(), _run)
         try:
             summary, generated, parser_session, parsed_visible_parts, prefix_flow = (
@@ -1232,6 +1286,8 @@ class DFlashEngine(BaseEngine):
 
         from ..engine_core import get_mlx_executor
         self._active_request = True
+        self._activity_started_at = time.monotonic()
+        self._activity_last_activity_at = self._activity_started_at
         future = loop.run_in_executor(
             get_mlx_executor(),
             self._run_generate_streaming,
@@ -1433,6 +1489,34 @@ class DFlashEngine(BaseEngine):
         if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
             return True
         return self._active_request
+
+    def get_activity_snapshot(self) -> dict[str, Any]:
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            if hasattr(self._fallback_engine, "get_activity_snapshot"):
+                return self._fallback_engine.get_activity_snapshot()
+            return {"active_requests": 0, "activities": []}
+        now = time.monotonic()
+        if self._active_request and self._activity_started_at is not None:
+            elapsed = max(0.0, now - self._activity_started_at)
+            last_activity = (
+                max(0.0, now - self._activity_last_activity_at)
+                if self._activity_last_activity_at is not None
+                else None
+            )
+            return {
+                "active_requests": 1,
+                "activities": [
+                    {
+                        "request_id": self._activity_request_id or "dflash",
+                        "kind": "generate",
+                        "detail": "DFlash generation",
+                        "started_at": self._activity_started_at,
+                        "elapsed_seconds": elapsed,
+                        "last_activity_age_seconds": last_activity,
+                    }
+                ],
+            }
+        return {"active_requests": 0, "activities": []}
 
     def get_stats(self) -> dict[str, Any]:
         return {

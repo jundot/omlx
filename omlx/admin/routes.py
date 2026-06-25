@@ -4532,6 +4532,9 @@ def _build_active_models_data() -> dict:
                 snapshot = entry.engine.get_activity_snapshot()
                 active_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
+            elif callable(getattr(entry.engine, "has_active_requests", None)):
+                if entry.engine.has_active_requests():
+                    active_requests = 1
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
