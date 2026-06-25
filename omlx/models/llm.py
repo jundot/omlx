@@ -76,9 +76,8 @@ class MLXLanguageModel:
             return
 
         try:
-            from mlx_lm import load
-
             from ..utils.model_loading import (
+                lm_load_compat,
                 maybe_apply_pre_load_patches,
                 maybe_load_custom_quantization,
             )
@@ -104,7 +103,7 @@ class MLXLanguageModel:
                 self.model = model
                 self.tokenizer = getattr(processor, "tokenizer", processor)
             else:
-                self.model, self.tokenizer = load(
+                self.model, self.tokenizer = lm_load_compat(
                     self.model_name,
                     tokenizer_config=tokenizer_config,
                     trust_remote_code=self.trust_remote_code,

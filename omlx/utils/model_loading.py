@@ -17,6 +17,26 @@ _VLM_TEXT_PREFIX = "language_model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
+# mlx_lm.load dropped trust_remote_code in some releases. Check once at
+# import time so call sites can pass it safely across versions.
+def _mlx_lm_load_accepts_trust_remote_code() -> bool:
+    try:
+        import inspect
+        from mlx_lm import load as _lm_load
+        return "trust_remote_code" in inspect.signature(_lm_load).parameters
+    except Exception:
+        return False
+
+_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
+
+
+def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
+    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    from mlx_lm import load
+    if _LM_LOAD_ACCEPTS_TRC:
+        kwargs["trust_remote_code"] = trust_remote_code
+    return load(path_or_repo, **kwargs)
+
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add ``language_model.``-prefixed variants of per-layer quantization keys.
@@ -500,14 +520,12 @@ def load_text_model(
 ):
     """Load an LLM model/tokenizer pair via mlx-lm."""
     maybe_apply_pre_load_patches(model_name, model_settings=model_settings)
-    from mlx_lm import load
-
     trust_remote_code = (
         bool(getattr(model_settings, "trust_remote_code", False))
         if model_settings is not None
         else False
     )
-    return load(
+    return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,
         trust_remote_code=trust_remote_code,

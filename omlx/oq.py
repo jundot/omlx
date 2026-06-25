@@ -4639,6 +4639,7 @@ def _measure_sensitivity_from_quantized_model(
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
+        lm_load_compat as lm_load,
         maybe_apply_pre_load_patches,
     )
 
@@ -4684,8 +4685,6 @@ def _measure_sensitivity_from_quantized_model(
             )
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from mlx_lm import load as lm_load
-
             # Mirror the main quantize path's MTP patch sequence so an
             # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
             # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
