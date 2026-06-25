@@ -44,22 +44,34 @@ def apply() -> bool:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Expert repack: gate_up_proj → gate_proj + up_proj per layer.
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
+
+        # Expert repack: normalise to switch_mlp form.
+        # Two source formats are seen in the wild:
+        #   - Fused ``experts.gate_up_proj`` (Qwen3.6 checkpoints)
+        #   - Per-expert ``experts.{N}.{gate,up,down}_proj.weight`` (Ornith / Qwen3.5)
         def _unfuse_layer_experts(prefix):
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                return  # already in switch_mlp form
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key not in weights:
-                return
-            gate_up_weight = weights.pop(gate_up_key)
-            mid = gate_up_weight.shape[-2] // 2
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
-                ..., :mid, :
-            ]
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
-                ..., mid:, :
-            ]
-            down_key = f"{prefix}.experts.down_proj"
-            if down_key in weights:
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(down_key)
+            if gate_up_key in weights:
+                gate_up_weight = weights.pop(gate_up_key)
+                gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+                down_key = f"{prefix}.experts.down_proj"
+                if down_key in weights:
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                        down_key
+                    )
+            elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
+                for n in ("gate_proj", "up_proj", "down_proj"):
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                            for e in range(num_experts)
+                        ]
+                    )
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")
