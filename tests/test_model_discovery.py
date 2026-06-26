@@ -2,7 +2,6 @@
 """Tests for model discovery functionality."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -11,12 +10,14 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_unsupported_model,
+    _read_model_context_length,
     _resolve_hf_cache_entry,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
     estimate_model_size,
     format_size,
+    model_directory_access_error,
 )
 
 
@@ -130,6 +131,28 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_lfm2_text_model_is_llm(self, tmp_path):
+        """LFM2 text checkpoints share model_type with non-text variants."""
+        llm_dir = tmp_path / "LFM2-1.2B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2",
+            "architectures": ["Lfm2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
+    def test_detect_lfm2_5_moe_text_model_is_llm(self, tmp_path):
+        """LiquidAI/LFM2.5-8B-A1B is a text-generation MoE LLM."""
+        llm_dir = tmp_path / "LFM2.5-8B-A1B"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
@@ -190,6 +213,44 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
+        """DiffusionGemma is served by mlx-vlm even without vision_config."""
+        config = {
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
+        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
+        config = {
+            "model_type": "cohere2_moe",
+            "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_vl_as_vlm(self, tmp_path):
+        """MiniMax M3 VL is served by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3VLForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1280},
+            "text_config": {"hidden_size": 6144},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_minimax_m3_text_as_vlm_native_text(self, tmp_path):
+        """MiniMax M3 text-only checkpoints are implemented by mlx-vlm."""
+        config = {
+            "model_type": "minimax_m3",
+            "architectures": ["MiniMaxM3ForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {
@@ -229,6 +290,17 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_vlm_gemma4_unified(self, tmp_path):
+        """Test detection of Gemma4 unified as VLM."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "audio_config": {"feature_size": 128},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_text_only_gemma3_as_llm(self, tmp_path):
         """Text-only quant of Gemma3 (no vision_config) should be LLM."""
         config = {
@@ -246,6 +318,15 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_gemma4_unified_without_vision_config_as_vlm(self, tmp_path):
+        """Gemma4 unified is always VLM even without vision_config."""
+        config = {
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""
@@ -409,6 +490,51 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_text_moe_family_as_llm_not_audio_sts(self, tmp_path):
+        """LFM text MoE (lfm*_moe + *ForCausalLM) must not use mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_future_moe_variant_as_llm_not_audio_sts(self, tmp_path):
+        """Any lfm*_moe text type with *ForCausalLM uses LLM, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm2_5_moe",
+            "architectures": ["Lfm2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
+        """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": ["LFM2AudioModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_lfm_audio_model_type_as_sts(self, tmp_path):
+        """lfm_audio model_type is STS even without a recognized architecture."""
+        config = {
+            "model_type": "lfm_audio",
+            "architectures": [],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_detect_unknown_lfm_prefix_without_causal_lm_as_sts(self, tmp_path):
+        """Unknown mlx-audio lfm* types without CausalLM still use prefix fallback."""
+        config = {
+            "model_type": "lfm_custom_audio",
+            "architectures": ["SomeLegacyLFMAudioWrapper"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_sts"
 
 
 class TestEstimateModelSize:
@@ -634,6 +760,45 @@ class TestDiscoverModels:
         with pytest.raises(ValueError, match="not a directory"):
             discover_models(file_path)
 
+    def test_unreadable_directory_is_skipped(self, tmp_path, monkeypatch):
+        """Test that unreadable model roots do not crash discovery."""
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == tmp_path:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        assert discover_models(tmp_path) == {}
+        assert "not readable" in model_directory_access_error(tmp_path)
+
+    def test_unreadable_directory_skipped_in_multi_dir_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        """Test that a readable directory still wins when another root is unreadable."""
+        unreadable = tmp_path / "unreadable"
+        unreadable.mkdir()
+        readable = tmp_path / "readable"
+        readable.mkdir()
+        model_dir = readable / "valid-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == unreadable:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+        models = discover_models_from_dirs([unreadable, readable])
+        assert list(models) == ["valid-model"]
+
     def test_model_with_weight_error_skipped(self, tmp_path):
         """Test that models with no weights are skipped."""
         # Model with config but no weights
@@ -778,6 +943,76 @@ class TestDiscoveredModel:
 
         assert model.model_type == "embedding"
         assert model.engine_type == "embedding"
+
+
+class TestReadModelContextLength:
+    """Tests for _read_model_context_length — the discovery-time
+    config.json reader that backs #1308's API exposure fix."""
+
+    def _write(self, tmp_path, config=None, tokenizer_config=None):
+        if config is not None:
+            (tmp_path / "config.json").write_text(json.dumps(config))
+        if tokenizer_config is not None:
+            (tmp_path / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+
+    def test_max_position_embeddings_wins(self, tmp_path):
+        self._write(tmp_path, config={"max_position_embeddings": 262144})
+        assert _read_model_context_length(tmp_path) == 262144
+
+    def test_alternate_keys(self, tmp_path):
+        for key in ("max_seq_len", "max_seq_length", "seq_length", "n_positions"):
+            sub = tmp_path / key
+            sub.mkdir()
+            self._write(sub, config={key: 8192})
+            assert _read_model_context_length(sub) == 8192, key
+
+    def test_top_level_takes_precedence_over_nested(self, tmp_path):
+        self._write(tmp_path, config={
+            "max_position_embeddings": 200000,
+            "text_config": {"max_position_embeddings": 32768},
+        })
+        assert _read_model_context_length(tmp_path) == 200000
+
+    def test_text_config_fallback(self, tmp_path):
+        """VLM wrappers stash the language head's ctx in text_config."""
+        self._write(tmp_path, config={"text_config": {"max_position_embeddings": 131072}})
+        assert _read_model_context_length(tmp_path) == 131072
+
+    def test_language_config_fallback(self, tmp_path):
+        """Some Qwen-style configs use language_config instead."""
+        self._write(tmp_path, config={"language_config": {"max_position_embeddings": 65536}})
+        assert _read_model_context_length(tmp_path) == 65536
+
+    def test_tokenizer_max_length_fallback(self, tmp_path):
+        """When config.json doesn't expose a length, tokenizer_config wins."""
+        self._write(tmp_path, config={"model_type": "llama"}, tokenizer_config={"model_max_length": 4096})
+        assert _read_model_context_length(tmp_path) == 4096
+
+    def test_tokenizer_sentinel_rejected(self, tmp_path):
+        """Transformers' int(1e30) "no cap" sentinel must NOT leak through."""
+        self._write(
+            tmp_path,
+            config={"model_type": "llama"},
+            tokenizer_config={"model_max_length": int(1e30)},
+        )
+        assert _read_model_context_length(tmp_path) is None
+
+    def test_no_config_returns_none(self, tmp_path):
+        assert _read_model_context_length(tmp_path) is None
+
+    def test_invalid_types_rejected(self, tmp_path):
+        """A string or zero in the config must not be returned as a length."""
+        self._write(tmp_path, config={"max_position_embeddings": "long"})
+        assert _read_model_context_length(tmp_path) is None
+        sub = tmp_path / "zero"
+        sub.mkdir()
+        self._write(sub, config={"max_position_embeddings": 0})
+        assert _read_model_context_length(sub) is None
+
+    def test_malformed_config_is_silent(self, tmp_path):
+        """A broken config.json must not raise — discovery should keep going."""
+        (tmp_path / "config.json").write_text("{not valid json")
+        assert _read_model_context_length(tmp_path) is None
 
 
 class TestTwoLevelDiscovery:
@@ -1046,13 +1281,14 @@ class TestHfCacheDiscovery:
         (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
 
     def test_resolve_valid_entry(self, tmp_path):
-        """Valid HF cache entry resolves to snapshot path and model name."""
+        """Valid HF cache entry resolves to snapshot path and repo metadata."""
         entry, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B-4bit")
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
-        assert result[0] == snapshot
-        assert result[1] == "Qwen3-8B-4bit"
+        assert result.snapshot_path == snapshot
+        assert result.model_id == "mlx-community--Qwen3-8B-4bit"
+        assert result.source_repo_id == "mlx-community/Qwen3-8B-4bit"
 
     def test_resolve_regular_dir_returns_none(self, tmp_path):
         """Regular directory without models-- prefix returns None."""
@@ -1060,14 +1296,21 @@ class TestHfCacheDiscovery:
         regular.mkdir()
         assert _resolve_hf_cache_entry(regular) is None
 
-    def test_resolve_single_separator_returns_none(self, tmp_path):
-        """models--Name (no org separator) returns None."""
-        entry = tmp_path / "models--NoOrg"
-        entry.mkdir()
-        assert _resolve_hf_cache_entry(entry) is None
+    def test_resolve_unnamespaced_repo(self, tmp_path):
+        """models--Name (no org separator) is supported."""
+        entry, _ = self._make_hf_cache_entry(tmp_path, "", "gpt2")
+        entry.rename(tmp_path / "models--gpt2")
+        entry = tmp_path / "models--gpt2"
+        snapshot = entry / "snapshots" / self.FAKE_COMMIT
+
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result.snapshot_path == snapshot
+        assert result.model_id == "gpt2"
+        assert result.source_repo_id == "gpt2"
 
     def test_resolve_missing_refs_main_returns_none(self, tmp_path):
-        """Missing refs/main returns None."""
+        """Missing refs and snapshots returns None."""
         entry = tmp_path / "models--mlx-community--Qwen3-8B"
         entry.mkdir(parents=True)
         assert _resolve_hf_cache_entry(entry) is None
@@ -1088,7 +1331,7 @@ class TestHfCacheDiscovery:
 
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
-        assert result[0] == snapshot
+        assert result.snapshot_path == snapshot
 
     def test_discover_hf_cache_model(self, tmp_path):
         """HF cache entries are discovered as models."""
@@ -1096,8 +1339,13 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 1
-        assert "Qwen3-8B-4bit" in models
-        assert models["Qwen3-8B-4bit"].model_type == "llm"
+        assert "mlx-community--Qwen3-8B-4bit" in models
+        assert models["mlx-community--Qwen3-8B-4bit"].model_type == "llm"
+        assert models["mlx-community--Qwen3-8B-4bit"].source_type == "hf_cache"
+        assert (
+            models["mlx-community--Qwen3-8B-4bit"].source_repo_id
+            == "mlx-community/Qwen3-8B-4bit"
+        )
 
     def test_discover_multiple_hf_cache_models(self, tmp_path):
         """Multiple HF cache entries are all discovered."""
@@ -1106,15 +1354,15 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 2
-        assert "Qwen3-8B-4bit" in models
-        assert "Mistral-7B-v0.3" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models
+        assert "mlx-community--Mistral-7B-v0.3" in models
 
     def test_hf_cache_model_path_points_to_snapshot(self, tmp_path):
         """model_path points to the snapshot dir, not the cache entry."""
         self._make_hf_cache_model(tmp_path, "mlx-community", "Qwen3-8B-4bit")
 
         models = discover_models(tmp_path)
-        assert models["Qwen3-8B-4bit"].model_path == str(
+        assert models["mlx-community--Qwen3-8B-4bit"].model_path == str(
             tmp_path / "models--mlx-community--Qwen3-8B-4bit" / "snapshots" / self.FAKE_COMMIT
         )
 
@@ -1125,6 +1373,31 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_hf_cache_non_mlx_repo_skipped(self, tmp_path):
+        """HF cache entries without MLX metadata or repo-name hints are skipped."""
+        self._make_hf_cache_model(tmp_path, "acme", "PlainModel")
+
+        models = discover_models(tmp_path)
+        assert len(models) == 0
+
+    def test_hf_cache_mlx_metadata_is_discovered(self, tmp_path):
+        """HF cache entries with safetensors format=mlx metadata are discovered."""
+        np = pytest.importorskip("numpy")
+        safetensors_numpy = pytest.importorskip("safetensors.numpy")
+
+        entry, snapshot = self._make_hf_cache_entry(tmp_path, "acme", "PlainModel")
+        (snapshot / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        safetensors_numpy.save_file(
+            {"weight": np.zeros((1,), dtype=np.float32)},
+            snapshot / "model.safetensors",
+            metadata={"format": "mlx"},
+        )
+
+        models = discover_models(tmp_path)
+        assert len(models) == 1
+        assert "acme--PlainModel" in models
+        assert models["acme--PlainModel"].source_repo_id == "acme/PlainModel"
+
     def test_mixed_flat_and_hf_cache(self, tmp_path):
         """Mix of flat models and HF cache entries."""
         self._make_model(tmp_path / "mistral-7b")
@@ -1133,7 +1406,7 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 2
         assert "mistral-7b" in models
-        assert "Qwen3-8B-4bit" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models
 
     def test_mixed_org_and_hf_cache(self, tmp_path):
         """Mix of org folders and HF cache entries."""
@@ -1143,7 +1416,7 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 2
         assert "Qwen3-8B" in models
-        assert "Mistral-7B" in models
+        assert "mlx-community--Mistral-7B" in models
 
     def test_hf_cache_does_not_fall_through_to_org_scan(self, tmp_path):
         """HF cache entries don't get scanned as org folders."""
@@ -1151,4 +1424,4 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 1
-        assert "Qwen3-8B-4bit" in models
+        assert "mlx-community--Qwen3-8B-4bit" in models

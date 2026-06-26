@@ -6,8 +6,8 @@ It adds:
 
 * a Multi-Token Prediction head (``MTPModule``) to
   ``mlx_vlm.models.qwen3_5_moe.language.LanguageModel`` when the model
-  config declares ``mtp_num_hidden_layers > 0`` and the process-wide MTP
-  active flag is on;
+  config declares ``mtp_num_hidden_layers > 0`` and the checkpoint has MTP
+  weights to bind;
 * a ``return_hidden=True`` mode on ``LanguageModel.__call__`` that returns
   ``(logits, pre_norm_hidden, gdn_states)`` — everything the MTP
   draft/verify cycle needs without touching the forward path of any
@@ -28,11 +28,9 @@ diff against mlx-vlm small (LanguageModel constructor + __call__ wrap
 that an earlier iteration of this patch attempted.
 
 Module-level apply ordering is significant: this patch must be applied
-*before* the model loads (so the patched ``__init__`` runs) and
-*before* ``omlx/patches/gated_delta_advance.py`` overrides
-``Qwen3_5GatedDeltaNet.__call__``. The current loader (``omlx/utils/model_loading.py``)
-calls ``apply_mlx_vlm_mtp_runtime_patch()`` in ``maybe_apply_pre_load_patches``
-which satisfies both.
+*before* the model loads so the patched ``__init__`` runs. The current loader
+(``omlx/utils/model_loading.py``) calls ``apply_mlx_vlm_mtp_runtime_patch()``
+in ``maybe_apply_pre_load_patches`` which satisfies that requirement.
 """
 
 from __future__ import annotations
@@ -205,20 +203,26 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
+        from ..mlx_lm_mtp import is_mtp_active
 
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads, so mlx-vlm's
         # load_weights (which skips Model.sanitize for is_mlx_format
         # checkpoints) can place the persisted mtp.* tensors. MTP speculative
         # decode invocation is gated downstream by
-        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via ``is_mtp_active``.
+        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via the per-instance
+        # ``_omlx_mtp_decode_enabled`` marker.
         #
         # Gated by ``is_mtp_attach_enabled()`` so checkpoints that declare
         # mtp_num_hidden_layers > 0 but ship no mtp.* weights (unsloth
         # Qwen3.6 UD MLX builds, issue #1426) don't trip strict load_weights
         # with "Missing N parameters" and silently fall back to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0 and is_mtp_attach_enabled():
+        attach_enabled = bool(is_mtp_attach_enabled())
+        self._omlx_mtp_decode_enabled = bool(
+            n_mtp > 0 and attach_enabled and is_mtp_active()
+        )
+        if n_mtp > 0 and attach_enabled:
             self.mtp = q35moe_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
@@ -239,13 +243,17 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
         the fact via ``rollback_speculative_cache``.
         """
         return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which we need.
+        # both of which we need.  Pop any existing value from kwargs to avoid
+        # "got multiple values for keyword argument" when the caller already
+        # passed capture_layer_ids (e.g. speculative_verify_logits).
+        kwargs.pop("capture_layer_ids", None)
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -256,8 +264,15 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
             capture_layer_ids=[last_layer_idx],
             **kwargs,
         )
+        from mlx_vlm.models.base import LanguageModelOutput
+
         hidden_pre_norm = out.hidden_states[0]
-        return out.logits, hidden_pre_norm, out.gdn_states
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[hidden_pre_norm],
+            gdn_states=out.gdn_states,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
     def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
         mtp_out = self.mtp(
@@ -419,6 +434,34 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
             for k, v in weights.items()
         )
 
+        # MTP-head norms can ship in a different convention than the backbone,
+        # even MIXED within the head (JANG MXFP4 Qwen3.6 bundles keep
+        # ``mtp.norm`` in MLX's +1 convention while the per-layer head norms
+        # remain raw-HF, mean ~= 0). The backbone-only conv1d signal never
+        # shifts those head norms, so every head RMSNorm multiplies by ~0 and
+        # MTP draft acceptance collapses to ~0%. Decide PER-KEY for MTP norms
+        # from each weight's own magnitude (raw-HF center ~0, MLX-shifted ~1).
+        # Mirrors the fix in mlx_lm_mtp/qwen35_model.py. The magnitude is
+        # unreadable during oQ streaming plan discovery (the weight is a
+        # no-data ``_TrackedTensor`` and ``mx.mean(...).item()`` raises), so
+        # emit a conditional replay transform there. A fixed fallback is wrong
+        # for full-precision Qwen3.6 sources where MTP norm conventions are
+        # mixed.
+        def _is_oq_tracked_tensor(_w):
+            return (
+                _w.__class__.__name__ == "_TrackedTensor"
+                and hasattr(_w, "_clone")
+            )
+
+        def _mark_mtp_norm_conditional_add(_w):
+            return _w._clone(transform="add_if_mean_lt_0_5")
+
+        def _mtp_norm_is_raw_hf(_w, _fallback):
+            try:
+                return float(mx.mean(_w.astype(mx.float32)).item()) < 0.5
+            except Exception:
+                return _fallback
+
         sanitized = {}
         for key, value in weights.items():
             if "model.language_model" in key:
@@ -439,10 +482,17 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 # called with a ``_TrackedTensor`` placeholder. The instance
                 # method on _TrackedTensor doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
-            if has_unsanitized_conv1d and any(
-                key.endswith(sfx) for sfx in norm_keys
-            ):
-                if value.ndim == 1:
+            if value.ndim == 1 and any(key.endswith(sfx) for sfx in norm_keys):
+                # ``key`` is already remapped to ``language_model.mtp.*`` for
+                # MTP weights here, so test the ``mtp.`` substring.
+                if "mtp." in key:
+                    # Per-key: a head norm may still be raw-HF even when a
+                    # sibling head norm (e.g. mtp.norm) is already shifted.
+                    if _is_oq_tracked_tensor(value):
+                        value = _mark_mtp_norm_conditional_add(value)
+                    elif _mtp_norm_is_raw_hf(value, has_unsanitized_conv1d):
+                        value = value + 1.0
+                elif has_unsanitized_conv1d:
                     value = value + 1.0
 
             sanitized[key] = value

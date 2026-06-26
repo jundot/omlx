@@ -173,6 +173,7 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     from mlx_lm.models.base import create_attention_mask
 
     CacheList = dsv4.CacheList
+    materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     def __call__(
         self,
@@ -209,6 +210,8 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+
+        materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -254,6 +257,7 @@ def _patch_model(dsv4: Any) -> None:
     PoolingCache = dsv4.PoolingCache
     RotatingKVCache = dsv4.RotatingKVCache
     SparseCompressedAttention = getattr(dsv4, "SparseCompressedAttention", None)
+    materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     original_init = cls.__init__
 
@@ -264,7 +268,9 @@ def _patch_model(dsv4: Any) -> None:
         # mtp_enabled=False produces a model indistinguishable from stock.
         from . import is_mtp_active
 
-        if n_mtp > 0 and is_mtp_active():
+        mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
+        self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
 
@@ -273,7 +279,16 @@ def _patch_model(dsv4: Any) -> None:
         inputs,
         cache=None,
         return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
+        # ``n_confirmed`` is part of the patched-backbone interface:
+        # batch_generator._call_backbone passes n_confirmed=1 during MTP
+        # verify cycles. It only matters for models with module-level
+        # recurrent state (Qwen3.5's GatedDeltaNet splits its forward to
+        # snapshot state after the confirmed prefix). DeepSeek-V4 keeps all
+        # decode state in cache objects (RotatingKVCache / PoolingCache)
+        # and draft rejection rolls back via cache.trim in
+        # _restore_or_trim_caches, so the argument is accepted and unused.
         if return_hidden:
             h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
             return self.lm_head(h), h_raw
@@ -346,6 +361,8 @@ def _patch_model(dsv4: Any) -> None:
                 h, self.model.embed_tokens, input_ids, mask, layer_cache
             )
             last_block = mtp_block
+
+        materialize_cache_arrays(cache)
 
         out = last_block.hc_head(h)
         out = last_block.norm(out)
@@ -489,6 +506,18 @@ def _patch_model(dsv4: Any) -> None:
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
                     )
+
+        # Same wo_a 2D -> 3D reshape for the MTP block's attention. The
+        # ndim==2 gate keeps this idempotent for checkpoints that already
+        # store the 3D MultiLinear layout (e.g. oQ output).
+        if has_mtp:
+            for mtp_idx in range(self.args.num_nextn_predict_layers):
+                prefix = f"mtp.{mtp_idx}.block.attn.wo_a"
+                for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                    if key in weights and weights[key].ndim == 2:
+                        weights[key] = weights[key].reshape(
+                            self.args.o_groups, self.args.o_lora_rank, -1
+                        )
 
         # Stack routed expert weights for MTP layers (PR 15).
         if has_mtp:

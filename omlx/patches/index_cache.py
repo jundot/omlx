@@ -7,7 +7,12 @@ tokens.  By reusing topk indices from a "Full" layer in subsequent
 "Shared" layers we skip the expensive Q*K attention + argpartition in
 the Indexer while keeping the indexer KV cache up to date.
 
-Supported model types: deepseek_v32, glm_moe_dsa
+Supported model types: deepseek_v32
+
+GLM-5.2 (``glm_moe_dsa``) has a native checkpoint-defined schedule where
+shared layers do not have indexer weights and must reuse the previous full
+layer's top-k. oMLX handles that with the GLM pre-load model patch instead
+of this post-load optimization.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Sentinel for supported model types
-_SUPPORTED_MODEL_TYPES = {"deepseek_v32", "glm_moe_dsa"}
+_SUPPORTED_MODEL_TYPES = {"deepseek_v32"}
 
 # Track whether the class-level patch has been applied
 _class_patch_applied = False

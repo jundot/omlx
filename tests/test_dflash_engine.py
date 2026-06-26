@@ -2,6 +2,7 @@
 """Tests for DFlash engine integration."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -137,14 +138,27 @@ class TestDFlashModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.dflash_enabled == original.dflash_enabled
         assert restored.dflash_draft_model == original.dflash_draft_model
-        assert restored.dflash_draft_quant_enabled == original.dflash_draft_quant_enabled
-        assert restored.dflash_draft_quant_weight_bits == original.dflash_draft_quant_weight_bits
-        assert restored.dflash_draft_quant_activation_bits == original.dflash_draft_quant_activation_bits
-        assert restored.dflash_draft_quant_group_size == original.dflash_draft_quant_group_size
+        assert (
+            restored.dflash_draft_quant_enabled == original.dflash_draft_quant_enabled
+        )
+        assert (
+            restored.dflash_draft_quant_weight_bits
+            == original.dflash_draft_quant_weight_bits
+        )
+        assert (
+            restored.dflash_draft_quant_activation_bits
+            == original.dflash_draft_quant_activation_bits
+        )
+        assert (
+            restored.dflash_draft_quant_group_size
+            == original.dflash_draft_quant_group_size
+        )
         assert restored.dflash_max_ctx == original.dflash_max_ctx
         assert restored.dflash_in_memory_cache == original.dflash_in_memory_cache
         assert restored.dflash_ssd_cache == original.dflash_ssd_cache
-        assert restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
+        assert (
+            restored.dflash_ssd_cache_max_bytes == original.dflash_ssd_cache_max_bytes
+        )
 
 
 class TestDFlashEngineInit:
@@ -152,6 +166,7 @@ class TestDFlashEngineInit:
 
     def test_import_without_dflash_mlx(self):
         from omlx.engine import DFlashEngine  # noqa: F401
+
         # Should not raise even if dflash-mlx is not installed
 
     def test_engine_properties(self):
@@ -172,6 +187,25 @@ class TestDFlashEngineInit:
         assert engine.tokenizer is None
         assert engine.model_type is None
         assert engine.has_active_requests() is False
+        assert engine.scheduler is None
+
+    def test_scheduler_resolves_nested_fallback_scheduler(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        scheduler = object()
+        fallback = SimpleNamespace(
+            _engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
+        )
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        engine._fallback_engine = fallback
+
+        assert engine.scheduler is scheduler
 
     def test_quant_disabled_keeps_none(self):
         try:
@@ -207,7 +241,6 @@ class TestDFlashEngineInit:
         assert engine._draft_quant_activation_bits == 32
         assert engine._draft_quant_group_size == 128
 
-
     def test_get_stats_no_verify_mode(self):
         """Stats should not include verify_mode (removed in v2)."""
         try:
@@ -237,6 +270,195 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         assert engine.get_cache_stats() is None
+
+    def test_stream_events_passes_suppress_token_ids(self, monkeypatch):
+        try:
+            from dflash_mlx import runtime as dflash_runtime
+            from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
+
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+        )
+        target_model = object()
+        target_ops = object()
+        snapshot = object()
+        engine._target_model = target_model
+        engine._target_ops = target_ops
+        engine._executor_tokenizer = object()
+        engine._draft_model = object()
+        engine._draft_backend = object()
+        engine._runtime_context = object()
+        engine._suppress_token_ids = {258883, 258882}
+
+        fake_flow = SimpleNamespace(
+            snapshot=snapshot,
+            snapshot_service=None,
+            stable_prefix_len=None,
+            cache_active=False,
+            publish_generation_snapshot=True,
+            hit_kind="l2_prefix",
+        )
+        captured = {}
+        prefix_kwargs = {}
+
+        def fake_for_request(cls, **kwargs):
+            prefix_kwargs.update(kwargs)
+            return fake_flow
+
+        monkeypatch.setattr(
+            PrefixCacheFlow, "for_request", classmethod(fake_for_request)
+        )
+        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda tokenizer: [2])
+
+        def fake_stream_dflash_generate(**kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+        monkeypatch.setattr(
+            dflash_runtime,
+            "stream_dflash_generate",
+            fake_stream_dflash_generate,
+        )
+
+        event_iter, _, stop_ids = engine._stream_dflash_events(
+            prompt_tokens=[1, 2],
+            max_tokens=3,
+        )
+
+        assert list(event_iter) == []
+        assert stop_ids == [2]
+        assert captured["suppress_token_ids"] == [258882, 258883]
+        assert captured["prefix_snapshot"] is snapshot
+        assert captured["prefix_hit_kind"] == "l2_prefix"
+        assert fake_flow.snapshot is None
+        assert prefix_kwargs["max_new_tokens"] == 3
+        model_provider = prefix_kwargs["model_provider"]
+        assert model_provider.model is target_model
+        assert model_provider.target_ops is target_ops
+
+    def test_runtime_cache_request_boundary_calls_supported_manager(self, monkeypatch):
+        try:
+            from dflash_mlx.cache import manager as cache_manager_mod
+
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        calls = []
+
+        class FakeManager:
+            def begin_request(self):
+                calls.append("begin")
+
+            def end_request(self):
+                calls.append("end")
+
+        fake_manager = FakeManager()
+        monkeypatch.setattr(
+            cache_manager_mod,
+            "current_runtime_cache_manager",
+            lambda: fake_manager,
+        )
+
+        manager = DFlashEngine._begin_runtime_cache_request()
+        DFlashEngine._end_runtime_cache_request(manager)
+
+        assert manager is fake_manager
+        assert calls == ["begin", "end"]
+
+    def test_runtime_cache_request_boundary_is_noop_on_old_manager(self, monkeypatch):
+        try:
+            from dflash_mlx.cache import manager as cache_manager_mod
+
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        monkeypatch.setattr(
+            cache_manager_mod,
+            "current_runtime_cache_manager",
+            lambda: object(),
+        )
+
+        assert DFlashEngine._begin_runtime_cache_request() is None
+        DFlashEngine._end_runtime_cache_request(object())
+
+    @pytest.mark.asyncio
+    async def test_start_passes_verify_config_to_target_load(self, monkeypatch):
+        try:
+            from dflash_mlx.runtime import loading as dflash_loading
+
+            from omlx.engine import dflash as dflash_mod
+            from omlx.engine.dflash import DFlashEngine
+            from omlx.patches import dflash_lifecycle
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+
+        captured = {}
+
+        def fake_load_target_bundle(model_ref, **kwargs):
+            captured["model_ref"] = model_ref
+            captured.update(kwargs)
+            return SimpleNamespace(
+                model=SimpleNamespace(),
+                tokenizer=SimpleNamespace(
+                    name_or_path="fake-target",
+                    eos_token_id=1,
+                    eos_token_ids=[1],
+                ),
+                meta={"config": {"model_type": "gemma4"}},
+                target_ops=SimpleNamespace(),
+            )
+
+        def fake_load_draft_bundle(model_ref, **kwargs):
+            captured["draft_model_ref"] = model_ref
+            captured["draft_kwargs"] = kwargs
+            return SimpleNamespace(), {}
+
+        monkeypatch.setattr(
+            dflash_loading, "load_target_bundle", fake_load_target_bundle
+        )
+        monkeypatch.setattr(dflash_loading, "load_draft_bundle", fake_load_draft_bundle)
+        monkeypatch.setattr(
+            dflash_mod,
+            "maybe_apply_pre_load_patches",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            dflash_lifecycle,
+            "install_dflash_lifecycle_wrap",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            dflash_mod,
+            "load_generation_config_token_ids",
+            lambda *args, **kwargs: set(),
+        )
+        monkeypatch.setattr(
+            dflash_mod, "detect_output_parser", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(dflash_mod, "set_model_info_from_model", lambda *args: None)
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_verify_mode="off"),
+        )
+
+        await engine.start()
+        try:
+            verify_config = captured["verify_config"]
+            assert captured["model_ref"] == "test-model"
+            assert captured["draft_model_ref"] == "test-draft"
+            assert verify_config.mode == "off"
+            assert captured["quantize_kv_cache"] is False
+        finally:
+            await engine.stop()
 
     def test_should_fallback_unlimited_when_max_ctx_none(self):
         """A None threshold means dflash handles every prompt size."""
@@ -539,10 +761,14 @@ class TestDFlashCompatibility:
             from omlx.engine.dflash import is_dflash_compatible
         except ImportError:
             pytest.skip("dflash-mlx not installed")
-        (tmp_path / "config.json").write_text(json.dumps({
-            "model_type": "gemma4_assistant",
-            "text_config": {"model_type": "gemma4_text"},
-        }))
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "gemma4_assistant",
+                    "text_config": {"model_type": "gemma4_text"},
+                }
+            )
+        )
         compatible, reason = is_dflash_compatible(tmp_path)
         assert compatible is False
         assert "gemma4_assistant" in reason
@@ -606,8 +832,9 @@ class TestDFlashThinkPrefix:
         engine._tokenizer_obj = tokenizer
         return engine
 
-    def _tokenizer(self, *, think_start_id=None, think_end_id=None,
-                   think_start_str="<think>"):
+    def _tokenizer(
+        self, *, think_start_id=None, think_end_id=None, think_start_str="<think>"
+    ):
         class _Tok:
             pass
 
@@ -624,9 +851,12 @@ class TestDFlashThinkPrefix:
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        engine = self._make_engine(self._tokenizer(
-            think_start_id=151667, think_end_id=151668,
-        ))
+        engine = self._make_engine(
+            self._tokenizer(
+                think_start_id=151667,
+                think_end_id=151668,
+            )
+        )
         # prompt ending: ..., <|im_start|>assistant\n, <think>\n
         assert engine._detect_needs_think_prefix([100, 200, 151667]) is True
 
@@ -636,13 +866,14 @@ class TestDFlashThinkPrefix:
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        engine = self._make_engine(self._tokenizer(
-            think_start_id=151667, think_end_id=151668,
-        ))
+        engine = self._make_engine(
+            self._tokenizer(
+                think_start_id=151667,
+                think_end_id=151668,
+            )
+        )
         # disabled-thinking pattern: <think></think>
-        assert engine._detect_needs_think_prefix(
-            [100, 151667, 151668]
-        ) is False
+        assert engine._detect_needs_think_prefix([100, 151667, 151668]) is False
 
     def test_detect_returns_false_when_think_start_id_unavailable(self):
         try:
@@ -673,9 +904,7 @@ class TestDFlashThinkPrefix:
         engine = self._make_engine(self._tokenizer(think_start_id=151667))
         # <think> appears earlier but not in last 3 — already inside an
         # assistant turn, so a fresh prefix is not needed
-        assert engine._detect_needs_think_prefix(
-            [151667, 1, 2, 3, 4, 5]
-        ) is False
+        assert engine._detect_needs_think_prefix([151667, 1, 2, 3, 4, 5]) is False
 
     def test_think_prefix_text_uses_tokenizer_attr(self):
         try:
@@ -683,9 +912,11 @@ class TestDFlashThinkPrefix:
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
-        engine = self._make_engine(self._tokenizer(
-            think_start_str="<longcat_think>",
-        ))
+        engine = self._make_engine(
+            self._tokenizer(
+                think_start_str="<longcat_think>",
+            )
+        )
         assert engine._think_prefix_text() == "<longcat_think>\n"
 
     def test_think_prefix_text_default(self):
@@ -697,6 +928,7 @@ class TestDFlashThinkPrefix:
         # Tokenizer with no think_start attr falls back to <think>
         class _Tok:
             pass
+
         engine = self._make_engine(_Tok())
         assert engine._think_prefix_text() == "<think>\n"
 
@@ -836,3 +1068,92 @@ class TestDFlashOutputParserWiring:
             {"model_type": "qwen3"},
         )
         assert factory is None
+
+
+class TestDFlashCachedTokens:
+    """#1441: DFlash must surface prefix-cache hits as cached_tokens.
+
+    When a DFlash prefix snapshot hits, prefill is skipped for the matched
+    tokens (PrefixCacheFlow.hit_tokens). The engine previously never set
+    cached_tokens on its GenerationOutput, so the API always reported 0 with
+    DFlash enabled (restored when disabled). These cover the pure mapping; the
+    end-to-end wiring is exercised by the CI-gated integration test below.
+    """
+
+    def test_hit_reports_matched_tokens(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        flow = SimpleNamespace(hit_tokens=4273)
+        assert DFlashEngine._cached_tokens_from_flow(flow) == 4273
+
+    def test_miss_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(SimpleNamespace(hit_tokens=0)) == 0
+
+    def test_none_flow_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(None) == 0
+
+    def test_missing_attr_is_zero(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._cached_tokens_from_flow(SimpleNamespace()) == 0
+
+    def test_negative_is_clamped(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert (
+            DFlashEngine._cached_tokens_from_flow(SimpleNamespace(hit_tokens=-5)) == 0
+        )
+
+
+class TestDFlashCachedTokensWiring:
+    """End-to-end: a prefix hit reaches GenerationOutput.cached_tokens.
+
+    Requires dflash-mlx (for SummaryEvent / the inner event loop); skipped where
+    it is unavailable, runs in CI.
+    """
+
+    @pytest.mark.asyncio
+    async def test_generate_sets_cached_tokens_from_hit(self, monkeypatch):
+        try:
+            from dflash_mlx.engine.events import SummaryEvent
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(),
+        )
+        engine._loaded = True
+        engine._tokenizer_obj = SimpleNamespace(
+            encode=lambda s: [1, 2, 3],
+            decode=lambda toks, **kw: "hi",
+        )
+        engine._output_parser_factory = None
+        engine._should_fallback = lambda toks: False
+        engine._detect_needs_think_prefix = lambda toks: False
+
+        summary = SummaryEvent(
+            elapsed_us=1000,
+            prompt_token_count=4273,
+            generated_token_ids=(5,),
+            generation_tokens=1,
+            accepted_from_draft=0,
+            acceptance_ratio=0.0,
+            cycles_completed=1,
+            phase_timings_us={},
+        )
+        fake_flow = SimpleNamespace(hit_tokens=4273)
+
+        def fake_stream_events(*, prompt_tokens, max_tokens):
+            return iter([summary]), fake_flow, [2]
+
+        monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)
+
+        out = await engine.generate("hello", max_tokens=4)
+        assert out.cached_tokens == 4273

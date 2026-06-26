@@ -2,6 +2,7 @@
     "models": [
         {
             "id": "Qwen3.6-27B-UD-MLX-4bit",
+            "display_name": "deepsweet/Qwen3.6-27B-UD-MLX-4bit",
             "model_path": "/Users/test/.omlx/models/Qwen3.6-27B-UD-MLX-4bit",
             "loaded": false,
             "is_loading": false,

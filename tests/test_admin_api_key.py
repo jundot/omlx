@@ -81,6 +81,78 @@ class TestListModelsSettings:
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
 
+    def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
+        """Ensure nested model paths only affect UI display names."""
+        model_root = tmp_path / "models"
+        model_path = model_root / "deepsweet" / "Qwen3.6-27B-MLX-oQ5-FP16"
+        model_path.mkdir(parents=True)
+        model_id = "Qwen3.6-27B-MLX-oQ5-FP16"
+
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": model_id,
+                    "model_path": str(model_path),
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                }
+            ]
+        }
+
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+
+        mock_server_state = MagicMock()
+        mock_server_state.default_model = None
+
+        mock_global_settings = SimpleNamespace(
+            base_path=tmp_path,
+            model=SimpleNamespace(get_model_dirs=lambda base_path: [model_root]),
+        )
+
+        with (
+            patch.object(
+                admin_routes, "_get_engine_pool", return_value=mock_engine_pool
+            ),
+            patch.object(
+                admin_routes,
+                "_get_settings_manager",
+                return_value=mock_settings_manager,
+            ),
+            patch.object(
+                admin_routes, "_get_server_state", return_value=mock_server_state
+            ),
+            patch.object(
+                admin_routes,
+                "_get_global_settings",
+                return_value=mock_global_settings,
+            ),
+            patch.object(
+                admin_routes,
+                "_paroquant_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_dflash_compat_for_model",
+                return_value=(False, None),
+            ),
+            patch.object(
+                admin_routes,
+                "_mtp_compat_for_model",
+                return_value=(False, None),
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["id"] == model_id
+        assert model["display_name"] == f"deepsweet/{model_id}"
+
 
 class TestValidateApiKey:
     """Tests for validate_api_key() format validation."""
@@ -151,6 +223,31 @@ class TestValidateApiKey:
         is_valid, msg = validate_api_key("ab\x07cd")
         assert is_valid is False
         assert "printable" in msg
+
+    def test_non_ascii_accented(self):
+        # Printable but non-ASCII: passes isprintable(), caught by isascii().
+        # Such a key can never be matched over HTTP (headers are latin-1
+        # decoded), so it must be rejected at configuration time.
+        is_valid, msg = validate_api_key("café-key")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_emoji(self):
+        is_valid, msg = validate_api_key("key-\U0001f511")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_non_ascii_cyrillic(self):
+        is_valid, msg = validate_api_key("ключ-секрет")
+        assert is_valid is False
+        assert "ASCII" in msg
+
+    def test_ascii_key_still_valid(self):
+        # Regression guard: ordinary ASCII keys remain valid after the
+        # ASCII-only rule was added.
+        is_valid, msg = validate_api_key("sk-abc123XYZ")
+        assert is_valid is True
+        assert msg == ""
 
 
 class TestVerifyApiKeyAdmin:
@@ -356,6 +453,30 @@ class TestSubKeyCRUD:
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
             assert exc_info.value.status_code == 404
+        finally:
+            _restore_getter(original)
+
+    def test_delete_sub_key_lone_surrogate_returns_404(self):
+        """Regression for #1717: a lone-surrogate key must 404, not 500.
+
+        delete_sub_key compares request.key without a validate_api_key
+        gate, so the comparison itself must tolerate any str json.loads
+        can produce, including lone surrogates from escape sequences.
+        """
+        import json
+
+        from fastapi import HTTPException
+        from omlx.settings import SubKeyEntry
+
+        mock_settings = _mock_global_settings(api_key="main-key")
+        mock_settings.auth.sub_keys = [SubKeyEntry(key="real-sub-key")]
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.DeleteSubKeyRequest(key=json.loads('"\\ud800abcd"'))
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
+            assert exc_info.value.status_code == 404
+            assert len(mock_settings.auth.sub_keys) == 1
         finally:
             _restore_getter(original)
 
@@ -576,6 +697,28 @@ class TestStatsSecurity:
         # api_key is included for admin-only CLI snippet generation in the dashboard
         assert result["api_key"] == "super-secret-key"
 
+    def test_active_models_data_ignores_enforcer_status_error(self):
+        """Admin stats should not fail when memory telemetry is unavailable."""
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [],
+            "current_model_memory": 123,
+            "final_ceiling": 456,
+        }
+        enforcer = MagicMock(spec=["get_status"])
+        enforcer.get_status.side_effect = RuntimeError("host_statistics64 failed")
+        state = SimpleNamespace(process_memory_enforcer=enforcer)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+        ):
+            result = admin_routes._build_active_models_data()
+
+        assert result["model_memory_used"] == 123
+        assert result["model_memory_max"] == 456
+        assert result["memory_pressure"]["enabled"] is False
+
     def test_stats_resolves_alias_on_read(self):
         """Per-model dropdown ID may be an alias; stats endpoint should resolve
         before querying the metrics store so per-model counters aren't zeroed."""
@@ -776,6 +919,75 @@ class TestRuntimeCacheObservability:
         ]
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
+
+    def test_runtime_cache_uses_global_hot_cache_cap_not_sum(self):
+        """Aggregate hot cache max is a shared cap, not per-loaded-model sum."""
+        cache_dir = Path("/tmp/omlx-cache")
+        hot_cap = 10 * 1024**3
+
+        mock_settings = MagicMock()
+        mock_settings.base_path = Path("/tmp/omlx-base")
+        mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
+
+        def _scheduler(model_name: str, hot_size: int, entries: int):
+            manager = MagicMock()
+            manager.get_stats_for_model.return_value = {
+                "num_files": entries,
+                "total_size_bytes": 4096 * entries,
+                "max_size_bytes": 0,
+                "hot_cache_max_bytes": hot_cap,
+                "hot_cache_size_bytes": hot_size,
+                "hot_cache_entries": entries,
+            }
+            scheduler = MagicMock()
+            scheduler.config.model_name = model_name
+            scheduler.paged_ssd_cache_manager = manager
+            scheduler.get_ssd_cache_stats.return_value = {
+                "block_size": 1024,
+                "indexed_blocks": entries,
+                "ssd_cache": {
+                    "num_files": 999,
+                    "total_size_bytes": 999_999,
+                    "hot_cache_max_bytes": hot_cap,
+                    "hot_cache_size_bytes": hot_size,
+                    "hot_cache_entries": entries,
+                },
+            }
+            return scheduler
+
+        scheduler_a = _scheduler("/models/model-a", hot_size=3 * 1024**3, entries=3)
+        scheduler_b = _scheduler("/models/model-b", hot_size=4 * 1024**3, entries=4)
+        engine_pool = MagicMock()
+        engine_pool.get_status.return_value = {
+            "models": [
+                {"id": "model-a", "loaded": True},
+                {"id": "model-b", "loaded": True},
+            ]
+        }
+        engine_pool._entries = {
+            "model-a": SimpleNamespace(
+                engine=SimpleNamespace(
+                    _engine=SimpleNamespace(
+                        engine=SimpleNamespace(scheduler=scheduler_a)
+                    )
+                )
+            ),
+            "model-b": SimpleNamespace(
+                engine=SimpleNamespace(
+                    _engine=SimpleNamespace(
+                        engine=SimpleNamespace(scheduler=scheduler_b)
+                    )
+                )
+            ),
+        }
+
+        with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
+            payload = admin_routes._build_runtime_cache_observability(mock_settings)
+
+        assert payload["hot_cache_size_bytes"] == 7 * 1024**3
+        assert payload["hot_cache_entries"] == 7
+        assert payload["hot_cache_max_bytes"] == hot_cap
 
     def test_runtime_cache_ignores_single_model_stats_failure(self):
         """One model failing stats collection should not break the whole payload."""
@@ -1028,3 +1240,14 @@ class TestGlobalSettingsValidation:
     def test_idle_timeout_accepts_valid_value(self):
         req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
         assert req.idle_timeout_seconds == 1800
+
+    def test_context_window_policy_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(sampling_max_context_window_policy=-1)
+
+    def test_context_window_policy_accepts_null(self):
+        req = admin_routes.GlobalSettingsRequest(
+            sampling_max_context_window_policy=None
+        )
+        assert req.sampling_max_context_window_policy is None
+        assert "sampling_max_context_window_policy" in req.model_fields_set

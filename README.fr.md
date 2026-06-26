@@ -55,7 +55,7 @@
 
 ### Application macOS
 
-Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. À noter que l'application macOS n'installe pas la commande CLI `omlx`. Pour une utilisation en terminal, installez via Homebrew ou depuis les sources.
+Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. L'application macOS installe aussi un shim CLI léger dans `~/.omlx/bin/omlx`, ce qui permet de contrôler le serveur géré par l'app depuis le terminal ou Apple Shortcuts.
 
 ### Homebrew
 
@@ -171,6 +171,7 @@ Configurez les paramètres d'échantillonnage, les kwargs du template de chat, l
 
 - **Alias de modèle** : définissez un nom personnalisé visible par l'API. `/v1/models` retourne l'alias, et les requêtes acceptent l'alias comme le nom du répertoire.
 - **Type de modèle** : forcez manuellement un modèle en LLM ou VLM indépendamment de l'auto-détection.
+- **Profils** : enregistrez des ensembles nommés de paramètres par modèle et basculez entre eux depuis le panneau d'admin. Un profil peut éventuellement être exposé comme son propre modèle : `/v1/models` liste alors aussi `<modèle>:<profil>` (par ex. `qwen3-8b:thinking`), qui s'exécute sur le même moteur que le modèle de base avec les paramètres du profil appliqués à chaque requête — sans mémoire supplémentaire ni rechargement. Lorsque le modèle de base possède un alias, l'identifiant exposé est annoncé sous la forme `<alias>:<profil>` ; la forme avec le nom du répertoire continue de fonctionner, comme pour le modèle de base.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">

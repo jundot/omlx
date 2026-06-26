@@ -17,6 +17,47 @@ except ImportError:
 from omlx.models.reranker import MLXRerankerModel, RerankOutput
 
 
+class TestXLMRobertaReranker:
+    """Tests for native XLM-RoBERTa sequence-classification rerankers."""
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_load_xlm_roberta_switches_to_eval_mode(self, tmp_path):
+        """Native reranker load must disable dropout for deterministic scores."""
+        from mlx.utils import tree_flatten
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaForSequenceClassification"],
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "vocab_size": 16,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "max_position_embeddings": 8,
+            "attention_probs_dropout_prob": 0.5,
+            "hidden_dropout_prob": 0.5,
+            "classifier_dropout": 0.5,
+            "pad_token_id": 1,
+            "num_labels": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        source_model = Model(ModelArgs(**config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {name: value for name, value in tree_flatten(source_model.parameters())},
+        )
+
+        loader = MLXRerankerModel(str(tmp_path))
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=MagicMock(),
+        ):
+            loaded_model, _ = loader._load_xlm_roberta()
+
+        assert loaded_model.training is False
+
+
 class TestCausalLMReranker:
     """Tests for CausalLM reranker (e.g., Qwen3-Reranker) functionality."""
 

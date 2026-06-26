@@ -7,6 +7,7 @@ text completions, tool calling, and structured output.
 """
 
 import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -57,6 +58,20 @@ class TestContentPart:
 
         assert part.type == "text"
         assert part.text is None
+
+    def test_file_content_part(self):
+        """Test creating file content part for document preprocessing."""
+        part = ContentPart(
+            type="file",
+            file={
+                "filename": "sample.pdf",
+                "file_data": "data:application/pdf;base64,ZA==",
+            },
+        )
+
+        assert part.type == "file"
+        assert part.file.filename == "sample.pdf"
+        assert part.file.file_data.endswith("ZA==")
 
 
 class TestMessage:
@@ -155,12 +170,27 @@ class TestFunctionCallAndToolCall:
         assert fc.name == "no_args"
         assert fc.arguments == "{}"
 
+    def test_function_call_strips_name_whitespace(self):
+        """Model-emitted function names must not include incidental whitespace."""
+        fc = FunctionCall(name="Bash\n\n", arguments={})
+
+        assert fc.name == "Bash"
+        assert fc.arguments == "{}"
+
+    def test_function_call_rejects_non_string_name(self):
+        """Name normalization must not widen FunctionCall.name beyond str."""
+        for name in (None, 123, {"name": "Bash"}, ["Bash"]):
+            with pytest.raises(ValidationError):
+                FunctionCall(name=name, arguments={})
+
     def test_tool_call(self):
         """Test creating tool call."""
         tc = ToolCall(
             id="call_abc123",
             type="function",
-            function=FunctionCall(name="get_weather", arguments='{"location": "Tokyo"}'),
+            function=FunctionCall(
+                name="get_weather", arguments='{"location": "Tokyo"}'
+            ),
         )
 
         assert tc.id == "call_abc123"
@@ -421,6 +451,31 @@ class TestChatCompletionRequest:
         assert len(req.tools) == 1
         assert req.tool_choice == "auto"
 
+    def test_max_completion_tokens_alias(self):
+        """Test OpenAI max_completion_tokens maps to max_tokens."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 65536
+
+    def test_max_tokens_preferred_over_alias(self):
+        """Test canonical max_tokens wins when both aliases are present."""
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4096,
+                "max_completion_tokens": 65536,
+            }
+        )
+
+        assert req.max_tokens == 4096
+
     def test_request_validation_requires_model(self):
         """Test that model is required."""
         with pytest.raises(ValidationError):
@@ -465,6 +520,15 @@ class TestChatCompletionRequest:
         )
         assert req.xtc_probability == 0.5
         assert req.xtc_threshold == 0.1
+
+    def test_guided_grammar_accepted(self):
+        """Test guided_grammar is accepted as a grammar alias."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            guided_grammar='root ::= "YES"',
+        )
+        assert req.guided_grammar == 'root ::= "YES"'
 
 
 class TestChatCompletionResponse:
@@ -733,6 +797,7 @@ class TestModelInfo:
 # =============================================================================
 # Stop Field Coercion
 # =============================================================================
+
 
 class TestStopCoercion:
     """Tests for stop field string-to-list coercion (OpenAI compat)."""

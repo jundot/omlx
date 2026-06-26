@@ -38,6 +38,8 @@ class CacheType(Enum):
     CACHE_LIST = "CacheList"
     POOLING_CACHE = "PoolingCache"
     BATCH_POOLING_CACHE = "BatchPoolingCache"
+    MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
+    MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
 
 
 @dataclass
@@ -224,6 +226,23 @@ class CacheTypeHandler(ABC):
         if isinstance(state, (list, tuple)):
             return tuple(state)
         return ()
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        """Return JSON-safe metadata for ``cache_obj``.
+
+        Most mlx-lm caches already expose a tuple-shaped ``meta_state``.
+        Some model-specific caches expose scalar strings; normalize them so
+        SSD/boundary snapshot metadata never iterates a string character by
+        character.
+        """
+        meta_state = getattr(cache_obj, "meta_state", ())
+        if meta_state in (None, ""):
+            return ()
+        if isinstance(meta_state, tuple):
+            return meta_state
+        if isinstance(meta_state, list):
+            return tuple(meta_state)
+        return (meta_state,)
 
     def deserialize_state(
         self,
@@ -980,11 +999,11 @@ class CacheListHandler(CacheTypeHandler):
         # Sanitize sub_meta_states for sub-cache types that don't support
         # meta_state (inherit _BaseCache's strict setter which rejects
         # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        _NO_META_STATE_TYPES = frozenset(
+        no_meta_state_types = frozenset(
             {"KVCache", "ConcatenateKVCache", "ArraysCache"}
         )
         sanitized_sub_meta_states = [
-            "" if cls_name in _NO_META_STATE_TYPES else sub_meta
+            "" if cls_name in no_meta_state_types else sub_meta
             for cls_name, sub_meta in zip(class_names, sub_meta_states)
         ]
 
@@ -1062,6 +1081,311 @@ class CacheListHandler(CacheTypeHandler):
 
     def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ("class_names", "sub_meta_states")
+
+
+def _minimax_index_offset(index_keys: Any, meta_state: Any | None = None) -> int:
+    if (
+        index_keys is not None
+        and hasattr(index_keys, "shape")
+        and len(index_keys.shape) >= 3
+    ):
+        return int(index_keys.shape[2])
+    if isinstance(meta_state, str):
+        try:
+            return int(meta_state)
+        except ValueError:
+            pass
+    if isinstance(meta_state, (list, tuple)) and meta_state:
+        try:
+            return int(meta_state[0])
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+class _MiniMaxM3CacheHandlerBase(CacheTypeHandler):
+    """Shared MiniMax M3 sparse-cache serialization helpers."""
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return False
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("index_keys", 2, False),
+        )
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        return (int(getattr(cache_obj, "index_offset", 0) or 0),)
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
+            return int(keys.shape[2])
+        index_keys = state.get("index_keys")
+        if (
+            index_keys is not None
+            and hasattr(index_keys, "shape")
+            and len(index_keys.shape) >= 3
+        ):
+            return int(index_keys.shape[2])
+        return 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        return {
+            **state,
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        return states[-1] if states else {}
+
+    def _get_state_keys(self) -> tuple[str, ...]:
+        return ("keys", "values", "index_keys")
+
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
+        return ("index_offset",)
+
+
+class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
+    """Handler for MiniMax M3 sparse attention side-index caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.MINIMAX_M3_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return True
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("index_keys", 2, True),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_state = cache_obj.state
+        if kv_state is None:
+            return (None, None, index_state)
+        if isinstance(kv_state, (list, tuple)) and len(kv_state) >= 2:
+            return (kv_state[0], kv_state[1], index_state)
+        return (None, None, index_state)
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        keys, values, index_keys = self.serialize_state(cache_obj)
+        return {
+            "keys": keys,
+            "values": values,
+            "index_keys": index_keys,
+            "states": (keys, values, index_keys),
+            "cache_type": self.cache_type.value,
+        }
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+
+        keys = state.get("keys")
+        values = state.get("values")
+        index_keys = state.get("index_keys")
+        if keys is None or values is None:
+            return None
+
+        try:
+            seq_len = int(keys.shape[2])
+            actual_end = min(end_idx, seq_len)
+            if start_idx >= actual_end:
+                return None
+
+            keys_slice = keys[:, :, start_idx:actual_end, :]
+            values_slice = values[:, :, start_idx:actual_end, :]
+            if index_keys is not None:
+                index_end = min(actual_end, int(index_keys.shape[2]))
+                index_slice = index_keys[:, :, start_idx:index_end, :]
+            else:
+                index_slice = None
+
+            return {
+                "keys": keys_slice,
+                "values": values_slice,
+                "index_keys": index_slice,
+                "states": (keys_slice, values_slice, index_slice),
+                "cache_type": self.cache_type.value,
+            }
+        except Exception as e:
+            logger.warning("Failed to slice MiniMax M3 cache state: %s", e)
+            return None
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+
+        keys_list = [s.get("keys") for s in states if s.get("keys") is not None]
+        values_list = [
+            s.get("values") for s in states if s.get("values") is not None
+        ]
+        index_list = [
+            s.get("index_keys")
+            for s in states
+            if s.get("index_keys") is not None
+        ]
+        if not keys_list or not values_list:
+            return {}
+
+        keys = mx.concatenate(keys_list, axis=2)
+        values = mx.concatenate(values_list, axis=2)
+        index_keys = mx.concatenate(index_list, axis=2) if index_list else None
+        return {
+            "keys": keys,
+            "values": values,
+            "index_keys": index_keys,
+            "states": (keys, values, index_keys),
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
+            from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+        except Exception as e:  # noqa: BLE001
+            logger.error("mlx-vlm MiniMaxM3KVCache unavailable: %s", e)
+            return None
+
+        keys = elements[0] if len(elements) > 0 else None
+        values = elements[1] if len(elements) > 1 else None
+        index_keys = elements[2] if len(elements) > 2 else None
+
+        cache = MiniMaxM3KVCache()
+        if keys is not None and values is not None:
+            cache.kv_cache.state = (keys, values)
+        cache.index_keys = index_keys
+        cache.index_offset = _minimax_index_offset(index_keys, meta_state)
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = (
+                state.get("keys"),
+                state.get("values"),
+                state.get("index_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+class MiniMaxM3BatchKVCacheHandler(_MiniMaxM3CacheHandlerBase):
+    """Handler for batched MiniMax M3 sparse attention caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.MINIMAX_M3_BATCH_KVCACHE
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("offset", None, False),
+            CacheStateAxisInfo("left_padding", None, False),
+            CacheStateAxisInfo("index_keys", 2, False),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_state = cache_obj.state
+        if isinstance(kv_state, (list, tuple)) and len(kv_state) >= 4:
+            return (
+                kv_state[0],
+                kv_state[1],
+                kv_state[2],
+                kv_state[3],
+                index_state,
+            )
+        return (None, None, None, None, index_state)
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        keys, values, offset, left_padding, index_keys = self.serialize_state(cache_obj)
+        return {
+            "keys": keys,
+            "values": values,
+            "offset": offset,
+            "left_padding": left_padding,
+            "index_keys": index_keys,
+            "states": (keys, values, offset, left_padding, index_keys),
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
+            from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3BatchKVCache
+        except Exception as e:  # noqa: BLE001
+            logger.error("mlx-vlm MiniMaxM3BatchKVCache unavailable: %s", e)
+            return None
+
+        keys = elements[0] if len(elements) > 0 else None
+        values = elements[1] if len(elements) > 1 else None
+        offset = elements[2] if len(elements) > 2 else None
+        left_padding = elements[3] if len(elements) > 3 else None
+        index_keys = elements[4] if len(elements) > 4 else None
+
+        left_padding_arg = left_padding if left_padding is not None else [0]
+        cache = MiniMaxM3BatchKVCache(left_padding_arg)
+        cache.state = ((keys, values, offset, left_padding_arg), index_keys)
+        cache.index_offset = _minimax_index_offset(index_keys, meta_state)
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = (
+                state.get("keys"),
+                state.get("values"),
+                state.get("offset"),
+                state.get("left_padding"),
+                state.get("index_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
 
 
 # Default handler for unknown types - falls back to KVCache behavior

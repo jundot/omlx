@@ -21,10 +21,10 @@ from omlx.utils.model_loading import (
     maybe_apply_pre_load_patches,
 )
 
-
 # ---------------------------------------------------------------------------
 # Patch orchestrator + sub-modules
 # ---------------------------------------------------------------------------
+
 
 class TestApplyOrchestrator:
     def test_apply_idempotent(self):
@@ -207,6 +207,145 @@ class TestQwen35Model:
         assert seen["n_confirmed"] == 3
 
 
+class TestQwen35MtpNormShift:
+    """Per-key +1 RMSNorm shift for mixed-convention MTP checkpoints (PR #1507).
+
+    Some pre-quantized Qwen3.6 MXFP4 bundles ship MTP-head norms in a mixed
+    convention: ``mtp.norm`` already in MLX's +1 convention (mean ~1.27) while
+    the per-layer head norms are still raw-HF (mean ~0). The backbone-only
+    conv1d signal evaluates False for such a checkpoint, so the old global
+    flag left the raw-HF head norms unshifted and MTP acceptance collapsed to
+    ~0%. The fix decides the shift per-key from each weight's own magnitude.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _apply(self):
+        try:
+            from omlx.patches.mlx_lm_mtp import qwen35_model
+        except ImportError:
+            pytest.skip("omlx.patches.mlx_lm_mtp not importable")
+        if not qwen35_model.apply():
+            pytest.skip("qwen35_model patch refused to apply")
+
+    def _model(self):
+        from mlx_lm.models.qwen3_5 import TextModel
+
+        m = TextModel.__new__(TextModel)
+        m.mtp = SimpleNamespace()  # presence keeps mtp.* keys in sanitize
+        m.args = SimpleNamespace(tie_word_embeddings=False)
+        return m
+
+    @staticmethod
+    def _first(arr):
+        return float(arr[0])
+
+    def test_mixed_convention_shifts_only_raw_hf_mtp_norms(self):
+        """No unsanitized conv1d (backbone already MLX) -> should_shift False.
+        Raw-HF head norms get +1, already-MLX siblings are left untouched."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            # Already-MLX (mean >= 0.5) -> must NOT shift.
+            "mtp.norm.weight": mx.full((16,), 1.27),
+            "mtp.layers.0.self_attn.q_norm.weight": mx.full((16,), 0.75),
+            "mtp.layers.0.self_attn.k_norm.weight": mx.full((16,), 0.74),
+            # Raw-HF (mean < 0.5) -> must shift by +1.
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
+            "mtp.layers.0.post_attention_layernorm.weight": mx.full((16,), 0.21),
+            "mtp.pre_fc_norm_embedding.weight": mx.full((16,), -0.44),
+            "mtp.pre_fc_norm_hidden.weight": mx.full((16,), -0.17),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        # Already-MLX siblings left untouched.
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+        assert abs(g(out["mtp.layers.0.self_attn.q_norm.weight"]) - 0.75) < 1e-3
+        assert abs(g(out["mtp.layers.0.self_attn.k_norm.weight"]) - 0.74) < 1e-3
+        # Raw-HF head norms shifted by +1.
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.layers.0.post_attention_layernorm.weight"]) - 1.21) < 1e-3
+        assert abs(g(out["mtp.pre_fc_norm_embedding.weight"]) - 0.56) < 1e-3
+        assert abs(g(out["mtp.pre_fc_norm_hidden.weight"]) - 0.83) < 1e-3
+
+    def test_pure_raw_hf_shifts_backbone_and_mtp(self):
+        """Unsanitized conv1d present -> should_shift True. Backbone and all
+        raw-HF MTP norms get +1 (matches the legacy global-flag behavior)."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            # shape[-1] != 1 marks a raw-HF checkpoint -> should_shift True.
+            "model.layers.0.self_attn.conv1d.weight": mx.zeros((8, 4, 3)),
+            "model.layers.0.input_layernorm.weight": mx.full((16,), 0.05),
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 0.04),
+            "mtp.norm.weight": mx.full((16,), 0.27),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+
+    def test_pure_mlx_leaves_everything_untouched(self):
+        """Already-converted checkpoint: no conv1d signal and all norms in the
+        +1 convention -> nothing is shifted (idempotent re-sanitize)."""
+        import mlx.core as mx
+
+        m = self._model()
+        weights = {
+            "model.layers.0.input_layernorm.weight": mx.full((16,), 1.05),
+            "mtp.layers.0.input_layernorm.weight": mx.full((16,), 1.04),
+            "mtp.norm.weight": mx.full((16,), 1.27),
+        }
+        out = m.sanitize(weights)
+        g = self._first
+
+        assert abs(g(out["model.layers.0.input_layernorm.weight"]) - 1.05) < 1e-3
+        assert abs(g(out["mtp.layers.0.input_layernorm.weight"]) - 1.04) < 1e-3
+        assert abs(g(out["mtp.norm.weight"]) - 1.27) < 1e-3
+
+    def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
+        """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
+        placeholders where the per-key magnitude can't be read. The helper
+        must record a conditional replay transform for MTP norms so the
+        materialization path can still decide from the real tensor value.
+        Otherwise full-precision Qwen3.6 sources with mixed MTP norm
+        conventions can be double-shifted or left unshifted."""
+        import mlx.core as mx
+
+        from omlx.oq import _discover_sanitize_plan
+
+        m = self._model()
+
+        class _FakeIdx:
+            def __init__(self, meta):
+                self._meta = meta
+
+            def logical_metadata(self):
+                return self._meta
+
+        # conv1d shape[-1] != 1 marks a raw-HF source -> should_shift True.
+        meta = {
+            "model.layers.0.self_attn.conv1d.weight": ((2048, 4, 4), mx.float32),
+            "model.layers.0.input_layernorm.weight": ((16,), mx.float32),
+            "mtp.layers.0.input_layernorm.weight": ((16,), mx.float32),
+            "mtp.norm.weight": ((16,), mx.float32),
+        }
+        plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
+
+        # Backbone still has a fixed +1 add from the raw-HF conv1d signal.
+        # MTP norms need per-key value checks at materialization time.
+        assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert (
+            plan["mtp.layers.0.input_layernorm.weight"]["transform"]
+            == "add_if_mean_lt_0_5"
+        )
+        assert plan["mtp.norm.weight"]["transform"] == "add_if_mean_lt_0_5"
+
+
 class TestQwen35MoeSanitize:
     """Regression tests for the MoE MTP sanitize patch (qwen3_5_moe.Model)."""
 
@@ -219,6 +358,7 @@ class TestQwen35MoeSanitize:
         if not qwen35_model.apply():
             pytest.skip("qwen35_model patch refused to apply")
         from omlx.patches.mlx_lm_mtp.qwen35_model import _patch_qwen3_5_moe
+
         _patch_qwen3_5_moe()
 
     @pytest.fixture()
@@ -247,15 +387,18 @@ class TestQwen35MoeSanitize:
         weights["language_model.model.embed_tokens.weight"] = mx.zeros((256, 64))
         return weights
 
-    def test_sanitize_no_mtp_weights(self, moe_model, caplog):
+    def test_sanitize_no_mtp_weights(self, moe_model):
         """Config declares mtp_num_hidden_layers=1 but no MTP weights exist
-        (model quantized without preserve_mtp). Must not crash."""
-        import logging
-
-        with caplog.at_level(logging.DEBUG):
-            result = moe_model.sanitize(self._backbone_weights())
+        (model quantized without preserve_mtp). Must not crash, and must
+        still produce the unfused backbone weights."""
+        result = moe_model.sanitize(self._backbone_weights())
+        assert isinstance(result, dict)
         assert not any("mtp" in k for k in result)
-        assert any("no MTP weights found" in r.getMessage() for r in caplog.records)
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            assert f"{pfx}.switch_mlp.gate_proj.weight" in result
+            assert f"{pfx}.switch_mlp.down_proj.weight" in result
+        assert "language_model.model.embed_tokens.weight" in result
 
     def test_sanitize_switch_mlp_form(self, moe_model):
         """oQ outputs store MTP experts in switch_mlp form — sanitize skips."""
@@ -326,7 +469,9 @@ class TestDeepseekV4Model:
         # Simulate the base patch not having run by removing the module.
         # No module-level _PATCHED to reset anymore — sub-patcher does its
         # own marker-based idempotency check against the live class state.
-        monkeypatch.setitem(__import__("sys").modules, "mlx_lm.models.deepseek_v4", None)
+        monkeypatch.setitem(
+            __import__("sys").modules, "mlx_lm.models.deepseek_v4", None
+        )
         # When the module is None / missing, apply() returns False without
         # raising — that's the contract for non-DeepSeek models.
         applied = deepseek_v4_model.apply()
@@ -360,6 +505,18 @@ class TestDeepseekV4Model:
         applied_again = deepseek_v4_model.apply()
         assert applied_again is True
 
+    def test_mtp_patch_materializes_backbone_and_mtp_cache(self):
+        """DeepSeek-V4 MTP override must keep the base Metal leak fix."""
+        import inspect
+
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model
+
+        call_source = inspect.getsource(deepseek_v4_model._patch_deepseek_v4_model_call)
+        model_source = inspect.getsource(deepseek_v4_model._patch_model)
+
+        assert "materialize_cache_arrays(cache)" in call_source
+        assert "materialize_cache_arrays(cache)" in model_source
+
 
 class TestBatchGeneratorDispatch:
     @pytest.fixture(autouse=True)
@@ -371,9 +528,142 @@ class TestBatchGeneratorDispatch:
             pytest.skip("batch_generator patch refused to apply (mlx_lm absent)")
 
     def test_generation_batch_is_patched(self):
-        from mlx_lm.generate import GenerationBatch
+        from mlx_lm.generate import BatchGenerator, GenerationBatch
 
         assert hasattr(GenerationBatch, "_omlx_mtp_patched")
+        assert hasattr(BatchGenerator, "_omlx_mtp_patched")
+
+    def test_next_realigns_rows_before_mtp_eligibility(self, monkeypatch):
+        """Native MTP must not read stale row slots before scheduler realignment."""
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        calls = []
+        batch = SimpleNamespace(
+            uids=[],
+            _omlx_realign_rows=lambda: calls.append("realign"),
+        )
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_is_mtp_batch_eligible",
+            lambda _: calls.append("batch_eligible") or False,
+        )
+        monkeypatch.setattr(
+            batch_generator,
+            "_is_mtp_eligible",
+            lambda _: calls.append("single_eligible") or False,
+        )
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+        monkeypatch.setattr(
+            batch_generator,
+            "_mark_standard_multirow_decode",
+            lambda _: calls.append("standard"),
+        )
+
+        assert GenerationBatch.next(batch) == []
+        assert calls[:3] == ["realign", "batch_eligible", "single_eligible"]
+
+    def test_realign_can_make_grammar_rows_disable_mtp(self, monkeypatch):
+        """If realignment reveals processors, MTP must not activate first."""
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        processor = object()
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *_, **__: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        batch = SimpleNamespace(
+            model=model,
+            uids=[1],
+            logits_processors=[],
+            _omlx_mtp_activation_safe=True,
+        )
+
+        def realign_rows():
+            batch.logits_processors = [[processor]]
+
+        batch._omlx_realign_rows = realign_rows
+
+        monkeypatch.setattr(
+            batch_generator,
+            "_has_grammar_processors",
+            lambda b: bool(b.logits_processors and b.logits_processors[0]),
+        )
+        monkeypatch.setattr(
+            batch_generator,
+            "_prepare_mtp_state_for_next",
+            lambda _: pytest.fail("MTP activated before row realignment"),
+        )
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+        monkeypatch.setattr(
+            batch_generator,
+            "_mark_standard_multirow_decode",
+            lambda b: setattr(b, "uids", []),
+        )
+
+        assert GenerationBatch.next(batch) == []
+        assert batch.logits_processors == [[processor]]
+
+    def test_decode_eligibility_reads_model_instance_flag_not_global(self):
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            set_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        model = SimpleNamespace(
+            mtp=object(),
+            mtp_forward=lambda *args, **kwargs: None,
+            _omlx_mtp_decode_enabled=True,
+        )
+        gen_batch = SimpleNamespace(
+            model=model,
+            uids=[0],
+            logits_processors=None,
+        )
+
+        prior_active = is_mtp_active()
+        try:
+            # Simulate a later non-MTP model load resetting the construction
+            # global. The already-loaded MTP model must stay eligible.
+            set_mtp_active(False)
+            assert batch_generator._mtp_common_eligible(gen_batch) is True
+
+            model._omlx_mtp_decode_enabled = False
+            assert batch_generator._mtp_common_eligible(gen_batch) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_decode_marker_is_found_on_wrapped_language_model(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        inner = SimpleNamespace(_omlx_mtp_decode_enabled=True)
+
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(language_model=inner)
+            )
+            is True
+        )
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(_language_model=inner)
+            )
+            is True
+        )
+        assert (
+            batch_generator._model_mtp_decode_enabled(
+                SimpleNamespace(
+                    language_model=SimpleNamespace(_omlx_mtp_decode_enabled=False)
+                )
+            )
+            is False
+        )
 
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
         from omlx.patches.mlx_lm_mtp import (
@@ -398,8 +688,9 @@ class TestBatchGeneratorDispatch:
             """Has both the method and the attached head — i.e. the model
             class was patched and the head was attached at load time."""
 
-            def __init__(self):
+            def __init__(self, decode_enabled=True):
                 self.mtp = object()  # placeholder for an actual MTPModule
+                self._omlx_mtp_decode_enabled = decode_enabled
 
             def mtp_forward(self, *_):
                 pass
@@ -416,21 +707,21 @@ class TestBatchGeneratorDispatch:
             assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
             # Has mtp_forward but no attached head → still off.
             assert (
-                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1]))
-                is False
+                _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
             )
-            # Head attached but the per-load mtp_active flag is off
+            # Head attached but the per-load decode marker is off
             # (e.g. VLM runtime patches attach unconditionally so weight
             # load matches, while inference-time MTP stays disabled).
-            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+            assert (
+                _is_mtp_eligible(_GenBatch(_MtpModel(decode_enabled=False), uids=[1]))
+                is False
+            )
 
-            set_mtp_active(True)
-            # Has both method and head + batch=1 + flag on → triggers the path.
+            # Has method, head, and per-instance marker + batch=1. The current
+            # process-wide construction flag no longer controls decode.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
             # MTP model with batch=2 falls back to standard step.
-            assert (
-                _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
-            )
+            assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
             # Empty batch never triggers.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
             # Grammar-constrained decoding relies on GenerationBatch._step hooks,
@@ -438,6 +729,286 @@ class TestBatchGeneratorDispatch:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(batch_generator, "_has_grammar_processors", lambda _: True)
                 assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_activation_waits_for_batch_generator_safe_point(self):
+        from omlx.patches.mlx_lm_mtp import (
+            is_mtp_active,
+            set_mtp_active,
+        )
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=False,
+            )
+            assert batch_generator._is_mtp_eligible(batch) is False
+
+            batch._omlx_mtp_state = batch_generator._MtpState(uid=1)
+            assert batch_generator._is_mtp_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_activation_blocked_after_standard_multirow_decode(self):
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(batch) is False
+
+            batch._omlx_mtp_state = batch_generator._MtpState(uid=1)
+            assert batch_generator._is_mtp_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_batch_generator_activation_safe_helper(self):
+        from collections import deque
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _batch_generator_allows_mtp_activation,
+        )
+
+        safe = SimpleNamespace(
+            _unprocessed_sequences=deque(),
+            _prompt_batch=[],
+            _currently_processing=[],
+        )
+        assert _batch_generator_allows_mtp_activation(safe) is True
+
+        for attr in (
+            "_unprocessed_sequences",
+            "_prompt_batch",
+            "_currently_processing",
+        ):
+            obj = SimpleNamespace(
+                _unprocessed_sequences=deque(),
+                _prompt_batch=[],
+                _currently_processing=[],
+            )
+            value = deque([1]) if attr == "_unprocessed_sequences" else [1]
+            setattr(obj, attr, value)
+            assert _batch_generator_allows_mtp_activation(obj) is False
+
+    def _make_bg_next_fake(self, *, size=1, next_size=None, active_state=None):
+        class _FakeGenerationBatch:
+            def __init__(self, size, next_size, active_state):
+                self.size = size
+                self.next_size = next_size
+                self.next_calls = 0
+                self.extended_with = None
+                if active_state == "single":
+                    self._omlx_mtp_state = object()
+                elif active_state == "batch":
+                    self._omlx_mtp_batch_state = object()
+
+            def __len__(self):
+                return self.size
+
+            def next(self):
+                self.next_calls += 1
+                if self.next_size is not None:
+                    self.size = self.next_size
+                return ["generation"]
+
+            def extend(self, gen_batch):
+                self.extended_with = gen_batch
+                self.size += len(gen_batch.uids)
+
+        class _FakePromptBatch:
+            def __init__(self):
+                self.split_indices = None
+                self.last_inputs = None
+                self.prompted = None
+
+            def __len__(self):
+                return 1
+
+            def extend(self, _batch):
+                raise AssertionError("prompt extend is not part of this probe")
+
+            def split(self, split):
+                self.split_indices = list(split)
+                return self
+
+            def generate(self, last_inputs):
+                self.last_inputs = list(last_inputs)
+                return SimpleNamespace(uids=[99])
+
+            def prompt(self, prompts):
+                self.prompted = list(prompts)
+
+        gen_batch = _FakeGenerationBatch(size, next_size, active_state)
+        prompt_batch = _FakePromptBatch()
+        bg = SimpleNamespace(
+            _generation_batch=gen_batch,
+            _prompt_batch=prompt_batch,
+            _currently_processing=[([[123]], 0, 1)],
+            _unprocessed_sequences=[],
+            _gen_tokens_counter=0,
+            _steps_counter=0,
+            _prompt_tokens_counter=0,
+            _prompt_time_counter=0.0,
+            completion_batch_size=4,
+            prefill_batch_size=1,
+        )
+        return bg, gen_batch, prompt_batch
+
+    def test_active_singleton_mtp_defers_late_join_extend(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(active_state="single")
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert prompt_responses == []
+        assert generation_responses == ["generation"]
+        assert gen_batch.next_calls == 1
+        assert gen_batch.extended_with is None
+        assert prompt_batch.split_indices is None
+        assert bg.completion_batch_size == 4
+
+    def test_active_rowwise_mtp_defers_late_join_even_when_batch_shrinks(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(
+            size=2,
+            next_size=1,
+            active_state="batch",
+        )
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert prompt_responses == []
+        assert generation_responses == ["generation"]
+        assert len(gen_batch) == 1
+        assert gen_batch.extended_with is None
+        assert prompt_batch.split_indices is None
+        assert bg.completion_batch_size == 4
+
+    def test_non_mtp_generation_batch_still_accepts_late_join_extend(self):
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(active_state=None)
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert generation_responses == ["generation"]
+        assert len(prompt_responses) == 1
+        assert gen_batch.extended_with is not None
+        assert gen_batch.extended_with.uids == [99]
+        assert prompt_batch.split_indices == [0]
+        assert prompt_batch.last_inputs == [[123]]
+        assert bg.completion_batch_size == 4
+
+    def test_empty_generation_batch_with_stale_mtp_state_does_not_defer(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _EmptyBatch:
+            _omlx_mtp_state = batch_generator._MtpState(uid=1)
+
+            def __len__(self):
+                return 0
+
+        assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
+
+    def test_rowwise_batch_eligibility_requires_safe_activation(self):
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+
+            batch._omlx_mtp_activation_safe = False
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch._omlx_mtp_batch_state = batch_generator._MtpBatchState(
+                states={1: batch_generator._MtpState(uid=1)}
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_rowwise_batch_new_activation_requires_aligned_offsets(self):
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Offset:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch.prompt_cache = [SimpleNamespace(offset=_Offset([8, 8]))]
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
 
@@ -488,6 +1059,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -499,9 +1071,7 @@ class TestBatchGeneratorDispatch:
         )
 
         def fake_post_init(gen_batch):
-            gen_batch._omlx_mtp_state = batch_generator._MtpState(
-                uid=gen_batch.uids[0]
-            )
+            gen_batch._omlx_mtp_state = batch_generator._MtpState(uid=gen_batch.uids[0])
 
         monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
 
@@ -516,6 +1086,7 @@ class TestBatchGeneratorDispatch:
         class _MtpModel:
             def __init__(self):
                 self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
 
             def mtp_forward(self, *_):
                 pass
@@ -529,9 +1100,7 @@ class TestBatchGeneratorDispatch:
         )
 
         def fake_post_init(gen_batch):
-            gen_batch._omlx_mtp_state = batch_generator._MtpState(
-                uid=gen_batch.uids[0]
-            )
+            gen_batch._omlx_mtp_state = batch_generator._MtpState(uid=gen_batch.uids[0])
 
         monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
 
@@ -664,6 +1233,7 @@ class TestBatchGeneratorDispatch:
 # ModelSettings — mtp_enabled field + mutual exclusion
 # ---------------------------------------------------------------------------
 
+
 class TestModelSettingsMtp:
     def test_default_mtp_disabled(self):
         s = ModelSettings()
@@ -698,6 +1268,7 @@ class TestModelSettingsMtp:
 # utils.model_loading — compatibility helpers + dispatch
 # ---------------------------------------------------------------------------
 
+
 class TestMtpCompatibilityHelpers:
     def test_has_mtp_heads_top_level_field(self):
         assert _has_mtp_heads({"mtp_num_hidden_layers": 1}) is True
@@ -706,9 +1277,7 @@ class TestMtpCompatibilityHelpers:
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
 
     def test_has_mtp_heads_text_config_field(self):
-        assert (
-            _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
-        )
+        assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
 
     def test_has_mtp_heads_zero_is_false(self):
         assert _has_mtp_heads({"mtp_num_hidden_layers": 0}) is False
@@ -772,10 +1341,13 @@ class TestPreLoadPatchDispatch:
             str(tmp_path), model_settings=ModelSettings(mtp_enabled=True)
         )
         # The skip path should log a warning so the user sees why MTP was inactive.
-        assert any(
-            "MTP path will be inactive" in record.getMessage()
-            for record in caplog.records
-        ) or True  # logger.warning may be filtered by pytest logging level
+        assert (
+            any(
+                "MTP path will be inactive" in record.getMessage()
+                for record in caplog.records
+            )
+            or True
+        )  # logger.warning may be filtered by pytest logging level
 
     def test_dispatch_handles_missing_config(self, tmp_path):
         # No config.json at all — function must not raise.
@@ -796,6 +1368,7 @@ class TestPreLoadPatchDispatch:
 # ---------------------------------------------------------------------------
 # batch_generator — _resolve_sampler + _is_greedy
 # ---------------------------------------------------------------------------
+
 
 class TestResolveSampler:
     """Tests for ``_resolve_sampler`` which mirrors GenerationBatch._step's
@@ -973,6 +1546,7 @@ class TestIsGreedy:
 # Issue #1388 — mtp patch must self-heal when dflash overwrote __call__
 # ---------------------------------------------------------------------------
 
+
 class TestMTPPatchSelfHealing:
     """Process-wide regression for #1388.
 
@@ -985,8 +1559,10 @@ class TestMTPPatchSelfHealing:
 
     def _simulate_dflash_overwrite(self, cls):
         """Replace cls.__call__ with a dflash-shaped hook that rejects n_confirmed."""
+
         def dflash_like_call(self, inputs, mask=None, cache=None):
             return inputs
+
         cls.__call__ = dflash_like_call
         cls._dflash_speculative_call_installed = True
 
@@ -995,6 +1571,7 @@ class TestMTPPatchSelfHealing:
         the MTP patch — the class must end up with an n_confirmed-aware __call__
         again."""
         from omlx.patches.mlx_lm_mtp import qwen35_model
+
         assert qwen35_model.apply()
         from mlx_lm.models.qwen3_5 import GatedDeltaNet
 
@@ -1013,13 +1590,16 @@ class TestMTPPatchSelfHealing:
             GatedDeltaNet.__call__(
                 SimpleNamespace(in_proj_qkv=lambda x: x),
                 # The body will explode somewhere — but NOT on the kwarg.
-                None, mask=None, cache=None, n_confirmed=1,
+                None,
+                mask=None,
+                cache=None,
+                n_confirmed=1,
             )
         except TypeError as e:
             # Must not be the n_confirmed signature error.
-            assert "n_confirmed" not in str(e), (
-                f"signature still rejects n_confirmed: {e}"
-            )
+            assert "n_confirmed" not in str(
+                e
+            ), f"signature still rejects n_confirmed: {e}"
         except Exception:
             # Any other error is fine — body needs real tensors.
             pass
@@ -1027,11 +1607,13 @@ class TestMTPPatchSelfHealing:
     def test_decoder_layer_reapplies_after_class_overwrite(self):
         """Same scenario for DecoderLayer.__call__."""
         from omlx.patches.mlx_lm_mtp import qwen35_model
+
         assert qwen35_model.apply()
         from mlx_lm.models.qwen3_5 import DecoderLayer
 
         def dflash_unrelated_call(self, x, mask=None, cache=None):
             return x
+
         DecoderLayer.__call__ = dflash_unrelated_call
 
         qwen35_model.apply()
@@ -1039,9 +1621,11 @@ class TestMTPPatchSelfHealing:
         # After re-apply, DecoderLayer.__call__ must accept n_confirmed again
         # (used by the MTP draft/verify path).
         seen = {"n_confirmed": None}
+
         def linear_attn_with_kwarg(h, mask=None, cache=None, n_confirmed=0):
             seen["n_confirmed"] = n_confirmed
             return h
+
         fake = SimpleNamespace(
             is_linear=True,
             input_layernorm=lambda x: x,
@@ -1057,6 +1641,7 @@ class TestMTPPatchSelfHealing:
         the underlying classes have been clobbered by another patch (dflash).
         """
         from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
         assert apply_mlx_lm_mtp_patch() is True
         from mlx_lm.models.qwen3_5 import GatedDeltaNet
 
@@ -1071,3 +1656,142 @@ class TestMTPPatchSelfHealing:
             "__call__ should carry the MTP marker after re-apply, "
             f"got {current_call!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Draft-rejection rollback atomicity
+# ---------------------------------------------------------------------------
+
+
+class _FakeTrimmable:
+    def __init__(self, trimmable=True):
+        self._trimmable = trimmable
+        self.trimmed = 0
+
+    def is_trimmable(self):
+        return self._trimmable
+
+    def trim(self, n):
+        self.trimmed += n
+        return n
+
+
+class TestRestoreOrTrimAtomicity:
+    """A layer that refuses rollback must leave every other layer untouched.
+
+    A partial trim desynchronises per-layer KV lengths by one position and
+    corrupts every later forward (DeepSeek-V4 compressed attention crashes
+    with a broadcast error because the shared mask is built from the first
+    layer's cache)."""
+
+    def test_partial_trim_is_rolled_back_to_noop(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        good_a = _FakeTrimmable()
+        bad = _FakeTrimmable(trimmable=False)
+        good_b = _FakeTrimmable()
+        assert _restore_or_trim_caches([good_a, bad, good_b]) is False
+        assert good_a.trimmed == 0
+        assert good_b.trimmed == 0
+
+    def test_all_trimmable_trims_all(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _restore_or_trim_caches
+
+        caches = [_FakeTrimmable(), _FakeTrimmable()]
+        assert _restore_or_trim_caches(caches) is True
+        assert all(c.trimmed == 1 for c in caches)
+
+
+# ---------------------------------------------------------------------------
+# Rotating-cache MTP undo log
+# ---------------------------------------------------------------------------
+
+
+class TestRotatingCacheMtpUndo:
+    """A rotated RotatingKVCache cannot trim, so MTP draft rejection needs
+    the armed one-update undo log: restore the pre-verify references and
+    replay the confirmed token. Equivalence is checked against a reference
+    cache that never saw the rejected draft."""
+
+    @staticmethod
+    def _fill(cache, n, dim=4, start=0):
+        import mlx.core as mx
+
+        for i in range(start, start + n):
+            k = mx.full((1, 1, 1, dim), float(i))
+            cache.update_and_fetch(k, k)
+
+    def _run_equivalence(self, make_cache):
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = make_cache()
+        ref = make_cache()
+        # Rotate both well past max_size so stock trim is impossible.
+        self._fill(cache, 12)
+        self._fill(ref, 12)
+
+        confirmed = mx.full((1, 1, 1, 4), 100.0)
+        draft = mx.full((1, 1, 1, 4), 200.0)
+        both = mx.concatenate([confirmed, draft], axis=2)
+        cache_rollback.set_undo_armed(True)
+        try:
+            cache.update_and_fetch(both, both)
+        finally:
+            cache_rollback.set_undo_armed(False)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+
+        ref.update_and_fetch(confirmed, confirmed)
+
+        nxt = mx.full((1, 1, 1, 4), 300.0)
+        ck, cv = cache.update_and_fetch(nxt, nxt)
+        rk, rv = ref.update_and_fetch(nxt, nxt)
+        mx.eval(ck, cv, rk, rv)
+        assert mx.array_equal(ck, rk).item()
+        assert mx.array_equal(cv, rv).item()
+        c_off = cache.offset
+        r_off = ref.offset
+        if hasattr(c_off, "tolist"):
+            assert c_off.tolist() == r_off.tolist()
+        else:
+            assert c_off == r_off
+
+    def test_rotating_kv_cache_undo(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        self._run_equivalence(lambda: RotatingKVCache(max_size=8))
+
+    def test_batch_rotating_kv_cache_undo(self):
+        from mlx_lm.models.cache import BatchRotatingKVCache
+
+        self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]))
+
+    def test_unarmed_update_keeps_stock_semantics(self):
+        import mlx.core as mx
+
+        from mlx_lm.models.cache import RotatingKVCache
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = RotatingKVCache(max_size=8)
+        self._fill(cache, 12)
+        both = mx.full((1, 1, 2, 4), 7.0)
+        cache.update_and_fetch(both, both)
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0
+
+    def test_grow_mode_trim_unchanged(self):
+        import mlx.core as mx
+
+        from mlx_lm.models.cache import RotatingKVCache
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+        cache = RotatingKVCache(max_size=64)
+        self._fill(cache, 4)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        assert cache.offset == 3

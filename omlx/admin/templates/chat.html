@@ -263,10 +263,12 @@
     .user-message {
         max-width: min(768px, 100%);
         align-self: flex-end;
+        padding-bottom: 32px;
     }
 
     .user-message.is-editing {
         width: min(768px, 100%);
+        padding-bottom: 0;
     }
 
     .user-message-bubble {
@@ -453,26 +455,127 @@
     }
 
     .code-copy-btn {
-        position: absolute;
-        top: 0.5em;
-        right: 0.5em;
         background: var(--bg-secondary);
         border: 1px solid var(--border-faint);
         border-radius: 0.375em;
         padding: 0.25em 0.5em;
         font-size: 0.7em;
         cursor: pointer;
-        opacity: 0;
-        transition: opacity 0.2s;
         color: var(--text-secondary);
-    }
-
-    .code-block-wrapper:hover .code-copy-btn {
-        opacity: 1;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35em;
+        flex-shrink: 0;
     }
 
     .code-copy-btn:hover {
         background: var(--bg-tertiary);
+    }
+
+    .svg-render-btn {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-faint);
+        border-radius: 0.375em;
+        padding: 0.25em 0.5em;
+        font-size: 0.7em;
+        cursor: pointer;
+        color: var(--text-secondary);
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35em;
+        flex-shrink: 0;
+    }
+
+    .svg-render-btn:hover {
+        background: var(--bg-tertiary);
+    }
+
+    .code-btn-row {
+        position: absolute;
+        top: 0.5em;
+        right: 0.5em;
+        display: flex;
+        gap: 0.35em;
+        opacity: 0;
+        transition: opacity 0.2s;
+        z-index: 1;
+    }
+
+    .code-block-wrapper:hover .code-btn-row {
+        opacity: 1;
+    }
+
+    .svg-preview-container {
+        margin: 0.5em 0;
+        padding: 1em;
+        background: #ffffff;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.5em;
+        text-align: center;
+        overflow: auto;
+        max-height: 2160px;
+    }
+
+    .svg-preview-container svg {
+        max-width: 100%;
+        height: auto;
+    }
+
+    .svg-allow-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+    }
+
+    .svg-allow-label {
+        display: flex;
+        align-items: center;
+        gap: 0.375rem;
+        min-width: 0;
+        flex: 1;
+    }
+
+    .svg-allow-switch {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        width: 2rem;
+        height: 1.125rem;
+        flex-shrink: 0;
+        border: none;
+        border-radius: 9999px;
+        padding: 0;
+        cursor: pointer;
+        background: var(--border-normal);
+        transition: background-color 0.2s ease;
+    }
+
+    .svg-allow-switch.is-on {
+        background: var(--timeline-accent);
+    }
+
+    .svg-allow-switch-knob {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 0.875rem;
+        height: 0.875rem;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+        transition: transform 0.2s ease;
+    }
+
+    .svg-allow-switch.is-on .svg-allow-switch-knob {
+        transform: translateX(0.875rem);
+    }
+
+    .svg-allow-warning {
+        margin-top: 0.25rem;
+        font-size: 10px;
+        line-height: 1.35;
+        color: var(--text-tertiary);
     }
 
     /* User message edit button */
@@ -482,8 +585,10 @@
 
     .user-message-actions {
         position: absolute;
-        left: -96px;
-        top: 4px;
+        right: 0;
+        bottom: 0;
+        left: auto;
+        top: auto;
         display: flex;
         flex-direction: row;
         gap: 4px;
@@ -677,7 +782,7 @@
     }
 
     /* Mobile responsive */
-    @media (max-width: 768px) {
+    @media (max-width: 767px) {
         .sidebar-width {
             position: fixed;
             z-index: 50;
@@ -700,7 +805,8 @@
         }
 
         .user-message-actions {
-            left: -28px;
+            right: 0;
+            left: auto;
         }
 
         /* Prevent iOS auto-zoom on input focus (requires >= 16px) */
@@ -1010,6 +1116,23 @@
                 <i data-lucide="settings" class="w-3 h-3"></i>
                 {{ t('chat.admin_settings') }}
             </a>
+            <div class="svg-allow-setting px-2 py-1.5">
+                <div class="svg-allow-row">
+                    <div class="svg-allow-label">
+                        <i data-lucide="wand-sparkles" class="w-3 h-3 shrink-0" style="color: var(--text-tertiary);"></i>
+                        <span class="text-xs truncate" style="color: var(--text-tertiary);"
+                            x-text="window.t('chat.allow_svg')"></span>
+                    </div>
+                    <button type="button" role="switch" class="svg-allow-switch"
+                        :class="{ 'is-on': allowSvg }"
+                        :aria-checked="allowSvg ? 'true' : 'false'"
+                        :aria-label="window.t('chat.allow_svg')"
+                        @click="setAllowSvg(!allowSvg)">
+                        <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                    </button>
+                </div>
+                <p class="svg-allow-warning" x-text="window.t('chat.allow_svg_warning')"></p>
+            </div>
             <!-- Theme Select -->
             <div class="relative w-full">
                 <div
@@ -1148,6 +1271,16 @@
                                                 </template>
                                             </div>
                                         </template>
+                                        <template x-if="getDocumentFiles(msg.content).length > 0">
+                                            <div class="flex flex-wrap gap-2 mb-2">
+                                                <template x-for="doc in getDocumentFiles(msg.content)" :key="doc.filename">
+                                                    <div class="inline-flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
+                                                        <i data-lucide="file-text" class="w-4 h-4 flex-shrink-0"></i>
+                                                        <span class="truncate max-w-56" x-text="doc.filename || window.t('chat.document_not_available')"></span>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                        </template>
                                         <!-- Text content -->
                                         <template x-if="getTextContent(msg.content)">
                                             <div class="user-message-bubble markdown-content"
@@ -1227,7 +1360,7 @@
                                         @click="msg._perfVisible = !msg._perfVisible"
                                         class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                         :style="msg._perfVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                        :title="msg._perfVisible ? 'Hide timeline' : 'Show timeline (' + msg._perfTotal + ')'">
+                                        :title="msg._perfVisible ? 'Hide info' : 'Show info (' + msg._perfTotal + ')'">
                                         <i data-lucide="activity" class="w-4 h-4"></i>
                                     </button>
                                     <button @click="copyMarkdown(msg)"
@@ -1240,7 +1373,7 @@
                                         title="{{ t('chat.regenerate_tooltip') }}">
                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                     </button>
-                                    <div class="relative min-w-[170px]">
+                                    <div class="relative flex-shrink-0">
                                         <button @click="contextOpen = !contextOpen" @click.outside="contextOpen = false"
                                             class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent text-fg-tertiary cursor-pointer transition-all hover:bg-surface-alt hover:text-fg-secondary">
                                             <i data-lucide="more-vertical" class="w-4 h-4"></i>
@@ -1335,7 +1468,7 @@
                             <button @click="toggleCurrentStreamTimeline()"
                                 class="w-7 h-7 flex items-center justify-center rounded-md bg-transparent cursor-pointer transition-all hover:bg-surface-alt"
                                 :style="currentStream()?.statusTimelineVisible ? 'color:var(--text-primary);' : 'color:var(--text-tertiary);'"
-                                title="Toggle timeline">
+                                title="Toggle info">
                                 <i data-lucide="activity" class="w-4 h-4"></i>
                             </button>
                             <button @click="stopStreaming()"
@@ -1461,6 +1594,8 @@
                     <!-- Hidden file input for image upload (multiple) -->
                     <input type="file" id="imageInput" accept="image/*" multiple x-ref="imageInput"
                         @change="handleImageSelect($event)" class="hidden">
+                    <input type="file" id="documentInput" accept=".pdf,.docx,.pptx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/markdown,text/x-markdown" multiple x-ref="documentInput"
+                        @change="handleDocumentSelect($event)" class="hidden">
 
                     <!-- Image preview area (multi-image) -->
                     <div x-show="uploadImages.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
@@ -1478,6 +1613,20 @@
                             </div>
                         </template>
                     </div>
+                    <div x-show="uploadDocuments.length > 0" class="flex flex-wrap gap-2 px-2 pt-2" x-cloak>
+                        <template x-for="(doc, idx) in uploadDocuments" :key="doc.id">
+                            <div class="relative group flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
+                                <i data-lucide="file-text" class="w-4 h-4 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="truncate max-w-48" x-text="doc.filename"></span>
+                                <span x-show="!doc.base64" class="text-[10px]" style="color: var(--text-tertiary);">...</span>
+                                <button @click="removeDocument(idx)"
+                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                    :title="window.t('chat.remove_document')">
+                                    <i data-lucide="x" class="w-3 h-3"></i>
+                                </button>
+                            </div>
+                        </template>
+                    </div>
 
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
@@ -1486,6 +1635,12 @@
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                        </button>
+                        <button x-show="hasDocumentSupport()" @click="$refs.documentInput.click()"
+                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
+                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                            :title="window.t('chat.upload_document')">
+                            <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
@@ -1497,7 +1652,7 @@
                             style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
                             <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
-                                :disabled="(!inputMessage.trim() && uploadImages.length === 0) || !apiKeySet || !currentModel"
+                                :disabled="(!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0) || hasPendingUploads() || !apiKeySet || !currentModel"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
@@ -1509,6 +1664,9 @@
                             <div x-show="uploadImages.length > 0"
                                 class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadImages.length"></div>
+                            <div x-show="uploadDocuments.length > 0 && uploadImages.length === 0"
+                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                x-text="uploadDocuments.length"></div>
                         </div>
                     </div>
                 </div>
@@ -1910,6 +2068,7 @@
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            allowSvg: localStorage.getItem('omlx-chat-allow-svg') === 'true',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
 
@@ -1949,6 +2108,12 @@
 
             // Image Upload State
             uploadImages: [],            // Array of { id, base64 } for pending images (max 10)
+            uploadDocuments: [],         // Array of { id, filename, mimeType, base64 }
+            markitdownSettings: {
+                enabled: true,
+                max_file_size_mb: 25,
+                max_files_per_request: 5,
+            },
             isDragOver: false,           // drag-and-drop state
 
             // Image Modal State
@@ -2314,6 +2479,48 @@
                     return this.availableModels[0].id;
                 }
                 return null;
+            },
+
+            /** Collapse duplicate gateway ids (aliases + duplicate /v1/models rows). */
+            dedupeAvailableModels(models) {
+                const byId = new Map();
+                for (const m of models) {
+                    const existing = byId.get(m.id);
+                    if (!existing) {
+                        byId.set(m.id, { ...m });
+                        continue;
+                    }
+                    // Prefer a human-friendly alias label over the raw directory id.
+                    if (m.name && m.name !== m.id && existing.name === existing.id) {
+                        existing.name = m.name;
+                    }
+                }
+                return Array.from(byId.values()).sort((a, b) =>
+                    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+                );
+            },
+
+            resolvePreferredDefaultModel(defaultModel) {
+                if (!this.availableModels?.length) return null;
+                if (defaultModel) {
+                    const candidate = this.resolveGatewayModelId(defaultModel);
+                    if (this.isModelAvailableOnServer(candidate)) {
+                        return candidate;
+                    }
+                }
+                return this.availableModels[0].id;
+            },
+
+            reconcileCurrentModelAfterLoad(defaultModel) {
+                if (!this.availableModels?.length) {
+                    this.currentModel = null;
+                    return;
+                }
+                if (!this.currentModel || !this.isModelAvailableOnServer(this.currentModel)) {
+                    this.currentModel = this.resolvePreferredDefaultModel(defaultModel);
+                } else {
+                    this.currentModel = this.resolveGatewayModelId(this.currentModel);
+                }
             },
 
             /** Keep messages through the user turn that precedes endIndex (drops assistant + tool rows). */
@@ -2762,6 +2969,24 @@
                 return { ...(this.snapshotGenerationSettings() || {}) };
             },
 
+            buildContentForApi(content) {
+                if (!Array.isArray(content)) return content ?? null;
+                const parts = [];
+                for (const part of content) {
+                    if (part?.type !== 'file') {
+                        parts.push(part);
+                        continue;
+                    }
+                    const file = part.file || {};
+                    const data = file.file_data || file.data;
+                    if (typeof data !== 'string' || !data.trim()) {
+                        continue;
+                    }
+                    parts.push(part);
+                }
+                return parts.length ? parts : '';
+            },
+
             buildMessagesForApi(messages, systemPrompt, opts = {}) {
                 const variantUserIndex = opts.variantUserIndex ?? null;
                 const excludeVariantsAtUserIndex = opts.excludeVariantsAtUserIndex ?? null;
@@ -2772,7 +2997,7 @@
                 const out = this.getApiTurnMessages(messages, excludeVariantsAtUserIndex, regenChainId)
                     .filter(msg => ['user', 'assistant', 'tool', 'system'].includes(msg.role))
                     .map(msg => {
-                        const m = { role: msg.role, content: msg.content ?? null };
+                        const m = { role: msg.role, content: this.buildContentForApi(msg.content) };
                         if (msg.reasoning_content) {
                             m.reasoning_content = msg.reasoning_content;
                         }
@@ -3176,6 +3401,23 @@
             }, 200);
         });
 
+        // Refresh model list when returning to chat (e.g. after HF download on dashboard).
+        this._modelsVisibilityTimer = null;
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible' || !this.apiKeySet) return;
+            clearTimeout(this._modelsVisibilityTimer);
+            this._modelsVisibilityTimer = setTimeout(async () => {
+                try {
+                    await this.loadModels();
+                    if (this.currentModel) {
+                        await this.loadModelCapabilities(this.currentModel);
+                    }
+                } catch (e) {
+                    console.error('Failed to refresh models on visibility:', e);
+                }
+            }, 300);
+        });
+
     },
 
             // ===== VLM Detection =====
@@ -3210,6 +3452,15 @@
     hasVisionSupport() {
         const id = this.resolveGatewayModelId(this.currentModel);
         return this.modelTypeMap[id] === 'vlm';
+    },
+
+    hasDocumentSupport() {
+        return Boolean(this.currentModel && this.markitdownSettings.enabled);
+    },
+
+    hasPendingUploads() {
+        return this.uploadImages.some(img => !img.base64)
+            || this.uploadDocuments.some(doc => !doc.base64);
     },
 
             // ===== MCP Tools =====
@@ -3314,13 +3565,15 @@
     // ===== Image Upload Functions =====
 
     handleDrop(event) {
-        if (!this.hasVisionSupport()) return;
         const files = event.dataTransfer?.files;
-        if (files) {
-            Array.from(files)
-                .filter(f => f.type.startsWith('image/'))
-                .forEach(f => this.loadImageFile(f));
-        }
+        if (!files) return;
+        Array.from(files).forEach(file => {
+            if (this.hasVisionSupport() && file.type.startsWith('image/')) {
+                this.loadImageFile(file);
+            } else if (this.hasDocumentSupport() && this.isSupportedDocumentFile(file)) {
+                this.loadDocumentFile(file);
+            }
+        });
     },
 
     handleImageSelect(event) {
@@ -3366,6 +3619,85 @@
 
     removeImage(index) {
         this.uploadImages.splice(index, 1);
+    },
+
+    handleDocumentSelect(event) {
+        const files = event.target.files;
+        if (!files) return;
+        Array.from(files).forEach(file => this.loadDocumentFile(file));
+        event.target.value = '';
+    },
+
+    isSupportedDocumentFile(file) {
+        const name = (file.name || '').toLowerCase();
+        const type = (file.type || '').toLowerCase();
+        return name.endsWith('.pdf')
+            || name.endsWith('.docx')
+            || name.endsWith('.pptx')
+            || name.endsWith('.txt')
+            || name.endsWith('.md')
+            || type === 'application/pdf'
+            || type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            || type === 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            || type === 'text/plain'
+            || type === 'text/markdown'
+            || type === 'text/x-markdown';
+    },
+
+    loadDocumentFile(file) {
+        if (!this.isSupportedDocumentFile(file)) {
+            alert(window.t('chat.error.invalid_document_type'));
+            return;
+        }
+
+        const maxFiles = this.markitdownSettings.max_files_per_request || 5;
+        if (this.uploadDocuments.length >= maxFiles) {
+            alert(window.t('chat.error.too_many_documents'));
+            return;
+        }
+
+        const maxSize = (this.markitdownSettings.max_file_size_mb || 25) * 1024 * 1024;
+        if (file.size > maxSize) {
+            alert(window.t('chat.error.document_too_large'));
+            return;
+        }
+
+        const id = `doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        this.uploadDocuments.push({
+            id,
+            filename: file.name,
+            mimeType: file.type || this.mimeTypeForDocumentName(file.name),
+            base64: null,
+            _pending: true,
+        });
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const entry = this.uploadDocuments.find(doc => doc.id === id);
+            if (!entry?._pending) return;
+            entry.base64 = e.target.result;
+            delete entry._pending;
+        };
+        reader.onerror = () => {
+            const idx = this.uploadDocuments.findIndex(doc => doc.id === id);
+            if (idx >= 0) this.uploadDocuments.splice(idx, 1);
+            alert(window.t('chat.error.document_load_failed'));
+        };
+        reader.readAsDataURL(file);
+    },
+
+    mimeTypeForDocumentName(name) {
+        const lower = (name || '').toLowerCase();
+        if (lower.endsWith('.pdf')) return 'application/pdf';
+        if (lower.endsWith('.docx')) return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        if (lower.endsWith('.pptx')) return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+        if (lower.endsWith('.txt')) return 'text/plain';
+        if (lower.endsWith('.md')) return 'text/markdown';
+        return 'application/octet-stream';
+    },
+
+    removeDocument(index) {
+        this.uploadDocuments.splice(index, 1);
     },
 
     handlePaste(event) {
@@ -3426,6 +3758,16 @@
         if (!Array.isArray(content)) return [];
         const count = content.filter(p => p.type === 'image_url' && !p.image_url?.url).length;
         return Array.from({ length: count }, (_, i) => i);
+    },
+
+    getDocumentFiles(content) {
+        if (!Array.isArray(content)) return [];
+        return content
+            .filter(p => p.type === 'file' && p.file)
+            .map(p => ({
+                filename: p.file.filename || window.t('chat.document_not_available'),
+                hasData: Boolean(p.file.file_data || p.file.data),
+            }));
     },
 
     // ===== End Image Upload Functions =====
@@ -3536,19 +3878,16 @@
 
             async loadModels() {
         try {
-            // Fetch models, admin model list, and server health in parallel
-            const [modelsResponse, adminModelsResponse, healthResponse] = await Promise.all([
-                fetch('/v1/models', {
-                    headers: {
-                        'Authorization': `Bearer ${this.getApiKey()}`
-                    }
-                }),
-                fetch('/admin/api/models', {
-                    headers: {
-                        'Authorization': `Bearer ${this.getApiKey()}`
-                    }
-                }),
-                fetch('/health')
+            this._adminModelsList = null;
+            const apiHeaders = this.getApiKey()
+                ? { 'Authorization': `Bearer ${this.getApiKey()}` }
+                : {};
+            // Fetch models, admin model list, server health, and integration settings in parallel
+            const [modelsResponse, adminModelsResponse, healthResponse, settingsResponse] = await Promise.all([
+                fetch('/v1/models', { headers: apiHeaders }),
+                fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
+                fetch('/health'),
+                fetch('/admin/api/global-settings', { credentials: 'same-origin' })
             ]);
 
             if (!modelsResponse.ok) {
@@ -3579,6 +3918,15 @@
                     }
                 }
             }
+            if (settingsResponse.ok) {
+                const settingsData = await settingsResponse.json();
+                const integrations = settingsData.integrations || {};
+                this.markitdownSettings = {
+                    enabled: integrations.markitdown_enabled !== false,
+                    max_file_size_mb: integrations.markitdown_max_file_size_mb || 25,
+                    max_files_per_request: integrations.markitdown_max_files_per_request || 5,
+                };
+            }
             this._mirrorAliasModelTypes();
 
             const modelsData = await modelsResponse.json();
@@ -3586,15 +3934,17 @@
 
             // Build available models with gateway id (directory name) as the value
             // Store alias for display (in case we want to show it later)
-            this.availableModels = allModels.filter(m => {
-                const gatewayId = this.aliasToGateway[m.id] || m.id;
-                const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
-            }).map(m => ({
-                id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
-                name: m.id, // original name (alias or directory name) for display
-                owned_by: m.owned_by
-            }));
+            this.availableModels = this.dedupeAvailableModels(
+                allModels.filter(m => {
+                    const gatewayId = this.aliasToGateway[m.id] || m.id;
+                    const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
+                    return !t.startsWith('audio_') && t !== 'embedding' && t !== 'reranker';
+                }).map(m => ({
+                    id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
+                    name: m.id, // original name (alias or directory name) for display
+                    owned_by: m.owned_by
+                }))
+            );
 
             // Get default model from health endpoint
             let defaultModel = null;
@@ -3603,20 +3953,14 @@
                 defaultModel = healthData.default_model;
             }
 
-            // Auto-select default model if set, otherwise first model (gateway id)
-            if (!this.currentModel && this.availableModels.length > 0) {
-                this.currentModel = this.availableModels[0].id;
-                if (defaultModel) {
-                    this.currentModel = this.aliasToGateway[defaultModel] || defaultModel;
-                }
-            }
+            this.reconcileCurrentModelAfterLoad(defaultModel);
         } catch (error) {
             console.error('Error loading models:', error);
         }
     },
 
-    async fetchAdminModelsList() {
-        if (this._adminModelsList) return this._adminModelsList;
+    async fetchAdminModelsList({ force = false } = {}) {
+        if (!force && this._adminModelsList) return this._adminModelsList;
         if (this._adminModelsListPromise) return this._adminModelsListPromise;
         this._adminModelsListPromise = fetch('/admin/api/models', { credentials: 'same-origin' })
             .then(async (response) => {
@@ -4025,6 +4369,7 @@
         const systemPrompt = sysDefault ? sysDefault.content : '';
         this.currentChatId = chatId;
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.inputMessage = '';
         this.systemPrompt = systemPrompt;
         this.activePromptProfile = sysDefault ? sysDefault.name : null;
@@ -4143,6 +4488,16 @@
                     if (part.type === 'image_url') {
                         return { type: 'image_url', image_url: { url: '' } };
                     }
+                    if (part.type === 'file') {
+                        return {
+                            type: 'file',
+                            file: {
+                                filename: part.file?.filename || '',
+                                mime_type: part.file?.mime_type || '',
+                                data: '',
+                            },
+                        };
+                    }
                     return part;
                 })
             };
@@ -4234,13 +4589,16 @@
     async sendMessage() {
         const userText = this.inputMessage.trim();
         const images = this.uploadImages.filter(img => img.base64);
+        const documents = this.uploadDocuments.filter(doc => doc.base64);
 
-        if (!userText && images.length === 0) return;
+        if (this.hasPendingUploads()) return;
+        if (!userText && images.length === 0 && documents.length === 0) return;
         if (!this.currentModel || this.isCurrentChatStreaming()) return;
 
         // Clear input state
         this.inputMessage = '';
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.$nextTick(() => {
             if (this.$refs.messageInput) {
                 this.resetTextareaHeight(this.$refs.messageInput);
@@ -4260,10 +4618,19 @@
 
         // Build message content (OpenAI content array for images, string for text-only)
         let content;
-        if (images.length > 0) {
+        if (images.length > 0 || documents.length > 0) {
             content = [];
             for (const img of images) {
                 content.push({ type: 'image_url', image_url: { url: img.base64 } });
+            }
+            for (const doc of documents) {
+                content.push({
+                    type: 'file',
+                    file: {
+                        filename: doc.filename,
+                        file_data: doc.base64,
+                    },
+                });
             }
             if (userText) {
                 content.push({ type: 'text', text: userText });
@@ -4341,6 +4708,8 @@
             stream.sourceSystemPrompt = context.systemPrompt;
             stream.sourceProfile = context._profile;
             stream.streamingContent = '';
+            stream.streamingThinking = '';
+            stream.streamingThinkingOpen = false;
         stream.abortController = new AbortController();
         this.autoScrollEnabled = true;
               
@@ -4601,6 +4970,8 @@
                 }
 
                 stream.streamingContent = '';
+                stream.streamingThinking = '';
+                stream.streamingThinkingOpen = false;
                 this.resetStreamRenderState(stream);
 
                 // Recurse — model synthesises final answer using tool results
@@ -4699,8 +5070,37 @@
                 }
                 if (msg) {
                         const totalTime = ((Date.now() - stream._statusStart) / 1000).toFixed(2);
-                        if (stream.statusLog.length > 0) {
-                            msg._perfLog = [...stream.statusLog];
+                        const perfEntries = [];
+                        const meta = msg.meta || {};
+                        const gen = meta.generation || {};
+                        const parts = [];
+                        const scalarLabels = [
+                            ['temperature', 'temp'],
+                            ['max_tokens', 'max_tok'],
+                            ['top_p', 'top_p'],
+                            ['top_k', 'top_k'],
+                            ['min_p', 'min_p'],
+                            ['repetition_penalty', 'rep_pen'],
+                            ['presence_penalty', 'pres_pen'],
+                        ];
+                        for (const [key, label] of scalarLabels) {
+                            if (gen[key] != null) parts.push(`${label}=${gen[key]}`);
+                        }
+                        const ctk = gen.chat_template_kwargs;
+                        if (ctk && typeof ctk.enable_thinking === 'boolean') {
+                            parts.push(`think=${ctk.enable_thinking ? 'on' : 'off'}`);
+                        }
+                        if (gen.thinking_budget != null) parts.push(`think_budget=${gen.thinking_budget}`);
+                        const modelLabel = meta.modelDisplay
+                            || this.availableModels.find(m => m.id === (stream.sourceModel || context.model))?.name
+                            || stream.sourceModel
+                            || context.model
+                            || '?';
+                        const summary = parts.length ? `${modelLabel} · ${parts.join(', ')}` : modelLabel;
+                        perfEntries.push({ t: '', text: summary, icon: null });
+                        perfEntries.push(...stream.statusLog);
+                        if (perfEntries.length > 0) {
+                            msg._perfLog = perfEntries;
                             msg._perfTotal = totalTime + 's total';
                         }
                         const msgStats = this.buildStreamRecentStats(stream, totalTime);
@@ -4927,6 +5327,16 @@
                     if (part.type === 'image_url') {
                         return { type: 'image_url', image_url: { url: '' } };
                     }
+                    if (part.type === 'file') {
+                        return {
+                            type: 'file',
+                            file: {
+                                filename: part.file?.filename || '',
+                                mime_type: part.file?.mime_type || '',
+                                data: '',
+                            },
+                        };
+                    }
                     return part;
                 })
             };
@@ -4967,6 +5377,8 @@
             if (el.offsetParent === null) return;
             const msgIndex = parseInt(el.dataset.msgIndex, 10);
             if (Number.isNaN(msgIndex)) return;
+            const msg = this.messages[msgIndex];
+            if (!msg || msg.role !== 'user') return;
             const msgTop = el.offsetTop;
             const ratio = scrollMax > 0 ? Math.min(msgTop / scrollMax, 1) : 0;
             result.push({ index: msgIndex, topPx: 16 + (ratio * (railHeight - 32)) });
@@ -4984,6 +5396,8 @@
             if (el.offsetParent === null) return;
             const msgIndex = parseInt(el.dataset.msgIndex, 10);
             if (Number.isNaN(msgIndex)) return;
+            const msg = this.messages[msgIndex];
+            if (!msg || msg.role !== 'user') return;
             const offset = el.offsetTop;
             if (offset <= scrollTop + 60) {
                 active = msgIndex;
@@ -5109,6 +5523,7 @@
         this.messages = [];
         this.inputMessage = '';
         this.uploadImages = [];
+        this.uploadDocuments = [];
         this.editingIndex = null;
         this.editContent = '';
         this.editImages = [];
@@ -5385,6 +5800,28 @@
         stream.streamRenderState.stableText = '';
     },
 
+    setAllowSvg(enabled) {
+        this.allowSvg = !!enabled;
+        localStorage.setItem('omlx-chat-allow-svg', this.allowSvg ? 'true' : 'false');
+        this.refreshCodeBlockButtons();
+    },
+
+    refreshCodeBlockButtons() {
+        const container = document.getElementById('messagesContainer');
+        if (!container) return;
+
+        container.querySelectorAll('.svg-preview-container').forEach(preview => {
+            const wrapper = preview.parentElement;
+            const pre = wrapper?.querySelector('pre');
+            if (pre) pre.style.display = '';
+            const copyBtn = wrapper?.querySelector('.code-copy-btn');
+            if (copyBtn) copyBtn.style.display = '';
+            preview.remove();
+        });
+        container.querySelectorAll('.code-btn-row').forEach(row => row.remove());
+        this.addCodeCopyButtons(container);
+    },
+
     addCodeCopyButtons(root = null) {
         const container = root || document.getElementById('messagesContainer');
         if (!container) return;
@@ -5401,22 +5838,68 @@
                 wrapper.appendChild(pre);
             }
 
-            // Check if button already exists
-            if (pre.parentElement.querySelector('.code-copy-btn')) return;
+            // Check if button row already exists
+            if (pre.parentElement.querySelector('.code-btn-row')) return;
+
+            // Detect SVG code blocks
+            const rawText = codeBlock.textContent;
+            const isSvg = /^\s*(?:<\?xml[^?]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)?<svg[\s>]/i.test(rawText);
+
+            // Create button row
+            const btnRow = document.createElement('div');
+            btnRow.className = 'code-btn-row';
+
+            // Create SVG render button (only for SVG blocks when allowed)
+            if (isSvg && this.allowSvg) {
+                const wandIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/></svg>';
+                const renderBtn = document.createElement('button');
+                renderBtn.className = 'svg-render-btn';
+                renderBtn.innerHTML = wandIcon + ' Render';
+                renderBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const wrapper = pre.parentElement;
+                    const copyBtn = wrapper.querySelector('.code-copy-btn');
+                    let preview = wrapper.querySelector('.svg-preview-container');
+                    if (preview) {
+                        // Toggle back to code view
+                        preview.remove();
+                        pre.style.display = '';
+                        if (copyBtn) copyBtn.style.display = '';
+                        renderBtn.innerHTML = wandIcon + ' Render';
+                        return;
+                    }
+                    const sanitized = DOMPurify.sanitize(rawText, {
+                        ADD_TAGS: ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'g', 'defs', 'clipPath', 'text', 'tspan', 'symbol', 'linearGradient', 'radialGradient', 'stop', 'pattern', 'mask', 'title', 'desc'],
+                        ADD_ATTR: ['viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'd', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points', 'transform', 'clip-path', 'opacity', 'gradientUnits', 'gradientTransform', 'offset', 'stop-color', 'stop-opacity', 'font-size', 'font-family', 'text-anchor', 'dominant-baseline', 'width', 'height', 'preserveAspectRatio', 'filter', 'flood-color', 'flood-opacity', 'in', 'in2', 'type', 'values', 'stdDeviation', 'result', 'patternTransform', 'patternUnits', 'spreadMethod', 'fx', 'fy'],
+                    });
+                    if (!sanitized || !sanitized.includes('<svg')) return;
+                    preview = document.createElement('div');
+                    preview.className = 'svg-preview-container';
+                    preview.innerHTML = sanitized;
+                    pre.style.display = 'none';
+                    if (copyBtn) copyBtn.style.display = 'none';
+                    wrapper.appendChild(preview);
+                    renderBtn.innerHTML = '\u2190 Back';
+                };
+                btnRow.appendChild(renderBtn);
+            }
 
             // Create copy button
+            const copyIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy-btn';
-            copyBtn.textContent = 'Copy';
+            copyBtn.innerHTML = copyIcon + ' Copy';
             copyBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 this._copyText(codeBlock.textContent).then(() => {
-                    copyBtn.textContent = 'Copied!';
-                    setTimeout(() => copyBtn.textContent = 'Copy', 2000);
+                    copyBtn.innerHTML = copyIcon + ' Copied!';
+                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' Copy', 2000);
                 });
             };
-            pre.parentElement.appendChild(copyBtn);
+            btnRow.appendChild(copyBtn);
+            pre.parentElement.appendChild(btnRow);
         });
     },
 

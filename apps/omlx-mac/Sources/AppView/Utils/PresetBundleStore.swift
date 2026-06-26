@@ -16,10 +16,11 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class PresetBundleStore: ObservableObject {
-    @Published private(set) var entries: [PresetEntry] = []
-    @Published private(set) var isRefreshing: Bool = false
-    @Published private(set) var lastError: String?
+@Observable
+final class PresetBundleStore {
+    private(set) var entries: [PresetEntry] = []
+    private(set) var isRefreshing: Bool = false
+    private(set) var lastError: String?
 
     /// Where we persist the most recent successful bundle. Same role as
     /// HTML's `localStorage.omlx_preset_cache`.

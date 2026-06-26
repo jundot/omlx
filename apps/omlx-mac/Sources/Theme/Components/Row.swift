@@ -53,7 +53,7 @@ struct Row<Trailing: View>: View {
                 Rectangle()
                     .fill(theme.rowSep)
                     .frame(height: 0.5)
-                    .padding(.leading, 14)
+                    .padding(.horizontal, 14)
             }
         }
     }
@@ -92,9 +92,81 @@ struct FreeRow<Content: View>: View {
                     Rectangle()
                         .fill(theme.rowSep)
                         .frame(height: 0.5)
-                        .padding(.leading, 14)
+                        .padding(.horizontal, 14)
                 }
             }
+    }
+}
+
+struct LinkRow<Icon: View>: View {
+    let label: String
+    let sublabel: String
+    let url: URL
+    var isLast: Bool = false
+
+    private let iconView: Icon
+
+    @Environment(\.omlxTheme) private var theme
+
+    init(
+        label: String,
+        sublabel: String,
+        url: URL,
+        isLast: Bool = false,
+        @ViewBuilder iconView: () -> Icon
+    ) {
+        self.label = label
+        self.sublabel = sublabel
+        self.url = url
+        self.isLast = isLast
+        self.iconView = iconView()
+    }
+
+    init(
+        label: String,
+        sublabel: String,
+        icon: String,
+        url: URL,
+        isLast: Bool = false
+    ) where Icon == AnyView {
+        self.label = label
+        self.sublabel = sublabel
+        self.url = url
+        self.isLast = isLast
+        self.iconView = AnyView(
+            Image(systemName: icon)
+                .font(.system(size: 14))
+                .frame(width: 18, alignment: .center)
+        )
+    }
+
+    var body: some View {
+        FreeRow(isLast: isLast) {
+            HStack(spacing: 10) {
+                iconView
+                    .foregroundStyle(theme.textSecondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(label)
+                        .font(.omlxText(13, weight: .medium))
+                        .foregroundStyle(theme.text)
+                    Text(sublabel)
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Label("common.open", systemImage: "arrow.up.right.square")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.omlx(.plain, size: .small))
+            }
+        }
     }
 }
 
@@ -105,9 +177,9 @@ struct FreeRow<Content: View>: View {
     return ListGroup {
         Row(
             label: "Listen Address",
-            sublabel: "Default 8080. Restart server to apply."
+            sublabel: "Default 8000. Restart server to apply."
         ) {
-            CodeChip(value: "127.0.0.1:8080")
+            CodeChip(value: "127.0.0.1:8000")
         }
         Row(label: "Auto-start on launch") {
             Toggle("", isOn: $autoStart).labelsHidden().toggleStyle(.switch)

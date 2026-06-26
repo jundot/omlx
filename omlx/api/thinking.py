@@ -10,20 +10,134 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
+from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
-
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
 _CLOSE_TAG = "</think>"
 _OPEN_LEN = len(_OPEN_TAG)   # 7
 _CLOSE_LEN = len(_CLOSE_TAG)  # 8
+_MINIMAX_OPEN_TAG = "<mm:think>"
+_MINIMAX_CLOSE_TAG = "</mm:think>"
 
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+
+
+def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
+    if tokenizer is None:
+        return default
+    try:
+        return getattr(tokenizer, attr, default)
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
+def _single_token_id(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _convert_token_to_id(tokenizer, token: str) -> int | None:
+    convert = _safe_tokenizer_attr(tokenizer, "convert_tokens_to_ids")
+    if not callable(convert):
+        return None
+    try:
+        token_id = convert(token)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if token_id == _safe_tokenizer_attr(tokenizer, "unk_token_id"):
+        return None
+    return _single_token_id(token_id)
+
+
+def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
+    encode = _safe_tokenizer_attr(tokenizer, "encode")
+    if not callable(encode):
+        return None
+    try:
+        return list(encode(prompt, add_special_tokens=False))
+    except TypeError:
+        try:
+            return list(encode(prompt))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _think_end_token_ids(tokenizer) -> list[int] | None:
+    think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
+    if think_end_id is not None:
+        return [think_end_id]
+
+    think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
+    encoded = _encode_prompt_ids(tokenizer, think_end_tag or _CLOSE_TAG)
+    if encoded:
+        return encoded
+
+    token_id = _convert_token_to_id(tokenizer, _CLOSE_TAG)
+    if token_id is not None:
+        return [token_id]
+    return None
+
+
+def prompt_opens_thinking(
+    tokenizer,
+    prompt: str,
+    prompt_token_ids: Sequence[int] | None = None,
+) -> tuple[bool, str]:
+    """Return whether a raw prompt would make the engine prepend ``<think>``.
+
+    Presentation-layer stripping must mirror the engine/scheduler decision, not
+    just the raw text suffix. Some prompts can contain a literal ``<think>``
+    without tokenizing to the model's think-start id, and templates can leave
+    the think-start token in the final token tail without the raw string ending
+    in the visible tag. When the caller already has prompt ids from the same
+    tokenizer path as the scheduler, those ids are authoritative.
+    """
+    think_tag = (
+        _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
+    )
+    if tokenizer is None:
+        return prompt.rstrip().endswith(think_tag), think_tag
+
+    think_start_id = _single_token_id(
+        _safe_tokenizer_attr(tokenizer, "think_start_id")
+    )
+    if think_start_id is None:
+        think_start_id = _convert_token_to_id(tokenizer, think_tag)
+    if think_start_id is None:
+        return False, think_tag
+
+    if prompt_token_ids is None:
+        prompt_ids = _encode_prompt_ids(tokenizer, prompt)
+    else:
+        prompt_ids = list(prompt_token_ids)
+    if not prompt_ids or not think_start_id:
+        return False, think_tag
+
+    last_tokens = list(prompt_ids[-3:])
+    if think_start_id not in last_tokens:
+        return False, think_tag
+
+    last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+    after_start = last_tokens[last_idx + 1 :]
+
+    if after_start:
+        think_end_ids = _think_end_token_ids(tokenizer)
+        if think_end_ids and think_end_ids[0] in after_start:
+            return False, think_tag
+
+    return True, think_tag
 
 
 def extract_thinking(text: str) -> Tuple[str, str]:
@@ -54,6 +168,10 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     """
     if not text:
         return ("", "")
+
+    text = text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG).replace(
+        _MINIMAX_CLOSE_TAG, _CLOSE_TAG
+    )
 
     thinking_parts = []
     remaining = text
@@ -278,6 +396,7 @@ class ThinkingBudgetProcessor:
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
+        token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -288,31 +407,24 @@ class ThinkingBudgetProcessor:
         )
         self._budget = budget
         self._think_start_id = think_start_token_id
+        self._token_to_piece = token_to_piece
 
         # State
         self._thinking_tokens: int = 0
         self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
         self._forcing: bool = False
+        self._waiting_utf8: bool = False
         self._force_idx: int = 0
         self._done: bool = False
         self._first_call: bool = True
-        # After forced sequence, suppress duplicate </think> tokens
-        self._suppress_end: bool = False
         # Sliding window for multi-token end detection
         self._recent_tokens: List[int] = []
-        # Flat set for fast single-token suppression check
-        self._end_id_set = set(think_end_token_ids)
+        self._last_token_utf8_complete: bool = True
+        self._pending_utf8: bytes = b""
 
     def __call__(self, tokens, logits):
         """mlx-lm logits processor: (tokens, logits) -> logits."""
         import mlx.core as mx
-
-        if self._done:
-            return logits
-
-        # Post-forcing phase: suppress duplicate </think> tokens
-        if self._suppress_end:
-            return self._suppress_end_tokens(logits, mx)
 
         # In new mlx-lm API, tokens is the full history list.
         # Accept each genuinely generated token exactly once (see grammar.py).
@@ -327,31 +439,44 @@ class ThinkingBudgetProcessor:
         # If state changed by _update_state, handle immediately
         if self._done:
             return logits
-        if self._suppress_end:
-            return self._suppress_end_tokens(logits, mx)
 
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        if self._waiting_utf8:
+            return logits
+
         if self._in_thinking:
             self._thinking_tokens += 1
             if self._thinking_tokens >= self._budget:
-                self._forcing = True
-                self._force_idx = 0
-                return self._force_next_token(logits, mx)
+                if self._last_token_utf8_complete:
+                    self._forcing = True
+                    self._force_idx = 0
+                    self._recent_tokens = []
+                    return self._force_next_token(logits, mx)
+                self._waiting_utf8 = True
+                self._recent_tokens = []
 
         return logits
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
+        self._last_token_utf8_complete = self._is_utf8_complete(token_id)
+
+        if self._done:
+            if self._think_start_id and token_id == self._think_start_id:
+                self._in_thinking = True
+                self._done = False
+                self._thinking_tokens = 0
+                self._recent_tokens = []
+            return
+
         if self._forcing:
             self._force_idx += 1
             if self._force_idx >= len(self._force_sequence):
                 self._in_thinking = False
                 self._forcing = False
-                # Don't set _done — enter suppression mode to prevent
-                # the model from generating a duplicate </think>.
-                self._suppress_end = True
+                self._done = True
             return
 
         # Detect natural close-think via sliding window
@@ -369,9 +494,46 @@ class ThinkingBudgetProcessor:
                 self._done = True
                 return
 
+        if self._waiting_utf8:
+            if self._last_token_utf8_complete:
+                self._waiting_utf8 = False
+                self._forcing = True
+                self._force_idx = 0
+                self._recent_tokens = []
+            return
+
         # Detect re-entry into thinking (rare but possible)
         if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
             self._in_thinking = True
+            self._done = False
+            self._thinking_tokens = 0
+            self._recent_tokens = []
+
+    def _is_utf8_complete(self, token_id: int) -> bool:
+        """Best-effort UTF-8 boundary check for accepted token bytes."""
+        if self._token_to_piece is None:
+            return True
+        try:
+            piece = self._token_to_piece(token_id)
+        except Exception:
+            return True
+        if piece is None:
+            return True
+        if isinstance(piece, str):
+            self._pending_utf8 = b""
+            return True
+        self._pending_utf8 += piece
+        try:
+            self._pending_utf8.decode("utf-8")
+            self._pending_utf8 = b""
+            return True
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data" or exc.end == len(
+                self._pending_utf8
+            ):
+                return False
+            self._pending_utf8 = b""
+            return True
 
     def _force_next_token(self, logits, mx):
         """Force the next token in the close-think + trailing sequence."""
@@ -379,11 +541,3 @@ class ThinkingBudgetProcessor:
         forced = mx.full(logits.shape, float("-inf"))
         forced[..., target_id] = 0.0
         return forced
-
-    def _suppress_end_tokens(self, logits, mx):
-        """Suppress duplicate </think> tokens after forced close."""
-        # Set logits of all end-token IDs to -inf so the model
-        # cannot produce another </think>.
-        for tid in self._end_id_set:
-            logits[..., tid] = float("-inf")
-        return logits

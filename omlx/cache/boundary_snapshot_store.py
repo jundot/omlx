@@ -20,6 +20,7 @@ import os
 import queue
 import shutil
 import threading
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,17 @@ logger = logging.getLogger(__name__)
 _MAX_PENDING_WRITES = 128
 
 
+def reset_boundary_snapshot_root(base_dir: Path) -> None:
+    """Remove all boundary snapshot sessions for a server lifecycle boundary."""
+    snapshot_root = base_dir / "_boundary_snapshots"
+    if snapshot_root.exists():
+        try:
+            shutil.rmtree(snapshot_root)
+        except Exception as e:
+            logger.warning("Failed to reset boundary snapshots: %s", e)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+
 class BoundarySnapshotSSDStore:
     """Temporary SSD storage for boundary cache snapshots.
 
@@ -53,7 +65,8 @@ class BoundarySnapshotSSDStore:
     ----------
     base_dir : Path
         Parent directory for the SSD cache (typically ``paged_ssd_cache_dir``).
-        Snapshots are stored under ``base_dir/_boundary_snapshots/``.
+        Snapshots are stored under
+        ``base_dir/_boundary_snapshots/<session_id>/<request_id>/``.
     """
 
     # Timeouts applied when acquiring _writer_busy from each cleanup
@@ -68,13 +81,9 @@ class BoundarySnapshotSSDStore:
     _CLEANUP_REQUEST_TIMEOUT_S = 2.0
 
     def __init__(self, base_dir: Path) -> None:
-        self._snapshot_dir = base_dir / "_boundary_snapshots"
-        # Clean up orphaned files from previous crashes.
-        if self._snapshot_dir.exists():
-            try:
-                shutil.rmtree(self._snapshot_dir)
-            except Exception as e:
-                logger.warning("Failed to clean up orphaned boundary snapshots: %s", e)
+        self._snapshot_root = base_dir / "_boundary_snapshots"
+        self._session_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+        self._snapshot_dir = self._snapshot_root / self._session_id
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         # request_id -> {token_count -> file_path}
@@ -383,7 +392,7 @@ class BoundarySnapshotSSDStore:
                 )
 
     def cleanup_all(self) -> None:
-        """Delete all snapshot files (for reset/startup).
+        """Delete all snapshot files for this store session.
 
         Synchronizes with the background writer: we drain the queue to
         prevent it from starting a new item, then acquire ``_writer_busy``

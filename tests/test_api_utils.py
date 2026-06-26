@@ -10,18 +10,16 @@ import logging
 
 import pytest
 
-from omlx.api.utils import (
-    SPECIAL_TOKENS_PATTERN,
-    _chat_template_supports_tool_role,
-    _consolidate_system_messages,
-    _drop_void_assistant_messages,
-    _extract_multimodal_content_list,
-    _merge_consecutive_roles,
-    clean_output_text,
-    detect_and_strip_partial,
-    extract_harmony_messages,
-    extract_multimodal_content,
-    extract_text_content,
+from omlx.api.anthropic_models import (
+    AnthropicMessage,
+    AnthropicTool,
+    ContentBlockDocument,
+    ContentBlockText,
+    ContentBlockThinking,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
+    MessagesRequest,
+    SystemContent,
 )
 from omlx.api.anthropic_utils import (
     convert_anthropic_to_internal,
@@ -38,18 +36,24 @@ from omlx.api.anthropic_utils import (
     create_text_delta_event,
     format_sse_event,
     map_finish_reason_to_stop_reason,
+    request_has_cache_control,
 )
 from omlx.api.openai_models import ContentPart, FunctionCall, Message, ToolCall
-from omlx.api.anthropic_models import (
-    AnthropicMessage,
-    AnthropicTool,
-    ContentBlockDocument,
-    ContentBlockText,
-    ContentBlockThinking,
-    ContentBlockToolResult,
-    ContentBlockToolUse,
-    MessagesRequest,
-    SystemContent,
+from omlx.api.utils import (
+    SPECIAL_TOKENS_PATTERN,
+    _chat_template_supports_tool_role,
+    _consolidate_system_messages,
+    _drop_void_assistant_messages,
+    _extract_multimodal_content_list,
+    _merge_consecutive_roles,
+    chat_template_preserves_mid_system,
+    clean_output_text,
+    detect_and_strip_partial,
+    extract_harmony_messages,
+    extract_multimodal_content,
+    extract_text_content,
+    prepare_system_messages_for_template,
+    uses_native_reasoning_content,
 )
 
 
@@ -115,6 +119,13 @@ class TestCleanOutputText:
         """Test removing [PAD], [SEP], [CLS] tokens."""
         result = clean_output_text("[CLS]Hello[SEP]World[PAD]")
         assert result == "HelloWorld"
+
+    def test_clean_gemma_special_tokens(self):
+        """Gemma special tokens must be stripped from output too (#1087)."""
+        assert clean_output_text("answer<eos>") == "answer"
+        assert clean_output_text("answer<end_of_turn>") == "answer"
+        assert clean_output_text("<start_of_turn>hi") == "hi"
+        assert clean_output_text("<bos>hello<eos>") == "hello"
 
     def test_clean_multiple_tokens(self):
         """Test removing multiple special tokens."""
@@ -547,7 +558,9 @@ class TestExtractTextContentNativeReasoningContent:
                 role="assistant",
                 reasoning_content="R",
                 content="calling",
-                tool_calls=[{"id": "c1", "function": {"name": "fn", "arguments": "{}"}}],
+                tool_calls=[
+                    {"id": "c1", "function": {"name": "fn", "arguments": "{}"}}
+                ],
             ),
         ]
 
@@ -573,6 +586,47 @@ class TestExtractTextContentNativeReasoningContent:
         assert len(result) == 1
         assert result[0]["content"] == "A"
         assert "reasoning_content" not in result[0]
+
+    def test_native_mode_recovers_inline_thinking_from_history(self):
+        """Inline <think> history is converted back to a native reasoning field."""
+        messages = [
+            Message(role="assistant", content="<think>\nR\n</think>\n\nA"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_recovers_minimax_inline_thinking_from_history(self):
+        """MiniMax native tags are also normalized into reasoning_content."""
+        messages = [
+            Message(role="assistant", content="<mm:think>R</mm:think>A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+
+
+class TestUsesNativeReasoningContent:
+    def test_detects_minimax_m3_by_config_type(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="minimax_m3_vl",
+        )
+
+    def test_detects_minimax_m3_by_model_name(self):
+        assert uses_native_reasoning_content("MiniMax-M3-4bit")
+
+    def test_preserve_thinking_models_are_native(self):
+        assert uses_native_reasoning_content(
+            "qwen",
+            preserve_thinking_default=True,
+        )
+
+    def test_plain_model_is_not_native(self):
+        assert not uses_native_reasoning_content("llama-3")
 
 
 class TestConvertAnthropicToInternal:
@@ -609,6 +663,25 @@ class TestConvertAnthropicToInternal:
         assert result[0]["role"] == "system"
         assert result[0]["content"] == "Be helpful"
         assert result[1]["role"] == "user"
+
+    def test_inline_system_position_can_be_deferred(self):
+        """Server path can defer inline system placement until template probing."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hello"),
+                AnthropicMessage(role="system", content="Cacheable tail note"),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            consolidate_system_messages=False,
+        )
+
+        assert [message["role"] for message in result] == ["user", "system"]
+        assert result[1]["content"] == "Cacheable tail note"
 
     def test_content_blocks(self):
         """Test converting message with content blocks."""
@@ -1445,8 +1518,13 @@ class TestConvertInternalToAnthropicResponse:
         # Should have at least one content block
         assert len(result.content) >= 1
 
-    def test_prefix_cache_disabled_legacy_shape(self):
-        """Caching off: usage keeps the legacy shape (input=prompt, cache=0)."""
+    def test_no_cache_control_legacy_shape(self):
+        """No cache_control: usage keeps the legacy shape (input=prompt, cache=0).
+
+        Engine-internal prefix cache hits MUST NOT leak into the Anthropic
+        cache fields when the client did not opt in via cache_control — that
+        would violate the spec contract for input_tokens (#1487).
+        """
         result = convert_internal_to_anthropic_response(
             text="hi",
             model="claude-3",
@@ -1454,15 +1532,31 @@ class TestConvertInternalToAnthropicResponse:
             completion_tokens=5,
             finish_reason="stop",
             cached_tokens=40,
-            prefix_cache_enabled=False,
+            request_uses_cache_control=False,
         )
 
         assert result.usage.input_tokens == 100
         assert result.usage.cache_creation_input_tokens == 0
         assert result.usage.cache_read_input_tokens == 0
 
-    def test_prefix_cache_enabled_splits_prompt(self):
-        """Caching on: prompt splits into input(0) + creation + read."""
+    def test_cache_control_cold_partitions_to_creation(self):
+        """cache_control + cold prefix cache: input=0, cw=prompt, cr=0."""
+        result = convert_internal_to_anthropic_response(
+            text="hi",
+            model="claude-3",
+            prompt_tokens=100,
+            completion_tokens=5,
+            finish_reason="stop",
+            cached_tokens=0,
+            request_uses_cache_control=True,
+        )
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.cache_creation_input_tokens == 100
+        assert result.usage.cache_read_input_tokens == 0
+
+    def test_cache_control_warm_partitions_to_read(self):
+        """cache_control + warm prefix hit: input=0, cw=tail, cr=hit."""
         result = convert_internal_to_anthropic_response(
             text="hi",
             model="claude-3",
@@ -1470,12 +1564,118 @@ class TestConvertInternalToAnthropicResponse:
             completion_tokens=5,
             finish_reason="stop",
             cached_tokens=20,
-            prefix_cache_enabled=True,
+            request_uses_cache_control=True,
         )
 
         assert result.usage.input_tokens == 0
         assert result.usage.cache_creation_input_tokens == 80
         assert result.usage.cache_read_input_tokens == 20
+
+    def test_usage_triple_is_disjoint_partition(self):
+        """input + cw + cr must equal prompt_tokens in every accounting mode (#1487)."""
+        for uses_cc in (True, False):
+            for cached in (0, 25, 100, 200):
+                result = convert_internal_to_anthropic_response(
+                    text="hi",
+                    model="claude-3",
+                    prompt_tokens=100,
+                    completion_tokens=5,
+                    finish_reason="stop",
+                    cached_tokens=cached,
+                    request_uses_cache_control=uses_cc,
+                )
+                u = result.usage
+                assert (
+                    u.input_tokens
+                    + u.cache_creation_input_tokens
+                    + u.cache_read_input_tokens
+                    == 100
+                ), (
+                    f"partition broken at uses_cc={uses_cc}, cached={cached}: "
+                    f"{u.input_tokens} + {u.cache_creation_input_tokens} + "
+                    f"{u.cache_read_input_tokens} != 100"
+                )
+                # cached_tokens > prompt_tokens must clamp, never under-report.
+                assert u.cache_read_input_tokens <= 100
+
+
+class TestRequestHasCacheControl:
+    """Tests for request_has_cache_control — the gate for the Anthropic
+    cache-usage partition (#1487)."""
+
+    @staticmethod
+    def _req(**overrides):
+        kwargs = dict(
+            model="claude-3",
+            max_tokens=10,
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        kwargs.update(overrides)
+        return MessagesRequest(**kwargs)
+
+    def test_no_cache_control_anywhere(self):
+        assert request_has_cache_control(self._req()) is False
+
+    def test_plain_string_system_never_signals(self):
+        """system as a plain string can't carry cache_control."""
+        req = self._req(system="You are helpful.")
+        assert request_has_cache_control(req) is False
+
+    def test_system_block_with_cache_control(self):
+        req = self._req(
+            system=[
+                SystemContent(
+                    type="text", text="ctx", cache_control={"type": "ephemeral"}
+                )
+            ]
+        )
+        assert request_has_cache_control(req) is True
+
+    def test_system_block_without_cache_control(self):
+        req = self._req(system=[SystemContent(type="text", text="ctx")])
+        assert request_has_cache_control(req) is False
+
+    def test_tool_with_cache_control(self):
+        req = self._req(
+            tools=[
+                AnthropicTool(
+                    name="get_weather",
+                    input_schema={"type": "object"},
+                    cache_control={"type": "ephemeral"},
+                )
+            ]
+        )
+        assert request_has_cache_control(req) is True
+
+    def test_document_block_with_cache_control(self):
+        doc = ContentBlockDocument(
+            type="document",
+            source={"type": "base64", "media_type": "text/plain", "data": ""},
+            cache_control={"type": "ephemeral"},
+        )
+        req = self._req(messages=[AnthropicMessage(role="user", content=[doc])])
+        assert request_has_cache_control(req) is True
+
+    def test_text_block_with_cache_control(self):
+        """A cache_control breakpoint set purely on a message text block must
+        be detected, even when system / tools carry no breakpoint (#1487)."""
+        block = ContentBlockText(text="big prefix", cache_control={"type": "ephemeral"})
+        req = self._req(messages=[AnthropicMessage(role="user", content=[block])])
+        assert request_has_cache_control(req) is True
+
+    def test_tool_result_block_with_cache_control(self):
+        block = ContentBlockToolResult(
+            tool_use_id="tu_1",
+            content="result",
+            cache_control={"type": "ephemeral"},
+        )
+        req = self._req(messages=[AnthropicMessage(role="user", content=[block])])
+        assert request_has_cache_control(req) is True
+
+    def test_string_content_message_never_signals(self):
+        """Plain-string message content can't carry cache_control."""
+        req = self._req(messages=[AnthropicMessage(role="user", content="just text")])
+        assert request_has_cache_control(req) is False
 
 
 class TestMapFinishReasonToStopReason:
@@ -1583,19 +1783,34 @@ class TestSSEEventFormatters:
 
         assert '"input_tokens": 100' in result
 
-    def test_create_message_delta_event_prefix_cache_enabled(self):
-        """With caching active, usage splits into disjoint cache fields."""
+    def test_create_message_delta_event_cache_control_splits(self):
+        """With cache_control present, usage splits into disjoint cache fields."""
         result = create_message_delta_event(
             "end_turn",
             10,
             input_tokens=100,
             cached_tokens=30,
-            prefix_cache_enabled=True,
+            request_uses_cache_control=True,
         )
 
         assert '"input_tokens": 0' in result
         assert '"cache_creation_input_tokens": 70' in result
         assert '"cache_read_input_tokens": 30' in result
+
+    def test_create_message_delta_event_no_cache_control_omits_cache_fields(self):
+        """Without cache_control the cache fields stay absent — even if the
+        engine's internal prefix cache hit (#1487)."""
+        result = create_message_delta_event(
+            "end_turn",
+            10,
+            input_tokens=100,
+            cached_tokens=30,
+            request_uses_cache_control=False,
+        )
+
+        assert '"input_tokens": 100' in result
+        assert "cache_creation_input_tokens" not in result
+        assert "cache_read_input_tokens" not in result
 
     def test_create_message_stop_event(self):
         """Test creating message_stop event."""
@@ -1728,7 +1943,6 @@ class TestExtractHarmonyMessages:
         content = result[0]["content"]
         assert isinstance(content, dict)
         assert content["result"] == "success"
-
 
     # -- dict input tests (issue #683) --
 
@@ -1898,16 +2112,350 @@ class TestConsolidateSystemMessages:
     def test_system_message_with_list_content(self):
         """System message with list content should extract text without crashing."""
         msgs = [
-            {"role": "system", "content": [
-                {"type": "text", "text": "Be helpful"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]},
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "Be helpful"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            },
             {"role": "user", "content": "Hello"},
         ]
         result = _consolidate_system_messages(msgs)
         assert result[0]["role"] == "system"
         assert isinstance(result[0]["content"], str)
         assert "Be helpful" in result[0]["content"]
+
+
+class TestPrepareSystemMessagesForTemplate:
+    """Tests for cache-preserving mid-conversation system handling."""
+
+    class PreserveTokenizer:
+        chat_template = "preserve-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "\n".join(
+                f"{msg['role']}:{msg.get('content', '')}" for msg in messages
+            )
+
+    class DropSystemTokenizer:
+        chat_template = "drop-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "\n".join(
+                f"{msg['role']}:{msg.get('content', '')}"
+                for msg in messages
+                if msg["role"] != "system"
+            )
+
+    class MoveSystemToFrontTokenizer:
+        chat_template = "move-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            system = [m for m in messages if m["role"] == "system"]
+            rest = [m for m in messages if m["role"] != "system"]
+            ordered = system + rest
+            return "\n".join(
+                f"{msg['role']}:{msg.get('content', '')}" for msg in ordered
+            )
+
+    class ErrorTokenizer:
+        chat_template = "error-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            raise ValueError("system message must be first")
+
+    class ToolsBranchTokenizer:
+        chat_template = "tools-branch-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            if kwargs.get("tools"):
+                return "\n".join(
+                    f"{msg['role']}:{msg.get('content', '')}" for msg in messages
+                )
+            return "user:__OMLX_MID_SYSTEM_PROBE_USER__"
+
+    def test_preserves_tail_system_when_template_keeps_position(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["user", "system"]
+        assert result[1]["content"] == "Plan mode"
+
+    def test_preserves_between_turn_system_when_template_keeps_position(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Mode changed"},
+            {"role": "assistant", "content": "OK"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["user", "system", "assistant"]
+
+    def test_merges_consecutive_tail_systems_in_place_when_preserved(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+            {"role": "system", "content": "Date changed"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["user", "system"]
+        assert result[1]["content"] == "Plan mode\n\nDate changed"
+
+    def test_falls_back_when_template_drops_mid_system(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.DropSystemTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+        assert result[0]["content"] == "Plan mode"
+
+    def test_falls_back_when_template_moves_mid_system_to_front(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.MoveSystemToFrontTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+
+    def test_falls_back_when_template_raises(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(messages, self.ErrorTokenizer())
+
+        assert [m["role"] for m in result] == ["system", "user"]
+
+    def test_user_note_policy_appends_tail_system_to_user(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["user"]
+        assert result[0]["content"] == (
+            "Hello\n\n[System note]\nPlan mode\n[/System note]"
+        )
+
+    def test_user_note_policy_prepends_system_before_next_user(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "OK"},
+            {"role": "system", "content": "Plan mode"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["user", "assistant", "user"]
+        assert result[2]["content"] == (
+            "[System note]\nPlan mode\n[/System note]\n\nContinue"
+        )
+
+    def test_user_note_policy_keeps_native_tool_history_when_safe(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "Answer"},
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+        ]
+        assert result[3]["content"] == (
+            "Answer\n\n[System note]\nRuntime tip\n[/System note]"
+        )
+
+    def test_user_note_policy_refuses_tool_call_boundary(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["system", "user", "assistant", "tool"]
+
+    def test_user_note_policy_refuses_multimodal_user_target(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png,..."}},
+                ],
+            },
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+        assert result[0]["content"] == "Runtime tip"
+
+    def test_user_note_policy_merges_leading_system_messages(self):
+        """Multiple leading system messages must be merged even when a
+        mid-system message triggers the user_note_safe downgrade path.
+
+        Regression test for: Codex App Desktop sends ``instructions`` plus a
+        system/developer message in ``input``, producing two leading system
+        messages.  When a later mid-system message triggers
+        ``_downgrade_mid_system_to_user_notes``, the leading block was
+        preserved as-is (two separate system messages), causing strict
+        templates like Qwen3.6 to reject with
+        "System message must be at the beginning."
+        """
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "system", "content": "Be concise"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Remember this"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        # All leading system messages must be merged into one
+        assert result[0]["role"] == "system"
+        assert "You are a helpful assistant" in result[0]["content"]
+        assert "Be concise" in result[0]["content"]
+        # No second system message at position 1 — strict templates
+        # (Qwen3.6) require a single system message at the beginning.
+        assert result[1]["role"] != "system", (
+            "Leading system messages were not merged — Qwen3.6-style "
+            "templates would reject this with "
+            "'System message must be at the beginning.'"
+        )
+
+    def test_falls_back_for_unsupported_mid_system_placement(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+        assert result[1]["content"] == "Hello\n\nContinue"
+
+    def test_partial_mode_keeps_strict_fallback(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.PreserveTokenizer(),
+            is_partial=True,
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == ["system", "user"]
+
+    def test_probe_cache_key_distinguishes_tools_branch(self):
+        tokenizer = self.ToolsBranchTokenizer()
+
+        without_tools = chat_template_preserves_mid_system(tokenizer, tools=None)
+        with_tools = chat_template_preserves_mid_system(
+            tokenizer,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Lookup.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        assert without_tools is False
+        assert with_tools is True
 
 
 class TestMergeConsecutiveRoles:
@@ -2032,10 +2580,16 @@ class TestMergeConsecutiveRoles:
     def test_merge_list_content_with_string(self):
         """Merging list content (image) with string content should not crash."""
         msgs = [
-            {"role": "user", "content": [
-                {"type": "text", "text": "Look at this"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Look at this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            },
             {"role": "user", "content": "What do you think?"},
         ]
         result = _merge_consecutive_roles(msgs)
@@ -2053,10 +2607,16 @@ class TestMergeConsecutiveRoles:
         """String content followed by list content should merge correctly."""
         msgs = [
             {"role": "user", "content": "Context text"},
-            {"role": "user", "content": [
-                {"type": "text", "text": "See image"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "See image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,def"},
+                    },
+                ],
+            },
         ]
         result = _merge_consecutive_roles(msgs)
         assert len(result) == 1
@@ -2067,12 +2627,24 @@ class TestMergeConsecutiveRoles:
     def test_merge_two_list_contents(self):
         """Two list contents should concatenate."""
         msgs = [
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,def"},
+                    },
+                ],
+            },
         ]
         result = _merge_consecutive_roles(msgs)
         assert len(result) == 1
@@ -2084,9 +2656,15 @@ class TestMergeConsecutiveRoles:
         """Empty string + list content should take the list content."""
         msgs = [
             {"role": "user", "content": ""},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            },
         ]
         result = _merge_consecutive_roles(msgs)
         assert len(result) == 1
@@ -2206,7 +2784,10 @@ class TestExtractMultimodalContent:
                     {
                         "type": "image_url",
                         "text": None,
-                        "image_url": {"url": "data:image/png;base64,abc", "detail": "auto"},
+                        "image_url": {
+                            "url": "data:image/png;base64,abc",
+                            "detail": "auto",
+                        },
                     },
                 ],
             )
@@ -2215,25 +2796,94 @@ class TestExtractMultimodalContent:
         content = result[0]["content"]
         assert isinstance(content, list)
         img_part = content[1]
-        assert img_part == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        assert img_part == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc"},
+        }
         assert "text" not in img_part
         assert "detail" not in img_part.get("image_url", {})
 
     def test_normalizes_image_url_string_form(self):
         """image_url with string value (not nested dict) should be normalized."""
-        parts = _extract_multimodal_content_list([
-            {"type": "image_url", "image_url": "data:image/png;base64,abc"},
-        ])
+        parts = _extract_multimodal_content_list(
+            [
+                {"type": "image_url", "image_url": "data:image/png;base64,abc"},
+            ]
+        )
         assert len(parts) == 1
-        assert parts[0] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        assert parts[0] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc"},
+        }
 
     def test_image_url_missing_url_dropped(self):
         """image_url item with no extractable URL should be dropped."""
-        parts = _extract_multimodal_content_list([
-            {"type": "image_url", "image_url": None},
-            {"type": "image_url"},
-        ])
+        parts = _extract_multimodal_content_list(
+            [
+                {"type": "image_url", "image_url": None},
+                {"type": "image_url"},
+            ]
+        )
         assert len(parts) == 0
+
+    def test_input_audio_pass_through(self):
+        """input_audio parts survive multimodal content extraction."""
+        parts = _extract_multimodal_content_list(
+            [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "abc", "format": "wav"},
+                },
+            ]
+        )
+        assert len(parts) == 1
+        assert parts[0] == {
+            "type": "input_audio",
+            "input_audio": {"data": "abc", "format": "wav"},
+        }
+
+    def test_input_audio_non_dict_dropped(self):
+        """input_audio with non-dict data is dropped."""
+        parts = _extract_multimodal_content_list(
+            [
+                {"type": "input_audio", "input_audio": None},
+                {"type": "input_audio"},
+            ]
+        )
+        assert len(parts) == 0
+
+    def test_input_audio_preserved_with_image(self):
+        """input_audio and image_url coexist in extracted parts."""
+        parts = _extract_multimodal_content_list(
+            [
+                {"type": "text", "text": "Look and listen"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "xyz", "format": "mp3"},
+                },
+            ]
+        )
+        assert len(parts) == 3
+        types = [p["type"] for p in parts]
+        assert types == ["text", "image_url", "input_audio"]
+
+    def test_input_audio_with_model_dump(self):
+        """input_audio from Pydantic model_dump works."""
+        from unittest.mock import MagicMock
+
+        audio_part = MagicMock()
+        audio_part.model_dump.return_value = {
+            "type": "input_audio",
+            "input_audio": {"data": "audio_data", "format": "wav"},
+        }
+        parts = _extract_multimodal_content_list([audio_part])
+        assert len(parts) == 1
+        assert parts[0]["type"] == "input_audio"
+        assert parts[0]["input_audio"]["format"] == "wav"
 
 
 # =============================================================================
@@ -2670,9 +3320,7 @@ class TestToolResultWithToolAwareTokenizer:
                 tool_call_id="call_xyz",
             )
         ]
-        result = extract_text_content(
-            messages, tokenizer=self._tool_aware_tokenizer()
-        )
+        result = extract_text_content(messages, tokenizer=self._tool_aware_tokenizer())
         assert len(result) == 1
         assert result[0]["role"] == "tool"
         assert result[0]["tool_call_id"] == "call_xyz"
@@ -2709,14 +3357,10 @@ class TestToolResultWithToolAwareTokenizer:
                 ],
             )
         ]
-        result = extract_text_content(
-            messages, tokenizer=self._tool_aware_tokenizer()
-        )
+        result = extract_text_content(messages, tokenizer=self._tool_aware_tokenizer())
         assert len(result) == 1
         assert result[0]["role"] == "assistant"
         assert "tool_calls" in result[0]
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # Arguments are parsed into dict for the chat template.
-        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
-            "city": "Seoul"
-        }
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Seoul"}

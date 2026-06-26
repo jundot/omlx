@@ -26,9 +26,7 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
     if has_mtp:
         keys["language_model.mtp.fc.weight"] = "model.safetensors"
     (tmp_path / "model.safetensors.index.json").write_text(
-        '{"metadata": {}, "weight_map": '
-        + str(keys).replace("'", '"')
-        + "}"
+        '{"metadata": {}, "weight_map": ' + str(keys).replace("'", '"') + "}"
     )
 
 
@@ -158,6 +156,59 @@ class TestParoquantDispatch:
         )
         assert maybe_load_custom_quantization(path, is_vlm=False) == ("M", "P")
         assert captured["called"] is True
+
+
+class TestLlama4PreLoadDispatch:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"model_type": "llama4", "text_config": {}}',
+            '{"model_type": "mllama", "text_config": {"model_type": "llama4"}}',
+        ],
+    )
+    def test_llama4_attention_patch_applies(self, tmp_path, monkeypatch, body):
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(set_mtp_active=MagicMock()),
+        )
+        apply_mock = MagicMock(return_value=True)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.llama4_attention",
+            MagicMock(apply_llama4_attention_patch=apply_mock),
+        )
+
+        path = _write_config(tmp_path, body)
+        maybe_apply_pre_load_patches(path)
+
+        apply_mock.assert_called_once_with()
+
+
+class TestLoadTextModel:
+    def test_forwards_trust_remote_code_to_mlx_lm_load(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path, '{"model_type": "llama"}')
+        maybe_apply = MagicMock()
+        monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", maybe_apply)
+
+        load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
+
+        settings = types.SimpleNamespace(trust_remote_code=True)
+        result = model_loading.load_text_model(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            model_settings=settings,
+        )
+
+        assert result == ("MODEL", "TOKENIZER")
+        maybe_apply.assert_called_once_with(path, model_settings=settings)
+        load_mock.assert_called_once_with(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            trust_remote_code=True,
+        )
 
 
 class TestVlmMtpPreLoadDispatch:
@@ -408,9 +459,7 @@ class TestCheckpointHasMtpWeights:
 
     def test_returns_false_for_nonexistent_path(self, tmp_path):
         assert (
-            model_loading._checkpoint_has_mtp_weights(
-                str(tmp_path / "does-not-exist")
-            )
+            model_loading._checkpoint_has_mtp_weights(str(tmp_path / "does-not-exist"))
             is False
         )
 
@@ -419,3 +468,22 @@ class TestCheckpointHasMtpWeights:
         # Falls through to safetensors-header scan; no shards exist, so
         # the helper conservatively returns False.
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_true_when_later_shard_has_mtp(self, tmp_path):
+        from safetensors.numpy import save_file
+        import numpy as np
+
+        save_file(
+            {
+                "language_model.model.embed_tokens.weight": np.zeros(
+                    (1,), dtype=np.float16
+                )
+            },
+            str(tmp_path / "model-00001-of-00002.safetensors"),
+        )
+        save_file(
+            {"language_model.mtp.fc.weight": np.zeros((1,), dtype=np.float16)},
+            str(tmp_path / "model-00002-of-00002.safetensors"),
+        )
+
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True

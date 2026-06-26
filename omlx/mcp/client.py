@@ -139,6 +139,7 @@ class MCPClient:
             command=self.config.command,
             args=self.config.args or [],
             env=self.config.env,
+            cwd=self.config.cwd,
         )
 
         # Create stdio client context

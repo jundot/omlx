@@ -24,21 +24,21 @@ from mlx_lm.models.cache import (
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
     TurboQuantMSEState,
-    TurboQuantProdState,
-    TurboQuantPolarState,
     TurboQuantPolarProdState,
+    TurboQuantPolarState,
+    TurboQuantProdState,
     TurboQuantSplitState,
+    _allocate_state_like,
     _build_codec,
     _concat_state,
+    _QuantizedStateProxy,
+    _reserve_state_capacity,
     _slice_state,
     _slice_state_range,
     _state_length,
     _state_nbytes,
-    _allocate_state_like,
-    _write_state,
-    _reserve_state_capacity,
-    _QuantizedStateProxy,
     _validate_bits,
+    _write_state,
     turboquant_enabled,
 )
 
@@ -68,7 +68,9 @@ def _infer_head_dim(state, bits: int) -> int:
         packed_width = state.mse_indices.shape[-1]
         bits = max(bits - 1, 1)
     else:
-        raise TypeError(f"Cannot infer head_dim from state type: {type(state).__name__}")
+        raise TypeError(
+            f"Cannot infer head_dim from state type: {type(state).__name__}"
+        )
     return packed_width * 32 // bits
 
 
@@ -93,9 +95,37 @@ def _rebuild_codecs(tq_cache: TurboQuantKVCache, key_state, value_state) -> None
     tq_cache.value_codec = _build_codec(dummy, val_bits, mode="mse", seed=seed + 1)
 
 
+def _concat_state_token_axis(states):
+    """Concatenate TurboQuant states along token axis with a low-churn fast path."""
+    if not states:
+        return None
+    if len(states) == 1:
+        state = states[0]
+        return state._state if isinstance(state, _QuantizedStateProxy) else state
+
+    unwrapped = [
+        state._state if isinstance(state, _QuantizedStateProxy) else state
+        for state in states
+    ]
+    first = unwrapped[0]
+    if isinstance(first, TurboQuantMSEState) and all(
+        isinstance(state, TurboQuantMSEState) for state in unwrapped
+    ):
+        return TurboQuantMSEState(
+            mx.concatenate([state.norms for state in unwrapped], axis=2),
+            mx.concatenate([state.indices for state in unwrapped], axis=2),
+        )
+
+    result = first
+    for state in unwrapped[1:]:
+        result = _concat_state(result, state)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Batch-level state helpers (axis-0 operations)
 # ---------------------------------------------------------------------------
+
 
 def _filter_state(state, indices):
     """Index-select along batch dimension (axis 0)."""
@@ -105,8 +135,10 @@ def _filter_state(state, indices):
         return TurboQuantMSEState(state.norms[indices], state.indices[indices])
     if isinstance(state, TurboQuantProdState):
         return TurboQuantProdState(
-            state.norms[indices], state.mse_indices[indices],
-            state.residual_norms[indices], state.qjl_signs[indices],
+            state.norms[indices],
+            state.mse_indices[indices],
+            state.residual_norms[indices],
+            state.qjl_signs[indices],
         )
     if isinstance(state, TurboQuantPolarState):
         return TurboQuantPolarState(
@@ -115,12 +147,15 @@ def _filter_state(state, indices):
         )
     if isinstance(state, TurboQuantPolarProdState):
         return TurboQuantPolarProdState(
-            state.norms[indices], _filter_state(state.polar_state, indices),
-            state.residual_norms[indices], state.qjl_signs[indices],
+            state.norms[indices],
+            _filter_state(state.polar_state, indices),
+            state.residual_norms[indices],
+            state.qjl_signs[indices],
         )
     if isinstance(state, TurboQuantSplitState):
         return TurboQuantSplitState(
-            _filter_state(state.low, indices), _filter_state(state.high, indices),
+            _filter_state(state.low, indices),
+            _filter_state(state.high, indices),
         )
     raise TypeError(f"Unsupported state type: {type(state)!r}")
 
@@ -146,7 +181,9 @@ def _concat_state_batch(states):
         return TurboQuantPolarState(
             mx.concatenate([s.radii for s in states], axis=0),
             tuple(
-                mx.concatenate([states[j].level_indices[i] for j in range(len(states))], axis=0)
+                mx.concatenate(
+                    [states[j].level_indices[i] for j in range(len(states))], axis=0
+                )
                 for i in range(len(first.level_indices))
             ),
         )
@@ -173,9 +210,20 @@ def _pad_state_left(state, pad_length: int):
     return _concat_state(pad, state)
 
 
+def _empty_state_batch_like(state, batch_size: int):
+    """Allocate an empty token state with the requested batch size."""
+    if state is None:
+        return None
+    row = _filter_state(_allocate_state_like(state, 0), slice(0, 1))
+    if batch_size == 1:
+        return row
+    return _concat_state_batch([row] * batch_size)
+
+
 # ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
+
 
 class BatchTurboQuantKVCache(TurboQuantKVCache):
     """TurboQuantKVCache with batch operations for continuous batching.
@@ -245,20 +293,15 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return create_attention_mask(N, offset, return_array, window_size)
         if isinstance(offset, mx.array) and offset.size == 1:
             return create_attention_mask(N, offset.item(), return_array, window_size)
-        # B>1: batched causal mask
-        max_offset = offset.max().item()
-        total = max_offset + N
-        rinds = mx.arange(total)[None, None, :]
-        linds = mx.arange(N)[None, None, :, None]
-        off = offset[:, None, None, None]
-        linds = linds + off
-        mask = linds >= rinds
-        if window_size is not None:
-            mask = mask & (linds < rinds + window_size)
-        if self.left_padding is not None:
-            lp = self.left_padding[:, None, None, None]
-            mask = mask & (rinds >= lp)
-        return mask
+        # B>1: delegate to mlx-lm's create_causal_mask with the physical column
+        # count + per-request left_padding, exactly like BatchKVCache. The old
+        # hand-rolled term compared each request's sequence length (offset)
+        # against the column index, which masked out valid left-padded tokens —
+        # so left-padded requests attended to ~nothing and decoded garbage.
+        phys = offset.max().item()
+        return create_causal_mask(
+            N, offset=phys, window_size=window_size, left_padding=self.left_padding
+        )
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
 
@@ -276,7 +319,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding if isinstance(self.offset, mx.array) else left_padding[0].item()
+            self.offset -= (
+                left_padding
+                if isinstance(self.offset, mx.array)
+                else left_padding[0].item()
+            )
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
 
@@ -291,7 +338,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.keys = self.key_codec.quantize(k_rolled)
             self.values = self.value_codec.quantize(v_rolled)
             mx.eval(self.keys, self.values)
-        self.offset -= padding if isinstance(self.offset, mx.array) else padding[0].item()
+        self.offset -= (
+            padding if isinstance(self.offset, mx.array) else padding[0].item()
+        )
         self.left_padding += padding
         self._right_padding = None
 
@@ -306,6 +355,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         self._cached_state_offset = -1
 
     def extend(self, other: "BatchTurboQuantKVCache"):
+        if not isinstance(other, BatchTurboQuantKVCache):
+            raise TypeError(
+                "BatchTurboQuantKVCache.extend expected BatchTurboQuantKVCache, "
+                f"got {type(other).__name__}"
+            )
         self._ensure_array_offset()
         other._ensure_array_offset()
         max_off = max(self.offset.max().item(), other.offset.max().item())
@@ -313,10 +367,21 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         s_idx = _state_length(self.keys) if self.keys is not None else 0
         o_idx = _state_length(other.keys) if other.keys is not None else 0
         max_idx = max(s_idx, o_idx)
+        ref_keys = self.keys if self.keys is not None else other.keys
+        ref_values = self.values if self.values is not None else other.values
 
         def _pad_and_trim(c, idx):
-            ks = _slice_state(c.keys, idx) if c.keys is not None else None
-            vs = _slice_state(c.values, idx) if c.values is not None else None
+            batch_size = int(c.offset.shape[0])
+            if c.keys is None:
+                if max_idx > 0 and ref_keys is not None:
+                    ks = _empty_state_batch_like(ref_keys, batch_size)
+                    vs = _empty_state_batch_like(ref_values, batch_size)
+                else:
+                    ks = None
+                    vs = None
+            else:
+                ks = _slice_state(c.keys, idx)
+                vs = _slice_state(c.values, idx)
             left = max_idx - idx
             if left > 0 and ks is not None:
                 ks = _pad_state_left(ks, left)
@@ -346,7 +411,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     def extract(self, idx: int) -> TurboQuantKVCache:
         padding = self.left_padding[idx].item()
-        total = self.offset[idx].item() if isinstance(self.offset, mx.array) else self.offset
+        total = (
+            self.offset[idx].item()
+            if isinstance(self.offset, mx.array)
+            else self.offset
+        )
         end = padding + total
 
         tq = TurboQuantKVCache(bits=self.bits, seed=self.seed)
@@ -362,6 +431,12 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
     @classmethod
     def merge(cls, caches: List[TurboQuantKVCache]) -> "BatchTurboQuantKVCache":
+        for cache in caches:
+            if not isinstance(cache, TurboQuantKVCache):
+                raise TypeError(
+                    "BatchTurboQuantKVCache.merge expected TurboQuantKVCache "
+                    f"entries, got {type(cache).__name__}"
+                )
         bits = caches[0].bits
         seed = caches[0].seed
         lengths = [c.offset for c in caches]
@@ -378,9 +453,29 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
 
         key_states = []
         value_states = []
+        reference_key_state = None
+        reference_value_state = None
+        for c in caches:
+            ks, vs = c.state
+            if ks is not None:
+                reference_key_state = (
+                    ks._state if isinstance(ks, _QuantizedStateProxy) else ks
+                )
+                reference_value_state = (
+                    vs._state if isinstance(vs, _QuantizedStateProxy) else vs
+                )
+                break
+
         for p, c in zip(padding, caches):
             ks, vs = c.state
             if ks is None:
+                if max_length > 0 and reference_key_state is not None:
+                    key_states.append(
+                        _allocate_state_like(reference_key_state, max_length)
+                    )
+                    value_states.append(
+                        _allocate_state_like(reference_value_state, max_length)
+                    )
                 continue
             ks = ks._state if isinstance(ks, _QuantizedStateProxy) else ks
             vs = vs._state if isinstance(vs, _QuantizedStateProxy) else vs

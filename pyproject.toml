@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "cmake>=3.27",
+    "nanobind",
+    "mlx==0.31.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,15 +34,18 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    # Vanilla MLX v0.31.2; optional GLM-5.2 kernels live under
+    # omlx.custom_kernels.glm_moe_dsa when built for release.
+    "mlx==0.31.2",
+    # mlx-lm from commit (2c008fd, v0.31.3) - trust_remote_code load gate,
+    # transformers 5.7.0 compatibility, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
+    "transformers>=5.7.0",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -48,11 +57,13 @@ dependencies = [
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
-    "numpy>=1.24.0",
+    "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
     "jinja2>=3.0",
+    # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
+    "rich>=13.0.0",
     "sentencepiece",
     "tiktoken",
     "protobuf",
@@ -62,6 +73,8 @@ dependencies = [
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
+    # Native process title support (shows as omlx-server instead of python)
+    "setproctitle>=1.3.3",
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
@@ -72,11 +85,16 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    # Cohere Command/Cohere2 output parser for reasoning and tool calls
+    "cohere_melody>=0.9.0",
+    # mlx-vlm from commit e390667. MiniMax M3 support is vendored under
+    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e3906673d54df42cf573b837a76e65d58a2b865c",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@1ba671372b289c025b435c1a13aabb4bfb80b183",
+    # dflash-mlx v0.1.10 (9ca0028) - bstnxbt repo. Apple G17 NAX verify,
+    # prefix snapshot metrics, CopySpec mode, and full-context draft-layer cache checks.
+    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@9ca002898b48e14c9727dec17299f497e8467870",
+    "markitdown[pdf,docx,pptx]==0.1.6",
 ]
 
 [project.optional-dependencies]
@@ -85,7 +103,7 @@ grammar = [
     "xgrammar>=0.1.32",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -102,7 +120,7 @@ paroquant = [
     # with --no-deps semantics here because the official [mlx] extra pulls
     # torchvision, which the load path doesn't actually use (verified end
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
-    "paroquant==0.1.14; python_version >= '3.11'",
+    "paroquant==0.1.15; python_version >= '3.11'",
 ]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the
@@ -117,7 +135,7 @@ paroquant = [
 # git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
 # separately via --no-deps post-resolution.
 bundle = [
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -141,8 +159,14 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
+    # The torch-stub smoke test (tests/test_torch_stub.py) gates
+    # xgrammar / tvm-ffi version bumps. It skips when these aren't
+    # importable, which silently hides regressions — install no-deps
+    # in the dev environment so the test actually runs.
+    "xgrammar==0.2.0",
+    "apache-tvm-ffi==0.1.11",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -154,8 +178,10 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=1.5.0",
     "venvstacks>=0.7.0",
+    "xgrammar==0.2.0",
+    "apache-tvm-ffi==0.1.11",
 ]
 
 [project.urls]
@@ -177,12 +203,14 @@ include = ["omlx*"]
 "omlx" = ["oq_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    "mlx==0.31.2",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2c008fd0252b2c569227d12568356ab88ab0560a",
 ]
 
 [tool.black]

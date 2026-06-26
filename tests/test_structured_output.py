@@ -6,7 +6,6 @@ These tests cover the _inject_json_instruction function from server.py
 which is used for injecting JSON schema instructions into messages.
 """
 
-import pytest
 from omlx.server import _inject_json_instruction
 
 
@@ -27,7 +26,7 @@ class TestInjectJsonInstruction:
         """Test appending to existing system message."""
         messages = [
             {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"}
+            {"role": "user", "content": "Hello"},
         ]
         result = _inject_json_instruction(messages, "Return JSON only")
 
@@ -62,7 +61,7 @@ class TestInjectJsonInstruction:
         assert "Use JSON format" in result[0]["content"]
 
     def test_inject_with_system_in_middle(self):
-        """Test that system message is found even if not first."""
+        """Test that mid-conversation system messages are not mutated."""
         messages = [
             {"role": "user", "content": "Hi"},
             {"role": "system", "content": "System prompt"},
@@ -70,12 +69,11 @@ class TestInjectJsonInstruction:
         ]
         result = _inject_json_instruction(messages, "JSON only")
 
-        # Should append to existing system message
-        assert len(result) == 3
-        # Find the system message
-        system_msg = next(m for m in result if m["role"] == "system")
-        assert "System prompt" in system_msg["content"]
-        assert "JSON only" in system_msg["content"]
+        assert len(result) == 4
+        assert result[0]["role"] == "system"
+        assert "JSON only" in result[0]["content"]
+        assert result[2]["role"] == "system"
+        assert result[2]["content"] == "System prompt"
 
     def test_inject_empty_instruction(self):
         """Test injection with empty instruction."""
@@ -119,6 +117,7 @@ The JSON should have these fields:
 
     def test_inject_with_pydantic_style_message(self):
         """Test injection with message objects that have attributes."""
+
         class MockMessage:
             def __init__(self, role, content):
                 self.role = role
@@ -134,6 +133,7 @@ The JSON should have these fields:
 
     def test_inject_with_dict_and_pydantic_mixed(self):
         """Test injection handles mixed dict and pydantic-style messages."""
+
         class MockMessage:
             def __init__(self, role, content):
                 self.role = role
@@ -163,6 +163,7 @@ class TestInjectJsonInstructionEdgeCases:
 
     def test_system_message_with_none_content(self):
         """Test handling system message with None content."""
+
         class MockMessage:
             def __init__(self):
                 self.role = "system"

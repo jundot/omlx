@@ -287,6 +287,38 @@ class TestMCPClientConnect:
         assert streamable_http_client.state == MCPServerState.CONNECTED
 
     @pytest.mark.asyncio
+    async def test_connect_stdio_passes_cwd_to_sdk(self):
+        """cwd from the server config reaches StdioServerParameters (#1111).
+
+        Runs the real _connect_stdio with only the SDK's stdio_client and
+        ClientSession mocked, so the real StdioServerParameters also proves
+        the pinned SDK accepts the field.
+        """
+        mcp = pytest.importorskip("mcp")
+        config = MCPServerConfig(
+            name="cwd-test",
+            transport=MCPTransport.STDIO,
+            command="python",
+            args=["-m", "mcp_server"],
+            cwd="/tmp/mcp-workdir",
+        )
+        client = MCPClient(config)
+
+        fake_ctx = MagicMock()
+        fake_ctx.__aenter__.return_value = (MagicMock(), MagicMock())
+        with patch(
+            "mcp.client.stdio.stdio_client", return_value=fake_ctx
+        ) as mock_stdio, patch("mcp.ClientSession", return_value=MagicMock()):
+            await client._connect_stdio()
+
+        server_params = mock_stdio.call_args.args[0]
+        assert isinstance(server_params, mcp.StdioServerParameters)
+        assert server_params.cwd == "/tmp/mcp-workdir"
+        # Existing fields keep flowing through unchanged.
+        assert server_params.command == "python"
+        assert server_params.args == ["-m", "mcp_server"]
+
+    @pytest.mark.asyncio
     async def test_connect_failure(self, stdio_client: MCPClient):
         """Test connection failure sets error state."""
         with patch.object(

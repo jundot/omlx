@@ -18,6 +18,27 @@ from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
+def _materialize_cache_arrays(cache: Optional[Any]) -> None:
+    """Detach DeepSeek-V4 cache update graphs from prior decode steps."""
+    if cache is None:
+        return
+
+    cache_arrays = []
+    for layer_cache in cache:
+        if layer_cache is None:
+            continue
+        leaves = getattr(layer_cache, "caches", None) or (layer_cache,)
+        for leaf in leaves:
+            if leaf is None:
+                continue
+            for value in vars(leaf).values():
+                if isinstance(value, mx.array):
+                    cache_arrays.append(value)
+
+    if cache_arrays:
+        mx.eval(*cache_arrays)
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v4"
@@ -94,6 +115,16 @@ def make_quantization_config(model):
     attn = {
         k: mxfp8 for k, _ in flat_modules if ".attn.w" in k or ".attn.indexer.wq" in k
     }
+    # MTP fusion projections (oMLX MTP patch attaches them as mtp.<i>.e_proj /
+    # mtp.<i>.h_proj). The fp8 checkpoint ships them as e4m3 weight + e8m0
+    # block scale, i.e. mxfp8 after sanitize. Without an explicit entry they
+    # fall through to the affine default, whose QuantizedLinear expects a
+    # .biases tensor the checkpoint doesn't have, and strict load fails.
+    mtp_projs = {
+        k: mxfp8
+        for k, _ in flat_modules
+        if k.startswith("mtp.") and (k.endswith(".e_proj") or k.endswith(".h_proj"))
+    }
 
     return {
         "group_size": 64,
@@ -102,6 +133,7 @@ def make_quantization_config(model):
         **experts,
         **shared_experts,
         **attn,
+        **mtp_projs,
     }
 
 
@@ -971,6 +1003,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+
+        _materialize_cache_arrays(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)

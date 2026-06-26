@@ -84,7 +84,7 @@ class MLXRerankerModel:
     # CausalLM reranker prompt template (Qwen3-Reranker format)
     _CAUSAL_LM_SYSTEM_PROMPT = (
         "Judge whether the Document meets the requirements based on the "
-        'Query and the Instruct provided. Note that the answer can only be '
+        "Query and the Instruct provided. Note that the answer can only be "
         '"yes" or "no".'
     )
     _CAUSAL_LM_DEFAULT_INSTRUCTION = (
@@ -138,7 +138,6 @@ class MLXRerankerModel:
         """Load XLMRoberta model using omlx native implementation."""
         import mlx.core as mx
         from mlx.utils import tree_unflatten
-        from safetensors import safe_open
         from transformers import AutoTokenizer
 
         from .xlm_roberta import Model, ModelArgs
@@ -149,21 +148,26 @@ class MLXRerankerModel:
         with open(model_path / "config.json") as f:
             config_dict = json.load(f)
 
-        config = ModelArgs(**{
-            k: v for k, v in config_dict.items()
-            if k in ModelArgs.__dataclass_fields__
-        })
+        config = ModelArgs(
+            **{
+                k: v
+                for k, v in config_dict.items()
+                if k in ModelArgs.__dataclass_fields__
+            }
+        )
 
         # Create model
         model = Model(config)
 
-        # Load weights
+        # Load weights. Use mx.load (not safetensors.safe_open + get_tensor),
+        # which reads safetensors directly into MLX arrays and supports the
+        # bfloat16 dtype. safe_open(framework="mlx").get_tensor() routes bf16
+        # through numpy, which has no bfloat16 dtype and raises
+        # "TypeError: data type 'bfloat16' not understood".
         weights = {}
         weight_files = list(model_path.glob("*.safetensors"))
         for wf in weight_files:
-            with safe_open(wf, framework="mlx") as f:
-                for key in f.keys():
-                    weights[key] = f.get_tensor(key)
+            weights.update(mx.load(str(wf)))
 
         # Sanitize weights (remove "roberta." prefix, etc.)
         weights = model.sanitize(weights)
@@ -171,6 +175,9 @@ class MLXRerankerModel:
         # Load weights into model
         model.load_weights(list(weights.items()))
         mx.eval(model.parameters())
+        # Reranker inference must be deterministic: disable dropout in the
+        # native XLM-RoBERTa path just like the native embedding loader does.
+        model.train(False)
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
@@ -194,9 +201,7 @@ class MLXRerankerModel:
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
         )
 
-    def _build_vl_item(
-        self, item: "str | dict[str, Any]"
-    ) -> Dict[str, Any]:
+    def _build_vl_item(self, item: "str | dict[str, Any]") -> Dict[str, Any]:
         """Normalize a rerank input into the mlx-embeddings VL item format.
 
         Accepts either a bare string (text) or a dict with 'text' and/or
@@ -220,9 +225,7 @@ class MLXRerankerModel:
                 # Already a PIL image or similar — pass through
                 result["image"] = image_ref
         if not result:
-            raise ValueError(
-                "VL reranker item must have at least 'text' or 'image'."
-            )
+            raise ValueError("VL reranker item must have at least 'text' or 'image'.")
         return result
 
     def _rerank_vl(
@@ -274,6 +277,7 @@ class MLXRerankerModel:
             loaded = mlx_lm_load(
                 model_path,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self.trust_remote_code,
             )
             model = loaded[0]
             tokenizer_wrapper = loaded[1]
@@ -348,6 +352,7 @@ class MLXRerankerModel:
             loaded = mlx_lm_load(
                 model_path,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self.trust_remote_code,
             )
             model = loaded[0]
             tokenizer_wrapper = loaded[1]
@@ -457,12 +462,10 @@ class MLXRerankerModel:
                 "Expected projector.safetensors for JinaForRanking models."
             )
 
-        from safetensors import safe_open
-
-        weights = {}
-        with safe_open(projector_path, framework="mlx") as f:
-            for key in f.keys():
-                weights[key] = f.get_tensor(key)
+        # mx.load reads safetensors into MLX arrays with bfloat16 support;
+        # safe_open(framework="mlx").get_tensor() routes bf16 through numpy and
+        # raises "TypeError: data type 'bfloat16' not understood".
+        weights = mx.load(str(projector_path))
 
         required_keys = ("linear1.weight", "linear2.weight")
         missing_keys = [key for key in required_keys if key not in weights]
@@ -687,9 +690,7 @@ class MLXRerankerModel:
             # CausalLM / VL reranker paths use custom scoring (yes/no logits or
             # mlx-embeddings model.process). VL forward needs pixel_values and
             # lacks pooler_output, so the compile wrapper here wouldn't apply.
-            logger.info(
-                f"mx.compile skipped for {self.model_name}"
-            )
+            logger.info(f"mx.compile skipped for {self.model_name}")
             self._compiled_seq_logits = None
             return False
 
@@ -700,7 +701,10 @@ class MLXRerankerModel:
 
             def _compiled_seq_logits(inputs):
                 outputs = base_model(**inputs)
-                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                if (
+                    hasattr(outputs, "pooler_output")
+                    and outputs.pooler_output is not None
+                ):
                     return outputs.pooler_output
                 raise ValueError(
                     "Model output does not contain pooler_output. "
@@ -724,9 +728,7 @@ class MLXRerankerModel:
             )
             return True
         except Exception as e:
-            logger.info(
-                f"mx.compile unavailable for {self.model_name}: {e}"
-            )
+            logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_seq_logits = None
             return False
 

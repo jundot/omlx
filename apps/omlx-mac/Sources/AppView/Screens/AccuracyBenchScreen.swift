@@ -35,11 +35,11 @@ import SwiftUI
 import AppKit
 
 struct AccuracyBenchScreen: View {
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
     // VM is owned by AppServices so an in-flight queue (or in-progress
     // benchmark) survives screen unloads. Same rationale as
     // ThroughputBenchScreen — see AppServices.accuracyBench.
-    @ObservedObject var vm: AccuracyBenchScreenVM
+    @Bindable var vm: AccuracyBenchScreenVM
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -212,7 +212,6 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Accuracy Bench batch-size selector")
             ) {
                 Segmented(selection: $batchSize, options: batchSizeOptions)
-                    .frame(width: 260)
             }
 
             Row(
@@ -320,15 +319,23 @@ private struct BenchmarkGrid: View {
     @Binding var selected: Set<String>
     @Binding var sampleSizes: [String: Int]
 
+    @State private var calculatedHeight: CGFloat = 334
+
+    private struct GridHeightKey: PreferenceKey {
+        static let defaultValue: CGFloat = 334
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
     var body: some View {
-        // 3-column grid on width > 600, 2-column otherwise. GeometryReader
-        // gives us the live width so we don't need a fixed window size.
         GeometryReader { geo in
             let cols = geo.size.width > 600 ? 3 : 2
             let layout = Array(
                 repeating: GridItem(.flexible(), spacing: 8),
                 count: cols
             )
+
             LazyVGrid(columns: layout, alignment: .leading, spacing: 8) {
                 ForEach(benchmarkCatalog) { entry in
                     BenchmarkCard(
@@ -337,26 +344,32 @@ private struct BenchmarkGrid: View {
                         sampleSize: binding(for: entry.key),
                         onToggle: { toggle(entry.key) }
                     )
+                    .frame(maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .background {
+                GeometryReader { contentGeo in
+                    Color.clear
+                        .preference(key: GridHeightKey.self, value: contentGeo.size.height)
                 }
             }
         }
-        .frame(minHeight: gridHeight)
-    }
-
-    /// LazyVGrid inside a GeometryReader needs an explicit frame height —
-    /// otherwise it collapses to zero. Estimate generously: 8 rows × 64 pt
-    /// covers both 2-column (8 rows) and 3-column (6 rows) layouts.
-    private var gridHeight: CGFloat {
-        let rows = Double(benchmarkCatalog.count) / 2.0
-        return CGFloat((rows.rounded(.up)) * 66)
+        .frame(height: calculatedHeight)
+        .onPreferenceChange(GridHeightKey.self) { height in
+            withAnimation {
+                self.calculatedHeight = height
+            }
+        }
     }
 
     private func toggle(_ key: String) {
-        if selected.contains(key) {
-            selected.remove(key)
-        } else {
-            selected.insert(key)
-            if sampleSizes[key] == nil { sampleSizes[key] = 100 }
+        withAnimation {
+            if selected.contains(key) {
+                selected.remove(key)
+            } else {
+                selected.insert(key)
+                if sampleSizes[key] == nil { sampleSizes[key] = 100 }
+            }
         }
     }
 
@@ -378,11 +391,11 @@ private struct BenchmarkCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: onToggle) {
-                HStack(alignment: .center, spacing: 8) {
-                    Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-                        .font(.system(size: 13))
-                        .foregroundStyle(isSelected ? theme.accent : theme.textTertiary)
+            Toggle(isOn: Binding(
+                get: { isSelected },
+                set: { _ in onToggle() }
+            )) {
+                HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(entry.displayName)
                             .font(.omlxText(12.5, weight: .medium))
@@ -391,11 +404,9 @@ private struct BenchmarkCard: View {
                             .font(.omlxText(10.5))
                             .foregroundStyle(theme.textTertiary)
                     }
-                    Spacer(minLength: 0)
+                    Spacer()
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if isSelected {
                 HStack(spacing: 6) {
@@ -825,7 +836,7 @@ private struct TextExportSection: View {
                                   : String(localized: "common.copy",
                                            defaultValue: "Copy",
                                            comment: "Generic Copy button label"),
-                                  systemImage: copied ? "checkmark" : "doc.on.doc")
+                                  systemImage: copied ? "checkmark" : "document.on.document")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.omlx(.normal, size: .small))
@@ -867,190 +878,4 @@ private struct TextExportSection: View {
             await MainActor.run { copied = false }
         }
     }
-}
-
-// MARK: - View model
-
-@MainActor
-final class AccuracyBenchScreenVM: ObservableObject {
-    // Form state
-    @Published var selectedModelId: String = ""
-    @Published var selectedBenchmarks: Set<String> = []
-    @Published var sampleSizes: [String: Int] = [:]
-    @Published var batchSize: Int = 4
-    @Published var enableThinking: Bool = false
-
-    // Server state
-    @Published private(set) var models: [ModelDTO] = []
-    @Published private(set) var status: AccuracyQueueStatus?
-    @Published private(set) var results: [AccuracyResultDTO] = []
-
-    // UI state
-    @Published private(set) var isAdding: Bool = false
-    @Published var lastError: String?
-
-    private weak var client: OMLXClient?
-    private var pollTask: Task<Void, Never>?
-
-    var canSubmit: Bool {
-        !selectedModelId.isEmpty && !selectedBenchmarks.isEmpty
-    }
-
-    // MARK: Lifecycle
-
-    func start(client: OMLXClient) async {
-        self.client = client
-        await loadModels()
-        await pollOnce()
-        startPolling()
-    }
-
-    func stop() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    // MARK: Loaders
-
-    private func loadModels() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listModels()
-            self.models = resp.models
-        } catch {
-            self.lastError = String(localized: "bench.accuracy.error.load_models",
-                                    defaultValue: "Failed to load models: \(error.omlxDescription)",
-                                    comment: "Accuracy Bench error when listing models fails; placeholder is the underlying error description")
-        }
-    }
-
-    private func pollOnce() async {
-        guard let client else { return }
-        // Status and results are independent endpoints — fan them out so a
-        // slow one doesn't block the other.
-        async let statusFetch = client.getAccuracyQueueStatus()
-        async let resultsFetch = client.listAccuracyResults()
-        do {
-            let s = try await statusFetch
-            self.status = s
-        } catch {
-            // Status failures are transient — keep the previous snapshot so
-            // the queue/running row doesn't flicker out during a hiccup.
-        }
-        do {
-            let r = try await resultsFetch
-            self.results = r.results
-        } catch {
-            // Same logic — last-known results stay visible.
-        }
-    }
-
-    // MARK: Polling
-
-    private func startPolling() {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let active = await MainActor.run { () -> Bool in
-                    let running = self.status?.running == true
-                    let queued = (self.status?.queue.isEmpty == false)
-                    return running || queued
-                }
-                // Fast 2 s cadence while work is in flight; idle 8 s otherwise.
-                try? await Task.sleep(for: .seconds(active ? 2 : 8))
-                if Task.isCancelled { return }
-                await self.pollOnce()
-            }
-        }
-    }
-
-    // MARK: Actions
-
-    func addToQueue(client: OMLXClient) {
-        guard canSubmit, !isAdding else { return }
-        // Snapshot form state — the user can keep editing while the request
-        // is in flight; we want the version they confirmed.
-        let modelId = selectedModelId
-        let benchmarks: [String: Int] = Dictionary(
-            uniqueKeysWithValues: selectedBenchmarks.map { key in
-                (key, sampleSizes[key] ?? 100)
-            }
-        )
-        let body = AccuracyQueueAddRequest(
-            modelId: modelId,
-            benchmarks: benchmarks,
-            batchSize: batchSize,
-            enableThinking: enableThinking
-        )
-        isAdding = true
-        lastError = nil
-        Task { [weak self] in
-            defer { Task { @MainActor [weak self] in self?.isAdding = false } }
-            do {
-                let s = try await client.addAccuracyQueue(body)
-                await MainActor.run {
-                    guard let self else { return }
-                    self.status = s
-                    // Reset selection on success so the user can stage another
-                    // run without manually clearing the grid.
-                    self.selectedBenchmarks = []
-                }
-                await self?.pollOnce()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "bench.accuracy.error.add_queue",
-                                             defaultValue: "Failed to add to queue: \(error.omlxDescription)",
-                                             comment: "Accuracy Bench error when adding to queue fails; placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
-    func removeFromQueue(client: OMLXClient, index: Int) {
-        Task { [weak self] in
-            do {
-                let s = try await client.removeAccuracyQueue(index: index)
-                await MainActor.run { self?.status = s }
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "bench.accuracy.error.remove",
-                                             defaultValue: "Failed to remove: \(error.omlxDescription)",
-                                             comment: "Accuracy Bench error when removing a queue entry fails; placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
-    func cancelRunning(client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.cancelAccuracyBench()
-                await self?.pollOnce()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "bench.accuracy.error.cancel",
-                                             defaultValue: "Failed to cancel: \(error.omlxDescription)",
-                                             comment: "Accuracy Bench error when cancelling the running bench fails; placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
-    func resetResults(client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.resetAccuracyResults()
-                await MainActor.run { self?.results = [] }
-                await self?.pollOnce()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "bench.accuracy.error.clear_results",
-                                             defaultValue: "Failed to clear results: \(error.omlxDescription)",
-                                             comment: "Accuracy Bench error when clearing accumulated results fails; placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
 }

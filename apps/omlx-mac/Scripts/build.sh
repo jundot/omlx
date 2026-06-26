@@ -9,7 +9,7 @@
 #      any new minor/patch within the pin range each build
 #   2. (auto) rebuild the venvstacks export if sources have drifted
 #   3. stage the Swift `.app` and copy the venvstacks-produced Python
-#      layers into Contents/Frameworks/ verbatim
+#      layers into Contents/Resources/Python/ verbatim
 #   4. embed the omlx package from the worktree and ad-hoc sign
 #
 # venvstacks is the single source of truth for the bundle's Python
@@ -31,9 +31,15 @@
 # Usage:
 #   apps/omlx-mac/Scripts/build.sh                    # Release, auto-rebuild donor when stale
 #   apps/omlx-mac/Scripts/build.sh debug              # Debug build instead
+#   apps/omlx-mac/Scripts/build.sh swift              # rebuild Swift app only; reuse existing _export/
+#   apps/omlx-mac/Scripts/build.sh swift debug        # Debug Swift app rebuild; reuse existing _export/
+#   apps/omlx-mac/Scripts/build.sh swift-fast         # like swift, but skip embedded native signing
 #   apps/omlx-mac/Scripts/build.sh release --bare     # skip Python embed
 #                                                       (no server, just the
 #                                                       AppView shell)
+#   apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
+#                                                     # build and bundle optional
+#                                                     # native custom kernels
 #   apps/omlx-mac/Scripts/build.sh --rebuild-donor    # force venvstacks rebuild
 #   apps/omlx-mac/Scripts/build.sh --no-rebuild-donor # never rebuild; use
 #                                                       existing donor even if stale
@@ -45,32 +51,65 @@
 #   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
 #   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
 #                                       (default: PATH lookup of python3)
+#   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
+#   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
+#                                       # macOS min version for custom kernels
 
 set -euo pipefail
 
-CONFIG="${1:-Release}"
-case "$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')" in
-    debug)   CONFIG=Debug ;;
-    release) CONFIG=Release ;;
-    *) echo "error: unknown configuration '$CONFIG' (expected debug|release)" >&2; exit 2 ;;
+SWIFT_REBUILD=0
+SKIP_EMBEDDED_SIGN=0
+case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    swift)
+        SWIFT_REBUILD=1
+        shift
+        ;;
+    swift-fast)
+        SWIFT_REBUILD=1
+        SKIP_EMBEDDED_SIGN=1
+        shift
+        ;;
 esac
 
+CONFIG=Release
+if [ $# -gt 0 ]; then
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        debug)   CONFIG=Debug; shift ;;
+        release) CONFIG=Release; shift ;;
+        --*) ;;
+        *)
+            echo "error: unknown configuration '$1' (expected swift|swift-fast|debug|release)" >&2
+            exit 2
+            ;;
+    esac
+fi
+
 BARE=0
+WITH_CUSTOM_KERNEL="${OMLX_WITH_CUSTOM_KERNEL:-0}"
 REBUILD_DONOR=auto    # auto | force | never
-shift || true
 for arg in "$@"; do
     case "$arg" in
         --bare) BARE=1 ;;
+        --with-custom-kernel) WITH_CUSTOM_KERNEL=1 ;;
         --rebuild-donor) REBUILD_DONOR=force ;;
         --no-rebuild-donor) REBUILD_DONOR=never ;;
         *) echo "error: unknown flag '$arg'" >&2; exit 2 ;;
     esac
 done
+case "$(echo "$WITH_CUSTOM_KERNEL" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) WITH_CUSTOM_KERNEL=1 ;;
+    *) WITH_CUSTOM_KERNEL=0 ;;
+esac
+if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$REBUILD_DONOR" = "force" ]; then
+    echo "error: swift cannot be combined with --rebuild-donor; use release --rebuild-donor." >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
+CUSTOM_KERNEL_DIR="$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
 # copy with platform-specific mlx-metal wheels swapped in.
@@ -93,6 +132,56 @@ log()  { printf "${LIGHT_BLUE}[build.sh]${RESET} %s\n" "$*"; }
 ok()   { printf "${GREEN}[build.sh]${RESET} %s\n" "$*"; }
 warn() { printf "${YELLOW}[build.sh]${RESET} %s\n" "$*"; }
 die()  { printf "${RED}[build.sh ERROR]${RESET} %s\n" "$*" >&2; exit 1; }
+
+_is_mach_o_file() {
+    local path="$1"
+    local type
+    type="$(file -b "$path" 2>/dev/null || true)"
+    [[ "$type" == *"Mach-O"* ]]
+}
+
+_sign_embedded_mach_o_files() {
+    local root="$1"
+    local count=0
+
+    while IFS= read -r -d '' path; do
+        _is_mach_o_file "$path" || continue
+        codesign --force --sign - "$path" >/dev/null 2>&1
+        count=$((count + 1))
+    done < <(
+        find "$root" \
+            \( -path "*/.dSYM/*" -o -path "*/__pycache__/*" \) -prune -o \
+            -type f \( \
+                -name "*.so" -o \
+                -name "*.dylib" -o \
+                -name "*.bundle" -o \
+                -perm -100 -o \
+                -perm -010 -o \
+                -perm -001 \
+            \) -print0
+    )
+
+    ok "  + signed $count embedded Mach-O files"
+}
+
+_app_python_layers_path() {
+    local app="$1"
+    for candidate in \
+        "$app/Contents/Resources/Python" \
+        "$app/Contents/Python" \
+        "$app/Contents/Frameworks"
+    do
+        if [ -d "$candidate/cpython-3.11" ] && [ -d "$candidate/framework-mlx-base" ]; then
+            printf "%s\n" "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ "$SWIFT_REBUILD" -eq 1 ] && [ "$BARE" -eq 0 ] && [ ! -d "$LOCAL_EXPORT" ]; then
+    die "Swift rebuild requires existing venvstacks export at $LOCAL_EXPORT. Run build.sh release first."
+fi
 
 # --- Resolve donor: pick a layer source and (re)build via venvstacks if stale
 
@@ -119,12 +208,106 @@ _rebuild_venvstacks_export() {
     ok "Venvstacks export ready at $LOCAL_EXPORT"
 }
 
+_custom_kernel_deployment_target() {
+    printf "%s\n" "${OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-15.0}}"
+}
+
+_custom_kernel_pythonpath() {
+    [ -n "${DONOR_LAYERS:-}" ] || die "custom kernel build requires resolved donor layers."
+    local mlx_site="$DONOR_LAYERS/framework-mlx-base/lib/python3.11/site-packages"
+    [ -d "$mlx_site" ] || die "donor missing framework MLX site-packages: $mlx_site"
+    if [ -n "${PYTHONPATH:-}" ]; then
+        printf "%s:%s\n" "$mlx_site" "$PYTHONPATH"
+    else
+        printf "%s\n" "$mlx_site"
+    fi
+}
+
+_clean_custom_kernel_build_artifacts() {
+    find "$CUSTOM_KERNEL_DIR" -maxdepth 1 -type f \( \
+        -name "*.so" -o \
+        -name "*.dylib" -o \
+        -name "*.metallib" \
+    \) -delete
+
+    if [ -d "$REPO_ROOT/build" ]; then
+        find "$REPO_ROOT/build" \
+            -type d \
+            -name "omlx.custom_kernels.glm_moe_dsa._ext" \
+            -prune \
+            -exec rm -rf {} +
+    fi
+}
+
+_custom_kernel_minos() {
+    otool -l "$1" 2>/dev/null | awk '
+        /LC_BUILD_VERSION/ { in_build = 1 }
+        in_build && /minos/ { print $2; exit }
+    '
+}
+
+_validate_custom_kernel_deployment_target() {
+    local expected="$1"
+    local path
+    local minos
+
+    command -v otool >/dev/null 2>&1 || return 0
+
+    for path in "$CUSTOM_KERNEL_DIR"/_ext*.so "$CUSTOM_KERNEL_DIR"/lib*.dylib; do
+        [ -e "$path" ] || continue
+        minos="$(_custom_kernel_minos "$path")"
+        [ -n "$minos" ] || die "could not read deployment target from $path."
+        [ "$minos" = "$expected" ] \
+            || die "custom kernel $path has macOS min $minos, expected $expected."
+    done
+}
+
+_build_custom_kernels() {
+    [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
+    local deployment_target
+    local cmake_args
+    local custom_kernel_pythonpath
+    deployment_target="$(_custom_kernel_deployment_target)"
+    cmake_args="${CMAKE_ARGS:-}"
+    custom_kernel_pythonpath="$(_custom_kernel_pythonpath)"
+
+    log "Building optional native custom kernels (macOS deployment target $deployment_target)…"
+    _clean_custom_kernel_build_artifacts
+    (
+        cd "$REPO_ROOT"
+        export PYTHONPATH="$custom_kernel_pythonpath"
+        export OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET="$deployment_target"
+        export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$deployment_target}"
+        if [[ "$cmake_args" != *"CMAKE_OSX_DEPLOYMENT_TARGET"* ]]; then
+            export CMAKE_ARGS="${cmake_args:+$cmake_args }-DCMAKE_OSX_DEPLOYMENT_TARGET=$deployment_target"
+        fi
+        "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
+    ) || die "custom kernel build failed; see output above."
+    [ -f "$CUSTOM_KERNEL_DIR/omlx_glm_kernels.metallib" ] \
+        || die "custom kernel build finished but GLM metallib is missing."
+    _validate_custom_kernel_deployment_target "$deployment_target"
+    ok "  + custom kernels ($deployment_target)"
+}
+
 resolve_donor_layers() {
+    # Fast Swift rebuild mode reuses an already-built venvstacks export.
+    # It intentionally refuses to rebuild or fall back to /Applications.
+    if [ "$SWIFT_REBUILD" -eq 1 ]; then
+        if [ ! -d "$LOCAL_EXPORT" ]; then
+            die "Swift rebuild requires existing venvstacks export at $LOCAL_EXPORT. Run build.sh release first."
+        fi
+        DONOR_LAYERS="$LOCAL_EXPORT"
+        DONOR_SOURCE="$LOCAL_EXPORT (swift rebuild, no venvstacks rebuild)"
+        _local_export_fresh \
+            || warn "Local export fingerprint mismatch; using stale layers (swift rebuild)."
+        return
+    fi
+
     # Explicit OMLX_DONOR_APP override → use it, skip rebuild logic entirely.
     if [ -n "$OMLX_DONOR_APP_SET" ]; then
         [ -d "$OMLX_DONOR_APP" ] || die "OMLX_DONOR_APP set but not found: $OMLX_DONOR_APP"
-        DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Python"
-        [ -d "$DONOR_LAYERS" ] || DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Frameworks"
+        DONOR_LAYERS="$(_app_python_layers_path "$OMLX_DONOR_APP")" \
+            || die "OMLX_DONOR_APP missing bundled Python layers: $OMLX_DONOR_APP"
         DONOR_SOURCE="OMLX_DONOR_APP=$OMLX_DONOR_APP"
         return
     fi
@@ -142,8 +325,8 @@ resolve_donor_layers() {
                 _local_export_fresh \
                     || warn "Local export fingerprint mismatch; using stale layers (--no-rebuild-donor)."
             elif [ -d "$OMLX_DONOR_APP" ]; then
-                DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Python"
-                [ -d "$DONOR_LAYERS" ] || DONOR_LAYERS="$OMLX_DONOR_APP/Contents/Frameworks"
+                DONOR_LAYERS="$(_app_python_layers_path "$OMLX_DONOR_APP")" \
+                    || die "Fallback donor missing bundled Python layers: $OMLX_DONOR_APP"
                 DONOR_SOURCE="$OMLX_DONOR_APP (fallback, --no-rebuild-donor)"
             else
                 die "No donor available: $LOCAL_EXPORT and $OMLX_DONOR_APP both missing, --no-rebuild-donor prevents rebuild."
@@ -235,9 +418,9 @@ if [ "$BARE" -eq 1 ]; then
     exit 0
 fi
 
-FRAMEWORKS_DIR="$STAGED_APP/Contents/Frameworks"
 RESOURCES_DIR="$STAGED_APP/Contents/Resources"
-mkdir -p "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
+PYTHON_DIR="$RESOURCES_DIR/Python"
+mkdir -p "$PYTHON_DIR" "$RESOURCES_DIR"
 
 # --- Embed Python layers --------------------------------------------------
 
@@ -247,31 +430,80 @@ log "Using donor: $DONOR_SOURCE"
 [ -d "$DONOR_LAYERS/framework-mlx-base" ] || die "Donor missing framework-mlx-base at $DONOR_LAYERS"
 
 log "Copying cpython-3.11 from donor…"
-ditto "$DONOR_LAYERS/cpython-3.11" "$FRAMEWORKS_DIR/cpython-3.11"
+ditto "$DONOR_LAYERS/cpython-3.11" "$PYTHON_DIR/cpython-3.11"
 ok "  + cpython-3.11"
 
 log "Copying framework-mlx-base from donor (~1 GB)…"
-ditto "$DONOR_LAYERS/framework-mlx-base" "$FRAMEWORKS_DIR/framework-mlx-base"
+ditto "$DONOR_LAYERS/framework-mlx-base" "$PYTHON_DIR/framework-mlx-base"
 ok "  + framework-mlx-base"
 
 if [ -d "$DONOR_LAYERS/__venvstacks__" ]; then
-    ditto "$DONOR_LAYERS/__venvstacks__" "$FRAMEWORKS_DIR/__venvstacks__"
+    ditto "$DONOR_LAYERS/__venvstacks__" "$PYTHON_DIR/__venvstacks__"
     ok "  + __venvstacks__ metadata"
 fi
 
 # --- Embed omlx package ---------------------------------------------------
 
+if [ "$WITH_CUSTOM_KERNEL" = "1" ]; then
+    _build_custom_kernels
+fi
+
 log "Copying omlx package from source tree…"
 rm -rf "$RESOURCES_DIR/omlx"
 mkdir -p "$RESOURCES_DIR/omlx"
 # rsync gives us per-tree exclude semantics that ditto lacks.
+RSYNC_EXCLUDES=(
+    --exclude='__pycache__'
+    --exclude='*.pyc'
+    --exclude='tests'
+    --exclude='.git'
+    --exclude='custom_kernels/*/csrc'
+)
+if [ "$WITH_CUSTOM_KERNEL" != "1" ]; then
+    RSYNC_EXCLUDES+=(
+        --exclude='custom_kernels/*/*.so'
+        --exclude='custom_kernels/*/*.dylib'
+        --exclude='custom_kernels/*/*.metallib'
+    )
+fi
 rsync -a \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='tests' \
-    --exclude='.git' \
+    "${RSYNC_EXCLUDES[@]}" \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
+
+log "Writing engine commit metadata..."
+"$PYTHON_BIN" "$PACKAGING_DIR/build.py" --write-engine-commits "$RESOURCES_DIR/omlx" \
+    || die "failed to write engine commit metadata."
+ok "  + _engine_commits.json"
+
+# --- Embed CLI wrapper ----------------------------------------------------
+
+log "Writing app-bundle CLI wrapper..."
+CLI_WRAPPER="$STAGED_APP/Contents/MacOS/omlx-cli"
+cat > "$CLI_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+PYROOT="$RESOURCES/Python"
+CPYTHON="$PYROOT/cpython-3.11"
+PYTHON="$CPYTHON/bin/python3"
+MLX_SITE="$PYROOT/framework-mlx-base/lib/python3.11/site-packages"
+
+export PYTHONHOME="$CPYTHON"
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$MLX_SITE:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES:$MLX_SITE"
+fi
+
+exec "$PYTHON" -m omlx.cli "$@"
+EOF
+chmod 755 "$CLI_WRAPPER"
+ok "  + omlx-cli"
 
 # --- Compile AppIcon.icon (Tahoe Liquid Glass) ----------------------------
 #
@@ -329,13 +561,22 @@ fi
 
 # --- Re-sign ad-hoc -------------------------------------------------------
 #
-# Even with CODE_SIGNING_ALLOWED=NO during xcodebuild, we re-sign the staged
-# bundle ad-hoc so Gatekeeper doesn't refuse to launch it from a non-derived
-# location on first quarantine attribute.
+# Even with CODE_SIGNING_ALLOWED=NO during xcodebuild, the staged bundle must
+# have a coherent app-bundle signature. Sign embedded native Python/MLX
+# libraries first, then seal the outer app bundle so TCC can match Full Disk
+# Access grants against the app identity instead of a bare linker signature.
 
-log "Ad-hoc resigning outer bundle…"
-codesign --force --sign - "$STAGED_APP" >/dev/null 2>&1 || \
-    warn "outer codesign emitted a warning; the app may still launch."
+if [ "$SKIP_EMBEDDED_SIGN" -eq 1 ]; then
+    warn "swift-fast set: skipping embedded native code signing."
+else
+    log "Ad-hoc signing embedded native code…"
+    _sign_embedded_mach_o_files "$PYTHON_DIR"
+    codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
+    ok "  + signed omlx-cli wrapper"
+fi
+
+log "Ad-hoc resigning app bundle…"
+codesign --force --sign - "$STAGED_APP"
 
 # Drop quarantine attributes so the bundle launches from anywhere.
 xattr -dr com.apple.quarantine "$STAGED_APP" 2>/dev/null || true

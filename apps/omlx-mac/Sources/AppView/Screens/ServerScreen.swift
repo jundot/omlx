@@ -11,8 +11,8 @@ import SwiftUI
 import AppKit
 
 struct ServerScreen: View {
-    @EnvironmentObject private var services: AppServices
-    @StateObject private var vm = ServerScreenVM()
+    @Environment(AppServices.self) private var services
+    @State private var vm = ServerScreenVM()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,7 +46,7 @@ struct ServerScreen: View {
                                   defaultValue: "Port",
                                   comment: "Row label for the server port field"),
                     sublabel: String(localized: "server.row.port.sub",
-                                     defaultValue: "Default 8080. Server restarts on save.",
+                                     defaultValue: "Default 8000. Server restarts on save.",
                                      comment: "Sublabel under the Port field"),
                     isLast: true
                 ) {
@@ -71,6 +71,27 @@ struct ServerScreen: View {
             // Server →" link (see AppServices.ServerAnchor.defaultProfile).
             .id(ServerAnchor.defaultProfile.rawValue)
             ServerDefaultProfileEditor(vm: vm)
+
+            SectionHeader(String(localized: "server.section.startup",
+                                  defaultValue: "Server Startup",
+                                  comment: "Section heading for server startup behavior settings"))
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.auto_start_on_launch",
+                                  defaultValue: "Automatically start server on launch",
+                                  comment: "Row label for automatically starting the managed server when the macOS app launches"),
+                    sublabel: String(localized: "server.row.auto_start_on_launch.sub",
+                                     defaultValue: "When disabled, the menu bar app opens without starting the server.",
+                                     comment: "Sublabel explaining the auto-start on launch setting"),
+                    isLast: true
+                ) {
+                    Toggle("", isOn: vm.bind($vm.autoStartOnLaunch, save: {
+                        vm.saveAutoStartOnLaunch(services: services)
+                    }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
 
             SectionHeader(String(localized: "server.section.logging",
                                   defaultValue: "Logging",
@@ -123,16 +144,21 @@ struct ServerScreen: View {
                 ) {
                     TextInput(text: $vm.basePathText, mono: true, width: 280)
                 }
+                FreeRow {
+                    ModelDirectoriesEditor(vm: vm)
+                }
                 Row(
-                    label: String(localized: "server.row.models_directory",
-                                  defaultValue: "Models Directory",
-                                  comment: "Row label for the Models Directory text input"),
-                    sublabel: String(localized: "server.row.models_directory.sub",
-                                     defaultValue: "Where the server reads and writes model weights. Downloaded models land here.",
-                                     comment: "Sublabel under the Models Directory field"),
+                    label: String(localized: "server.row.hf_cache",
+                                  defaultValue: "Use Hugging Face local cache",
+                                  comment: "Row label for enabling standard Hugging Face Hub cache model discovery"),
+                    sublabel: String(localized: "server.row.hf_cache.sub",
+                                     defaultValue: "Discover MLX-compatible models from the standard Hugging Face Hub cache.",
+                                     comment: "Sublabel for enabling Hugging Face local cache discovery"),
                     isLast: true
                 ) {
-                    TextInput(text: $vm.modelDirText, mono: true, width: 280)
+                    Toggle("", isOn: $vm.hfCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
             }
             ServerAdvancedSection(vm: vm)
@@ -171,6 +197,84 @@ struct ServerScreen: View {
     }
 }
 
+private struct ModelDirectoriesEditor: View {
+    var vm: ServerScreenVM
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(localized: "server.row.models_directories",
+                                defaultValue: "Model Directories",
+                                comment: "Row label for the model directories editor"))
+                        .font(.omlxText(13, weight: .medium))
+                        .foregroundStyle(theme.text)
+                    Text(String(localized: "server.row.models_directories.sub",
+                                defaultValue: "The first path is the download target. All paths are scanned for local models.",
+                                comment: "Sublabel under the model directories editor"))
+                        .font(.omlxText(11.5))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer(minLength: 12)
+                Button {
+                    vm.addModelDirectory()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                .help(String(localized: "server.model_dirs.add.help",
+                             defaultValue: "Add model directory",
+                             comment: "Tooltip for the add model directory button"))
+            }
+
+            VStack(spacing: 7) {
+                ForEach(Array(vm.modelDirTexts.indices), id: \.self) { index in
+                    modelDirRow(index: index)
+                }
+            }
+        }
+    }
+
+    private func modelDirRow(index: Int) -> some View {
+        HStack(spacing: 7) {
+            Text(index == 0
+                 ? String(localized: "server.model_dirs.primary",
+                          defaultValue: "Primary",
+                          comment: "Badge for the first model directory")
+                 : String(format: "#%d", index + 1))
+                .font(.omlxMono(10, weight: .semibold))
+                .foregroundStyle(index == 0 ? theme.accent : theme.textSecondary)
+                .frame(width: 52, alignment: .leading)
+
+            TextInput(text: Binding(
+                get: { vm.modelDirText(at: index) },
+                set: { vm.setModelDirText($0, at: index) }
+            ), mono: true, width: 340)
+
+            Button {
+                vm.browseModelDirectory(at: index)
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .help(String(localized: "server.model_dirs.browse.help",
+                         defaultValue: "Choose folder",
+                         comment: "Tooltip for choosing a model directory"))
+
+            Button {
+                vm.removeModelDirectory(at: index)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.omlx(.plain, size: .small))
+            .help(String(localized: "server.model_dirs.remove.help",
+                         defaultValue: "Remove model directory",
+                         comment: "Tooltip for removing a model directory"))
+        }
+    }
+}
+
 // MARK: - Server hero
 
 /// Hero card shared between the Server and Status screens (omlx-screens.jsx
@@ -181,7 +285,7 @@ struct ServerScreen: View {
 struct ServerHeroCard: View {
     var vm: ServerScreenVM? = nil
 
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -197,9 +301,7 @@ struct ServerHeroCard: View {
                 .frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text(String(localized: "server.hero.title",
-                                defaultValue: "oMLX Server",
-                                comment: "Hero card title on Server and Status screens"))
+                    Text(title)
                         .font(.omlxText(18, weight: .semibold))
                         .foregroundStyle(theme.text)
                     StatusPill(status: pillStatus)
@@ -212,17 +314,10 @@ struct ServerHeroCard: View {
             buttons
         }
         .padding(18)
-        // Hero card surface: subtle accent gradient over a glass/material
-        // fill that's clipped to the rounded-rect outline. The gradient stays
-        // on top so the green/blue accent reads on both macOS 15 (over
-        // .thickMaterial) and macOS 26 (over real liquid glass).
+        // Hero card surface follows the grouped Settings style. Status is
+        // carried by the pill/actions, not by a colored background wash.
         .background(heroBackground)
-        .appGlass(.strong, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(theme.groupBorder, lineWidth: 0.5)
-        )
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
     }
@@ -328,23 +423,13 @@ struct ServerHeroCard: View {
 
     @ViewBuilder
     private var heroBackground: some View {
-        if theme.isDark {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0x30D158, opacity: 0.08),
-                    Color(rgb24: 0x0A84FF, opacity: 0.06),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        } else {
-            LinearGradient(
-                colors: [
-                    Color(rgb24: 0xF4FAF6),
-                    Color(rgb24: 0xF4F7FC),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-        }
+        theme.groupBg
+    }
+
+    private var title: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "oMLX" : "oMLX \(trimmed)"
     }
 }
 
@@ -359,7 +444,7 @@ struct ServerHeroCard: View {
 /// them disabled with a "Per-model only" tag so the user knows where to
 /// look. Expander mirrors the design's "Show all fields…" affordance.
 private struct ServerDefaultProfileEditor: View {
-    @ObservedObject var vm: ServerScreenVM
+    @Bindable var vm: ServerScreenVM
 
     @State private var expanded: Bool = false
     @Environment(\.omlxTheme) private var theme
@@ -557,7 +642,7 @@ private struct APIEndpointsList: View {
 /// chevron so they don't crowd the main ServerScreen surface, but rendered
 /// inline (not in a popover) so power users can scroll-find them.
 private struct ServerAdvancedSection: View {
-    @ObservedObject var vm: ServerScreenVM
+    @Bindable var vm: ServerScreenVM
 
     @State private var expanded: Bool = false
     @Environment(\.omlxTheme) private var theme
@@ -660,444 +745,5 @@ private struct HintFooter: View {
         }
         .padding(.horizontal, 18)
         .padding(.top, 8)
-    }
-}
-
-// MARK: - View model
-
-@MainActor
-final class ServerScreenVM: ObservableObject {
-    @Published var host: String = "127.0.0.1"
-    @Published var portText: String = "8080"
-    @Published var logLevel: String = "info"
-
-    // Phase 4 — Advanced disclosure.
-    @Published var sseKeepaliveMode: String = "chunk"
-    /// Comma-separated text shown in the input. Parsed to `[String]` on save
-    /// so the user can edit incrementally without intermediate trips to the
-    /// server. Empty string clears all aliases.
-    @Published var serverAliasesText: String = ""
-    @Published var basePathText: String = AppConfig.defaultBasePath()
-    @Published var modelDirText: String = ""
-    @Published var lastError: String?
-    @Published private(set) var isMovingBasePath: Bool = false
-
-    // Server default profile (GlobalSettings.sampling). Backed by 6
-    // server-side fields; the other design rows render disabled.
-    @Published var samplingContextText: String = "32768"
-    @Published var samplingMaxTokensText: String = "32768"
-    @Published var samplingTemperatureText: String = "1.0"
-    @Published var samplingTopPText: String = "0.95"
-    @Published var samplingTopKText: String = "0"
-    @Published var samplingRepetitionPenaltyText: String = "1.0"
-
-    /// Last applied (effective) values used to build endpoint URLs. Distinct
-    /// from `host`/`portText` so the URLs don't flicker mid-edit.
-    @Published var effectiveHost: String = "127.0.0.1"
-    @Published var effectivePort: Int = 8080
-
-    /// Apply-button baselines: snapshots of each Apply-managed draft taken
-    /// after a successful `load()` or `applyServerSettings()`. The button's
-    /// `disabled` state is `drafts == baselines`, so re-snapshotting on
-    /// success collapses the page back to "no pending changes".
-    ///
-    /// Listen Address / Log Level / SSE Keep-Alive Mode auto-apply via the
-    /// `bind()` wrapper and don't need baselines here.
-    private var baselinePortText: String = "8080"
-    private var baselineSamplingContextText: String = "32768"
-    private var baselineSamplingMaxTokensText: String = "32768"
-    private var baselineSamplingTemperatureText: String = "1.0"
-    private var baselineSamplingTopPText: String = "0.95"
-    private var baselineSamplingTopKText: String = "0"
-    private var baselineSamplingRepetitionPenaltyText: String = "1.0"
-    private var baselineServerAliasesText: String = ""
-
-    private weak var client: OMLXClient?
-    private var hasLoaded = false
-
-    func load(client: OMLXClient) async {
-        self.client = client
-        do {
-            let dto = try await client.getGlobalSettings()
-            self.host = dto.server.host
-            self.portText = String(dto.server.port)
-            self.logLevel = canonicalize(level: dto.server.logLevel)
-            self.effectiveHost = dto.server.host
-            self.effectivePort = dto.server.port
-            self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
-            self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
-            if let s = dto.sampling {
-                self.samplingContextText = String(s.maxContextWindow)
-                self.samplingMaxTokensText = String(s.maxTokens)
-                self.samplingTemperatureText = trimDouble(s.temperature)
-                self.samplingTopPText = trimDouble(s.topP)
-                self.samplingTopKText = String(s.topK)
-                self.samplingRepetitionPenaltyText = trimDouble(s.repetitionPenalty)
-            }
-            self.lastError = nil
-            self.hasLoaded = true
-            self.snapshotApplyBaselines()
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    // MARK: - Apply orchestrator
-
-    /// Snapshot current draft values as the new "applied" baseline. Called
-    /// at the end of `load()` and after a successful `applyServerSettings()`.
-    private func snapshotApplyBaselines() {
-        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
-        baselinePortText = t(portText)
-        baselineSamplingContextText = t(samplingContextText)
-        baselineSamplingMaxTokensText = t(samplingMaxTokensText)
-        baselineSamplingTemperatureText = t(samplingTemperatureText)
-        baselineSamplingTopPText = t(samplingTopPText)
-        baselineSamplingTopKText = t(samplingTopKText)
-        baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
-        baselineServerAliasesText = serverAliasesText
-    }
-
-    /// Apply-button gate: true when any Apply-managed draft diverges from
-    /// its baseline, or when Storage has uncommitted changes. Listen
-    /// Address / Log Level / SSE Keep-Alive Mode auto-apply via `bind()`
-    /// and are intentionally excluded from this check.
-    func hasPendingServerChanges(services: AppServices) -> Bool {
-        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
-        if t(portText) != baselinePortText { return true }
-        if t(samplingContextText) != baselineSamplingContextText { return true }
-        if t(samplingMaxTokensText) != baselineSamplingMaxTokensText { return true }
-        if t(samplingTemperatureText) != baselineSamplingTemperatureText { return true }
-        if t(samplingTopPText) != baselineSamplingTopPText { return true }
-        if t(samplingTopKText) != baselineSamplingTopKText { return true }
-        if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
-        if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
-        return hasPendingStorageChanges(services: services)
-    }
-
-    /// Page-wide Apply. Validates every dirty Apply-managed field upfront
-    /// (bail loudly on bad input — no partial patches), bundles the
-    /// non-storage changes into a single `GlobalSettingsPatch`, then runs
-    /// the storage move flow if needed. A bundled port change rides along
-    /// with the storage move's single restart (passed as `port:`); a
-    /// port-only change with no storage move goes through
-    /// `applyServerEndpoint` instead.
-    func applyServerSettings(services: AppServices) {
-        let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
-        var patch = GlobalSettingsPatch()
-        var nextPort: Int? = nil
-
-        if t(portText) != baselinePortText {
-            guard let p = Int(t(portText)), (1...65535).contains(p) else {
-                self.lastError = String(localized: "server.error.port_invalid",
-                                        defaultValue: "Port must be a number between 1 and 65535.",
-                                        comment: "Server screen error when port value is out of valid range")
-                return
-            }
-            patch.port = p
-            nextPort = p
-        }
-        if t(samplingContextText) != baselineSamplingContextText {
-            guard let n = Int(t(samplingContextText)), n > 0 else {
-                self.lastError = String(localized: "server.error.context_window_invalid",
-                                        defaultValue: "Context Window must be a positive integer.",
-                                        comment: "Server screen error when Context Window input is invalid")
-                return
-            }
-            patch.samplingMaxContextWindow = n
-        }
-        if t(samplingMaxTokensText) != baselineSamplingMaxTokensText {
-            guard let n = Int(t(samplingMaxTokensText)), n > 0 else {
-                self.lastError = String(localized: "server.error.max_tokens_invalid",
-                                        defaultValue: "Max Tokens must be a positive integer.",
-                                        comment: "Server screen error when Max Tokens input is invalid")
-                return
-            }
-            patch.samplingMaxTokens = n
-        }
-        if t(samplingTemperatureText) != baselineSamplingTemperatureText {
-            guard let v = Double(t(samplingTemperatureText)), v >= 0, v <= 2 else {
-                self.lastError = String(localized: "server.error.temperature_invalid",
-                                        defaultValue: "Temperature must be a number in [0, 2].",
-                                        comment: "Server screen error when Temperature input is out of range")
-                return
-            }
-            patch.samplingTemperature = v
-        }
-        if t(samplingTopPText) != baselineSamplingTopPText {
-            guard let v = Double(t(samplingTopPText)), v >= 0, v <= 1 else {
-                self.lastError = String(localized: "server.error.top_p_invalid",
-                                        defaultValue: "Top P must be a number in [0, 1].",
-                                        comment: "Server screen error when Top P input is out of range")
-                return
-            }
-            patch.samplingTopP = v
-        }
-        if t(samplingTopKText) != baselineSamplingTopKText {
-            guard let n = Int(t(samplingTopKText)), n >= 0 else {
-                self.lastError = String(localized: "server.error.top_k_invalid",
-                                        defaultValue: "Top K must be ≥ 0.",
-                                        comment: "Server screen error when Top K input is negative or not a number")
-                return
-            }
-            patch.samplingTopK = n
-        }
-        if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText {
-            guard let v = Double(t(samplingRepetitionPenaltyText)), v >= 0 else {
-                self.lastError = String(localized: "server.error.repetition_penalty_invalid",
-                                        defaultValue: "Repetition Penalty must be a non-negative number.",
-                                        comment: "Server screen error when Repetition Penalty is invalid")
-                return
-            }
-            patch.samplingRepetitionPenalty = v
-        }
-
-        let newAliases = parseAliases(serverAliasesText)
-        if newAliases != parseAliases(baselineServerAliasesText) {
-            patch.serverAliases = newAliases
-        }
-
-        let diff = storageDiff(services: services)
-        if diff.baseChanged && diff.normalizedBase.isEmpty {
-            self.lastError = String(localized: "server.error.base_path_empty",
-                                    defaultValue: "Base path cannot be empty.",
-                                    comment: "Server screen error when Base Path is empty on Apply")
-            return
-        }
-        if diff.dirChanged && diff.normalizedModelDir.isEmpty {
-            self.lastError = String(localized: "server.error.models_dir_empty",
-                                    defaultValue: "Models Directory cannot be empty.",
-                                    comment: "Server screen error when Models Directory is empty on Apply")
-            return
-        }
-
-        let patchHasFields = patch.port != nil
-            || patch.samplingMaxContextWindow != nil
-            || patch.samplingMaxTokens != nil
-            || patch.samplingTemperature != nil
-            || patch.samplingTopP != nil
-            || patch.samplingTopK != nil
-            || patch.samplingRepetitionPenalty != nil
-            || patch.serverAliases != nil
-
-        if !patchHasFields && !diff.hasChanges {
-            self.lastError = String(localized: "server.error.nothing_to_apply",
-                                    defaultValue: "Nothing to apply — every field matches the current config.",
-                                    comment: "Server screen error when Apply is tapped with no pending changes")
-            return
-        }
-
-        if diff.hasChanges { isMovingBasePath = true }
-        Task {
-            defer {
-                Task { @MainActor in
-                    if self.isMovingBasePath { self.isMovingBasePath = false }
-                }
-            }
-            do {
-                if patchHasFields, let client {
-                    _ = try await client.updateGlobalSettings(patch)
-                }
-                if diff.hasChanges {
-                    // Hand the bundled port to the storage flow so its single
-                    // restart binds the new port. Without this the restart
-                    // reuses the cached --port args and silently keeps the old
-                    // port even though we just PATCHed the new one.
-                    try await services.applyStorageChanges(
-                        basePath: diff.baseChanged ? diff.normalizedBase : nil,
-                        modelDir: diff.dirChanged ? diff.normalizedModelDir : nil,
-                        port: nextPort
-                    )
-                    self.basePathText = services.config.basePath
-                    self.modelDirText = services.config.modelDir
-                    if let p = nextPort { self.effectivePort = p }
-                } else if let p = nextPort {
-                    try await services.applyServerEndpoint(port: p)
-                    self.effectivePort = p
-                }
-                self.lastError = nil
-                self.snapshotApplyBaselines()
-            } catch {
-                self.lastError = error.omlxDescription
-            }
-        }
-    }
-
-    /// Parse the comma-separated aliases text into a dedupe-preserving list.
-    /// Used both to build the outbound patch and to diff drafts against the
-    /// saved baseline (which is also parsed before compare so reordering /
-    /// whitespace-only edits don't false-trigger Apply).
-    private func parseAliases(_ text: String) -> [String] {
-        let parts = text
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        var seen = Set<String>()
-        return parts.filter { seen.insert($0).inserted }
-    }
-
-    /// Format a double for an editable field: `1.0` → `"1.0"`, `0.95` →
-    /// `"0.95"`, drops trailing zeros above the first decimal.
-    private func trimDouble(_ v: Double) -> String {
-        v.truncatingRemainder(dividingBy: 1) == 0
-            ? String(format: "%.1f", v)
-            : String(v)
-    }
-
-    func applyConfig(_ config: AppConfig) {
-        if !hasLoaded {
-            self.host = config.host
-            self.portText = String(config.port)
-            self.effectiveHost = config.host
-            self.effectivePort = config.port
-        }
-        // basePath/modelDir always mirror the live config — they're not
-        // gated by `hasLoaded` because the global-settings PATCH path
-        // (which sets `hasLoaded = true`) doesn't carry them. modelDir is
-        // always a literal path (default `<basePath>/models` or whatever
-        // the user pointed it at) — never blank.
-        self.basePathText = config.basePath
-        self.modelDirText = config.modelDir
-    }
-
-    func saveHost(services: AppServices) {
-        let next = host
-        Task {
-            await commit(GlobalSettingsPatch(host: next))
-            do {
-                try await services.applyServerEndpoint(host: next)
-                self.effectiveHost = next
-            } catch {
-                self.lastError = error.omlxDescription
-            }
-        }
-    }
-
-    /// True when either Storage text field differs from the current config.
-    /// Drives the Apply button's `disabled` state so we don't bounce the
-    /// server for an idempotent click.
-    func hasPendingStorageChanges(services: AppServices) -> Bool {
-        storageDiff(services: services).hasChanges
-    }
-
-    /// Computed diff against `services.config`, with tilde expansion + path
-    /// normalization. modelDir always carries a literal path (no
-    /// "empty == default" magic). Internal so unit tests can drive it.
-    struct StorageDiff: Equatable {
-        let normalizedBase: String
-        let normalizedModelDir: String
-        let baseChanged: Bool
-        let dirChanged: Bool
-        var hasChanges: Bool { baseChanged || dirChanged }
-    }
-
-    func storageDiff(services: AppServices) -> StorageDiff {
-        let trimmedBase = basePathText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedBase = ((trimmedBase as NSString).expandingTildeInPath
-                              as NSString).standardizingPath
-        let currentBase = (services.config.basePath as NSString).standardizingPath
-        let baseChanged = !normalizedBase.isEmpty && normalizedBase != currentBase
-
-        let trimmedDir = modelDirText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedDir = ((trimmedDir as NSString).expandingTildeInPath
-                             as NSString).standardizingPath
-        let currentDir = (services.config.modelDir as NSString).standardizingPath
-        let dirChanged = !normalizedDir.isEmpty && normalizedDir != currentDir
-
-        return StorageDiff(
-            normalizedBase: normalizedBase,
-            normalizedModelDir: normalizedDir,
-            baseChanged: baseChanged,
-            dirChanged: dirChanged
-        )
-    }
-
-    /// Restart wired to the hero button. Folds any pending edits in the
-    /// Listen Address / Port fields into the restart so the user can either
-    /// hit Enter on the field OR just click Restart — both reach the same
-    /// place.
-    func restart(services: AppServices) {
-        let trimmedPort = portText.trimmingCharacters(in: .whitespaces)
-        let parsedPort = Int(trimmedPort)
-        let portChanged = parsedPort.map { $0 != effectivePort } ?? false
-        let hostChanged = host != effectiveHost
-
-        if portChanged, let p = parsedPort, !(1...65535).contains(p) {
-            self.lastError = String(localized: "server.error.port_invalid",
-                                    defaultValue: "Port must be a number between 1 and 65535.",
-                                    comment: "Server screen error when port value is out of valid range")
-            return
-        }
-        if portChanged && parsedPort == nil {
-            self.lastError = String(localized: "server.error.port_invalid",
-                                    defaultValue: "Port must be a number between 1 and 65535.",
-                                    comment: "Server screen error when port value is out of valid range")
-            return
-        }
-
-        Task {
-            do {
-                if portChanged || hostChanged {
-                    if portChanged, let p = parsedPort {
-                        await commit(GlobalSettingsPatch(port: p))
-                    }
-                    if hostChanged {
-                        await commit(GlobalSettingsPatch(host: host))
-                    }
-                    try await services.applyServerEndpoint(
-                        host: hostChanged ? host : nil,
-                        port: portChanged ? parsedPort : nil
-                    )
-                    if let p = parsedPort, portChanged { self.effectivePort = p }
-                    if hostChanged { self.effectiveHost = host }
-                } else {
-                    try await services.restartServer()
-                }
-            } catch {
-                self.lastError = error.omlxDescription
-            }
-        }
-    }
-
-    func saveLogLevel() {
-        Task { await commit(GlobalSettingsPatch(logLevel: logLevel)) }
-    }
-
-    func saveSseKeepaliveMode() {
-        Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
-    }
-
-    /// Build a `Binding` that calls `save` after the value changes. Used for
-    /// Popups that have no `onSubmit` hook.
-    func bind<T: Equatable>(
-        _ binding: Binding<T>,
-        save: @escaping () -> Void
-    ) -> Binding<T> {
-        Binding(
-            get: { binding.wrappedValue },
-            set: { newValue in
-                let changed = binding.wrappedValue != newValue
-                binding.wrappedValue = newValue
-                if changed { save() }
-            }
-        )
-    }
-
-    private func commit(_ patch: GlobalSettingsPatch) async {
-        guard let client else { return }
-        do {
-            _ = try await client.updateGlobalSettings(patch)
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-
-    private func canonicalize(level raw: String) -> String {
-        switch raw.lowercased() {
-        case "warn":   return "warning"
-        default:       return raw.lowercased()
-        }
     }
 }

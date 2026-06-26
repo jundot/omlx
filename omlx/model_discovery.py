@@ -17,6 +17,8 @@ Supports:
 import contextlib
 import json
 import logging
+import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,8 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
+    "diffusion_gemma",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -55,10 +59,19 @@ VLM_MODEL_TYPES = {
     "deepseekocr_2",
     "dots_ocr",
     "glm_ocr",
+    "minimax_m3_vl",
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+}
+
+# Text-only model families that are implemented in mlx-vlm rather than
+# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# models and adapts their language model to oMLX's scheduler.
+VLM_NATIVE_TEXT_MODEL_TYPES = {
+    "cohere2_moe",
+    "minimax_m3",
 }
 
 # Known VLM architectures
@@ -90,7 +103,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -99,6 +111,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures
@@ -277,6 +290,18 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"  # "local" or "hf_cache"
+    source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+
+
+@dataclass(frozen=True)
+class HfCacheEntry:
+    """Resolved HuggingFace Hub cache entry."""
+
+    snapshot_path: Path
+    model_id: str
+    source_repo_id: str
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -372,6 +397,47 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     )
 
 
+def _looks_like_nemo_asr_config(config: dict) -> bool:
+    """Return True for NeMo ASR exports that omit HF ``model_type``.
+
+    NVIDIA Parakeet TDT/CTC MLX conversions keep the original NeMo ASR
+    training config instead of a HuggingFace-style ``model_type`` or
+    ``architectures`` field.  mlx-audio can load these models by name, but
+    oMLX must still classify them as STT during discovery or they fall through
+    to the LLM engine and fail with a misleading ``'model_type'`` error.
+
+    Only top-level NeMo ASR module targets are considered so multimodal models
+    with nested ``audio_config`` sections are not misclassified.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    module_targets: list[str] = []
+    for key in ("preprocessor", "encoder", "decoder", "joint"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            target = value.get("_target_")
+            if isinstance(target, str):
+                module_targets.append(target.lower())
+
+    if not any("nemo.collections.asr" in target for target in module_targets):
+        return False
+
+    # NeMo ASR configs include an audio preprocessor plus tokenizer/decoder
+    # metadata.  Requiring these keeps the heuristic narrow while covering
+    # Parakeet TDT exports whose config has no model_type at all.
+    preprocessor = config.get("preprocessor")
+    has_audio_preprocessor = isinstance(preprocessor, dict) and (
+        "audio" in str(preprocessor.get("_target_", "")).lower()
+        or "melspectrogram" in str(preprocessor.get("_target_", "")).lower()
+    )
+    has_asr_head = isinstance(config.get("decoder"), dict) or isinstance(
+        config.get("joint"), dict
+    )
+    has_tokenizer = isinstance(config.get("tokenizer"), dict)
+    return has_audio_preprocessor and has_asr_head and has_tokenizer
+
+
 def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
@@ -393,6 +459,16 @@ def _has_vision_subconfig(config: dict) -> bool:
         or "vit_config" in config
         or bool(config.get("mm_vision_tower"))
     )
+
+
+def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
+    """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
+
+    Liquid LFM text checkpoints (LFM2, LFM2.5 MoE, etc.) use ``lfm*`` model
+    types and ``*ForCausalLM`` classes. mlx-audio LFM STS uses ``LFM2AudioModel``
+    and is handled earlier via :data:`AUDIO_STS_ARCHITECTURES`.
+    """
+    return any("causallm" in arch.lower() for arch in architectures)
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -487,6 +563,12 @@ def detect_model_type(model_path: Path) -> ModelType:
             "— treating as LLM"
         )
 
+    if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
+        logger.info(
+            f"{model_type} detected as mlx-vlm native text model"
+        )
+        return "vlm"
+
     # Check for VLM: architectures field
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
     # architecture name but strip vision_config and vision weights.
@@ -507,8 +589,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified and
+    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
+    # vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+            logger.info(
+                f"{model_type} detected as VLM (mlx-vlm native model)"
+            )
+            return "vlm"
         if _has_vision_subconfig(config):
             return "vlm"
         logger.info(
@@ -530,6 +619,12 @@ def detect_model_type(model_path: Path) -> ModelType:
     for arch in architectures:
         if arch in AUDIO_STT_ARCHITECTURES:
             return "audio_stt"
+
+    # NeMo ASR exports such as mlx-community/parakeet-tdt-0.6b-v3 ship a
+    # NeMo training config without HF model_type/architectures.  They are
+    # still STT models and mlx-audio can load them by directory/repo name.
+    if _looks_like_nemo_asr_config(config):
+        return "audio_stt"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"
@@ -546,8 +641,12 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
+    # mlx-audio LFM STS may use an "lfm*" model_type without a known architecture
+    # string yet. Liquid LFM *text* checkpoints share that prefix — disambiguate
+    # with CausalLM architecture names (LFM2 / LFM2.5 MoE, future lfm* LMs).
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        if _architecture_indicates_causal_lm(architectures):
+            return "llm"
         return "audio_sts"
 
     return "llm"
@@ -595,6 +694,81 @@ def detect_thinking_default(model_path: Path) -> bool | None:
         return True  # ON by default (Qwen pattern)
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
+
+    return None
+
+
+# Context-length keys, in priority order. Order mirrors HuggingFace
+# Transformers conventions: ``max_position_embeddings`` is the canonical
+# field for decoder-only LLMs; ``max_seq_len`` / ``seq_length`` show up on
+# Llama / Mistral / Qwen forks; ``n_positions`` is the GPT-2 lineage.
+_CONTEXT_LENGTH_KEYS = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "max_seq_length",
+    "seq_length",
+    "n_positions",
+)
+
+# tokenizer_config.json's ``model_max_length`` is Transformers' fallback
+# field. Transformers seeds it with ``int(1e30)`` when the tokenizer has
+# no real cap, and downstream code distinguishes that sentinel from a
+# real long context. Anything above ~1e18 is treated as the sentinel.
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
+
+
+def _read_model_context_length(model_path: Path) -> int | None:
+    """Discover the declared context length from a model's config files.
+
+    Resolution order:
+
+    1. Top-level ``config.json`` keys (``max_position_embeddings`` first,
+       then the rest of :data:`_CONTEXT_LENGTH_KEYS`).
+    2. Nested ``text_config`` / ``language_config`` keys (used by VLM
+       wrappers and Qwen-style MoE configs that put the language head in
+       a sub-object).
+    3. ``tokenizer_config.json``'s ``model_max_length`` — but only when
+       it is a finite positive integer, since Transformers seeds it with
+       ``int(1e30)`` as a "no cap" sentinel.
+
+    Returns:
+        Positive integer context length, or ``None`` when no usable
+        value was found in any of the above.
+    """
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                model_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read config.json for {model_path}: {e}")
+            model_config = {}
+
+        for key in _CONTEXT_LENGTH_KEYS:
+            value = model_config.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+
+        for nest_key in ("text_config", "language_config"):
+            nested = model_config.get(nest_key)
+            if isinstance(nested, dict):
+                for key in _CONTEXT_LENGTH_KEYS:
+                    value = nested.get(key)
+                    if isinstance(value, int) and value > 0:
+                        return value
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path, encoding="utf-8") as f:
+                tc = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read tokenizer_config.json for {model_path}: {e}")
+            tc = {}
+
+        value = tc.get("model_max_length")
+        if isinstance(value, int) and 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return value
 
     return None
 
@@ -685,34 +859,194 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
-def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
-    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+def model_directory_access_error(path: Path) -> str | None:
+    """Return a user-facing error if a model directory cannot be scanned."""
+    try:
+        if not path.exists():
+            return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+        next(path.iterdir(), None)
+    except OSError as e:
+        return (
+            f"Model directory is not readable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+    return None
 
-    Returns (snapshot_path, model_name) or None if not a valid HF cache entry.
-    """
-    name = path.name
-    if not name.startswith("models--") or name.count("--") < 2:
-        return None
 
-    # "models--Org--Name" → "Name"
-    model_name = name.split("--", 2)[2]
+def model_directory_write_error(path: Path, *, create: bool = False) -> str | None:
+    """Return a user-facing error if a model directory cannot be written."""
+    try:
+        if not path.exists():
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    access_error = model_directory_access_error(path)
+    if access_error is not None:
+        return access_error
 
     try:
-        commit_hash = (path / "refs" / "main").read_text().strip()
-    except OSError:
+        with tempfile.NamedTemporaryFile(
+            prefix=".omlx-write-test-",
+            dir=path,
+            delete=True,
+        ) as f:
+            f.write(b"")
+            f.flush()
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    return None
+
+
+def _iter_readable_entries(path: Path, context: str) -> list[Path]:
+    """Return sorted directory entries, or an empty list when scanning fails."""
+    try:
+        return sorted(path.iterdir())
+    except OSError as e:
+        logger.warning(
+            "Skipping unreadable %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return []
+
+
+def _is_readable_dir(path: Path, context: str) -> bool:
+    try:
+        return path.is_dir()
+    except OSError as e:
+        logger.warning(
+            "Skipping inaccessible %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
+def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
+    """Decode models--org--repo into (route_safe_id, repo_id)."""
+    name = path.name
+    if not name.startswith("models--"):
         return None
 
-    snapshot = path / "snapshots" / commit_hash
-    if not snapshot.is_dir():
+    encoded = name[len("models--"):]
+    if not encoded:
         return None
 
-    return snapshot, model_name
+    parts = encoded.split("--")
+    if len(parts) == 1:
+        return parts[0], parts[0]
+
+    repo_name = "--".join(parts[1:])
+    return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
+
+
+def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
+    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+
+    Returns an HfCacheEntry or None if not a valid HF model cache entry.
+    """
+    decoded = _decode_hf_cache_model_id(path)
+    if decoded is None:
+        return None
+    model_id, source_repo_id = decoded
+
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    for ref_name in ("main", "master"):
+        try:
+            commit_hash = (path / "refs" / ref_name).read_text().strip()
+        except OSError:
+            continue
+        snapshot = snapshots_dir / commit_hash
+        if snapshot.is_dir():
+            return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    snapshots = [
+        p
+        for p in _iter_readable_entries(snapshots_dir, "HF cache snapshots")
+        if _is_readable_dir(p, "HF cache snapshot")
+    ]
+    if not snapshots:
+        return None
+    if len(snapshots) == 1:
+        return HfCacheEntry(snapshots[0], model_id, source_repo_id)
+
+    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+    return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+
+def _safetensors_has_mlx_metadata(path: Path) -> bool:
+    """Return True if any model safetensors shard declares MLX format."""
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        logger.debug(f"safetensors import failed while checking {path}: {e}")
+        return False
+
+    for shard in sorted(path.glob("model*.safetensors")):
+        try:
+            with safe_open(str(shard), framework="numpy") as f:
+                metadata = f.metadata() or {}
+        except Exception as e:
+            logger.debug(f"Could not read safetensors metadata from {shard}: {e}")
+            continue
+        if str(metadata.get("format", "")).lower() == "mlx":
+            return True
+    return False
+
+
+_MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
+
+
+def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+    """Heuristic for HF cache entries that can be loaded without conversion."""
+    if not _is_model_dir(model_dir):
+        return False
+    if not list(model_dir.glob("model*.safetensors")):
+        logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+        return False
+    if _safetensors_has_mlx_metadata(model_dir):
+        return True
+
+    repo_lower = source_repo_id.lower()
+    if repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(source_repo_id):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible by repo name: {source_repo_id}"
+        )
+        return True
+
+    logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
+    return False
 
 
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
     model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
     try:
@@ -748,6 +1082,7 @@ def _register_model(
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
+        model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -758,6 +1093,9 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            model_context_length=model_context_length,
+            source_type=source_type,
+            source_repo_id=source_repo_id,
         )
 
         size_gb = estimated_size / (1024**3)
@@ -799,16 +1137,17 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
-    if not model_dir.exists():
-        raise ValueError(f"Model directory does not exist: {model_dir}")
-
-    if not model_dir.is_dir():
-        raise ValueError(f"Model directory is not a directory: {model_dir}")
+    access_error = model_directory_access_error(model_dir)
+    if access_error is not None:
+        if "not readable" in access_error:
+            logger.warning("Skipping directory %s: %s", model_dir, access_error)
+            return {}
+        raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
 
-    for subdir in sorted(model_dir.iterdir()):
-        if not subdir.is_dir() or subdir.name.startswith("."):
+    for subdir in _iter_readable_entries(model_dir, "model directory"):
+        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
 
         if _is_adapter_dir(subdir):
@@ -823,15 +1162,26 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                snapshot_path, model_name = hf_resolved
-                if _is_model_dir(snapshot_path):
-                    _register_model(models, snapshot_path, model_name)
+                if _is_hf_cache_mlx_compatible(
+                    hf_resolved.snapshot_path,
+                    hf_resolved.source_repo_id,
+                ):
+                    _register_model(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                 continue
 
             # Level 2: organization folder — scan children
             has_children = False
-            for child in sorted(subdir.iterdir()):
-                if not child.is_dir() or child.name.startswith("."):
+            for child in _iter_readable_entries(subdir, "model group"):
+                if (
+                    not _is_readable_dir(child, "model group entry")
+                    or child.name.startswith(".")
+                ):
                     continue
                 if _is_adapter_dir(child):
                     logger.info(
@@ -875,11 +1225,9 @@ def discover_models_from_dirs(
     merged: dict[str, DiscoveredModel] = {}
 
     for model_dir in model_dirs:
-        if not model_dir.exists():
-            logger.warning(f"Model directory does not exist, skipping: {model_dir}")
-            continue
-        if not model_dir.is_dir():
-            logger.warning(f"Not a directory, skipping: {model_dir}")
+        access_error = model_directory_access_error(model_dir)
+        if access_error is not None:
+            logger.warning(f"Skipping directory {model_dir}: {access_error}")
             continue
 
         try:

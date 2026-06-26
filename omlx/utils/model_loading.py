@@ -80,8 +80,16 @@ def maybe_apply_pre_load_patches(
 
     Dispatches:
 
-    - DeepSeek V4 patch (PR 1192) when ``config.json`` declares
-      ``model_type == "deepseek_v4"``.
+    - DeepSeek V4 patch (PR 1192) when ``config.json`` declares a
+      ``deepseek_v4*`` model_type.
+    - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
+      declares ``model_type == "step3p7"``.
+    - Llama 4 attention offset patch when ``config.json`` declares
+      ``model_type == "llama4"`` directly or under ``text_config``.
+    - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
+      declares ``model_type == "glm_moe_dsa"``. Required because pinned
+      mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
+      checkpoints whose shared DSA layers carry no indexer weights.
     - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
@@ -98,6 +106,8 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
+    - mlx-vlm diffusion mxfp4 embedding patch when ``for_vlm`` is True and
+      the checkpoint declares ``model_type == "diffusion_gemma"``.
 
     Both patches inject modules into ``sys.modules`` and replace mlx-lm
     internals; gating keeps non-affected models at zero cost.
@@ -125,11 +135,63 @@ def maybe_apply_pre_load_patches(
         return
 
     model_type = config.get("model_type")
-    if model_type == "deepseek_v4":
+    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():
             logger.info("DeepSeek V4 pre-load patch applied for %s", model_name)
+
+    if model_type == "step3p7":
+        from ..patches.step3p7 import apply_step3p7_patch
+
+        if apply_step3p7_patch():
+            logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if model_type == "llama4" or text_model_type == "llama4":
+        from ..patches.llama4_attention import apply_llama4_attention_patch
+
+        if apply_llama4_attention_patch():
+            logger.info("Llama 4 attention patch applied for %s", model_name)
+
+    if model_type == "glm_moe_dsa":
+        from ..patches.glm_moe_dsa import apply_glm_moe_dsa_patch
+
+        if apply_glm_moe_dsa_patch():
+            logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
+
+    if for_vlm and model_type == "diffusion_gemma":
+        from ..patches.mlx_vlm_diffusion import apply_mlx_vlm_diffusion_patch
+
+        if apply_mlx_vlm_diffusion_patch():
+            logger.info("mlx-vlm diffusion patch applied for %s", model_name)
+
+    minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
+    if for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        from ..patches.mlx_vlm_minimax_m3_compat import (
+            apply_mlx_vlm_minimax_m3_compat_patch,
+        )
+
+        if apply_mlx_vlm_minimax_m3_compat_patch():
+            logger.info(
+                "MiniMax M3 mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+        from ..patches.minimax_m3_sparse_attention import (
+            apply_minimax_m3_sparse_attention_patch,
+        )
+
+        if apply_minimax_m3_sparse_attention_patch():
+            logger.info(
+                "MiniMax M3 sparse attention patch applied for %s",
+                model_name,
+            )
 
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
@@ -150,7 +212,10 @@ def maybe_apply_pre_load_patches(
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
-        from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+        )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
@@ -350,28 +415,27 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(
-                k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map
-            )
+            return any(k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map)
         except Exception as e:
-            logger.debug(
-                "Failed to read %s for mtp weight scan: %s", index_path, e
-            )
+            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
     shards = sorted(p.glob("*.safetensors"))
     if not shards:
         return False
     try:
         import safetensors
-
-        with safetensors.safe_open(str(shards[0]), framework="numpy") as f:
-            for k in f.keys():
-                if k.startswith(_MTP_WEIGHT_PREFIXES):
-                    return True
     except Exception as e:
-        logger.debug(
-            "Failed to read %s header for mtp weight scan: %s", shards[0], e
-        )
+        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+        return False
+
+    for shard in shards:
+        try:
+            with safetensors.safe_open(str(shard), framework="numpy") as f:
+                for k in f.keys():
+                    if k.startswith(_MTP_WEIGHT_PREFIXES):
+                        return True
+        except Exception as e:
+            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
     return False
 
 
@@ -402,7 +466,16 @@ def load_text_model(
     maybe_apply_pre_load_patches(model_name, model_settings=model_settings)
     from mlx_lm import load
 
-    return load(model_name, tokenizer_config=tokenizer_config)
+    trust_remote_code = (
+        bool(getattr(model_settings, "trust_remote_code", False))
+        if model_settings is not None
+        else False
+    )
+    return load(
+        model_name,
+        tokenizer_config=tokenizer_config,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def materialize_lazy_state(model: Any) -> None:
@@ -427,7 +500,6 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 
     Currently supports:
     - IndexCache: skip redundant indexer computation in DSA layers
-    - GatedDeltaNet advance: fix missing cache.advance() in qwen3_5
 
     Args:
         model: A loaded mlx-lm model instance.
@@ -436,16 +508,6 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
-    # GatedDeltaNet advance patch: always applied for qwen3_5 models
-    # (no settings needed — auto-detected by model type)
-    from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-    from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
-
-    if apply_gated_delta_advance_patch(model):
-        logger.info("GatedDeltaNet advance() patch applied")
-    if apply_qwen3_5_attention_patch(model):
-        logger.info("Qwen3_5Attention plain-rope patch applied")
-
     if model_settings is None:
         return model
 

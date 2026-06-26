@@ -1,7 +1,7 @@
-// PR 4 — 1Hz poller against /admin/api/stats. Mirrors the requests.Session
-// flow in app.py:1745-1840: persistent cookies, auto re-login on 401, scope
-// query for session vs all-time stats. Emits NotificationCenter posts so the
-// menubar refreshes without polling state itself.
+// Menubar poller: use lightweight /api/status for live display and liveness,
+// with occasional /admin/api/stats?scope=alltime fetches for the All-Time
+// submenu. Emits NotificationCenter posts so the menubar refreshes without
+// polling state itself.
 //
 // PR 7's OMLXClient will absorb this auth machinery; for now the poller owns
 // its own URLSession + cookie jar to keep the menubar self-contained.
@@ -12,8 +12,8 @@ import Foundation
 final class MenubarStatsPoller {
     static let didUpdateNotification = Notification.Name("OMLXMenubarStatsDidUpdate")
 
-    /// Subset of /admin/api/stats response — extend as the menubar surfaces
-    /// more fields. Keys mirror routes.py JSON.
+    /// Subset shared by /api/status and /admin/api/stats responses — extend
+    /// as the menubar surfaces more fields. Keys mirror server JSON.
     struct Stats: Codable, Sendable, Equatable {
         var totalPromptTokens: Int?
         var totalCachedTokens: Int?
@@ -33,22 +33,22 @@ final class MenubarStatsPoller {
     }
 
     private let baseURL: URL
-    private let apiKey: String
+    private let apiKey: String?
     private let interval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
-    /// Number of ticks between all-time fetches. Session stats need
-    /// sub-second freshness for the live tok/s display in the header;
-    /// all-time stats only show in the "All-Time" submenu and don't
-    /// jitter, so polling them at the same rate burns server CPU for
-    /// no UX benefit. At interval=1s this fetches every 10s.
-    private let alltimeEveryNTicks = 10
+    /// Number of ticks between all-time fetches. Live status is cheap and
+    /// needs steady refresh; all-time stats only show in the "All-Time"
+    /// submenu, so polling them at the same rate burns server CPU for no UX
+    /// benefit. At interval=2s this fetches every 30s.
+    private let alltimeEveryNTicks = 15
     private var tickCount = 0
 
     private(set) var sessionStats: Stats?
     private(set) var alltimeStats: Stats?
+    private(set) var lastStatusSuccessAt: Date?
 
-    init(baseURL: URL, apiKey: String, interval: TimeInterval = 1.0) {
+    init(baseURL: URL, apiKey: String?, interval: TimeInterval = 2.0) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.interval = interval
@@ -65,7 +65,7 @@ final class MenubarStatsPoller {
         cfg.httpShouldSetCookies = true
         cfg.httpCookieAcceptPolicy = .always
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        cfg.timeoutIntervalForRequest = 2.0
+        cfg.timeoutIntervalForRequest = 5.0
         self.session = URLSession(configuration: cfg)
     }
 
@@ -96,61 +96,88 @@ final class MenubarStatsPoller {
         let fetchAlltime = (tickCount % alltimeEveryNTicks == 0)
         tickCount &+= 1
         do {
-            let s = try await fetchStats(scope: nil)
+            let s = try await fetchPublicStatus()
             self.sessionStats = s
-            if fetchAlltime {
-                self.alltimeStats = try await fetchStats(scope: "alltime")
-            }
+            self.lastStatusSuccessAt = Date()
             NotificationCenter.default.post(
                 name: Self.didUpdateNotification, object: self
             )
+            if fetchAlltime, hasAPIKey,
+               let alltime = try? await fetchAdminStats(scope: "alltime") {
+                self.alltimeStats = alltime
+            }
         } catch {
             // Suppress: server may be transitioning, paused, or 401-pending.
             // Next tick retries; we log only the once-per-tick failure mode.
         }
     }
 
-    private func fetchStats(scope: String?) async throws -> Stats {
-        let url = try statsURL(scope: scope)
-        let req = URLRequest(url: url)
+    private func fetchPublicStatus() async throws -> Stats {
+        let url = try makeURL(path: "/api/status")
+        var req = URLRequest(url: url)
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let key = apiKey, !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: req)
+        try validateOK(response)
+        return try JSONDecoder().decode(Stats.self, from: data)
+    }
+
+    private func fetchAdminStats(scope: String) async throws -> Stats {
+        let url = try makeURL(
+            path: "/admin/api/stats",
+            queryItems: [URLQueryItem(name: "scope", value: scope)]
+        )
+        var req = URLRequest(url: url)
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: req)
 
         if let http = response as? HTTPURLResponse, http.statusCode == 401 {
             try await login()
             let (data2, response2) = try await session.data(for: req)
-            if let http2 = response2 as? HTTPURLResponse,
-               !(200..<300).contains(http2.statusCode) {
-                // Stats has all-Optional fields, so a FastAPI error body
-                // (`{"detail": "..."}`) decodes into an all-nil struct and
-                // silently overwrites real stats with dashes. Fail loudly
-                // instead so the outer tick() catches and we keep the last
-                // good values.
-                throw URLError(.userAuthenticationRequired)
-            }
+            try validateOK(response2)
             return try JSONDecoder().decode(Stats.self, from: data2)
         }
+        try validateOK(response)
         return try JSONDecoder().decode(Stats.self, from: data)
     }
 
     private func login() async throws {
-        var req = URLRequest(url: baseURL.appendingPathComponent("/admin/api/login"))
+        guard let apiKey, !apiKey.isEmpty else {
+            throw URLError(.userAuthenticationRequired)
+        }
+        var req = URLRequest(url: try makeURL(path: "/admin/api/login"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONEncoder().encode(["api_key": apiKey])
-        _ = try await session.data(for: req)
+        let (_, response) = try await session.data(for: req)
+        try validateOK(response)
     }
 
-    private func statsURL(scope: String?) throws -> URL {
-        var comps = URLComponents(
-            url: baseURL.appendingPathComponent("/admin/api/stats"),
-            resolvingAgainstBaseURL: false
-        )
-        if let scope {
-            comps?.queryItems = [URLQueryItem(name: "scope", value: scope)]
+    private var hasAPIKey: Bool {
+        guard let apiKey else { return false }
+        return !apiKey.isEmpty
+    }
+
+    private func makeURL(path: String, queryItems: [URLQueryItem] = []) throws -> URL {
+        var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        comps?.path = path.hasPrefix("/") ? path : "/" + path
+        if !queryItems.isEmpty {
+            comps?.queryItems = queryItems
         }
         guard let url = comps?.url else {
             throw URLError(.badURL)
         }
         return url
+    }
+
+    private func validateOK(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw URLError(.userAuthenticationRequired)
+        }
     }
 }

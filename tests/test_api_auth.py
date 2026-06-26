@@ -364,3 +364,181 @@ class TestAdminAuth:
 
         # Empty key
         assert verify_api_key("", server_key) is False
+
+
+class TestNonAsciiApiKeys:
+    """Regression tests for #1717: non-ASCII keys must yield 401, not 500.
+
+    secrets.compare_digest raises TypeError for str arguments containing
+    non-ASCII characters, which surfaced as an unhandled 500 on every
+    authenticated endpoint. compare_keys compares UTF-8 bytes instead.
+    """
+
+    def test_compare_keys_non_ascii_mismatch(self):
+        """Non-ASCII client key against ASCII server key returns False."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("café-key", "secret123") is False
+
+    def test_compare_keys_non_ascii_match(self):
+        """Matching non-ASCII keys compare equal."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("clé-secrète-héhé", "clé-secrète-héhé") is True
+
+    def test_verify_api_key_non_ascii_client_key(self):
+        """verify_api_key must not raise on a non-ASCII client key."""
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("café", "secret123") is False
+
+    def test_verify_api_key_non_ascii_server_key(self):
+        """A configured non-ASCII key compares without raising.
+
+        Function-level only: over HTTP, Starlette decodes header values as
+        latin-1, so a client sending UTF-8 non-ASCII bytes will not match a
+        configured non-ASCII key anyway. The point here is no TypeError.
+        """
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("pässwörd", "pässwörd") is True
+        assert verify_api_key("password", "pässwörd") is False
+
+    def test_compare_keys_lone_surrogate(self):
+        """Lone surrogates (json.loads can produce them) must not raise.
+
+        Strict UTF-8 encoding rejects lone surrogates, which would revive
+        the 500 on any JSON route that compares keys without validating
+        printability first (delete_sub_key).
+        """
+        import json
+
+        from omlx.admin.auth import compare_keys
+
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert compare_keys(surrogate_key, "secret123") is False
+        assert compare_keys("secret123", surrogate_key) is False
+        assert compare_keys(surrogate_key, surrogate_key) is True
+
+    def test_verify_any_api_key_non_ascii_sub_keys(self):
+        """verify_any_api_key must not raise when sub keys are checked."""
+        from omlx.admin.auth import verify_any_api_key
+        from unittest.mock import MagicMock
+
+        sub_key = MagicMock()
+        sub_key.key = "sub-key-1"
+
+        assert verify_any_api_key("café", "main-key", [sub_key]) is False
+        sub_key.key = "clé-única"
+        assert verify_any_api_key("clé-única", "main-key", [sub_key]) is True
+
+    def test_server_dependency_non_ascii_bearer_returns_401(self):
+        """The server auth dependency turns a non-ASCII bearer into 401, not 500."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials="smart-quote-’key’"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=credentials)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+
+
+class TestRejectedKeyFingerprint:
+    """Regression tests for #1440 (item 4): a rejected API key must never be
+    logged verbatim. The auth path logs a short, non-reversible SHA-256
+    fingerprint instead, so operators can correlate repeated bad keys without
+    the secret landing in server.log.
+    """
+
+    def test_fingerprint_key_short_hex(self):
+        """fingerprint_key returns 8 lowercase hex characters."""
+        from omlx.admin.auth import fingerprint_key
+
+        fp = fingerprint_key("super-secret-key")
+        assert len(fp) == 8
+        assert all(c in "0123456789abcdef" for c in fp)
+
+    def test_fingerprint_key_deterministic(self):
+        """The same key always fingerprints to the same value."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("abc123") == fingerprint_key("abc123")
+
+    def test_fingerprint_key_does_not_contain_secret(self):
+        """The fingerprint never leaks the raw key material."""
+        from omlx.admin.auth import fingerprint_key
+
+        secret = "sk-live-0123456789abcdef"
+        fp = fingerprint_key(secret)
+        assert secret not in fp
+        assert fp not in secret
+
+    def test_fingerprint_key_distinguishes_keys(self):
+        """Different keys produce different fingerprints."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("key-a") != fingerprint_key("key-b")
+
+    def test_fingerprint_key_non_ascii_and_surrogate(self):
+        """fingerprint_key tolerates any str the auth path accepts (no raise).
+
+        Mirrors compare_keys: non-ASCII and lone surrogates (which json.loads
+        can produce) must fingerprint without a UnicodeEncodeError.
+        """
+        import json
+
+        from omlx.admin.auth import fingerprint_key
+
+        assert len(fingerprint_key("clé-secrète-héhé")) == 8
+        assert len(fingerprint_key("")) == 8
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert len(fingerprint_key(surrogate_key)) == 8
+
+    def test_rejected_key_logged_as_fingerprint_not_verbatim(self, caplog):
+        """The auth dependency logs the fingerprint, not the raw rejected key."""
+        import asyncio
+        import logging
+
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from omlx.admin.auth import fingerprint_key
+        from omlx.server import verify_api_key, _server_state
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+        bad_key = "sk-leaky-supersecret-0xCAFE"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials=bad_key
+            )
+            with caplog.at_level(logging.WARNING, logger="omlx.server"):
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        verify_api_key(request=_mock_request(), credentials=credentials)
+                    )
+            assert exc_info.value.status_code == 401
+
+            rejection_logs = "\n".join(
+                r.getMessage()
+                for r in caplog.records
+                if "Rejected API key" in r.getMessage()
+            )
+            assert rejection_logs, "expected a rejection log line"
+            assert bad_key not in rejection_logs
+            assert fingerprint_key(bad_key) in rejection_logs
+        finally:
+            _server_state.api_key = original_key

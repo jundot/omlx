@@ -54,7 +54,7 @@
 
 ### macOS 앱
 
-[Releases](https://github.com/jundot/omlx/releases)에서 `.dmg`를 다운로드하고, Applications에 드래그하면 끝입니다. 앱 내 자동 업데이트를 지원하므로 이후 업그레이드는 클릭 한 번이면 됩니다. macOS 앱은 `omlx` CLI 명령어를 포함하지 않습니다. 터미널 사용이 필요하면 Homebrew 또는 소스에서 설치하세요.
+[Releases](https://github.com/jundot/omlx/releases)에서 `.dmg`를 다운로드하고, Applications에 드래그하면 끝입니다. 앱 내 자동 업데이트를 지원하므로 이후 업그레이드는 클릭 한 번이면 됩니다. macOS 앱은 `~/.omlx/bin/omlx` CLI shim도 설치하므로 터미널 명령이나 Apple Shortcuts에서 앱이 관리하는 서버를 제어할 수 있습니다.
 
 ### Homebrew
 
@@ -66,7 +66,7 @@ brew install omlx
 brew update && brew upgrade omlx
 
 # 백그라운드 서비스로 실행 (크래시 시 자동 재시작)
-brew services start omlx
+omlx start
 
 # 선택사항: MCP (Model Context Protocol) 지원
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
@@ -97,6 +97,12 @@ Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단�
 ### CLI
 
 ```bash
+# 관리형 백그라운드 서버 (macOS 앱 또는 Homebrew 설치)
+omlx start
+omlx stop
+omlx restart
+
+# 현재 터미널에 붙는 foreground 서버
 omlx serve --model-dir ~/models
 ```
 
@@ -107,13 +113,17 @@ omlx serve --model-dir ~/models
 Homebrew로 설치한 경우 oMLX를 관리형 백그라운드 서비스로 실행할 수 있습니다:
 
 ```bash
+omlx start                    # brew services를 통해 시작
+omlx stop                     # 중지
+omlx restart                  # 재시작
+
 brew services start omlx    # 시작 (크래시 시 자동 재시작)
 brew services stop omlx     # 중지
 brew services restart omlx  # 재시작
 brew services info omlx     # 상태 확인
 ```
 
-서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). 커스터마이즈하려면 환경 변수(`OMLX_MODEL_DIR`, `OMLX_PORT` 등)를 설정하거나, `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
+서비스는 기본 설정으로 `omlx serve`를 실행합니다 (`~/.omlx/models`, 포트 8000). `omlx start`, `omlx stop`, `omlx restart`는 공통 lifecycle 명령이며, Homebrew 설치에서는 `brew services`로 위임됩니다. 커스터마이즈하려면 환경 변수(`OMLX_MODEL_DIR`, `OMLX_PORT` 등)를 설정하거나, `omlx serve --model-dir /your/path`를 한 번 실행하여 `~/.omlx/settings.json`에 설정을 저장하세요.
 
 로그는 두 곳에 기록됩니다:
 - **서비스 로그**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
@@ -170,6 +180,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 - **모델 별칭**: 커스텀 API 표시 이름을 설정합니다. `/v1/models`에서 별칭을 반환하며, 요청 시 별칭과 디렉토리 이름 모두 사용 가능합니다.
 - **모델 타입 오버라이드**: 자동 감지와 관계없이 LLM 또는 VLM으로 수동 설정합니다.
+- **프로파일**: 모델별 설정을 이름이 지정된 번들로 저장하고 관리자 패널에서 전환합니다. 프로파일은 선택적으로 자체 모델로 노출할 수 있습니다: 그러면 `/v1/models`에 `<모델>:<프로파일>`(예: `qwen3-8b:thinking`)도 표시되며, 베이스 모델과 동일한 엔진에서 프로파일 설정을 요청마다 덮어써 동작합니다 — 추가 메모리나 재로드가 없습니다. 베이스 모델에 별칭이 있으면 노출되는 ID는 `<별칭>:<프로파일>` 형식으로 표시되고, 디렉토리 이름 형식도 베이스 모델과 마찬가지로 계속 작동합니다.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX 채팅 템플릿 파라미터" width="480">
@@ -272,6 +283,11 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 ## CLI 설정
 
 ```bash
+# 관리형 백그라운드 서버 (macOS 앱 또는 Homebrew 설치)
+omlx start
+omlx stop
+omlx restart
+
 # 로드된 모델의 메모리 제한
 omlx serve --model-dir ~/models --max-model-memory 32GB
 
@@ -346,6 +362,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# 선택 GLM 네이티브 커스텀 커널을 포함해 스테이징
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 첫 cold 빌드는 10–20분 소요됩니다 (venvstacks Python 레이어 어셈블리). 이후 빌드는 `packaging/_export/` 캐시를 재사용해 약 4분에 끝납니다. 레이어 구성은 [packaging/README.md](packaging/README.md), Swift 소스는 [apps/omlx-mac/](apps/omlx-mac/) 를 참조하세요.

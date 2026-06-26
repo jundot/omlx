@@ -21,10 +21,8 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 
-# Lowercase full-names work for both Qwen3-ASR (its _build_prompt lowercases
-# the supported-language list before lookup) and Whisper (its TO_LANGUAGE_CODE
-# normalizer maps lowercase names to ISO codes). Capitalized names would break
-# Whisper because `<|Chinese|>` is not a valid language token.
+# Lowercase full-names are needed for Qwen3-ASR-style prompt builders whose
+# support_languages list contains names such as "Chinese" and "English".
 _ISO_TO_STT_LANG: dict[str, str] = {
     "zh": "chinese",
     "yue": "cantonese",
@@ -40,8 +38,26 @@ _ISO_TO_STT_LANG: dict[str, str] = {
 }
 
 
-def _normalize_stt_generate_language(language: str | None) -> str | None:
-    """Map OpenAI-style ISO codes to language names accepted by mlx-audio backends."""
+def _stt_model_expects_language_names(model: Any) -> bool:
+    """Return True for STT backends whose language hints are full names."""
+    config = getattr(model, "config", None)
+    support_languages = getattr(config, "support_languages", None)
+    if not support_languages:
+        return False
+    if isinstance(support_languages, str):
+        support_languages = [support_languages]
+
+    supported = {
+        str(lang).strip().lower() for lang in support_languages if str(lang).strip()
+    }
+    return bool(supported & set(_ISO_TO_STT_LANG.values()))
+
+
+def _normalize_stt_generate_language(
+    model: Any,
+    language: str | None,
+) -> str | None:
+    """Normalize API language hints for the specific mlx-audio STT backend."""
     if language is None:
         return None
 
@@ -49,7 +65,9 @@ def _normalize_stt_generate_language(language: str | None) -> str | None:
     if not normalized:
         return None
 
-    return _ISO_TO_STT_LANG.get(normalized.lower(), normalized)
+    if _stt_model_expects_language_names(model):
+        return _ISO_TO_STT_LANG.get(normalized.lower(), normalized)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +278,7 @@ class STTEngine(BaseNonStreamingEngine):
             # Call model.generate() directly instead of
             # generate_transcription() which writes files to disk.
             gen_kwargs = dict(kwargs)
-            generate_language = _normalize_stt_generate_language(language)
+            generate_language = _normalize_stt_generate_language(model, language)
             if generate_language is not None:
                 gen_kwargs["language"] = generate_language
 

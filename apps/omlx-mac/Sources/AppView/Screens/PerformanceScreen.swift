@@ -3,13 +3,13 @@
 // One tab for every "how the engine runs" knob. Three sections:
 //   • Scheduler — max_concurrent_requests (moved from ServerScreen for
 //     scheduler coherence), embedding_batch_size, and chunked_prefill.
-//   • Memory & Lifecycle — process / model memory limits, prefill memory
-//     guard, server-wide idle timeout, model fallback routing.
+//   • Memory & Lifecycle — prefill memory guard tier, server-wide idle
+//     timeout, model fallback routing.
 //   • Cache — master enable toggle gates a hot-cache toggle + size, a
 //     cold-cache directory + size, and an advanced initial-blocks tuning
 //     knob (requires restart).
 //
-// All thirteen fields are server-side already (`omlx/admin/routes.py:191-272`)
+// All fields are server-side already (`omlx/admin/routes.py:198-235`)
 // — Phase 3 is pure UI. Single Apply button at the bottom, Storage /
 // Network pattern: disabled until at least one trimmed draft diverges
 // from its loaded value, and only changed fields are sent in the PATCH
@@ -18,8 +18,8 @@
 import SwiftUI
 
 struct PerformanceScreen: View {
-    @EnvironmentObject private var services: AppServices
-    @StateObject private var vm = PerformanceScreenVM()
+    @Environment(AppServices.self) private var services
+    @State private var vm = PerformanceScreenVM()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -55,7 +55,7 @@ struct PerformanceScreen: View {
 // MARK: - Scheduler
 
 private struct SchedulerSection: View {
-    @ObservedObject var vm: PerformanceScreenVM
+    @Bindable var vm: PerformanceScreenVM
 
     var body: some View {
         SectionHeader(
@@ -107,7 +107,7 @@ private struct SchedulerSection: View {
 // MARK: - Memory & Lifecycle
 
 private struct MemoryLifecycleSection: View {
-    @ObservedObject var vm: PerformanceScreenVM
+    @Bindable var vm: PerformanceScreenVM
 
     var body: some View {
         SectionHeader(
@@ -115,55 +115,71 @@ private struct MemoryLifecycleSection: View {
                    defaultValue: "Memory & Lifecycle",
                    comment: "Section header for memory and lifecycle settings"),
             subtitle: String(localized: "performance.section.memory.sub",
-                             defaultValue: "Ceilings + auto-unload behavior. Memory limits accept \"auto\", \"disabled\", \"24GB\", or \"50%\".",
-                             comment: "Subtitle explaining accepted memory limit values")
+                             defaultValue: "Memory admission control and auto-unload behavior.",
+                             comment: "Subtitle explaining memory and lifecycle settings")
         )
 
         ListGroup {
-            Row(
-                label: String(localized: "performance.memory.max_process",
-                              defaultValue: "Max Process Memory",
-                              comment: "Row label for the max process memory field"),
-                sublabel: String(localized: "performance.memory.max_process.sub",
-                                 defaultValue: "Total resident memory ceiling for the server process.",
-                                 comment: "Sublabel for max process memory")
-            ) {
-                TextInput(
-                    text: $vm.maxProcessMemory,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
-                    mono: true,
-                    width: 140
-                )
-            }
-            Row(
-                label: String(localized: "performance.memory.max_model",
-                              defaultValue: "Max Model Memory",
-                              comment: "Row label for the max model memory field"),
-                sublabel: String(localized: "performance.memory.max_model.sub",
-                                 defaultValue: "Engine pool ceiling. Models above this won't be auto-loaded.",
-                                 comment: "Sublabel for max model memory")
-            ) {
-                TextInput(
-                    text: $vm.maxModelMemory,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
-                    mono: true,
-                    width: 140
-                )
-            }
             Row(
                 label: String(localized: "performance.memory.prefill_guard",
                               defaultValue: "Prefill Memory Guard",
                               comment: "Row label for prefill memory guard toggle"),
                 sublabel: String(localized: "performance.memory.prefill_guard.sub",
-                                 defaultValue: "Preflight prefill memory before kicking the engine. Drops requests that would OOM.",
+                                 defaultValue: "Preflight prefill memory before kicking the engine and defer generation scheduling near the ceiling.",
                                  comment: "Sublabel for prefill memory guard")
             ) {
                 Toggle("", isOn: $vm.prefillMemoryGuard)
                     .labelsHidden().toggleStyle(.switch)
+            }
+            Row(
+                label: String(localized: "performance.memory.guard_tier",
+                              defaultValue: "Memory Guard Tier",
+                              comment: "Row label for memory guard tier popup"),
+                sublabel: vm.memoryGuardTierDescription
+            ) {
+                Popup(
+                    selection: $vm.memoryGuardTier,
+                    width: 150,
+                    options: [
+                        ("safe",
+                         String(localized: "performance.memory.guard_tier.safe",
+                                defaultValue: "Safe",
+                                comment: "Memory guard tier option: safe")),
+                        ("balanced",
+                         String(localized: "performance.memory.guard_tier.balanced",
+                                defaultValue: "Balanced",
+                                comment: "Memory guard tier option: balanced")),
+                        ("aggressive",
+                         String(localized: "performance.memory.guard_tier.aggressive",
+                                defaultValue: "Aggressive",
+                                comment: "Memory guard tier option: aggressive")),
+                        ("custom",
+                         String(localized: "performance.memory.guard_tier.custom",
+                                defaultValue: "Custom",
+                                comment: "Memory guard tier option: custom")),
+                    ]
+                )
+                .disabled(!vm.prefillMemoryGuard)
+            }
+            if vm.prefillMemoryGuard && vm.memoryGuardTier == "custom" {
+                Row(
+                    label: String(localized: "performance.memory.custom_ceiling",
+                                  defaultValue: "Custom Ceiling",
+                                  comment: "Row label for memory guard custom ceiling"),
+                    sublabel: String(localized: "performance.memory.custom_ceiling.sub",
+                                     defaultValue: "Fixed process memory ceiling in GB. Used only with the Custom tier.",
+                                     comment: "Sublabel for memory guard custom ceiling")
+                ) {
+                    TextInput(
+                        text: $vm.memoryGuardCustomCeilingText,
+                        placeholder: String(localized: "performance.memory.custom_ceiling.placeholder",
+                                            defaultValue: "GB",
+                                            comment: "Placeholder for custom memory guard ceiling"),
+                        mono: true,
+                        suffix: "GB",
+                        width: 110
+                    )
+                }
             }
             Row(
                 label: String(localized: "performance.memory.idle_timeout",
@@ -202,7 +218,7 @@ private struct MemoryLifecycleSection: View {
 // MARK: - Cache
 
 private struct CacheSection: View {
-    @ObservedObject var vm: PerformanceScreenVM
+    @Bindable var vm: PerformanceScreenVM
 
     var body: some View {
         SectionHeader(
@@ -243,14 +259,12 @@ private struct CacheSection: View {
                               defaultValue: "Hot Cache Size",
                               comment: "Row label for the hot cache size field"),
                 sublabel: String(localized: "performance.cache.hot_size.sub",
-                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, \"8GB\" or \"auto\" accepted.",
+                                 defaultValue: "RAM ceiling for hot cache. \"0\" disables, sizes like \"8GB\" are accepted.",
                                  comment: "Sublabel describing accepted hot cache size values")
             ) {
                 TextInput(
                     text: $vm.hotCacheMaxSize,
-                    placeholder: String(localized: "performance.memory.placeholder_auto",
-                                        defaultValue: "auto",
-                                        comment: "Memory field placeholder meaning automatic"),
+                    placeholder: "0",
                     mono: true,
                     width: 140
                 )
@@ -311,236 +325,4 @@ private struct CacheSection: View {
             }
         }
     }
-}
-
-// MARK: - View model
-
-@MainActor
-final class PerformanceScreenVM: ObservableObject {
-    // Scheduler
-    @Published var maxConcurrentText: String = "8"
-    @Published var embeddingBatchSizeText: String = "32"
-    @Published var chunkedPrefill: Bool = false
-
-    // Memory & Lifecycle
-    @Published var maxProcessMemory: String = ""
-    @Published var maxModelMemory: String = ""
-    @Published var prefillMemoryGuard: Bool = false
-    @Published var idleTimeoutText: String = ""
-    @Published var modelFallback: Bool = false
-
-    // Cache
-    @Published var cacheEnabled: Bool = true
-    @Published var hotCacheOnly: Bool = false
-    @Published var hotCacheMaxSize: String = ""
-    @Published var ssdCacheDir: String = ""
-    @Published var ssdCacheMaxSize: String = ""
-    @Published var initialCacheBlocksText: String = ""
-
-    // Loaded baselines (everything that drives Apply's enabled state)
-    @Published private(set) var loadedMaxConcurrent: Int = 8
-    @Published private(set) var loadedEmbeddingBatchSize: Int = 32
-    @Published private(set) var loadedChunkedPrefill: Bool = false
-    @Published private(set) var loadedMaxProcessMemory: String = ""
-    @Published private(set) var loadedMaxModelMemory: String = ""
-    @Published private(set) var loadedPrefillMemoryGuard: Bool = false
-    @Published private(set) var loadedIdleTimeoutSeconds: Int? = nil
-    @Published private(set) var loadedModelFallback: Bool = false
-    @Published private(set) var loadedCacheEnabled: Bool = true
-    @Published private(set) var loadedHotCacheOnly: Bool = false
-    @Published private(set) var loadedHotCacheMaxSize: String = ""
-    @Published private(set) var loadedSsdCacheDir: String = ""
-    @Published private(set) var loadedSsdCacheMaxSize: String = ""
-    @Published private(set) var loadedInitialCacheBlocks: Int? = nil
-
-    @Published private(set) var isSaving: Bool = false
-    @Published var lastError: String?
-
-    var hasPendingChanges: Bool {
-        parsedMaxConcurrent != loadedMaxConcurrent
-            || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
-            || chunkedPrefill != loadedChunkedPrefill
-            || trim(maxProcessMemory) != loadedMaxProcessMemory
-            || trim(maxModelMemory) != loadedMaxModelMemory
-            || prefillMemoryGuard != loadedPrefillMemoryGuard
-            || parsedIdleTimeout != loadedIdleTimeoutSeconds
-            || modelFallback != loadedModelFallback
-            || cacheEnabled != loadedCacheEnabled
-            || hotCacheOnly != loadedHotCacheOnly
-            || trim(hotCacheMaxSize) != loadedHotCacheMaxSize
-            || trim(ssdCacheDir) != loadedSsdCacheDir
-            || trim(ssdCacheMaxSize) != loadedSsdCacheMaxSize
-            || parsedInitialCacheBlocks != loadedInitialCacheBlocks
-    }
-
-    func load(client: OMLXClient) async {
-        do {
-            let s = try await client.getGlobalSettings()
-            if let sched = s.scheduler {
-                self.maxConcurrentText = String(sched.maxConcurrentRequests)
-                self.loadedMaxConcurrent = sched.maxConcurrentRequests
-                let embeddingBatchSize = sched.embeddingBatchSize ?? 32
-                self.embeddingBatchSizeText = String(embeddingBatchSize)
-                self.loadedEmbeddingBatchSize = embeddingBatchSize
-                self.chunkedPrefill = sched.chunkedPrefill ?? false
-                self.loadedChunkedPrefill = sched.chunkedPrefill ?? false
-            }
-            if let mem = s.memory {
-                self.maxProcessMemory = mem.maxProcessMemory ?? ""
-                self.loadedMaxProcessMemory = mem.maxProcessMemory ?? ""
-                self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
-                self.loadedPrefillMemoryGuard = mem.prefillMemoryGuard ?? false
-            }
-            if let model = s.model {
-                self.maxModelMemory = model.maxModelMemory ?? ""
-                self.loadedMaxModelMemory = model.maxModelMemory ?? ""
-                self.modelFallback = model.modelFallback ?? false
-                self.loadedModelFallback = model.modelFallback ?? false
-            }
-            if let idle = s.idleTimeout {
-                self.idleTimeoutText = idle.idleTimeoutSeconds.map { String($0) } ?? ""
-                self.loadedIdleTimeoutSeconds = idle.idleTimeoutSeconds
-            }
-            if let cache = s.cache {
-                self.cacheEnabled = cache.enabled
-                self.loadedCacheEnabled = cache.enabled
-                self.hotCacheOnly = cache.hotCacheOnly ?? false
-                self.loadedHotCacheOnly = cache.hotCacheOnly ?? false
-                self.hotCacheMaxSize = cache.hotCacheMaxSize ?? ""
-                self.loadedHotCacheMaxSize = cache.hotCacheMaxSize ?? ""
-                self.ssdCacheDir = cache.ssdCacheDir ?? ""
-                self.loadedSsdCacheDir = cache.ssdCacheDir ?? ""
-                self.ssdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
-                self.loadedSsdCacheMaxSize = cache.ssdCacheMaxSize ?? ""
-                self.initialCacheBlocksText = cache.initialCacheBlocks.map { String($0) } ?? ""
-                self.loadedInitialCacheBlocks = cache.initialCacheBlocks
-            }
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    func save(client: OMLXClient) async {
-        // Validate first so a bad field's error surfaces without sending a
-        // partial patch.
-        guard let mc = parsedMaxConcurrent, mc > 0 else {
-            self.lastError = String(localized: "performance.error.max_concurrent_invalid",
-                                    defaultValue: "Max Concurrent Requests must be a positive integer.",
-                                    comment: "Performance screen error when max concurrent input is invalid")
-            return
-        }
-        guard let embeddingBatchSize = parsedEmbeddingBatchSize, embeddingBatchSize > 0 else {
-            self.lastError = String(localized: "performance.error.embedding_batch_size_invalid",
-                                    defaultValue: "Embedding Batch Size must be a positive integer.",
-                                    comment: "Performance screen error when embedding batch size input is invalid")
-            return
-        }
-        // Idle timeout: empty = leave alone (no patch field for null). Non-
-        // empty must be a positive integer; server enforces >= 60 itself.
-        let idleTrimmed = idleTimeoutText.trimmingCharacters(in: .whitespaces)
-        var idleSeconds: Int? = nil
-        if !idleTrimmed.isEmpty {
-            guard let n = Int(idleTrimmed), n >= 60 else {
-                self.lastError = String(localized: "performance.error.idle_timeout_invalid",
-                                        defaultValue: "Idle Timeout must be ≥ 60 seconds (or empty to leave unchanged).",
-                                        comment: "Performance screen error when idle timeout input is below 60 seconds")
-                return
-            }
-            idleSeconds = n
-        }
-        // Initial cache blocks: empty = leave alone, non-empty must parse.
-        let initTrimmed = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
-        var initBlocks: Int? = nil
-        if !initTrimmed.isEmpty {
-            guard let n = Int(initTrimmed), n > 0 else {
-                self.lastError = String(localized: "performance.error.initial_blocks_invalid",
-                                        defaultValue: "Initial Cache Blocks must be a positive integer (or empty).",
-                                        comment: "Performance screen error when initial cache blocks input is invalid")
-                return
-            }
-            initBlocks = n
-        }
-
-        var patch = GlobalSettingsPatch()
-        // Scheduler
-        if mc != loadedMaxConcurrent { patch.maxConcurrentRequests = mc }
-        if embeddingBatchSize != loadedEmbeddingBatchSize {
-            patch.embeddingBatchSize = embeddingBatchSize
-        }
-        if chunkedPrefill != loadedChunkedPrefill { patch.chunkedPrefill = chunkedPrefill }
-        // Memory & lifecycle
-        let mpm = trim(maxProcessMemory)
-        if mpm != loadedMaxProcessMemory { patch.maxProcessMemory = mpm }
-        let mmm = trim(maxModelMemory)
-        if mmm != loadedMaxModelMemory { patch.maxModelMemory = mmm }
-        if prefillMemoryGuard != loadedPrefillMemoryGuard {
-            patch.memoryPrefillMemoryGuard = prefillMemoryGuard
-        }
-        if idleSeconds != loadedIdleTimeoutSeconds, let s = idleSeconds {
-            patch.idleTimeoutSeconds = s
-        }
-        if modelFallback != loadedModelFallback { patch.modelFallback = modelFallback }
-        // Cache
-        if cacheEnabled != loadedCacheEnabled { patch.cacheEnabled = cacheEnabled }
-        if hotCacheOnly != loadedHotCacheOnly { patch.hotCacheOnly = hotCacheOnly }
-        let hcm = trim(hotCacheMaxSize)
-        if hcm != loadedHotCacheMaxSize { patch.hotCacheMaxSize = hcm }
-        let scd = trim(ssdCacheDir)
-        if scd != loadedSsdCacheDir { patch.ssdCacheDir = scd }
-        let scm = trim(ssdCacheMaxSize)
-        if scm != loadedSsdCacheMaxSize { patch.ssdCacheMaxSize = scm }
-        if initBlocks != loadedInitialCacheBlocks, let n = initBlocks {
-            patch.initialCacheBlocks = n
-        }
-
-        isSaving = true
-        defer { isSaving = false }
-        do {
-            _ = try await client.updateGlobalSettings(patch)
-            // Converge baselines on success.
-            self.loadedMaxConcurrent = mc
-            self.loadedEmbeddingBatchSize = embeddingBatchSize
-            self.loadedChunkedPrefill = chunkedPrefill
-            self.loadedMaxProcessMemory = mpm
-            self.loadedMaxModelMemory = mmm
-            self.loadedPrefillMemoryGuard = prefillMemoryGuard
-            if let s = idleSeconds { self.loadedIdleTimeoutSeconds = s }
-            self.loadedModelFallback = modelFallback
-            self.loadedCacheEnabled = cacheEnabled
-            self.loadedHotCacheOnly = hotCacheOnly
-            self.loadedHotCacheMaxSize = hcm
-            self.loadedSsdCacheDir = scd
-            self.loadedSsdCacheMaxSize = scm
-            if let n = initBlocks { self.loadedInitialCacheBlocks = n }
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    // MARK: - Parsing helpers
-
-    private var parsedMaxConcurrent: Int? {
-        Int(maxConcurrentText.trimmingCharacters(in: .whitespaces))
-    }
-
-    private var parsedEmbeddingBatchSize: Int? {
-        Int(embeddingBatchSizeText.trimmingCharacters(in: .whitespaces))
-    }
-
-    private var parsedIdleTimeout: Int? {
-        let t = idleTimeoutText.trimmingCharacters(in: .whitespaces)
-        return t.isEmpty ? nil : Int(t)
-    }
-
-    private var parsedInitialCacheBlocks: Int? {
-        let t = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
-        return t.isEmpty ? nil : Int(t)
-    }
-
-    private func trim(_ s: String) -> String {
-        s.trimmingCharacters(in: .whitespaces)
-    }
-
 }

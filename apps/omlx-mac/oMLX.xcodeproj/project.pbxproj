@@ -23,16 +23,17 @@
 		2BB000000000000000000008 /* ListGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000008 /* ListGroup.swift */; };
 		2BB000000000000000000009 /* Row.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC000000000000000000009 /* Row.swift */; };
 		2BB00000000000000000000A /* SectionHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000A /* SectionHeader.swift */; };
-		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
 		2BB00000000000000000000B /* StatusPill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000B /* StatusPill.swift */; };
 		2BB00000000000000000000C /* CodeChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000C /* CodeChip.swift */; };
+		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
-		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
-		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
+		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
+		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
 		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
 		4BB000000000000000000002 /* SignalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000002 /* SignalHandlers.swift */; };
+		4BB000000000000000000003 /* AppControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000003 /* AppControlServer.swift */; };
 		6BB000000000000000000001 /* AppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000001 /* AppView.swift */; };
 		6BB000000000000000000002 /* AppSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000002 /* AppSection.swift */; };
 		6BB000000000000000000004 /* ServerScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000004 /* ServerScreen.swift */; };
@@ -62,16 +63,30 @@
 		8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000004 /* ModelSettingsScreen.swift */; };
 		8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000005 /* ChatTemplateKwargs.swift */; };
 		8BB000000000000000000006 /* DflashByteSize.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000006 /* DflashByteSize.swift */; };
-		8BB000000000000000000007 /* SystemMetrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetrics.swift */; };
+		8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000007 /* SystemMetricsPoller.swift */; };
 		8BB000000000000000000008 /* ProfileViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000008 /* ProfileViews.swift */; };
 		8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC000000000000000000009 /* ProfileWorkingState.swift */; };
 		8BB00000000000000000000A /* MSTaskDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CC00000000000000000000A /* MSTaskDTO.swift */; };
-		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
-		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
 		9BB000000000000000000001 /* SubKeyDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000001 /* SubKeyDTO.swift */; };
 		9BB000000000000000000002 /* OQDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000002 /* OQDTO.swift */; };
 		9BB000000000000000000003 /* HFUploadDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000003 /* HFUploadDTO.swift */; };
 		9BB000000000000000000004 /* BenchDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000004 /* BenchDTO.swift */; };
+		9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000005 /* PresetBundleDTO.swift */; };
+		9BB000000000000000000006 /* PresetBundleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CC000000000000000000006 /* PresetBundleStore.swift */; };
+		AACFCBE42FE115A200B224C0 /* ProgressBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = AACFCBE32FE115A200B224C0 /* ProgressBar.swift */; };
+		AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5162FE283D100FAEA05 /* ServerScreenVM.swift */; };
+		AAD9D5192FE2840100FAEA05 /* StatusScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5182FE2840100FAEA05 /* StatusScreenVM.swift */; };
+		AAD9D51B2FE2841500FAEA05 /* LogsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D51A2FE2841500FAEA05 /* LogsScreenVM.swift */; };
+		AAD9D51D2FE2842C00FAEA05 /* ModelsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */; };
+		AAD9D51F2FE2843F00FAEA05 /* DownloadsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */; };
+		AAD9D5212FE2845300FAEA05 /* ModelSettingsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */; };
+		AAD9D5232FE2846600FAEA05 /* IntegrationsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */; };
+		AAD9D5252FE2848500FAEA05 /* SecurityScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */; };
+		AAD9D5272FE2849800FAEA05 /* QuantizationScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */; };
+		AAD9D5292FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */; };
+		AAD9D52B2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */; };
+		AAD9D52D2FE284D100FAEA05 /* NetworkScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */; };
+		AAD9D52F2FE284E200FAEA05 /* PerformanceScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */; };
 		ABB000000000000000000001 /* WelcomeWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC000000000000000000001 /* WelcomeWindow.swift */; };
 		BBB000000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000002 /* Localizable.xcstrings */; };
 		BBB000000000000000000004 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000003 /* AppUpdater.swift */; };
@@ -92,6 +107,15 @@
 		DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */; };
 		DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC00000000000000000000F /* LocalizationSmokeTests.swift */; };
 		DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000100 /* MenubarControllerPortTests.swift */; };
+		DBB000000000000000000101 /* ModelCardDTO.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000101 /* ModelCardDTO.swift */; };
+		DBB000000000000000000102 /* ModelCardSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000102 /* ModelCardSheet.swift */; };
+		DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */; };
+		DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000104 /* ShellEnvWriterTests.swift */; };
+		DBB000000000000000000105 /* ThemeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000105 /* ThemeTests.swift */; };
+		DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000106 /* ReleasesCheckerTests.swift */; };
+		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
+		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
+		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -100,7 +124,7 @@
 			containerPortal = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 1AAAAAAAAAAAAAAAAAAAAAA2;
-			remoteInfo = "oMLX";
+			remoteInfo = oMLX;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -109,9 +133,9 @@
 		1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "oMLX.entitlements"; sourceTree = "<group>"; };
+		1CCCCCCCCCCCCCCCCCCCCCC5 /* oMLX.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = oMLX.entitlements; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "oMLX.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = oMLX.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntime.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcess.swift; sourceTree = "<group>"; };
 		2CC000000000000000000001 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -124,16 +148,17 @@
 		2CC000000000000000000008 /* ListGroup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListGroup.swift; sourceTree = "<group>"; };
 		2CC000000000000000000009 /* Row.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Row.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000A /* SectionHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SectionHeader.swift; sourceTree = "<group>"; };
-		2CC00000000000000000000D /* ScreenScaffold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenScaffold.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000B /* StatusPill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusPill.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
+		2CC00000000000000000000D /* ScreenScaffold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenScaffold.swift; sourceTree = "<group>"; };
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
-		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
-		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
+		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
+		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
 		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
 		4CC000000000000000000002 /* SignalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalHandlers.swift; sourceTree = "<group>"; };
+		4CC000000000000000000003 /* AppControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppControlServer.swift; sourceTree = "<group>"; };
 		6CC000000000000000000001 /* AppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppView.swift; sourceTree = "<group>"; };
 		6CC000000000000000000002 /* AppSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSection.swift; sourceTree = "<group>"; };
 		6CC000000000000000000004 /* ServerScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreen.swift; sourceTree = "<group>"; };
@@ -163,16 +188,30 @@
 		8CC000000000000000000004 /* ModelSettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreen.swift; sourceTree = "<group>"; };
 		8CC000000000000000000005 /* ChatTemplateKwargs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTemplateKwargs.swift; sourceTree = "<group>"; };
 		8CC000000000000000000006 /* DflashByteSize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DflashByteSize.swift; sourceTree = "<group>"; };
-		8CC000000000000000000007 /* SystemMetrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetrics.swift; sourceTree = "<group>"; };
+		8CC000000000000000000007 /* SystemMetricsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemMetricsPoller.swift; sourceTree = "<group>"; };
 		8CC000000000000000000008 /* ProfileViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileViews.swift; sourceTree = "<group>"; };
 		8CC000000000000000000009 /* ProfileWorkingState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileWorkingState.swift; sourceTree = "<group>"; };
 		8CC00000000000000000000A /* MSTaskDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MSTaskDTO.swift; sourceTree = "<group>"; };
-		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
-		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
 		9CC000000000000000000001 /* SubKeyDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubKeyDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000002 /* OQDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OQDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000003 /* HFUploadDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFUploadDTO.swift; sourceTree = "<group>"; };
 		9CC000000000000000000004 /* BenchDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000005 /* PresetBundleDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleDTO.swift; sourceTree = "<group>"; };
+		9CC000000000000000000006 /* PresetBundleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBundleStore.swift; sourceTree = "<group>"; };
+		AACFCBE32FE115A200B224C0 /* ProgressBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgressBar.swift; sourceTree = "<group>"; };
+		AAD9D5162FE283D100FAEA05 /* ServerScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5182FE2840100FAEA05 /* StatusScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D51A2FE2841500FAEA05 /* LogsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurityScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThroughputBenchScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccuracyBenchScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVM.swift; sourceTree = "<group>"; };
 		ACC000000000000000000001 /* WelcomeWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeWindow.swift; sourceTree = "<group>"; };
 		BCC000000000000000000002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		BCC000000000000000000003 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
@@ -192,8 +231,16 @@
 		DCC00000000000000000000D /* DTOFixtureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DTOFixtureTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProcessIntegrationTests.swift; sourceTree = "<group>"; };
 		DCC00000000000000000000F /* LocalizationSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationSmokeTests.swift; sourceTree = "<group>"; };
-		DCC000000000000000000100 /* MenubarControllerPortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerPortTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000010 /* oMLXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = oMLXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		DCC000000000000000000100 /* MenubarControllerPortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerPortTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000101 /* ModelCardDTO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTO.swift; sourceTree = "<group>"; };
+		DCC000000000000000000102 /* ModelCardSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardSheet.swift; sourceTree = "<group>"; };
+		DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCardDTODecodeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000104 /* ShellEnvWriterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriterTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000105 /* ThemeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000106 /* ReleasesCheckerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesCheckerTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -201,6 +248,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EBB000000000000000000001 /* MarkdownUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -214,7 +262,7 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		1BBBBBBBBBBBBBBBBBBBBBB1 /* oMLX */ = {
+		1BBBBBBBBBBBBBBBBBBBBBB1 = {
 			isa = PBXGroup;
 			children = (
 				1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */,
@@ -222,37 +270,6 @@
 				1BBBBBBBBBBBBBBBBBBBBBB5 /* Resources */,
 				1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */,
 			);
-			sourceTree = "<group>";
-		};
-		DEE000000000000000000001 /* Tests */ = {
-			isa = PBXGroup;
-			children = (
-				DEE000000000000000000002 /* oMLXTests */,
-			);
-			path = Tests;
-			sourceTree = "<group>";
-		};
-		DEE000000000000000000002 /* oMLXTests */ = {
-			isa = PBXGroup;
-			children = (
-				DCC000000000000000000001 /* AppServicesPathTests.swift */,
-				DCC000000000000000000002 /* AppConfigTests.swift */,
-				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
-				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
-				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
-				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
-				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
-				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
-				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
-				DCC00000000000000000000A /* ProfileScopeTests.swift */,
-				DCC00000000000000000000B /* SystemMetricsTests.swift */,
-				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
-				DCC00000000000000000000D /* DTOFixtureTests.swift */,
-				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
-				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
-				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
-			);
-			path = oMLXTests;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB2 /* Sources */ = {
@@ -269,141 +286,6 @@
 				AEE000000000000000000001 /* Welcome */,
 			);
 			path = Sources;
-			sourceTree = "<group>";
-		};
-		AEE000000000000000000001 /* Welcome */ = {
-			isa = PBXGroup;
-			children = (
-				ACC000000000000000000001 /* WelcomeWindow.swift */,
-			);
-			path = Welcome;
-			sourceTree = "<group>";
-		};
-		6EE000000000000000000001 /* AppView */ = {
-			isa = PBXGroup;
-			children = (
-				6CC000000000000000000001 /* AppView.swift */,
-				6CC000000000000000000002 /* AppSection.swift */,
-				7CC000000000000000000001 /* AppServices.swift */,
-				9CC000000000000000000006 /* PresetBundleStore.swift */,
-				6EE000000000000000000002 /* Screens */,
-			);
-			path = AppView;
-			sourceTree = "<group>";
-		};
-		7EE000000000000000000001 /* Net */ = {
-			isa = PBXGroup;
-			children = (
-				7CC000000000000000000002 /* OMLXClient.swift */,
-				7CC000000000000000000003 /* Endpoints.swift */,
-				7EE000000000000000000002 /* DTO */,
-			);
-			path = Net;
-			sourceTree = "<group>";
-		};
-		7EE000000000000000000002 /* DTO */ = {
-			isa = PBXGroup;
-			children = (
-				7CC000000000000000000004 /* GlobalSettingsDTO.swift */,
-				7CC000000000000000000005 /* ServerInfoDTO.swift */,
-				7CC000000000000000000006 /* StatsDTO.swift */,
-				7CC000000000000000000007 /* LogsDTO.swift */,
-				8CC000000000000000000001 /* ModelsDTO.swift */,
-				8CC000000000000000000002 /* ProfileDTO.swift */,
-				8CC000000000000000000003 /* HFTaskDTO.swift */,
-				8CC00000000000000000000A /* MSTaskDTO.swift */,
-				9CC000000000000000000001 /* SubKeyDTO.swift */,
-				9CC000000000000000000002 /* OQDTO.swift */,
-				9CC000000000000000000003 /* HFUploadDTO.swift */,
-				9CC000000000000000000004 /* BenchDTO.swift */,
-				9CC000000000000000000005 /* PresetBundleDTO.swift */,
-			);
-			path = DTO;
-			sourceTree = "<group>";
-		};
-		7EE000000000000000000003 /* Updater */ = {
-			isa = PBXGroup;
-			children = (
-				7CC000000000000000000008 /* UpdateController.swift */,
-				BCC000000000000000000003 /* AppUpdater.swift */,
-				BCC000000000000000000004 /* ReleasesChecker.swift */,
-			);
-			path = Updater;
-			sourceTree = "<group>";
-		};
-		6EE000000000000000000002 /* Screens */ = {
-			isa = PBXGroup;
-			children = (
-				6CC000000000000000000004 /* ServerScreen.swift */,
-				6CC000000000000000000005 /* StatusScreen.swift */,
-				6CC000000000000000000006 /* LogsScreen.swift */,
-				6CC000000000000000000007 /* ModelsScreen.swift */,
-				6CC000000000000000000008 /* DownloadsScreen.swift */,
-				8CC000000000000000000004 /* ModelSettingsScreen.swift */,
-				8CC000000000000000000005 /* ChatTemplateKwargs.swift */,
-				8CC000000000000000000006 /* DflashByteSize.swift */,
-				8CC000000000000000000007 /* SystemMetrics.swift */,
-				8CC000000000000000000008 /* ProfileViews.swift */,
-				8CC000000000000000000009 /* ProfileWorkingState.swift */,
-				6CC000000000000000000009 /* IntegrationsScreen.swift */,
-				6CC00000000000000000000A /* SecurityScreen.swift */,
-				6CC00000000000000000000B /* AboutScreen.swift */,
-				6CC00000000000000000000C /* QuantizationScreen.swift */,
-				6CC00000000000000000000D /* ThroughputBenchScreen.swift */,
-				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
-				6CC00000000000000000000F /* NetworkScreen.swift */,
-				6CC000000000000000000010 /* PerformanceScreen.swift */,
-			);
-			path = Screens;
-			sourceTree = "<group>";
-		};
-		3EE000000000000000000001 /* Config */ = {
-			isa = PBXGroup;
-			children = (
-				3CC000000000000000000001 /* AppConfig.swift */,
-				3CC000000000000000000004 /* ShellEnvWriter.swift */,
-				3CC000000000000000000005 /* APIKeyGenerator.swift */,
-			);
-			path = Config;
-			sourceTree = "<group>";
-		};
-		2EE000000000000000000001 /* Theme */ = {
-			isa = PBXGroup;
-			children = (
-				2CC000000000000000000001 /* Theme.swift */,
-				2CC000000000000000000002 /* Squircle.swift */,
-				2CC000000000000000000003 /* Glass.swift */,
-				2EE000000000000000000002 /* Components */,
-			);
-			path = Theme;
-			sourceTree = "<group>";
-		};
-		2EE000000000000000000002 /* Components */ = {
-			isa = PBXGroup;
-			children = (
-				2CC000000000000000000004 /* Button.swift */,
-				2CC000000000000000000005 /* Popup.swift */,
-				2CC000000000000000000006 /* TextInput.swift */,
-				2CC000000000000000000007 /* Segmented.swift */,
-				2CC000000000000000000008 /* ListGroup.swift */,
-				2CC000000000000000000009 /* Row.swift */,
-				2CC00000000000000000000A /* SectionHeader.swift */,
-				2CC00000000000000000000B /* StatusPill.swift */,
-				2CC00000000000000000000C /* CodeChip.swift */,
-				2CC00000000000000000000D /* ScreenScaffold.swift */,
-			);
-			path = Components;
-			sourceTree = "<group>";
-		};
-		1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */ = {
-			isa = PBXGroup;
-			children = (
-				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
-				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
-				4CC000000000000000000001 /* PortConflictResolver.swift */,
-				4CC000000000000000000002 /* SignalHandlers.swift */,
-			);
-			path = Server;
 			sourceTree = "<group>";
 		};
 		1BBBBBBBBBBBBBBBBBBBBBB3 /* App */ = {
@@ -445,6 +327,211 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		1BBBBBBBBBBBBBBBBBBBBBB7 /* Server */ = {
+			isa = PBXGroup;
+			children = (
+				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
+				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
+				4CC000000000000000000001 /* PortConflictResolver.swift */,
+				4CC000000000000000000002 /* SignalHandlers.swift */,
+				4CC000000000000000000003 /* AppControlServer.swift */,
+			);
+			path = Server;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000001 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000001 /* Theme.swift */,
+				2CC000000000000000000002 /* Squircle.swift */,
+				2CC000000000000000000003 /* Glass.swift */,
+				2EE000000000000000000002 /* Components */,
+			);
+			path = Theme;
+			sourceTree = "<group>";
+		};
+		2EE000000000000000000002 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				2CC000000000000000000004 /* Button.swift */,
+				AACFCBE32FE115A200B224C0 /* ProgressBar.swift */,
+				2CC000000000000000000005 /* Popup.swift */,
+				2CC000000000000000000006 /* TextInput.swift */,
+				2CC000000000000000000007 /* Segmented.swift */,
+				2CC000000000000000000008 /* ListGroup.swift */,
+				2CC000000000000000000009 /* Row.swift */,
+				2CC00000000000000000000A /* SectionHeader.swift */,
+				2CC00000000000000000000B /* StatusPill.swift */,
+				2CC00000000000000000000C /* CodeChip.swift */,
+				2CC00000000000000000000D /* ScreenScaffold.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		3EE000000000000000000001 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				3CC000000000000000000001 /* AppConfig.swift */,
+				3CC000000000000000000004 /* ShellEnvWriter.swift */,
+				3CC000000000000000000005 /* APIKeyGenerator.swift */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		6EE000000000000000000001 /* AppView */ = {
+			isa = PBXGroup;
+			children = (
+				6CC000000000000000000001 /* AppView.swift */,
+				6CC000000000000000000002 /* AppSection.swift */,
+				7CC000000000000000000001 /* AppServices.swift */,
+				AA81FB452FE29345001BF56E /* Utils */,
+				AAD9D5152FE283B000FAEA05 /* ViewModels */,
+				6EE000000000000000000002 /* Screens */,
+			);
+			path = AppView;
+			sourceTree = "<group>";
+		};
+		6EE000000000000000000002 /* Screens */ = {
+			isa = PBXGroup;
+			children = (
+				6CC000000000000000000004 /* ServerScreen.swift */,
+				6CC000000000000000000005 /* StatusScreen.swift */,
+				6CC000000000000000000006 /* LogsScreen.swift */,
+				6CC000000000000000000007 /* ModelsScreen.swift */,
+				6CC000000000000000000008 /* DownloadsScreen.swift */,
+				8CC000000000000000000004 /* ModelSettingsScreen.swift */,
+				8CC000000000000000000008 /* ProfileViews.swift */,
+				6CC000000000000000000009 /* IntegrationsScreen.swift */,
+				6CC00000000000000000000A /* SecurityScreen.swift */,
+				6CC00000000000000000000B /* AboutScreen.swift */,
+				6CC00000000000000000000C /* QuantizationScreen.swift */,
+				6CC00000000000000000000D /* ThroughputBenchScreen.swift */,
+				6CC00000000000000000000E /* AccuracyBenchScreen.swift */,
+				6CC00000000000000000000F /* NetworkScreen.swift */,
+				6CC000000000000000000010 /* PerformanceScreen.swift */,
+				DCC000000000000000000102 /* ModelCardSheet.swift */,
+			);
+			path = Screens;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000001 /* Net */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000002 /* OMLXClient.swift */,
+				7CC000000000000000000003 /* Endpoints.swift */,
+				7EE000000000000000000002 /* DTO */,
+			);
+			path = Net;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000002 /* DTO */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000004 /* GlobalSettingsDTO.swift */,
+				7CC000000000000000000005 /* ServerInfoDTO.swift */,
+				7CC000000000000000000006 /* StatsDTO.swift */,
+				7CC000000000000000000007 /* LogsDTO.swift */,
+				8CC000000000000000000001 /* ModelsDTO.swift */,
+				8CC000000000000000000002 /* ProfileDTO.swift */,
+				8CC000000000000000000003 /* HFTaskDTO.swift */,
+				8CC00000000000000000000A /* MSTaskDTO.swift */,
+				9CC000000000000000000001 /* SubKeyDTO.swift */,
+				9CC000000000000000000002 /* OQDTO.swift */,
+				9CC000000000000000000003 /* HFUploadDTO.swift */,
+				9CC000000000000000000004 /* BenchDTO.swift */,
+				9CC000000000000000000005 /* PresetBundleDTO.swift */,
+				DCC000000000000000000101 /* ModelCardDTO.swift */,
+			);
+			path = DTO;
+			sourceTree = "<group>";
+		};
+		7EE000000000000000000003 /* Updater */ = {
+			isa = PBXGroup;
+			children = (
+				7CC000000000000000000008 /* UpdateController.swift */,
+				BCC000000000000000000003 /* AppUpdater.swift */,
+				BCC000000000000000000004 /* ReleasesChecker.swift */,
+			);
+			path = Updater;
+			sourceTree = "<group>";
+		};
+		AA81FB452FE29345001BF56E /* Utils */ = {
+			isa = PBXGroup;
+			children = (
+				8CC000000000000000000005 /* ChatTemplateKwargs.swift */,
+				8CC000000000000000000006 /* DflashByteSize.swift */,
+				8CC000000000000000000009 /* ProfileWorkingState.swift */,
+				9CC000000000000000000006 /* PresetBundleStore.swift */,
+				8CC000000000000000000007 /* SystemMetricsPoller.swift */,
+			);
+			path = Utils;
+			sourceTree = "<group>";
+		};
+		AAD9D5152FE283B000FAEA05 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				AAD9D5162FE283D100FAEA05 /* ServerScreenVM.swift */,
+				AAD9D5182FE2840100FAEA05 /* StatusScreenVM.swift */,
+				AAD9D51A2FE2841500FAEA05 /* LogsScreenVM.swift */,
+				AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */,
+				AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */,
+				AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */,
+				AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */,
+				AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */,
+				AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */,
+				AAD9D5282FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift */,
+				AAD9D52A2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift */,
+				AAD9D52C2FE284D100FAEA05 /* NetworkScreenVM.swift */,
+				AAD9D52E2FE284E200FAEA05 /* PerformanceScreenVM.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		AEE000000000000000000001 /* Welcome */ = {
+			isa = PBXGroup;
+			children = (
+				ACC000000000000000000001 /* WelcomeWindow.swift */,
+			);
+			path = Welcome;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				DEE000000000000000000002 /* oMLXTests */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		DEE000000000000000000002 /* oMLXTests */ = {
+			isa = PBXGroup;
+			children = (
+				DCC000000000000000000001 /* AppServicesPathTests.swift */,
+				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
+				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
+				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
+				DCC000000000000000000006 /* APIKeyGeneratorTests.swift */,
+				DCC000000000000000000007 /* ChatTemplateKwargsCodecTests.swift */,
+				DCC000000000000000000008 /* DflashByteSizeTests.swift */,
+				DCC000000000000000000009 /* GlobalSettingsSamplingTests.swift */,
+				DCC00000000000000000000A /* ProfileScopeTests.swift */,
+				DCC00000000000000000000B /* SystemMetricsTests.swift */,
+				DCC00000000000000000000C /* WelcomeViewModelTests.swift */,
+				DCC00000000000000000000D /* DTOFixtureTests.swift */,
+				DCC00000000000000000000E /* ServerProcessIntegrationTests.swift */,
+				DCC00000000000000000000F /* LocalizationSmokeTests.swift */,
+				DCC000000000000000000100 /* MenubarControllerPortTests.swift */,
+				DCC000000000000000000103 /* ModelCardDTODecodeTests.swift */,
+				DCC000000000000000000104 /* ShellEnvWriterTests.swift */,
+				DCC000000000000000000105 /* ThemeTests.swift */,
+				DCC000000000000000000106 /* ReleasesCheckerTests.swift */,
+				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
+				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
+			);
+			path = oMLXTests;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -460,10 +547,11 @@
 			);
 			dependencies = (
 			);
-			name = "oMLX";
+			name = oMLX;
 			packageProductDependencies = (
+				ECC000000000000000000001 /* MarkdownUI */,
 			);
-			productName = "oMLX";
+			productName = oMLX;
 			productReference = 1CCCCCCCCCCCCCCCCCCCCCC7 /* oMLX.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -513,6 +601,7 @@
 			);
 			mainGroup = 1BBBBBBBBBBBBBBBBBBBBBB1;
 			packageReferences = (
+				EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
 			);
 			productRefGroup = 1BBBBBBBBBBBBBBBBBBBBBB6 /* Products */;
 			projectDirPath = "";
@@ -543,10 +632,12 @@
 			files = (
 				1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */,
+				AAD9D51D2FE2842C00FAEA05 /* ModelsScreenVM.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD5 /* PythonRuntime.swift in Sources */,
 				1DDDDDDDDDDDDDDDDDDDDDD6 /* ServerProcess.swift in Sources */,
 				2BB000000000000000000001 /* Theme.swift in Sources */,
+				AAD9D5252FE2848500FAEA05 /* SecurityScreenVM.swift in Sources */,
 				2BB000000000000000000002 /* Squircle.swift in Sources */,
 				2BB000000000000000000003 /* Glass.swift in Sources */,
 				2BB000000000000000000004 /* Button.swift in Sources */,
@@ -554,10 +645,12 @@
 				2BB000000000000000000006 /* TextInput.swift in Sources */,
 				2BB000000000000000000007 /* Segmented.swift in Sources */,
 				2BB000000000000000000008 /* ListGroup.swift in Sources */,
+				AAD9D5292FE284AA00FAEA05 /* ThroughputBenchScreenVM.swift in Sources */,
 				2BB000000000000000000009 /* Row.swift in Sources */,
 				2BB00000000000000000000A /* SectionHeader.swift in Sources */,
 				2BB00000000000000000000D /* ScreenScaffold.swift in Sources */,
 				2BB00000000000000000000B /* StatusPill.swift in Sources */,
+				AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,
 				3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */,
@@ -566,26 +659,35 @@
 				3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */,
 				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
 				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
+				4BB000000000000000000003 /* AppControlServer.swift in Sources */,
 				6BB000000000000000000001 /* AppView.swift in Sources */,
 				6BB000000000000000000002 /* AppSection.swift in Sources */,
 				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
 				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
+				AAD9D51F2FE2843F00FAEA05 /* DownloadsScreenVM.swift in Sources */,
 				6BB000000000000000000006 /* LogsScreen.swift in Sources */,
 				6BB000000000000000000007 /* ModelsScreen.swift in Sources */,
 				6BB000000000000000000008 /* DownloadsScreen.swift in Sources */,
+				AAD9D52D2FE284D100FAEA05 /* NetworkScreenVM.swift in Sources */,
 				6BB000000000000000000009 /* IntegrationsScreen.swift in Sources */,
 				6BB00000000000000000000A /* SecurityScreen.swift in Sources */,
+				AAD9D52B2FE284BF00FAEA05 /* AccuracyBenchScreenVM.swift in Sources */,
 				6BB00000000000000000000B /* AboutScreen.swift in Sources */,
 				6BB00000000000000000000C /* QuantizationScreen.swift in Sources */,
 				6BB00000000000000000000D /* ThroughputBenchScreen.swift in Sources */,
+				AAD9D52F2FE284E200FAEA05 /* PerformanceScreenVM.swift in Sources */,
 				6BB00000000000000000000E /* AccuracyBenchScreen.swift in Sources */,
 				6BB00000000000000000000F /* NetworkScreen.swift in Sources */,
 				6BB000000000000000000010 /* PerformanceScreen.swift in Sources */,
+				AAD9D5212FE2845300FAEA05 /* ModelSettingsScreenVM.swift in Sources */,
+				AAD9D5192FE2840100FAEA05 /* StatusScreenVM.swift in Sources */,
+				AAD9D5272FE2849800FAEA05 /* QuantizationScreenVM.swift in Sources */,
 				7BB000000000000000000001 /* AppServices.swift in Sources */,
 				7BB000000000000000000002 /* OMLXClient.swift in Sources */,
 				7BB000000000000000000003 /* Endpoints.swift in Sources */,
 				7BB000000000000000000004 /* GlobalSettingsDTO.swift in Sources */,
 				7BB000000000000000000005 /* ServerInfoDTO.swift in Sources */,
+				AAD9D5232FE2846600FAEA05 /* IntegrationsScreenVM.swift in Sources */,
 				7BB000000000000000000006 /* StatsDTO.swift in Sources */,
 				7BB000000000000000000007 /* LogsDTO.swift in Sources */,
 				7BB000000000000000000008 /* UpdateController.swift in Sources */,
@@ -594,11 +696,15 @@
 				8BB000000000000000000003 /* HFTaskDTO.swift in Sources */,
 				8BB00000000000000000000A /* MSTaskDTO.swift in Sources */,
 				9BB000000000000000000005 /* PresetBundleDTO.swift in Sources */,
+				DBB000000000000000000101 /* ModelCardDTO.swift in Sources */,
+				AAD9D51B2FE2841500FAEA05 /* LogsScreenVM.swift in Sources */,
+				DBB000000000000000000102 /* ModelCardSheet.swift in Sources */,
 				9BB000000000000000000006 /* PresetBundleStore.swift in Sources */,
+				AACFCBE42FE115A200B224C0 /* ProgressBar.swift in Sources */,
 				8BB000000000000000000004 /* ModelSettingsScreen.swift in Sources */,
 				8BB000000000000000000005 /* ChatTemplateKwargs.swift in Sources */,
 				8BB000000000000000000006 /* DflashByteSize.swift in Sources */,
-				8BB000000000000000000007 /* SystemMetrics.swift in Sources */,
+				8BB000000000000000000007 /* SystemMetricsPoller.swift in Sources */,
 				8BB000000000000000000008 /* ProfileViews.swift in Sources */,
 				8BB000000000000000000009 /* ProfileWorkingState.swift in Sources */,
 				9BB000000000000000000001 /* SubKeyDTO.swift in Sources */,
@@ -631,6 +737,12 @@
 				DBB00000000000000000000E /* ServerProcessIntegrationTests.swift in Sources */,
 				DBB00000000000000000000F /* LocalizationSmokeTests.swift in Sources */,
 				DBB000000000000000000100 /* MenubarControllerPortTests.swift in Sources */,
+				DBB000000000000000000103 /* ModelCardDTODecodeTests.swift in Sources */,
+				DBB000000000000000000104 /* ShellEnvWriterTests.swift in Sources */,
+				DBB000000000000000000105 /* ThemeTests.swift in Sources */,
+				DBB000000000000000000106 /* ReleasesCheckerTests.swift in Sources */,
+				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
+				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -768,7 +880,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
+				CODE_SIGN_ENTITLEMENTS = Resources/oMLX.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -776,14 +888,14 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = "Resources/Info.plist";
+				INFOPLIST_FILE = Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -794,7 +906,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "Resources/oMLX.entitlements";
+				CODE_SIGN_ENTITLEMENTS = Resources/oMLX.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -802,14 +914,14 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = "Resources/Info.plist";
+				INFOPLIST_FILE = Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx";
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -825,7 +937,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;
@@ -842,7 +954,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "app.omlx.tests";
+				PRODUCT_BUNDLE_IDENTIFIER = app.omlx.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;
@@ -881,6 +993,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.4.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		ECC000000000000000000001 /* MarkdownUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = EDD000000000000000000001 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
+			productName = MarkdownUI;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 1AAAAAAAAAAAAAAAAAAAAAA1 /* Project object */;
 }

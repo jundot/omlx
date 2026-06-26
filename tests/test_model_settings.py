@@ -36,6 +36,25 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
 
+    def test_guided_grammar_defaults(self):
+        """Test guided grammar defaults to disabled."""
+        settings = ModelSettings()
+        assert settings.guided_grammar_enabled is False
+        assert settings.guided_grammar is None
+
+    def test_guided_grammar_roundtrip(self):
+        """Test guided grammar survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            guided_grammar_enabled=True,
+            guided_grammar='root ::= "YES"',
+        )
+        d = original.to_dict()
+        assert d["guided_grammar_enabled"] is True
+        assert d["guided_grammar"] == 'root ::= "YES"'
+        restored = ModelSettings.from_dict(d)
+        assert restored.guided_grammar_enabled is True
+        assert restored.guided_grammar == 'root ::= "YES"'
+
     def test_trust_remote_code_excluded_from_profiles(self):
         """Security flag must never propagate via profiles or templates."""
         from omlx.model_profiles import EXCLUDED_FROM_PROFILES
@@ -196,6 +215,66 @@ class TestModelSettings:
         settings = ModelSettings()
         d = settings.to_dict()
         assert "model_type_override" not in d
+
+    def test_turboquant_kv_bits_default(self):
+        """Default bit depth = 4."""
+        settings = ModelSettings()
+        assert settings.turboquant_kv_bits == 4
+
+    def test_turboquant_kv_bits_roundtrip(self):
+        original = ModelSettings(turboquant_kv_bits=2.5)
+        d = original.to_dict()
+        assert d["turboquant_kv_bits"] == 2.5
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_kv_bits == 2.5
+
+    def test_turboquant_kv_bits_always_in_to_dict(self):
+        """Non-Optional field with a default must always serialize."""
+        settings = ModelSettings()
+        assert "turboquant_kv_bits" in settings.to_dict()
+
+    def test_turboquant_skip_last_default(self):
+        """Default = True — protects sensitive models from last-layer corruption."""
+        settings = ModelSettings()
+        assert settings.turboquant_skip_last is True
+
+    def test_turboquant_skip_last_roundtrip(self):
+        original = ModelSettings(turboquant_skip_last=False)
+        d = original.to_dict()
+        assert d["turboquant_skip_last"] is False
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_skip_last is False
+
+    def test_vlm_mtp_draft_model_default(self):
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_model is None
+
+    def test_vlm_mtp_draft_model_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant")
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_model"] == "gemma-4-26B-A4B-it-assistant"
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_model == "gemma-4-26B-A4B-it-assistant"
+
+    def test_vlm_mtp_draft_model_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_model" not in settings.to_dict()
+
+    def test_vlm_mtp_draft_block_size_default(self):
+        """None means 'use mlx-vlm default'."""
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_block_size is None
+
+    def test_vlm_mtp_draft_block_size_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_block_size=8)
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_block_size"] == 8
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_block_size == 8
+
+    def test_vlm_mtp_draft_block_size_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_block_size" not in settings.to_dict()
 
 
 class TestModelSettingsManager:

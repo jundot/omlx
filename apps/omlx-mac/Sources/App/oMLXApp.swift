@@ -29,7 +29,7 @@ struct OMLXApp: App {
         // fallback when title is empty, so we don't lose the in-menu name.
         Window("", id: "main") {
             AppView()
-                .environmentObject(appDelegate.services)
+                .environment(appDelegate.services)
         }
         .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["main"])

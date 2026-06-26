@@ -27,8 +27,10 @@ import asyncio
 import contextlib
 import copy
 import importlib
+import inspect
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,18 +38,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..api.utils import (
+    clean_special_tokens,
+    detect_and_strip_partial,
+    remove_special_tokens_preserve_whitespace,
+)
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
+from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
-from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
 )
-from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput
+from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,14 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
     "<|endofassistant|>",
 ]
 
+VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
+
+COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
+MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
+
+DIFFUSION_PREFILL_STEP_SIZE = 2048
+
 # Per-model OCR generation defaults from official configs.
 # Applied automatically when no explicit user override is provided.
 OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -96,6 +108,96 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 8192,
     },
 }
+
+
+def _read_config_model_type(model_path: str | Path) -> str | None:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return None
+    model_type = data.get("model_type")
+    return model_type if isinstance(model_type, str) else None
+
+
+def _apply_minimax_m3_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX enable_thinking to MiniMax M3's thinking_mode template kwarg."""
+    if model_type not in MINIMAX_M3_MODEL_TYPES:
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    if "thinking_mode" in template_kwargs:
+        return
+
+    if enable_thinking is True:
+        template_kwargs["thinking_mode"] = "enabled"
+    elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
+
+
+def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
+    from mlx_vlm.tokenizer_utils import load_tokenizer
+    from mlx_vlm.utils import StoppingCriteria
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+
+    detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+    tokenizer.detokenizer = detokenizer_class(tokenizer)
+
+    final_eos_token_ids = (
+        eos_token_id
+        or getattr(tokenizer, "eos_token_ids", None)
+        or getattr(tokenizer, "eos_token_id", None)
+    )
+    tokenizer.stopping_criteria = StoppingCriteria(final_eos_token_ids, tokenizer)
+    return tokenizer
+
+
+def _load_cohere2_moe_text_model(
+    model_name: str,
+    *,
+    trust_remote_code: bool = False,
+):
+    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    from mlx_vlm.utils import get_model_path, load_model, load_processor
+    from transformers import AutoTokenizer
+
+    model_path = get_model_path(model_name)
+    model = load_model(
+        model_path,
+        lazy=False,
+        strict=True,
+        trust_remote_code=trust_remote_code,
+    )
+
+    eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    try:
+        processor = load_processor(
+            model_path,
+            True,
+            eos_token_ids=eos_token_id,
+            trust_remote_code=trust_remote_code,
+        )
+    except Exception as exc:
+        logger.debug(
+            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "falling back to AutoTokenizer: %s",
+            model_name,
+            exc,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
+        processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
+
+    return model, processor
+
 
 _video_processor_patched = False
 
@@ -257,6 +359,32 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
             "torch+torchvision or upgrade mlx-vlm."
         )
 
+    # Read feature_extractor config if present (needed for audio models like gemma4_unified)
+    fe_config = {}
+    fe_type = None
+    for fname in ("processor_config.json", "preprocessor_config.json"):
+        cfg_path = p / fname
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        fe_section = cfg.get("feature_extractor", {})
+        if isinstance(fe_section, dict):
+            fe_config = dict(fe_section)
+            fe_type = fe_config.pop("feature_extractor_type", None)
+            if fe_type:
+                break
+
+    feature_extractor = None
+    if fe_type:
+        # Dynamically import the feature extractor class
+        fe_cls = _resolve_feature_extractor_class(fe_type)
+        if fe_cls is not None:
+            try:
+                feature_extractor = fe_cls(**fe_config)
+                logger.debug("Created feature_extractor %s from %s", fe_type, path)
+            except Exception as e:
+                logger.warning("Failed to create feature_extractor %s: %s", fe_type, e)
     pil_cls = _resolve_pil_image_processor_class(ip_type, IMAGE_PROCESSOR_MAPPING_NAMES)
     if pil_cls is None:
         raise ImportError(
@@ -276,7 +404,11 @@ def _build_processor_via_pil_image_processor(cls, path, **kwargs):
     except (ImportError, AttributeError):
         pass
 
-    return cls(image_processor=image_processor, tokenizer=tokenizer)
+    processor_kwargs = {"image_processor": image_processor, "tokenizer": tokenizer}
+    if feature_extractor is not None:
+        processor_kwargs["feature_extractor"] = feature_extractor
+
+    return cls(**processor_kwargs)
 
 
 def _resolve_pil_image_processor_class(ip_type, mapping_names):
@@ -298,6 +430,37 @@ def _resolve_pil_image_processor_class(ip_type, mapping_names):
         candidate = getattr(mod, pil_name, None)
         if candidate is not None and not getattr(candidate, "is_dummy", False):
             return candidate
+    return None
+
+
+# Mapping from feature_extractor_type to (module, class) locations in mlx_vlm
+_FEATURE_EXTRACTOR_MAP = {
+    "Gemma4UnifiedAudioFeatureExtractor": (
+        "mlx_vlm.models.gemma4_unified.processing_gemma4_unified",
+        "Gemma4UnifiedAudioFeatureExtractor",
+    ),
+    "Gemma4AudioFeatureExtractor": (
+        "mlx_vlm.models.gemma4.audio_feature_extractor",
+        "Gemma4AudioFeatureExtractor",
+    ),
+}
+
+
+def _resolve_feature_extractor_class(fe_type: str):
+    """Resolve a feature extractor class by its ``feature_extractor_type`` string.
+
+    Returns the class object, or None if not found.
+    """
+    import importlib
+
+    if fe_type in _FEATURE_EXTRACTOR_MAP:
+        mod_name, cls_name = _FEATURE_EXTRACTOR_MAP[fe_type]
+        try:
+            mod = importlib.import_module(mod_name)
+            return getattr(mod, cls_name, None)
+        except ImportError:
+            return None
+
     return None
 
 
@@ -408,8 +571,261 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         _vu.load_config = original
 
 
+def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
+    """Return True when the first safetensors shard declares ``format=mlx``."""
+    import safetensors
+
+    try:
+        weight_files = sorted(
+            sf
+            for sf in model_dir.glob("*.safetensors")
+            if not sf.name.endswith("consolidated.safetensors")
+        )
+    except Exception:
+        return False
+    if not weight_files:
+        return False
+
+    try:
+        with safetensors.safe_open(str(weight_files[0]), framework="np") as f:
+            metadata = f.metadata()
+    except Exception:
+        return False
+    return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+
+@contextlib.contextmanager
+def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
+    """Drop Gemma4 shared-KV extra weights for MLX-format VLM checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata is ``format=mlx``.
+    Gemma4 E2B/E4B MLX checkpoints still ship K/V tensors for shared-KV layers,
+    but the mlx-vlm model tree intentionally omits those modules.  If the
+    extras reach strict ``load_weights``, VLM loading fails and oMLX falls back
+    to text-only LLM.  Scope the fix to Gemma4 MLX-format models whose config
+    declares shared-KV layers; 26B/31B Gemma4 models have zero shared-KV layers
+    and remain no-op.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        yield
+        return
+
+    if config.get("model_type") != "gemma4":
+        yield
+        return
+    if text_config.get("model_type") != "gemma4_text":
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    try:
+        num_layers = int(text_config.get("num_hidden_layers") or 0)
+        num_shared = int(text_config.get("num_kv_shared_layers") or 0)
+    except (TypeError, ValueError):
+        yield
+        return
+    if num_layers <= 0 or num_shared <= 0 or num_shared >= num_layers:
+        yield
+        return
+
+    first_shared = num_layers - num_shared
+    drop_modules = {"k_proj", "v_proj", "k_norm", "v_norm"}
+    layer_prefix = "language_model.model.layers."
+
+    def _is_shared_kv_extra(key: str) -> bool:
+        if not key.startswith(layer_prefix):
+            return False
+        parts = key[len(layer_prefix) :].split(".")
+        if len(parts) < 4 or parts[1] != "self_attn":
+            return False
+        try:
+            layer_idx = int(parts[0])
+        except ValueError:
+            return False
+        return first_shared <= layer_idx < num_layers and parts[2] in drop_modules
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    dropped = 0
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal dropped
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        filtered = []
+        local_dropped = 0
+        for item in weights_items:
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) >= 2
+                and isinstance(item[0], str)
+                and _is_shared_kv_extra(item[0])
+            ):
+                local_dropped += 1
+                continue
+            filtered.append(item)
+        dropped += local_dropped
+        return original_load_weights(self, filtered, *args, **kwargs)
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
+        if dropped:
+            logger.info(
+                "Dropped %d Gemma4 shared-KV extra weights for MLX-format "
+                "checkpoint %s",
+                dropped,
+                model_dir.name,
+            )
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
+
+
+@contextlib.contextmanager
+def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
+    """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
+
+    mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
+    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
+    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
+    the unpacked MoE layout, so strict loading sees those tensors as unknown.
+    Hide only the safetensors ``format=mlx`` metadata during this load so the
+    upstream sanitize path runs before quantization and load_weights.
+    """
+    if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
+        yield
+        return
+
+    from ..patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    import safetensors
+    from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
+
+    original_safe_open = safetensors.safe_open
+    original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
+        pack_shared = (
+            args.n_shared_experts == 1
+            and args.shared_intermediate_size == args.intermediate_size
+        )
+        if not pack_shared:
+            return 0
+
+        packed = 0
+        for layer_idx in range(args.num_hidden_layers):
+            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+            for suffix in ("weight", "scales", "biases", "bias"):
+                gate_key = f"{prefix}.switch_mlp.gate_proj.{suffix}"
+                up_key = f"{prefix}.switch_mlp.up_proj.{suffix}"
+                shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
+                shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
+                gate_up_key = f"{prefix}.switch_mlp.gate_up_proj.{suffix}"
+
+                if (
+                    gate_up_key not in weights
+                    and gate_key in weights
+                    and up_key in weights
+                    and shared_gate_key in weights
+                    and shared_up_key in weights
+                ):
+                    gate = weights.pop(gate_key)
+                    up = weights.pop(up_key)
+                    shared_gate = weights.pop(shared_gate_key)
+                    shared_up = weights.pop(shared_up_key)
+                    routed_gate_up = mx.concatenate([gate, up], axis=1)
+                    shared_gate_up = mx.expand_dims(
+                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
+                    )
+                    weights[gate_up_key] = mx.concatenate(
+                        [routed_gate_up, shared_gate_up], axis=0
+                    )
+                    packed += 1
+
+                down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
+                packed_down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                if down_key in weights and shared_down_key in weights:
+                    down = weights.pop(down_key)
+                    shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
+                    weights[packed_down_key] = mx.concatenate(
+                        [down, shared_down], axis=0
+                    )
+                    packed += 1
+        return packed
+
+    def _patched_sanitize_moe_weights(weights: dict, args: Any) -> None:
+        original_sanitize_moe_weights(weights, args)
+        packed = _pack_mlx_unpacked_moe_weights(weights, args)
+        if packed:
+            logger.info(
+                "MiniMax M3 MLX-format MoE sanitize packed %d tensor groups",
+                packed,
+            )
+
+    safetensors.safe_open = _patched_safe_open
+    _minimax_m3_vl._sanitize_moe_weights = _patched_sanitize_moe_weights
+    try:
+        logger.info(
+            "MiniMax M3 MLX-format MoE sanitize patch active for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+        _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
 
 
 @contextlib.contextmanager
@@ -507,6 +923,191 @@ _QWEN_VISION_MODELS = {
 }
 
 
+# Conservative fallback upper bound on image-placeholder tokens per image
+# content part. Used by ``preflight_chat`` only when the actual
+# ``max_pixels`` cannot be derived from the loaded processor config.
+# Qwen-VL / Gemma-Vision typically expand each image to 256–1280 tokens
+# at default settings, but a deployment that lifts ``max_pixels`` can
+# legitimately exceed this — relying on a hard-coded 1280 in that case
+# silently under-counts and re-opens the panic-prone MLX prefill path.
+# Prefer ``_derive_image_token_upper_bound(processor)`` when the
+# processor is loaded.
+_IMAGE_TOKEN_UPPER_BOUND_FALLBACK = 1280
+
+
+def _derive_image_token_upper_bound(processor: Any) -> int:
+    """Derive the per-image token upper bound from the processor config.
+
+    Qwen-style image processors expose ``max_pixels`` (an *area*) and
+    pack pixels into ``patch_size`` × ``patch_size`` patches, then merge
+    ``merge_size`` × ``merge_size`` patches into one model token. The
+    per-image token bound is therefore::
+
+        max_tokens = max_pixels / (patch_size**2 * merge_size**2)
+
+    Falls back to the conservative module-level constant when the
+    processor doesn't expose the expected attributes (other model
+    families) so we never *under*-count.
+    """
+    if processor is None:
+        return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+    ip = getattr(processor, "image_processor", None) or processor
+    max_pixels = getattr(ip, "max_pixels", None)
+    patch_size = getattr(ip, "patch_size", None)
+    merge_size = getattr(ip, "merge_size", None)
+    if (
+        isinstance(max_pixels, int)
+        and max_pixels > 0
+        and isinstance(patch_size, int)
+        and patch_size > 0
+        and isinstance(merge_size, int)
+        and merge_size > 0
+    ):
+        derived = max_pixels // (patch_size * patch_size * merge_size * merge_size)
+        # Never go *below* the conservative fallback — a model whose
+        # processor reports a tiny max_pixels (e.g. test fixtures) should
+        # not weaken the guard.
+        return max(derived, _IMAGE_TOKEN_UPPER_BOUND_FALLBACK)
+    return _IMAGE_TOKEN_UPPER_BOUND_FALLBACK
+
+
+def _count_image_tokens(
+    messages: list[dict[str, Any]],
+    per_image_upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+) -> int:
+    """Count image-bearing content parts in OpenAI-style messages and
+    return the conservative token-budget contribution.
+
+    Supports both the OpenAI ``image_url`` / ``image`` part types and the
+    Anthropic ``image`` block shape that gets adapted into the same
+    message-list before reaching the engine layer.
+    """
+    image_parts = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype in ("image_url", "image", "input_image"):
+                image_parts += 1
+    return image_parts * per_image_upper_bound
+
+
+def _smart_resize_tokens(
+    h: int, w: int, patch_size: int, merge_size: int,
+    min_pixels: int, max_pixels: int,
+) -> int:
+    """Real merged-token count for one image of pixel size (h, w), mirroring
+    the Qwen image processor's ``smart_resize`` -> grid_thw ->
+    ``(t*h*w)//merge**2`` pipeline (t=1 for a still image). Pure arithmetic;
+    no pixel decode. This is the *exact* count the real chat path produces, so
+    it never under-counts the prefill-memory guard."""
+    import math
+
+    factor = patch_size * merge_size
+    if h <= 0 or w <= 0:
+        return 0
+    h_bar = round(h / factor) * factor
+    w_bar = round(w / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((h * w) / max_pixels)
+        h_bar = max(factor, math.floor(h / beta / factor) * factor)
+        w_bar = max(factor, math.floor(w / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (h * w))
+        h_bar = math.ceil(h * beta / factor) * factor
+        w_bar = math.ceil(w * beta / factor) * factor
+    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
+
+
+def _read_image_dims(part: dict) -> Optional[tuple]:
+    """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
+
+    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
+    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
+    anything that would need a network fetch or that fails to parse, so callers
+    fall back to the conservative per-image upper bound."""
+    import base64 as _b64
+    import binascii
+    import io as _io
+
+    from PIL import Image as _Image
+
+    obj = part.get("image_url")
+    if obj is None:
+        obj = part.get("input_image") or part.get("image")
+    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    if not isinstance(url, str) or not url:
+        return None
+
+    raw = None
+    s = url.strip()
+    if s.startswith("data:"):
+        _, sep, encoded = s.partition(",")
+        if sep == ",":
+            try:
+                raw = _b64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return None
+    elif s.startswith(("http://", "https://")):
+        return None  # no network in preflight
+    else:
+        try:
+            raw = _b64.b64decode(s, validate=True)
+        except (binascii.Error, ValueError):
+            raw = None  # not base64 -> treat as path below
+
+    try:
+        if raw is not None:
+            with _Image.open(_io.BytesIO(raw)) as im:
+                return im.size  # (width, height)
+        with _Image.open(s) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _count_image_tokens_real(
+    messages: list[dict[str, Any]],
+    processor: Any,
+    *,
+    upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+) -> int:
+    """Sum the *real* per-image token contribution from actual image
+    dimensions, instead of charging every image the model's ``max_pixels``
+    ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
+    be read decode-free or the processor isn't a Qwen-style one, so the guard
+    still never under-counts."""
+    ip = getattr(processor, "image_processor", None) or processor
+    ps = getattr(ip, "patch_size", None)
+    ms = getattr(ip, "merge_size", None)
+    minp = getattr(ip, "min_pixels", None)
+    maxp = getattr(ip, "max_pixels", None)
+    qwen_ok = all(
+        isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp)
+    )
+
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image_url", "image", "input_image"):
+                continue
+            wh = _read_image_dims(part) if qwen_ok else None
+            if wh is None:
+                total += upper_bound
+            else:
+                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+    return total
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -524,6 +1125,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        prefill_eviction_callback: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -531,6 +1133,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._prefill_eviction_callback = prefill_eviction_callback
 
         self._vlm_model = None
         self._processor = None
@@ -545,6 +1148,32 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        self._diffusion_family: str | None = None
+        self._diffusion_lock = asyncio.Lock()
+        self._diffusion_active_requests = 0
+        self._diffusion_cancel_events: set[threading.Event] = set()
+
+    async def _preflight_or_raise_with_eviction(
+        self,
+        scheduler: Any,
+        *,
+        num_prompt_tokens: int,
+        request_id: str | None,
+    ) -> None:
+        eviction_request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        if eviction_request is not None and self._prefill_eviction_callback is not None:
+            logger.info(
+                "Running preflight LRU eviction for request %s",
+                eviction_request.request_id,
+            )
+            await self._prefill_eviction_callback(eviction_request)
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
 
     @property
     def model_name(self) -> str:
@@ -556,8 +1185,9 @@ class VLMBatchedEngine(BaseEngine):
 
     @property
     def model_type(self) -> str | None:
-        if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
-            config = self._vlm_model.config
+        vlm_model = getattr(self, "_vlm_model", None)
+        if vlm_model is not None and hasattr(vlm_model, "config"):
+            config = vlm_model.config
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
@@ -578,8 +1208,31 @@ class VLMBatchedEngine(BaseEngine):
         return (self.model_type or "") in OCR_MODEL_TYPES
 
     @property
+    def is_diffusion_model(self) -> bool:
+        return getattr(self, "_diffusion_family", None) == "block"
+
+    @property
+    def supports_tool_calling(self) -> bool:
+        """True when a tool parser was injected into the tokenizer.
+
+        Tool calling is prompt-driven plus output parsing — it does not
+        require grammar-constrained decoding, so it works on any lane
+        (autoregressive or diffusion) whose chat template matched a
+        parser in ``_inject_tool_calling``.
+        """
+        return bool(getattr(self._tokenizer, "has_tool_calling", False))
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this VLM model."""
+        if self.is_diffusion_model:
+            # The diffusion lane denoises canvas positions in parallel —
+            # there is no sequential logit stream to mask, so compiled
+            # grammars cannot be enforced. Returning None routes
+            # response_format through the existing prompt-injection
+            # fallback (with the #1241 Warning header) instead of
+            # compiling a grammar that the lane would have to reject.
+            return None
         if self._grammar_compiler is not None:
             return self._grammar_compiler
         if self._grammar_compiler_init_attempted:
@@ -597,10 +1250,12 @@ class VLMBatchedEngine(BaseEngine):
 
             method = get_install_method()
             if method == "dmg":
-                logger.info(
-                    "Structured output is not available in the DMG version "
-                    "(xgrammar requires torch which significantly increases app size). "
-                    "Use the pip or Homebrew version for structured output support."
+                logger.warning(
+                    "GrammarCompiler initialization failed for %s on the "
+                    "DMG build. The bundle ships xgrammar against a torch "
+                    "stub; this usually means the bundled xgrammar / tvm-"
+                    "ffi version drifted past what the stub covers.",
+                    self._model_name,
                 )
             elif method == "homebrew":
                 logger.info(
@@ -623,6 +1278,29 @@ class VLMBatchedEngine(BaseEngine):
             return self._engine.engine.scheduler.block_aware_cache is not None
         except AttributeError:
             return False
+
+    def _detect_diffusion_family(self) -> str | None:
+        """Return the mlx-vlm diffusion generation family for loaded models."""
+        try:
+            from mlx_vlm.generate.diffusion import diffusion_generation_family
+
+            family = diffusion_generation_family(self._vlm_model)
+            if family == "block":
+                return family
+            if family is not None:
+                logger.warning(
+                    "Unsupported diffusion generation family for %s: %s",
+                    self._model_name,
+                    family,
+                )
+            return None
+        except Exception as e:
+            logger.debug("mlx-vlm diffusion family detection skipped: %s", e)
+
+        config = getattr(self._vlm_model, "config", None)
+        if getattr(config, "canvas_length", None) is not None:
+            return "block"
+        return None
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
@@ -684,6 +1362,8 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
+                _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
@@ -693,6 +1373,12 @@ class VLMBatchedEngine(BaseEngine):
                 if custom_loaded is not None:
                     model, processor = custom_loaded
                     return model, processor
+
+                if _read_config_model_type(self._model_name) == COHERE2_MOE_MODEL_TYPE:
+                    return _load_cohere2_moe_text_model(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
                 return vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
@@ -706,27 +1392,39 @@ class VLMBatchedEngine(BaseEngine):
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
+
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
 
         _fix_processor_none_pixels(self._processor)
+        self._diffusion_family = self._detect_diffusion_family()
+        if self.is_diffusion_model:
+            logger.info(
+                "Diffusion VLM detected; using serial diffusion lane for %s",
+                self._model_name,
+            )
 
         # Initialize vision feature cache
         vision_ssd_dir = None
-        if self._scheduler_config and getattr(
-            self._scheduler_config, "paged_ssd_cache_dir", None
-        ):
-            vision_ssd_dir = (
-                Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+        if not self.is_diffusion_model:
+            if self._scheduler_config and getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            ):
+                vision_ssd_dir = (
+                    Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
+                )
+            self._vision_cache = VisionFeatureSSDCache(
+                cache_dir=vision_ssd_dir,
+                max_memory_entries=20,
             )
-        self._vision_cache = VisionFeatureSSDCache(
-            cache_dir=vision_ssd_dir,
-            max_memory_entries=20,
-        )
-        logger.info(
-            "Vision feature cache enabled (SSD: %s)", vision_ssd_dir or "disabled"
-        )
+            logger.info(
+                "Vision feature cache enabled (SSD: %s)",
+                vision_ssd_dir or "disabled",
+            )
+        else:
+            self._vision_cache = None
+            self._vision_cache_enabled = False
 
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
@@ -740,19 +1438,16 @@ class VLMBatchedEngine(BaseEngine):
         else:
             self._tokenizer = copy.deepcopy(self._processor)
 
+        if self.is_diffusion_model:
+            self._inject_tool_calling(self._tokenizer)
+            self._loaded = True
+            logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
+            return
+
         # Create VLM model adapter wrapping language_model.
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
-
-        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
-        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
-        # Class-level monkey-patch — no-op when target classes are absent
-        # or already fixed upstream.
-        apply_gated_delta_advance_patch()
-        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
-        # inputs. Preserves mRoPE for genuine multimodal positions.
-        apply_qwen3_5_attention_patch()
 
         # Create scheduler config
         scheduler_config = (
@@ -766,6 +1461,7 @@ class VLMBatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            prefill_eviction_callback=self._prefill_eviction_callback,
         )
 
         # Create engine with adapter as the "model"
@@ -779,6 +1475,7 @@ class VLMBatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         # TurboQuant KV cache
+        scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
@@ -788,11 +1485,13 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
-                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
+                scheduler._set_model_info_for_monitor()
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+        scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -807,9 +1506,11 @@ class VLMBatchedEngine(BaseEngine):
                     from mlx_lm import load as mlx_lm_load
 
                     from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
+                        from ..utils.model_loading import materialize_lazy_state
 
                         was_mtp = False
                         try:
@@ -826,8 +1527,26 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             if custom_loaded is not None:
                                 draft_model, _ = custom_loaded
-                                return draft_model
-                            draft_model, _ = mlx_lm_load(specprefill_draft)
+                            else:
+                                draft_tokenizer_config = get_tokenizer_config(
+                                    specprefill_draft,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
+                                draft_model, _ = mlx_lm_load(
+                                    specprefill_draft,
+                                    tokenizer_config=draft_tokenizer_config,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
+                            # Materialize frozen buffers (RoPE freqs, etc.)
+                            # on the loader thread. mlx_lm.load only does
+                            # mx.eval(model.parameters()) and leaves siblings
+                            # lazy bound to this thread's stream. Without
+                            # this, the first score_tokens() call from
+                            # Scheduler.step on the per-engine executor
+                            # thread raises "no Stream(gpu, X) in current
+                            # thread". Same root cause and fix as e93c408
+                            # for the VLM MTP drafter.
+                            materialize_lazy_state(draft_model)
                             return draft_model
                         finally:
                             set_mtp_active(was_mtp)
@@ -851,11 +1570,12 @@ class VLMBatchedEngine(BaseEngine):
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
     def set_vlm_mtp_drafter(self, drafter: Any) -> None:
-        """Attach a loaded gemma4_assistant drafter for VLM MTP decoding.
+        """Attach a loaded MTP drafter for VLM MTP decoding.
 
         Passes the drafter (and the configured draft-block size) down to
         the scheduler so eligible requests get routed to mlx-vlm's MTP
-        round loop at decode time.
+        round loop at decode time.  Supports gemma4_assistant and
+        qwen3_5_mtp drafter types.
         """
         self._vlm_mtp_drafter = drafter
         block_size = None
@@ -888,12 +1608,17 @@ class VLMBatchedEngine(BaseEngine):
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None
+        for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
+            cancel_event.set()
+        self._diffusion_cancel_events = set()
         self._engine = None
         self._vlm_model = None
         self._processor = None
         self._adapter = None
         self._tokenizer = None
         self._vlm_mtp_drafter = None
+        self._diffusion_family = None
+        self._diffusion_active_requests = 0
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
 
@@ -986,8 +1711,9 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         num_images: int,
+        num_audios: int = 0,
     ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
-        """Format VLM messages with image tokens on image-bearing user turns."""
+        """Format VLM messages with image/audio tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
         model_type = self.model_type or getattr(
@@ -997,14 +1723,23 @@ class VLMBatchedEngine(BaseEngine):
             raise ValueError("Missing VLM model_type for chat template formatting")
 
         image_part_types = {"image", "image_url", "input_image"}
+        audio_part_types = {"input_audio"}
         has_explicit_images = any(
             isinstance(msg, dict)
             and self._count_content_parts(msg.get("content"), image_part_types) > 0
             for msg in messages
         )
 
+        has_explicit_audio = any(
+            isinstance(msg, dict)
+            and self._count_content_parts(msg.get("content"), audio_part_types) > 0
+            for msg in messages
+        )
+
         remaining_images = num_images
+        remaining_audios = num_audios
         assigned_fallback_images = False
+        assigned_fallback_audios = False
         formatted_messages: list[dict[str, Any]] = []
         image_message_ranges: list[tuple[int, int]] = []
 
@@ -1017,9 +1752,13 @@ class VLMBatchedEngine(BaseEngine):
             content = extract_text_from_content(raw_content)
 
             msg_num_images = 0
+            msg_num_audios = 0
             if role == "user":
                 explicit_images = self._count_content_parts(
                     raw_content, image_part_types
+                )
+                explicit_audios = self._count_content_parts(
+                    raw_content, audio_part_types
                 )
                 if explicit_images > 0 and remaining_images > 0:
                     msg_num_images = min(explicit_images, remaining_images)
@@ -1032,6 +1771,18 @@ class VLMBatchedEngine(BaseEngine):
                     msg_num_images = remaining_images
                     remaining_images = 0
                     assigned_fallback_images = True
+
+                if explicit_audios > 0 and remaining_audios > 0:
+                    msg_num_audios = min(explicit_audios, remaining_audios)
+                    remaining_audios -= msg_num_audios
+                elif (
+                    not has_explicit_audio
+                    and remaining_audios > 0
+                    and not assigned_fallback_audios
+                ):
+                    msg_num_audios = remaining_audios
+                    remaining_audios = 0
+                    assigned_fallback_audios = True
 
             if msg_num_images > 0:
                 image_message_ranges.append((idx, msg_num_images))
@@ -1057,9 +1808,9 @@ class VLMBatchedEngine(BaseEngine):
                     content,
                     role,
                     skip_image_token=role != "user" or msg_num_images == 0,
-                    skip_audio_token=True,
+                    skip_audio_token=role != "user" or msg_num_audios == 0,
                     num_images=msg_num_images,
-                    num_audios=0,
+                    num_audios=msg_num_audios,
                 )
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
@@ -1096,6 +1847,61 @@ class VLMBatchedEngine(BaseEngine):
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
+            image_grid_thw = extra_model_inputs.get("image_grid_thw")
+            image_position_ids = extra_model_inputs.get("image_position_ids")
+            if image_grid_thw is not None or image_position_ids is not None:
+                try:
+                    signature = inspect.signature(model.encode_image)
+                except (TypeError, ValueError):
+                    signature = None
+
+                if signature is None:
+                    try:
+                        if image_grid_thw is not None:
+                            return model.encode_image(
+                                pixel_values, image_grid_thw=image_grid_thw
+                            )
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+                    except TypeError:
+                        logger.debug(
+                            "encode_image rejected image metadata; "
+                            "retrying without it",
+                            exc_info=True,
+                        )
+                else:
+                    parameters = signature.parameters
+                    accepts_kwargs = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in parameters.values()
+                    )
+                    if image_grid_thw is not None and (
+                        "image_grid_thw" in parameters or accepts_kwargs
+                    ):
+                        return model.encode_image(
+                            pixel_values, image_grid_thw=image_grid_thw
+                        )
+
+                    if image_position_ids is not None and (
+                        "image_position_ids" in parameters or accepts_kwargs
+                    ):
+                        return model.encode_image(
+                            pixel_values, image_position_ids=image_position_ids
+                        )
+
+                    positional_parameters = [
+                        p
+                        for p in parameters.values()
+                        if p.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+                    if image_position_ids is not None and len(positional_parameters) >= 2:
+                        return model.encode_image(pixel_values, image_position_ids)
+
             return model.encode_image(pixel_values)
 
         # Strategy 2: qwen-style (vision_tower + grid_thw)
@@ -1166,6 +1972,34 @@ class VLMBatchedEngine(BaseEngine):
         if features.ndim >= 3 and features.shape[0] == num_images:
             return [features[i : i + 1] for i in range(num_images)]
 
+        # Some mlx-vlm models, including Gemma4 unified, return compacted flat
+        # features after applying per-image position IDs.
+        if features.ndim == 2:
+            soft_tokens = self._as_int_list(
+                extra_model_inputs.get("num_soft_tokens_per_image")
+            )
+            if soft_tokens is not None:
+                if len(soft_tokens) != num_images:
+                    logger.debug(
+                        "Per-image soft token count mismatch: expected %d entries, got %d",
+                        num_images,
+                        len(soft_tokens),
+                    )
+                    return None
+                if sum(soft_tokens) != features.shape[0]:
+                    logger.debug(
+                        "Per-image soft token total mismatch: expected %d, got %d",
+                        sum(soft_tokens),
+                        features.shape[0],
+                    )
+                    return None
+                result = []
+                offset = 0
+                for count in soft_tokens:
+                    result.append(features[offset : offset + count])
+                    offset += count
+                return result
+
         # Qwen: flat (total_merged_tokens, dim) → split using grid_thw
         if model_type in _QWEN_VISION_MODELS and features.ndim == 2:
             grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -1195,10 +2029,100 @@ class VLMBatchedEngine(BaseEngine):
 
         return None
 
+    @staticmethod
+    def _as_int_list(value: Any) -> Optional[List[int]]:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (int, float)):
+            return [int(value)]
+        if not isinstance(value, (list, tuple)):
+            return None
+
+        result: List[int] = []
+        for item in value:
+            if hasattr(item, "tolist"):
+                item = item.tolist()
+            if isinstance(item, (list, tuple)):
+                if len(item) != 1:
+                    return None
+                item = item[0]
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return result
+
+    @staticmethod
+    def _vision_feature_token_count(features: Any) -> Optional[int]:
+        if isinstance(features, (list, tuple)):
+            total = 0
+            for feature in features:
+                count = VLMBatchedEngine._vision_feature_token_count(feature)
+                if count is None:
+                    return None
+                total += count
+            return total
+
+        shape = getattr(features, "shape", None)
+        if not shape:
+            return None
+        if len(shape) == 1:
+            return 1
+
+        count = 1
+        for dim in shape[:-1]:
+            count *= int(dim)
+        return count
+
+    def _image_token_count(self, input_ids: Any) -> Optional[int]:
+        config = getattr(self._vlm_model, "config", None)
+        image_token_id = getattr(config, "image_token_id", None)
+        if image_token_id is None:
+            return None
+
+        try:
+            ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+            return int(mx.sum(ids == int(image_token_id)).item())
+        except Exception:
+            logger.debug("Failed to count VLM image tokens", exc_info=True)
+            return None
+
+    def _vision_features_match_image_tokens(
+        self, features: Any, image_token_count: Optional[int]
+    ) -> bool:
+        if image_token_count is None:
+            return True
+
+        feature_token_count = self._vision_feature_token_count(features)
+        if feature_token_count is None:
+            return True
+
+        if feature_token_count == image_token_count:
+            return True
+
+        logger.debug(
+            "Ignoring cached vision features: feature_tokens=%d, image_tokens=%d",
+            feature_token_count,
+            image_token_count,
+        )
+        return False
+
+    @staticmethod
+    def _language_prompt_kwargs(extra_model_inputs: dict[str, Any]) -> dict[str, Any]:
+        """Return processor kwargs that must survive into language prefill."""
+        return {
+            key: extra_model_inputs[key]
+            for key in VLM_LANGUAGE_PROMPT_KWARGS
+            if extra_model_inputs.get(key) is not None
+        }
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
         images: list[Any],
+        audio: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
     ) -> Tuple[
@@ -1217,8 +2141,9 @@ class VLMBatchedEngine(BaseEngine):
         4. Compute image hash for prefix cache
 
         Args:
-            messages: Chat messages (text-only, images already extracted)
+            messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
+            audio: List of audio data (BytesIO, file paths, or numpy arrays)
 
         Returns:
             Tuple of (
@@ -1238,11 +2163,34 @@ class VLMBatchedEngine(BaseEngine):
               cumulative image hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
 
         num_images = len(images)
-        model_type = self.model_type or ""
+        num_audios = len(audio) if audio else 0
 
+        model_type = self.model_type or ""
+        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+            raise InvalidRequestError(
+                "Cohere2 MoE is a text-only model and does not support "
+                "image or audio input.",
+                field="messages",
+            )
+
+        # Normalize audio to numpy float32 arrays expected by processor.
+        # extract_images_from_messages produces BytesIO / file-path strings, but
+        # the processor's __call__ expects numpy arrays or (array, sample_rate)
+        # tuples. load_audio handles all three source types.
+        if audio:
+            if any(not isinstance(a, tuple) for a in audio):
+                from ..patches.mlx_audio_compat import (
+                    ensure_mlx_audio_resample_export,
+                )
+
+                ensure_mlx_audio_resample_export()
+            audio = [
+                _load_audio(a, 16000) if not isinstance(a, tuple) else a for a in audio
+            ]
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
             raise ValueError(
@@ -1255,7 +2203,9 @@ class VLMBatchedEngine(BaseEngine):
         # receive image tokens, regardless of conversation history shape.
         try:
             formatted_messages, image_message_ranges = (
-                self._format_messages_for_vlm_template(messages, num_images=num_images)
+                self._format_messages_for_vlm_template(
+                    messages, num_images=num_images, num_audios=num_audios
+                )
             )
         except Exception as e:
             logger.debug(
@@ -1268,6 +2218,7 @@ class VLMBatchedEngine(BaseEngine):
                 self._vlm_model.config,
                 messages,
                 num_images=num_images,
+                num_audios=num_audios,
                 return_messages=True,
             )
             image_message_ranges = []
@@ -1294,6 +2245,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         # Use processor or its tokenizer for chat template application
         template_target = self._processor
@@ -1333,10 +2285,11 @@ class VLMBatchedEngine(BaseEngine):
             else:
                 raise
 
-        # Tokenize text and preprocess images
+        # Tokenize text and preprocess images and audio
         inputs = prepare_inputs(
             self._processor,
             images=images if images else None,
+            audio=audio if audio else None,
             prompts=[prompt] if isinstance(prompt, str) else prompt,
         )
 
@@ -1358,6 +2311,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
+                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -1419,15 +2373,27 @@ class VLMBatchedEngine(BaseEngine):
             and v is not None
         }
 
-        if pixel_values is not None and num_images > 0:
-            # Compute whole-request image hash (used for KV prefix cache keying)
-            image_hash = compute_image_hash(images)
+        # Check for any multimodal inputs: images or audio
+        has_audio = "input_features" in extra_model_inputs
+        has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
 
-            # Build call kwargs from extra_model_inputs
+        if has_multimodal:
+            # Build call kwargs from extra_model_inputs (includes input_features
+            # for audio, image_grid_thw, etc.)
             call_kwargs = dict(extra_model_inputs)
 
-            # Try per-image vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled:
+            # Image-specific: compute hash and try vision feature cache
+            image_hash = None
+            image_token_count = None
+            if num_images > 0:
+                image_hash = compute_image_hash(images)
+                image_token_count = self._image_token_count(input_ids)
+
+            if (
+                num_images > 0
+                and self._vision_cache is not None
+                and self._vision_cache_enabled
+            ):
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
@@ -1438,31 +2404,44 @@ class VLMBatchedEngine(BaseEngine):
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
-                    cached_whole = self._vision_cache.get(
-                        image_hash, self._model_name
-                    )
+                    cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
+                used_cached_features = False
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
-                    call_kwargs["cached_image_features"] = combined
-                    logger.debug(
-                        "Vision feature cache hit (per-image): all %d images cached",
-                        num_images,
-                    )
+                    if self._vision_features_match_image_tokens(
+                        combined, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = combined
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (per-image): all %d images cached",
+                            num_images,
+                        )
                 elif cached_whole is not None:
-                    call_kwargs["cached_image_features"] = cached_whole
-                    logger.debug(
-                        "Vision feature cache hit (whole-request): %s",
-                        image_hash[:16],
-                    )
-                else:
+                    if self._vision_features_match_image_tokens(
+                        cached_whole, image_token_count
+                    ):
+                        call_kwargs["cached_image_features"] = cached_whole
+                        used_cached_features = True
+                        logger.debug(
+                            "Vision feature cache hit (whole-request): %s",
+                            image_hash[:16],
+                        )
+
+                if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
                             pixel_values, extra_model_inputs
                         )
-                        if features is not None:
+                        if (
+                            features is not None
+                            and self._vision_features_match_image_tokens(
+                                features, image_token_count
+                            )
+                        ):
                             mx.eval(features)
                             call_kwargs["cached_image_features"] = features
                             # Split and cache each image individually
@@ -1522,6 +2501,8 @@ class VLMBatchedEngine(BaseEngine):
                 for k, v in feat_dict.items():
                     if k != "inputs_embeds" and v is not None:
                         extra_kwargs[k] = v
+            for k, v in self._language_prompt_kwargs(extra_model_inputs).items():
+                extra_kwargs.setdefault(k, v)
 
             # Capture per-request mRoPE state set by
             # get_input_embeddings(). The language model stores these as
@@ -1588,6 +2569,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
+            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -1623,6 +2605,33 @@ class VLMBatchedEngine(BaseEngine):
         """Generate a complete response (non-streaming)."""
         if not self._loaded:
             await self.start()
+
+        if self.is_diffusion_model:
+            full_text = ""
+            last_output: GenerationOutput | None = None
+            async for output in self.stream_generate(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                **kwargs,
+            ):
+                full_text += output.new_text
+                last_output = output
+            if last_output is None:
+                return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
+            return GenerationOutput(
+                text=full_text,
+                prompt_tokens=last_output.prompt_tokens,
+                completion_tokens=last_output.completion_tokens,
+                finish_reason=last_output.finish_reason,
+                cached_tokens=0,
+            )
 
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
@@ -1693,6 +2702,39 @@ class VLMBatchedEngine(BaseEngine):
         """Stream generation token by token."""
         if not self._loaded:
             await self.start()
+
+        if self.is_diffusion_model:
+            if (
+                vlm_inputs_embeds is not None
+                or vlm_extra_kwargs is not None
+                or vlm_image_hash is not None
+                or vlm_cache_key_ranges is not None
+                or vlm_cache_key_start
+            ):
+                raise InvalidRequestError(
+                    "Precomputed VLM embeddings and cache metadata are not "
+                    "supported with diffusion models."
+                )
+            self._validate_diffusion_request(
+                stop=stop,
+                kwargs=kwargs,
+            )
+            loop = asyncio.get_running_loop()
+            from ..engine_core import get_mlx_executor
+
+            diffusion_inputs = await loop.run_in_executor(
+                get_mlx_executor(),
+                self._prepare_diffusion_inputs_from_prompt,
+                prompt,
+            )
+            async for output in self._stream_diffusion_inputs(
+                diffusion_inputs,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=kwargs.get("seed"),
+            ):
+                yield output
+            return
 
         # OCR models: add extra stop token IDs to prevent degeneration.
         # Sampling params (temperature, repetition_penalty, max_tokens) are
@@ -1792,6 +2834,33 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if self.is_diffusion_model:
+            full_text = ""
+            last_output: GenerationOutput | None = None
+            async for output in self.stream_chat(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            ):
+                full_text += output.new_text
+                last_output = output
+            if last_output is None:
+                return GenerationOutput(text="", prompt_tokens=0, completion_tokens=0)
+            return GenerationOutput(
+                text=full_text,
+                prompt_tokens=last_output.prompt_tokens,
+                completion_tokens=last_output.completion_tokens,
+                finish_reason=last_output.finish_reason,
+                cached_tokens=0,
+            )
+
         loop = asyncio.get_running_loop()
         (
             prompt,
@@ -1825,6 +2894,143 @@ class VLMBatchedEngine(BaseEngine):
             **kwargs,
         )
 
+    async def preflight_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for chat completions (VLM path).
+
+        The actual VLM prompt is built by ``_process_chat_messages`` →
+        ``_prepare_vision_inputs``, which expands each image content-part
+        into 256–1280 model-specific image-placeholder tokens before the
+        chat template runs. Doing that work here would require image
+        decoding + the heavy preprocessor pipeline; for preflight we only
+        need a conservative upper bound on the prompt size, so we instead:
+
+          1. Apply the *text-only* chat template (cheap).
+          2. Count its tokens.
+          3. Add a per-image upper-bound budget (``_IMAGE_TOKEN_UPPER_BOUND``)
+             for each image-bearing content part — over-counts somewhat
+             on small images (false-positive 400s for borderline-and-image
+             cases) but never under-counts, which is the property the
+             guard needs to stay safe against the Apple IOGPUFamily
+             panic path.
+
+        Tools (when supplied as Pydantic ``ToolDefinition`` objects by
+        direct API callers) must be converted to dict form for the
+        template — ``BatchedEngine.preflight_chat`` does this and we
+        mirror it here. Without conversion the template's ``TypeError``
+        retry path silently drops tools entirely, which not only
+        miscalibrates the token count but also bypasses the actual
+        tool-prompt rendering on the real chat path.
+
+        Raises ``PrefillMemoryExceededError`` if the conservative estimate
+        would exceed the configured memory ceiling. See
+        ``BatchedEngine.preflight_chat`` for the upstream rationale
+        (avoiding the ``StreamingResponse`` 200 commit so HTTP 400
+        actually reaches the client).
+        """
+        if not self._loaded:
+            await self.start()
+        if self.is_diffusion_model:
+            _, _, audio = extract_images_from_messages(messages)
+            self._validate_diffusion_request(
+                tools=tools,
+                audio=audio if audio else None,
+                stop=kwargs.get("stop"),
+                kwargs=kwargs,
+            )
+            return
+        template_tools = convert_tools_for_template(tools) if tools else None
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
+        # Strip image content-parts BEFORE templating. Modern HF chat
+        # templates (Qwen2.5-VL, Gemma-Vision, Llama-3.2-Vision) render
+        # ``image_url`` / ``image`` content parts as literal placeholder
+        # strings inline with the text; if we leave them in, the
+        # tokenized prompt already contains some image-placeholder
+        # tokens AND we then add the per-image budget on top — a double
+        # count that rejects borderline image-bearing prompts the real
+        # chat path would have handled. The real ``chat`` flow itself
+        # strips images first via ``extract_images_from_messages`` (see
+        # ``_process_chat_messages``), so mirroring that here keeps
+        # preflight and execution on the same template input.
+        text_messages, _, _ = extract_images_from_messages(messages)
+        prompt = self._apply_chat_template(
+            text_messages,
+            template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=partial,
+        )
+        # Tokenizer errors propagate as 500 today regardless of where they
+        # fire; the real chat path's add_request → tokenize call has no
+        # path-specific 400 handler. Don't introduce a NEW failure mode
+        # in preflight: skip the memory check on tokenizer error and let
+        # the real chat path surface the same error through the existing
+        # handler chain.
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
+                "%s; skipping prefill memory check, real chat path will "
+                "surface the error",
+                type(e).__name__,
+            )
+            return
+        # Count images from the ORIGINAL messages (the stripped
+        # ``text_messages`` no longer has the image content-parts).
+        num_tokens += _count_image_tokens_real(
+            messages,
+            getattr(self, "_processor", None),
+            upper_bound=_derive_image_token_upper_bound(
+                getattr(self, "_processor", None)
+            ),
+        )
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_chat")
+            return
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+        )
+
+    async def preflight_completion(
+        self,
+        prompt: str,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Early prefill memory check for plain /v1/completions calls (VLM)."""
+        if not self._loaded:
+            await self.start()
+        if self.is_diffusion_model:
+            self._validate_diffusion_request(
+                stop=kwargs.get("stop"),
+                kwargs=kwargs,
+            )
+            return
+        try:
+            num_tokens = len(self._tokenizer.encode(prompt))
+        except Exception as e:
+            logger.warning(
+                "VLMBatchedEngine.preflight_completion: tokenizer.encode "
+                "raised %s; skipping prefill memory check, real completion "
+                "path will surface the error",
+                type(e).__name__,
+            )
+            return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_completion")
+            return
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+        )
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -1841,6 +3047,31 @@ class VLMBatchedEngine(BaseEngine):
         """Stream chat completion with vision support."""
         if not self._loaded:
             await self.start()
+
+        if self.is_diffusion_model:
+            self._validate_diffusion_request(
+                tools=tools,
+                stop=kwargs.get("stop"),
+                kwargs=kwargs,
+            )
+            loop = asyncio.get_running_loop()
+            from ..engine_core import get_mlx_executor
+
+            diffusion_inputs = await loop.run_in_executor(
+                get_mlx_executor(),
+                self._process_diffusion_chat_messages,
+                messages,
+                tools,
+                dict(kwargs),
+            )
+            async for output in self._stream_diffusion_inputs(
+                diffusion_inputs,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=kwargs.get("seed"),
+            ):
+                yield output
+            return
 
         # Run vision encoding on the MLX executor thread to avoid blocking
         # the event loop.  Blocking here (synchronous mx.eval) prevents
@@ -1977,7 +3208,7 @@ class VLMBatchedEngine(BaseEngine):
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
         # Extract images from messages
-        text_messages, images = extract_images_from_messages(messages)
+        text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
@@ -1996,16 +3227,13 @@ class VLMBatchedEngine(BaseEngine):
         ) = self._prepare_vision_inputs(
             vlm_messages,
             images,
+            audio=audio if audio else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
         )
 
         if images:
             # Free Metal intermediates from vision encoding.
-            # Vision tower + projector produce large intermediate buffers
-            # that stay in the Metal cache pool until explicitly cleared.
-            # Without this, repeated VLM requests accumulate memory and
-            # eventually trigger ProcessMemoryEnforcer aborts (see #667).
             mx.synchronize()
             mx.clear_cache()
 
@@ -2017,6 +3245,412 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_start,
             image_cache_key_ranges,
         )
+
+    def _validate_diffusion_request(
+        self,
+        *,
+        tools: list[dict] | None = None,
+        audio: list | None = None,
+        stop: list[str] | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.is_diffusion_model:
+            return
+        kwargs = kwargs or {}
+        if tools and not self.supports_tool_calling:
+            raise InvalidRequestError(
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
+                field="tools",
+            )
+        if audio:
+            raise InvalidRequestError(
+                "Audio input is not supported with diffusion models.",
+                field="messages",
+            )
+        if stop:
+            raise InvalidRequestError(
+                "Custom stop sequences are not supported with diffusion models.",
+                field="stop",
+            )
+        if kwargs.get("compiled_grammar") is not None:
+            raise InvalidRequestError(
+                "Structured response_format is not supported with diffusion models.",
+                field="response_format",
+            )
+        if kwargs.get("specprefill") is True:
+            raise InvalidRequestError(
+                "SpecPrefill is not supported with diffusion models.",
+                field="specprefill",
+            )
+
+    def _diffusion_apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        images: list[Any],
+        chat_template_kwargs: dict[str, Any] | None = None,
+        tools: list[dict] | None = None,
+    ) -> str | list[int]:
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        num_images = len(images)
+        model_type = self.model_type or ""
+        if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
+            raise ValueError(
+                f"Model {model_type} does not support multi-image chat. "
+                f"Please use only 1 image."
+            )
+
+        try:
+            formatted_messages, _ = self._format_messages_for_vlm_template(
+                messages, num_images=num_images, num_audios=0
+            )
+        except Exception as e:
+            logger.debug(
+                "Falling back to mlx-vlm apply_chat_template for diffusion: %s",
+                e,
+            )
+            formatted_messages = apply_chat_template(
+                self._processor,
+                self._vlm_model.config,
+                messages,
+                num_images=num_images,
+                num_audios=0,
+                return_messages=True,
+            )
+
+        detect_and_strip_partial(formatted_messages)
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if self._enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self._enable_thinking
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+
+        template_target = self._processor
+        if not hasattr(template_target, "apply_chat_template"):
+            template_target = getattr(self._processor, "tokenizer", self._processor)
+        try:
+            return template_target.apply_chat_template(
+                formatted_messages, **template_kwargs
+            )
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            return template_target.apply_chat_template(
+                formatted_messages, **template_kwargs
+            )
+        except ValueError:
+            fallback = getattr(self._processor, "tokenizer", None)
+            if fallback is None or fallback is template_target:
+                raise
+            try:
+                return fallback.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+            except TypeError:
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
+                template_kwargs.pop("tools", None)
+                template_kwargs.pop("enable_thinking", None)
+                return fallback.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+
+    def _prepare_diffusion_inputs_from_prompt(
+        self,
+        prompt: str | list[int],
+        *,
+        images: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        from mlx_vlm.utils import prepare_inputs
+
+        images = images or []
+        if isinstance(prompt, list):
+            input_ids = mx.array([prompt])
+            return {
+                "input_ids": input_ids,
+                "pixel_values": None,
+                "attention_mask": None,
+                "mm_token_type_ids": None,
+                "prompt_tokens": int(input_ids.size),
+            }
+
+        inputs = prepare_inputs(
+            self._processor,
+            images=images if images else None,
+            prompts=[prompt],
+        )
+        input_ids = inputs["input_ids"]
+        return {
+            "input_ids": input_ids,
+            "pixel_values": inputs.get("pixel_values"),
+            "attention_mask": inputs.get("attention_mask"),
+            "mm_token_type_ids": inputs.get("mm_token_type_ids"),
+            "prompt_tokens": int(input_ids.size),
+        }
+
+    def _process_diffusion_chat_messages(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        text_messages, images, audio = extract_images_from_messages(messages)
+        self._validate_diffusion_request(
+            tools=tools,
+            audio=audio if audio else None,
+            stop=kwargs.get("stop"),
+            kwargs=kwargs,
+        )
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        diffusion_messages = messages if images else text_messages
+        prompt = self._diffusion_apply_chat_template(
+            diffusion_messages,
+            images=images,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=tools,
+        )
+        return self._prepare_diffusion_inputs_from_prompt(prompt, images=images)
+
+    def _iter_diffusion_outputs_sync(
+        self,
+        diffusion_inputs: dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
+        from mlx_vlm.generate.diffusion import stream_diffusion_generate
+
+        try:
+            from mlx_vlm.generate.common import generation_stream, wired_limit
+
+            limit_ctx = wired_limit(self._vlm_model, [generation_stream])
+        except Exception:
+            limit_ctx = contextlib.nullcontext()
+
+        if seed is not None:
+            mx.random.seed(seed)
+
+        tokenizer = self._tokenizer
+        if hasattr(tokenizer, "stopping_criteria"):
+            tokenizer.stopping_criteria.reset(
+                getattr(self._vlm_model.config, "eos_token_id", None)
+            )
+
+        prompt_tokens = int(diffusion_inputs.get("prompt_tokens") or 0)
+        results = None
+        full_text = ""
+        block_text: list[str] = []
+        emitted_tokens = 0
+        last_stream_segment = ""
+
+        # Special tokens are stripped from the stream, EXCEPT protocol
+        # markers the model's output parser needs to see in the text:
+        # tool-call markers (e.g. Gemma's <|tool_call> / <tool_call|>)
+        # for the tool parser, and channel/turn markers for the output
+        # parser session (thought-channel → <think> conversion). They
+        # are removed downstream (parser session / parse_tool_calls /
+        # ToolCallStreamFilter) so they never leak to clients.
+        skip_special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+        preserved_marker_texts: list[str] = []
+        if getattr(tokenizer, "has_tool_calling", False):
+            preserved_marker_texts.extend(
+                m
+                for m in (
+                    getattr(tokenizer, "tool_call_start", None),
+                    getattr(tokenizer, "tool_call_end", None),
+                )
+                if m
+            )
+
+        # Detect a protocol output parser (e.g. gemma4 channel markers).
+        # The diffusion lane emits detokenized text segments, so only
+        # sessions exposing ``process_text`` can be used here.
+        parser_session = None
+        try:
+            from ..adapter.output_parser import detect_output_parser
+
+            model_config = {"model_type": self.model_type} if self.model_type else None
+            factory = detect_output_parser(self._model_name, tokenizer, model_config)
+            if factory is not None:
+                session = factory.create_session(tokenizer)
+                if hasattr(session, "process_text"):
+                    parser_session = session
+                    preserved_marker_texts.extend(factory.protocol_marker_texts)
+        except Exception as e:
+            logger.debug("Diffusion output parser unavailable: %s", e)
+            parser_session = None
+
+        for marker in preserved_marker_texts:
+            try:
+                marker_id = tokenizer.convert_tokens_to_ids(marker)
+            except Exception:
+                marker_id = None
+            if marker_id is not None:
+                skip_special_ids.discard(marker_id)
+
+        def _parse_block(text: str, *, final: bool = False) -> str:
+            if parser_session is None:
+                return text
+            parsed = parser_session.process_text(text).visible_text
+            if final:
+                parsed += parser_session.finalize().visible_text
+            return parsed
+
+        try:
+            with limit_ctx:
+                results = stream_diffusion_generate(
+                    self._vlm_model,
+                    self._processor,
+                    tokenizer,
+                    diffusion_inputs["input_ids"],
+                    diffusion_inputs.get("pixel_values"),
+                    diffusion_inputs.get("attention_mask"),
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    skip_special_token_ids=skip_special_ids,
+                    mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
+                    prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
+                )
+                for result in results:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if getattr(result, "is_draft", False):
+                        continue
+                    result_tokens = getattr(result, "generation_tokens", None)
+                    finish_reason = getattr(result, "finish_reason", None)
+                    result_text = result.text or ""
+                    if result_text:
+                        has_token_progress = (
+                            result_tokens is None or int(result_tokens) > emitted_tokens
+                        )
+                        has_final_flush = (
+                            finish_reason is not None
+                            and result_text != last_stream_segment
+                        )
+                        if has_token_progress or has_final_flush:
+                            block_text.append(result_text)
+                            last_stream_segment = result_text
+                    is_boundary = bool(
+                        getattr(result, "diffusion_block_complete", False)
+                    )
+                    if not is_boundary and not finish_reason:
+                        continue
+
+                    new_text = remove_special_tokens_preserve_whitespace(
+                        _parse_block(
+                            "".join(block_text),
+                            final=finish_reason is not None,
+                        )
+                    )
+                    full_text += new_text
+                    completion_tokens = int(result_tokens or emitted_tokens)
+                    emitted_tokens = max(emitted_tokens, completion_tokens)
+                    if new_text or finish_reason:
+                        yield GenerationOutput(
+                            text=full_text,
+                            new_text=new_text,
+                            prompt_tokens=int(
+                                getattr(result, "prompt_tokens", prompt_tokens)
+                                or prompt_tokens
+                            ),
+                            completion_tokens=emitted_tokens,
+                            finished=finish_reason is not None,
+                            finish_reason=finish_reason,
+                            cached_tokens=0,
+                            prompt_tps=float(getattr(result, "prompt_tps", 0.0) or 0.0),
+                            generation_tps=float(
+                                getattr(result, "generation_tps", 0.0) or 0.0
+                            ),
+                            diffusion_canvas_tokens=int(
+                                getattr(result, "diffusion_canvas_tokens", 0) or 0
+                            ),
+                            diffusion_denoising_steps=int(
+                                getattr(result, "diffusion_denoising_steps", 0) or 0
+                            ),
+                            diffusion_work_tokens=int(
+                                getattr(result, "diffusion_work_tokens", 0) or 0
+                            ),
+                            diffusion_canvas_tps=float(
+                                getattr(result, "diffusion_canvas_tps", 0.0) or 0.0
+                            ),
+                            diffusion_work_tps=float(
+                                getattr(result, "diffusion_work_tps", 0.0) or 0.0
+                            ),
+                        )
+                    block_text = []
+                    if finish_reason:
+                        break
+        finally:
+            if results is not None and callable(getattr(results, "close", None)):
+                results.close()
+            mx.synchronize()
+            mx.clear_cache()
+
+    async def _stream_diffusion_inputs(
+        self,
+        diffusion_inputs: dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None = None,
+    ) -> AsyncIterator[GenerationOutput]:
+        from ..engine_core import get_mlx_executor
+
+        async with self._diffusion_lock:
+            self._diffusion_active_requests += 1
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            cancel_event = threading.Event()
+            self._diffusion_cancel_events.add(cancel_event)
+            loop = asyncio.get_running_loop()
+
+            def _put(item: Any) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+
+            def _worker() -> None:
+                try:
+                    for item in self._iter_diffusion_outputs_sync(
+                        diffusion_inputs,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        seed=seed,
+                        cancel_event=cancel_event,
+                    ):
+                        _put(item)
+                        if cancel_event.is_set():
+                            break
+                except BaseException as e:
+                    _put(e)
+                finally:
+                    _put(None)
+
+            future = loop.run_in_executor(get_mlx_executor(), _worker)
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+            finally:
+                cancel_event.set()
+                await future
+                self._diffusion_cancel_events.discard(cancel_event)
+                self._diffusion_active_requests -= 1
 
     def count_chat_tokens(
         self,
@@ -2033,7 +3667,7 @@ class VLMBatchedEngine(BaseEngine):
         # Extract text-only version for token counting
         from ..utils.image import extract_images_from_messages
 
-        text_messages, _ = extract_images_from_messages(messages)
+        text_messages, _, _ = extract_images_from_messages(messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
@@ -2046,6 +3680,8 @@ class VLMBatchedEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
+        if self.is_diffusion_model:
+            return getattr(self, "_diffusion_active_requests", 0) > 0
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
@@ -2062,6 +3698,9 @@ class VLMBatchedEngine(BaseEngine):
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
         }
+        if self._diffusion_family is not None:
+            stats["diffusion_family"] = self._diffusion_family
+            stats["active_requests"] = self._diffusion_active_requests
         if self._engine:
             stats.update(self._engine.get_stats())
         return stats
@@ -2074,6 +3713,11 @@ class VLMBatchedEngine(BaseEngine):
 
     async def abort_all_requests(self) -> int:
         """Abort all active requests."""
+        if self.is_diffusion_model:
+            cancel_events = list(getattr(self, "_diffusion_cancel_events", ()))
+            for cancel_event in cancel_events:
+                cancel_event.set()
+            return len(cancel_events)
         if self._engine and self._engine.engine:
             return await self._engine.engine.abort_all_requests()
         return 0

@@ -58,7 +58,8 @@ final class LocalizationSmokeTests: XCTestCase {
         "settings.section.basic", "settings.advanced.experimental.section",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",
-        "update.channel.stable",
+        "menubar.item.settings", "menubar.item.web_dashboard",
+        "update.channel.stable", "update.confirm.title",
     ]
 
     func testCatalogResolvesCommonBaseline() {

@@ -50,6 +50,7 @@ enum AdminAPI {
     static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
     static let hfRecommended   = "\(prefix)/hf/recommended"
     static let hfSearch        = "\(prefix)/hf/search"
+    static let hfModelInfo     = "\(prefix)/hf/model-info"
     static func hfModel(_ name: String) -> String { "\(prefix)/hf/models/\(name)" }
 
     // Phase 2 — ModelScope downloader (mirrors the /hf/* surface 1:1, just
@@ -62,6 +63,7 @@ enum AdminAPI {
     static func msTask(_ taskId: String) -> String   { "\(prefix)/ms/task/\(taskId)" }
     static let msRecommended   = "\(prefix)/ms/recommended"
     static let msSearch        = "\(prefix)/ms/search"
+    static let msModelInfo     = "\(prefix)/ms/model-info"
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"

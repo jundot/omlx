@@ -1,10 +1,10 @@
 // PR 7 — wires AppDelegate-owned runtime objects (ServerProcess, AppConfig)
-// to the SwiftUI side. AppView mounts a single instance via `.environmentObject`
+// to the SwiftUI side. AppView mounts a single instance via `.environment`
 // so screens can pull whatever they need without prop drilling. The screens
 // keep their own data + polling state in their own view models.
 //
 // `serverState` republishes ServerProcess.State on every state change so a
-// view can `@EnvironmentObject` AppServices and use it as a SwiftUI source
+// view can `@Environment(AppServices.self)` AppServices and use it as a SwiftUI source
 // of truth. ServerProcess itself stays NSNotification-driven (no Combine
 // retrofit).
 
@@ -12,33 +12,34 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class AppServices: NSObject, ObservableObject {
-    @Published var config: AppConfig
-    @Published var serverState: ServerProcess.State = .stopped
+@Observable
+final class AppServices: NSObject {
+    var config: AppConfig
+    var serverState: ServerProcess.State = .stopped
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
-    @Published var modelDetailID: String?
+    var modelDetailID: String?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's
     /// "Edit on Server →" link) without prop-drilling a `Binding<AppSection>`.
-    @Published var requestedSection: AppSection?
+    var requestedSection: AppSection?
     /// Pair with `requestedSection` to scroll the Server screen to a
     /// specific section after the deep-link lands. ContentScaffold's
     /// `ScrollViewReader` observes this, scrolls, then nils it. Only the
     /// Default Profile anchor is wired today — extend the enum as more
     /// deep links land.
-    @Published var requestedServerAnchor: ServerAnchor?
+    var requestedServerAnchor: ServerAnchor?
 
     let client: OMLXClient
     let updates: UpdateController
     /// Read-only preset bundle (sourced from the shipped JSON + remote
     /// refresh). The per-model settings preset chip strip subscribes via
-    /// `@EnvironmentObject` to react to refreshes.
+    /// Observation to react to refreshes.
     let presetBundle = PresetBundleStore()
 
     /// Long-lived view models for the Bench screens. Owned here (not by
-    /// the screen's `@StateObject`) so a running benchmark survives
+    /// screen-local state) so a running benchmark survives
     /// leaving the screen — the server keeps producing results while
     /// we're off-screen and the poll task continues updating these VMs,
     /// so coming back shows the in-flight state instead of an empty
@@ -47,6 +48,7 @@ final class AppServices: NSObject, ObservableObject {
     let throughputBench = ThroughputBenchScreenVM()
     let accuracyBench   = AccuracyBenchScreenVM()
 
+    @ObservationIgnored
     private weak var server: ServerProcess?
 
     init(config: AppConfig = .default, server: ServerProcess? = nil) {
@@ -96,6 +98,15 @@ final class AppServices: NSObject, ObservableObject {
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
     }
 
+    func setAutoStartOnLaunch(_ enabled: Bool, persist: Bool = true) throws {
+        var updated = config
+        updated.autoStartOnLaunch = enabled
+        if persist {
+            try updated.save()
+        }
+        self.config = updated
+    }
+
     // MARK: - Server lifecycle (proxied to ServerProcess)
 
     var hasServer: Bool { server != nil }
@@ -142,11 +153,11 @@ final class AppServices: NSObject, ObservableObject {
     /// optional so the caller (Server screen → Apply) can submit only
     /// what actually changed:
     ///   • `basePath`: relocates every file under the current root, sets
-    ///     `OMLX_BASE_PATH` (env + bootstrap file + shell rc), and
+    ///     `OMLX_BASE_PATH` (env + bootstrap file), and
     ///     reconfigures the spawn args.
-    ///   • `modelDir`: writes the explicit override into
-    ///     `<basePath>/settings.json`. Empty string clears it back to the
-    ///     server's default (`<basePath>/models`).
+    ///   • `modelDir` / `modelDirs`: writes the explicit model root list into
+    ///     `<basePath>/settings.json`; the first entry is the primary
+    ///     download target and backward-compatible `model_dir` value.
     ///   • `port`: a port change bundled into the same Apply. The spawn
     ///     uses cached `--port` args, so the restart below must carry the
     ///     new port or the server silently comes back on the old one. The
@@ -154,17 +165,31 @@ final class AppServices: NSObject, ObservableObject {
     /// The server is stopped once before any mutation and restarted once
     /// at the end — the user-stated rule: restart only fires when at
     /// least one of the inputs actually differs from the current config.
-    func applyStorageChanges(basePath: String? = nil, modelDir: String? = nil, port: Int? = nil) async throws {
+    func applyStorageChanges(
+        basePath: String? = nil,
+        modelDir: String? = nil,
+        modelDirs: [String]? = nil,
+        port: Int? = nil
+    ) async throws {
         let normalizedBase = basePath.map(Self.normalize)
         let trimmedDir = modelDir?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedModelDirs: [String]? = {
+            if let modelDirs {
+                return Self.cleanedModelDirs(modelDirs)
+            }
+            if let trimmedDir, !trimmedDir.isEmpty {
+                return [Self.normalize(trimmedDir)]
+            }
+            return nil
+        }()
 
         let basePathChanging: Bool = {
             guard let normalizedBase else { return false }
             return normalizedBase != Self.normalize(config.basePath)
         }()
         let modelDirChanging: Bool = {
-            guard let trimmedDir else { return false }
-            return trimmedDir != config.modelDir
+            guard let requestedModelDirs else { return false }
+            return requestedModelDirs != Self.cleanedModelDirs(config.effectiveModelDirs)
         }()
 
         guard basePathChanging || modelDirChanging else {
@@ -179,9 +204,9 @@ final class AppServices: NSObject, ObservableObject {
             try migrateBasePath(to: newPath)
         }
 
-        if modelDirChanging, let newDir = trimmedDir {
+        if modelDirChanging, let requestedModelDirs {
             var updated = config
-            updated.modelDir = newDir
+            updated.setModelDirs(requestedModelDirs)
             try updated.save()
             self.config = updated
         }
@@ -254,18 +279,21 @@ final class AppServices: NSObject, ObservableObject {
         // moveItem() above, so the new path is where they actually live.
         // A modelDir outside the old basePath (e.g. /Volumes/SSD/models)
         // stays put untouched.
-        updated.modelDir = Self.relocate(path: config.modelDir, oldBase: oldPath, newBase: newPath)
+        updated.setModelDirs(config.effectiveModelDirs.map {
+            Self.relocate(path: $0, oldBase: oldPath, newBase: newPath)
+        })
         // Persist any unknown server keys at the new location — settings.json
         // moved with the directory, so this is mostly a refresh of our slice
         // for first installs that didn't have one yet.
         try? updated.save()
         self.config = updated
 
-        // AppConfig.save() only owns its own slice; settings.json also carries
-        // path-bearing fields the Python server owns (model.model_dirs list,
-        // cache.ssd_cache_dir, logging.log_dir). When those were persisted as
+        // settings.json also carries path-bearing fields outside AppConfig's
+        // normal slice (cache.ssd_cache_dir, logging.log_dir). When those were persisted as
         // absolute paths under the old basePath, the server reads them after
         // the move and recreates dirs at the stale path. Rewrite them here.
+        // The model list is included too for older settings files and as a
+        // second pass after AppConfig.save().
         // Errors are surfaced via NSLog so a silent failure is debuggable in
         // Console.app — but we don't fail the migration (move already worked).
         do {
@@ -296,9 +324,9 @@ final class AppServices: NSObject, ObservableObject {
         return path
     }
 
-    /// Rewrite path-bearing fields in `<basePath>/settings.json` that
-    /// AppConfig doesn't own (model.model_dirs, cache.ssd_cache_dir,
-    /// logging.log_dir). Paths outside the migrated tree are left alone.
+    /// Rewrite path-bearing fields in `<basePath>/settings.json` that may
+    /// contain old-base absolute paths. Paths outside the migrated tree are
+    /// left alone.
     nonisolated static func relocateOrphanPaths(in url: URL, oldBase: String, newBase: String) throws {
         NSLog("oMLX: relocateOrphanPaths in=%@ old=%@ new=%@",
               url.path, oldBase, newBase)
@@ -348,6 +376,16 @@ final class AppServices: NSObject, ObservableObject {
         ((path as NSString).expandingTildeInPath as NSString).standardizingPath
     }
 
+    nonisolated private static func cleanedModelDirs(_ dirs: [String]) -> [String] {
+        var seen = Set<String>()
+        return dirs.compactMap { raw in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let normalized = normalize(trimmed)
+            return seen.insert(normalized).inserted ? normalized : nil
+        }
+    }
+
     /// Persist a new host/port to AppConfig, reconfigure the running server
     /// process, and bounce it. Without this, ServerScreenVM's port path in
     /// `applyServerSettings` (and `saveHost` for Listen Address) would only
@@ -359,24 +397,23 @@ final class AppServices: NSObject, ObservableObject {
     /// double-write here. When the server is offline (wizard dropouts,
     /// dev), we DO write so the next spawn reads the right values.
     func applyServerEndpoint(host: String? = nil, port: Int? = nil) async throws {
-        let resolvedHost = host ?? config.host
+        let resolvedBindAddress = host ?? config.bindAddress
         let resolvedPort = port ?? config.port
 
         var updated = config
-        updated.host = resolvedHost
+        updated.bindAddress = resolvedBindAddress
         updated.port = resolvedPort
         if server == nil {
             try updated.save()
         }
         self.config = updated
 
-        // The HTTP client also needs to know about the new endpoint so future
-        // admin calls land on the new bind address.
-        client.configure(host: resolvedHost, port: resolvedPort, apiKey: updated.apiKey)
+        // The HTTP client uses the connectable host (normalises 0.0.0.0 → 127.0.0.1).
+        client.configure(host: updated.host, port: resolvedPort, apiKey: updated.apiKey)
 
         if let server {
             await server.stop()
-            try server.reconfigure(host: resolvedHost, port: resolvedPort)
+            try server.reconfigure(bindAddress: resolvedBindAddress, port: resolvedPort)
             _ = try server.start()
         }
     }

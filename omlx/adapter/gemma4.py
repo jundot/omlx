@@ -5,14 +5,10 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, List
-
-try:
-    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-except ImportError:
-    NaiveStreamingDetokenizer = None
+from typing import Any
 
 from ..api.utils import _PRESERVE_BOUNDARY_KEY
+from ..utils.tokenizer import create_streaming_detokenizer
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
 
 _OPEN_MARKER = "<|channel>thought\n"
@@ -28,6 +24,17 @@ _LEADING_THOUGHT_RE = re.compile(
     r"\A\s*(?:(?:<think>.*?</think>|<\|channel>.*?<channel\|>)\s*)+",
     re.DOTALL,
 )
+
+# Matches the STRAY bare-token spellings (<|tool_call> and <tool_call|>),
+# not the template's well-formed closing form (</tool_call|> with slash).
+_PROTOCOL_MARKER_RE = re.compile(r"<\|tool_call>|<tool_call\|>")
+
+
+def _strip_protocol_markers(text: Any) -> Any:
+    """Remove stray <|tool_call> / <tool_call|> tokens from assistant content."""
+    if not isinstance(text, str) or not text:
+        return text
+    return _PROTOCOL_MARKER_RE.sub("", text)
 
 
 def _try_parse_json(s: str) -> Any:
@@ -64,10 +71,11 @@ def _strip_thinking(text: Any) -> Any:
 
 
 def extract_gemma4_messages(
-    messages: List[Any],
+    messages: list[Any],
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
-) -> List[dict]:
+    consolidate_system_messages: bool = True,
+) -> list[dict]:
     """Convert OpenAI-format messages to Gemma 4 chat-template format.
 
     The Gemma 4 chat template does not handle ``role=tool`` messages.
@@ -93,6 +101,10 @@ def extract_gemma4_messages(
         max_tool_result_tokens: Maximum token count for tool results
             (truncation applied when tokenizer is provided).
         tokenizer: Tokenizer for optional truncation.
+        consolidate_system_messages: When True, preserve the legacy behavior
+            of moving all system/developer messages to the leading system
+            prompt. Server routes pass False and defer that decision until the
+            model chat template can be probed.
 
     Returns:
         List of dicts ready for ``tokenizer.apply_chat_template``.
@@ -176,6 +188,7 @@ def extract_gemma4_messages(
             # Per Gemma 4's multi-turn rule, prior thought blocks must not
             # be fed back into the next turn. Strip them before rendering.
             content = _strip_thinking(content)
+            content = _strip_protocol_markers(content)
 
             out_msg: dict = {"role": "assistant", "content": content or ""}
 
@@ -247,14 +260,17 @@ def extract_gemma4_messages(
             continue
 
         # All other roles (user, system)
-        # Preserve image_url parts for VLM processing
+        # Preserve image_url and input_audio parts for VLM processing
         content = msg.get("content", "")
         if isinstance(content, list):
             from ..api.utils import _extract_multimodal_content_list
 
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
-            if has_images:
+            multimodal_types = {"image_url", "input_audio"}
+            has_multimodal = any(
+                p.get("type") in multimodal_types for p in multimodal_parts
+            )
+            if has_multimodal:
                 content = multimodal_parts
             else:
                 content = _extract_text_from_content_list(content)
@@ -269,9 +285,11 @@ def extract_gemma4_messages(
         _merge_consecutive_roles,
     )
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed))
-    )
+    cleaned = processed
+    if consolidate_system_messages:
+        cleaned = _consolidate_system_messages(cleaned)
+    cleaned = _drop_void_assistant_messages(cleaned)
+    return _merge_consecutive_roles(cleaned)
 
 
 def _matching_prefix_len(text: str, marker: str) -> int:
@@ -286,18 +304,13 @@ def _matching_prefix_len(text: str, marker: str) -> int:
 class Gemma4OutputParserSession:
     """Suppress Gemma 4 protocol markers and re-emit thought blocks as ``<think>`` tags."""
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
         self._buffer = ""
         self._in_thought = False
+        self._text_mode = False
 
-        if hasattr(tokenizer, "detokenizer"):
-            self._detokenizer = tokenizer.detokenizer
-        elif NaiveStreamingDetokenizer is not None:
-            self._detokenizer = NaiveStreamingDetokenizer(tokenizer)
-        else:
-            self._detokenizer = None
-
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
             self._detokenizer.reset()
 
@@ -385,13 +398,8 @@ class Gemma4OutputParserSession:
             # tokens arrive. Buffer and wait so the canonical match wins.
             if not final and marker == _OPEN_MARKER_BARE:
                 suffix = source[idx:]
-                if (
-                    len(suffix) < len(_OPEN_MARKER)
-                    and _OPEN_MARKER.startswith(suffix)
-                ):
-                    self._append_text(
-                        stream_parts, visible_parts, source[pos:idx]
-                    )
+                if len(suffix) < len(_OPEN_MARKER) and _OPEN_MARKER.startswith(suffix):
+                    self._append_text(stream_parts, visible_parts, source[pos:idx])
                     self._buffer = suffix
                     return OutputParserTokenResult(
                         stream_text="".join(stream_parts),
@@ -449,9 +457,24 @@ class Gemma4OutputParserSession:
             text = self._tokenizer.decode([token_id])
         return self._consume_text(text)
 
+    def process_text(self, text: str) -> OutputParserTokenResult:
+        """Process an already-detokenized text segment.
+
+        Engines that emit text segments instead of token ids (the serial
+        diffusion lane detokenizes inside ``stream_diffusion_generate``)
+        feed their output through this entry point so protocol markers
+        are handled identically to the token-id path.  Switches the
+        session to text mode so ``finalize`` does not flush the unused
+        token detokenizer.
+        """
+        self._text_mode = True
+        if not text:
+            return OutputParserTokenResult(stream_text="", visible_text="")
+        return self._consume_text(text)
+
     def finalize(self) -> OutputParserFinalizeResult:
         text = ""
-        if self._detokenizer is not None:
+        if self._detokenizer is not None and not self._text_mode:
             self._detokenizer.finalize()
             text = self._detokenizer.last_segment
 
