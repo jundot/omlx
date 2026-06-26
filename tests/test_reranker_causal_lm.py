@@ -583,3 +583,42 @@ class TestRerankerCompileFallback:
 
         assert result is False
         assert model._compiled_seq_logits is None
+
+    def test_release_resources_drops_model_references(self):
+        """release_resources should break compiled closures and model refs."""
+        model = MLXRerankerModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._num_labels = 1
+        model._is_causal_lm = True
+        model._is_jina_reranker = True
+        model._is_vl_reranker = True
+        model._token_true_id = 1
+        model._token_false_id = 2
+        model._doc_embed_token_id = 3
+        model._query_embed_token_id = 4
+        model._jina_projector = MagicMock()
+        model._prefix_tokens = [1, 2]
+        model._suffix_tokens = [3, 4]
+        model._is_compiled = True
+        model._compiled_seq_logits = MagicMock()
+
+        model.release_resources()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_seq_logits is None
+        assert model._is_compiled is False
+        assert model._loaded is False
+        assert model._num_labels is None
+        assert model._is_causal_lm is False
+        assert model._is_jina_reranker is False
+        assert model._is_vl_reranker is False
+        assert model._token_true_id is None
+        assert model._token_false_id is None
+        assert model._doc_embed_token_id is None
+        assert model._query_embed_token_id is None
+        assert model._jina_projector is None
+        assert model._prefix_tokens is None
+        assert model._suffix_tokens is None

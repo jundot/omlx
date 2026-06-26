@@ -1098,6 +1098,23 @@ class TestEnginePoolAsync:
         assert pool._entries["model-a"].engine is None
 
     @pytest.mark.asyncio
+    async def test_unload_engine_releases_free_malloc_pages(self, pool_with_mock_engines):
+        """Model unload should pressure malloc to return empty pages to macOS."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+
+        with patch("omlx.engine_pool.release_free_malloc_pages") as mock_release:
+            await pool._unload_engine("model-a")
+
+        mock_release.assert_called()
+
+    @pytest.mark.asyncio
     async def test_shutdown_unloads_all(self, pool_with_mock_engines):
         """Test that shutdown unloads all engines."""
         pool = pool_with_mock_engines

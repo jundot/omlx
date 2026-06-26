@@ -702,6 +702,17 @@ class MLXEmbeddingModel:
         """Get the embedding dimension."""
         return self._hidden_size
 
+    def release_resources(self) -> None:
+        """Drop model-side references that can keep MLX weights alive."""
+        self._compiled_embed = None
+        self._is_compiled = False
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._hidden_size = None
+        self._using_native = False
+        self._remap_input_ids_to_inputs = False
+
     def get_model_info(self) -> dict:
         """Get information about the loaded model."""
         if not self._loaded:

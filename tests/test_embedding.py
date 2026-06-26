@@ -32,7 +32,7 @@ from omlx.api.embedding_utils import (
 )
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.model_discovery import detect_model_type
-from omlx.models.embedding import EmbeddingOutput
+from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
 
 
 class TestEmbeddingModels:
@@ -466,10 +466,32 @@ class TestExtractEmbeddingsArray:
 class TestEmbeddingCompileFallback:
     """Tests for embedding compile path fallback behavior."""
 
+    def test_release_resources_drops_model_references(self):
+        """release_resources should break compiled closures and model refs."""
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._hidden_size = 384
+        model._using_native = True
+        model._is_compiled = True
+        model._compiled_embed = MagicMock()
+        model._remap_input_ids_to_inputs = True
+
+        model.release_resources()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_embed is None
+        assert model._is_compiled is False
+        assert model._loaded is False
+        assert model._hidden_size is None
+        assert model._using_native is False
+        assert model._remap_input_ids_to_inputs is False
+
     def test_compiled_path_fallback_on_failure(self):
         """Test that embed() falls back to eager when compiled path raises."""
         import mlx.core as mx
-        from omlx.models.embedding import MLXEmbeddingModel
 
         class StandardTokenizer:
             def encode(self, text, add_special_tokens=True):

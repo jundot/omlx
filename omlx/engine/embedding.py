@@ -16,6 +16,7 @@ import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
+from ..utils.compile_cache import clear_thread_compile_cache
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
@@ -97,18 +98,35 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._model is None:
+        model = self._model
+        if model is None:
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
         self._model = None
 
-        gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await loop.run_in_executor(get_mlx_executor(), self._release_model, model)
+        del model
+        gc.collect()
         logger.info(f"Embedding engine stopped: {self._model_name}")
+
+    @staticmethod
+    def _release_model(model: MLXEmbeddingModel) -> None:
+        """Release embedding model resources on the MLX executor thread."""
+        try:
+            mx.synchronize()
+            release = getattr(model, "release_resources", None)
+            if callable(release):
+                release()
+            gc.collect()
+            mx.clear_cache()
+            clear_thread_compile_cache()
+            mx.synchronize()
+            mx.clear_cache()
+        except Exception:
+            logger.warning("Error releasing embedding model resources", exc_info=True)
+            raise
 
     async def embed(
         self,

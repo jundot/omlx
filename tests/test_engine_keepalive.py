@@ -61,6 +61,32 @@ class TestEmbeddingEngineStartStop:
 
         assert not hasattr(engine, "_keepalive_task")
 
+    def test_engine_stop_releases_model_and_compile_cache(self):
+        """stop should run model release and compile-cache clear on cleanup."""
+        from omlx.engine.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
+             patch("omlx.engine.embedding.mx") as mock_mx, \
+             patch(
+                 "omlx.engine.embedding.clear_thread_compile_cache"
+             ) as mock_clear_compile_cache:
+            mock_model = MagicMock()
+            MockModel.return_value = mock_model
+
+            async def run():
+                await engine.start()
+                await engine.stop()
+
+            asyncio.run(run())
+
+            mock_model.release_resources.assert_called_once()
+            mock_clear_compile_cache.assert_called_once()
+            assert mock_mx.synchronize.call_count == 2
+            assert mock_mx.clear_cache.call_count == 2
+            assert engine._model is None
+
 
 class TestRerankerEngineStartStop:
     """Tests for RerankerEngine start/stop lifecycle."""
@@ -79,3 +105,29 @@ class TestRerankerEngineStartStop:
             asyncio.run(engine.start())
 
         assert not hasattr(engine, "_keepalive_task")
+
+    def test_engine_stop_releases_model_and_compile_cache(self):
+        """stop should run model release and compile-cache clear on cleanup."""
+        from omlx.engine.reranker import RerankerEngine
+
+        engine = RerankerEngine("test-model")
+
+        with patch("omlx.engine.reranker.MLXRerankerModel") as MockModel, \
+             patch("omlx.engine.reranker.mx") as mock_mx, \
+             patch(
+                 "omlx.engine.reranker.clear_thread_compile_cache"
+             ) as mock_clear_compile_cache:
+            mock_model = MagicMock()
+            MockModel.return_value = mock_model
+
+            async def run():
+                await engine.start()
+                await engine.stop()
+
+            asyncio.run(run())
+
+            mock_model.release_resources.assert_called_once()
+            mock_clear_compile_cache.assert_called_once()
+            assert mock_mx.synchronize.call_count == 2
+            assert mock_mx.clear_cache.call_count == 2
+            assert engine._model is None

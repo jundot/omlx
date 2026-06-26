@@ -295,6 +295,61 @@ class TestBatchedEngineInitialization:
         assert engine.model_type is None
 
 
+class TestBatchedEngineStopSafety:
+    """Tests for BatchedEngine.stop() exception safety and reclaim ordering."""
+
+    @pytest.mark.asyncio
+    async def test_stop_drops_wrapper_refs_before_close(self):
+        """Wrapper refs are gone before EngineCore.close() can reclaim MLX memory."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model = object()
+        engine._tokenizer = object()
+
+        wrapper = MagicMock()
+        wrapper.stop = AsyncMock()
+        inner_engine = MagicMock()
+
+        def assert_refs_dropped():
+            assert engine._engine is None
+            assert engine._model is None
+            assert engine._tokenizer is None
+
+        inner_engine.close.side_effect = assert_refs_dropped
+        wrapper.engine = inner_engine
+        engine._engine = wrapper
+
+        await engine.stop()
+
+        wrapper.stop.assert_awaited_once()
+        inner_engine.close.assert_called_once()
+        assert engine._loaded is False
+
+    @pytest.mark.asyncio
+    async def test_stop_completes_when_close_raises(self):
+        """stop() should complete even if engine.close() raises an exception."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model = object()
+        engine._tokenizer = object()
+
+        wrapper = MagicMock()
+        wrapper.stop = AsyncMock()
+        wrapper.engine.close.side_effect = RuntimeError("close failed")
+        engine._engine = wrapper
+
+        await engine.stop()
+
+        assert engine._engine is None
+        assert engine._model is None
+        assert engine._tokenizer is None
+        assert engine._loaded is False
+
+
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
 

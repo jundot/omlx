@@ -732,6 +732,25 @@ class MLXRerankerModel:
             self._compiled_seq_logits = None
             return False
 
+    def release_resources(self) -> None:
+        """Drop model-side references that can keep MLX weights alive."""
+        self._compiled_seq_logits = None
+        self._is_compiled = False
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._num_labels = None
+        self._is_causal_lm = False
+        self._is_jina_reranker = False
+        self._is_vl_reranker = False
+        self._token_true_id = None
+        self._token_false_id = None
+        self._doc_embed_token_id = None
+        self._query_embed_token_id = None
+        self._jina_projector = None
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
     _DEFAULT_MAX_LENGTH_CAUSAL_LM = 8192

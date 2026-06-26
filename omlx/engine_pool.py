@@ -45,6 +45,7 @@ from .exceptions import (
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
+from .utils.memory_reclaim import release_free_malloc_pages
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -1075,6 +1076,7 @@ class EnginePool:
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
+        release_free_malloc_pages()
 
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
@@ -1123,6 +1125,7 @@ class EnginePool:
             await loop.run_in_executor(
                 get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
             )
+            release_free_malloc_pages()
 
         # Release memory tracking AFTER barrier
         self._current_model_memory -= entry.estimated_size
@@ -1157,6 +1160,7 @@ class EnginePool:
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
+                release_free_malloc_pages()
                 await asyncio.sleep(1.0)
             active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:

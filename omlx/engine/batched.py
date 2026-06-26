@@ -401,16 +401,22 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._engine:
-            await self._engine.stop()
-            if hasattr(self._engine, "engine") and self._engine.engine is not None:
-                try:
-                    self._engine.engine.close()
-                except Exception as e:
-                    logger.warning(f"Error closing engine: {e}")
+        engine = self._engine
+
+        # Drop wrapper-side references before EngineCore.close() performs its
+        # final worker-thread MLX reclaim. Otherwise the BatchedEngine wrapper
+        # can keep model weights alive until after the reclaim pass has run.
         self._engine = None
         self._model = None
         self._tokenizer = None
+
+        if engine:
+            await engine.stop()
+            if hasattr(engine, "engine") and engine.engine is not None:
+                try:
+                    engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
