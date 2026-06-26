@@ -172,15 +172,17 @@ class TestPerEngineExecutor:
                 assert engine.tokenizer is None
                 assert engine.scheduler is None
 
+            mock_model.release_resources.side_effect = lambda: events.append("release")
             mock_reclaim.side_effect = reclaim_side_effect
             mock_clear.side_effect = lambda: events.append("compile")
             engine.close()
 
             # Memory is reclaimed after dropping engine refs, then the compile
             # cache is cleared on the worker thread before thread shutdown.
+            mock_model.release_resources.assert_called_once_with()
             mock_reclaim.assert_called_once_with(engine._mlx_stream)
             mock_clear.assert_called()
-            assert events == ["reclaim", "compile"]
+            assert events == ["release", "reclaim", "compile"]
             assert engine._mlx_executor is None
             assert executor._shutdown
             assert executor not in ec._immortal_mlx_executors

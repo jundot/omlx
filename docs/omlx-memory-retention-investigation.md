@@ -96,6 +96,27 @@ Why this matches the runtime evidence:
 - Restart released everything, proving it was process-local retained MLX/Metal
   state rather than external files or hot cache entries.
 
+The live validation also exposed a second, VLM-specific reference-retention
+path:
+
+- `EngineCore.model` is a `VLMModelAdapter` for VLM engines.
+- That adapter kept strong references to both `_vlm_model` and
+  `_language_model`.
+- `VLMBatchedEngine` also kept wrapper-side references to the VLM model,
+  processor, adapter, tokenizer, and drafter until after `EngineCore.close()`.
+- A first patched run that added final worker-thread reclaim to
+  `EngineCore.close()` still retained about `19.0GB` of
+  `IOAccelerator (graphics)` after unload.
+- Dropping the wrapper references before `EngineCore.close()` was not enough by
+  itself, because the adapter inside `EngineCore.model` still held the raw model
+  objects.
+
+Therefore the final fix needs both:
+
+- final reclaim on the engine worker thread after engine-owned references are
+  dropped; and
+- explicit release of VLM adapter/wrapper references before that final reclaim.
+
 Secondary observation:
 
 - `VLMBatchedEngine.has_active_requests()` only checks output collectors.
@@ -110,8 +131,11 @@ Secondary observation:
 Files changed:
 
 - `omlx/engine_core.py`
+- `omlx/engine/vlm.py`
+- `omlx/models/vlm.py`
 - `tests/test_per_engine_threads.py`
 - `tests/test_engine_core.py`
+- `tests/test_vlm_model_adapter.py`
 
 Patch intent:
 
@@ -125,11 +149,17 @@ Patch intent:
    - clear the leftover bound-method local `fn`;
    - close and detach the SSD cache manager;
    - clear output collectors and request-side stream state;
+   - call model-specific `release_resources()` if present;
    - set `self.model`, `self.tokenizer`, and `self.scheduler` to `None`;
    - submit `_final_engine_thread_reclaim(self._mlx_stream)` to the same
      per-engine executor;
    - only then clear the MLX compile cache and shut down or immortalize the
      executor according to the existing compile-cache policy.
+4. In `VLMBatchedEngine.stop()`:
+   - drop wrapper-side references before closing the inner engine.
+5. In `VLMModelAdapter.release_resources()`:
+   - drop pending VLM arrays and the raw `_vlm_model` / `_language_model`
+     references before the final worker-thread reclaim.
 
 The important design choice is that final reclaim happens after engine-owned
 references are dropped, and on the same worker thread/stream that owned the MLX
@@ -138,11 +168,14 @@ allocations.
 Test changes:
 
 - `test_close_clears_compile_cache_then_shuts_down` now asserts:
+  - model-specific `release_resources()` runs before final reclaim;
   - final reclaim is called before compile-cache clear;
   - by the time final reclaim runs, `engine.model`, `engine.tokenizer`, and
     `engine.scheduler` are already `None`.
 - `test_close_fatal_exits_when_compile_cache_clear_times_out` now accounts for
   the extra executor submission before compile-cache clear.
+- `test_release_resources_drops_model_references` asserts the VLM adapter drops
+  raw model and pending-array references.
 
 ## Verification update
 
@@ -233,6 +266,81 @@ Result:
 78 passed in 4.31s
 ```
 
+After the VLM adapter/wrapper reference-release patch, the narrower targeted
+suite also passed:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_vlm_model_adapter.py::TestVLMModelAdapter::test_release_resources_drops_model_references \
+  tests/test_vlm_engine.py::TestStopSafety \
+  tests/test_per_engine_threads.py::TestPerEngineExecutor::test_close_clears_compile_cache_then_shuts_down \
+  tests/test_engine_core.py::TestEngineCoreClose
+```
+
+Result:
+
+```text
+9 passed in 1.33s
+```
+
+`git diff --check` also passed.
+
+## Live validation on port 11445
+
+Validation server:
+
+```bash
+.venv/bin/python -m omlx.cli serve \
+  --host 127.0.0.1 \
+  --port 11445 \
+  --base-path /tmp/omlx-patched-validation2 \
+  --model-dir /Users/zhouwei/.omlx/models \
+  --api-key validation-key \
+  --hf-endpoint https://hf-mirror.com \
+  --paged-ssd-cache-dir /tmp/omlx-patched-validation2/cache \
+  --paged-ssd-cache-max-size 20GB \
+  --hot-cache-max-size 10GB \
+  --memory-guard-gb 76 \
+  --log-level info
+```
+
+Baseline before request:
+
+- `/api/status`: `models_loaded=0`, `model_memory_used=0B`.
+- `vmmap`: physical footprint `102.3M`.
+- `vmmap`: `IOAccelerator (graphics)` resident `48K`.
+
+Long-context request:
+
+- Model: `Qwen3.6-35B-A3B-nvfp4`.
+- Prompt tokens: `51419`.
+- Cached prompt tokens: `0`.
+- Completion tokens: `32`.
+- Request status: `200`.
+- Elapsed wall time from the client: `37.99s`.
+
+Before unload:
+
+- `/api/status`: `models_loaded=1`.
+- `/api/status`: `model_memory_used_formatted=19.95GB`.
+- `vmmap`: physical footprint `23.6G`.
+- `vmmap`: `IOAccelerator (graphics)` resident `20.5G`.
+
+After unload:
+
+- `POST /v1/models/Qwen3.6-35B-A3B-nvfp4/unload` returned:
+  `{"status":"ok","model_id":"Qwen3.6-35B-A3B-nvfp4"}`.
+- `/api/status`: `models_loaded=0`, `model_memory_used=0B`.
+- `vmmap`: physical footprint `569.7M`.
+- `vmmap`: `IOAccelerator (graphics)` resident `2832K`.
+- Server log:
+  `Unloaded model: Qwen3.6-35B-A3B-nvfp4, freed=20.41GB (expected>=17.95GB), active_memory: 1.02KB (settled)`.
+
+This validates that the patch releases the previously retained Metal memory in
+the same long-prefill scenario that reproduced the leak. The remaining process
+footprint is normal runtime/library allocator residue, not the prior retained
+GPU allocation.
+
 ## Recommended next steps
 
 1. If full dependency sync is still needed later, prefer the domestic PyPI
@@ -256,25 +364,8 @@ git diff --check
 
 This passed after the patch.
 
-4. Perform a live memory validation:
-
-- Start patched oMLX.
-- Load `Qwen3.6-35B-A3B-nvfp4`.
-- Reproduce a long-context request similar to the observed `~40k` prompt case.
-- Confirm idle state through `/api/status`.
-- Record `vmmap -summary <pid>` before unload.
-- Unload the model.
-- Record:
-  - `/api/status`;
-  - admin active model/cache stats;
-  - `vmmap -summary <pid>`.
-- Expected result after the patch:
-  - model-weight memory drops as before;
-  - retained `IOAccelerator`/`mx.get_active_memory()` should be much lower than
-    the previous `42.89GB` residual;
-  - if it is not lower, the next suspect is scheduler-side request/cache
-    reference retention after deep reset rather than missing final worker-thread
-    reclaim.
+4. Live memory validation has passed on port `11445`; the patched unload path
+   reduced `IOAccelerator (graphics)` from `20.5G` to `2832K`.
 
 5. Consider a follow-up UI/admin fix:
 

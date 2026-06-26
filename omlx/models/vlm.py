@@ -68,6 +68,15 @@ class VLMModelAdapter(nn.Module):
         self._uid_rope_deltas: Dict[int, float] = {}
         self._batch_rope_deltas: Optional[mx.array] = None
 
+    def release_resources(self) -> None:
+        """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        self._pending_embeds = None
+        self._pending_kwargs = {}
+        self._uid_rope_deltas.clear()
+        self._batch_rope_deltas = None
+        self._language_model = None
+        self._vlm_model = None
+
     @property
     def layers(self):
         """Expose language model layers for cache creation.

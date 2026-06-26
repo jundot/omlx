@@ -1080,6 +1080,18 @@ class EngineCore:
         self._finished_events.clear()
         self._finished_at.clear()
 
+        release_model_resources = getattr(self.model, "release_resources", None)
+        if callable(release_model_resources):
+            try:
+                release_model_resources()
+            except Exception:
+                logger.warning(
+                    "Engine %s: model resource release failed during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+        release_model_resources = None
+
         # Release model, tokenizer, and scheduler references before the final
         # MLX reclaim. The reclaim must run on this engine's worker thread and
         # stream; clearing on the global executor cannot reliably return this
