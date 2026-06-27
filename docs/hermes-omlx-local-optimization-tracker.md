@@ -326,6 +326,14 @@ Failed to resolve CDP endpoint http://localhost:9222
    - 分批 unlink，避免推理线程被文件删除阻塞；
    - 输出每个逻辑域的 cache 使用量和清理原因。
 
+   互斥要求：
+
+   - 当所有模型都已经卸载，并进入 cache 自愈/内存清理治理作业后，后续模型加载和业务请求必须等待治理完成。
+   - 治理作业应有明确的 maintenance gate，不能与 `get_engine()`、模型加载、TTL 卸载、手动卸载或 runtime settings reload 并发修改 engine/cache 状态。
+   - 治理期间可以拒绝或排队新请求；更适合本地 Hermes 场景的策略是排队等待，而不是直接返回错误。
+   - 治理必须是 bounded：限制单轮 unlink 文件数和最长耗时，避免最后一个模型卸载后长时间阻塞下一次加载。
+   - 互斥治理不应调用 `clear_hot_cache()` 或 `SharedHotCacheBudget.clear_all_owners()`，因为目标是保留 hot cache，只治理 SSD cache 和释放模型运行态内存。
+
 6. 模型卸载时只降权，不立即清 cache
 
    模型卸载应该释放内存，但不等于删除有价值的 SSD cache：
@@ -350,25 +358,32 @@ Failed to resolve CDP endpoint http://localhost:9222
 - [x] 在 SSD 淘汰逻辑中加入域预算和评分制：优先清理 incompatible/inactive signature，再清理超过预算的 embedding/rerank 和辅助 chat 域，保护高命中主 chat block。
 - [x] 增加显式 cache domain janitor：`run_cache_domain_janitor()`，当前为手动/后续调度调用，不额外启动后台线程。
 - [x] 增加测试覆盖：主模型高命中 block 不应被低命中辅助模型优先挤出；incompatible/stale 占比超过阈值时应优先清理；低复用 embedding hot eviction 可跳过 SSD 持久化。
+- [x] 增加 maintenance gate：全模型卸载后的治理作业执行期间，`get_engine()` 和后续模型加载请求必须等待治理完成。
+- [x] 将治理接入最后一个模型卸载后的空闲窗口：当没有 loaded/loading/in-use/pending unload 模型时，执行 SSD cache janitor 和额外 MLX 内存清理。
+- [x] 治理使用临时 SSD cache manager，`hot_cache_max_bytes=0`、`hot_cache_budget=None`，不调用共享 hot cache 清理。
 
 实现记录：
 
 - 分支：`feature/single-instance-cache-domains`。
-- 核心代码：`omlx/cache/paged_ssd_cache.py`。
-- 测试代码：`tests/test_paged_ssd_cache.py`。
+- 核心代码：`omlx/cache/paged_ssd_cache.py`、`omlx/engine_pool.py`。
+- 测试代码：`tests/test_paged_ssd_cache.py`、`tests/test_engine_pool.py`。
 - 策略边界：
   - 不拆分 oMLX 实例；
   - 不拆分 `ssd_cache_dir`；
   - 不改变默认 hot cache write-back 契约；
   - 只对明确低价值的 embedding/rerank 短生命周期 block 做 SSD 准入降级；
   - SSD 淘汰使用小窗口候选评分，不在请求路径做全量扫描。
+  - 全模型卸载后的治理会阻塞后续模型加载，直到治理完成。
+  - 治理只扫描/清理 SSD cache 和执行 MLX allocator 清理，不释放共享 hot cache。
 - 已验证：
   - `git diff --check` 通过；
   - `.venv/bin/python -m compileall -q omlx/cache/paged_ssd_cache.py tests/test_paged_ssd_cache.py` 通过；
   - `.venv/bin/python -m pytest tests/test_hot_cache.py tests/test_paged_ssd_cache.py` 通过，`185 passed`。
+  - `.venv/bin/python -m compileall -q omlx/cache/paged_ssd_cache.py omlx/engine_pool.py tests/test_paged_ssd_cache.py tests/test_engine_pool.py` 通过；
+  - `.venv/bin/python -m pytest tests/test_hot_cache.py tests/test_paged_ssd_cache.py tests/test_engine_pool.py` 通过，`284 passed`。
 - 未完成/后续：
   - `uv run ruff ...` 当前仍受依赖解析问题阻塞：解析 Python 3.14 split 时找不到 `num2words>=0.5.14`；本地 `.venv` 中没有 `ruff` 可执行文件。
-  - 当前 janitor 为显式调用方法，尚未接入周期性后台调度或管理 API。
+  - 当前 janitor 已接入“全模型卸载后”的空闲窗口，但尚未暴露管理 API 或状态 API。
 
 ### P1：清理或扩容当前 SSD cache
 

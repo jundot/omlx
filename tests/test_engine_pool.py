@@ -17,7 +17,7 @@ from omlx.exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from omlx.scheduler import PrefillEvictionRequest
+from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -1098,6 +1098,111 @@ class TestEnginePoolAsync:
         assert pool._entries["model-a"].engine is None
 
     @pytest.mark.asyncio
+    async def test_get_engine_waits_for_maintenance_gate(
+        self, pool_with_mock_engines
+    ):
+        """New model loads wait while all-unloaded maintenance is active."""
+        pool = pool_with_mock_engines
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        await pool._maintenance_gate.acquire()
+        try:
+            with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+                task = asyncio.create_task(pool.get_engine("model-a"))
+                await asyncio.sleep(0)
+                assert not mock_engine.start.await_count
+
+                pool._maintenance_gate.release()
+                engine = await task
+
+            assert engine is mock_engine
+            mock_engine.start.assert_awaited_once()
+        finally:
+            if pool._maintenance_gate.locked():
+                pool._maintenance_gate.release()
+
+    @pytest.mark.asyncio
+    async def test_last_unload_runs_cache_memory_maintenance(
+        self, pool_with_mock_engines
+    ):
+        """The last unloaded model triggers bounded maintenance."""
+        pool = pool_with_mock_engines
+        pool._run_all_unloaded_cache_janitor = AsyncMock(return_value=4096)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+            await pool._unload_engine("model-a")
+
+        pool._run_all_unloaded_cache_janitor.assert_awaited_once_with(
+            trigger_model_id="model-a"
+        )
+        assert pool._maintenance_runs == 1
+        assert pool._maintenance_last_freed_bytes == 4096
+        assert not pool._maintenance_in_progress
+
+    @pytest.mark.asyncio
+    async def test_unload_skips_maintenance_when_other_model_loaded(
+        self, pool_with_mock_engines
+    ):
+        """Maintenance runs only after all engines are unloaded."""
+        pool = pool_with_mock_engines
+        pool._run_all_unloaded_cache_janitor = AsyncMock(return_value=4096)
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        mock_engine_a.stop = AsyncMock()
+        mock_engine_b = MagicMock()
+        mock_engine_b.start = AsyncMock()
+        mock_engine_b.stop = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=[mock_engine_a, mock_engine_b],
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            await pool._unload_engine("model-a")
+
+        pool._run_all_unloaded_cache_janitor.assert_not_awaited()
+        assert pool._maintenance_runs == 0
+
+    @pytest.mark.asyncio
+    async def test_cache_janitor_uses_temp_manager_without_hot_cache(self, tmp_path):
+        """Maintenance trims SSD cache without clearing the shared hot cache."""
+        pool = EnginePool(
+            scheduler_config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_ssd_cache_max_size=12345,
+                hot_cache_max_size=999,
+            )
+        )
+        manager = MagicMock()
+        manager.run_cache_domain_janitor.return_value = 4096
+
+        with patch(
+            "omlx.cache.paged_ssd_cache.PagedSSDCacheManager",
+            return_value=manager,
+        ) as MockManager:
+            freed = await pool._run_all_unloaded_cache_janitor(
+                trigger_model_id="model-a"
+            )
+
+        assert freed == 4096
+        kwargs = MockManager.call_args.kwargs
+        assert kwargs["cache_dir"] == tmp_path
+        assert kwargs["max_size_bytes"] == 12345
+        assert kwargs["hot_cache_max_bytes"] == 0
+        assert kwargs["hot_cache_budget"] is None
+        assert kwargs["expected_model_name"] == "model-a"
+        manager.run_cache_domain_janitor.assert_called_once()
+        manager.close.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_shutdown_unloads_all(self, pool_with_mock_engines):
         """Test that shutdown unloads all engines."""
         pool = pool_with_mock_engines
@@ -2127,9 +2232,10 @@ class TestMemorySettleBarrier:
         assert "indeterminate under concurrent activity" not in caplog.text
         assert "Settle barrier timed out" in caplog.text
         # Full barrier behavior preserved: 1 initial release cycle + 10 settle
-        # rounds + 3 emergency-reclaim rounds on the executor.
-        assert mock_mx.synchronize.call_count == 14
-        assert mock_mx.clear_cache.call_count == 14
+        # rounds + 3 emergency-reclaim rounds, followed by the all-unloaded
+        # maintenance reclaim pass.
+        assert mock_mx.synchronize.call_count == 15
+        assert mock_mx.clear_cache.call_count == 15
 
     def test_other_entries_serving_in_use_lease_counts(self, pool_with_loaded_model):
         """The in-use lease (acquired but not yet active) also marks the pool

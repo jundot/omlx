@@ -141,6 +141,10 @@ class EnginePool:
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
+        self._maintenance_gate = asyncio.Lock()
+        self._maintenance_in_progress = False
+        self._maintenance_runs = 0
+        self._maintenance_last_freed_bytes = 0
         self.configure_hot_cache_budget()
 
     @property
@@ -182,6 +186,84 @@ class EnginePool:
         wake = getattr(enforcer, "wake", None) if enforcer is not None else None
         if callable(wake):
             wake(active=active)
+
+    async def _wait_for_maintenance_gate(self) -> None:
+        """Wait until all-unloaded maintenance completes."""
+        async with self._maintenance_gate:
+            return
+
+    def _all_models_unloaded_quiescent(self) -> bool:
+        """Return True when no model is loaded, loading, leased, or pending."""
+        for entry in self._entries.values():
+            if entry.engine is not None or entry.is_loading or entry.in_use > 0:
+                return False
+            if entry.pending_unload_reason or entry.abort_requested:
+                return False
+        return True
+
+    async def _run_all_unloaded_maintenance_if_quiescent(
+        self, *, trigger_model_id: str
+    ) -> None:
+        """Run bounded SSD cache and memory maintenance after the last unload."""
+        if self._maintenance_in_progress:
+            return
+        if not self._all_models_unloaded_quiescent():
+            return
+
+        async with self._maintenance_gate:
+            if self._maintenance_in_progress:
+                return
+            if not self._all_models_unloaded_quiescent():
+                return
+            self._maintenance_in_progress = True
+            try:
+                freed = await self._run_all_unloaded_cache_janitor(
+                    trigger_model_id=trigger_model_id
+                )
+                loop = asyncio.get_running_loop()
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+                )
+                self._maintenance_runs += 1
+                self._maintenance_last_freed_bytes = freed
+                logger.info(
+                    "All-models-unloaded maintenance complete: "
+                    "ssd_freed=%s, hot_cache_preserved=True",
+                    format_size(freed),
+                )
+            finally:
+                self._maintenance_in_progress = False
+                self._wake_process_memory_enforcer()
+
+    async def _run_all_unloaded_cache_janitor(self, *, trigger_model_id: str) -> int:
+        """Run SSD cache domain janitor without touching shared hot cache."""
+        cache_dir = getattr(self._scheduler_config, "paged_ssd_cache_dir", None)
+        max_size = int(
+            getattr(self._scheduler_config, "paged_ssd_cache_max_size", 0) or 0
+        )
+        if not cache_dir or max_size <= 0:
+            return 0
+
+        from pathlib import Path
+
+        from .cache.paged_ssd_cache import PagedSSDCacheManager
+
+        def run() -> int:
+            manager = PagedSSDCacheManager(
+                cache_dir=Path(cache_dir),
+                max_size_bytes=max_size,
+                hot_cache_max_bytes=0,
+                hot_cache_budget=None,
+                expected_model_name=trigger_model_id,
+            )
+            try:
+                return manager.run_cache_domain_janitor()
+            finally:
+                manager.close()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, run)
 
     @staticmethod
     def _canonical_signature_value(value: object) -> str:
@@ -661,6 +743,7 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        await self._wait_for_maintenance_gate()
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
@@ -1173,6 +1256,9 @@ class EnginePool:
                 )
 
         self._wake_process_memory_enforcer()
+        await self._run_all_unloaded_maintenance_if_quiescent(
+            trigger_model_id=model_id
+        )
 
     async def _load_engine(
         self,
