@@ -232,6 +232,8 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
+            force_non_strict_weight_load,
+            is_weight_mismatch_error,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
         )
@@ -263,11 +265,32 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            return load(
-                self._model_name,
-                tokenizer_config=tokenizer_config,
-                trust_remote_code=self._trust_remote_code,
-            )
+            try:
+                return load(
+                    self._model_name,
+                    tokenizer_config=tokenizer_config,
+                    trust_remote_code=self._trust_remote_code,
+                )
+            except ValueError as exc:
+                # mlx-lm loads weights with strict=True and raises
+                # "Missing N parameters" when a checkpoint legitimately omits
+                # tied/optional weights (mlx nn.Module.load_weights). load()
+                # doesn't expose `strict`, so retry once forcing strict=False
+                # to skip the unmatched weights (mirrors the TTS engine).
+                if not is_weight_mismatch_error(exc):
+                    raise
+                logger.warning(
+                    "Strict weight loading failed for %s; retrying with "
+                    "strict=False so unmatched weights are skipped: %s",
+                    self._model_name,
+                    exc,
+                )
+                with force_non_strict_weight_load():
+                    return load(
+                        self._model_name,
+                        tokenizer_config=tokenizer_config,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
         loop = asyncio.get_running_loop()
         self._model, self._tokenizer = await loop.run_in_executor(

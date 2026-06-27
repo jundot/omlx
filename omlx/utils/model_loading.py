@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -16,6 +17,54 @@ logger = logging.getLogger(__name__)
 _VLM_TEXT_PREFIX = "language_model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+
+
+def is_weight_mismatch_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is an mlx strict weight-load mismatch.
+
+    mlx's ``nn.Module.load_weights(..., strict=True)`` raises ``ValueError``
+    for three mismatch shapes (see ``mlx/nn/layers/base.py``):
+
+    - ``"Missing N parameters: ..."``        — checkpoint omits model weights
+    - ``"Received N parameters not in model"`` — checkpoint has extra weights
+    - ``"Expected shape ... but received ..."`` — a weight has the wrong shape
+
+    All three are skipped when the same load runs with ``strict=False``.
+    """
+    if not isinstance(exc, ValueError):
+        return False
+    msg = str(exc)
+    return (
+        ("Missing" in msg and "parameters" in msg)
+        or "parameters not in model" in msg
+        or "Expected shape" in msg
+    )
+
+
+@contextlib.contextmanager
+def force_non_strict_weight_load():
+    """Force mlx-lm's ``load_model`` to skip unmatched weights for one load.
+
+    ``mlx_lm.load()`` does not expose ``strict``, and ``load_model`` defaults
+    to ``strict=True`` (``mlx_lm/utils.py``), so some converted/quantized
+    checkpoints that legitimately omit tied or optional weights crash with
+    ``"Missing N parameters"``. Wrapping the *current* ``load_model`` to force
+    ``strict=False`` lets those weights be skipped. Because it wraps whatever
+    ``load_model`` is bound at enter time, it composes with the other
+    ``load_model`` patches (e.g. DeepSeek V4). Restores the original on exit.
+    """
+    import mlx_lm.utils as _lu
+
+    original = _lu.load_model
+
+    def _non_strict(model_path, lazy=False, strict=True, **kwargs):
+        return original(model_path, lazy, strict=False, **kwargs)
+
+    _lu.load_model = _non_strict
+    try:
+        yield
+    finally:
+        _lu.load_model = original
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:

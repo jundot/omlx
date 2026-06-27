@@ -9,6 +9,8 @@ import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    force_non_strict_weight_load,
+    is_weight_mismatch_error,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
 )
@@ -487,3 +489,67 @@ class TestCheckpointHasMtpWeights:
         )
 
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+
+
+class TestWeightMismatchError:
+    """is_weight_mismatch_error() recognizes mlx's strict-load failures."""
+
+    def test_missing_parameters(self):
+        # The exact message mlx raises from nn.Module.load_weights.
+        exc = ValueError("Missing 285 parameters: \nfoo.bar,\nbaz.qux")
+        assert is_weight_mismatch_error(exc) is True
+
+    def test_extra_parameters_not_in_model(self):
+        exc = ValueError("Received 3 parameters not in model: \nx,\ny,\nz")
+        assert is_weight_mismatch_error(exc) is True
+
+    def test_shape_mismatch(self):
+        exc = ValueError(
+            "Expected shape (4,) but received shape (8,) for parameter w"
+        )
+        assert is_weight_mismatch_error(exc) is True
+
+    def test_unrelated_value_error_is_not_mismatch(self):
+        assert is_weight_mismatch_error(ValueError("Model type x not found")) is False
+
+    def test_non_value_error_is_not_mismatch(self):
+        # Must be a ValueError specifically; a RuntimeError with similar text
+        # should not be swallowed by the non-strict retry.
+        assert is_weight_mismatch_error(RuntimeError("Missing 285 parameters")) is False
+
+
+class TestForceNonStrictWeightLoad:
+    """force_non_strict_weight_load() forces strict=False and restores."""
+
+    def test_forces_strict_false_and_restores(self, monkeypatch):
+        import mlx_lm.utils as mlx_utils
+
+        captured = {}
+
+        def fake_load_model(model_path, lazy=False, strict=True, **kwargs):
+            captured["strict"] = strict
+            captured["kwargs"] = kwargs
+            return ("model", "config")
+
+        monkeypatch.setattr(mlx_utils, "load_model", fake_load_model)
+
+        with force_non_strict_weight_load():
+            # Wrapped: caller's strict=True default is overridden to False,
+            # and other kwargs (model_config) pass through untouched.
+            assert mlx_utils.load_model is not fake_load_model
+            result = mlx_utils.load_model("/path", False, model_config={"a": 1})
+
+        assert result == ("model", "config")
+        assert captured["strict"] is False
+        assert captured["kwargs"] == {"model_config": {"a": 1}}
+        # Original restored on exit.
+        assert mlx_utils.load_model is fake_load_model
+
+    def test_restores_on_exception(self, monkeypatch):
+        import mlx_lm.utils as mlx_utils
+
+        sentinel = mlx_utils.load_model
+        with pytest.raises(RuntimeError):
+            with force_non_strict_weight_load():
+                raise RuntimeError("boom")
+        assert mlx_utils.load_model is sentinel
