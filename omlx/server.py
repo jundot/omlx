@@ -165,6 +165,8 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.utils import (
+    build_choice_logprobs,
+    clean_output_text,
     clean_special_tokens,
     detect_and_strip_partial,
     extract_multimodal_content,
@@ -173,7 +175,7 @@ from .api.utils import (
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
+from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -3386,6 +3388,18 @@ async def create_chat_completion(
         if request.stop:
             chat_kwargs["stop"] = request.stop
 
+        # Per-token logprobs (#1549): forward to the engine, clamping the requested
+        # top_logprobs to the server-side cap. Only set when requested so the
+        # disabled path is unchanged. Built before the preflight call below so the
+        # guard sees the complete chat_kwargs.
+        if getattr(request, "logprobs", False):
+            cap = 20
+            gs = _server_state.global_settings
+            if gs is not None and getattr(gs, "sampling", None) is not None:
+                cap = getattr(gs.sampling, "top_logprobs_k", 20)
+            chat_kwargs["logprobs"] = True
+            chat_kwargs["top_logprobs"] = min(request.top_logprobs or 0, cap)
+
         # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
         # the response in a StreamingResponse — starlette emits
         # http.response.start (status 200) before iterating the body generator,
@@ -3514,6 +3528,14 @@ async def create_chat_completion(
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
+            # Per-token logprobs (#1549). D1: raw generation order — under
+            # thinking/tool extraction these cover the generated tokens, not the
+            # post-processed content substring. Gate on the request so logprobs are
+            # never serialized unless the client asked, independent of engine output.
+            choice_logprobs = None
+            if getattr(request, "logprobs", False):
+                choice_logprobs = build_choice_logprobs(output.logprobs, engine.tokenizer)
+
             return ChatCompletionResponse(
                 model=request.model,
                 choices=[
@@ -3526,6 +3548,7 @@ async def create_chat_completion(
                             tool_calls=tool_calls,
                         ),
                         finish_reason=finish_reason,
+                        logprobs=choice_logprobs,
                     )
                 ],
                 usage=Usage(
@@ -4198,6 +4221,10 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    # Per-token logprobs (#1549): only when requested AND no tool-call filter is
+    # active. The tool filter buffers/strips markup independently, so logprob
+    # alignment through it is not supported yet — omit rather than misalign.
+    want_logprobs = getattr(request, "logprobs", False) and tool_filter is None
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if first_token_time is None and output.new_text:
@@ -4207,7 +4234,25 @@ async def stream_chat_completion(
                 accumulated_text += output.new_text
 
             if stream_content and output.new_text:
-                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+                if want_logprobs and output.logprobs:
+                    # Feed per token so content logprobs stay aligned to content
+                    # tokens through tag-lookahead buffering (#1549, Phase 3b).
+                    td_parts, cd_parts, content_lps = [], [], []
+                    for tl in output.logprobs:
+                        td_i, cd_i, clps_i = thinking_parser.feed_with_logprob(
+                            tl.text, tl
+                        )
+                        if td_i:
+                            td_parts.append(td_i)
+                        if cd_i:
+                            cd_parts.append(cd_i)
+                        if clps_i:
+                            content_lps.extend(clps_i)
+                    thinking_delta = "".join(td_parts)
+                    content_delta = "".join(cd_parts)
+                else:
+                    thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+                    content_lps = None
 
                 # Emit reasoning_content delta
                 if thinking_delta:
@@ -4234,6 +4279,11 @@ async def stream_chat_completion(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        # Logprobs (#1549): content_lps are aligned to this
+                        # chunk's content tokens (per-token feed above).
+                        chunk_logprobs = build_choice_logprobs(
+                            content_lps, engine.tokenizer
+                        )
                         chunk = ChatCompletionChunk(
                             id=response_id,
                             model=request.model,
@@ -4243,6 +4293,7 @@ async def stream_chat_completion(
                                         content=content_delta
                                     ),
                                     finish_reason=None,
+                                    logprobs=chunk_logprobs,
                                 )
                             ],
                         )
@@ -4256,7 +4307,13 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        if want_logprobs:
+            thinking_delta, content_delta, content_lps = (
+                thinking_parser.finish_with_logprob()
+            )
+        else:
+            thinking_delta, content_delta = thinking_parser.finish()
+            content_lps = None
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -4294,6 +4351,7 @@ async def stream_chat_completion(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                chunk_logprobs = build_choice_logprobs(content_lps, engine.tokenizer)
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -4301,6 +4359,7 @@ async def stream_chat_completion(
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(content=content_delta),
                             finish_reason=None,
+                            logprobs=chunk_logprobs,
                         )
                     ],
                 )

@@ -1861,6 +1861,30 @@ class TestSamplingSettings:
         assert with_policy.max_context_window_policy == 128_000
         assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
+    def test_top_logprobs_k_default_is_20(self):
+        """Launch-side logprobs cap defaults to 20 (#1549)."""
+        assert SamplingSettings().top_logprobs_k == 20
+
+    def test_top_logprobs_k_clamped_high(self):
+        """Values above the OpenAI ceiling clamp to 20."""
+        assert SamplingSettings(top_logprobs_k=50).top_logprobs_k == 20
+
+    def test_top_logprobs_k_clamped_negative(self):
+        """Negative values clamp to 0."""
+        assert SamplingSettings(top_logprobs_k=-5).top_logprobs_k == 0
+
+    def test_top_logprobs_k_roundtrip(self):
+        """top_logprobs_k round-trips through from_dict / to_dict."""
+        settings = SamplingSettings.from_dict({"top_logprobs_k": 5})
+        assert settings.top_logprobs_k == 5
+        assert settings.to_dict()["top_logprobs_k"] == 5
+
+    def test_top_logprobs_k_from_dict_default(self):
+        assert SamplingSettings.from_dict({}).top_logprobs_k == 20
+
+    def test_top_logprobs_k_from_dict_clamps(self):
+        assert SamplingSettings.from_dict({"top_logprobs_k": 99}).top_logprobs_k == 20
+
 
 class TestClaudeCodeSettings:
     """Tests for ClaudeCodeSettings dataclass."""

@@ -232,6 +232,9 @@ class ThinkingParser:
     def __init__(self, start_in_thinking: bool = False):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
+        # Per-char logprob objects parallel to ``_buffer`` (only populated on
+        # the logprob-aware path; the text-only path never reads it).
+        self._buffer_lps: list = []
         # Recovery state for malformed thinking: when the prompt prepends
         # ``<think>`` and the model never emits ``</think>`` before EOS,
         # everything we streamed went out as thinking. The streamed events
@@ -251,15 +254,43 @@ class ThinkingParser:
         Returns:
             Tuple of (thinking_text, content_text) extracted from this chunk.
         """
-        if not text:
-            return ("", "")
+        thinking_delta, content_delta, _ = self._process(text, None)
+        return (thinking_delta, content_delta)
 
-        # Prepend any buffered partial tag content
+    def feed_with_logprob(self, text: str, token_logprob):
+        """Logprob-aware feed for a single token's text (#1549).
+
+        Identical text routing to :meth:`feed`, but also returns the logprob
+        objects for the content tokens emitted by this call — one entry per
+        content-contributing token, aligned to ``content_delta`` even across
+        tag-lookahead buffering. Tokens whose text is tag markup or thinking
+        produce no content entry.
+
+        Returns:
+            Tuple of (thinking_delta, content_delta, content_logprobs).
+        """
+        return self._process(text, token_logprob)
+
+    def _process(self, text: str, lp):
+        """Shared core for feed/feed_with_logprob.
+
+        When ``lp`` is None this is the text-only path (no logprob tracking,
+        behaviour identical to the original ``feed``). Otherwise every char of
+        ``text`` is attributed to ``lp`` and content logprobs are returned.
+        """
+        track = lp is not None
+        if not text:
+            return ("", "", [] if track else None)
+
+        # Prepend any buffered partial tag content (and its per-char logprobs).
+        char_lps = (self._buffer_lps + [lp] * len(text)) if track else None
         text = self._buffer + text
         self._buffer = ""
+        self._buffer_lps = []
 
         thinking_out = []
         content_out = []
+        content_lp_chars = []
 
         i = 0
         while i < len(text):
@@ -284,6 +315,8 @@ class ThinkingParser:
                 if self._could_be_tag(remaining):
                     # Buffer the rest and wait for more data
                     self._buffer = remaining
+                    if track:
+                        self._buffer_lps = char_lps[i:]
                     break
 
                 # Not a tag, emit the '<' as regular content
@@ -291,12 +324,16 @@ class ThinkingParser:
                     thinking_out.append('<')
                 else:
                     content_out.append('<')
+                    if track:
+                        content_lp_chars.append(char_lps[i])
                 i += 1
             else:
                 if self._in_thinking:
                     thinking_out.append(text[i])
                 else:
                     content_out.append(text[i])
+                    if track:
+                        content_lp_chars.append(char_lps[i])
                 i += 1
 
         thinking_delta = "".join(thinking_out)
@@ -305,7 +342,17 @@ class ThinkingParser:
             self._thinking_accumulated.append(thinking_delta)
         if content_delta:
             self._content_emitted = True
-        return (thinking_delta, content_delta)
+        content_lps = self._group_lps(content_lp_chars) if track else None
+        return (thinking_delta, content_delta, content_lps)
+
+    @staticmethod
+    def _group_lps(lp_chars: list) -> list:
+        """Collapse per-char logprob objects to one entry per token (by identity)."""
+        out: list = []
+        for clp in lp_chars:
+            if not out or out[-1] is not clp:
+                out.append(clp)
+        return out
 
     def finish(self) -> Tuple[str, str]:
         """Flush any remaining buffered content.
@@ -321,8 +368,23 @@ class ThinkingParser:
             Tuple of (thinking_text, content_text) from remaining buffer
             (plus recovered content if applicable).
         """
+        thinking_delta, content_delta, _ = self._finish_impl(False)
+        return (thinking_delta, content_delta)
+
+    def finish_with_logprob(self):
+        """Logprob-aware flush; returns (thinking_delta, content_delta, content_logprobs).
+
+        The malformed-thinking recovery path re-emits accumulated thinking text
+        as content; those tokens were never tracked as content, so the recovered
+        content carries no logprobs (empty list).
+        """
+        return self._finish_impl(True)
+
+    def _finish_impl(self, track: bool):
         partial = self._buffer
+        partial_lps = self._buffer_lps
         self._buffer = ""
+        self._buffer_lps = []
 
         # Recovery: prompt opened a thinking block (or model echoed
         # ``<think>`` itself), the close tag never arrived, and nothing
@@ -339,18 +401,19 @@ class ThinkingParser:
         ):
             recovered = "".join(self._thinking_accumulated) + partial
             self._content_emitted = True
-            return ("", recovered)
+            return ("", recovered, [] if track else None)
 
         if not partial:
-            return ("", "")
+            return ("", "", [] if track else None)
 
         # Partial tag never completed — emit it as-is in the current mode.
         if self._in_thinking:
             self._thinking_accumulated.append(partial)
-            return (partial, "")
+            return (partial, "", [] if track else None)
         else:
             self._content_emitted = True
-            return ("", partial)
+            content_lps = self._group_lps(partial_lps) if track else None
+            return ("", partial, content_lps)
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:
