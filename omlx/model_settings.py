@@ -373,10 +373,31 @@ class ModelSettingsManager:
         }
 
         try:
-            # Write in-place so symlinks and hard links are preserved, consistent
-            # with how settings.json is saved via GlobalSettings.save.
-            with open(self.settings_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            # Serialize first so any JSON encoding errors surface before we
+            # touch the filesystem — avoids writing a partial/corrupt file.
+            serialized = json.dumps(data, indent=2, ensure_ascii=False)
+
+            # Write to a temp file first for crash-safety.  If this step fails
+            # or the process is killed, the original file is untouched.
+            temp_file = self.settings_file.with_suffix(".tmp")
+            temp_file.write_text(serialized, encoding="utf-8")
+
+            try:
+                # Write to the original path in-place so the inode is preserved.
+                # This keeps symlinks and hard links valid — atomic rename would
+                # unlink the original inode and break them (see issue #1958).
+                with open(self.settings_file, "w", encoding="utf-8") as f:
+                    f.write(serialized)
+            except Exception:
+                # temp_file holds the complete, valid serialization and can be
+                # used for manual recovery if the in-place write failed.
+                logger.warning(
+                    f"In-place write failed; recovery backup at {temp_file}"
+                )
+                raise
+            else:
+                temp_file.unlink(missing_ok=True)
+
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
