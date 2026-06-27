@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for process memory reclamation helpers."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from omlx.utils import memory_reclaim
 
@@ -10,6 +10,8 @@ def _reset_resolution_state():
     memory_reclaim._resolved = False
     memory_reclaim._pressure_relief_fn = None
     memory_reclaim._default_zone_fn = None
+    memory_reclaim._get_all_zones_fn = None
+    memory_reclaim._mach_task_self = 0
 
 
 def test_release_free_malloc_pages_noops_off_macos():
@@ -43,6 +45,9 @@ def test_release_free_malloc_pages_calls_default_zone_pressure_relief():
 
     with patch.object(memory_reclaim.sys, "platform", "darwin"), \
          patch.object(memory_reclaim.ctypes, "CDLL", return_value=mock_lib):
-        assert memory_reclaim.release_free_malloc_pages() == 4096
+        assert memory_reclaim.release_free_malloc_pages() == 8192
 
-    mock_pressure_relief.assert_called_once_with(1234, 0)
+    assert mock_pressure_relief.call_args_list == [
+        call(1234, memory_reclaim._PRESSURE_RELIEF_GOAL),
+        call(1234, memory_reclaim._PRESSURE_RELIEF_GOAL),
+    ]

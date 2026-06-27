@@ -13,6 +13,7 @@ Supports:
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -686,6 +687,18 @@ class MLXRerankerModel:
           in some MLX output containers.
         - Compile a narrow function that returns logits only.
         """
+        if os.getenv("OMLX_RERANKER_COMPILE", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+        }:
+            logger.info(
+                f"mx.compile skipped for {self.model_name} "
+                "(set OMLX_RERANKER_COMPILE=1 to enable)"
+            )
+            self._compiled_seq_logits = None
+            return False
+
         if self._is_causal_lm or self._is_vl_reranker:
             # CausalLM / VL reranker paths use custom scoring (yes/no logits or
             # mlx-embeddings model.process). VL forward needs pixel_values and
