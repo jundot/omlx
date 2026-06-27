@@ -745,23 +745,53 @@ class EnginePool:
                         )
                         await self._unload_engine(victim)
                         continue
-                    # Nothing else to evict -- model cannot fit. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when the model would fit on a clean process but the
-                    # current usage leaves no room.
+                    # Nothing else to evict. Before failing, re-test against
+                    # the *tracked committed* baseline. The phys_footprint term
+                    # folded into `current` is the macOS kernel ledger, which
+                    # still counts reclaimable residue from models we just
+                    # evicted -- dirty file-backed (mmap'd weight) and
+                    # IOAccelerator pages the kernel has not reaped yet but
+                    # drops under allocation pressure (jetsam reclaims them
+                    # before OOM-killing). That residue caused false 507s on
+                    # back-to-back large-model swaps: eviction settled (both
+                    # mx.get_active_memory() and _current_model_memory dropped)
+                    # yet phys_footprint lagged hundreds of GB high, so a model
+                    # that fits cleanly on its own was rejected. The pool's
+                    # tracked accumulator excludes that residue, so once there
+                    # is nothing left to evict, trust it. Pinned/in-use models
+                    # that could not be evicted remain counted in
+                    # _current_model_memory, so this never over-admits past
+                    # genuinely committed memory (see #1623).
+                    committed = max(
+                        mx.get_active_memory(), self._current_model_memory
+                    )
+                    committed_projected = committed + entry.estimated_size
+                    if committed_projected <= ceiling:
+                        logger.info(
+                            f"Admitting '{model_id}': committed baseline "
+                            f"{format_size(committed_projected)} fits ceiling "
+                            f"{format_size(ceiling)} "
+                            f"(live footprint {format_size(projected)} included "
+                            "reclaimable residue from evicted models)"
+                        )
+                        break
+
+                    # Still over budget even discounting reclaimable residue --
+                    # a genuine shortfall. Use ModelTooLargeError when the model
+                    # alone exceeds the ceiling (no chance of fitting),
+                    # InsufficientMemoryError when committed usage leaves no room.
                     if entry.estimated_size > ceiling:
                         raise ModelTooLargeError(
                             model_id, entry.estimated_size, ceiling
                         )
                     raise InsufficientMemoryError(
                         required=entry.estimated_size,
-                        current=current,
+                        current=committed,
                         message=(
                             f"Cannot load {model_id}: projected memory "
-                            f"{format_size(projected)} would exceed the memory "
-                            f"ceiling {format_size(ceiling)} "
-                            f"(current: {format_size(current)}, "
+                            f"{format_size(committed_projected)} would exceed "
+                            f"the memory ceiling {format_size(ceiling)} "
+                            f"(committed: {format_size(committed)}, "
                             f"model: {format_size(entry.estimated_size)}). "
                             "Free system memory or lower memory_guard_tier."
                         ),
