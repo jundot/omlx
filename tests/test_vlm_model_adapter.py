@@ -55,6 +55,26 @@ class TestVLMModelAdapter:
         assert adapter._pending_embeds is None
         assert adapter._embed_offset == 0
 
+    def test_release_resources_drops_model_references(self):
+        """release_resources drops raw VLM/language model and pending arrays."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter._pending_embeds = MockMXArray()
+        adapter._pending_kwargs = {"position_ids": MockMXArray()}
+        adapter._uid_rope_deltas[1] = 2.0
+        adapter._batch_rope_deltas = MockMXArray()
+
+        adapter.release_resources()
+
+        assert adapter._vlm_model is None
+        assert adapter._language_model is None
+        assert adapter._pending_embeds is None
+        assert adapter._pending_kwargs == {}
+        assert adapter._uid_rope_deltas == {}
+        assert adapter._batch_rope_deltas is None
+
     def test_layers_property(self):
         """Test layers property delegates to language_model.model.layers."""
         from omlx.models.vlm import VLMModelAdapter

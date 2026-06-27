@@ -684,7 +684,12 @@ class TestEngineCoreClose:
             timeout_future = MagicMock()
             timeout_future.result.side_effect = concurrent.futures.TimeoutError
             executor = MagicMock()
-            executor.submit.side_effect = [ok_future, ok_future, timeout_future]
+            executor.submit.side_effect = [
+                ok_future,
+                ok_future,
+                ok_future,
+                timeout_future,
+            ]
             engine._mlx_executor = executor
 
             with (

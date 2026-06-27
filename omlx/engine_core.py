@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
 import os
 import time
@@ -38,7 +39,7 @@ from .exceptions import PrefillMemoryExceededError
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig
+from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.compile_cache import (
     clear_thread_compile_cache,
     compile_cache_clear_available,
@@ -76,6 +77,13 @@ _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 # these stay empty and the worker threads shut down normally.
 _immortal_mlx_executors: list = []
 _immortal_mlx_streams: list = []
+
+
+def _final_engine_thread_reclaim(stream: Any) -> None:
+    """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
+    gc.collect()
+    _sync_and_clear_cache(stream)
+    gc.collect()
 
 
 def _init_mlx_thread() -> None:
@@ -1043,6 +1051,10 @@ class EngineCore:
                     exc_info=True,
                 )
 
+        # Drop the last bound-method reference from the teardown loop before
+        # the final GC/reclaim pass below.
+        fn = None
+
         # Guarantee the SSD cache manager is released even if shutdown() did not
         # reach its own close() above. The manager's writer thread holds a strong
         # reference to it, so an unclosed manager leaks until restart.
@@ -1057,8 +1069,57 @@ class EngineCore:
                     exc_info=True,
                 )
             self.scheduler.paged_ssd_cache_manager = None
+        manager = None
+
+        # Clear output collectors before dropping model/scheduler references so
+        # any request-side caches they retain are eligible for the final reclaim.
+        for collector in self._output_collectors.values():
+            collector.clear()
+        self._output_collectors.clear()
+        self._stream_states.clear()
+        self._finished_events.clear()
+        self._finished_at.clear()
+
+        release_model_resources = getattr(self.model, "release_resources", None)
+        if callable(release_model_resources):
+            try:
+                release_model_resources()
+            except Exception:
+                logger.warning(
+                    "Engine %s: model resource release failed during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+        release_model_resources = None
+
+        # Release model, tokenizer, and scheduler references before the final
+        # MLX reclaim. The reclaim must run on this engine's worker thread and
+        # stream; clearing on the global executor cannot reliably return this
+        # thread/stream-local Metal memory to MLX.
+        self.model = None
+        self.tokenizer = None
+        self.scheduler = None
 
         if self._mlx_executor is not None:
+            try:
+                self._mlx_executor.submit(
+                    _final_engine_thread_reclaim, self._mlx_stream
+                ).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                fatal_exit(
+                    f"Engine teardown timed out after "
+                    f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
+                    f"MLX memory for engine {self._engine_id}"
+                )
+            except RuntimeError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Engine %s: final MLX reclaim raised during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+
             # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
             # this worker thread exits with a non-empty cache, ~CompilerCache
             # frees the cached graphs' Python objects from a thread-exit handler
@@ -1089,19 +1150,6 @@ class EngineCore:
                 _immortal_mlx_executors.append(self._mlx_executor)
                 _immortal_mlx_streams.append(self._mlx_stream)
             self._mlx_executor = None
-
-        # Clear output collectors
-        for collector in self._output_collectors.values():
-            collector.clear()
-        self._output_collectors.clear()
-        self._stream_states.clear()
-        self._finished_events.clear()
-        self._finished_at.clear()
-
-        # Release model and tokenizer references for GC
-        self.model = None
-        self.tokenizer = None
-        self.scheduler = None
 
         logger.debug(f"Engine {self._engine_id} closed")
 
