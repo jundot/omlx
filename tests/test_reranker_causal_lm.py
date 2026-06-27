@@ -584,6 +584,42 @@ class TestRerankerCompileFallback:
         assert result is False
         assert model._compiled_seq_logits is None
 
+    def test_try_compile_can_be_disabled_by_env(self, tmp_path):
+        """Environment can disable reranker compile for troubleshooting."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = False
+        model._is_vl_reranker = False
+        model.model = MagicMock()
+
+        with patch.dict("os.environ", {"OMLX_RERANKER_COMPILE": "0"}), \
+             patch("omlx.models.reranker.mx") as mock_mx:
+            result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_seq_logits is None
+        mock_mx.compile.assert_not_called()
+
+    def test_try_compile_enabled_by_default(self, tmp_path):
+        """Reranker compile remains enabled unless explicitly disabled."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = False
+        model._is_vl_reranker = False
+        model.model = MagicMock()
+
+        with patch.dict("os.environ", {}, clear=True), \
+             patch("omlx.models.reranker.mx") as mock_mx:
+            mock_compiled_fn = MagicMock(return_value=MagicMock())
+            mock_mx.compile.return_value = mock_compiled_fn
+            mock_mx.zeros.return_value = MagicMock()
+            mock_mx.ones.return_value = MagicMock()
+            mock_mx.int32 = "int32"
+            result = model._try_compile()
+
+        assert result is True
+        assert model._compiled_seq_logits is mock_compiled_fn
+
     def test_release_resources_drops_model_references(self):
         """release_resources should break compiled closures and model refs."""
         model = MLXRerankerModel("test-model")

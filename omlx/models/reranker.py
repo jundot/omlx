@@ -687,14 +687,14 @@ class MLXRerankerModel:
           in some MLX output containers.
         - Compile a narrow function that returns logits only.
         """
-        if os.getenv("OMLX_RERANKER_COMPILE", "").lower() not in {
-            "1",
-            "true",
-            "yes",
+        if os.getenv("OMLX_RERANKER_COMPILE", "").lower() in {
+            "0",
+            "false",
+            "no",
         }:
             logger.info(
                 f"mx.compile skipped for {self.model_name} "
-                "(set OMLX_RERANKER_COMPILE=1 to enable)"
+                "(OMLX_RERANKER_COMPILE disables it)"
             )
             self._compiled_seq_logits = None
             return False
