@@ -152,6 +152,10 @@ class TestPagedSSDBlockMetadata:
         assert d["model_name"] == "test-model"
         assert d["block_size"] == 2048
         assert d["cache_signature"] == "sig"
+        assert d["model_role"] == "unknown"
+        assert d["hit_count"] == 0
+        assert d["last_hit_at"] == 0.0
+        assert d["hot_cache_evictions"] == 0
         assert d["layer_cache_types"] == ["KVCache", "ArraysCache"]
         assert d["layer_meta_states"] == [[0], [1, 2, 3, 4]]
 
@@ -168,6 +172,10 @@ class TestPagedSSDBlockMetadata:
             "model_name": "test-model",
             "block_size": 2048,
             "cache_signature": "sig",
+            "model_role": "primary_chat",
+            "hit_count": 2,
+            "last_hit_at": 1200.0,
+            "hot_cache_evictions": 1,
             "layer_cache_types": ["KVCache", "RotatingKVCache"],
             "layer_meta_states": [[0], [1, 2, 3, 4]],
         }
@@ -179,6 +187,10 @@ class TestPagedSSDBlockMetadata:
         assert metadata.file_size == 1024
         assert metadata.block_size == 2048
         assert metadata.cache_signature == "sig"
+        assert metadata.model_role == "primary_chat"
+        assert metadata.hit_count == 2
+        assert metadata.last_hit_at == 1200.0
+        assert metadata.hot_cache_evictions == 1
         assert metadata.layer_cache_types == ["KVCache", "RotatingKVCache"]
         assert metadata.layer_meta_states == [(0,), (1, 2, 3, 4)]
 
@@ -199,8 +211,29 @@ class TestPagedSSDBlockMetadata:
         assert metadata.model_name == ""
         assert metadata.block_size == 0
         assert metadata.cache_signature == ""
+        assert metadata.model_role == "unknown"
+        assert metadata.hit_count == 0
+        assert metadata.last_hit_at == 0.0
+        assert metadata.hot_cache_evictions == 0
         assert metadata.layer_cache_types is None
         assert metadata.layer_meta_states is None
+
+    def test_touch_can_record_hit(self):
+        """Test touch can update reuse accounting."""
+        metadata = PagedSSDBlockMetadata(
+            block_hash=b"test_hash_bytes_1234",
+            file_path=Path("/tmp/test.safetensors"),
+            file_size=1024,
+            token_count=64,
+            created_at=1000.0,
+            last_access=1000.0,
+            num_layers=32,
+        )
+
+        metadata.touch(hit=True)
+
+        assert metadata.hit_count == 1
+        assert metadata.last_hit_at == metadata.last_access
 
 
 class TestPagedSSDCacheIndex:
@@ -457,6 +490,180 @@ class TestPagedSSDCacheIndex:
         assert len(all_hashes) == 3
         for h in hashes:
             assert h in all_hashes
+
+
+class TestPagedSSDCacheDomainPolicy:
+    """Tests for single-instance logical SSD cache domain policy."""
+
+    def _metadata(
+        self,
+        tmp_path: Path,
+        name: str,
+        *,
+        size: int = 1024,
+        last_access: float = 1000.0,
+        model_name: str = "model",
+        model_role: str = "assistant_chat",
+        hit_count: int = 0,
+        token_count: int = 64,
+        cache_signature: str = "sig",
+    ) -> PagedSSDBlockMetadata:
+        file_path = tmp_path / f"{name}.safetensors"
+        file_path.write_bytes(b"x")
+        return PagedSSDBlockMetadata(
+            block_hash=name.encode("utf-8").ljust(32, b"_")[:32],
+            file_path=file_path,
+            file_size=size,
+            token_count=token_count,
+            created_at=last_access,
+            last_access=last_access,
+            num_layers=32,
+            model_name=model_name,
+            block_size=256,
+            cache_signature=cache_signature,
+            model_role=model_role,
+            hit_count=hit_count,
+            last_hit_at=last_access if hit_count else 0.0,
+        )
+
+    def test_eviction_prefers_low_value_auxiliary_over_primary(
+        self, tmp_path: Path
+    ):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path,
+            max_size_bytes=3 * 1024,
+            expected_model_name="primary-model",
+        )
+        try:
+            primary = self._metadata(
+                tmp_path,
+                "primary",
+                model_name="primary-model",
+                model_role="primary_chat",
+                hit_count=5,
+                last_access=900.0,
+            )
+            auxiliary = self._metadata(
+                tmp_path,
+                "auxiliary",
+                model_name="helper-model",
+                model_role="assistant_chat",
+                hit_count=0,
+                last_access=1000.0,
+            )
+            manager._index.add(primary)
+            manager._index.add(auxiliary)
+
+            evicted = manager._evict_tracked_until_size(1024, max_count=1)
+
+            assert [metadata.block_hash for _, metadata in evicted] == [
+                auxiliary.block_hash
+            ]
+            assert manager._index.contains(primary.block_hash)
+            assert not manager._index.contains(auxiliary.block_hash)
+        finally:
+            manager.close()
+
+    def test_eviction_prefers_incompatible_before_compatible(
+        self, tmp_path: Path
+    ):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path,
+            max_size_bytes=3 * 1024,
+            expected_model_name="primary-model",
+        )
+        try:
+            compatible = self._metadata(
+                tmp_path,
+                "compatible",
+                model_name="primary-model",
+                model_role="primary_chat",
+                hit_count=3,
+                last_access=900.0,
+            )
+            incompatible = self._metadata(
+                tmp_path,
+                "incompatible",
+                model_name="old-helper",
+                model_role="assistant_chat",
+                last_access=1100.0,
+            )
+            manager._index.add(compatible)
+            manager._incompatible_index.add(incompatible)
+
+            evicted = manager._evict_tracked_until_size(1024, max_count=1)
+
+            assert [metadata.block_hash for _, metadata in evicted] == [
+                incompatible.block_hash
+            ]
+            assert manager._index.contains(compatible.block_hash)
+        finally:
+            manager.close()
+
+    def test_low_value_embedding_hot_eviction_is_not_persisted(
+        self, tmp_path: Path
+    ):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path,
+            max_size_bytes=1024,
+            hot_cache_only=True,
+            expected_model_name="primary-model",
+        )
+        embedding = self._metadata(
+            tmp_path,
+            "embedding",
+            model_name="Qwen3-Embedding-0.6B-8bit",
+            model_role="embedding",
+            hit_count=0,
+        )
+        entry = {
+            "block_metadata": embedding,
+            "file_metadata": {},
+            "tensors_raw": {"x": (b"x", "F16", [1])},
+            "dirty": True,
+        }
+
+        manager._handle_hot_cache_eviction(embedding.block_hash, entry)
+
+        assert manager._stats["ssd_write_drops"] == 1
+        assert manager._index.count == 0
+
+    def test_cache_domain_janitor_trims_auxiliary_budget_first(
+        self, tmp_path: Path
+    ):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path,
+            max_size_bytes=10 * 1024,
+            expected_model_name="primary-model",
+        )
+        try:
+            primary = self._metadata(
+                tmp_path,
+                "primary_janitor",
+                size=8 * 1024,
+                model_name="primary-model",
+                model_role="primary_chat",
+                hit_count=10,
+            )
+            auxiliary = self._metadata(
+                tmp_path,
+                "aux_janitor",
+                size=4 * 1024,
+                model_name="helper-model",
+                model_role="assistant_chat",
+                hit_count=0,
+            )
+            manager._index.add(primary)
+            manager._index.add(auxiliary)
+
+            freed = manager.run_cache_domain_janitor(max_unlinks=1)
+
+            assert freed == auxiliary.file_size
+            assert manager._index.contains(primary.block_hash)
+            assert not manager._index.contains(auxiliary.block_hash)
+            assert not auxiliary.file_path.exists()
+        finally:
+            manager.close()
 
 
 class TestPagedSSDCacheManager:

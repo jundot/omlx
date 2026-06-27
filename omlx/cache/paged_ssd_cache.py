@@ -158,6 +158,16 @@ _CACHE_FORMAT_VERSION = "3"
 # sees a uniform shape. New writes always use V3.
 _READABLE_CACHE_FORMAT_VERSIONS = frozenset({"2", "3"})
 
+_CACHE_ROLE_PRIMARY_CHAT = "primary_chat"
+_CACHE_ROLE_ASSISTANT_CHAT = "assistant_chat"
+_CACHE_ROLE_EMBEDDING = "embedding"
+_CACHE_ROLE_RERANK = "rerank"
+_CACHE_ROLE_UNKNOWN = "unknown"
+_CACHE_DOMAIN_INCOMPATIBLE_MAX_FRACTION = 0.10
+_CACHE_DOMAIN_ASSISTANT_CHAT_MAX_FRACTION = 0.20
+_CACHE_DOMAIN_EMBEDDING_RERANK_MAX_FRACTION = 0.05
+_CACHE_DOMAIN_JANITOR_MAX_UNLINKS = 32
+
 
 # Layer cache type names whose meta_state should be clamped on save so the
 # rotating buffer's _idx never exceeds the actual buffer length. Restoring a
@@ -203,6 +213,26 @@ def _cache_compat_signature(
         "layer_cache_types": list(layer_cache_types or []),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _infer_model_role(model_name: str, expected_model_name: str = "") -> str:
+    """Infer a coarse cache domain role from model identity."""
+    normalized = (model_name or "").rstrip("/")
+    basename = os.path.basename(normalized).lower()
+    expected = (expected_model_name or "").rstrip("/")
+    expected_basename = os.path.basename(expected).lower()
+
+    if expected and (
+        normalized == expected or (basename and basename == expected_basename)
+    ):
+        return _CACHE_ROLE_PRIMARY_CHAT
+    if "embed" in basename or "bge-m3" in basename:
+        return _CACHE_ROLE_EMBEDDING
+    if "rerank" in basename or "reranker" in basename:
+        return _CACHE_ROLE_RERANK
+    if basename:
+        return _CACHE_ROLE_ASSISTANT_CHAT
+    return _CACHE_ROLE_UNKNOWN
 
 
 def _clamp_rotating_meta_states(
@@ -472,6 +502,10 @@ class PagedSSDBlockMetadata:
         model_name: Model name for cache isolation between different models
         block_size: Paged cache block size that created this block
         cache_signature: Compatibility signature for the saved cache layout
+        model_role: Coarse role for multi-model cache policy
+        hit_count: Number of successful cache hits observed for this block
+        last_hit_at: Last successful hit time, or 0 when never hit
+        hot_cache_evictions: Number of hot-tier evictions for this block
         layer_cache_types: Per-layer cache type names (e.g., ["KVCache", "ArraysCache"])
         layer_meta_states: Per-layer meta_state tuples for reconstruction
     """
@@ -486,12 +520,24 @@ class PagedSSDBlockMetadata:
     model_name: str = ""
     block_size: int = 0
     cache_signature: str = ""
+    model_role: str = _CACHE_ROLE_UNKNOWN
+    hit_count: int = 0
+    last_hit_at: float = 0.0
+    hot_cache_evictions: int = 0
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
 
-    def touch(self) -> None:
-        """Update last access time."""
-        self.last_access = time.time()
+    def touch(self, *, hit: bool = False) -> None:
+        """Update last access time and optional hit accounting."""
+        now = time.time()
+        self.last_access = now
+        if hit:
+            self.hit_count += 1
+            self.last_hit_at = now
+
+    def record_hot_cache_eviction(self) -> None:
+        """Record that this block left the hot tier."""
+        self.hot_cache_evictions += 1
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -506,6 +552,10 @@ class PagedSSDBlockMetadata:
             "model_name": self.model_name,
             "block_size": self.block_size,
             "cache_signature": self.cache_signature,
+            "model_role": self.model_role,
+            "hit_count": self.hit_count,
+            "last_hit_at": self.last_hit_at,
+            "hot_cache_evictions": self.hot_cache_evictions,
         }
         if self.layer_cache_types:
             result["layer_cache_types"] = self.layer_cache_types
@@ -533,6 +583,10 @@ class PagedSSDBlockMetadata:
             model_name=data.get("model_name", ""),
             block_size=data.get("block_size", 0),
             cache_signature=data.get("cache_signature", ""),
+            model_role=data.get("model_role", _CACHE_ROLE_UNKNOWN),
+            hit_count=int(data.get("hit_count", 0) or 0),
+            last_hit_at=float(data.get("last_hit_at", 0.0) or 0.0),
+            hot_cache_evictions=int(data.get("hot_cache_evictions", 0) or 0),
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
         )
@@ -623,16 +677,17 @@ class PagedSSDCacheIndex:
             self._total_size -= metadata.file_size
             return metadata
 
-    def touch(self, block_hash: bytes) -> None:
+    def touch(self, block_hash: bytes, *, hit: bool = False) -> None:
         """
         Update last access time (move to end of LRU).
 
         Args:
             block_hash: Block content hash.
+            hit: Whether this touch corresponds to a successful cache hit.
         """
         with self._lock:
             if block_hash in self._index:
-                self._index[block_hash].touch()
+                self._index[block_hash].touch(hit=hit)
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
 
@@ -1123,6 +1178,25 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        blk_meta = entry.get("block_metadata")
+        if isinstance(blk_meta, PagedSSDBlockMetadata):
+            blk_meta.record_hot_cache_eviction()
+            file_metadata = entry.get("file_metadata")
+            if isinstance(file_metadata, dict):
+                file_metadata["hot_cache_evictions"] = str(
+                    blk_meta.hot_cache_evictions
+                )
+            if not self._should_persist_hot_eviction(blk_meta):
+                self._stats["ssd_write_drops"] += 1
+                logger.debug(
+                    "Dropped low-value hot cache block instead of persisting "
+                    "to SSD: role=%s hits=%d tokens=%d hash=%s",
+                    blk_meta.model_role,
+                    blk_meta.hit_count,
+                    blk_meta.token_count,
+                    block_hash.hex()[:16],
+                )
+                return
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -1130,6 +1204,20 @@ class PagedSSDCacheManager(CacheManager):
             )
             return
         self._enqueue_ssd_write(block_hash, entry)
+
+    def _should_persist_hot_eviction(self, metadata: PagedSSDBlockMetadata) -> bool:
+        """Return whether an evicted hot block is valuable enough for SSD."""
+        if metadata.model_role == _CACHE_ROLE_PRIMARY_CHAT:
+            return True
+        if metadata.hit_count > 0:
+            return True
+        if metadata.hot_cache_evictions > 1:
+            return True
+        if metadata.token_count >= max(self._expected_block_size or 0, 1024):
+            return True
+        if metadata.model_role in {_CACHE_ROLE_EMBEDDING, _CACHE_ROLE_RERANK}:
+            return False
+        return True
 
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
@@ -1205,6 +1293,7 @@ class PagedSSDCacheManager(CacheManager):
         if not tensors_raw:
             return False
         metadata = entry["file_metadata"]
+        self._sync_policy_metadata(metadata, blk_meta)
 
         # 1. Buffer first — instant read-back for concurrent loads (CPD K1).
         #    Must precede _index.add so load_block never sees an index hit
@@ -1338,6 +1427,111 @@ class PagedSSDCacheManager(CacheManager):
     def _tracked_ssd_count(self) -> int:
         """Return compatible plus incompatible tracked SSD cache file count."""
         return self._index.count + self._incompatible_index.count
+
+    def _cache_domain_usage(self) -> dict[str, dict[str, int]]:
+        """Return byte/file usage grouped by compatibility and role."""
+        usage: dict[str, dict[str, int]] = {}
+
+        def add(metadata: PagedSSDBlockMetadata, *, compatible: bool) -> None:
+            compat = "compatible" if compatible else "incompatible"
+            role = metadata.model_role or _infer_model_role(
+                metadata.model_name, self._expected_model_name
+            )
+            key = f"{compat}:{role}:{metadata.cache_signature or 'no_signature'}"
+            bucket = usage.setdefault(key, {"bytes": 0, "files": 0})
+            bucket["bytes"] += metadata.file_size
+            bucket["files"] += 1
+
+        for metadata in self._index.get_all_metadata():
+            add(metadata, compatible=True)
+        for metadata in self._incompatible_index.get_all_metadata():
+            add(metadata, compatible=False)
+        return usage
+
+    def _role_usage_bytes(self) -> dict[str, int]:
+        """Return SSD bytes grouped by coarse model role."""
+        usage: dict[str, int] = {}
+        for metadata in self._index.get_all_metadata():
+            role = metadata.model_role or _infer_model_role(
+                metadata.model_name, self._expected_model_name
+            )
+            usage[role] = usage.get(role, 0) + metadata.file_size
+        return usage
+
+    def _eviction_score(
+        self,
+        metadata: PagedSSDBlockMetadata,
+        *,
+        compatible: bool,
+        role_usage: dict[str, int],
+        total_size: int,
+    ) -> tuple[int, int, int, float, int]:
+        """Score SSD eviction candidates. Lower scores are evicted first."""
+        role = metadata.model_role or _infer_model_role(
+            metadata.model_name, self._expected_model_name
+        )
+        role_bytes = role_usage.get(role, 0)
+        inactive_signature = bool(
+            self._expected_cache_signature()
+            and metadata.cache_signature
+            and metadata.cache_signature != self._expected_cache_signature()
+        )
+
+        if not compatible:
+            tier = 0
+            over_budget = int(
+                self._incompatible_index.total_size
+                > total_size * _CACHE_DOMAIN_INCOMPATIBLE_MAX_FRACTION
+            )
+        elif inactive_signature:
+            tier = 1
+            over_budget = 1
+        elif role in {_CACHE_ROLE_EMBEDDING, _CACHE_ROLE_RERANK}:
+            tier = 2
+            over_budget = int(
+                role_bytes
+                > total_size * _CACHE_DOMAIN_EMBEDDING_RERANK_MAX_FRACTION
+            )
+        elif role == _CACHE_ROLE_ASSISTANT_CHAT:
+            tier = 3
+            over_budget = int(
+                role_bytes > total_size * _CACHE_DOMAIN_ASSISTANT_CHAT_MAX_FRACTION
+            )
+        elif role == _CACHE_ROLE_PRIMARY_CHAT:
+            tier = 5
+            over_budget = 0
+        else:
+            tier = 4
+            over_budget = 0
+
+        reuse_penalty = min(metadata.hit_count, 100)
+        hot_penalty = min(metadata.hot_cache_evictions, 100)
+        return (
+            tier,
+            -over_budget,
+            reuse_penalty + hot_penalty,
+            metadata.last_access,
+            metadata.token_count,
+        )
+
+    def _record_block_hit(
+        self, block_hash: bytes, metadata: PagedSSDBlockMetadata | None
+    ) -> None:
+        """Record one cache hit without double-counting indexed metadata."""
+        if self._index.contains(block_hash):
+            self._index.touch(block_hash, hit=True)
+        elif metadata is not None:
+            metadata.touch(hit=True)
+
+    @staticmethod
+    def _sync_policy_metadata(
+        metadata: dict[str, Any], block: PagedSSDBlockMetadata
+    ) -> None:
+        """Copy policy fields from block metadata into on-disk metadata."""
+        metadata["model_role"] = block.model_role
+        metadata["hit_count"] = str(block.hit_count)
+        metadata["last_hit_at"] = str(block.last_hit_at)
+        metadata["hot_cache_evictions"] = str(block.hot_cache_evictions)
 
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
@@ -1555,6 +1749,17 @@ class PagedSSDCacheManager(CacheManager):
                 model_name=metadata.get("model_name", ""),
                 block_size=int(metadata.get("block_size", 0)),
                 cache_signature=metadata.get("cache_signature", ""),
+                model_role=metadata.get(
+                    "model_role",
+                    _infer_model_role(
+                        metadata.get("model_name", ""), self._expected_model_name
+                    ),
+                ),
+                hit_count=int(metadata.get("hit_count", 0) or 0),
+                last_hit_at=float(metadata.get("last_hit_at", 0.0) or 0.0),
+                hot_cache_evictions=int(
+                    metadata.get("hot_cache_evictions", 0) or 0
+                ),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
             )
@@ -1930,6 +2135,12 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": model_name,
                 "block_size": str(block_size),
                 "cache_signature": cache_signature,
+                "model_role": _infer_model_role(
+                    model_name, self._expected_model_name
+                ),
+                "hit_count": "0",
+                "last_hit_at": "0.0",
+                "hot_cache_evictions": "0",
                 "created_at": str(time.time()),
             }
 
@@ -1988,6 +2199,7 @@ class PagedSSDCacheManager(CacheManager):
                 model_name=model_name,
                 block_size=block_size,
                 cache_signature=cache_signature,
+                model_role=metadata["model_role"],
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
             )
@@ -2537,7 +2749,7 @@ class PagedSSDCacheManager(CacheManager):
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
 
-            self._index.touch(block_hash)
+            self._record_block_hit(block_hash, blk_meta)
             self._stats["loads"] += 1
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
@@ -2573,7 +2785,7 @@ class PagedSSDCacheManager(CacheManager):
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
 
-            self._index.touch(block_hash)
+            self._record_block_hit(block_hash, blk_meta)
             self._stats["loads"] += 1
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
@@ -2655,7 +2867,7 @@ class PagedSSDCacheManager(CacheManager):
                         pass
 
             # Update access time
-            self._index.touch(block_hash)
+            self._index.touch(block_hash, hit=True)
             self._stats["loads"] += 1
             self._stats["hits"] += 1
 
@@ -3050,31 +3262,37 @@ class PagedSSDCacheManager(CacheManager):
         target_size: int,
         max_count: int | None = None,
     ) -> list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]]:
-        """Remove oldest tracked SSD entries from their indexes until target."""
+        """Remove lowest-value tracked SSD entries until target."""
         evicted: list[tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata]] = []
 
         while self._tracked_ssd_size() > target_size:
             if max_count is not None and len(evicted) >= max_count:
                 break
 
-            compatible = self._index.get_lru_entries(1)
-            incompatible = self._incompatible_index.get_lru_entries(1)
-            if not compatible and not incompatible:
+            compatible = self._index.get_lru_entries(32)
+            incompatible = self._incompatible_index.get_lru_entries(32)
+            candidates: list[
+                tuple[PagedSSDCacheIndex, PagedSSDBlockMetadata, bool]
+            ] = [
+                (self._index, metadata, True) for metadata in compatible
+            ] + [
+                (self._incompatible_index, metadata, False)
+                for metadata in incompatible
+            ]
+            if not candidates:
                 break
 
-            if compatible and incompatible:
-                if incompatible[0].last_access <= compatible[0].last_access:
-                    source_index = self._incompatible_index
-                    candidate = incompatible[0]
-                else:
-                    source_index = self._index
-                    candidate = compatible[0]
-            elif incompatible:
-                source_index = self._incompatible_index
-                candidate = incompatible[0]
-            else:
-                source_index = self._index
-                candidate = compatible[0]
+            role_usage = self._role_usage_bytes()
+            total_size = max(1, self._tracked_ssd_size())
+            source_index, candidate, _ = min(
+                candidates,
+                key=lambda item: self._eviction_score(
+                    item[1],
+                    compatible=item[2],
+                    role_usage=role_usage,
+                    total_size=total_size,
+                ),
+            )
 
             metadata = source_index.remove(candidate.block_hash)
             if metadata is not None:
@@ -3178,6 +3396,55 @@ class PagedSSDCacheManager(CacheManager):
             f"SSD cache size enforcement: freed {format_bytes(freed)}, "
             f"evicted {len(evicted)} files"
         )
+        return freed
+
+    def run_cache_domain_janitor(
+        self,
+        *,
+        max_unlinks: int = _CACHE_DOMAIN_JANITOR_MAX_UNLINKS,
+    ) -> int:
+        """Trim stale or low-value SSD cache domains without changing topology."""
+        if self._tracked_ssd_size() <= 0:
+            return 0
+
+        total_size = max(1, self._tracked_ssd_size())
+        target_size = total_size
+        incompatible_size = self._incompatible_index.total_size
+        incompatible_limit = int(total_size * _CACHE_DOMAIN_INCOMPATIBLE_MAX_FRACTION)
+        if incompatible_size > incompatible_limit:
+            target_size -= incompatible_size - incompatible_limit
+
+        role_usage = self._role_usage_bytes()
+        assistant_limit = int(total_size * _CACHE_DOMAIN_ASSISTANT_CHAT_MAX_FRACTION)
+        assistant_size = role_usage.get(_CACHE_ROLE_ASSISTANT_CHAT, 0)
+        if assistant_size > assistant_limit:
+            target_size -= assistant_size - assistant_limit
+
+        aux_limit = int(total_size * _CACHE_DOMAIN_EMBEDDING_RERANK_MAX_FRACTION)
+        aux_size = role_usage.get(_CACHE_ROLE_EMBEDDING, 0) + role_usage.get(
+            _CACHE_ROLE_RERANK, 0
+        )
+        if aux_size > aux_limit:
+            target_size -= aux_size - aux_limit
+
+        target_size = max(0, target_size)
+        if target_size >= total_size:
+            return 0
+
+        evicted = self._evict_tracked_until_size(
+            target_size,
+            max_count=max(0, int(max_unlinks)),
+        )
+        for source_index, metadata in evicted:
+            self._unlink_evicted(metadata, source_index)
+
+        freed = sum(metadata.file_size for _, metadata in evicted)
+        if freed:
+            logger.info(
+                "Cache domain janitor freed %s across %d files",
+                format_bytes(freed),
+                len(evicted),
+            )
         return freed
 
     def _unlink_evicted(
@@ -3420,6 +3687,7 @@ class PagedSSDCacheManager(CacheManager):
                 "hot_cache_max_formatted": format_bytes(
                     self._effective_hot_cache_max_bytes()
                 ),
+                "cache_domain_usage": self._cache_domain_usage(),
                 **self._stats,
             }
 
