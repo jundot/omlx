@@ -123,3 +123,4 @@ docs/native_app_architecture.md
 uv.lock
 # generated TurboQuant memory report (machine-specific)
 tq_batch_memory.md
+/.codebase-memory
