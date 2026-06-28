@@ -1491,6 +1491,18 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 scheduler._set_model_info_for_monitor()
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+
+        # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
+        # batched.py for rationale. Passthrough-safe; strictly gated route.
+        if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
+            try:
+                from ..patches.sdpa256_attention import (
+                    apply_sdpa256_attention_patch,
+                )
+
+                apply_sdpa256_attention_patch()
+            except Exception:
+                logger.debug("sdpa256 attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
