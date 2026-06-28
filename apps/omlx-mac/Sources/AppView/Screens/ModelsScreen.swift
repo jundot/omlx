@@ -186,7 +186,7 @@ private struct LibrarySection: View {
                                     defaultValue: "Model Library",
                                     comment: "Section heading for the on-disk model library"),
                       subtitle: String(localized: "models.library.subtitle",
-                                       defaultValue: "\(models.count) models · \(formatBytes(totalSize)) on disk",
+                                       defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
                                        comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk"))
 
         ListGroup {

@@ -688,8 +688,8 @@ struct ProfileDetailCard: View {
                                                                             defaultValue: "Profile",
                                                                             comment: "Fallback scope label in the profile detail subtitle when scope is unknown")
         return String(localized: "profile.detail.subtitle.named",
-                      defaultValue: "\(scopeLabel) profile · \(count) setting\(count == 1 ? "" : "s")",
-                      comment: "Profile detail card subtitle for a named profile; placeholders are scope label and a setting count with pluralization")
+                      defaultValue: "\(scopeLabel) profile · settings: \(count)",
+                      comment: "Profile detail card subtitle for a named profile; placeholders are scope label and setting count")
     }
 
     @ViewBuilder
@@ -943,16 +943,16 @@ struct ProfileDetailCard: View {
             if let count = nonEmptyKwargCount(s["chat_template_kwargs"]) {
                 flagChip(
                     label: String(localized: "profile.detail.templates.chat_template",
-                                  defaultValue: "Chat template · \(count) override\(count == 1 ? "" : "s")",
-                                  comment: "Templates chip describing chat-template kwarg override count; placeholder is the count with pluralization"),
+                                  defaultValue: "Chat template · overrides: \(count)",
+                                  comment: "Templates chip describing chat-template kwarg override count; placeholder is the count"),
                     on: true
                 )
             }
             if let count = nonEmptyKwargCount(s["forced_ct_kwargs"]) {
                 flagChip(
                     label: String(localized: "profile.detail.templates.forced_ct",
-                                  defaultValue: "Forced CT · \(count) key\(count == 1 ? "" : "s")",
-                                  comment: "Templates chip describing forced chat-template key count; placeholder is the count with pluralization"),
+                                  defaultValue: "Forced CT · keys: \(count)",
+                                  comment: "Templates chip describing forced chat-template key count; placeholder is the count"),
                     on: true
                 )
             }
