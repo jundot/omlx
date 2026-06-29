@@ -85,8 +85,11 @@ class Omlx < Formula
     end
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
-    system libexec/"bin/pip", "install", "--no-deps",
-           resource("en-core-web-sm").cached_download
+    spacy_resource = resource("en-core-web-sm")
+    spacy_wheel = buildpath/File.basename(spacy_resource.url)
+    spacy_resource.fetch unless spacy_resource.downloaded?
+    cp spacy_resource.cached_download, spacy_wheel
+    system libexec/"bin/pip", "install", "--no-deps", spacy_wheel
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
 
