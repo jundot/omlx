@@ -396,9 +396,17 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Backbone MoE: convert fused gate_up_proj → switch_mlp.{gate,up,down}.
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
+
+        # Backbone MoE: fused gate_up_proj (Qwen3.6) or per-expert tensors
+        # (Ornith / raw Qwen3.5). Unfuse the fused form; fall back to
+        # per-expert stacking when fused keys are absent.
         for l in range(self.config.text_config.num_hidden_layers):
-            _unfuse_layer_experts(weights, f"model.language_model.layers.{l}.mlp")
+            prefix = f"model.language_model.layers.{l}.mlp"
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                continue  # already in switch_mlp form
+            if not _unfuse_layer_experts(weights, prefix):
+                _stack_per_expert(weights, prefix, num_experts)
 
         # MTP MoE layers: discover via weight keys.
         # Two possible prefixes:
@@ -414,7 +422,6 @@ def _patch_vlm_outer_model_sanitize(q35moe_outer: Any) -> None:
                 }
             )
 
-        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
         for prefix_root in ("mtp.layers.", "language_model.mtp.layers."):
             for layer_idx in _discover_mtp_layers(prefix_root):
                 prefix = f"{prefix_root}{layer_idx}.mlp"

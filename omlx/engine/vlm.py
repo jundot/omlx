@@ -1515,9 +1515,10 @@ class VLMBatchedEngine(BaseEngine):
             )
             if specprefill_enabled and specprefill_draft:
                 try:
-                    from mlx_lm import load as mlx_lm_load
-
-                    from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.model_loading import (
+                        lm_load_compat as mlx_lm_load,
+                        maybe_load_custom_quantization,
+                    )
                     from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():

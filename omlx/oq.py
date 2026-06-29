@@ -4339,7 +4339,7 @@ def _measure_sensitivity(
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from mlx_lm import load as lm_load
+            from omlx.utils.model_loading import lm_load_compat as lm_load
 
             model, tokenizer = lm_load(
                 model_path,

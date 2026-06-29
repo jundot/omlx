@@ -65,13 +65,21 @@ def apply() -> bool:
                         down_key
                     )
             elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
+                # Also stack quantization metadata (.scales, .biases) so a
+                # per-expert *quantized* checkpoint loads cleanly. Without this,
+                # only .weight is stacked and the per-expert scales/biases
+                # survive as orphan keys -> "Received N parameters not in model".
                 for n in ("gate_proj", "up_proj", "down_proj"):
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                            for e in range(num_experts)
-                        ]
-                    )
+                    for suffix in ("weight", "scales", "biases"):
+                        first_key = f"{prefix}.experts.0.{n}.{suffix}"
+                        if first_key not in weights:
+                            continue
+                        weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(
+                            [
+                                weights.pop(f"{prefix}.experts.{e}.{n}.{suffix}")
+                                for e in range(num_experts)
+                            ]
+                        )
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")

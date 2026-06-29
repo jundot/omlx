@@ -3572,10 +3572,20 @@ class TestMeasureSensitivityVlmMtp:
         mock_set_active.assert_not_called()
 
     def test_text_load_forwards_trust_remote_code(self, monkeypatch):
-        """Text sensitivity load forwards the mlx-lm custom-code opt-in."""
+        """Text sensitivity load forwards the mlx-lm custom-code opt-in when
+        the installed mlx-lm supports it."""
+        import omlx.utils.model_loading as real_ml
+
         self._patch_common(monkeypatch, has_mtp=True)
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
+        # _patch_common swapped model_loading for a MagicMock; oq imports
+        # lm_load_compat from it. Expose the real shim and pin the capability
+        # flag so forwarding is deterministic regardless of installed mlx-lm.
+        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", True)
+        sys.modules["omlx.utils.model_loading"].lm_load_compat = (
+            real_ml.lm_load_compat
+        )
 
         _measure_sensitivity(
             "/fake/text",

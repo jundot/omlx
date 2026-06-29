@@ -261,9 +261,10 @@ class MLXRerankerModel:
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -336,9 +337,10 @@ class MLXRerankerModel:
         Jina v3 reranker uses special-token hidden states + projector + cosine
         similarity for listwise scoring.
         """
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
