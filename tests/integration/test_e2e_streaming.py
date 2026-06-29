@@ -553,6 +553,90 @@ class TestStreamingHelperFunctions:
         assert data["choices"][0]["delta"].get("role") == "assistant"
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_prompt_opened_thinking_streams_as_reasoning(self):
+        """If the rendered prompt opens <think>, initial deltas are reasoning."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        class PromptOpenedThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 999
+            think_end_id = 998
+            unk_token_id = -1
+
+            def convert_tokens_to_ids(self, token: str):
+                if token == self.think_start:
+                    return self.think_start_id
+                if token == self.think_end:
+                    return self.think_end_id
+                return self.unk_token_id
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                ids = [101]
+                if text.rstrip().endswith(self.think_start):
+                    ids.append(self.think_start_id)
+                return ids
+
+            def apply_chat_template(
+                self, messages: List[Dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                return "user: Hi\nassistant:<think>"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PromptOpenedThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="Need to inspect first.",
+                new_text="Need to inspect first.",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="Need to inspect first.</think>Done.",
+                new_text="</think>Done.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+        )
+
+        payloads = []
+        messages = [{"role": "user", "content": "Hi"}]
+        async for event in stream_chat_completion(
+            engine,
+            messages,
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            if event.startswith("data: {"):
+                payloads.append(json.loads(event[6:-2]))
+
+        reasoning_deltas = []
+        content_deltas = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            if delta.get("reasoning_content"):
+                reasoning_deltas.append(delta["reasoning_content"])
+            if delta.get("content"):
+                content_deltas.append(delta["content"])
+
+        assert "".join(reasoning_deltas) == "Need to inspect first."
+        assert content_deltas == ["Done."]
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_streams_content_incrementally(self):
         """Tool availability must not force full buffering of normal text deltas."""
         from omlx.server import stream_chat_completion

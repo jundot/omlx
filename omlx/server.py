@@ -4166,7 +4166,20 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if kwargs.get("tools"):
+                template_kwargs["tools"] = kwargs["tools"]
+            if kwargs.get("chat_template_kwargs"):
+                template_kwargs.update(kwargs["chat_template_kwargs"])
+            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+            start_in_thinking, _ = prompt_opens_thinking(tokenizer, prompt)
+    except Exception as exc:
+        logger.debug("Could not detect chat stream thinking state: %s", exc)
+    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
