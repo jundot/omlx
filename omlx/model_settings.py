@@ -100,6 +100,7 @@ class ModelSettings:
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
         active_profile_name: Name of the currently-applied profile (None = no profile).
+        adapter_path: Path to LoRA adapter weights for fine-tuned models (None = no adapter).
     """
 
     # Sampling parameters (None means use global default)
@@ -213,6 +214,9 @@ class ModelSettings:
     # loaders are allowed to execute custom Python from the model repository
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
+
+    # LoRA adapters
+    adapter_path: Optional[str] = None  # Path to LoRA adapter weights for fine-tuned models
 
     # Metadata
     display_name: Optional[str] = None

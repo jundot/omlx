@@ -254,6 +254,10 @@ class BatchedEngine(BaseEngine):
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
 
+        adapter_path = None
+        if self._model_settings is not None:
+            adapter_path = getattr(self._model_settings, "adapter_path", None)
+
         def _load_model_sync():
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
@@ -266,6 +270,7 @@ class BatchedEngine(BaseEngine):
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
+                adapter_path=adapter_path,
                 trust_remote_code=self._trust_remote_code,
             )
 

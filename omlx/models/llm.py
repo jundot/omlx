@@ -53,6 +53,7 @@ class MLXLanguageModel:
         model_name: str,
         tokenizer_name: str | None = None,
         trust_remote_code: bool = False,
+        adapter_path: str | None = None,
     ):
         """
         Initialize the MLX language model.
@@ -61,10 +62,12 @@ class MLXLanguageModel:
             model_name: HuggingFace model name or local path
             tokenizer_name: Optional separate tokenizer name
             trust_remote_code: Whether to trust remote code
+            adapter_path: Optional path to LoRA adapter weights
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
+        self.adapter_path = adapter_path
 
         self.model = None
         self.tokenizer = None
@@ -107,6 +110,7 @@ class MLXLanguageModel:
                 self.model, self.tokenizer = load(
                     self.model_name,
                     tokenizer_config=tokenizer_config,
+                    adapter_path=self.adapter_path,
                     trust_remote_code=self.trust_remote_code,
                 )
 
