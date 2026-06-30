@@ -2,6 +2,7 @@
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
 import json
+import math
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -3942,3 +3943,94 @@ class TestQuantizeOqStreamingOq25:
             tensors.update(mx.load(str(sf)))
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
+
+
+class TestSensitivityMicroBatch:
+    """Micro-batched sensitivity must match the single-batch result.
+
+    Chunking the calibration set changes only peak activation memory: a per-layer
+    score is a mean over samples, so pooling the squared-error and magnitude sums
+    and dividing once is numerically identical. The samples here carry distinct
+    magnitudes and the chunk sizes do not divide the sample count, so an
+    implementation that averaged per-chunk scores instead of pooling would
+    diverge and fail this test.
+    """
+
+    @pytest.mark.skipif(not HAS_MLX, reason="requires mlx")
+    def test_microbatch_matches_single_batch(self):
+        from omlx import oq
+
+        n_samples, seq, hidden, n_layers = 8, 4, 6, 3
+        # Each row's token id IS its sample index, so a chunk slice carries its
+        # own samples. Distinct magnitude per sample (index + 1) means an
+        # implementation that averaged per-chunk scores would diverge.
+        calib = mx.broadcast_to(
+            mx.arange(n_samples).reshape(n_samples, 1), (n_samples, seq)
+        ).astype(mx.int32)
+
+        def embed(ids):
+            magnitude = ids[:, 0].reshape(-1, 1, 1).astype(mx.float32) + 1.0
+            return mx.broadcast_to(magnitude, (ids.shape[0], seq, hidden))
+
+        class Block:
+            def __init__(self, shift):
+                self.shift = shift
+                self.q = False
+
+        layers = [Block(0.1 * (i + 1)) for i in range(n_layers)]
+
+        def find_layers(_model):
+            return embed, layers
+
+        def prepare(_model, _layers, _calib, inputs):
+            return inputs, [None] * len(layers), {}
+
+        def forward(block, inputs, _mask, _pos):
+            # Baseline returns the input; the temporary quantize shifts it.
+            return inputs + (block.shift if block.q else 0.0), None
+
+        def quantize(block, _config, _level, _gs):
+            block.q = True
+            return block
+
+        def restore(block, _saved):
+            block.q = False
+
+        def run(micro_batch):
+            for b in layers:
+                b.q = False
+            # Spy on _prepare_layer_inputs: the single-batch path prepares once,
+            # the chunked path once per chunk. Counting it proves the chunked
+            # code is actually taken (an equivalence check alone would silently
+            # pass a dispatch that ignored micro_batch and ran single-batch).
+            prepare_spy = MagicMock(side_effect=prepare)
+            with (
+                patch.object(oq, "_load_calibration_data", return_value=calib),
+                patch.object(oq, "_find_model_layers", side_effect=find_layers),
+                patch.object(oq, "_prepare_layer_inputs", prepare_spy),
+                patch.object(oq, "_forward_layer_result", side_effect=forward),
+                patch.object(oq, "_temporary_quantize_block", side_effect=quantize),
+                patch.object(oq, "_restore_saved_weights", side_effect=restore),
+            ):
+                result = oq._measure_sensitivity_from_model(
+                    object(),
+                    object(),
+                    {},
+                    4,
+                    num_samples=n_samples,
+                    seq_length=seq,
+                    micro_batch=micro_batch,
+                )
+            return result, prepare_spy.call_count
+
+        single, single_calls = run(0)
+        assert single, "single-batch sensitivity should be non-empty"
+        assert single_calls == 1
+
+        # Cover max chunking (1), divisors, non-divisors, == count, and > count.
+        for chunk in (1, 2, 3, 5, 8, 16):
+            chunked, chunk_calls = run(chunk)
+            assert chunk_calls == math.ceil(n_samples / chunk)
+            assert set(chunked) == set(single)
+            for layer_idx in single:
+                assert chunked[layer_idx] == pytest.approx(single[layer_idx], abs=1e-5)
