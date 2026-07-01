@@ -799,6 +799,55 @@ class TestEmbeddingCompileFallback:
         with pytest.raises(ValueError, match="does not support image inputs"):
             model.embed([{"image": "https://example.com/image.jpg"}])
 
+    def test_try_compile_respects_disable_env(self, monkeypatch):
+        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+
+        with patch("omlx.models.embedding.mx") as mock_mx:
+            result = model._try_compile()
+
+        assert result is False
+        assert model._compiled_embed is None
+        mock_mx.compile.assert_not_called()
+
+    def test_close_releases_compiled_model_and_processor_resources(self):
+        """close() should drop wrapper references before clearing MLX caches."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model.model = MagicMock()
+        model.processor = MagicMock()
+        model._loaded = True
+        model._hidden_size = 384
+        model._using_native = False
+        model._is_compiled = True
+        model._compiled_embed = MagicMock()
+        model._remap_input_ids_to_inputs = True
+
+        with patch("omlx.models.embedding.gc.collect") as collect, \
+             patch("omlx.models.embedding.mx") as mock_mx, \
+             patch(
+                 "omlx.models.embedding.clear_thread_compile_cache"
+             ) as clear_compile_cache:
+            model.close()
+
+        assert model.model is None
+        assert model.processor is None
+        assert model._compiled_embed is None
+        assert model._loaded is False
+        assert model._hidden_size is None
+        assert model._using_native is False
+        assert model._is_compiled is False
+        assert model._remap_input_ids_to_inputs is False
+        mock_mx.synchronize.assert_called_once()
+        mock_mx.clear_cache.assert_called_once()
+        clear_compile_cache.assert_called_once()
+        assert collect.call_count == 2
+
 
 class TestEmbeddingEngine:
     """Tests for EmbeddingEngine."""
@@ -822,6 +871,8 @@ class TestEmbeddingEngine:
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
+            mock_model.close.assert_called_once()
+            assert engine._model is None
 
     def test_engine_embed(self):
         """Test embedding generation through engine."""

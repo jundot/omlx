@@ -7,9 +7,11 @@ text embeddings using Apple's MLX framework, with native fallback
 for XLMRoBERTa, BERT, and Qwen2-decoder embedding models.
 """
 
+import gc
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -17,6 +19,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from ..utils.compile_cache import clear_thread_compile_cache
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -32,6 +35,7 @@ _CONTEXT_LENGTH_ATTRS = (
     "seq_length",
     "n_positions",
 )
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -476,6 +480,15 @@ class MLXEmbeddingModel:
           for some embedding/reranker models, causing eval() runtime errors.
         - We compile a narrower function that returns only the final embedding array.
         """
+        compile_env = os.getenv("OMLX_EMBEDDING_COMPILE", "1").strip().lower()
+        if compile_env in _FALSE_ENV_VALUES:
+            logger.info(
+                "mx.compile disabled for %s by OMLX_EMBEDDING_COMPILE",
+                self.model_name,
+            )
+            self._compiled_embed = None
+            return False
+
         base_model = self.model
 
         try:
@@ -497,6 +510,37 @@ class MLXEmbeddingModel:
             logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_embed = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, and compiled embedding resources."""
+        if not self._loaded and self.model is None and self.processor is None:
+            self._compiled_embed = None
+            self._is_compiled = False
+            return
+
+        logger.info(
+            "Releasing embedding model resources: %s "
+            "(compiled=%s, native=%s)",
+            self.model_name,
+            self._is_compiled,
+            self._using_native,
+        )
+
+        self._compiled_embed = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._hidden_size = None
+        self._loaded = False
+        self._using_native = False
+        self._remap_input_ids_to_inputs = False
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        clear_thread_compile_cache()
+        gc.collect()
 
     def embed(
         self,
