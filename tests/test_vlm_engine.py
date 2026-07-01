@@ -1909,6 +1909,8 @@ class TestStopSafety:
         vision_cache.close.side_effect = lambda: events.append("vision_cache")
         engine._vision_cache = vision_cache
         engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
 
         mock_inner_engine = MagicMock()
 
@@ -1919,6 +1921,8 @@ class TestStopSafety:
             assert engine._processor is None
             assert engine._adapter is None
             assert engine._tokenizer is None
+            assert engine._grammar_compiler is None
+            assert engine._grammar_compiler_init_attempted is False
             assert engine._vision_cache is None
 
         mock_inner_engine.close.side_effect = close_side_effect

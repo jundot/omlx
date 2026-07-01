@@ -14,7 +14,12 @@ from typing import Any
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _clear_teardown_references,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -426,9 +431,16 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
-        self._engine = None
-        self._model = None
-        self._tokenizer = None
+        _clear_teardown_references(
+            self,
+            none_attrs=(
+                "_engine",
+                "_model",
+                "_tokenizer",
+                "_grammar_compiler",
+            ),
+            false_attrs=("_grammar_compiler_init_attempted",),
+        )
         self._loaded = False
         logger.info("BatchedEngine stopped")
 

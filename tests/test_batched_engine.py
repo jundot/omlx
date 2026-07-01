@@ -294,6 +294,32 @@ class TestBatchedEngineInitialization:
 
         assert engine.model_type is None
 
+    @pytest.mark.asyncio
+    async def test_stop_clears_wrapper_teardown_references(self):
+        """stop() releases wrapper-side native helper references."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        inner_engine = MagicMock()
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = inner_engine
+        engine._model = object()
+        engine._tokenizer = object()
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
+        engine._loaded = True
+
+        await engine.stop()
+
+        assert engine._engine is None
+        assert engine._model is None
+        assert engine._tokenizer is None
+        assert engine._grammar_compiler is None
+        assert engine._grammar_compiler_init_attempted is False
+        assert engine._loaded is False
+        inner_engine.close.assert_called_once()
+
 
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
