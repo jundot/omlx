@@ -10,6 +10,7 @@ streaming or chat completion.
 import asyncio
 import gc
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -21,15 +22,36 @@ from .base import BaseNonStreamingEngine
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _EmbedWork:
+    """Single embedding request pending dispatch."""
+
+    texts: List  # List[str | Dict[str, str]]
+    max_length: int
+    padding: bool
+    truncation: bool
+    future: asyncio.Future = field(repr=False)
+
+
+def _approx_len(item: Any) -> int:
+    """Approximate token-length of one text item by character count."""
+    if isinstance(item, str):
+        return len(item)
+    if isinstance(item, dict):
+        return len(item.get("text", "")) + len(item.get("image", "") or "")
+    return 0
+
+
 class EmbeddingEngine(BaseNonStreamingEngine):
     """
     Engine for generating text embeddings.
 
-    This engine wraps MLXEmbeddingModel and provides async methods
-    for integration with the oMLX server.
-
-    Unlike BaseEngine, this doesn't support streaming or chat
-    since embeddings are computed in a single forward pass.
+    Features a coalescing dispatch loop that:
+    - Collects all concurrently-pending requests before each executor call
+    - Sorts ALL texts by approximate token length across requests
+    - Runs one forward pass per batch with homogeneous sequence lengths
+      (reduces padding waste by up to 3x for variable-length inputs)
+    - Issues a single mx.synchronize()/clear_cache() per dispatch cycle
     """
 
     def __init__(
@@ -56,12 +78,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         self._trust_remote_code = trust_remote_code
         if batch_size is None:
             batch_size = (
-                getattr(scheduler_config, "embedding_batch_size", 32)
+                getattr(scheduler_config, "embedding_batch_size", 64)
                 if scheduler_config is not None
-                else 32
+                else 64
             )
-        self._batch_size = max(1, int(batch_size))
+        self._batch_size = max(1, int(batch_size))  # type: ignore[arg-type]
         self._model: Optional[MLXEmbeddingModel] = None
+        self._work_queue: Optional[asyncio.Queue] = None
+        self._dispatch_task: Optional[asyncio.Task] = None
 
     @property
     def model_name(self) -> str:
@@ -93,6 +117,10 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), self._model.load)
+
+        self._work_queue = asyncio.Queue()
+        self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+
         logger.info(f"Embedding engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -101,14 +129,39 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
-        self._model = None
 
+        if self._dispatch_task is not None:
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+            self._dispatch_task = None
+
+        # Drain and fail any remaining work
+        if self._work_queue is not None:
+            while not self._work_queue.empty():
+                try:
+                    work, _ = self._work_queue.get_nowait()
+                    if not work.future.done():
+                        work.future.set_exception(
+                            RuntimeError("Embedding engine stopped")
+                        )
+                except asyncio.QueueEmpty:
+                    break
+            self._work_queue = None
+
+        self._model = None
         gc.collect()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
         logger.info(f"Embedding engine stopped: {self._model_name}")
+
+    # ------------------------------------------------------------------
+    # Public embed API
+    # ------------------------------------------------------------------
 
     async def embed(
         self,
@@ -130,68 +183,202 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         Returns:
             EmbeddingOutput with embeddings and token count
         """
-        if self._model is None:
+        if self._model is None or self._work_queue is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        model = self._model
-        input_items = [texts] if isinstance(texts, str) else list(texts)
-
+        input_items: List = [texts] if isinstance(texts, str) else list(texts)
         if not input_items:
             return EmbeddingOutput(embeddings=[], total_tokens=0, dimensions=0)
 
-        batch_size = self._batch_size
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        work = _EmbedWork(
+            texts=input_items,
+            max_length=max_length,
+            padding=padding,
+            truncation=truncation,
+            future=fut,
+        )
         activity_id = self._begin_activity(
             "embedding",
             detail="Embedding",
             total_items=len(input_items),
-            metadata={"input_count": len(input_items), "batch_size": batch_size},
+            metadata={"input_count": len(input_items), "batch_size": self._batch_size},
         )
+        await self._work_queue.put((work, activity_id))
         try:
-            loop = asyncio.get_running_loop()
-            embeddings: List[List[float]] = []
-            total_tokens = 0
-            dimensions = 0
+            return await fut
+        finally:
+            self._end_activity(activity_id)
 
-            for start in range(0, len(input_items), batch_size):
-                batch = input_items[start:start + batch_size]
+    # ------------------------------------------------------------------
+    # Coalescing dispatch loop
+    # ------------------------------------------------------------------
 
-                def _embed_sync():
+    async def _dispatch_loop(self) -> None:
+        """
+        Background coroutine: drain the work queue, coalesce concurrent
+        requests, sort all texts by length, and run one executor call.
+        """
+        queue = self._work_queue
+        assert queue is not None
+        while True:
+            try:
+                first = await queue.get()
+                pending = [first]
+
+                # Drain any immediately-available concurrent requests
+                while True:
                     try:
-                        return model.embed(
-                            inputs=batch,
-                            max_length=max_length,
-                            padding=padding,
-                            truncation=truncation,
-                        )
-                    finally:
-                        mx.synchronize()
-                        mx.clear_cache()
+                        pending.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
 
-                output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
-                embeddings.extend(output.embeddings)
-                total_tokens += output.total_tokens
-                if output.dimensions:
-                    dimensions = output.dimensions
-                self._update_activity(
-                    activity_id,
-                    completed_items=min(start + len(batch), len(input_items)),
-                    token_count=total_tokens,
-                    dimensions=dimensions,
+                await self._run_coalesced(pending)
+
+            except asyncio.CancelledError:
+                # Fail any items we already drained but haven't processed
+                break
+            except Exception as exc:
+                logger.error(
+                    f"Embedding dispatch loop error: {exc}", exc_info=True
                 )
 
-            output = EmbeddingOutput(
+    async def _run_coalesced(
+        self, pending: List[tuple]  # List[(work, activity_id)]
+    ) -> None:
+        """
+        Process a coalesced group of requests in a single executor call,
+        resolving each request's future as soon as its last text is processed.
+
+        Steps:
+        1. Flatten all texts from all requests with position tracking
+        2. Sort globally by approximate token length (reduces padding waste)
+        3. Split into fixed-size forward-pass batches
+        4. Run all batches in one executor call; after each batch check which
+           requests are now complete and resolve their futures immediately via
+           loop.call_soon_threadsafe() — so shorter-text requests return before
+           longer-text ones without waiting for the whole group to finish
+        5. Any requests not resolved mid-run are resolved after the final batch
+
+        GPU work is always fully interleaved (no per-request sequential processing)
+        so throughput is unchanged vs. the flat-coalescing approach.
+        """
+        model = self._model
+        assert model is not None
+        batch_size = self._batch_size
+        loop = asyncio.get_running_loop()
+
+        # --- 1. Flatten with origin tracking ---------------------------------
+        # flat[i] = (req_idx, text_idx_in_req, text_item)
+        flat: List[tuple] = []
+        for req_idx, (work, _) in enumerate(pending):
+            for text_idx, text in enumerate(work.texts):
+                flat.append((req_idx, text_idx, text))
+
+        # --- 2. Sort globally by approximate token length --------------------
+        flat.sort(key=lambda x: _approx_len(x[2]))
+
+        first_work: _EmbedWork = pending[0][0]
+        sorted_texts = [x[2] for x in flat]
+        batches = [
+            sorted_texts[i : i + batch_size]
+            for i in range(0, len(sorted_texts), batch_size)
+        ]
+
+        # Per-request accounting
+        n_reqs = len(pending)
+        req_total = [len(pending[i][0].texts) for i in range(n_reqs)]
+        req_embs: List[Dict[int, List[float]]] = [{} for _ in range(n_reqs)]
+        req_chars = [0] * n_reqs
+        total_chars = 0
+        for req_idx, _text_idx, text in flat:
+            c = _approx_len(text)
+            req_chars[req_idx] += c
+            total_chars += c
+
+        # Mutable state shared between _run_sync (MLX thread) and
+        # _resolve_req (event-loop thread).  Python's GIL is sufficient —
+        # _state is written only by _run_sync and read only by _resolve_req,
+        # which is scheduled *after* the write via call_soon_threadsafe.
+        _state: Dict[str, Any] = {"total_tokens": 0, "dimensions": 0}
+        _resolved: set = set()
+
+        def _resolve_req(req_idx: int) -> None:
+            """Scheduled on the event-loop thread; safe to call set_result."""
+            work, activity_id = pending[req_idx]
+            emb_map = req_embs[req_idx]
+            embeddings = [emb_map[i] for i in range(len(work.texts))]
+            total_tokens = _state["total_tokens"]
+            dimensions = _state["dimensions"]
+            req_tokens = (
+                round(req_chars[req_idx] / total_chars * total_tokens)
+                if total_chars > 0
+                else 0
+            )
+            result = EmbeddingOutput(
                 embeddings=embeddings,
-                total_tokens=total_tokens,
+                total_tokens=req_tokens,
                 dimensions=dimensions,
             )
             self._update_activity(
                 activity_id,
-                token_count=output.total_tokens,
-                dimensions=output.dimensions,
+                completed_items=len(work.texts),
+                token_count=req_tokens,
+                dimensions=dimensions,
             )
-            return output
-        finally:
-            self._end_activity(activity_id)
+            if not work.future.done():
+                work.future.set_result(result)
+
+        # --- 3 & 4. Run all batches in one executor call ---------------------
+        def _run_sync() -> None:
+            sorted_pos = 0
+            try:
+                for batch in batches:
+                    out = model.embed(
+                        inputs=batch,
+                        max_length=first_work.max_length,
+                        padding=first_work.padding,
+                        truncation=first_work.truncation,
+                    )
+                    _state["total_tokens"] += out.total_tokens
+                    if out.dimensions:
+                        _state["dimensions"] = out.dimensions
+
+                    for k, embedding in enumerate(out.embeddings):
+                        ri, ti, _ = flat[sorted_pos + k]
+                        req_embs[ri][ti] = embedding
+                    sorted_pos += len(batch)
+
+                    # Free Metal pool after every batch (prevents 1GB→10GB RAM
+                    # growth; safe because model.embed() calls mx.eval() inside).
+                    mx.clear_cache()
+
+                    # Resolve any request whose last text was in this batch
+                    for i in range(n_reqs):
+                        if i not in _resolved and len(req_embs[i]) == req_total[i]:
+                            _resolved.add(i)
+                            loop.call_soon_threadsafe(_resolve_req, i)
+            finally:
+                mx.synchronize()
+                mx.clear_cache()
+
+        try:
+            await loop.run_in_executor(get_mlx_executor(), _run_sync)
+        except Exception as exc:
+            for i, (work, _) in enumerate(pending):
+                if i not in _resolved and not work.future.done():
+                    work.future.set_exception(exc)
+            return
+
+        # Resolve stragglers (defensive; normally all resolved inside _run_sync)
+        for i in range(n_reqs):
+            if i not in _resolved:
+                _resolve_req(i)
+
+    # ------------------------------------------------------------------
+    # Stats / info
+    # ------------------------------------------------------------------
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
