@@ -11,6 +11,7 @@ Supports:
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
+import gc
 import json
 import logging
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -731,6 +733,32 @@ class MLXRerankerModel:
             logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_seq_logits = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, projector, and compiled reranker resources."""
+        self._compiled_seq_logits = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._num_labels = None
+        self._is_causal_lm = False
+        self._is_jina_reranker = False
+        self._is_vl_reranker = False
+        self._token_true_id = None
+        self._token_false_id = None
+        self._doc_embed_token_id = None
+        self._query_embed_token_id = None
+        self._jina_projector = None
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        clear_thread_compile_cache()
+        gc.collect()
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
