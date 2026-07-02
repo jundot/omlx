@@ -3,16 +3,20 @@
 
 import base64
 import io
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
 
 from omlx.utils.image import (
+    TempVideoPath,
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
+    extract_media_from_messages,
     load_image,
+    load_video_reference,
 )
 
 
@@ -375,6 +379,122 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         # Text content should be preserved
         assert "Describe this image and audio" in text_msgs[0]["content"]
+
+
+# =============================================================================
+# Tests: extract_media_from_messages (video)
+# =============================================================================
+
+
+class TestExtractMediaFromMessagesVideo:
+    """Tests for video_url extraction via extract_media_from_messages()."""
+
+    def test_video_url_data_uri_extracts_temp_file(self):
+        """Data URI video decodes to a temp file with matching bytes."""
+        payload = b"fake-mp4-bytes"
+        uri = (
+            "data:video/mp4;base64,"
+            + base64.b64encode(payload).decode("ascii")
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": uri}},
+                    {"type": "text", "text": "Describe this clip"},
+                ],
+            },
+        ]
+
+        text_msgs, images, audio, videos = extract_media_from_messages(messages)
+
+        assert len(videos) == 1
+        assert len(images) == 0
+        assert len(audio) == 0
+        assert text_msgs[0]["content"] == "Describe this clip"
+        video_path = videos[0]
+        assert isinstance(video_path, TempVideoPath)
+        assert os.path.exists(video_path)
+        try:
+            with open(video_path, "rb") as handle:
+                assert handle.read() == payload
+        finally:
+            if os.path.exists(video_path):
+                os.unlink(video_path)
+
+    def test_video_url_string_form_extracts(self):
+        """String-form video_url returns one reference and strips media part."""
+        uri = "https://example.com/clip.mp4"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": uri},
+                    {"type": "text", "text": "What happens?"},
+                ],
+            },
+        ]
+
+        text_msgs, images, audio, videos = extract_media_from_messages(messages)
+
+        assert videos == [uri]
+        assert text_msgs[0]["content"] == "What happens?"
+
+    def test_video_url_file_path_passthrough(self):
+        """Local file path is returned unchanged."""
+        path = "/tmp/local_clip.mp4"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": path}},
+                ],
+            },
+        ]
+
+        _text_msgs, _images, _audio, videos = extract_media_from_messages(messages)
+
+        assert videos == [path]
+
+    def test_video_url_http_passthrough(self):
+        """HTTP URL is returned unchanged without fetching."""
+        url = "https://example.com/a.mp4"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                ],
+            },
+        ]
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            _text_msgs, _images, _audio, videos = extract_media_from_messages(messages)
+
+        mock_urlopen.assert_not_called()
+        assert videos == [url]
+
+    def test_video_url_invalid_base64_raises(self):
+        """Malformed base64 in a video data URI raises ValueError."""
+        with pytest.raises(ValueError, match=r"(?i)video.*base64|base64.*video"):
+            load_video_reference("data:video/mp4;base64,%%%")
+
+    def test_video_url_decoded_cap_raises(self, monkeypatch):
+        """Oversize decoded video payloads raise ValueError mentioning the cap."""
+        monkeypatch.setattr(
+            "omlx.utils.image.VIDEO_DECODED_SIZE_CAP",
+            4,
+        )
+        payload = b"12345"
+        uri = (
+            "data:video/mp4;base64,"
+            + base64.b64encode(payload).decode("ascii")
+        )
+        with pytest.raises(ValueError) as exc_info:
+            load_video_reference(uri)
+        message = str(exc_info.value).lower()
+        assert "video" in message
+        assert "100" in message or "cap" in message or "too large" in message
 
 
 # =============================================================================

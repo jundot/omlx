@@ -2885,6 +2885,115 @@ class TestExtractMultimodalContent:
         assert parts[0]["type"] == "input_audio"
         assert parts[0]["input_audio"]["format"] == "wav"
 
+    def test_video_url_nested_dict_normalized(self):
+        """video_url nested dict normalizes to url-only shape."""
+        parts = _extract_multimodal_content_list([
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": "data:video/mp4;base64,AAA",
+                    "detail": "auto",
+                },
+            },
+        ])
+        assert parts == [
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAA"}},
+        ]
+
+    def test_video_url_string_form_normalized(self):
+        """video_url with string value (not nested dict) should be normalized."""
+        parts = _extract_multimodal_content_list([
+            {"type": "video_url", "video_url": "data:video/mp4;base64,AAA"},
+        ])
+        assert parts == [
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAA"}},
+        ]
+
+    def test_video_url_missing_url_dropped(self):
+        """video_url item with no extractable URL should be dropped."""
+        assert _extract_multimodal_content_list([
+            {"type": "video_url", "video_url": None},
+        ]) == []
+        assert _extract_multimodal_content_list([
+            {"type": "video_url"},
+        ]) == []
+        assert _extract_multimodal_content_list([
+            {"type": "video_url", "video_url": {}},
+        ]) == []
+        assert _extract_multimodal_content_list([
+            {"type": "video_url", "video_url": {"url": ""}},
+        ]) == []
+
+    def test_video_url_from_content_part_model(self):
+        """video_url from ContentPart model_dump should be normalized."""
+        from omlx.api.openai_models import ContentPart, VideoURL
+
+        part = ContentPart(
+            type="video_url",
+            video_url=VideoURL(url="file:///tmp/a.mp4"),
+        )
+        parts = _extract_multimodal_content_list([part])
+        assert parts == [
+            {"type": "video_url", "video_url": {"url": "file:///tmp/a.mp4"}},
+        ]
+
+    def test_extract_multimodal_content_preserves_video_list(self):
+        """text + video_url content stays as a list for VLM processing."""
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Describe this video"},
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "data:video/mp4;base64,AAA",
+                            "detail": "auto",
+                        },
+                    },
+                ],
+            )
+        ]
+        result = extract_multimodal_content(messages)
+        content = result[0]["content"]
+        assert isinstance(content, list)
+        assert [p["type"] for p in content] == ["text", "video_url"]
+        assert content[1] == {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64,AAA"},
+        }
+
+    def test_video_url_coexists_with_image_and_audio(self):
+        """text + image_url + video_url + input_audio preserve order and shape."""
+        parts = _extract_multimodal_content_list([
+            {"type": "text", "text": "Look, watch, and listen"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "video_url", "video_url": "data:video/mp4;base64,AAA"},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "xyz", "format": "mp3"},
+            },
+        ])
+        assert len(parts) == 4
+        assert [p["type"] for p in parts] == [
+            "text",
+            "image_url",
+            "video_url",
+            "input_audio",
+        ]
+        assert parts[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc"},
+        }
+        assert parts[2] == {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64,AAA"},
+        }
+        assert parts[3] == {
+            "type": "input_audio",
+            "input_audio": {"data": "xyz", "format": "mp3"},
+        }
+
 
 # =============================================================================
 # Partial Mode & Name Preservation

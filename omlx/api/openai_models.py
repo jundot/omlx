@@ -34,6 +34,13 @@ class ImageURL(BaseModel):
     detail: Optional[str] = "auto"  # "low", "high", "auto"
 
 
+class VideoURL(BaseModel):
+    """Video URL or base64 data URI for vision model input."""
+
+    url: str  # "https://..." or "data:video/mp4;base64,..."
+    detail: Optional[str] = "auto"  # "low", "high", "auto"
+
+
 class InputAudio(BaseModel):
     """Audio input data for multimodal models (OpenAI format)."""
 
@@ -62,13 +69,15 @@ class ContentPart(BaseModel):
     Supports:
     - text: Plain text content
     - image_url: Image input for vision models
+    - video_url: Video input for vision models
     - input_audio: Audio input for multimodal audio models
     - file: Document or text input for attachment preprocessing
     """
 
-    type: str  # "text", "image_url", "input_audio", or "file"
+    type: str  # "text", "image_url", "video_url", "input_audio", or "file"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
+    video_url: Optional[VideoURL] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 
