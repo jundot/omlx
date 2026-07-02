@@ -2736,7 +2736,10 @@ class TestSchedulerSSDLayerSignature:
     ):
         from mlx_lm.models.cache import KVCache
 
-        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDBlockMetadata,
+            _cache_compat_signature,
+        )
 
         class TwoLayerModel:
             config = SimpleNamespace(
@@ -2786,6 +2789,16 @@ class TestSchedulerSSDLayerSignature:
                 model_name="test-model",
                 block_size=4,
                 layer_cache_types=["TurboQuantKVCache", "KVCache"],
+                # TurboQuant blocks must prove their bit depth to survive a
+                # sweep under an active depth expectation (#2045); this is
+                # the signature the save path stamps since the fix.
+                cache_signature=_cache_compat_signature(
+                    model_name="test-model",
+                    num_layers=2,
+                    block_size=4,
+                    layer_cache_types=["TurboQuantKVCache", "KVCache"],
+                    turboquant_kv_bits=4.0,
+                ),
             )
             manager._index.add(stale)
             manager._index.add(fresh)
@@ -2799,6 +2812,86 @@ class TestSchedulerSSDLayerSignature:
             assert manager._expected_layer_cache_types == layer_cache_types
             assert manager._index.get(stale.block_hash) is None
             assert manager._index.get(fresh.block_hash) is not None
+        finally:
+            scheduler.shutdown()
+
+    def test_refresh_infers_layout_without_model_make_cache(
+        self, mock_tokenizer, tmp_path
+    ):
+        # Plain dense models (most mlx-lm architectures) define no
+        # make_cache; the request path builds their caches through
+        # make_prompt_cache's per-layer KVCache fallback. The refresh must
+        # infer through the same fallback — requiring model.make_cache made
+        # it a silent no-op for these models, so the manager never learned
+        # the TurboQuant bit depth and mixed-width blocks kept loading
+        # after a turboquant_kv_bits change (#2045).
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDBlockMetadata,
+            _cache_compat_signature,
+        )
+
+        turbo_types = ["TurboQuantKVCache", "KVCache"]
+
+        class PlainDenseModel:
+            config = SimpleNamespace(
+                num_hidden_layers=2,
+                num_key_value_heads=2,
+                num_attention_heads=2,
+                head_dim=32,
+            )
+            layers = [object(), object()]
+
+        scheduler = Scheduler(
+            model=PlainDenseModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=4,
+                model_name="test-model",
+            ),
+        )
+        try:
+            manager = scheduler.paged_ssd_cache_manager
+            assert manager is not None
+
+            def _block(block_hash: bytes, bits: float | None) -> PagedSSDBlockMetadata:
+                return PagedSSDBlockMetadata(
+                    block_hash=block_hash,
+                    file_path=tmp_path / "never-touched.safetensors",
+                    file_size=1024,
+                    token_count=4,
+                    created_at=0.0,
+                    last_access=0.0,
+                    num_layers=2,
+                    model_name="test-model",
+                    block_size=4,
+                    layer_cache_types=turbo_types,
+                    cache_signature=_cache_compat_signature(
+                        model_name="test-model",
+                        num_layers=2,
+                        block_size=4,
+                        layer_cache_types=turbo_types,
+                        turboquant_kv_bits=bits,
+                    ),
+                )
+
+            old_depth = _block(b"old".ljust(32, b"\0"), 4.0)
+            unproven = _block(b"unproven".ljust(32, b"\0"), None)
+            current = _block(b"current".ljust(32, b"\0"), 6.0)
+            manager._index.add(old_depth)
+            manager._index.add(unproven)
+            manager._index.add(current)
+
+            scheduler._turboquant_kv_bits = 6.0
+            scheduler._turboquant_skip_last = True
+
+            layer_cache_types = scheduler.refresh_ssd_layer_signature()
+
+            assert layer_cache_types == turbo_types
+            assert manager._expected_turboquant_kv_bits == 6.0
+            assert manager._index.get(old_depth.block_hash) is None
+            assert manager._index.get(unproven.block_hash) is None
+            assert manager._index.get(current.block_hash) is not None
         finally:
             scheduler.shutdown()
 

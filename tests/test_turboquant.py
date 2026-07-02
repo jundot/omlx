@@ -146,6 +146,29 @@ def test_batch_tq_merge_extract():
     assert e2.offset == 4
 
 
+def test_batch_tq_merge_rejects_mixed_bit_depths():
+    """#2045 last-line guard: members packed at different depths (or seeds)
+    have incompatible packed widths/codecs and must fail loud at merge, not
+    as a raw mx.concatenate shape error deep in _concat_state_batch."""
+    c4 = TurboQuantKVCache(bits=4.0)
+    c4.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    c6 = TurboQuantKVCache(bits=6.0)
+    c6.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)), mx.random.normal((1, 2, 4, 32))
+    )
+    mx.eval(c4.keys, c4.values, c6.keys, c6.values)
+
+    with pytest.raises(ValueError, match="mixed quantization"):
+        BatchTurboQuantKVCache.merge([c4, c6])
+
+    with pytest.raises(ValueError, match="mixed quantization"):
+        BatchTurboQuantKVCache.merge(
+            [c4, TurboQuantKVCache(bits=4.0, seed=1)]
+        )
+
+
 def test_batch_tq_merge_preserves_empty_rows():
     """Regression: mixed empty/non-empty rows must keep the batch dimension."""
     full = TurboQuantKVCache(bits=4.0)
