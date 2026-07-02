@@ -1875,6 +1875,11 @@ class Scheduler:
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
 
+        # Drop transient aliases after ownership moves to scheduler fields;
+        # close()/deep_reset() clear those fields during teardown.
+        model = None
+        tokenizer = None
+
     @contextmanager
     def _phase_timer(self, phase: str):
         """Lightweight wall-time accumulator for cache-on overhead diagnostics.
