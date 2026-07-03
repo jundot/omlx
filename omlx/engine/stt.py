@@ -101,6 +101,37 @@ def _missing_processor_hint(model_name: str) -> str:
     )
 
 
+def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
+    """Map the OpenAI ``prompt`` field onto the backend's biasing hook.
+
+    Qwen3-ASR-style backends expose ``generate(..., system_prompt=...)`` —
+    a trained context-injection mechanism with strong biasing. Whisper-family
+    backends expose ``generate(..., initial_prompt=...)`` — a decoder-prefix
+    soft prior (~224-token window). Backends with neither hook ignore the
+    field; a request must never fail because of ``prompt``.
+    """
+    if prompt is None or not prompt.strip():
+        return {}
+
+    import inspect
+
+    try:
+        params = inspect.signature(model.generate).parameters
+    except (TypeError, ValueError):
+        return {}
+
+    if "system_prompt" in params:
+        return {"system_prompt": prompt}
+    if "initial_prompt" in params:
+        return {"initial_prompt": prompt}
+
+    logger.debug(
+        "STT backend %s has no prompt-biasing hook; ignoring 'prompt'",
+        type(model).__name__,
+    )
+    return {}
+
+
 def _wrap_stt_load_error(model_name: str, exc: Exception) -> Exception:
     """Return a clearer exception for known mlx-audio STT load failures."""
     message = str(exc)
@@ -221,6 +252,7 @@ class STTEngine(BaseNonStreamingEngine):
         self,
         audio_path: str,
         language: str | None = None,
+        prompt: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """
@@ -229,6 +261,10 @@ class STTEngine(BaseNonStreamingEngine):
         Args:
             audio_path: Path to the audio file to transcribe
             language: Optional language code (e.g. 'en', 'fr')
+            prompt: Optional vocabulary / context biasing text (OpenAI
+                ``prompt`` field), mapped onto the backend's biasing hook
+                (Qwen3-ASR ``system_prompt``, Whisper ``initial_prompt``);
+                ignored by backends without one
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -281,6 +317,7 @@ class STTEngine(BaseNonStreamingEngine):
             generate_language = _normalize_stt_generate_language(model, language)
             if generate_language is not None:
                 gen_kwargs["language"] = generate_language
+            gen_kwargs.update(_map_stt_prompt_kwargs(model, prompt))
 
             result = model.generate(audio_path, **gen_kwargs)
 

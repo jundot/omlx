@@ -485,6 +485,194 @@ class TestSTTEndpointBasic:
 
 
 # ---------------------------------------------------------------------------
+# TestSTTEnginePromptBiasing
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEnginePromptBiasing:
+    """OpenAI ``prompt`` field maps onto per-backend biasing hooks (#2078)."""
+
+    @staticmethod
+    def _wav(tmp_path):
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+        return str(audio_path)
+
+    @pytest.mark.asyncio
+    async def test_prompt_maps_to_system_prompt_for_qwen3_style(self, tmp_path):
+        """Backends with a system_prompt hook get trained context injection."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(
+            self._wav(tmp_path), prompt="Vocabulary: Kubernetes, issue, omlx."
+        )
+
+        assert generate_kwargs["system_prompt"] == (
+            "Vocabulary: Kubernetes, issue, omlx."
+        )
+        assert "prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_prompt_maps_to_initial_prompt_for_whisper_style(self, tmp_path):
+        """Whisper-family backends get the prompt as a decoder prefix."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, initial_prompt=None, **kwargs):
+                generate_kwargs["initial_prompt"] = initial_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("whisper-large")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path), prompt="ZyntriQix, Digique")
+
+        assert generate_kwargs["initial_prompt"] == "ZyntriQix, Digique"
+        assert "prompt" not in generate_kwargs
+        assert "system_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_prompt_dropped_for_backends_without_hook(self, tmp_path):
+        """Backends with no biasing hook never see the field and never fail."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("plain-asr")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(self._wav(tmp_path), prompt="hint text")
+
+        assert result["text"] == "ok"
+        assert "prompt" not in generate_kwargs
+        assert "system_prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_no_prompt_leaves_generate_kwargs_unchanged(self, tmp_path):
+        """Requests without prompt are byte-for-byte today's behavior."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path))
+
+        assert generate_kwargs["system_prompt"] is None
+
+    @pytest.mark.asyncio
+    async def test_blank_prompt_is_dropped(self, tmp_path):
+        """Whitespace-only prompts keep the backend in its default mode."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path), prompt="   ")
+
+        assert generate_kwargs["system_prompt"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEndpointPrompt
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEndpointPrompt:
+    """POST /v1/audio/transcriptions forwards the OpenAI prompt field (#2078)."""
+
+    def test_prompt_forwarded_to_engine(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={
+                "model": "qwen3-asr",
+                "prompt": "Vocabulary: Kubernetes, issue, omlx.",
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured.get("prompt") == "Vocabulary: Kubernetes, issue, omlx."
+
+    def test_absent_prompt_not_forwarded(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "qwen3-asr"},
+        )
+
+        assert response.status_code == 200
+        assert "prompt" not in captured
+
+
+# ---------------------------------------------------------------------------
 # TestSTTEndpointResponseFormat
 # ---------------------------------------------------------------------------
 
