@@ -9,6 +9,7 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
+import json
 import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -557,6 +558,278 @@ class TestSTTEndpointErrors:
             "/v1/audio/transcriptions",
             files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
             data={"model": "whisper-tiny"},
+        )
+        assert response.status_code >= 500
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEngineStreaming
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEngineStreaming:
+    """Unit tests for STTEngine.transcribe_stream (#1066)."""
+
+    @pytest.mark.asyncio
+    async def test_native_stream_yields_normalized_chunks(self, tmp_path):
+        """Models with a ``stream`` generate() param yield incremental chunks."""
+        from omlx.engine.stt import STTEngine
+
+        calls = []
+
+        class FakeModel:
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                calls.append({
+                    "audio_path": audio_path, "stream": stream, "kwargs": kwargs,
+                })
+                return iter([
+                    SimpleNamespace(
+                        text="hello ", is_final=False, language="en",
+                        prompt_tokens=0, generation_tokens=0,
+                    ),
+                    SimpleNamespace(
+                        text="world", is_final=True, language="en",
+                        prompt_tokens=5, generation_tokens=2,
+                    ),
+                ])
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("whisper-tiny")
+        engine._model = FakeModel()
+
+        chunks = [c async for c in engine.transcribe_stream(str(audio_path))]
+
+        assert [c["text"] for c in chunks] == ["hello ", "world"]
+        assert chunks[-1]["prompt_tokens"] == 5
+        assert chunks[-1]["generation_tokens"] == 2
+        assert chunks[-1]["language"] == "en"
+        assert calls[0]["audio_path"] == str(audio_path)
+        assert calls[0]["stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_native_stream_normalizes_language(self, tmp_path):
+        """Language hints get the same backend normalization as transcribe()."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            config = SimpleNamespace(support_languages=["Chinese", "English"])
+
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                generate_kwargs.update(kwargs)
+                return iter([
+                    SimpleNamespace(
+                        text="你好", is_final=True, language="zh",
+                        prompt_tokens=0, generation_tokens=0,
+                    ),
+                ])
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        chunks = [
+            c async for c in engine.transcribe_stream(
+                str(audio_path), language="zh"
+            )
+        ]
+
+        assert generate_kwargs["language"] == "chinese"
+        assert chunks[0]["text"] == "你好"
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_native_stream_support(self, tmp_path):
+        """Models without a ``stream`` param fall back to one-shot transcribe."""
+        from omlx.engine.stt import STTEngine
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                assert "stream" not in kwargs
+                return SimpleNamespace(
+                    text="hello world",
+                    language="en",
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("legacy-asr")
+        engine._model = FakeModel()
+
+        chunks = [c async for c in engine.transcribe_stream(str(audio_path))]
+
+        assert len(chunks) == 1
+        assert chunks[0]["text"] == "hello world"
+        assert chunks[0]["language"] == "en"
+
+    def test_supports_native_stt_streaming_detection(self):
+        """Capability check keys off the ``stream`` param in generate()."""
+        from omlx.engine.stt import STTEngine
+
+        class StreamingModel:
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                pass
+
+        class OneShotModel:
+            def generate(self, audio_path, **kwargs):
+                pass
+
+        engine = STTEngine("m")
+        engine._model = StreamingModel()
+        assert engine.supports_native_stt_streaming() is True
+
+        engine._model = OneShotModel()
+        assert engine.supports_native_stt_streaming() is False
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEndpointStreaming
+# ---------------------------------------------------------------------------
+
+
+def _sse_events(body: str) -> list[dict]:
+    """Parse data-only SSE payloads out of a response body."""
+    events = []
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[len("data: "):]))
+    return events
+
+
+def _set_stream_chunks(engine, chunks):
+    """Install a fake transcribe_stream that records calls and yields chunks."""
+    calls = []
+
+    def fake_stream(path, **kwargs):
+        calls.append({"path": path, "kwargs": kwargs})
+
+        async def _gen():
+            for chunk in chunks:
+                yield chunk
+
+        return _gen()
+
+    engine.transcribe_stream = fake_stream
+    return calls
+
+
+class TestSTTEndpointStreaming:
+    """POST /v1/audio/transcriptions with stream=true returns SSE (#1066)."""
+
+    def test_stream_true_returns_sse_deltas_and_done(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        _set_stream_chunks(engine, [
+            {"text": "hello ", "language": "en",
+             "prompt_tokens": 0, "generation_tokens": 0},
+            {"text": "world", "language": "en",
+             "prompt_tokens": 5, "generation_tokens": 2},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+
+        events = _sse_events(response.text)
+        deltas = [e for e in events if e["type"] == "transcript.text.delta"]
+        assert [d["delta"] for d in deltas] == ["hello ", "world"]
+
+        done = events[-1]
+        assert done["type"] == "transcript.text.done"
+        assert done["text"] == "hello world"
+        assert done["usage"] == {
+            "type": "tokens",
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "total_tokens": 7,
+        }
+
+    def test_stream_skips_empty_deltas_and_omits_unknown_usage(
+        self, server_audio_client
+    ):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        _set_stream_chunks(engine, [
+            {"text": "", "language": None,
+             "prompt_tokens": 0, "generation_tokens": 0},
+            {"text": "hi", "language": None,
+             "prompt_tokens": 0, "generation_tokens": 0},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
+        )
+
+        events = _sse_events(response.text)
+        deltas = [e for e in events if e["type"] == "transcript.text.delta"]
+        assert [d["delta"] for d in deltas] == ["hi"]
+        assert "usage" not in events[-1]
+
+    def test_stream_forwards_transcribe_kwargs(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        calls = _set_stream_chunks(engine, [
+            {"text": "ok", "language": "zh",
+             "prompt_tokens": 0, "generation_tokens": 0},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={
+                "model": "whisper-tiny",
+                "stream": "true",
+                "language": "zh",
+                "max_tokens": "128",
+            },
+        )
+
+        assert response.status_code == 200
+        assert calls[0]["kwargs"]["language"] == "zh"
+        assert calls[0]["kwargs"]["max_tokens"] == 128
+
+    def test_stream_false_keeps_json_response(self, server_audio_client):
+        client, _ = server_audio_client
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "false"},
+        )
+        assert response.status_code == 200
+        assert "application/json" in response.headers.get("content-type", "")
+        assert response.json()["text"] == "hello world"
+
+    def test_stream_engine_error_returns_500(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        def broken_stream(path, **kwargs):
+            async def _gen():
+                raise RuntimeError("model failed")
+                yield  # pragma: no cover
+
+            return _gen()
+
+        engine.transcribe_stream = broken_stream
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
         )
         assert response.status_code >= 500
 
