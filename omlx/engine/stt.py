@@ -398,9 +398,13 @@ class STTEngine(BaseNonStreamingEngine):
         self,
         audio_path: str,
         language: str | None = None,
+        prompt: str | None = None,
         **kwargs,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream transcription chunks as the model decodes them.
+
+        ``prompt`` is the OpenAI vocabulary / context biasing field, mapped
+        onto the backend's biasing hook exactly as in transcribe().
 
         Yields dicts with keys:
             text: Incremental text delta for this chunk
@@ -415,7 +419,9 @@ class STTEngine(BaseNonStreamingEngine):
             raise RuntimeError("Engine not started. Call start() first.")
 
         if not self.supports_native_stt_streaming():
-            result = await self.transcribe(audio_path, language=language, **kwargs)
+            result = await self.transcribe(
+                audio_path, language=language, prompt=prompt, **kwargs
+            )
             yield {
                 "text": result.get("text", ""),
                 "language": result.get("language"),
@@ -440,6 +446,7 @@ class STTEngine(BaseNonStreamingEngine):
         generate_language = _normalize_stt_generate_language(model, language)
         if generate_language is not None:
             gen_kwargs["language"] = generate_language
+        gen_kwargs.update(_map_stt_prompt_kwargs(model, prompt))
         gen_kwargs["stream"] = True
 
         iterator: Any = None
