@@ -426,6 +426,7 @@ async def create_transcription(
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
     stream: bool = Form(False),
@@ -442,6 +443,13 @@ async def create_transcription(
     by a final ``transcript.text.done`` event with the full transcription
     (#1066). Models whose mlx-audio backend lacks native streaming still
     respond in SSE format, with the full text arriving in a single delta.
+
+    ``prompt`` follows the OpenAI spec: optional text to guide recognition
+    toward specific vocabulary, spellings, or style. Mapped onto the
+    backend's biasing hook — Qwen3-ASR receives it as trained context
+    injection (``system_prompt``, strong biasing), Whisper models as a
+    decoder-prefix soft prior (``initial_prompt``, ~224-token window).
+    Backends without a biasing hook ignore it; it never fails a request.
 
     ``max_tokens`` is an oMLX extension that raises the underlying model's
     output cap. Useful for long audio with models like VibeVoice-ASR whose
@@ -508,6 +516,8 @@ async def create_transcription(
                     pass
 
         transcribe_kwargs: dict = {"language": language}
+        if prompt is not None:
+            transcribe_kwargs["prompt"] = prompt
         if effective_max_tokens is not None:
             transcribe_kwargs["max_tokens"] = effective_max_tokens
         if word_timestamps:
