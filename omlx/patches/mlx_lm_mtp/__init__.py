@@ -78,7 +78,13 @@ def apply_mlx_lm_mtp_patch() -> bool:
         True if the patch is now active. False if a sub-step refused
         to apply (mlx-lm not importable, missing prerequisite patch).
     """
-    from . import batch_generator, cache_rollback, deepseek_v4_model, qwen35_model
+    from . import (
+        batch_generator,
+        cache_rollback,
+        deepseek_v4_model,
+        glm_moe_dsa_model,
+        qwen35_model,
+    )
 
     if not cache_rollback.apply():
         return False
@@ -88,6 +94,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
+    if not glm_moe_dsa_model.apply():
+        logger.debug("GLM-5.2 MTP patch did not apply (likely non-GLM model)")
     if not batch_generator.apply():
         logger.warning(
             "BatchGenerator MTP dispatch patch failed; MTP path will be inactive"

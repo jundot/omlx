@@ -1541,6 +1541,18 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         _clear_rollback(gen_batch.prompt_cache)
         state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
 
+        # Aligned-cache heads (e.g. GLM-5.2 external MTP): also insert the
+        # accepted draft's (hidden, token) pair so the head cache tracks
+        # every confirmed position and RoPE/indexer offsets stay exact.
+        # Logits of this fill forward are never evaluated (lazy), so the
+        # lm_head matmul is skipped — only the KV/indexer update runs.
+        if getattr(gen_batch.model, "_omlx_mtp_aligned_cache", False):
+            gen_batch.model.mtp_forward(
+                hidden_at_confirmed,
+                _ensure_uint32(state.draft_tok).reshape(1, 1),
+                state.mtp_cache,
+            )
+
         # --- MTP head forward for next draft (timed inside _step_mtp) ---
         new_draft, new_draft_lp = _step_mtp(
             gen_batch,

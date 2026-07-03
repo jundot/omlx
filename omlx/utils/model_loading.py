@@ -195,8 +195,10 @@ def maybe_apply_pre_load_patches(
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
     from ..patches.mlx_lm_mtp import set_mtp_active
+    from ..patches.mlx_lm_mtp.glm_moe_dsa_model import set_glm_mtp_path
 
     set_mtp_active(False)
+    set_glm_mtp_path(None)
 
     _patch_mlx_lm_load_config()
 
@@ -239,6 +241,40 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
+
+        # GLM-5.2 MTP: the head ships as a separate checkpoint (common
+        # quantized checkpoints strip the mtp.* tensors), so the in-config
+        # detection (_is_mtp_compatible) does not apply. Gate on
+        # model_settings.mtp_enabled + a <model_dir>/mtp checkpoint and
+        # arm the post-load attach (apply_post_load_transforms).
+        from ..patches.mlx_lm_mtp.glm_moe_dsa_model import (
+            find_glm_mtp_checkpoint,
+        )
+
+        glm_mtp_enabled = bool(
+            model_settings is not None
+            and getattr(model_settings, "mtp_enabled", False)
+        )
+        glm_mtp_path = (
+            find_glm_mtp_checkpoint(str(model_name)) if glm_mtp_enabled else None
+        )
+        if glm_mtp_path:
+            from ..patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch
+
+            if apply_mlx_lm_mtp_patch():
+                from ..patches.mlx_lm_mtp.glm_moe_dsa_model import (
+                    set_glm_mtp_path as _arm_glm_mtp,
+                )
+
+                _arm_glm_mtp(glm_mtp_path)
+                logger.info(
+                    "GLM MTP armed for %s (head: %s)", model_name, glm_mtp_path
+                )
+        elif glm_mtp_enabled:
+            logger.warning(
+                "mtp_enabled is set for %s but no <model_dir>/mtp checkpoint "
+                "was found — MTP inactive", model_name,
+            )
 
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if for_vlm and (
@@ -577,6 +613,10 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    from ..patches.mlx_lm_mtp.glm_moe_dsa_model import maybe_attach_glm_mtp
+
+    model = maybe_attach_glm_mtp(model, model_settings)
+
     if model_settings is None:
         return model
 
