@@ -1243,6 +1243,55 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    def _schedule_failed_load_reclaim(
+        self, model_id: str, pre_load_memory: int
+    ) -> None:
+        """Reclaim memory left behind by a failed model load.
+
+        When a load raises partway through (e.g. weights loaded, processor
+        construction failed), the weights are often reachable only via the
+        propagating exception's traceback frames. Spawn a background task
+        that waits briefly for the exception to be handled and dropped, then
+        runs gc + synchronize + clear_cache rounds until the live memory
+        reading returns near its pre-load level (or rounds are exhausted).
+        """
+
+        async def _reclaim() -> None:
+            loop = asyncio.get_running_loop()
+            # 2 GB slack over the pre-load level mirrors the unload settle
+            # barrier's small-model tolerance floor.
+            target = pre_load_memory + 2 * 1024**3
+            current = 0
+            for _round in range(6):
+                await asyncio.sleep(0.5 if _round == 0 else 1.0)
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                current = max(mx.get_active_memory(), get_phys_footprint())
+                if current <= target:
+                    logger.info(
+                        f"Reclaimed memory after failed load of '{model_id}': "
+                        f"current={format_size(current)} "
+                        f"(pre-load={format_size(pre_load_memory)})"
+                    )
+                    self._wake_process_memory_enforcer()
+                    return
+            logger.warning(
+                f"Post-failed-load reclaim for '{model_id}' did not settle: "
+                f"current={format_size(current)} "
+                f"(pre-load={format_size(pre_load_memory)}). A server restart "
+                f"may be required to release the leaked memory."
+            )
+            self._wake_process_memory_enforcer()
+
+        # Keep a reference so the task isn't garbage-collected mid-flight;
+        # one slot suffices -- a newer failure supersedes the previous task.
+        self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
+            _reclaim()
+        )
+
     async def _load_engine(
         self,
         model_id: str,
@@ -1637,6 +1686,16 @@ class EnginePool:
                 f"total: {format_size(self._current_model_memory)})"
             )
         except Exception as exc:
+            # A failed load can leave tens of GB of just-loaded weights
+            # reachable only through the propagating exception's traceback
+            # frames (loader-internal locals). Running gc/clear_cache
+            # synchronously here is useless -- the exception is still alive
+            # in the caller. Schedule a deferred reclaim that runs after the
+            # exception has been handled and dropped, so the buffers are
+            # actually released; otherwise the process footprint stays
+            # inflated and the memory-ceiling admission check rejects all
+            # subsequent loads until a server restart.
+            self._schedule_failed_load_reclaim(model_id, pre_load_memory)
             if not entry.abort_loading:
                 self._mark_load_failure(entry, exc)
                 logger.exception(

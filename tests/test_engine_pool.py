@@ -2455,3 +2455,112 @@ class TestResetActivityTracking:
         # Teardown reset the leaked counter (getattr-guarded reset called).
         assert engine._active_count == 0
         assert engine.has_active_requests() is False
+
+
+class TestFailedLoadReclaim:
+    """Failed model loads schedule a deferred memory reclaim.
+
+    Weights loaded before a load failure can remain reachable only through
+    the propagating exception's traceback frames, so synchronous
+    gc/clear_cache at raise time cannot free them. The pool schedules a
+    background task (_schedule_failed_load_reclaim) that retries reclaim
+    after the exception has been handled and dropped.
+    """
+
+    async def test_reclaim_settles_when_memory_returns(self):
+        pool = _make_pool()
+        gauge = {"active": 80 * 1024**3}
+
+        def _fake_active():
+            return gauge["active"]
+
+        def _drop_on_clear():
+            # Simulate the leaked buffers becoming collectable after the
+            # first gc + clear_cache round.
+            gauge["active"] = 1 * 1024**3
+
+        import concurrent.futures
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with (
+                patch(
+                    "omlx.engine_pool.mx.get_active_memory",
+                    side_effect=_fake_active,
+                ),
+                patch("omlx.engine_pool.mx.synchronize"),
+                patch(
+                    "omlx.engine_pool.mx.clear_cache",
+                    side_effect=_drop_on_clear,
+                ),
+                patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_mlx_executor", return_value=executor
+                ),
+                patch(
+                    "omlx.engine_pool.asyncio.sleep",
+                    new=AsyncMock(return_value=None),
+                ),
+            ):
+                pool._schedule_failed_load_reclaim(
+                    "model-x", pre_load_memory=1 * 1024**3
+                )
+                await asyncio.wait_for(
+                    pool._failed_load_reclaim_task, timeout=10
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert gauge["active"] == 1 * 1024**3
+
+    async def test_reclaim_gives_up_after_max_rounds(self):
+        """A permanently-inflated gauge must not hang the reclaim task."""
+        pool = _make_pool()
+
+        import concurrent.futures
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with (
+                patch(
+                    "omlx.engine_pool.mx.get_active_memory",
+                    return_value=80 * 1024**3,
+                ),
+                patch("omlx.engine_pool.mx.synchronize"),
+                patch("omlx.engine_pool.mx.clear_cache"),
+                patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_mlx_executor", return_value=executor
+                ),
+                patch(
+                    "omlx.engine_pool.asyncio.sleep",
+                    new=AsyncMock(return_value=None),
+                ),
+            ):
+                pool._schedule_failed_load_reclaim(
+                    "model-x", pre_load_memory=1 * 1024**3
+                )
+                await asyncio.wait_for(
+                    pool._failed_load_reclaim_task, timeout=10
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+    async def test_failed_load_schedules_reclaim(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        failing_engine = MagicMock()
+        failing_engine.start = AsyncMock(side_effect=RuntimeError("boom"))
+        failing_engine.stop = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=failing_engine),
+            patch.object(pool, "_schedule_failed_load_reclaim") as scheduled,
+        ):
+            with pytest.raises(Exception):
+                await pool._load_engine("model-a")
+
+        scheduled.assert_called_once()
+        args = scheduled.call_args[0]
+        assert args[0] == "model-a"
