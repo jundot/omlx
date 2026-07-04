@@ -400,6 +400,26 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     )
 
 
+def _looks_like_kokoro_config(config: dict) -> bool:
+    """Return True for Kokoro exports that omit HF ``model_type``.
+
+    mlx-community Kokoro conversions (e.g. Kokoro-82M-bf16) keep the original
+    Kokoro config — top-level ``istftnet`` + ``plbert`` sections and a
+    ``vocab`` table — with no HF-style ``model_type``/``architectures``.
+    mlx-audio loads them fine, but oMLX must classify them as TTS during
+    discovery or they fall through to the LLM engine, whose loader only
+    matches ``model*.safetensors`` and fails with a misleading
+    "No safetensors found" error.
+    """
+    if not isinstance(config, dict):
+        return False
+    return (
+        isinstance(config.get("istftnet"), dict)
+        and isinstance(config.get("plbert"), dict)
+        and isinstance(config.get("vocab"), dict)
+    )
+
+
 def _looks_like_nemo_asr_config(config: dict) -> bool:
     """Return True for NeMo ASR exports that omit HF ``model_type``.
 
@@ -628,6 +648,9 @@ def detect_model_type(model_path: Path) -> ModelType:
     # still STT models and mlx-audio can load them by directory/repo name.
     if _looks_like_nemo_asr_config(config):
         return "audio_stt"
+    # Kokoro exports similarly ship a bare original config (istftnet/plbert).
+    if _looks_like_kokoro_config(config):
+        return "audio_tts"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"
