@@ -9,11 +9,13 @@ This module provides OpenAI-compatible audio endpoints:
 """
 
 import base64
+import json
 import logging
 import math
 import os
 import re
 import tempfile
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -478,6 +480,49 @@ async def create_transcription(
         duration=result.get("duration"),
         segments=segments,
     )
+
+
+@router.get("/v1/audio/voices")
+async def list_model_voices(model: Optional[str] = None):
+    """List built-in speaker/voice names for a TTS model.
+
+    Reads static metadata only — a ``voices/`` directory (Kokoro-style)
+    or the speaker table in ``config.json`` (Qwen3-TTS CustomVoice's
+    ``talker_config.spk_id``) — so the model does not need to be loaded.
+    Returns ``{"model": ..., "voices": [...]}``; an empty list means the
+    model has no named speakers (e.g. voice-cloning base models).
+    """
+    if not model:
+        raise HTTPException(
+            status_code=400, detail="'model' query parameter is required"
+        )
+    pool = _get_engine_pool()
+    resolved = _resolve_model(model)
+    entry = pool.get_entry(resolved)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{resolved}' not found"
+        )
+
+    model_dir = Path(entry.model_path)
+    voices: list[str] = []
+    voices_dir = model_dir / "voices"
+    if voices_dir.is_dir():
+        voices = sorted({
+            f.stem
+            for f in voices_dir.iterdir()
+            if f.suffix in (".safetensors", ".pt")
+        })
+    else:
+        try:
+            config = json.loads((model_dir / "config.json").read_text())
+        except (OSError, ValueError):
+            config = {}
+        talker = config.get("talker_config") or {}
+        spk = talker.get("spk_id") or config.get("spk_id") or {}
+        if isinstance(spk, dict):
+            voices = sorted(spk.keys())
+    return {"model": resolved, "voices": voices}
 
 
 @router.post("/v1/audio/speech")
