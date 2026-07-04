@@ -51,7 +51,13 @@ dependencies = [
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.7.0",
+    # <5.13: transformers 5.13.0 (released 2026-07-03) tightened
+    # _LazyAutoMapping.register to require config classes, breaking mlx-lm
+    # 0.31.3's AutoTokenizer.register("NewlineTokenizer", ...) at import time
+    # (AttributeError: 'str' object has no attribute '__module__'). Every
+    # `import mlx_lm` fails on a fresh resolve. Lift once the mlx-lm pin
+    # advances past a fix.
+    "transformers>=5.7.0,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
