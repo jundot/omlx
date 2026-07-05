@@ -50,6 +50,8 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+_NATIVE_MEMORY_RESIDUAL_FLOOR = 512 * 1024**2
+
 
 @dataclass
 class EngineEntry:
@@ -151,6 +153,34 @@ class EnginePool:
     def current_model_memory(self) -> int:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
+
+    def _observed_native_memory(self) -> int:
+        """Return the live native memory ledger used for admission decisions."""
+        try:
+            return max(mx.get_active_memory(), get_phys_footprint())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Native memory observation unavailable: %s", exc)
+            return 0
+
+    def _untracked_native_memory(self, observed: int | None = None) -> int:
+        """Native memory still resident but no longer charged to live engines."""
+        observed = self._observed_native_memory() if observed is None else observed
+        loading_reserved = int(getattr(self, "_loading_reserved_bytes", 0) or 0)
+        accounted = self._current_model_memory + loading_reserved
+        residual = max(0, observed - accounted)
+        if residual < _NATIVE_MEMORY_RESIDUAL_FLOOR:
+            return 0
+        return residual
+
+    @property
+    def observed_native_memory(self) -> int:
+        """Live MLX/phys-footprint memory seen by the running process."""
+        return self._observed_native_memory()
+
+    @property
+    def untracked_native_memory(self) -> int:
+        """Residual native memory not attached to a loaded or loading engine."""
+        return self._untracked_native_memory()
 
     def configure_hot_cache_budget(self) -> None:
         """Ensure loaded schedulers share one process-wide hot cache budget."""
@@ -1713,9 +1743,23 @@ class EnginePool:
         Returns:
             Dictionary with pool status information
         """
+        observed_native_memory = self._observed_native_memory()
+        untracked_native_memory = self._untracked_native_memory(
+            observed_native_memory
+        )
+        loading_reserved_memory = int(
+            getattr(self, "_loading_reserved_bytes", 0) or 0
+        )
         return {
             "final_ceiling": self._current_ceiling(),
             "current_model_memory": self._current_model_memory,
+            "loading_reserved_memory": loading_reserved_memory,
+            "observed_native_memory": observed_native_memory,
+            "untracked_native_memory": untracked_native_memory,
+            "effective_model_memory": (
+                self._current_model_memory + loading_reserved_memory
+                + untracked_native_memory
+            ),
             "model_count": len(self._entries),
             "loaded_count": sum(
                 1 for e in self._entries.values() if e.engine is not None

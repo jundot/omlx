@@ -71,6 +71,8 @@
   "status.speed.token_generation": "Generación de Tokens",
   "status.active_models.section_label": "Modelos Activos",
   "status.active_models.no_models": "No hay modelos cargados",
+  "status.active_models.residual_memory": "No models loaded, but {memory} native memory is still resident",
+  "status.active_models.residual_memory_hint": "Restart oMLX if this does not clear after cache reclaim.",
   "status.active_models.active": "Activo",
   "status.active_models.waiting": "Esperando",
   "status.active_models.req": "req",

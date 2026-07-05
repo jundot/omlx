@@ -2131,6 +2131,7 @@ async def health():
 
     pool_status = None
     if _server_state.engine_pool is not None:
+        pool = _server_state.engine_pool
         enforcer = _server_state.process_memory_enforcer
         ceiling = 0
         if enforcer is not None:
@@ -2138,11 +2139,22 @@ async def health():
                 ceiling = enforcer.get_final_ceiling()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Health memory ceiling unavailable: %s", exc)
+        untracked_native_memory = int(
+            getattr(pool, "untracked_native_memory", 0) or 0
+        )
+        observed_native_memory = int(
+            getattr(pool, "observed_native_memory", 0) or 0
+        )
         pool_status = {
-            "model_count": _server_state.engine_pool.model_count,
-            "loaded_count": _server_state.engine_pool.loaded_model_count,
+            "model_count": pool.model_count,
+            "loaded_count": pool.loaded_model_count,
             "final_ceiling": ceiling,
-            "current_model_memory": _server_state.engine_pool.current_model_memory,
+            "current_model_memory": pool.current_model_memory,
+            "observed_native_memory": observed_native_memory,
+            "untracked_native_memory": untracked_native_memory,
+            "effective_model_memory": (
+                pool.current_model_memory + untracked_native_memory
+            ),
         }
 
     return {
@@ -2168,6 +2180,9 @@ async def server_status(_: bool = Depends(verify_api_key)):
     models_loaded = 0
     models_loading = 0
     loaded_models = []
+    model_memory_accounted = 0
+    untracked_native_memory = 0
+    observed_native_memory = 0
     model_memory_used = 0
     model_memory_max = None
 
@@ -2175,7 +2190,14 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_discovered = pool.model_count
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
-        model_memory_used = pool.current_model_memory
+        model_memory_accounted = pool.current_model_memory
+        untracked_native_memory = int(
+            getattr(pool, "untracked_native_memory", 0) or 0
+        )
+        observed_native_memory = int(
+            getattr(pool, "observed_native_memory", 0) or 0
+        )
+        model_memory_used = model_memory_accounted + untracked_native_memory
         enforcer = _server_state.process_memory_enforcer
         if enforcer is not None:
             try:
@@ -2224,9 +2246,17 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "avg_prefill_tps": snapshot["avg_prefill_tps"],
         "avg_generation_tps": snapshot["avg_generation_tps"],
         "model_memory_used": model_memory_used,
+        "model_memory_accounted": model_memory_accounted,
+        "observed_native_memory": observed_native_memory,
+        "untracked_native_memory": untracked_native_memory,
         "model_memory_max": model_memory_max,
         "model_memory_used_formatted": (
             format_size(model_memory_used) if model_memory_used else "0B"
+        ),
+        "untracked_native_memory_formatted": (
+            format_size(untracked_native_memory)
+            if untracked_native_memory
+            else "0B"
         ),
         "model_memory_max_formatted": (
             format_size(model_memory_max) if model_memory_max else "unlimited"

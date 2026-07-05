@@ -4670,12 +4670,21 @@ def _build_active_models_data() -> dict:
         memory_used = enforcer_status.get("current_bytes", 0)
         memory_max = enforcer_status.get("ceiling_bytes", 0)
     else:
-        memory_used = status.get("current_model_memory", 0)
+        memory_used = status.get(
+            "effective_model_memory",
+            status.get("current_model_memory", 0),
+        )
         memory_max = status.get("final_ceiling", 0)
+    untracked_native_memory = status.get("untracked_native_memory", 0)
+    observed_native_memory = status.get("observed_native_memory", 0)
     return {
         "models": models,
         "model_memory_used": memory_used,
         "model_memory_max": memory_max,
+        "model_memory_accounted": status.get("current_model_memory", 0),
+        "observed_native_memory": observed_native_memory,
+        "untracked_native_memory": untracked_native_memory,
+        "untracked_native_memory_formatted": format_size(untracked_native_memory),
         "memory_pressure": {
             "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
             "current_bytes": (

@@ -309,7 +309,7 @@ class TestEnginePoolErrors:
         assert pool.get_entry("model-a") is None
 
 
-class TestEnginePoolStatus:
+class TestEnginePoolStatusReporting:
     """Tests for EnginePool status reporting."""
 
     def test_get_status(self, small_mock_model_dir):
@@ -333,6 +333,72 @@ class TestEnginePoolStatus:
         model_a_status = next(m for m in status["models"] if m["id"] == "model-a")
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
+
+    def test_get_status_reports_untracked_native_memory(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """No loaded engine should not hide residual MLX/Metal memory."""
+        gb = 1024**3
+        observed_native_memory = 7 * gb
+        pool = _make_pool(ceiling=64 * gb)
+        pool.discover_models(str(small_mock_model_dir))
+
+        monkeypatch.setattr(
+            "omlx.engine_pool.mx.get_active_memory",
+            lambda: observed_native_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+
+        status = pool.get_status()
+
+        assert status["loaded_count"] == 0
+        assert status["current_model_memory"] == 0
+        assert status["observed_native_memory"] == observed_native_memory
+        assert status["untracked_native_memory"] == observed_native_memory
+        assert status["effective_model_memory"] == observed_native_memory
+
+    def test_get_status_subtracts_accounted_memory_from_native_residual(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """Residual memory is the observed native ledger minus accounted memory."""
+        gb = 1024**3
+        accounted_memory = 3 * gb
+        observed_native_memory = 8 * gb
+        pool = _make_pool(ceiling=64 * gb)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._current_model_memory = accounted_memory
+
+        monkeypatch.setattr(
+            "omlx.engine_pool.mx.get_active_memory",
+            lambda: observed_native_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+
+        status = pool.get_status()
+
+        assert status["current_model_memory"] == accounted_memory
+        assert status["observed_native_memory"] == observed_native_memory
+        assert status["untracked_native_memory"] == (
+            observed_native_memory - accounted_memory
+        )
+        assert status["effective_model_memory"] == observed_native_memory
+
+    def test_get_status_ignores_small_native_memory_noise(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """Tiny native samples are not reported as meaningful residual memory."""
+        noise = 128 * 1024**2
+        pool = _make_pool(ceiling=64 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: noise)
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+
+        status = pool.get_status()
+
+        assert status["observed_native_memory"] == noise
+        assert status["untracked_native_memory"] == 0
+        assert status["effective_model_memory"] == 0
 
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""

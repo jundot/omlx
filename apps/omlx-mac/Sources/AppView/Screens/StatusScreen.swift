@@ -65,7 +65,7 @@ struct StatusScreen: View {
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
-            ActiveNowList(models: vm.stats?.activeModels.models ?? [])
+            ActiveNowList(activeModels: vm.stats?.activeModels)
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
@@ -536,20 +536,47 @@ private struct ThermalTrailing: View {
 // MARK: - Active Now
 
 private struct ActiveNowList: View {
-    let models: [StatsDTO.ActiveModelDTO]
+    let activeModels: StatsDTO.ActiveModelsDTO?
     @Environment(\.omlxTheme) private var theme
+
+    private var models: [StatsDTO.ActiveModelDTO] {
+        activeModels?.models ?? []
+    }
+
+    private var residualMemory: Int64 {
+        activeModels?.untrackedNativeMemory ?? 0
+    }
+
+    private var residualMemoryText: String {
+        activeModels?.untrackedNativeMemoryFormatted ?? formatBytes(residualMemory)
+    }
 
     var body: some View {
         ListGroup {
             if models.isEmpty {
                 FreeRow(isLast: true) {
-                    Text(String(localized: "status.active_now.empty",
-                                defaultValue: "Server idle — no models loaded",
-                                comment: "Empty-state text shown when the Active Now list has no entries"))
-                        .font(.omlxText(12))
-                        .foregroundStyle(theme.textTertiary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 12)
+                    VStack(spacing: 4) {
+                        if residualMemory > 0 {
+                            Text(String(localized: "status.active_now.residual",
+                                        defaultValue: "No models loaded, but \(residualMemoryText) native memory is still resident",
+                                        comment: "Empty-state text when no model is loaded but native memory remains resident"))
+                                .font(.omlxText(12, weight: .medium))
+                                .foregroundStyle(theme.amberDot)
+                            Text(String(localized: "status.active_now.residual_hint",
+                                        defaultValue: "Restart oMLX if cache reclaim does not clear it.",
+                                        comment: "Hint shown under residual native memory warning"))
+                                .font(.omlxText(11))
+                                .foregroundStyle(theme.textTertiary)
+                        } else {
+                            Text(String(localized: "status.active_now.empty",
+                                        defaultValue: "Server idle — no models loaded",
+                                        comment: "Empty-state text shown when the Active Now list has no entries"))
+                                .font(.omlxText(12))
+                                .foregroundStyle(theme.textTertiary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 12)
                 }
             } else {
                 ForEach(Array(models.enumerated()), id: \.element.id) { index, model in

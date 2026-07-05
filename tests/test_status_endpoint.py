@@ -76,6 +76,38 @@ class TestStatusEndpoint:
         assert "GB" in data["model_memory_used_formatted"]
         assert "GB" in data["model_memory_max_formatted"]
 
+    def test_reports_untracked_native_memory_with_no_loaded_models(
+        self, client
+    ):
+        """Residual native memory is reported even with no loaded models."""
+        gb = 1024**3
+        residual_memory = 6 * gb
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "get_loaded_model_ids",
+            "current_model_memory", "observed_native_memory",
+            "untracked_native_memory", "_entries",
+        ])
+        pool.model_count = 5
+        pool.loaded_model_count = 0
+        pool.get_loaded_model_ids.return_value = []
+        pool.current_model_memory = 0
+        pool.observed_native_memory = residual_memory
+        pool.untracked_native_memory = residual_memory
+        pool._entries = {}
+
+        self._state.engine_pool = pool
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["models_loaded"] == 0
+        assert data["loaded_models"] == []
+        assert data["model_memory_used"] == residual_memory
+        assert data["model_memory_accounted"] == 0
+        assert data["observed_native_memory"] == residual_memory
+        assert data["untracked_native_memory"] == residual_memory
+        assert "GB" in data["untracked_native_memory_formatted"]
+
     def test_status_ignores_memory_ceiling_error(self, client):
         """Memory telemetry failures should not break status polling."""
         pool = MagicMock(spec=[
@@ -122,6 +154,32 @@ class TestStatusEndpoint:
         data = resp.json()
         assert data["status"] == "healthy"
         assert data["engine_pool"]["final_ceiling"] == 0
+
+    def test_health_reports_untracked_native_memory(self, client):
+        """Health telemetry includes residual native memory separately."""
+        gb = 1024**3
+        residual_memory = 9 * gb
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "current_model_memory",
+            "observed_native_memory", "untracked_native_memory",
+        ])
+        pool.model_count = 5
+        pool.loaded_model_count = 0
+        pool.current_model_memory = 0
+        pool.observed_native_memory = residual_memory
+        pool.untracked_native_memory = residual_memory
+
+        self._state.engine_pool = pool
+
+        resp = client.get("/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["engine_pool"]["loaded_count"] == 0
+        assert data["engine_pool"]["observed_native_memory"] == residual_memory
+        assert data["engine_pool"]["untracked_native_memory"] == residual_memory
+        assert data["engine_pool"]["effective_model_memory"] == residual_memory
 
     def test_aggregates_active_waiting_requests(self, client):
         """Active/waiting request counts are summed across loaded engines."""

@@ -147,7 +147,17 @@
                             <!-- Empty state -->
                             <div x-show="!stats.active_models.models || stats.active_models.models.length === 0"
                                  class="px-6 py-8 text-center text-sm text-neutral-400">
-                                {{ t('status.active_models.no_models') }}
+                                <div x-show="!(stats.active_models.untracked_native_memory > 0)">
+                                    {{ t('status.active_models.no_models') }}
+                                </div>
+                                <div x-show="stats.active_models.untracked_native_memory > 0" x-cloak
+                                     class="space-y-1">
+                                    <div class="font-medium text-amber-700"
+                                         x-text="window.t('status.active_models.residual_memory').replace('{memory}', formatSizeBytes(stats.active_models.untracked_native_memory || 0))"></div>
+                                    <div class="text-xs text-neutral-500">
+                                        {{ t('status.active_models.residual_memory_hint') }}
+                                    </div>
+                                </div>
                             </div>
                             <!-- Model rows -->
                             <template x-for="m in (stats.active_models.models || [])" :key="m.id">

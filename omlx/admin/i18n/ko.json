@@ -71,6 +71,8 @@
   "status.speed.token_generation": "토큰 생성",
   "status.active_models.section_label": "활성 모델",
   "status.active_models.no_models": "로드된 모델 없음",
+  "status.active_models.residual_memory": "로드된 모델은 없지만 네이티브 메모리 {memory}가 아직 남아 있음",
+  "status.active_models.residual_memory_hint": "캐시 회수 후에도 사라지지 않으면 oMLX를 재시작하세요.",
   "status.active_models.active": "활성",
   "status.active_models.waiting": "대기",
   "status.active_models.req": "요청",

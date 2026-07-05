@@ -35,6 +35,8 @@ struct StatsDTO: Codable, Equatable, Sendable {
         let models: [ActiveModelDTO]
         let modelMemoryUsed: Int64?
         let modelMemoryMax: Int64?
+        let untrackedNativeMemory: Int64?
+        let untrackedNativeMemoryFormatted: String?
         let totalActiveRequests: Int?
         let totalWaitingRequests: Int?
     }
