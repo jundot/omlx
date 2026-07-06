@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from omlx.utils.sampling import (
+    _fused_top_k_top_p,
     apply_min_p,
     apply_top_k,
     apply_top_p,
@@ -173,3 +174,66 @@ def test_make_sampler_runs_with_various_top_p(top_p):
     mx.eval(out)
     token = out.item()
     assert 0 <= token < 1000
+
+
+def test_make_sampler_fused_top_p_top_k_runs_and_is_valid():
+    """make_sampler's fused top_p+top_k fast path should sample a valid token
+    for the production sampler config (temp=1.0, top_p=0.95, top_k=20)."""
+    mx.random.seed(0)
+    logits = mx.random.normal(shape=(1, 5000))
+    mx.eval(logits)
+
+    sampler = make_sampler(temp=1.0, top_p=0.95, top_k=20)
+    out = sampler(logits)
+    mx.eval(out)
+    token = out.item()
+    assert 0 <= token < 5000
+
+
+def _old_top_k_top_p_pipeline(
+    logprobs: mx.array, top_k: int, top_p: float
+) -> mx.array:
+    """Reproduces make_sampler's pre-fusion composition order (top_p first,
+    then top_k) using the unfused per-method helpers, as the fast-path
+    reference."""
+    out = apply_top_p(logprobs, top_p)
+    out = apply_top_k(out, top_k)
+    return out
+
+
+@pytest.mark.parametrize("top_p,top_k", [(0.95, 20), (0.9, 100)])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_fused_top_k_top_p_matches_old_pipeline(batch, top_p, top_k):
+    """_fused_top_k_top_p (argpartition over just the top_k candidates) must
+    reproduce apply_top_p -> apply_top_k (full-vocab argsort) exactly: same
+    surviving token set, same renormalized probabilities within bf16
+    tolerance, at the real 248,320-token production vocab."""
+    vocab = 248320
+    n_iters = 200
+    mx.random.seed(0)
+
+    for i in range(n_iters):
+        raw = mx.random.normal(shape=(batch, vocab)).astype(mx.bfloat16) * 3.0
+        logprobs = raw - mx.logsumexp(
+            raw.astype(mx.float32), axis=-1, keepdims=True
+        ).astype(mx.bfloat16)
+
+        old = _old_top_k_top_p_pipeline(logprobs, top_k, top_p)
+        new = _fused_top_k_top_p(logprobs, top_k, top_p)
+        mx.eval(old, new)
+
+        old_np = np.asarray(old.astype(mx.float32))
+        new_np = np.asarray(new.astype(mx.float32))
+        old_finite = np.isfinite(old_np)
+        new_finite = np.isfinite(new_np)
+        assert np.array_equal(old_finite, new_finite), (
+            f"iter {i}: surviving token sets differ "
+            f"(old={old_finite.sum(-1)}, new={new_finite.sum(-1)})"
+        )
+
+        # Renormalized probabilities over the surviving tokens must match.
+        old_probs = np.asarray(mx.softmax(old, axis=-1).astype(mx.float32))
+        new_probs = np.asarray(mx.softmax(new, axis=-1).astype(mx.float32))
+        assert np.allclose(
+            old_probs, new_probs, atol=1e-3
+        ), f"iter {i}: renormalized probabilities differ by more than 1e-3"
