@@ -8381,11 +8381,16 @@ class Scheduler:
                 if request.num_output_tokens > completion_tokens_before
                 else None
             )
+            # output_token_ids (the cumulative decode so far) is only filled in
+            # below on the finish path. Streaming (non-finished) consumers use
+            # new_text/new_token_ids for the delta; nothing reads the
+            # cumulative list on a non-finished RequestOutput, so building it
+            # here on every decode step was an O(output-length) copy wasted on
+            # every token of every stream.
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
@@ -8405,6 +8410,7 @@ class Scheduler:
 
                 output.finished = True
                 output.finish_reason = response.finish_reason
+                output.output_token_ids = list(request.output_token_ids)
                 finished_ids.add(request_id)
 
                 if parser_session is not None:
