@@ -681,9 +681,23 @@ class BatchedEngine(BaseEngine):
         )
 
         finished_normally = False
+        # Cache the cleaned text keyed on the raw cumulative value so repeated
+        # chunks with an unchanged output_text (the common case: the scheduler
+        # only populates it once, on the final chunk - see RequestOutput.output_text)
+        # skip re-running the special-token regex. Without this, cleaning was
+        # re-applied to the full cumulative text on every streamed token,
+        # which is O(N) per token / O(N^2) total for an N-token response if
+        # output_text is ever populated incrementally (e.g. by a future engine
+        # or a test double). clean_special_tokens is pure, so caching on an
+        # unchanged input is byte-identical to recomputing it.
+        last_raw_output_text: str | None = None
+        last_cleaned_text = ""
         try:
             async for output in engine.stream_outputs(request_id):
-                text = clean_special_tokens(output.output_text)
+                if output.output_text != last_raw_output_text:
+                    last_cleaned_text = clean_special_tokens(output.output_text)
+                    last_raw_output_text = output.output_text
+                text = last_cleaned_text
 
                 # Set finished_normally BEFORE yield, because the consumer
                 # may stop iterating after receiving the final output,
