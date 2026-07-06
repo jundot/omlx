@@ -321,6 +321,7 @@ class TestSchedulerSettings:
             "max_concurrent_requests": 8,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
+            "prefill_step_size": 2048,
         }
 
     def test_from_dict(self):
@@ -1140,6 +1141,11 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("embedding_batch_size" in e.lower() for e in errors)
 
+        settings = GlobalSettings()
+        settings.scheduler.prefill_step_size = 63
+        errors = settings.validate()
+        assert any("prefill_step_size" in e.lower() for e in errors)
+
     def test_validate_invalid_cache_size(self):
         """Test validation catches invalid cache size."""
         settings = GlobalSettings()
@@ -1258,6 +1264,17 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.scheduler.embedding_batch_size == 24
+
+    def test_env_override_prefill_step_size(self):
+        """Test environment variable override for prefill step size."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_PREFILL_STEP_SIZE": "256"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.scheduler.prefill_step_size == 256
 
     def test_env_override_scheduler_legacy_fallback(self):
         """Test legacy OMLX_MAX_NUM_SEQS env var is accepted as fallback."""
@@ -1527,6 +1544,15 @@ class TestGlobalSettings:
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12
         assert scheduler_config.initial_cache_blocks == 256  # default
+        assert scheduler_config.prefill_step_size == 2048  # default
+
+    def test_to_scheduler_config_prefill_step_size(self):
+        """Test that prefill_step_size passes through to SchedulerConfig."""
+        settings = GlobalSettings()
+        settings.scheduler.prefill_step_size = 256
+
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.prefill_step_size == 256
 
     def test_to_scheduler_config_initial_cache_blocks(self):
         """Test that initial_cache_blocks passes through to SchedulerConfig."""

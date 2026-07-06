@@ -263,6 +263,10 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # Token chunk size for chunked prefill (only used when chunked_prefill=True).
+    # Smaller values smooth interleaved decode-stream stalls during a large
+    # prefill at the cost of more per-step scheduling overhead.
+    prefill_step_size: int = 2048
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -284,6 +288,7 @@ class SchedulerSettings:
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            prefill_step_size=data.get("prefill_step_size", 2048),
         )
 
 
@@ -944,6 +949,13 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
+        if prefill_step_size := os.getenv("OMLX_PREFILL_STEP_SIZE"):
+            try:
+                self.scheduler.prefill_step_size = int(prefill_step_size)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_PREFILL_STEP_SIZE value: {prefill_step_size}"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1284,6 +1296,11 @@ class GlobalSettings:
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
             )
+        if self.scheduler.prefill_step_size < 64:
+            errors.append(
+                f"Invalid prefill_step_size: "
+                f"{self.scheduler.prefill_step_size} (must be >= 64)"
+            )
 
         # Cache validation
         if self.cache.ssd_cache_max_size.lower() != "auto":
@@ -1418,6 +1435,7 @@ class GlobalSettings:
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_step_size=self.scheduler.prefill_step_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
