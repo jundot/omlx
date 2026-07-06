@@ -439,6 +439,35 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # Fused GatedDeltaNet decode-step kernel for Qwen3.5/3.6 linear-attention
+    # layers (qwen3_5_moe.Model subclasses qwen3_5.Model, so both model types
+    # share the same mlx_lm.models.qwen3_5.GatedDeltaNet class). Must run
+    # last in this function: it captures whatever __call__ is currently
+    # installed (stock mlx-lm, or the Native-MTP patch's n_confirmed-aware
+    # version applied above) as its fallback, so applying it any earlier
+    # would let a subsequent MTP patch pass clobber it. Gated purely on
+    # model_type — the patch itself only ever engages its fast path for a
+    # T==1, no-mask, warm-cache, non-distributed, non-training decode step
+    # and falls through to the captured fallback for everything else
+    # (prefill, MTP draft/verify splits, first token, padded batches,
+    # sharded layers, non-Metal), so it is safe to apply unconditionally
+    # whenever this model family is loaded.
+    if (model_type and model_type.startswith("qwen3_5")) or (
+        text_model_type and text_model_type.startswith("qwen3_5")
+    ):
+        try:
+            from ..patches.qwen3_5_fused_decode import (
+                apply_qwen3_5_fused_decode_patch,
+            )
+        except Exception as e:
+            logger.debug("qwen3_5 fused decode patch import failed: %s", e)
+        else:
+            if apply_qwen3_5_fused_decode_patch():
+                logger.info(
+                    "qwen3_5 fused GatedDeltaNet decode-step patch applied for %s",
+                    model_name,
+                )
+
 
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
