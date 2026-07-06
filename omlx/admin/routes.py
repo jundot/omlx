@@ -4828,7 +4828,7 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
 
     from ..engine_core import get_mlx_executor
     from ..scheduler import _sync_and_clear_cache
-    from ..utils.proc_memory import get_phys_footprint
+    from ..utils.proc_memory import get_phys_footprint, relieve_malloc_pressure
 
     footprint_before = get_phys_footprint()
     total_cleared = 0
@@ -4887,12 +4887,14 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
                 await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
     else:
         await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
+    malloc_bytes_relieved = relieve_malloc_pressure()
     bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
 
     return {
         "status": "ok",
         "total_cleared": total_cleared,
         "bytes_reclaimed": bytes_reclaimed,
+        "malloc_bytes_relieved": malloc_bytes_relieved,
     }
 
 

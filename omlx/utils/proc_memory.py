@@ -74,6 +74,9 @@ _RUSAGE_INFO_V4 = 4
 
 _libproc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
+_libsystem: ctypes.CDLL | None = None
+_malloc_default_zone = None
+_malloc_zone_pressure_relief = None
 
 if sys.platform == "darwin":
     try:
@@ -89,6 +92,20 @@ if sys.platform == "darwin":
         logger.warning(f"libproc unavailable, phys_footprint will return 0: {e}")
         _libproc = None
         _proc_pid_rusage = None
+
+    try:
+        _libsystem = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+        _malloc_default_zone = _libsystem.malloc_default_zone
+        _malloc_default_zone.argtypes = []
+        _malloc_default_zone.restype = ctypes.c_void_p
+        _malloc_zone_pressure_relief = _libsystem.malloc_zone_pressure_relief
+        _malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        _malloc_zone_pressure_relief.restype = ctypes.c_size_t
+    except (AttributeError, OSError) as e:
+        logger.debug("malloc pressure relief unavailable: %s", e)
+        _libsystem = None
+        _malloc_default_zone = None
+        _malloc_zone_pressure_relief = None
 
 
 def get_phys_footprint(pid: int | None = None) -> int:
@@ -116,3 +133,31 @@ def get_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_phys_footprint
+
+
+def relieve_malloc_pressure(goal: int = 0) -> int:
+    """Ask Darwin malloc to return free pages from the default zone.
+
+    Model teardown already drops Python references and clears MLX allocator
+    caches, but macOS malloc can keep empty pages resident in the process after
+    large native allocations churn. ``malloc_zone_pressure_relief`` is the
+    supported Darwin hook for nudging that allocator state back toward the OS.
+
+    Args:
+        goal: Optional byte goal passed to malloc_zone_pressure_relief. ``0``
+            lets malloc choose how much releasable memory to return.
+
+    Returns:
+        Bytes reported as relieved by malloc. Returns 0 on non-Darwin systems,
+        when the symbol is unavailable, or when the call fails.
+    """
+    if _malloc_default_zone is None or _malloc_zone_pressure_relief is None:
+        return 0
+    try:
+        zone = _malloc_default_zone()
+        if not zone:
+            return 0
+        return int(_malloc_zone_pressure_relief(zone, max(0, int(goal))))
+    except Exception as exc:
+        logger.debug("malloc pressure relief failed: %s", exc)
+        return 0

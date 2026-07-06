@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from omlx.utils.proc_memory import get_phys_footprint
+from omlx.utils.proc_memory import get_phys_footprint, relieve_malloc_pressure
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin-only API")
@@ -56,3 +56,43 @@ class TestGetPhysFootprintFallback:
         monkeypatch.setattr("omlx.utils.proc_memory._proc_pid_rusage", None)
         assert get_phys_footprint() == 0
         assert get_phys_footprint(pid=12345) == 0
+
+
+class TestRelieveMallocPressure:
+    def test_returns_zero_when_unavailable(self, monkeypatch):
+        monkeypatch.setattr("omlx.utils.proc_memory._malloc_default_zone", None)
+        monkeypatch.setattr("omlx.utils.proc_memory._malloc_zone_pressure_relief", None)
+
+        assert relieve_malloc_pressure() == 0
+
+    def test_calls_default_zone_pressure_relief(self, monkeypatch):
+        calls = []
+
+        def default_zone():
+            calls.append(("zone",))
+            return 123
+
+        def pressure_relief(zone, goal):
+            calls.append(("relief", zone, goal))
+            return 4096
+
+        monkeypatch.setattr(
+            "omlx.utils.proc_memory._malloc_default_zone", default_zone
+        )
+        monkeypatch.setattr(
+            "omlx.utils.proc_memory._malloc_zone_pressure_relief", pressure_relief
+        )
+
+        assert relieve_malloc_pressure(goal=2048) == 4096
+        assert calls == [("zone",), ("relief", 123, 2048)]
+
+    def test_negative_goal_is_clamped(self, monkeypatch):
+        monkeypatch.setattr(
+            "omlx.utils.proc_memory._malloc_default_zone", lambda: 123
+        )
+        monkeypatch.setattr(
+            "omlx.utils.proc_memory._malloc_zone_pressure_relief",
+            lambda zone, goal: goal,
+        )
+
+        assert relieve_malloc_pressure(goal=-1) == 0

@@ -58,6 +58,7 @@ class _reclaim_env:
         self.synchronize = MagicMock()
         self.footprint = MagicMock(side_effect=[footprint_before, footprint_after])
         self.get_mlx_executor = MagicMock(return_value=self._executor)
+        self.relieve_malloc_pressure = MagicMock(return_value=128)
 
     def __enter__(self):
         self._patches = [
@@ -65,6 +66,10 @@ class _reclaim_env:
             patch("mlx.core.synchronize", self.synchronize),
             patch("omlx.engine_core.get_mlx_executor", self.get_mlx_executor),
             patch("omlx.utils.proc_memory.get_phys_footprint", self.footprint),
+            patch(
+                "omlx.utils.proc_memory.relieve_malloc_pressure",
+                self.relieve_malloc_pressure,
+            ),
         ]
         for p in self._patches:
             p.start()
@@ -121,8 +126,14 @@ class TestHotCacheClear:
         ):
             result = _run_clear()
 
-        assert set(result.keys()) == {"status", "total_cleared", "bytes_reclaimed"}
+        assert set(result.keys()) == {
+            "status",
+            "total_cleared",
+            "bytes_reclaimed",
+            "malloc_bytes_relieved",
+        }
         assert result["status"] == "ok"
+        assert result["malloc_bytes_relieved"] == 128
 
 
 class TestClearReachesOrphans:

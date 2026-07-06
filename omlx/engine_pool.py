@@ -46,7 +46,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import get_phys_footprint, relieve_malloc_pressure
 
 logger = logging.getLogger(__name__)
 
@@ -1240,6 +1240,14 @@ class EnginePool:
                     f"Emergency reclaim succeeded: "
                     f"active_memory={format_size(active_after)}"
                 )
+
+        relieved = relieve_malloc_pressure()
+        if relieved:
+            logger.info(
+                "Malloc pressure relief after unloading %s: relieved=%s",
+                model_id,
+                format_size(relieved),
+            )
 
         self._wake_process_memory_enforcer()
 
