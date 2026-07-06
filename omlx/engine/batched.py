@@ -322,6 +322,18 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
 
+        # qwen3_5 ragged-decode SDPA kernel hardcodes a 1024-thread threadgroup
+        # that exceeds the per-kernel limit on some GPUs (M2 Ultra=896), hard-
+        # crashing mid-length prompts. Neutralize -> portable vector SDPA.
+        try:
+            from ..patches.qwen3_5_ragged_sdpa_threadgroup import (
+                apply_qwen3_5_ragged_sdpa_threadgroup_fix,
+            )
+
+            apply_qwen3_5_ragged_sdpa_threadgroup_fix()
+        except Exception:
+            logger.debug("qwen3_5 ragged SDPA fix not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
