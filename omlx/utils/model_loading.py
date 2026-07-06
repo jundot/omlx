@@ -224,6 +224,12 @@ def maybe_apply_pre_load_patches(
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
 
+    if model_type == "hy_v3":
+        from ..patches.hy_v3 import apply_hy_v3_patch
+
+        if apply_hy_v3_patch():
+            logger.info("Hy3 pre-load patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
