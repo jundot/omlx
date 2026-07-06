@@ -173,6 +173,24 @@ class EngineConfig:
             os.environ.get("OMLX_DECODE_BURST_BUDGET_S", "0.03")
         )
     )
+    # Burst Decode UI mode (see settings.BURST_DECODE_MODES: off/light/balanced/
+    # aggressive). Only "aggressive" changes behavior here: it lets concurrent
+    # requests share the same (larger) single-request budget below instead of
+    # the tighter decode_burst_budget_s, since an operator who opted into the
+    # fastest mode wants that under concurrency too (the ~0.03s concurrent
+    # default measured ~8% throughput loss vs. the single-request budget - see
+    # _step_burst). Seeded directly as OMLX_DECODE_BURST_MODE by cli.py /
+    # admin routes (kept separate from burst_decode_env()'s numeric-only
+    # mapping so that mapping's env-var set is unchanged).
+    decode_burst_mode: str = field(
+        default_factory=lambda: os.environ.get("OMLX_DECODE_BURST_MODE", "balanced")
+    )
+    # Whether OMLX_DECODE_BURST_BUDGET_S was explicitly set by the operator
+    # (vs. left at its coded default). An explicit value always wins over the
+    # aggressive-mode behavior above.
+    decode_burst_budget_s_explicit: bool = field(
+        default_factory=lambda: "OMLX_DECODE_BURST_BUDGET_S" in os.environ
+    )
 
 
 class EngineCore:
@@ -333,13 +351,22 @@ class EngineCore:
             return outputs
         # Adaptive budget: single active request -> aggressive (nothing else to
         # stay responsive to); concurrent -> tight to keep admission/abort low.
+        # Exception: "aggressive" mode's whole point is favoring throughput, so
+        # unless the operator explicitly pinned decode_burst_budget_s, give
+        # concurrent requests the same budget as solo ones instead of the
+        # tighter default (measured ~8% throughput loss from the extra
+        # per-burst GIL hand-offs under concurrency).
         running = getattr(self.scheduler, "running", None)
         single = running is None or len(running) <= 1
-        budget = (
-            self.config.decode_burst_budget_single_s
-            if single
-            else self.config.decode_burst_budget_s
-        )
+        if single:
+            budget = self.config.decode_burst_budget_single_s
+        elif (
+            self.config.decode_burst_mode == "aggressive"
+            and not self.config.decode_burst_budget_s_explicit
+        ):
+            budget = self.config.decode_burst_budget_single_s
+        else:
+            budget = self.config.decode_burst_budget_s
         if budget <= 0:
             return outputs
         deadline = time.monotonic() + budget

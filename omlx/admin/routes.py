@@ -3372,6 +3372,10 @@ async def update_global_settings(
         # and its burst fields are read fresh each decode burst
         # (EngineCore._step_burst), so this takes effect on the next token.
         max_steps, single_s = BURST_DECODE_MODES[mode]
+        # Seed the mode string directly (read by EngineConfig for the
+        # aggressive-mode concurrent-budget behavior; kept separate from
+        # burst_decode_env()'s numeric-only OMLX_DECODE_BURST_* mapping).
+        os.environ["OMLX_DECODE_BURST_MODE"] = mode
         from ..server import _server_state
 
         pool = _server_state.engine_pool
@@ -3389,6 +3393,8 @@ async def update_global_settings(
                 if cfg is not None and hasattr(cfg, "decode_burst_budget_single_s"):
                     cfg.decode_burst_max_steps = max_steps
                     cfg.decode_burst_budget_single_s = single_s
+                    if hasattr(cfg, "decode_burst_mode"):
+                        cfg.decode_burst_mode = mode
         runtime_applied.append("burst_decode_mode")
         logger.info(f"Burst Decode mode set to '{mode}'")
     if request.auto_start_on_launch is not None:

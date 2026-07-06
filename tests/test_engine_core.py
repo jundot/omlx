@@ -1621,6 +1621,63 @@ class TestStepBurst:
         finally:
             engine.close()
 
+    def test_aggressive_mode_uses_single_budget_when_concurrent(
+        self, mock_model, mock_tokenizer
+    ):
+        """'aggressive' mode shares the single-request budget under concurrency.
+
+        Unless the operator explicitly pinned decode_burst_budget_s, aggressive
+        mode should not throttle concurrent requests tighter than solo ones.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            config = EngineConfig(
+                decode_burst_max_steps=4,
+                decode_burst_budget_single_s=10.0,  # large -> burst to cap
+                decode_burst_budget_s=0.0,  # would disable if used
+                decode_burst_mode="aggressive",
+            )
+            engine = EngineCore(
+                model=mock_model, tokenizer=mock_tokenizer, config=config
+            )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            engine.scheduler.running = {"a": object(), "b": object()}  # concurrent
+            outs = engine._step_burst()
+            assert len(outs) == 4
+        finally:
+            engine.close()
+
+    def test_aggressive_mode_respects_explicit_concurrent_budget(
+        self, mock_model, mock_tokenizer
+    ):
+        """An explicitly-set decode_burst_budget_s still wins in aggressive mode."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            config = EngineConfig(
+                decode_burst_max_steps=4,
+                decode_burst_budget_single_s=10.0,  # would burst if used
+                decode_burst_budget_s=0.0,  # explicit -> must still disable
+                decode_burst_mode="aggressive",
+                decode_burst_budget_s_explicit=True,
+            )
+            engine = EngineCore(
+                model=mock_model, tokenizer=mock_tokenizer, config=config
+            )
+        try:
+            engine.scheduler.step = MagicMock(
+                return_value=SchedulerOutput(has_work=True)
+            )
+            engine.scheduler.has_requests = MagicMock(return_value=True)
+            engine.scheduler.running = {"a": object(), "b": object()}  # concurrent
+            outs = engine._step_burst()
+            assert len(outs) == 1
+        finally:
+            engine.close()
+
 
 class TestOrphanedCollectorReaping:
     """Reaping of output collectors orphaned by a client disconnect (#1154).

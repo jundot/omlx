@@ -165,6 +165,11 @@ def serve_command(args):
     # engine construction (no restart needed when the mode changes later).
     for _key, _value in burst_decode_env(settings.server.burst_decode_mode).items():
         os.environ[_key] = _value
+    # Also seed the mode string itself. EngineConfig reads this directly
+    # (separate from burst_decode_env()'s numeric-only mapping) so
+    # "aggressive" can raise the concurrent decode budget to match the
+    # single-request one.
+    os.environ["OMLX_DECODE_BURST_MODE"] = settings.server.burst_decode_mode
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
