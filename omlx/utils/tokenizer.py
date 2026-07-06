@@ -299,6 +299,42 @@ class _CompatNaiveStreamingDetokenizer:
         return segment
 
 
+def _ensure_cached_vocab(tokenizer: Any) -> None:
+    """Memoize ``tokenizer.get_vocab()`` on the tokenizer instance itself.
+
+    ``BPEStreamingDetokenizer``/``SPMStreamingDetokenizer`` (mlx-lm) read
+    ``tokenizer.vocab`` in their constructors, and HuggingFace's ``.vocab``
+    property calls ``get_vocab()`` fresh on every access — which rebuilds the
+    *entire* vocab dict (hundreds of thousands of entries for some models)
+    from the underlying Rust tokenizer. Since ``create_streaming_detokenizer``
+    builds a brand-new detokenizer per request, that rebuild used to happen
+    on every single request even though the vocab never changes for a given
+    tokenizer instance.
+
+    Cache the result as an attribute on the tokenizer object itself (not a
+    module-level dict keyed by ``id()``): this scopes the cache exactly to
+    that tokenizer instance, so multiple tokenizers (multi-model server)
+    never share or clobber each other's cache, and the cache is freed
+    automatically when the tokenizer is garbage collected.
+    """
+    raw = unwrap_tokenizer(tokenizer)
+    if getattr(raw, "_omlx_vocab_cache", None) is not None:
+        return
+    get_vocab = getattr(raw, "get_vocab", None)
+    if get_vocab is None or not callable(get_vocab):
+        return
+    try:
+        vocab = get_vocab()
+    except Exception as exc:
+        logger.debug("Failed to precompute vocab for caching: %s", exc)
+        return
+    try:
+        raw._omlx_vocab_cache = vocab
+        raw.get_vocab = lambda: raw._omlx_vocab_cache
+    except (AttributeError, TypeError) as exc:
+        logger.debug("Tokenizer does not support vocab caching: %s", exc)
+
+
 def create_streaming_detokenizer(
     tokenizer: Any,
     model_path: str | Path | None = None,
@@ -309,6 +345,8 @@ def create_streaming_detokenizer(
     raw VLM/DFlash tokenizers may not.  In that case, mirror mlx-lm's
     tokenizer.json decoder detection before falling back to the naive decoder.
     """
+    _ensure_cached_vocab(tokenizer)
+
     has_existing_attr = True
     try:
         detokenizer = tokenizer.detokenizer
