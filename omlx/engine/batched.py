@@ -802,6 +802,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         request_id: str | None = None,
+        rendered_prompt: str | None = None,
         **kwargs,
     ) -> None:
         """Early prefill memory check for chat completions.
@@ -817,19 +818,27 @@ class BatchedEngine(BaseEngine):
         Cheap enough to run as a precondition: tokenization of even a
         100k-token chat takes tens of milliseconds compared to the many
         seconds the prefill it gates would consume.
+
+        Args:
+            rendered_prompt: Optional prompt already rendered by the caller
+                with identical messages/tools/chat_template_kwargs/is_partial
+                (e.g. from ``stream_chat``'s render). When given, skips
+                re-rendering the chat template and just encodes it.
         """
         if not self._loaded:
             await self.start()
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
-        ct_kwargs = kwargs.get("chat_template_kwargs")
-        partial = kwargs.get("is_partial")
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
+        prompt = rendered_prompt
+        if prompt is None:
+            messages = self._preprocess_messages(messages)
+            template_tools = convert_tools_for_template(tools) if tools else None
+            ct_kwargs = kwargs.get("chat_template_kwargs")
+            partial = kwargs.get("is_partial")
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
         # malformed input) are normally surfaced by the real chat path's
         # add_request → tokenize call as a 500 — there's no path-specific
@@ -897,6 +906,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        rendered_prompt: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -912,6 +922,12 @@ class BatchedEngine(BaseEngine):
             repetition_penalty: Repetition penalty (1.0 = disabled)
             presence_penalty: Presence penalty (0.0 = disabled)
             tools: Optional tool definitions
+            rendered_prompt: Optional prompt already rendered by the caller
+                with identical messages/tools/chat_template_kwargs/is_partial
+                (e.g. from ``preflight_chat``'s render). When given, skips
+                re-rendering the chat template. Messages are still
+                preprocessed/tools still converted below since SpecPrefill
+                (further down) needs them independently of the render.
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -929,12 +945,14 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
+        prompt = rendered_prompt
+        if prompt is None:
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),

@@ -173,7 +173,7 @@ from .api.utils import (
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
+from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -3403,6 +3403,35 @@ async def create_chat_completion(
         if request.stop:
             chat_kwargs["stop"] = request.stop
 
+        # Render the chat template once and reuse it for the prefill preflight
+        # check, thinking-mode detection, and the actual generation call below
+        # — previously each re-rendered (and preflight/count also re-encoded)
+        # the same prompt independently. Only wired up for BatchedEngine,
+        # whose preflight_chat/stream_chat render with identical inputs at
+        # this point; VLM's preflight intentionally renders a cheaper
+        # text-only approximation of the real (multimodal) prompt and DFlash
+        # may transparently fall back to a different engine, so their
+        # independent rendering is left untouched. `count_chat_tokens` above
+        # is also left independent: `merged_ct_kwargs` can still gain
+        # enable_thinking/preserve_thinking between that call and this point.
+        if isinstance(engine, BatchedEngine):
+            try:
+                _shared_prompt_messages = engine._preprocess_messages(messages)
+                _shared_prompt_tools = (
+                    convert_tools_for_template(tools_for_template)
+                    if tools_for_template
+                    else None
+                )
+                chat_kwargs["rendered_prompt"] = engine._apply_chat_template(
+                    _shared_prompt_messages,
+                    _shared_prompt_tools,
+                    chat_template_kwargs=merged_ct_kwargs or None,
+                    is_partial=is_partial,
+                )
+            except Exception:
+                # Fall back to each call site rendering independently, as before.
+                chat_kwargs.pop("rendered_prompt", None)
+
         # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
         # the response in a StreamingResponse — starlette emits
         # http.response.start (status 200) before iterating the body generator,
@@ -4252,9 +4281,21 @@ async def stream_chat_completion(
     try:
         tokenizer = getattr(engine, "tokenizer", None)
         if tokenizer is not None:
-            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                engine, messages, kwargs
-            )
+            # Reuse the prompt the caller already rendered for the preflight
+            # check when available, instead of rendering it a third time.
+            # Not safe for gpt_oss: `_preprocess_messages` strips <think>
+            # tags from prior assistant turns before rendering, but this
+            # helper's fallback render below does not, so a cached prompt
+            # would silently skip that step for Harmony models.
+            cached_prompt = kwargs.get("rendered_prompt")
+            if cached_prompt is not None and getattr(
+                engine, "model_type", None
+            ) != "gpt_oss":
+                prompt, prompt_token_ids = cached_prompt, None
+            else:
+                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                    engine, messages, kwargs
+                )
             start_in_thinking, _ = prompt_opens_thinking(
                 tokenizer, prompt, prompt_token_ids=prompt_token_ids
             )

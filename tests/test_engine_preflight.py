@@ -206,6 +206,33 @@ async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_batched_engine_preflight_chat_uses_rendered_prompt_when_given(
+    monkeypatch,
+):
+    """When the caller (server.py's chat-completions handler) already
+    rendered the chat template, ``preflight_chat`` must encode that prompt
+    directly instead of re-rendering it — the redundant-render elimination
+    on the hot chat-completions path."""
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = _make_scheduler()
+    scheduler.preflight_or_raise = lambda **k: None  # type: ignore[assignment]
+
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    engine._apply_chat_template = MagicMock(
+        side_effect=AssertionError("should not re-render when rendered_prompt is given")
+    )
+
+    await engine.preflight_chat(
+        messages=[{"role": "user", "content": "x"}],
+        rendered_prompt="already rendered prompt",
+    )
+
+    engine._apply_chat_template.assert_not_called()
+    engine._tokenizer.encode.assert_called_once_with("already rendered prompt")
+
+
+@pytest.mark.asyncio
 async def test_vlm_engine_preflight_chat_raises_for_oversize_prompt(monkeypatch):
     from omlx.engine.vlm import VLMBatchedEngine
 

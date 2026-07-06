@@ -807,3 +807,76 @@ class TestApplyChatTemplatePartialMode:
         # continue_final_message=True (not add_generation_prompt=True).
         assert count_kwargs["continue_final_message"] is True
         assert count_kwargs["add_generation_prompt"] is False
+
+
+class TestStreamChatRenderedPromptShortCircuit:
+    """``stream_chat`` must skip re-rendering the chat template when the
+    caller (server.py's chat-completions handler) already rendered it —
+    the redundant-render elimination on the hot chat-completions path."""
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_uses_rendered_prompt_when_given(self):
+        from omlx.engine.base import GenerationOutput
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model = MagicMock(spec=[])  # not gpt_oss
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template = MagicMock(
+            side_effect=AssertionError(
+                "should not re-render when rendered_prompt is given"
+            )
+        )
+        engine._tokenizer = mock_tokenizer
+
+        captured_prompts = []
+
+        async def fake_stream_generate(prompt, **kwargs):
+            captured_prompts.append(prompt)
+            yield GenerationOutput(text="hi", new_text="hi")
+
+        engine.stream_generate = fake_stream_generate
+
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                rendered_prompt="already rendered prompt",
+            )
+        ]
+
+        assert captured_prompts == ["already rendered prompt"]
+        assert [o.new_text for o in outputs] == ["hi"]
+        mock_tokenizer.apply_chat_template.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renders_when_rendered_prompt_omitted(self):
+        """Default (no rendered_prompt) behavior is unchanged."""
+        from omlx.engine.base import GenerationOutput
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model = MagicMock(spec=[])  # not gpt_oss
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template = MagicMock(return_value="rendered here")
+        engine._tokenizer = mock_tokenizer
+
+        captured_prompts = []
+
+        async def fake_stream_generate(prompt, **kwargs):
+            captured_prompts.append(prompt)
+            yield GenerationOutput(text="hi", new_text="hi")
+
+        engine.stream_generate = fake_stream_generate
+
+        [
+            output
+            async for output in engine.stream_chat([{"role": "user", "content": "hi"}])
+        ]
+
+        assert captured_prompts == ["rendered here"]
+        mock_tokenizer.apply_chat_template.assert_called_once()
