@@ -1201,14 +1201,35 @@ class TestPoolingCacheTrimRollback:
         )
 
     def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
-        """Prompt-sized updates (L > 2) don't stash an undo log; a trim at
+        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
         a pool boundary right after one must report not-trimmable instead
-        of corrupting state."""
+        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
+        MTP verify windows can roll back.)"""
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(4)
+        self._push(
+            cache,
+            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            0,
+        )
+        assert cache.remainder == 0
+        assert cache.pooled is not None
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0
+
+    def test_verify_sized_update_keeps_undo(self, applied_patch):
+        """MTP verify windows (2 < L <= 8) stash an undo log: a trim right
+        after one rolls back across the pool boundary instead of failing."""
         from mlx_lm.models.cache import PoolingCache
 
         cache = PoolingCache(4)
         self._push(cache, self._tok([1.0, 2.0, 3.0, 4.0]), 0)
         assert cache.remainder == 0
         assert cache.pooled is not None
-        assert not cache.is_trimmable()
-        assert cache.trim(1) == 0
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        # The completed window is undone: its 3 surviving tokens are back
+        # in the remainder buffer and no pooled row remains visible.
+        assert cache.remainder == 3
+        assert cache.size() == 0
