@@ -309,11 +309,13 @@ class TestQwen35MtpNormShift:
 
     def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
-        placeholders where the per-key magnitude can't be read. The helper
-        must record a conditional replay transform for MTP norms so the
-        materialization path can still decide from the real tensor value.
-        Otherwise full-precision Qwen3.6 sources with mixed MTP norm
-        conventions can be double-shifted or left unshifted."""
+        placeholders. On a raw-HF source (unsanitized conv1d present) every
+        Qwen3-Next RMSNorm gamma is zero-centered, so MTP-head norms record
+        the same unconditional +1 "add" transform as the backbone norms.
+        (The old conditional add_if_mean_lt_0_5 misclassified q_norm/k_norm
+        [raw mean ~0.75] and mtp.norm [raw ~1.27], costing ~14pp of draft
+        acceptance on Qwen3.6-27B.) Pre-converted sources — no unsanitized
+        conv1d — keep the per-key conditional for mixed-convention bundles."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -336,14 +338,10 @@ class TestQwen35MtpNormShift:
         }
         plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
 
-        # Backbone still has a fixed +1 add from the raw-HF conv1d signal.
-        # MTP norms need per-key value checks at materialization time.
+        # Raw-HF source: backbone AND head norms all take the fixed +1 add.
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
-        assert (
-            plan["mtp.layers.0.input_layernorm.weight"]["transform"]
-            == "add_if_mean_lt_0_5"
-        )
-        assert plan["mtp.norm.weight"]["transform"] == "add_if_mean_lt_0_5"
+        assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert plan["mtp.norm.weight"]["transform"] == "add"
 
 
 class TestQwen35MoeSanitize:

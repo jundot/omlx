@@ -455,13 +455,21 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         except Exception:
             gated_delta_update = getattr(module, "gated_delta_update", None)
 
-        def patched_gdn(self, inputs, mask=None, cache=None):
+        def patched_gdn(self, inputs, mask=None, cache=None, n_confirmed: int = 0):
+            # n_confirmed is the Native-MTP draft/verify split (patches/mlx_lm_mtp).
+            # Verify forwards are always far below min_tokens, so this wrapper
+            # never routes them; forward the kwarg to the underlying (MTP-patched)
+            # __call__ only when set, so stock GatedDeltaNet stays compatible.
             if (
                 gated_delta_update is None
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
             ):
+                if n_confirmed:
+                    return orig_gdn(
+                        self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
+                    )
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             input_linears = (
@@ -471,6 +479,10 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_a,
             )
             if not any(should_route(linear, inputs) for linear in input_linears):
+                if n_confirmed:
+                    return orig_gdn(
+                        self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
+                    )
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape

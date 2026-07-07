@@ -191,6 +191,12 @@ class ModelSettings:
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
     # with dflash and turboquant.
     mtp_enabled: bool = False
+    # Maximum chained MTP draft tokens per verify cycle (speculative depth).
+    # None = default (3). Effective for Qwen3.5/3.6 native MTP only;
+    # DeepSeek-V4 native MTP always runs depth 1. An adaptive controller
+    # picks 1..max per sequence from rolling acceptance/latency estimates;
+    # set to 1 for a fixed depth-1 cycle.
+    mtp_num_draft_tokens: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp

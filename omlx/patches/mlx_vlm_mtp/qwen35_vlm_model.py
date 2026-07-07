@@ -129,9 +129,18 @@ def apply() -> bool:
                 # ``key`` is already remapped to ``language_model.mtp.*`` for
                 # MTP weights here, so test the ``mtp.`` substring.
                 if "mtp." in key:
-                    # Per-key: a head norm may still be raw-HF even when a
-                    # sibling head norm (e.g. mtp.norm) is already shifted.
-                    if _is_oq_tracked_tensor(value):
+                    if should_shift_norm_weights:
+                        # Raw-HF source: every Qwen3-Next RMSNorm gamma is
+                        # zero-centered — shift head norms uniformly like
+                        # the backbone's. The mean heuristic misclassifies
+                        # q_norm/k_norm (raw ~0.75) and mtp.norm (raw
+                        # ~1.27), costing ~14pp draft acceptance.
+                        # ``+ 1.0`` also records an unconditional "add"
+                        # transform on oQ _TrackedTensor.
+                        value = value + 1.0
+                    # Pre-converted checkpoints: per-key decision (JANG
+                    # mixed-convention bundles).
+                    elif _is_oq_tracked_tensor(value):
                         value = _mark_mtp_norm_conditional_add(value)
                     elif _mtp_norm_is_raw_hf(value, should_shift_norm_weights):
                         value = value + 1.0

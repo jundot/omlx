@@ -65,8 +65,9 @@ def _wrap_rotating(cls, fields) -> None:
     def update_and_fetch(self, keys, values):
         # Only armed verify-sized updates are undoable: S == 1 uses the
         # in-place ring write (setitem invalidates reference snapshots) and
-        # prompt chunks have no rollback consumer.
-        if keys.shape[2] == 2 and _is_undo_armed():
+        # prompt chunks have no rollback consumer. The upper bound covers
+        # depth-k chain verify windows (k + 1 tokens).
+        if 2 <= keys.shape[2] <= 8 and _is_undo_armed():
             snap = {}
             for f in fields:
                 v = getattr(self, f)

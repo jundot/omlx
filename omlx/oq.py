@@ -2862,8 +2862,33 @@ def _get_predicate_bits(
         bits = result.get("bits", base_bits)
         gs = result.get("group_size", group_size)
         mode = result.get("mode", _mode_for_bits(bits))
+        if _is_mtp_tensor(tensor_name):
+            raised = _mtp_bits_override(bits)
+            if raised != bits:
+                # Floor lift re-derives mode and group size; unchanged bits
+                # keep the predicate's choice (e.g. mxfp8 head projections).
+                bits, mode = raised, _mode_for_bits(raised)
+                gs = _gs_for_mode(raised, group_size)
         return bits, gs, mode
-    return base_bits, _gs_for_mode(base_bits, group_size), _mode_for_bits(base_bits)
+    bits = base_bits
+    if _is_mtp_tensor(tensor_name):
+        bits = _mtp_bits_override(bits)
+    return bits, _gs_for_mode(bits, group_size), _mode_for_bits(bits)
+
+
+# Minimum bits for quantized MTP-head tensors. Sub-4-bit oQ levels drag the
+# head down with the trunk (DeepSeek-V4 oQ2.5e stored its head's routed
+# experts and attention at 2-bit gs64), but the head only shapes drafts —
+# every emitted token is trunk-verified — so its footprint (~2 GB on
+# DeepSeek-V4-Flash, ~15 MB on Qwen3.6) buys draft acceptance directly and
+# costs almost nothing relative to the model.
+_MTP_MIN_BITS = 4
+
+
+def _mtp_bits_override(bits: int) -> int:
+    if bits and bits < _MTP_MIN_BITS:
+        return _MTP_MIN_BITS
+    return bits
 
 
 def _mode_for_bits(bits: int) -> str:
@@ -4354,7 +4379,19 @@ def quantize_oq_streaming(
                     ):
                         w_mx = w_mx.astype(target_dtype)
                     importance = None
-                    if imatrix_data is not None and qmode == "affine":
+                    # MTP-head tensors quantize PLAIN (no imatrix weighting):
+                    # the weighted clipping search minimizes weighted MSE,
+                    # but draft quality is argmax agreement with the trunk —
+                    # measured on Qwen3.6-27B (same trunk, greedy, identical
+                    # prompts) the imatrix-weighted gs32 head accepts 60.7%
+                    # on prose vs 69.6% for plain min/max gs32. The head
+                    # still participates in imatrix *collection* so coverage
+                    # reporting stays clean.
+                    if (
+                        imatrix_data is not None
+                        and qmode == "affine"
+                        and not _is_mtp_tensor(tensor_name)
+                    ):
                         importance = _lookup_imatrix_importance(
                             imatrix_data,
                             tensor_name,
@@ -5095,11 +5132,22 @@ class OQImatrixCollector:
         cls = type(module).__name__
         if cls in _OQE_SWITCH_LINEAR_CLASSES:
             return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        # QuantizedLinear capture lets imatrix collection run against
+        # already-quantized checkpoints (e.g. deriving a recalibrated MTP
+        # head from an oQ8 model when the bf16 source is gone).
         return (
-            cls == "Linear"
+            cls in ("Linear", "QuantizedLinear")
             and hasattr(module, "weight")
             and getattr(module.weight, "ndim", 0) == 2
         )
+
+    @staticmethod
+    def _module_in_dim(module) -> int:
+        w = module.weight
+        bits = getattr(module, "bits", None)
+        if bits and w.dtype == mx.uint32:
+            return int(w.shape[-1] * 32 // int(bits))
+        return int(w.shape[-1])
 
     def install(self, model) -> int:
         replacements = []
@@ -5138,7 +5186,7 @@ class OQImatrixCollector:
 
     def collect_dense(self, name: str, module, x) -> None:
         try:
-            in_dim = int(module.weight.shape[-1])
+            in_dim = self._module_in_dim(module)
             if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
                 return
             mx.eval(x)
@@ -5224,6 +5272,54 @@ class OQImatrixCollector:
             self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
         except Exception as e:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
+
+
+def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
+    """Run the MTP head over a calibration micro-batch.
+
+    The trunk-layer walk never invokes the head, so without this pass every
+    ``mtp.*`` linear lands in the imatrix "missing" list and gets quantized
+    without calibration — measurably hurting draft acceptance. Mirrors the
+    decode-time contract: fuse the trunk's post-norm hidden at position t
+    with the embedding of token t+1 (the head's own input RMSNorms make the
+    residual pre/post-norm difference negligible for activation statistics).
+    """
+    inner = getattr(model, "language_model", None) or model
+    mtp = getattr(inner, "mtp", None)
+    if mtp is None:
+        return False
+    try:
+        if isinstance(mtp, (list, tuple)):
+            # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
+            # trunk hidden; Model.mtp_forward wires mask/cache/embedding.
+            out = inner.mtp_forward(
+                hidden[:, :-1],
+                batch[:, 1:],
+                inner.make_mtp_cache(),
+            )
+            mx.eval(out)
+            return True
+        core = getattr(inner, "model", None) or inner
+        norm = getattr(core, "norm", None)
+        embed = getattr(core, "embed_tokens", None)
+        if norm is None or embed is None:
+            return False
+        # The head's attention reads cache.offset unconditionally on the
+        # mlx-vlm classes — give it a fresh cache per micro-batch.
+        make_cache = getattr(inner, "make_mtp_cache", None)
+        if callable(make_cache):
+            mtp_cache = make_cache()
+        else:
+            from mlx_lm.models.cache import KVCache
+
+            mtp_cache = [KVCache() for _ in mtp.layers]
+        h = norm(hidden[:, :-1, :])
+        out = mtp(h, batch[:, 1:], embed, mtp_cache)
+        mx.eval(out)
+        return True
+    except Exception as e:
+        logger.warning("oQe imatrix MTP head pass skipped: %s", e)
+        return False
 
 
 def _collect_imatrix_from_model(
@@ -5328,6 +5424,14 @@ def _collect_imatrix_from_model(
                         and position_ids.get("kind") == "glm_moe_dsa"
                     ):
                         position_ids["prev_topk_indices"] = aux or prev_aux
+                    mx.synchronize()
+                    mx.clear_cache()
+
+                # MTP-head pass: the layer walk above leaves ``inputs`` as
+                # the final-layer hidden states; feed them (post-norm) plus
+                # the shifted token ids through the head so its linears
+                # contribute imatrix entries too.
+                if _collect_mtp_head_imatrix(model, batch, inputs):
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -5464,16 +5568,21 @@ def _collect_imatrix(
     maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
 
     restore_mtp_active = None
-    if is_vlm and _has_mtp_heads(config) and has_mtp_weights:
+    if _has_mtp_heads(config) and has_mtp_weights:
+        # Attach the MTP head on the temporary calibration model so the
+        # head-forward pass in _collect_imatrix_from_model can exercise its
+        # linears (they'd otherwise land in the imatrix "missing" list).
         try:
             from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
-            from omlx.patches.mlx_vlm_mtp import (
-                apply_mlx_vlm_mtp_patch,
-                apply_mlx_vlm_mtp_runtime_patch,
-            )
 
-            apply_mlx_vlm_mtp_patch()
-            apply_mlx_vlm_mtp_runtime_patch()
+            if is_vlm:
+                from omlx.patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_patch,
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+
+                apply_mlx_vlm_mtp_patch()
+                apply_mlx_vlm_mtp_runtime_patch()
             prev_active = is_mtp_active()
             set_mtp_active(True)
 
@@ -5482,7 +5591,7 @@ def _collect_imatrix(
 
             restore_mtp_active = _restore_mtp_active
         except Exception as e:
-            logger.debug("mlx-vlm MTP runtime patch skipped for oQe imatrix: %s", e)
+            logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
 
     try:
         if is_vlm:
@@ -5541,6 +5650,22 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
+def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
+    """True when the model declares MTP heads but the cache predates the
+    MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
+    the head gets calibrated quantization instead of landing in "missing"."""
+    try:
+        from omlx.utils.model_loading import _has_mtp_heads
+
+        if not _has_mtp_heads(config):
+            return False
+    except Exception:
+        return False
+    return not any(
+        ".mtp." in key or key.startswith("mtp.") for key in cache.entries
+    )
+
+
 def _load_or_collect_imatrix(
     model_path: str,
     config: dict,
@@ -5568,7 +5693,13 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_has_required_expert_coverage(cache):
+            if _oqe_cache_missing_mtp_entries(cache, config):
+                logger.info(
+                    "oQe imatrix: cache predates MTP-head collection "
+                    "(no mtp.* entries), recollecting %s",
+                    path,
+                )
+            elif _oqe_cache_has_required_expert_coverage(cache):
                 cache.reused = True
                 logger.info("oQe imatrix: using cache %s", path)
                 _emit_progress(

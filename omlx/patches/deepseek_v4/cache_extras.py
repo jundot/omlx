@@ -50,11 +50,11 @@ class PoolingCache(_BaseCache):
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
         # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 2) are ever trimmed; skipping the stash for
-        # prompt chunks avoids pinning large prefill projections. Buffer
-        # slices are taken before any mutation, so they reference the
-        # pre-update array node.
-        if L <= 2:
+        # sized updates (L <= 8 covers depth-k chain verify windows) are
+        # ever trimmed; skipping the stash for prompt chunks avoids pinning
+        # large prefill projections. Buffer slices are taken before any
+        # mutation, so they reference the pre-update array node.
+        if L <= 8:
             self._undo = (
                 self.buf_kv[:, : self.remainder] if self.remainder > 0 else None,
                 self.buf_gate[:, : self.remainder] if self.remainder > 0 else None,
@@ -282,7 +282,7 @@ class BatchPoolingCache(_BaseCache):
         # the stashed objects keep the pre-update contents. The pooled
         # tensor needs no snapshot: update_and_fetch only writes beyond the
         # old _pool_lengths, so restoring the length lists is enough.
-        if L <= 2:
+        if L <= 8:
             self._undo = (
                 self.buf_kv,
                 self.buf_gate,

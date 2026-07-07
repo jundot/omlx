@@ -286,10 +286,20 @@ def maybe_apply_pre_load_patches(
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
+            set_mtp_depth,
         )
 
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
+            # mtp_num_draft_tokens is the MAX draft depth; an adaptive
+            # controller picks 1..max per sequence from rolling accept/latency
+            # estimates, so prose/chat settles at 1 and predictable text
+            # climbs. Set it to 1 for a fixed depth-1 cycle. Note: depth >= 2
+            # verify forwards route through the verify-shape qmm kernels
+            # (M >= 3), whose numerics can diverge from the unrouted path at
+            # bf16 tail-ULP level.
+            depth = getattr(model_settings, "mtp_num_draft_tokens", None)
+            set_mtp_depth(int(depth) if depth else 3)
             if mtp_enabled:
                 logger.info(
                     "Native MTP patch applied for %s (model_type=%s, active)",
