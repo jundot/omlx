@@ -146,8 +146,13 @@ class MoEGate(nn.Module):
         self.expert_bias = mx.zeros((args.num_experts,))
 
     def __call__(self, x):
+        # Router matmul in fp32, matching the transformers reference
+        # (HYV3TopKRouter computes F.linear on .float() operands): with 192
+        # experts under a sigmoid router + e-score correction bias, top-8
+        # selection margins are tight and bf16 matmul rounding can flip
+        # expert choices. See mlx-lm#1211 discussion.
         return expert_select(
-            self.gate(x),
+            self.gate(x.astype(mx.float32)),
             self.expert_bias,
             self.top_k,
             self.routed_scaling_factor,
