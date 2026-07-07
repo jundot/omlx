@@ -324,9 +324,21 @@ def serve_command(args):
         # with mx.synchronize()). See issue #300.
         import mlx.core as mx
 
+        # The MLX buffer-cache pool retains freed Metal buffers for reuse (avoids the M4
+        # allocator::free()-while-in-use race, issue #300). Left at `total_mem` the pool grows to
+        # fill ALL GPU memory over hours; the prefill memory guard then counts that (reclaimable)
+        # cache as "used" and rejects every prompt (predicted-peak > ceiling) — chat dies with the
+        # pins resident. Bound the pool via OMLX_CACHE_LIMIT_GB so live model weights + a bounded
+        # reuse pool + prefill headroom coexist under the Metal wired cap. Unset → old behavior.
         total_mem = mx.device_info().get("memory_size", 0)
-        if total_mem > 0:
-            mx.set_cache_limit(total_mem)
+        cache_limit = total_mem
+        if _limit_gb := os.getenv("OMLX_CACHE_LIMIT_GB"):
+            try:
+                cache_limit = int(float(_limit_gb) * 1024**3)
+            except ValueError:
+                print(f"[omlx] invalid OMLX_CACHE_LIMIT_GB={_limit_gb!r}; using total_mem")
+        if cache_limit > 0:
+            mx.set_cache_limit(cache_limit)
 
         # Initialize server
         # Note: pinned_models and default_model are managed via admin page (model_settings.json)
