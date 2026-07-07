@@ -1857,10 +1857,18 @@ def init_server(
 _KEEPALIVE_SENTINEL = object()
 
 _KEEPALIVE_COMMENT = ": keep-alive\n\n"
+# The delta carries "role":"assistant" because this frame is the FIRST event
+# of every stream and some accumulators type the whole stream from the first
+# chunk's role: LangChain.js builds a generic ChatMessageChunk when it is
+# absent, and merging the real chunks into it silently discards all
+# tool_call_chunks (#2074, hits n8n AI Agent workflows). Cloud APIs open every
+# stream with a role chunk, so clients rely on it; the OpenAI SDKs, openai-go,
+# and LangChain all tolerate the duplicate role in later chunks.
 _KEEPALIVE_CHAT_CHUNK = (
     'data: {"id":"chatcmpl-keepalive","object":"chat.completion.chunk",'
     '"created":0,"model":"keepalive",'
-    '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+    '"finish_reason":null}]}\n\n'
 )
 _KEEPALIVE_COMPLETION_CHUNK = (
     'data: {"id":"cmpl-keepalive","object":"text_completion","created":0,'
@@ -1909,11 +1917,16 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     keepalive with the stream's own ``response_id`` makes it a true no-op for
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
+
+    The delta must also carry ``"role":"assistant"`` — see the comment on
+    ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
+    first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
         '"created":0,"model":"keepalive",'
-        '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+        '"finish_reason":null}]}\n\n'
     )
 
 
