@@ -16,6 +16,11 @@ class Omlx < Formula
   depends_on :macos
   depends_on "python@3.11"
 
+  # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries
+  # (llvm/llvm-project#203678). Skip Homebrew's post-install clean pass over
+  # the venv so it never runs `strip` on the compiled dylibs.
+  skip_clean "libexec" if MacOS.version >= "27"
+
   # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
   # mlx-lm. Fetch source separately so we can patch the pin before install.
   resource "mlx-audio" do
@@ -51,6 +56,19 @@ class Omlx < Formula
     # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+
+    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
+    if MacOS.version >= "27"
+      # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
+      # 8-byte boundary; prebuilt Rust wheels aligned to 4 bytes fail dlopen
+      # with "mis-aligned LINKEDIT string pool". Build them from source, and
+      # keep Cargo/maturin's release stripping off so the beta's broken
+      # `strip` (llvm/llvm-project#203678) never touches the fresh dylibs.
+      no_binary += ",tokenizers"
+      ENV["CARGO_PROFILE_RELEASE_STRIP"] = "false"
+      ENV["MATURIN_STRIP"] = "false"
+    end
+
     if build.with?("custom-kernel")
       kernel_sources = [
         buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
@@ -61,21 +79,29 @@ class Omlx < Formula
       end
 
       ENV["OMLX_WITH_CUSTOM_KERNEL"] = "1"
+      # Pin CMake to the venv's Python; its default discovery can pick a
+      # newer unlinked system Python instead. setup.py forwards CMAKE_ARGS
+      # to the kernel builds.
+      ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
     system libexec/"bin/pip", "install",
-           "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
+           "--no-binary", no_binary,
            install_spec
 
     if build.with?("custom-kernel")
-      system libexec/"bin/python", "-c", <<~PYTHON
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
-        assert glm_fast.is_native_available(), glm_fast.import_error()
-        assert minimax_fast.is_native_available(), minimax_fast.import_error()
-      PYTHON
+      # Run from libexec so buildpath's raw omlx/ source tree doesn't shadow
+      # the compiled package in the venv's site-packages.
+      Dir.chdir(libexec) do
+        system libexec/"bin/python", "-c", <<~PYTHON
+          from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+          from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+          assert glm_fast.is_native_available(), glm_fast.import_error()
+          assert minimax_fast.is_native_available(), minimax_fast.import_error()
+        PYTHON
+      end
     end
 
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
