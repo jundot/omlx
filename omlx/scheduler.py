@@ -4964,6 +4964,17 @@ class Scheduler:
                 "Enabled boundary cache snapshots for stateful non-sliceable "
                 "cache layers"
             )
+            # Ask the speculative (MTP) decode path to land its commits on
+            # block boundaries: its emit queue otherwise leaves the cache a
+            # few tokens ahead of the emitted count when a boundary token
+            # surfaces, which forces the consistency guard in
+            # _extract_boundary_snapshot to skip most captures.
+            block = int(self.config.paged_cache_block_size or 0)
+            if block > 0:
+                try:
+                    self.model._omlx_mtp_commit_align = block
+                except Exception:
+                    pass
         else:
             logger.debug(
                 "Boundary cache snapshots disabled (no stateful non-sliceable "
@@ -4972,11 +4983,24 @@ class Scheduler:
 
         return self._boundary_snapshot_required
 
-    def _extract_boundary_snapshot(self, uid: int) -> list[Any] | None:
+    def _extract_boundary_snapshot(
+        self, uid: int, expected_tokens: int | None = None
+    ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
         Uses BatchGenerator.extract_cache() which returns
         Dict[uid, (cache_list, tokens_list)].
+
+        ``expected_tokens`` guards positional consistency: a snapshot labeled
+        "state at N tokens" must be extracted while the cache holds exactly N
+        forwarded tokens. The standard decode step always satisfies this at
+        emit time, but speculative (MTP) decode advances the cache in bursts
+        and emits from a queue, so the cache can be a few tokens ahead of —
+        or one behind — the emitted count when the boundary token surfaces.
+        A skewed snapshot would pair block-aligned KV with recurrent (SSM)
+        state from a different position and corrupt later prefix-cache hits
+        on hybrid models; skipping the capture merely costs a reuse
+        opportunity.
         """
         if self.batch_generator is None:
             return None
@@ -4992,6 +5016,26 @@ class Scheduler:
                     if uid not in result:
                         return None
                     cache_list, _tokens = result[uid]
+                    if expected_tokens is not None:
+                        for c in cache_list:
+                            offset = getattr(c, "offset", None)
+                            if offset is None:
+                                continue
+                            try:
+                                offset = int(offset)
+                            except Exception:
+                                continue
+                            if offset != expected_tokens:
+                                logger.debug(
+                                    "Skipping boundary snapshot for uid=%s: "
+                                    "cache offset %d != boundary %d "
+                                    "(speculative decode skew)",
+                                    uid,
+                                    offset,
+                                    expected_tokens,
+                                )
+                                return None
+                            break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
                     return [
@@ -5024,7 +5068,9 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
-        snapshot_cache = self._extract_boundary_snapshot(uid)
+        snapshot_cache = self._extract_boundary_snapshot(
+            uid, expected_tokens=total_tokens
+        )
         if not snapshot_cache:
             return
 

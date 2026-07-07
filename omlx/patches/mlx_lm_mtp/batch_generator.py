@@ -1951,6 +1951,23 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             emit_last_id = bonus_id
             emit_last_lp = combined_lp[k]
 
+    # Boundary-aligned commit: when the scheduler needs block-boundary
+    # cache snapshots (hybrid models), land the committed run exactly on
+    # the next block boundary whenever it falls inside the accepted
+    # drafts. The emit-time snapshot capture can then observe the boundary
+    # state (cache offset == emitted count), which the emit queue's
+    # run-ahead otherwise makes rare. Emitting fewer verified drafts is
+    # distribution-exact; the cost is at most depth-1 verified tokens once
+    # per block.
+    align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    if align > 0 and m > 0:
+        emitted = len(gen_batch.tokens[0])
+        aligned = ((emitted // align) + 1) * align - emitted
+        if 0 < aligned < m:
+            m = aligned
+            emit_last_id = draft_ids[m]
+            emit_last_lp = combined_lp[m]
+
     # Clamp the accepted count to what every cache layer can roll back
     # (optional model hook — DeepSeek-V4 PoolingCache replay windows are
     # bounded). Emitting fewer verified drafts is always correct; position

@@ -1902,6 +1902,9 @@ class TestSchedulerBoundarySnapshots:
         # which returns {uid: (cache_list, tokens_list)}.
         mock_layer_cache = MagicMock()
         type(mock_layer_cache).__name__ = "BatchArraysCache"
+        # Positional-consistency guard: the cache must hold exactly the
+        # boundary token count at capture time (standard decode invariant).
+        mock_layer_cache.offset = 4
 
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.extract_cache.return_value = {
@@ -1923,6 +1926,41 @@ class TestSchedulerBoundarySnapshots:
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
         # Non-sliceable cache layer is kept as-is in the snapshot
         assert snapshot == [mock_layer_cache]
+
+    def test_boundary_snapshot_skipped_on_speculative_skew(
+        self, mock_model, mock_tokenizer
+    ):
+        """Speculative (MTP) decode advances the cache in bursts and emits
+        from a queue, so the cache can be a few tokens ahead of the emitted
+        count when the boundary token surfaces. A snapshot captured then
+        would pair the boundary label with recurrent state from a different
+        position — the capture must be skipped instead."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        mock_layer_cache.offset = 6  # cache ran ahead of the emitted count
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-skew",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]  # Total = 4 (boundary)
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert "req-skew" not in scheduler._boundary_cache_snapshots
 
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
