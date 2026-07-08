@@ -4379,19 +4379,7 @@ def quantize_oq_streaming(
                     ):
                         w_mx = w_mx.astype(target_dtype)
                     importance = None
-                    # MTP-head tensors quantize PLAIN (no imatrix weighting):
-                    # the weighted clipping search minimizes weighted MSE,
-                    # but draft quality is argmax agreement with the trunk —
-                    # measured on Qwen3.6-27B (same trunk, greedy, identical
-                    # prompts) the imatrix-weighted gs32 head accepts 60.7%
-                    # on prose vs 69.6% for plain min/max gs32. The head
-                    # still participates in imatrix *collection* so coverage
-                    # reporting stays clean.
-                    if (
-                        imatrix_data is not None
-                        and qmode == "affine"
-                        and not _is_mtp_tensor(tensor_name)
-                    ):
+                    if imatrix_data is not None and qmode == "affine":
                         importance = _lookup_imatrix_importance(
                             imatrix_data,
                             tensor_name,
