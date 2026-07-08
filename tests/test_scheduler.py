@@ -1962,6 +1962,114 @@ class TestSchedulerBoundarySnapshots:
 
         assert "req-skew" not in scheduler._boundary_cache_snapshots
 
+    @staticmethod
+    def _cache_list_layer(leaf_offset: int):
+        """CacheList-style wrapper: no own offset, sub-caches carry it."""
+
+        class _Leaf:
+            offset = leaf_offset
+
+        class _PoolingLeaf:
+            # Offset counts pooled windows, not tokens — must not be used
+            # by the guard (it walks depth-first, leading leaf wins).
+            offset = leaf_offset // 4
+
+        class _CacheListLike:
+            caches = [_Leaf(), _PoolingLeaf()]
+
+        return _CacheListLike()
+
+    def test_boundary_snapshot_skew_guard_sees_cachelist_sub_offsets(
+        self, mock_model, mock_tokenizer
+    ):
+        """DeepSeek/GLM-style CacheList layers expose no offset themselves;
+        the guard must walk into sub-caches or a skewed capture passes."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        layer = self._cache_list_layer(leaf_offset=6)  # ran ahead of boundary 4
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([layer], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-cl-skew",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]  # Total = 4 (boundary)
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert "req-cl-skew" not in scheduler._boundary_cache_snapshots
+
+    def test_boundary_snapshot_captured_through_cachelist(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aligned CacheList sub-offsets pass the guard and capture proceeds."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        layer = self._cache_list_layer(leaf_offset=4)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([layer], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-cl-ok",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert 4 in scheduler._boundary_cache_snapshots["req-cl-ok"]
+
+    def test_cleanup_finished_skips_store_without_boundary_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """Snapshot-needing models must not store live non-sliceable state
+        when no boundary-aligned snapshot exists (e.g. every capture was
+        skipped by the speculative-decode skew guard)."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = True
+
+        request = Request(
+            request_id="req-no-snap",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]  # Total = 8 (2 full blocks)
+        request._extracted_cache = [{"state": "live-cache"}]
+        request._model_cache_config = "live-config"
+
+        scheduler.running["req-no-snap"] = request
+        scheduler.requests["req-no-snap"] = request
+        # No boundary snapshots recorded for this request.
+
+        scheduler._cleanup_finished({"req-no-snap"})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_called_with(
+            "req-no-snap"
+        )
+
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
     ):
