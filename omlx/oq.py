@@ -4053,6 +4053,42 @@ def quantize_oq_streaming(
             "OOM-prone paths will be skipped"
         )
 
+    # RAM-safe calibration proxy, shared between oQe imatrix collection and
+    # auto-proxy sensitivity so an exceeds-RAM run builds it at most once.
+    # Built lazily (an imatrix cache hit never pays for it) and deleted as
+    # soon as the last calibration pass is done.
+    _ram_safe_proxy_dir: Path | None = None
+
+    def _ensure_ram_safe_proxy() -> Path:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is None:
+            logger.warning(
+                f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) "
+                f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
+                f"({_system_ram / 1e9:.1f} GB). Building a uniform "
+                f"{_PROXY_QUANT_BITS}-bit proxy on disk for the calibration "
+                "passes."
+            )
+            _ram_safe_proxy_dir = _build_proxy_for_sensitivity(
+                model_path,
+                config=config,
+                dtype=dtype,
+                working_dir=str(output.parent),
+                trust_remote_code=trust_remote_code,
+                preserve_mtp=preserve_mtp,
+            )
+        return _ram_safe_proxy_dir
+
+    def _cleanup_ram_safe_proxy() -> None:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is not None and _ram_safe_proxy_dir.exists():
+            shutil.rmtree(_ram_safe_proxy_dir, ignore_errors=True)
+            logger.info(
+                f"oQ{oq_level:g}: cleaned up calibration proxy at "
+                f"{_ram_safe_proxy_dir}"
+            )
+        _ram_safe_proxy_dir = None
+
     cb("loading", 12.0, "Preparing quantization inputs")
 
     imatrix_data: OQImatrixData | None = None
@@ -4072,19 +4108,35 @@ def quantize_oq_streaming(
                 )
             )
         cb("imatrix", 13.0, "Preparing oQe imatrix calibration")
-        imatrix_data = _load_or_collect_imatrix(
-            model_path,
-            config,
-            cache_path=imatrix_cache_path,
-            reuse_cache=imatrix_reuse_cache,
-            num_samples=int(imatrix_num_samples),
-            seq_length=int(imatrix_seq_length),
-            strict=imatrix_strict,
-            trust_remote_code=trust_remote_code,
-            progress_callback=cb,
-            progress_start=13.0,
-            progress_end=18.0,
-        )
+
+        def _imatrix_load_path() -> str:
+            cb(
+                "imatrix",
+                13.0,
+                "Building RAM-safe proxy for imatrix calibration",
+            )
+            return str(_ensure_ram_safe_proxy())
+
+        try:
+            imatrix_data = _load_or_collect_imatrix(
+                model_path,
+                config,
+                cache_path=imatrix_cache_path,
+                reuse_cache=imatrix_reuse_cache,
+                num_samples=int(imatrix_num_samples),
+                seq_length=int(imatrix_seq_length),
+                strict=imatrix_strict,
+                trust_remote_code=trust_remote_code,
+                progress_callback=cb,
+                progress_start=13.0,
+                progress_end=18.0,
+                load_path_factory=(
+                    _imatrix_load_path if _model_exceeds_ram else None
+                ),
+            )
+        except BaseException:
+            _cleanup_ram_safe_proxy()
+            raise
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
         imatrix_report = {
             "enabled": True,
@@ -4153,15 +4205,8 @@ def quantize_oq_streaming(
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
-            _proxy_dir: Path | None = None
             try:
-                _proxy_dir = _build_proxy_for_sensitivity(
-                    model_path,
-                    config=config,
-                    dtype=dtype,
-                    working_dir=str(output.parent),
-                    trust_remote_code=trust_remote_code,
-                )
+                _proxy_dir = _ensure_ram_safe_proxy()
                 logger.info(
                     f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
                 )
@@ -4181,9 +4226,7 @@ def quantize_oq_streaming(
                     "full-fp16 sensitivity measurement."
                 ) from e
             finally:
-                if _proxy_dir is not None and _proxy_dir.exists():
-                    shutil.rmtree(_proxy_dir, ignore_errors=True)
-                    logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
+                _cleanup_ram_safe_proxy()
         elif _model_exceeds_ram:
             raise RuntimeError(
                 f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
@@ -4210,12 +4253,18 @@ def quantize_oq_streaming(
     # error here so the rest of quantize_oq_streaming never runs without a
     # data-driven sensitivity map.
     if not sensitivity_map:
+        _cleanup_ram_safe_proxy()
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
             "Check the preceding log lines for the root cause (model load, "
             "calibration data, or layer discovery), and either fix it or "
             "pass an explicit sensitivity_model_path."
         )
+
+    # Calibration passes are done — drop the RAM-safe proxy (built when the
+    # source exceeds system RAM; a cached sensitivity map plus an imatrix
+    # cache hit means it was never built at all).
+    _cleanup_ram_safe_proxy()
 
     cb(
         "loading",
@@ -5702,6 +5751,7 @@ def _load_or_collect_imatrix(
     progress_callback=None,
     progress_start: float = 13.0,
     progress_end: float = 18.0,
+    load_path_factory: Callable[[], str] | None = None,
 ) -> OQImatrixData:
     source = Path(model_path)
     path = Path(cache_path)
@@ -5746,8 +5796,16 @@ def _load_or_collect_imatrix(
         seq_length,
         calib_dataset,
     )
+    # ``load_path_factory`` swaps in an alternate checkpoint for the
+    # calibration forwards (a RAM-safe quantized proxy of the source when
+    # the source exceeds system RAM). Resolved only on a cache miss so a
+    # reusable cache never pays the proxy build. The cache signature stays
+    # keyed to the source checkpoint either way.
+    load_path = model_path
+    if load_path_factory is not None:
+        load_path = load_path_factory()
     entries, collection_metadata = _collect_imatrix(
-        model_path,
+        load_path,
         config,
         calib_dataset=calib_dataset,
         num_samples=num_samples,
@@ -5993,12 +6051,14 @@ def _build_proxy_for_sensitivity(
     dtype: str,
     working_dir: str | None = None,
     trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
 ) -> Path:
-    """Build a temporary uniform 4-bit proxy for sensitivity measurement.
+    """Build a temporary uniform 4-bit proxy for calibration passes.
 
     Used when the source model exceeds available RAM and full-fp16
-    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
-    without it, quantize_oq_streaming aborts the run with a RuntimeError.
+    sensitivity measurement / oQe imatrix collection is not feasible. The
+    proxy keeps oQ data-driven; without it, quantize_oq_streaming aborts
+    the run with a RuntimeError.
 
     ``working_dir`` controls where the proxy is written. Defaults to the
     system temp dir when None, but callers should pass the parent of the
@@ -6006,6 +6066,9 @@ def _build_proxy_for_sensitivity(
     already provisioned for the quantized output. This avoids the trap of
     Linux ``/tmp`` being tmpfs (RAM-backed), which would defeat the whole
     point of the OOM-driven proxy.
+
+    ``preserve_mtp`` keeps the MTP head in the proxy so the imatrix head
+    pass can exercise its linears; sensitivity-only proxies leave it off.
 
     The caller is responsible for deleting the returned directory.
     """
@@ -6017,6 +6080,7 @@ def _build_proxy_for_sensitivity(
         proxy_dir,
         dtype=dtype,
         trust_remote_code=trust_remote_code,
+        preserve_mtp=preserve_mtp,
     )
     return proxy_dir
 
@@ -6027,6 +6091,7 @@ def _build_streaming_proxy_for_sensitivity(
     *,
     dtype: str,
     trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
 ) -> None:
     """Build a loadable 4-bit sensitivity proxy without loading the source.
 
@@ -6133,7 +6198,7 @@ def _build_streaming_proxy_for_sensitivity(
                 w_mx = w_mx[:]
             shape = w_mx.shape
 
-            if _is_mtp_tensor(tensor_name):
+            if _is_mtp_tensor(tensor_name) and not preserve_mtp:
                 del w_mx
                 continue
 
@@ -6214,7 +6279,8 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_non_quantizable",
     ):
         output_config.pop(temp_key, None)
-    _normalize_mtp_in_config(output_config)
+    if not preserve_mtp:
+        _normalize_mtp_in_config(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val

@@ -472,8 +472,33 @@ _MTP_WEIGHT_PREFIXES = (
 )
 
 
+def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
+    """Weight-key prefixes for MTP layers stored as extra decoder layers.
+
+    DeepSeek-V3-style checkpoints (GLM-5.2 among them) keep their MTP head
+    as ``model.layers.<num_hidden_layers + i>.*`` rather than ``mtp.*``;
+    the model patch's sanitize remaps them at load/convert time, so for
+    detection purposes those layers count as MTP weights.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except Exception:
+        return ()
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return ()
+    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+    if n_main <= 0:
+        return ()
+    return tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+
+
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
-    """True iff the checkpoint at *model_path* ships any ``mtp.*`` weight tensor.
+    """True iff the checkpoint at *model_path* ships any MTP weight tensor.
+
+    Matches both the ``mtp.*`` naming and the nextn layout (extra decoder
+    layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -491,12 +516,14 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     if not p.is_dir():
         return False
 
+    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(p)
+
     index_path = p / "model.safetensors.index.json"
     if index_path.exists():
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(k.startswith(_MTP_WEIGHT_PREFIXES) for k in weight_map)
+            return any(k.startswith(prefixes) for k in weight_map)
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
@@ -513,7 +540,7 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         try:
             with safetensors.safe_open(str(shard), framework="numpy") as f:
                 for k in f.keys():
-                    if k.startswith(_MTP_WEIGHT_PREFIXES):
+                    if k.startswith(prefixes):
                         return True
         except Exception as e:
             logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)

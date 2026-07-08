@@ -2314,8 +2314,17 @@ class TestBuildProxyForSensitivity:
 
         calls = []
 
-        def _fake_build(model_path, output_path, *, dtype, trust_remote_code=False):
-            calls.append((model_path, output_path, dtype, trust_remote_code))
+        def _fake_build(
+            model_path,
+            output_path,
+            *,
+            dtype,
+            trust_remote_code=False,
+            preserve_mtp=False,
+        ):
+            calls.append(
+                (model_path, output_path, dtype, trust_remote_code, preserve_mtp)
+            )
             output_path.mkdir()
 
         monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
@@ -2325,7 +2334,9 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
+        assert calls == [
+            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True, False)
+        ]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
