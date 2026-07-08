@@ -556,6 +556,7 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        priority: int = 0,
     ) -> str:
         """
         Add a request for processing.
@@ -572,6 +573,10 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            priority: Scheduling priority, lower = served first. Only
+                consulted when the scheduler's policy is PRIORITY (opt-in via
+                OMLX_PRIORITY_SCHEDULING=1); ignored under the default FCFS
+                policy. Default 0 (equal priority = arrival order preserved).
 
         Returns:
             The request ID
@@ -586,6 +591,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            priority=priority,
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,

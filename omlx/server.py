@@ -1854,6 +1854,14 @@ def init_server(
     logger.info("HF Uploader initialized")
 
 
+# Admission-priority default for requests that don't set ChatCompletionRequest.priority
+# (every caller today, until the Rust tool-server is wired). Deliberately a LOW-priority
+# (numerically high) value, not 0 — an unmarked/background request must never accidentally
+# outrank a caller that explicitly asked for priority=0 (interactive). Only consulted when
+# SchedulingPolicy.PRIORITY is enabled (OMLX_PRIORITY_SCHEDULING=1); irrelevant under the
+# default FCFS policy.
+_DEFAULT_BACKGROUND_PRIORITY = 10
+
 _KEEPALIVE_SENTINEL = object()
 
 _KEEPALIVE_COMMENT = ": keep-alive\n\n"
@@ -3338,6 +3346,18 @@ async def create_chat_completion(
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
             chat_kwargs["seed"] = request.seed
+
+        # Admission-scheduling priority (see _DEFAULT_BACKGROUND_PRIORITY docstring
+        # above and Scheduler._admit_to_waiting). Threads through engine.chat /
+        # engine.stream_chat -> engine/batched.py's generate/stream_generate ->
+        # AsyncEngineCore -> EngineCore.add_request -> Request.priority. A caller
+        # that omits this field (everyone, until the Rust side sends it) gets the
+        # background default, never priority 0.
+        chat_kwargs["priority"] = (
+            request.priority
+            if request.priority is not None
+            else _DEFAULT_BACKGROUND_PRIORITY
+        )
 
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(request, request.model)

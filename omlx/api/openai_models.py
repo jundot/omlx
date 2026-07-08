@@ -308,6 +308,14 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Admission-scheduling priority — lower value is served first (see
+    # Request.priority docstring). Only consulted when the scheduler's
+    # policy is PRIORITY (opt-in via OMLX_PRIORITY_SCHEDULING=1); ignored
+    # under the default FCFS policy, so omitting this field changes nothing.
+    # None (default) is treated as the lowest priority tier (background) once
+    # the policy is enabled — an explicit interactive caller must set a lower
+    # value (e.g. 0) to be served ahead of unmarked background traffic.
+    priority: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod

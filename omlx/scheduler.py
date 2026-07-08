@@ -6009,11 +6009,56 @@ class Scheduler:
 
         # Add to tracking
         self.requests[request.request_id] = request
-        self.waiting.append(request)
+        self._admit_to_waiting(request)
 
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
         )
+
+    def _admit_to_waiting(self, request: Request) -> None:
+        """
+        Insert a newly-admitted request into the waiting queue.
+
+        FCFS policy (the default): append to the back — byte-identical to
+        the historical behavior this replaces.
+
+        PRIORITY policy (opt-in via OMLX_PRIORITY_SCHEDULING=1, see
+        settings.to_scheduler_config): stable-insert by ``request.priority``
+        (lower value = higher priority, see the field's docstring on
+        ``Request``). Scans from the back and inserts immediately after the
+        last waiting request whose priority is <= this one's, so requests of
+        EQUAL priority keep arrival order — when every caller leaves
+        ``priority`` at its default of 0 (nothing sets it yet, pending the
+        Rust-side wiring), this is exactly FCFS. O(n) in queue depth, but the
+        waiting queue is capped at ``max(max_num_seqs * 4, 32)`` admissions
+        (see the SchedulerQueueFullError check above) — a small, bounded
+        scan on the rare new-admission path, not a hot per-token loop.
+
+        Only the genuinely-new-admission path (this function) is
+        priority-ordered. The many ``self.waiting.appendleft(...)`` call
+        sites elsewhere in this file reschedule ALREADY-ADMITTED work
+        resuming after a transient failure (cache eviction, corruption
+        retry, generation overflow) — that work has sunk cost, so it holds
+        its front-of-queue slot against a new arrival of EQUAL OR LOWER
+        actual priority (same-or-higher priority VALUE), exactly as before
+        this change. It does NOT hold that slot against a new arrival of
+        STRICTLY HIGHER actual priority (e.g. a live interactive turn behind
+        a resumed background request) — that new arrival correctly cuts
+        ahead, because the entire point of priority scheduling is that
+        interactive traffic never waits behind background work, resumed or
+        not. This scan needs no special-casing for that: it only compares
+        against whatever is already in the queue, so a resumed item is
+        displaced exactly when — and only when — a strictly more urgent
+        request is actually waiting behind it.
+        """
+        if self.config.policy is not SchedulingPolicy.PRIORITY:
+            self.waiting.append(request)
+            return
+        for i in range(len(self.waiting) - 1, -1, -1):
+            if self.waiting[i].priority <= request.priority:
+                self.waiting.insert(i + 1, request)
+                return
+        self.waiting.insert(0, request)
 
     def set_specprefill_draft_model(
         self, draft_model: Any, draft_model_name: str | None = None

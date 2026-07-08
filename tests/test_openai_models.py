@@ -418,6 +418,16 @@ class TestChatCompletionRequest:
         assert req.max_tokens is None
         assert req.stream is False
         assert req.tools is None
+        assert req.priority is None
+
+    def test_priority_field_accepts_explicit_value(self):
+        """priority round-trips; omitting it (the common case today) leaves None."""
+        req = ChatCompletionRequest(
+            model="gpt-4",
+            messages=[Message(role="user", content="Hello")],
+            priority=0,
+        )
+        assert req.priority == 0
 
     def test_request_with_all_fields(self):
         """Test creating request with all fields."""

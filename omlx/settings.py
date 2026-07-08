@@ -1421,7 +1421,7 @@ class GlobalSettings:
         Returns:
             SchedulerConfig instance with values from settings.
         """
-        from .scheduler import SchedulerConfig
+        from .scheduler import SchedulerConfig, SchedulingPolicy
 
         # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
@@ -1430,7 +1430,23 @@ class GlobalSettings:
             self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
         )
 
+        # Opt-in admission-priority scheduling (OMLX_PRIORITY_SCHEDULING=1):
+        # activates Scheduler._admit_to_waiting's priority-ordered insert
+        # instead of plain FCFS append. Read directly from the environment
+        # (not the settings-file schema) — an operational toggle, same
+        # pattern as OMLX_CACHE_LIMIT_GB elsewhere in this codebase. Default
+        # OFF: SchedulingPolicy.FCFS, byte-identical to pre-existing
+        # behavior, so shipping this code is a no-op until explicitly
+        # enabled — the staged rollout for a change to the live scheduler
+        # every chat request depends on.
+        scheduling_policy = (
+            SchedulingPolicy.PRIORITY
+            if os.environ.get("OMLX_PRIORITY_SCHEDULING") == "1"
+            else SchedulingPolicy.FCFS
+        )
+
         return SchedulerConfig(
+            policy=scheduling_policy,
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,

@@ -602,6 +602,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            priority=kwargs.get("priority", 0),
         )
 
         text = clean_special_tokens(output.output_text)
@@ -689,6 +690,7 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            priority=kwargs.get("priority", 0),
             **specprefill_kwargs,
         )
 
