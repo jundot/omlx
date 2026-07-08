@@ -3,7 +3,8 @@
 
 This patch is intentionally narrow:
   - Qwen3.5/3.6 dense VLM attention layout: q heads=24, kv heads=4, D=256
-  - causal prefill/chunked-prefill only (q_len > 1)
+  - causal prefill/chunked-prefill only (q_len >= 16; decode and MTP verify
+    stay on the stock path)
   - no array masks and no sinks
 
 The native op uses MLX's steel attention template through the oMLX custom
@@ -23,6 +24,13 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+
+# Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
+# must not take the steel prefill kernel: it scans the full KV per call, so
+# at tiny q_len it is 3-16x slower than the stock fused/unfused path and
+# collapses long-context MTP throughput (issue #2127). Genuine prefill
+# chunks are always far above this floor.
+_MIN_ROUTE_Q_LEN = 16
 
 
 def _native_kernel():
@@ -62,7 +70,7 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
         head_dim == 256
         and q_heads == 24
         and kv_heads == 4
-        and q_len > 1
+        and q_len >= _MIN_ROUTE_Q_LEN
         and kv_len >= min_kv_len
         and q_len <= kv_len
     )

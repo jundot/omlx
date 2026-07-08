@@ -68,6 +68,13 @@ def test_route_gate_is_qwen_fa256_only():
     assert not patch._should_route(q[:, :12], k, None, "causal", None, 2048)
     assert not patch._should_route(q, k[:, :2], None, "causal", None, 2048)
     assert not patch._should_route(q[:, :, :1], k, None, "causal", None, 2048)
+    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
+    # the steel prefill kernel is 3-16x slower at tiny q_len (issue #2127)
+    for q_len in (2, 4, 9, 15):
+        qv, kv, _ = _qkv(q_len, 16384)
+        assert not patch._should_route(qv, kv, None, "causal", None, 2048)
+    qv, kv, _ = _qkv(16, 16384)
+    assert patch._should_route(qv, kv, None, "causal", None, 2048)
     assert not patch._should_route(q, k, None, mx.zeros((128, 2048)), None, 2048)
     assert not patch._should_route(q, k, None, "causal", mx.zeros((4,)), 2048)
 
