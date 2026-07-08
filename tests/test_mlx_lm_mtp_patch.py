@@ -1299,9 +1299,12 @@ class TestModelSettingsMtp:
         with pytest.raises(ValueError, match="speculative-decoding"):
             ModelSettings(mtp_enabled=True, dflash_enabled=True)
 
-    def test_mutual_exclusion_with_turboquant(self):
-        with pytest.raises(ValueError, match="TurboQuant"):
-            ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+    def test_mtp_with_turboquant_allowed(self):
+        # TurboQuant's attention patch routes MTP's decode-shaped multi-row
+        # verify through the quantized decode kernels, so the combo is valid.
+        s = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert s.mtp_enabled is True
+        assert s.turboquant_kv_enabled is True
 
     def test_mtp_with_specprefill_allowed(self):
         # SpecPrefill targets a different code path (sparse prefill scoring),

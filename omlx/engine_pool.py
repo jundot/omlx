@@ -1374,7 +1374,7 @@ class EnginePool:
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
             # exists on the language model path. mtp_enabled was already
-            # validated as mutually exclusive with dflash / turboquant in
+            # validated as mutually exclusive with dflash in
             # metal-knowledge: with the mlx-vlm runtime MTP patch (see
             # omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py) VLM models
             # can run MTP natively while keeping vision intact. The old

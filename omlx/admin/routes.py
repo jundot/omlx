@@ -2421,7 +2421,7 @@ async def update_model_settings(
                         "mlx-lm sanitize() path strips them."
                     ),
                 )
-            # Mutual exclusion with DFlash / TurboQuant — ModelSettings.__post_init__
+            # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
                 bool(request.dflash_enabled)
@@ -2432,16 +2432,6 @@ async def update_model_settings(
                 raise HTTPException(
                     status_code=400,
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
-                )
-            tq_after = (
-                bool(request.turboquant_kv_enabled)
-                if "turboquant_kv_enabled" in sent
-                else current_settings.turboquant_kv_enabled
-            )
-            if tq_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
 
