@@ -360,3 +360,42 @@ class TestSmallLRouting:
             absorbed = run(L, 8)
             diff = float(mx.abs(legacy - absorbed).max())
             assert diff < 2e-5, f"L={L}: {diff}"
+
+    def test_topk_gather_matches_masked_reference(self, glm, mtp_active):
+        """With the DSA indexer active (K > index_topk), the decode-shape
+        per-row gather path must equal the legacy masked full-K path."""
+        import omlx.patches.glm_moe_dsa.glm_moe_dsa_model as gm
+        from mlx_lm.models.base import create_attention_mask
+        from mlx_lm.models.cache import KVCache
+
+        mx.random.seed(5)
+        args = glm.ModelArgs.from_dict(TINY_CFG)
+        attn = glm.GlmMoeDsaAttention(args, 0)
+        mx.eval(attn.parameters())
+
+        def run(L, max_l):
+            mx.random.seed(17)
+            cache = [KVCache(), KVCache()]
+            # Prefill past index_topk (16) so the indexer emits topk state.
+            x_pre = mx.random.normal((1, 24, TINY_CFG["hidden_size"]))
+            mask = create_attention_mask(x_pre, cache[0], return_array=True)
+            out, _ = attn(x_pre, mask, cache, None)
+            mx.eval(out)
+            x = mx.random.normal((1, L, TINY_CFG["hidden_size"]))
+            mask = create_attention_mask(x, cache[0], return_array=True)
+            saved = gm._ABSORBED_DECODE_MAX_L
+            gm._ABSORBED_DECODE_MAX_L = max_l
+            try:
+                out, state = attn(x, mask, cache, None)
+                mx.eval(out)
+            finally:
+                gm._ABSORBED_DECODE_MAX_L = saved
+            return out, state
+
+        for L in (2, 3, 4):
+            legacy, legacy_state = run(L, 1)  # masked materialize fallback
+            gathered, state = run(L, 8)  # per-row topk gather
+            idx, prefix = gm._parse_topk_state(state)
+            assert idx is not None and idx.shape[2] == L and prefix == 0
+            diff = float(mx.abs(legacy - gathered).max())
+            assert diff < 2e-5, f"L={L}: {diff}"
