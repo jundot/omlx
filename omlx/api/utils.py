@@ -150,9 +150,9 @@ def _extract_text_from_content_list(content: list) -> str:
 
 
 def _extract_multimodal_content_list(content: list) -> list:
-    """Extract text, image, and audio parts from a content array.
+    """Extract text, image, video, and audio parts from a content array.
 
-    Keeps text, image_url, and input_audio items for VLM processing.
+    Keeps text, image_url, video_url, and input_audio items for VLM processing.
     Other content types (tool_use, thinking, refusal, etc.) are dropped.
     """
     parts = []
@@ -178,6 +178,20 @@ def _extract_multimodal_content_list(content: list) -> list:
                         {
                             "type": "image_url",
                             "image_url": {"url": url},
+                        }
+                    )
+            elif item_type == "video_url":
+                video_url_value = item.get("video_url")
+                url = None
+                if isinstance(video_url_value, str):
+                    url = video_url_value
+                elif isinstance(video_url_value, dict):
+                    url = video_url_value.get("url")
+                if url:
+                    parts.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": url},
                         }
                     )
             elif item_type == "input_image":
@@ -1182,9 +1196,9 @@ def extract_multimodal_content(
         if isinstance(content, str):
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Preserve image_url and input_audio parts for VLM processing
+            # Preserve image_url, video_url, and input_audio parts for VLM processing
             multimodal_parts = _extract_multimodal_content_list(content)
-            multimodal_types = {"image_url", "input_audio"}
+            multimodal_types = {"image_url", "video_url", "input_audio"}
             has_multimodal = any(
                 p.get("type") in multimodal_types for p in multimodal_parts
             )
