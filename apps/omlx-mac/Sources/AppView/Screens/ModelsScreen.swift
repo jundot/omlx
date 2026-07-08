@@ -229,47 +229,62 @@ private struct LibrarySection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
-                            .layoutPriority(1)
                             Spacer(minLength: 8)
-                            if isModelLoaded(m.id) {
-                                Button(String(localized: "models.library.unload",
-                                              defaultValue: "Unload",
-                                              comment: "Button label that unloads a library model from memory")) { onUnload(m.id) }
+                            HStack(spacing: 10) {
+                                if isModelLoaded(m.id) {
+                                    Button {
+                                        onUnload(m.id)
+                                    } label: {
+                                        Text(String(localized: "models.library.unload",
+                                                    defaultValue: "Unload",
+                                                    comment: "Button label that unloads a library model from memory"))
+                                            .lineLimit(1)
+                                            .frame(minWidth: 48)
+                                    }
                                     .buttonStyle(.omlx(.plain, size: .small))
-                            } else {
-                                Button(String(localized: "models.library.load",
-                                              defaultValue: "Load",
-                                              comment: "Button label that loads a library model into memory")) { onLoad(m.id) }
+                                } else {
+                                    Button {
+                                        onLoad(m.id)
+                                    } label: {
+                                        Text(String(localized: "models.library.load",
+                                                    defaultValue: "Load",
+                                                    comment: "Button label that loads a library model into memory"))
+                                            .lineLimit(1)
+                                            .frame(minWidth: 48)
+                                    }
                                     .buttonStyle(.omlx(.normal, size: .small))
                                     .disabled(m.isLoading)
-                            }
-                            Button {
-                                onOpenSettings(m.id)
-                            } label: {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 11))
-                            }
-                            .buttonStyle(.omlx(.plain, size: .small))
-                            .help(String(localized: "models.library.settings.help",
-                                         defaultValue: "Settings",
-                                         comment: "Tooltip on the chevron that opens a model's settings screen"))
-                            Button {
-                                onRequestRemove(m.id)
-                            } label: {
-                                if deletingID == m.id {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                } else {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(theme.redDot)
                                 }
+                                Button {
+                                    onOpenSettings(m.id)
+                                } label: {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 11))
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .help(String(localized: "models.library.settings.help",
+                                             defaultValue: "Settings",
+                                             comment: "Tooltip on the chevron that opens a model's settings screen"))
+                                Button {
+                                    onRequestRemove(m.id)
+                                } label: {
+                                    if deletingID == m.id {
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(theme.redDot)
+                                    }
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .disabled(deletingID != nil)
+                                .help(String(localized: "models.library.remove.help",
+                                             defaultValue: "Remove from disk",
+                                             comment: "Tooltip on the trash button that deletes a model from local storage"))
                             }
-                            .buttonStyle(.omlx(.plain, size: .small))
-                            .disabled(deletingID != nil)
-                            .help(String(localized: "models.library.remove.help",
-                                         defaultValue: "Remove from disk",
-                                         comment: "Tooltip on the trash button that deletes a model from local storage"))
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(1)
                         }
                     }
                 }
