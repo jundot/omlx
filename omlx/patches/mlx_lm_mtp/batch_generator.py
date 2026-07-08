@@ -1322,10 +1322,18 @@ class _DepthController:
     ADAPT_INTERVAL = 16
     PROBE_INTERVAL = 96
     PROBE_LEN = 6
-    MARGINAL_MS = 7.0  # prior cost of one extra verify token (measured 6-10ms)
+    # Prior cost of one extra verify token. 7 ms matches dense backbones
+    # (measured 6-10 ms); fine-grained MoE models override it per model —
+    # each extra verify row pulls a nearly disjoint routed-expert set, so
+    # the marginal row costs a large fraction of a full step and a dense
+    # prior makes the controller over-draft on low-acceptance content
+    # until the EMA catches up.
+    MARGINAL_MS = 7.0
     HYSTERESIS = 1.03
 
-    def __init__(self, max_depth: int):
+    def __init__(self, max_depth: int, marginal_ms: Optional[float] = None):
+        if marginal_ms:
+            self.MARGINAL_MS = float(marginal_ms)
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth  # start deep so deep stats populate early
         self.p = [0.6] * self.max_depth
@@ -1572,7 +1580,12 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.depth = depth
         state.head_clone = head_clone
         if depth > 1:
-            state.controller = _DepthController(depth)
+            state.controller = _DepthController(
+                depth,
+                marginal_ms=getattr(
+                    gen_batch.model, "_omlx_mtp_marginal_ms", None
+                ),
+            )
         state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))

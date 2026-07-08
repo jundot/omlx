@@ -523,9 +523,9 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
-    Phase 1 supports Qwen3.5/3.6 (mlx-lm PR 990) and DeepSeek-V4-Flash
-    (Blaizzy/mlx-lm fork PR 15). The model also has to declare MTP heads
-    in the config; otherwise the patch is a no-op.
+    Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
+    fork PR 15) and GLM-5.2 (glm_moe_dsa). The model also has to declare
+    MTP heads in the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -535,6 +535,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+        or model_type == "glm_moe_dsa"
     )
 
 

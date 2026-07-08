@@ -818,8 +818,16 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            continue
-        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            # MTP-head tensors carry no ``layers.<n>`` index but should
+            # compete like any other non-expert tensor (the stated contract
+            # is backbone-equal treatment for the head's internal block);
+            # score 0 seeds them at the bottom tier and the under-target
+            # fallback lifts them with the rest.
+            if not _is_mtp_tensor(path):
+                continue
+            layer_score = 0.0
+        else:
+            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -2488,6 +2496,28 @@ def _is_mtp_tensor(name: str) -> bool:
     return name.startswith("mtp.") or ".mtp." in name
 
 
+def _source_has_nextn_tensors(keys, config: dict) -> bool:
+    """True iff the checkpoint stores its MTP head as extra decoder layers.
+
+    DeepSeek-V3-style checkpoints (GLM-5.2 among them) keep the MTP layers
+    as ``model.layers.<num_hidden_layers + i>.*`` rather than ``mtp.*``;
+    the model patch's sanitize remaps them, so for preservation purposes
+    they count as MTP tensors even though ``_is_mtp_tensor`` (which sees
+    post-sanitize names) doesn't match them.
+    """
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return False
+    n_main = 0
+    for c in cfgs:
+        n_main = max(n_main, int(c.get("num_hidden_layers", 0) or 0))
+    if n_main <= 0:
+        return False
+    prefixes = tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    return any(k.startswith(prefixes) for k in keys)
+
+
 def _normalize_mtp_in_config(config: dict) -> None:
     """Zero out MTP layer counts in the output config (in place).
 
@@ -2815,18 +2845,18 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
     Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
     semantics under different names (``e_proj`` + ``h_proj`` for the
-    embedding/hidden fusion; ``hc_head.*`` for the final projection).
-    All of these stay in full precision; the MTP block's internal
-    DeepseekV4Block (attn/ffn) gets the same quantization as the
-    backbone's other layers.
+    embedding/hidden fusion; ``hc_head.*`` for the final projection);
+    GLM-5.2's ``GlmMTPBlock`` calls it ``eh_proj``. All of these stay in
+    full precision; the MTP block's internal decoder block (attn/ffn)
+    gets the same quantization as the backbone's other layers.
     """
     if not (name.startswith("mtp.") or ".mtp." in name):
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
-    # DeepSeek-V4 MTPBlock fusion projections
-    if name.endswith(".e_proj.weight") or name.endswith(".h_proj.weight"):
+    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections
+    if name.endswith((".e_proj.weight", ".h_proj.weight", ".eh_proj.weight")):
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
@@ -3993,7 +4023,11 @@ def quantize_oq_streaming(
     cb("loading", 8.0, "Indexing source weights")
 
     all_weights = _LazyTensorIndex(weight_files)
-    if preserve_mtp and not any(_is_mtp_tensor(k) for k in all_weights.keys()):
+    if (
+        preserve_mtp
+        and not any(_is_mtp_tensor(k) for k in all_weights.keys())
+        and not _source_has_nextn_tensors(all_weights.keys(), config)
+    ):
         logger.warning(
             "Preserve MTP requested for %s, but no mtp.* tensors were found "
             "in the checkpoint; disabling MTP preservation",
