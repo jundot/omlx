@@ -21,7 +21,6 @@ import bisect
 import json
 import logging
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +28,7 @@ import regex
 from jsonschema import ValidationError, validate
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
+from .shared_models import generate_tool_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             arguments = parsed.get("arguments", {})
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=name,
@@ -184,7 +184,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     arguments[key] = val
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -214,7 +214,7 @@ def _parse_xml_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                     arguments[k] = v
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -269,7 +269,7 @@ def _parse_namespaced_tool_calls(
                     arguments[key] = val
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -316,7 +316,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             if name:
                 tool_calls.append(
                     ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        id=generate_tool_call_id(),
                         type="function",
                         function=FunctionCall(
                             name=name,
@@ -359,7 +359,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
             tool_calls.append(
                 ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    id=generate_tool_call_id(),
                     type="function",
                     function=FunctionCall(
                         name=func_name,
@@ -401,7 +401,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
             arguments = {"raw": args_str}
         tool_calls.append(
             ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
+                id=generate_tool_call_id(),
                 type="function",
                 function=FunctionCall(
                     name=name,
@@ -421,7 +421,7 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
         name = match.group(1)
         tool_calls.append(
             ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
+                id=generate_tool_call_id(),
                 type="function",
                 function=FunctionCall(
                     name=name,
@@ -1152,7 +1152,7 @@ def _parse_tool_calls_impl(
                         arguments = p.get("arguments", {})
                         tool_calls.append(
                             ToolCall(
-                                id=f"call_{uuid.uuid4().hex[:8]}",
+                                id=generate_tool_call_id(),
                                 type="function",
                                 function=FunctionCall(
                                     name=name,
@@ -1184,7 +1184,7 @@ def _parse_tool_calls_impl(
                                 arguments = p.get("arguments", {})
                                 tool_calls.append(
                                     ToolCall(
-                                        id=f"call_{uuid.uuid4().hex[:8]}",
+                                        id=generate_tool_call_id(),
                                         type="function",
                                         function=FunctionCall(
                                             name=name,
