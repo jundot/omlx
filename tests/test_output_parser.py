@@ -68,6 +68,17 @@ class CohereTokenizer:
         return "".join(self._token_map[token_id] for token_id in token_ids)
 
 
+class DeepSeekV4Tokenizer(CohereTokenizer):
+    has_tool_calling = True
+    tool_call_start = "<｜DSML｜tool_calls>"
+    tool_call_end = "</｜DSML｜tool_calls>"
+
+    def tool_parser(self, text: str, tools=None):
+        from omlx.patches.deepseek_v4.tool_parser_v4 import parse_tool_call
+
+        return parse_tool_call(text, tools)
+
+
 class _FakeMelodyOptions:
     def cmd4(self):
         return self
@@ -253,13 +264,16 @@ class TestCohere2MoeOutputParserSession:
                         name="edit",
                         arguments=literal_newline_args,
                     )
-                    return SimpleNamespace(content=None, reasoning=None, tool_calls=[tc])
+                    return SimpleNamespace(
+                        content=None, reasoning=None, tool_calls=[tc]
+                    )
                 return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
 
             def flush_partials(self):
                 return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
 
         import types, json as _json
+
         module = types.ModuleType("cohere_melody")
         module.PyFilter = _FakeMelodyFilterLiteralNewline
         module.PyFilterOptions = _FakeMelodyOptions
@@ -267,6 +281,7 @@ class TestCohere2MoeOutputParserSession:
 
         tokenizer = CohereTokenizer({"TC": "TC"})
         from omlx.adapter.output_parser import Cohere2MoeOutputParserSession
+
         session = Cohere2MoeOutputParserSession.__new__(Cohere2MoeOutputParserSession)
         session._tokenizer = tokenizer
         session._melody = _FakeMelodyFilterLiteralNewline(None)
@@ -477,6 +492,90 @@ class TestGemma4OutputParserSession:
 
 
 class TestOutputParserFactory:
+    def test_detects_deepseek_v4_by_config(self):
+        tokenizer = DeepSeekV4Tokenizer({1: "x"})
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "deepseek_v4"
+
+    def test_deepseek_v4_stops_at_first_dsml_tool_block(self):
+        tokenizer = DeepSeekV4Tokenizer(
+            {
+                1: "Before ",
+                2: "<｜DSML｜tool",
+                3: '_calls>\n<｜DSML｜invoke name="Bash">\n',
+                4: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n",
+                5: "</｜DSML｜tool_calls>",
+            }
+        )
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        visible = []
+        stop_seen = False
+        for token_id in [1, 2, 3, 4, 5]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            stop_seen = stop_seen or result.is_stop
+            assert result.record_token is True
+
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert stop_seen is True
+        assert "".join(stream) == "Before "
+        assert "".join(visible) == "Before "
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "Bash"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"command": "ls"}
+
+    def test_deepseek_v4_drops_text_after_tool_end_in_same_token(self):
+        tokenizer = DeepSeekV4Tokenizer(
+            {
+                1: '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n',
+                2: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n",
+                3: "</｜DSML｜tool_calls>\n"
+                '<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>',
+            }
+        )
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        stop_seen = False
+        for token_id in [1, 2, 3]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            stop_seen = stop_seen or result.is_stop
+
+        final = session.finalize()
+        stream.append(final.stream_text)
+
+        assert stop_seen is True
+        assert "".join(stream) == ""
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"command": "ls"}
+
     def test_detects_minimax_m3_by_config(self):
         tokenizer = CohereTokenizer({1: "x"})
         factory = detect_output_parser(

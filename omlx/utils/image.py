@@ -2,57 +2,111 @@
 """
 Image processing utilities for VLM (Vision-Language Model) support.
 
-This module provides functions for loading images from URLs/base64,
+This module provides functions for loading images from base64 data URIs,
 extracting images from OpenAI-format messages, and computing image
 hashes for prefix cache deduplication.
 """
 
 import base64
+import binascii
 import hashlib
 import io
-import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
 
-logger = logging.getLogger(__name__)
+from ..exceptions import InvalidRequestError
 
 
-def load_image(url_or_base64: str) -> Image.Image:
+_IMAGE_INPUT_ERROR = (
+    "Image inputs must be base64 data URIs "
+    "(data:image/...;base64,...). Remote URLs and local file paths are not supported."
+)
+_AUDIO_INPUT_ERROR = (
+    "input_audio.data must be a base64 string or base64 data URI. "
+    "Local file paths are not supported."
+)
+
+
+def _decode_base64_data_uri(value: str, *, field: str) -> bytes:
+    """Decode a base64 data URI, mapping malformed input to a request error."""
+    if not isinstance(value, str):
+        raise InvalidRequestError(_IMAGE_INPUT_ERROR, field=field)
+
+    stripped = value.strip()
+    if not stripped.startswith("data:"):
+        raise InvalidRequestError(_IMAGE_INPUT_ERROR, field=field)
+
+    prefix, separator, encoded = stripped.partition(",")
+    prefix_lower = prefix.lower()
+    if (
+        separator != ","
+        or not prefix_lower.startswith("data:image/")
+        or ";base64" not in prefix_lower
+    ):
+        raise InvalidRequestError(
+            f"{field} must use a base64 image data URI.",
+            field=field,
+        )
+
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidRequestError(
+            f"{field} contains invalid base64 data.",
+            field=field,
+        ) from exc
+
+
+def _decode_input_audio_data(data: str, *, field: str = "input_audio.data") -> bytes:
+    """Decode input_audio.data without falling back to filesystem paths."""
+    stripped = data.strip()
+    if stripped.startswith("data:"):
+        prefix, separator, encoded = stripped.partition(",")
+        if separator != "," or ";base64" not in prefix.lower():
+            raise InvalidRequestError(
+                f"{field} must use a base64 data URI.",
+                field=field,
+            )
+    else:
+        encoded = stripped
+
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidRequestError(_AUDIO_INPUT_ERROR, field=field) from exc
+
+
+def validate_image_data_uri(value: str, *, field: str = "image") -> str:
+    """Validate that a request-facing image reference is an inline data URI."""
+    _decode_base64_data_uri(value, field=field)
+    return value
+
+
+def load_image(url_or_base64: str, *, field: str = "image_url") -> Image.Image:
     """
-    Load an image from a URL or base64 data URI.
+    Load an image from a base64 data URI.
 
     Supports:
-    - HTTP/HTTPS URLs: Downloads the image
     - Data URIs: "data:image/jpeg;base64,..." format
 
     Args:
-        url_or_base64: Image URL or base64 data URI string
+        url_or_base64: Image base64 data URI string
 
     Returns:
         PIL Image object
 
     Raises:
-        ValueError: If the URL format is unsupported
-        IOError: If the image cannot be loaded
+        InvalidRequestError: If the input is not a valid image data URI
     """
-    if url_or_base64.startswith("data:"):
-        # base64 data URI: "data:image/jpeg;base64,<data>"
-        try:
-            _, data_part = url_or_base64.split(",", 1)
-        except ValueError:
-            raise ValueError(f"Invalid data URI format: {url_or_base64[:50]}...")
-        img_bytes = base64.b64decode(data_part)
+    img_bytes = _decode_base64_data_uri(url_or_base64, field=field)
+    try:
         img = Image.open(io.BytesIO(img_bytes))
-    elif url_or_base64.startswith(("http://", "https://")):
-        import urllib.request
-
-        with urllib.request.urlopen(url_or_base64, timeout=30) as response:
-            img_bytes = response.read()
-        img = Image.open(io.BytesIO(img_bytes))
-    else:
-        # Try as local file path
-        img = Image.open(url_or_base64)
+    except Exception as exc:
+        raise InvalidRequestError(
+            f"{field} does not contain a decodable image.",
+            field=field,
+        ) from exc
 
     # Apply EXIF orientation (phone photos etc.) before processing.
     # Matches mlx-vlm's load_image which calls ImageOps.exif_transpose().
@@ -80,10 +134,8 @@ def extract_images_from_messages(
         Tuple of (text_messages, images, audio):
         - text_messages: Messages with media parts removed, text parts joined
         - images: List of loaded PIL Image objects in order of appearance
-        - audio: List of BytesIO/str audio references for load_audio()
+        - audio: List of BytesIO audio buffers
     """
-    import binascii
-
     text_messages = []
     images = []
     audio = []
@@ -111,7 +163,11 @@ def extract_images_from_messages(
                 part_type = getattr(part, "type", None)
 
             if part_type == "text":
-                text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                text = (
+                    part.get("text")
+                    if isinstance(part, dict)
+                    else getattr(part, "text", None)
+                )
                 if text:
                     text_parts.append(text)
 
@@ -119,7 +175,8 @@ def extract_images_from_messages(
                 # OpenAI chat format: {"type":"image_url","image_url":{"url":"..."}}
                 # Responses-style format: {"type":"input_image","image_url":"..."}
                 image_url_obj = (
-                    part.get("image_url") if isinstance(part, dict)
+                    part.get("image_url")
+                    if isinstance(part, dict)
                     else getattr(part, "image_url", None)
                 )
                 if image_url_obj is None and isinstance(part, dict):
@@ -134,37 +191,19 @@ def extract_images_from_messages(
                     url = getattr(image_url_obj, "url", None)
 
                 if url:
-                    try:
-                        img = load_image(url)
-                        images.append(img)
-                    except Exception as e:
-                        logger.warning(f"Failed to load image: {e}")
+                    images.append(load_image(url, field="image_url"))
 
             elif part_type == "input_audio":
                 # OpenAI audio format: {"type":"input_audio","input_audio":{"data":"...","format":"wav"}}
                 input_audio = (
-                    part.get("input_audio") if isinstance(part, dict)
+                    part.get("input_audio")
+                    if isinstance(part, dict)
                     else getattr(part, "input_audio", None)
                 )
                 if input_audio and isinstance(input_audio, dict):
                     data = input_audio.get("data", "")
                     if isinstance(data, str):
-                        stripped = data.strip()
-                        # Handle data URI (data:audio/wav;base64,...)
-                        if stripped.startswith("data:"):
-                            prefix, separator, encoded = stripped.partition(",")
-                            if separator == "," and ";base64" in prefix:
-                                try:
-                                    audio.append(io.BytesIO(base64.b64decode(encoded, validate=True)))
-                                except (binascii.Error, ValueError) as exc:
-                                    logger.warning(f"Failed to decode input_audio base64: {exc}")
-                                continue
-                        # Try raw base64 decode
-                        try:
-                            audio.append(io.BytesIO(base64.b64decode(stripped, validate=True)))
-                        except (binascii.Error, ValueError):
-                            # Not base64 — treat as file path/reference
-                            audio.append(stripped)
+                        audio.append(io.BytesIO(_decode_input_audio_data(data)))
                     elif isinstance(data, bytes):
                         audio.append(io.BytesIO(data))
                     else:
@@ -178,6 +217,8 @@ def extract_images_from_messages(
         text_messages.append(new_msg)
 
     return text_messages, images, audio
+
+
 def compute_image_hash(images: List[Image.Image]) -> Optional[str]:
     """
     Compute a SHA256 hash from a list of images for prefix cache deduplication.

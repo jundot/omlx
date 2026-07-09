@@ -60,6 +60,15 @@ def _has_no_real_recipient(recipient: str | None) -> bool:
     return recipient is None or recipient == "<|start|>assistant"
 
 
+def _is_commentary_tool_call_message(msg: Any) -> bool:
+    recipient = getattr(msg, "recipient", None)
+    return (
+        getattr(msg, "channel", None) == "commentary"
+        and isinstance(recipient, str)
+        and recipient.startswith("functions.")
+    )
+
+
 @lru_cache(maxsize=1)
 def load_harmony_gpt_oss_encoding() -> HarmonyEncoding:
     """Load the Harmony gpt-oss encoding with a small retry window."""
@@ -333,7 +342,7 @@ class HarmonyStreamingParser:
                 return tool_calls
 
             for msg in messages:
-                if not msg.recipient or not msg.recipient.startswith("functions."):
+                if not _is_commentary_tool_call_message(msg):
                     continue
 
                 name = msg.recipient[10:]  # Remove "functions." prefix
@@ -470,7 +479,7 @@ def parse_tool_calls_from_tokens(
                     if isinstance(text, str):
                         analysis_text += text
 
-            elif msg.recipient and msg.recipient.startswith("functions."):
+            elif _is_commentary_tool_call_message(msg):
                 # Extract tool calls from commentary channel
                 name = msg.recipient[10:]  # Remove "functions." prefix
                 arguments = ""

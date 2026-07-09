@@ -25,17 +25,21 @@ execute_process(
 find_package(MLX CONFIG REQUIRED)
 list(GET MLX_INCLUDE_DIRS 0 OMLX_GLM_MLX_INCLUDE_DIR)
 
+set(OMLX_CUSTOM_KERNEL_COMMON_DIR
+    ${CMAKE_CURRENT_LIST_DIR}/../../common/csrc)
+
 add_library(omlx_glm_kernel_ops)
 target_sources(
   omlx_glm_kernel_ops
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
 target_include_directories(
   omlx_glm_kernel_ops
-  PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+  PUBLIC ${CMAKE_CURRENT_LIST_DIR} ${OMLX_CUSTOM_KERNEL_COMMON_DIR})
 target_compile_definitions(
   omlx_glm_kernel_ops
   PUBLIC OMLX_GLM_KERNEL_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}"
@@ -44,12 +48,16 @@ target_link_libraries(omlx_glm_kernel_ops PUBLIC mlx)
 
 if(MLX_BUILD_METAL)
   set(OMLX_GLM_METAL_SOURCES
+      ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
+      ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal)
   file(GLOB_RECURSE OMLX_GLM_METAL_HEADERS CONFIGURE_DEPENDS
-       ${CMAKE_CURRENT_LIST_DIR}/*.h)
+       ${CMAKE_CURRENT_LIST_DIR}/*.h
+       ${OMLX_CUSTOM_KERNEL_COMMON_DIR}/kernels/*.h
+       ${OMLX_CUSTOM_KERNEL_COMMON_DIR}/mlx/**/*.h)
   set(OMLX_GLM_METAL_FLAGS
       -x
       metal
@@ -68,6 +76,7 @@ if(MLX_BUILD_METAL)
         "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif()
   set(OMLX_GLM_METAL_INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}
+                                  ${OMLX_CUSTOM_KERNEL_COMMON_DIR}
                                   ${MLX_INCLUDE_DIRS})
   set(OMLX_GLM_METAL_INCLUDE_ARGS)
   foreach(INCLUDE_DIR IN LISTS OMLX_GLM_METAL_INCLUDE_DIRS)

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from omlx.admin.oq_manager import OQManager
+from omlx.admin.oq_manager import OQManager, QuantStatus, QuantTask
 
 
 @pytest.fixture
@@ -179,6 +179,38 @@ class TestOQManagerDtypeSupport:
 
         assert manager._tasks == {}
         assert not (root / "DeepSeek-V4-Flash-oQ4-fp16").exists()
+
+
+class TestOQManagerProgress:
+    def test_byte_level_quant_progress_disables_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=39.0,
+            progress_meta={"processed_bytes": 31, "total_bytes": 100},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is True
+
+    def test_non_byte_quant_progress_can_use_time_estimator(self):
+        task = QuantTask(
+            task_id="task",
+            model_name="Model",
+            model_path="/tmp/Model",
+            oq_level=2.5,
+            output_name="Model-oQ2.5e",
+            output_path="/tmp/Model-oQ2.5e",
+            status=QuantStatus.QUANTIZING,
+            progress=30.0,
+            progress_meta={},
+        )
+
+        assert OQManager._has_explicit_quant_progress(task) is False
 
 
 class TestOQManagerEnhanced:

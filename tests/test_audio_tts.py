@@ -111,6 +111,80 @@ def server_tts_client():
 # ---------------------------------------------------------------------------
 
 
+class TestTTSKokoroLangInference:
+    """Kokoro G2P lang_code inference from the voice naming convention.
+
+    Kokoro voice names are ``<lang><gender>_<name>`` (af_heart, bm_george,
+    zf_xiaoxiao). Without a lang_code the pipeline falls back to English
+    G2P and non-English text is mangled. Names that don't match the
+    convention (Qwen3-TTS speakers like 'aiden') must NOT trigger
+    inference — those backends have their own lang_code defaults.
+    """
+
+    @staticmethod
+    def _engine_with_fake_model(captured: dict):
+        import numpy as np
+        from types import SimpleNamespace
+
+        from omlx.engine.tts import TTSEngine
+
+        class FakeModel:
+            sample_rate = 24000
+
+            def generate(
+                self, *, text, verbose=False, voice=None, lang_code=None, **kw
+            ):
+                captured["voice"] = voice
+                captured["lang_code"] = lang_code
+                captured["had_lang_code"] = lang_code is not None
+                return [SimpleNamespace(audio=np.zeros(100, dtype=np.float32))]
+
+        engine = TTSEngine("kokoro")
+        engine._model = FakeModel()
+        return engine
+
+    def test_helper_covers_all_kokoro_languages(self):
+        from omlx.engine.tts import _infer_kokoro_lang_code
+
+        for code in "abefhijpz":
+            assert _infer_kokoro_lang_code(f"{code}f_test") == code
+            assert _infer_kokoro_lang_code(f"{code}m_test") == code
+
+    def test_helper_rejects_non_kokoro_names(self):
+        from omlx.engine.tts import _infer_kokoro_lang_code
+
+        for name in ("aiden", "eric", "alloy", "zeta", "af", "xf_test", None, ""):
+            assert _infer_kokoro_lang_code(name) is None
+
+    @pytest.mark.asyncio
+    async def test_kokoro_voice_infers_lang_code(self):
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("你好世界", voice="zf_xiaoxiao")
+
+        assert captured["lang_code"] == "z"
+
+    @pytest.mark.asyncio
+    async def test_explicit_language_wins_over_inference(self):
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("hello", voice="zf_xiaoxiao", language="en")
+
+        assert captured["lang_code"] == "en"
+
+    @pytest.mark.asyncio
+    async def test_non_kokoro_voice_gets_no_inferred_lang_code(self):
+        """Qwen3-TTS-style speakers must keep the backend's own default."""
+        captured: dict = {}
+        engine = self._engine_with_fake_model(captured)
+
+        await engine.synthesize("hello", voice="aiden")
+
+        assert captured["had_lang_code"] is False
+
+
 class TestTTSEndpointBasic:
     """Core TTS endpoint behaviour."""
 

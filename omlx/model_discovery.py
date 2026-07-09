@@ -74,6 +74,61 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     "minimax_m3",
 }
 
+# Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
+# are never meant to be served as standalone chat models. Some declare a
+# distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
+# or ``*_mtp`` (e.g. qwen3_5_mtp) marker — but DFlash draft checkpoints declare
+# a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
+# architecture name (``DFlashDraftModel``) or a drafter-only config block
+# (``dflash_config``). Keep these in sync with the drafter resolution in
+# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
+# drafter families are added.
+HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
+_HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
+_HELPER_CONFIG_KEYS = ("dflash_config",)
+
+
+def is_helper_config_model_type(config_model_type: str | None) -> bool:
+    """True when ``config_model_type`` marks a speculative-decoding drafter.
+
+    These are the raw top-level ``model_type`` values from a checkpoint's
+    config.json (e.g. ``gemma4_assistant``, ``qwen3_5_mtp``). Note this misses
+    DFlash drafts, whose model_type is a plain ``qwen3`` — use
+    :func:`is_helper_model_config` when the full config dict is available.
+    """
+    if not isinstance(config_model_type, str) or not config_model_type:
+        return False
+    mt = config_model_type.lower()
+    return mt.endswith(HELPER_CONFIG_MODEL_TYPE_SUFFIXES)
+
+
+def is_helper_model_config(config: dict) -> bool:
+    """True when a parsed config.json marks a speculative-decoding drafter.
+
+    Catches three intrinsic signals, any of which is definitive:
+    an ``*_assistant`` / ``*_mtp`` model_type, a drafter architecture name
+    (e.g. ``DFlashDraftModel``), or a drafter-only config block
+    (e.g. ``dflash_config``). These are helper checkpoints backing
+    dFlash / MTP / assistant speculative decoding, not chat models.
+    """
+    if not isinstance(config, dict):
+        return False
+    if is_helper_config_model_type(config.get("model_type")):
+        return True
+    if any(key in config for key in _HELPER_CONFIG_KEYS):
+        return True
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    elif not isinstance(architectures, list | tuple | set):
+        return False
+    for arch in architectures:
+        arch_lower = str(arch).lower()
+        if any(token in arch_lower for token in _HELPER_ARCH_TOKENS):
+            return True
+    return False
+
+
 # Known VLM architectures
 VLM_ARCHITECTURES = {
     "LlavaForConditionalGeneration",
@@ -296,6 +351,7 @@ class DiscoveredModel:
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+    is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
 
 
 @dataclass(frozen=True)
@@ -397,6 +453,26 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
         module_type.startswith("sentence_transformers.models.")
         and module_type != "sentence_transformers.models.Transformer"
         for module_type in module_types
+    )
+
+
+def _looks_like_kokoro_config(config: dict) -> bool:
+    """Return True for Kokoro exports that omit HF ``model_type``.
+
+    mlx-community Kokoro conversions (e.g. Kokoro-82M-bf16) keep the original
+    Kokoro config — top-level ``istftnet`` + ``plbert`` sections and a
+    ``vocab`` table — with no HF-style ``model_type``/``architectures``.
+    mlx-audio loads them fine, but oMLX must classify them as TTS during
+    discovery or they fall through to the LLM engine, whose loader only
+    matches ``model*.safetensors`` and fails with a misleading
+    "No safetensors found" error.
+    """
+    if not isinstance(config, dict):
+        return False
+    return (
+        isinstance(config.get("istftnet"), dict)
+        and isinstance(config.get("plbert"), dict)
+        and isinstance(config.get("vocab"), dict)
     )
 
 
@@ -628,6 +704,9 @@ def detect_model_type(model_path: Path) -> ModelType:
     # still STT models and mlx-audio can load them by directory/repo name.
     if _looks_like_nemo_asr_config(config):
         return "audio_stt"
+    # Kokoro exports similarly ship a bare original config (istftnet/plbert).
+    if _looks_like_kokoro_config(config):
+        return "audio_tts"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"
@@ -1021,6 +1100,31 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
 
 _MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
 
+# Speculative-decoding helper checkpoints (e.g. z-lab/Qwen3.6-27B-DFlash) are
+# MLX-loadable drafts even though their safetensors are saved in PyTorch ("pt")
+# format and the repo name carries no "mlx" token, so the HF-cache MLX
+# heuristic must recognise them explicitly or they vanish from the draft-model
+# picker (#1643). Detection delegates to is_helper_model_config so the drafter
+# markers stay in sync with helper flagging and engine_pool's drafter
+# resolution.
+def _is_helper_checkpoint(model_path: Path) -> bool:
+    """True if ``model_path`` is a speculative-decoding helper checkpoint.
+
+    Must never raise on an unreadable entry: unlike the config reads inside
+    _register_model, this runs outside discover_models' per-model guard, so
+    an escaped exception would abort the whole scan. UnicodeDecodeError from
+    a non-UTF-8 config.json is a ValueError, not a JSONDecodeError.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+    return is_helper_model_config(config)
+
 
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
@@ -1039,6 +1143,13 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
         )
         return True
 
+    if _is_helper_checkpoint(model_dir):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible speculative-decoding "
+            f"helper: {source_repo_id}"
+        )
+        return True
+
     logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
     return False
 
@@ -1052,6 +1163,12 @@ def _register_model(
     source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
+    if model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {model_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
     try:
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
@@ -1075,11 +1192,15 @@ def _register_model(
         estimated_size = estimate_model_size(model_dir)
 
         # Read raw config model_type for sub-type detection (e.g., OCR models)
+        # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
+        is_helper = False
         try:
             import json
             with open(model_dir / "config.json") as f:
-                config_model_type = json.load(f).get("model_type", "")
+                _config = json.load(f)
+            config_model_type = _config.get("model_type", "")
+            is_helper = is_helper_model_config(_config)
         except Exception:
             pass
 
@@ -1099,6 +1220,7 @@ def _register_model(
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
+            is_helper=is_helper,
         )
 
         size_gb = estimated_size / (1024**3)

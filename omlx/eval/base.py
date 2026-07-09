@@ -182,7 +182,8 @@ class BaseBenchmark(ABC):
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
         kwargs = dict(sampling_kwargs or {})
-        # Force benchmark-controlled params (override model settings)
+        # max_tokens is always benchmark-controlled — a model's small configured
+        # limit must not truncate long answers and corrupt scores.
         max_tokens = self.get_max_tokens()
         # Harmony models (gpt_oss) use analysis + final channels;
         # analysis can consume the entire budget before final is emitted
@@ -193,9 +194,13 @@ class BaseBenchmark(ABC):
                 max(max_tokens, THINKING_MIN_TOKENS), THINKING_MAX_TOKENS
             )
         kwargs["max_tokens"] = max_tokens
-        kwargs["temperature"] = 0.0
-        kwargs["presence_penalty"] = 0.0
-        kwargs["repetition_penalty"] = 1.0
+        # Greedy/neutral defaults keep scores reproducible. setdefault (not
+        # force-set) lets the caller's "model_settings" sampling profile supply
+        # its own temperature/penalties; the default profile passes none, so
+        # these fall through to deterministic values.
+        kwargs.setdefault("temperature", 0.0)
+        kwargs.setdefault("presence_penalty", 0.0)
+        kwargs.setdefault("repetition_penalty", 1.0)
         # Merge enable_thinking into any existing chat_template_kwargs
         ct_kwargs = kwargs.pop("chat_template_kwargs", {}) or {}
         ct_kwargs["enable_thinking"] = enable_thinking

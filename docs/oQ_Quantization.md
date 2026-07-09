@@ -29,6 +29,8 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 | Level | Base Bits | Target bpw | Description |
 |-------|-----------|------------|-------------|
 | oQ2 | 2 | ~2.9 | Extreme compression |
+| oQ2.5 | 2 | ~3.2 | Code-preserving routed down-projection boosts |
+| oQ2.7 | 2 | ~3.3 | Higher-budget code-preserving routed boosts |
 | oQ3 | 3 | ~3.5 | Balanced |
 | oQ3.5 | 3 | ~3.8 | Quality balanced |
 | oQ4 | 4 | ~4.6 | Recommended |

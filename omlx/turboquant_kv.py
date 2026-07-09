@@ -439,6 +439,21 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
         bits = caches[0].bits
         seed = caches[0].seed
+        configs = {(c.bits, c.seed) for c in caches}
+        if len(configs) > 1:
+            # Packed state width is ceil(head_dim * bits / 32) and codecs are
+            # rebuilt from (head_dim, bits, seed), so members quantized under
+            # different configs cannot share a batch. Without this guard the
+            # mismatch surfaces as a raw mx.concatenate shape error (or, for
+            # equal widths, silent garbage decode) deep in
+            # _concat_state_batch (#2045).
+            raise ValueError(
+                "Cannot batch TurboQuant caches with mixed quantization "
+                f"configs (bits, seed): {sorted(configs)}. A request restored "
+                "from cache blocks written at another turboquant_kv_bits "
+                "depth cannot share a batch with fresh requests; clear the "
+                "paged SSD cache for this model if this persists."
+            )
         lengths = [c.offset for c in caches]
         max_length = max(lengths)
         padding = [max_length - l for l in lengths]

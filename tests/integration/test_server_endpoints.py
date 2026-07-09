@@ -1481,6 +1481,11 @@ class TestEmbeddingsEndpoint:
         mock_engine_pool._models.append(
             {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
         )
+        image_data_uri = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+            "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        )
 
         response = client.post(
             "/v1/embeddings",
@@ -1488,10 +1493,10 @@ class TestEmbeddingsEndpoint:
                 "model": "test-embed-model",
                 "items": [
                     {"text": "hello"},
-                    {"image": "https://example.com/image.jpg"},
+                    {"image": image_data_uri},
                     {
                         "text": "hello",
-                        "image": "https://example.com/image.jpg",
+                        "image": image_data_uri,
                     },
                 ],
             },

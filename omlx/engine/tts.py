@@ -11,6 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,27 @@ from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+# Kokoro voice names are ``<lang><gender>_<name>`` — af_heart, bm_george,
+# zf_xiaoxiao — where the first letter is the G2P pipeline lang_code
+# (a/b = US/GB English, e = es, f = fr, h = hi, i = it, j = ja, p = pt-br,
+# z = zh; see mlx_audio.tts.models.kokoro.pipeline.LANG_CODES).
+_KOKORO_VOICE_RE = re.compile(r"^([abefhijpz])[fm]_")
+
+
+def _infer_kokoro_lang_code(voice: Optional[str]) -> Optional[str]:
+    """Infer Kokoro's G2P lang_code from its voice naming convention.
+
+    Without a lang_code the Kokoro pipeline falls back to English G2P and
+    non-English text is mangled or dropped. Only full ``<lang><gender>_``
+    prefixes match; other backends' speaker names (e.g. Qwen3-TTS's
+    'aiden', 'eric') must not trigger inference — those models have their
+    own lang_code defaults such as 'auto'.
+    """
+    if not voice:
+        return None
+    match = _KOKORO_VOICE_RE.match(voice.lower())
+    return match.group(1) if match else None
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -207,8 +229,13 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
-            if language and "lang_code" in gen_params:
-                gen_kwargs["lang_code"] = language
+            if "lang_code" in gen_params:
+                if language:
+                    gen_kwargs["lang_code"] = language
+                elif "voice" in gen_params:
+                    inferred = _infer_kokoro_lang_code(voice)
+                    if inferred:
+                        gen_kwargs["lang_code"] = inferred
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -327,8 +354,13 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
-            if language and "lang_code" in gen_params:
-                gen_kwargs["lang_code"] = language
+            if "lang_code" in gen_params:
+                if language:
+                    gen_kwargs["lang_code"] = language
+                elif "voice" in gen_params:
+                    inferred = _infer_kokoro_lang_code(voice)
+                    if inferred:
+                        gen_kwargs["lang_code"] = inferred
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:

@@ -2071,7 +2071,7 @@ def parse_json_output(
 
     # json_schema - validate against schema
     if format_type == "json_schema":
-        json_schema_spec = rf_dict.get("json_schema", {})
+        json_schema_spec = rf_dict.get("json_schema") or {}
         schema = json_schema_spec.get("schema", {})
 
         if schema:
@@ -2128,7 +2128,7 @@ def build_json_system_prompt(
         )
 
     if format_type == "json_schema":
-        json_schema_spec = rf_dict.get("json_schema", {})
+        json_schema_spec = rf_dict.get("json_schema") or {}
         schema = json_schema_spec.get("schema", {})
         name = json_schema_spec.get("name", "response")
         description = json_schema_spec.get("description", "")

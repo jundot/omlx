@@ -66,6 +66,11 @@
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
+    // Default sort for the settings and manager model tables. Also the target
+    // state for the "reset sort" action.
+    const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
+    const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
+
     function dashboard() {
         return {
             // Theme
@@ -87,7 +92,7 @@
             globalSettings: {
                 base_path: '',
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true },
-                model: { model_dirs: [''] },
+                model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
@@ -131,8 +136,14 @@
             models: [],
             loadingModels: false,
             reloading: false,
-            sortBy: 'id',
-            sortOrder: 'asc',
+            // Sort state persists across refreshes/restarts via localStorage.
+            sortBy: localStorage.getItem('omlx_models_sort_by') || MODELS_SORT_DEFAULT.by,
+            sortOrder: localStorage.getItem('omlx_models_sort_order') || MODELS_SORT_DEFAULT.order,
+            modelSearch: '',
+            // Manager tab (Browse Models > Local) sort + search state.
+            managerSortBy: localStorage.getItem('omlx_manager_sort_by') || MANAGER_SORT_DEFAULT.by,
+            managerSortOrder: localStorage.getItem('omlx_manager_sort_order') || MANAGER_SORT_DEFAULT.order,
+            managerSearch: '',
 
             // Auth UI state
             showApiKey: false,
@@ -514,6 +525,7 @@
             ],
             accBatchSize: 1,
             accEnableThinking: false,
+            accSamplingProfile: 'deterministic',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -848,6 +860,7 @@
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
+                            hide_helper_models: this.globalSettings.model.hide_helper_models,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             memory_guard_tier: this.globalSettings.memory.memory_guard_tier,
                             memory_guard_custom_ceiling_gb: this.globalSettings.memory.memory_guard_custom_ceiling_gb,
@@ -1019,6 +1032,9 @@
                         } else if (field === 'is_pinned') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.pinned = value;
+                        } else if (field === 'is_hidden') {
+                            const model = this.models.find(m => m.id === modelId);
+                            if (model) model.is_hidden = value;
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -3237,6 +3253,7 @@
                             ),
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accEnableThinking,
+                            sampling_profile: this.accSamplingProfile,
                         }),
                     });
                     if (!resp.ok) {
@@ -3948,9 +3965,9 @@
                 return `${gb}GB`;
             },
 
-            // Sort models
+            // Filter + sort models
             get sortedModels() {
-                return [...this.models].sort((a, b) => {
+                return [...this.filterModelsByName(this.models, this.modelSearch)].sort((a, b) => {
                     let aVal, bVal;
 
                     switch (this.sortBy) {
@@ -3978,6 +3995,10 @@
                             aVal = a.is_default ? 1 : 0;
                             bVal = b.is_default ? 1 : 0;
                             break;
+                        case 'is_hidden':
+                            aVal = a.is_hidden ? 1 : 0;
+                            bVal = b.is_hidden ? 1 : 0;
+                            break;
                         default:
                             return 0;
                     }
@@ -3995,6 +4016,108 @@
                     this.sortBy = column;
                     this.sortOrder = 'asc';
                 }
+                this.persistSort('omlx_models_sort_by', this.sortBy, 'omlx_models_sort_order', this.sortOrder);
+            },
+
+            resetSort() {
+                this.sortBy = MODELS_SORT_DEFAULT.by;
+                this.sortOrder = MODELS_SORT_DEFAULT.order;
+                try {
+                    localStorage.removeItem('omlx_models_sort_by');
+                    localStorage.removeItem('omlx_models_sort_order');
+                } catch (e) { /* storage disabled */ }
+            },
+
+            get isModelsSortDefault() {
+                return this.sortBy === MODELS_SORT_DEFAULT.by
+                    && this.sortOrder === MODELS_SORT_DEFAULT.order;
+            },
+
+            // ---- Manager (Browse Models > Local) filter + sort ----
+
+            // Cross-reference the richer /api/models entry (has model_type,
+            // settings) for a manager row keyed by its model name.
+            managerModelInfo(name) {
+                return this.models.find(m => m.id === name);
+            },
+
+            filterModelsByName(list, query) {
+                const q = (query || '').trim().toLowerCase();
+                if (!q) return list;
+                return list.filter(m => {
+                    const id = (m.id || m.name || '').toLowerCase();
+                    const display = (m.display_name || '').toLowerCase();
+                    const alias = (
+                        (m.settings && m.settings.model_alias)
+                        || (this.managerModelInfo(m.name) && this.managerModelInfo(m.name).settings
+                            && this.managerModelInfo(m.name).settings.model_alias)
+                        || ''
+                    ).toLowerCase();
+                    return id.includes(q) || display.includes(q) || alias.includes(q);
+                });
+            },
+
+            get sortedManagerModels() {
+                const list = this.filterModelsByName(this.hfModels, this.managerSearch);
+                return [...list].sort((a, b) => {
+                    let aVal, bVal;
+                    switch (this.managerSortBy) {
+                        case 'name':
+                            aVal = (a.display_name || a.name || '').toLowerCase();
+                            bVal = (b.display_name || b.name || '').toLowerCase();
+                            break;
+                        case 'type':
+                            aVal = (this.managerModelInfo(a.name)?.model_type || 'llm').toLowerCase();
+                            bVal = (this.managerModelInfo(b.name)?.model_type || 'llm').toLowerCase();
+                            break;
+                        case 'size':
+                            aVal = a.size || 0;
+                            bVal = b.size || 0;
+                            break;
+                        default:
+                            return 0;
+                    }
+                    if (aVal < bVal) return this.managerSortOrder === 'asc' ? -1 : 1;
+                    if (aVal > bVal) return this.managerSortOrder === 'asc' ? 1 : -1;
+                    return 0;
+                });
+            },
+
+            toggleManagerSort(column) {
+                if (this.managerSortBy === column) {
+                    this.managerSortOrder = this.managerSortOrder === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.managerSortBy = column;
+                    this.managerSortOrder = 'asc';
+                }
+                this.persistSort('omlx_manager_sort_by', this.managerSortBy, 'omlx_manager_sort_order', this.managerSortOrder);
+            },
+
+            resetManagerSort() {
+                this.managerSortBy = MANAGER_SORT_DEFAULT.by;
+                this.managerSortOrder = MANAGER_SORT_DEFAULT.order;
+                try {
+                    localStorage.removeItem('omlx_manager_sort_by');
+                    localStorage.removeItem('omlx_manager_sort_order');
+                } catch (e) { /* storage disabled */ }
+            },
+
+            get isManagerSortDefault() {
+                return this.managerSortBy === MANAGER_SORT_DEFAULT.by
+                    && this.managerSortOrder === MANAGER_SORT_DEFAULT.order;
+            },
+
+            persistSort(byKey, byVal, orderKey, orderVal) {
+                try {
+                    localStorage.setItem(byKey, byVal);
+                    localStorage.setItem(orderKey, orderVal);
+                } catch (e) { /* storage disabled */ }
+            },
+
+            // Deeplink from a manager row to that model's settings card (modal).
+            openModelSettingsFromManager(name) {
+                const model = this.managerModelInfo(name);
+                if (model) this.openModelSettings(model);
             },
 
             // Theme select

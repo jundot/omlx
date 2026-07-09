@@ -1136,6 +1136,91 @@ class TestStreamingHelperFunctions:
         assert "tool_use" in stop_reasons
 
     @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_starts_parser_when_prompt_opens_thinking(self):
+        """Prompt-opened thinking must stream as thinking, not public text."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        class PromptOpenedThinkingTokenizer(MockTokenizer):
+            think_start = "<think>"
+            think_end = "</think>"
+            think_start_id = 9001
+            think_end_id = 9002
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+                if text.rstrip().endswith(self.think_start):
+                    return [101, self.think_start_id]
+                return [101]
+
+            def apply_chat_template(
+                self, messages: List[Dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                return "system: hidden\nuser: hi\nassistant:<think>"
+
+        engine = MockBaseEngine()
+        engine._tokenizer = PromptOpenedThinkingTokenizer()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="The user asked a simple informational question.</think>",
+                new_text="The user asked a simple informational question.</think>",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text=(
+                    "The user asked a simple informational question.</think>"
+                    "Visible answer."
+                ),
+                new_text="Visible answer.",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=256,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            max_tokens=256,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+
+        thinking_deltas = []
+        text_deltas = []
+        for event in parsed_events:
+            if event.get("type") != "content_block_delta":
+                continue
+            delta = event.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                thinking_deltas.append(delta["thinking"])
+            elif delta.get("type") == "text_delta":
+                text_deltas.append(delta["text"])
+
+        streamed_thinking = "".join(thinking_deltas)
+        streamed_text = "".join(text_deltas)
+        assert "The user asked a simple informational question." in streamed_thinking
+        assert "The user asked a simple informational question." not in streamed_text
+        assert streamed_text == "Visible answer."
+
+    @pytest.mark.asyncio
     async def test_anthropic_tool_only_stream_starts_with_tool_use_block(self):
         """A tool-only response should not emit an empty text block before tool_use."""
         from omlx.server import stream_anthropic_messages

@@ -61,7 +61,7 @@
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
-                                    <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', hfModels.length)"></span>
+                                    <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', sortedManagerModels.length)"></span>
                                 </div>
                                 <button @click="loadHFModels()"
                                         class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
@@ -70,57 +70,117 @@
                                     {{ t('models.manager.refresh') }}
                                 </button>
                             </div>
-                            <div class="divide-y divide-neutral-100">
-                                <template x-if="hfModels.length === 0">
-                                    <div class="px-6 py-12 text-center">
-                                        <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
-                                        <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
+
+                            <!-- Search + reset sort toolbar -->
+                            <div x-show="hfModels.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 px-4 sm:px-6 py-3 border-b border-neutral-100">
+                                <div class="relative flex-1">
+                                    <i data-lucide="search" class="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                                    <input type="text" x-model="managerSearch"
+                                           :placeholder="window.t('models.manager.search_placeholder')"
+                                           class="w-full pl-9 pr-9 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                    <button x-show="managerSearch" @click="managerSearch = ''"
+                                            class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                        <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                </div>
+                                <button @click="resetManagerSort()" :disabled="isManagerSortDefault"
+                                        class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                                    <i data-lucide="arrow-up-down" class="w-3.5 h-3.5"></i>
+                                    <span x-text="window.t('models.manager.reset_sort')"></span>
+                                </button>
+                            </div>
+
+                            <!-- Empty (no models on disk) -->
+                            <template x-if="hfModels.length === 0">
+                                <div class="px-6 py-12 text-center">
+                                    <i data-lucide="inbox" class="w-8 h-8 text-neutral-300 mx-auto mb-3"></i>
+                                    <p class="text-sm text-neutral-500">{{ t('models.manager.no_models') }}</p>
+                                </div>
+                            </template>
+
+                            <!-- Table -->
+                            <div x-show="hfModels.length > 0" class="overflow-x-auto">
+                                <!-- Table Header -->
+                                <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
+                                    <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('name')">
+                                        {{ t('models.manager.table.model') }}
+                                        <span x-show="managerSortBy === 'name'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                                     </div>
-                                </template>
-                                <template x-for="model in hfModels" :key="model.name">
-                                    <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
-                                        <div class="min-w-0 flex-1 flex items-center gap-2">
-                                            <span class="text-sm font-medium text-neutral-900 truncate"
-                                                  :title="model.display_name || model.name"
-                                                  x-text="model.display_name || model.name"></span>
-                                            <template x-if="models.find(m => m.id === model.name)?.settings?.model_alias">
-                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
-                                                      x-text="models.find(m => m.id === model.name)?.settings?.model_alias"></span>
-                                            </template>
-                                            <span class="text-xs text-neutral-400 flex-shrink-0" x-text="'(' + model.size_formatted + ')'"></span>
-                                            <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(models.find(m => m.id === model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="p-1 rounded-md transition-all flex-shrink-0"
-                                                    :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('models.manager.copy_model_name_tooltip')">
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                            </button>
-                                        </div>
-                                        <div class="flex items-center gap-2 ml-4 shrink-0">
-                                            <template x-if="hfDeleteConfirm !== model.name">
-                                                <button @click="hfDeleteConfirm = model.name"
-                                                        class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                                        :title="window.t('models.manager.delete_tooltip')">
-                                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                    <div class="hidden sm:flex w-24 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('type')">
+                                        {{ t('models.manager.table.type') }}
+                                        <span x-show="managerSortBy === 'type'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                    </div>
+                                    <div class="w-24 text-right sm:text-center flex items-center justify-end sm:justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleManagerSort('size')">
+                                        {{ t('models.manager.table.size') }}
+                                        <span x-show="managerSortBy === 'size'" x-text="managerSortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                    </div>
+                                    <div class="w-20 text-center"></div>
+                                </div>
+
+                                <!-- Table Body -->
+                                <div class="divide-y divide-neutral-100">
+                                    <div x-show="sortedManagerModels.length === 0" class="px-6 py-10 text-center text-sm text-neutral-500"
+                                         x-text="window.t('models.manager.no_match')"></div>
+                                    <template x-for="model in sortedManagerModels" :key="model.name">
+                                        <div class="flex items-center gap-4 px-4 sm:px-6 py-3 hover:bg-neutral-50 transition-colors">
+                                            <!-- Name -->
+                                            <div class="min-w-0 flex-1 flex items-center gap-2">
+                                                <span class="text-sm font-medium text-neutral-900 truncate"
+                                                      :title="model.display_name || model.name"
+                                                      x-text="model.display_name || model.name"></span>
+                                                <template x-if="managerModelInfo(model.name)?.settings?.model_alias">
+                                                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                          x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
+                                                </template>
+                                                <button x-data="{ copied: false }"
+                                                        @click.stop="copyToClipboard(managerModelInfo(model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
+                                                        class="p-1 rounded-md transition-all flex-shrink-0"
+                                                        :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                        :title="window.t('models.manager.copy_model_name_tooltip')">
+                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                    <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                                 </button>
-                                            </template>
-                                            <template x-if="hfDeleteConfirm === model.name">
-                                                <div class="flex items-center gap-2">
-                                                    <span class="text-xs text-red-600">{{ t('models.manager.delete_confirm') }}</span>
-                                                    <button @click="deleteHFModel(model.name)"
-                                                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
-                                                        {{ t('models.manager.delete_yes') }}
+                                            </div>
+                                            <!-- Type -->
+                                            <div class="hidden sm:flex w-24 justify-center">
+                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 uppercase tracking-wide"
+                                                      x-text="managerModelInfo(model.name)?.model_type || 'llm'"></span>
+                                            </div>
+                                            <!-- Size -->
+                                            <div class="w-24 text-right sm:text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
+                                            <!-- Actions -->
+                                            <div class="flex items-center justify-end gap-1 shrink-0">
+                                                <template x-if="managerModelInfo(model.name)">
+                                                    <button @click="openModelSettingsFromManager(model.name)"
+                                                            class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
+                                                            :title="window.t('models.manager.settings_tooltip')">
+                                                        <i data-lucide="settings-2" class="w-4 h-4"></i>
                                                     </button>
-                                                    <button @click="hfDeleteConfirm = null"
-                                                            class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
-                                                        {{ t('models.manager.delete_no') }}
+                                                </template>
+                                                <template x-if="hfDeleteConfirm !== model.name">
+                                                    <button @click="hfDeleteConfirm = model.name"
+                                                            class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                                            :title="window.t('models.manager.delete_tooltip')">
+                                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
                                                     </button>
-                                                </div>
-                                            </template>
+                                                </template>
+                                                <template x-if="hfDeleteConfirm === model.name">
+                                                    <div class="flex items-center gap-1.5">
+                                                        <span class="text-xs text-red-600 hidden sm:inline">{{ t('models.manager.delete_confirm') }}</span>
+                                                        <button @click="deleteHFModel(model.name)"
+                                                                class="px-2 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                                            {{ t('models.manager.delete_yes') }}
+                                                        </button>
+                                                        <button @click="hfDeleteConfirm = null"
+                                                                class="px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                                                            {{ t('models.manager.delete_no') }}
+                                                        </button>
+                                                    </div>
+                                                </template>
+                                            </div>
                                         </div>
-                                    </div>
-                                </template>
+                                    </template>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1258,7 +1318,7 @@
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="2" x-text="oqLevelLabel(2)"></option>
                                             <option value="2.5" x-text="oqLevelLabel(2.5)"></option>
-                                            <option value="2.8" x-text="oqLevelLabel(2.8)"></option>
+                                            <option value="2.7" x-text="oqLevelLabel(2.7)"></option>
                                             <option value="3" x-text="oqLevelLabel(3)"></option>
                                             <option value="3.5" x-text="oqLevelLabel(3.5)"></option>
                                             <option value="4" selected x-text="oqLevelLabel(4)"></option>

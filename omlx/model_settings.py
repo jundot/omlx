@@ -89,7 +89,7 @@ class ModelSettings:
             for multi-row decode batches whose cache positions are aligned. Unaligned
             continuous batches fall back to standard decoding automatically. Compatible
             model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
-            dflash_enabled and turboquant_kv_enabled.
+            dflash_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
@@ -189,8 +189,14 @@ class ModelSettings:
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash and turboquant.
+    # with dflash.
     mtp_enabled: bool = False
+    # Maximum chained MTP draft tokens per verify cycle (speculative depth).
+    # None = default (3). Effective for Qwen3.5/3.6 native MTP only;
+    # DeepSeek-V4 native MTP always runs depth 1. An adaptive controller
+    # picks 1..max per sequence from rolling acceptance/latency estimates;
+    # set to 1 for a fixed depth-1 cycle.
+    mtp_num_draft_tokens: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -208,6 +214,7 @@ class ModelSettings:
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
@@ -220,19 +227,15 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
-        # Native MTP is mutually exclusive with DFlash (also speculative) and
-        # TurboQuant KV (patches the same attention path). Reject combos at
-        # construction time so the conflict surfaces in the admin UI / API
-        # rather than at model load.
+        # Native MTP is mutually exclusive with DFlash (also speculative).
+        # Reject the combo at construction time so the conflict surfaces in
+        # the admin UI / API rather than at model load. TurboQuant KV is
+        # compatible: its attention patch routes MTP's decode-shaped
+        # multi-row verify through the quantized decode kernels.
         if self.mtp_enabled and self.dflash_enabled:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
-            )
-        if self.mtp_enabled and self.turboquant_kv_enabled:
-            raise ValueError(
-                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
-                "TurboQuant patches the attention path that MTP relies on"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
