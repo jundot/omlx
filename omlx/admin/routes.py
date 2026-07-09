@@ -4917,6 +4917,37 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     }
 
 
+def _normalize_probe_tool_calls(messages: list[dict]) -> list[dict]:
+    """Parse echoed tool_call arguments (JSON string -> object) for templating.
+
+    Native tool-calling chat templates (GLM, Qwen3.x, MiniMax) iterate
+    ``tool_call.function.arguments.items()``, but the OpenAI wire form sends
+    ``arguments`` as a JSON string. Rendering the string form raises
+    ``'str object' has no attribute 'items'`` and the probe 400s, so any
+    conversation that used tools reports an error (hollow cache dot) instead
+    of a real hit/miss. The chat path parses these before rendering; mirror
+    that here so (a) tool conversations tokenize and (b) the probe's block
+    hashes line up with what a real prefill produced. Returns shallow copies
+    so the caller's message dicts are left untouched.
+    """
+    from ..api.utils import _try_parse_json
+
+    normalized: list[dict] = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not tool_calls:
+            normalized.append(msg)
+            continue
+        new_calls = []
+        for tc in tool_calls:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict) and "arguments" in fn:
+                tc = {**tc, "function": {**fn, "arguments": _try_parse_json(fn["arguments"])}}
+            new_calls.append(tc)
+        normalized.append({**msg, "tool_calls": new_calls})
+    return normalized
+
+
 @router.post("/api/cache/probe")
 async def probe_cache(
     request: CacheProbeRequest,
@@ -4984,7 +5015,7 @@ async def probe_cache(
     # Render + tokenize the prompt using the same path as generation so the
     # hashes line up with what the scheduler would produce at prefill.
     try:
-        messages = request.messages
+        messages = _normalize_probe_tool_calls(request.messages)
         if hasattr(engine, "_preprocess_messages"):
             messages = engine._preprocess_messages(messages)
         try:
