@@ -3,13 +3,13 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.31.2 was built with
-    # (MLX pins nanobind v2.12.0 / ABI v19 via FetchContent in its CMakeLists.txt).
-    # A newer nanobind (e.g. 2.13.0 / ABI v20) isolates the `mlx` NB_DOMAIN, so
-    # custom kernel extensions (omlx.custom_kernels.*) reject every mlx.core.array
-    # at the type caster with `incompatible function arguments`.
-    "nanobind==2.12.0",
-    "mlx==0.31.2",
+    # Pin nanobind to match the ABI version MLX 0.32.0 was built with
+    # (MLX pins nanobind v2.13.0 via FetchContent in its CMakeLists.txt).
+    # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
+    # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
+    # type caster with `incompatible function arguments`.
+    "nanobind==2.13.0",
+    "mlx==0.32.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -39,9 +39,11 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.31.2; optional custom kernels live under
-    # omlx.custom_kernels.* when built for release.
-    "mlx==0.31.2",
+    # Vanilla MLX v0.32.0; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release. The bundled kernel
+    # binaries are ABI-coupled to this exact mlx version — bumping the pin
+    # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
+    "mlx==0.32.0",
     # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
@@ -221,7 +223,7 @@ include = ["omlx*"]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
-    "mlx==0.31.2",
+    "mlx==0.32.0",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
 ]
 
