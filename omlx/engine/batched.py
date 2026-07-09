@@ -322,6 +322,60 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("sdpa256 attention patch not applied", exc_info=True)
 
+        # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
+        # Strictly shape-gated; decode, quantized-cache paths, and unsupported
+        # models fall through to the previous SDPA implementation.
+        if (
+            getattr(self._model_settings, "fa256_steel_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_fa256_attention import (
+                    apply_qwen35_fa256_attention_patch,
+                )
+
+                apply_qwen35_fa256_attention_patch()
+            except Exception:
+                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 q4 prefill linears -> native qmm tile tuned for long
+        # batches. Strictly gated in the patch; decode and unsupported linears
+        # fall through.
+        if (
+            getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_q4_mlp import (
+                    apply_qwen35_q4_lm_prefill_linear_patch,
+                    apply_qwen35_q4_mlp_patch,
+                    apply_qwen35_q4_prefill_linear_patch,
+                )
+
+                apply_qwen35_q4_mlp_patch()
+                apply_qwen35_q4_prefill_linear_patch()
+                apply_qwen35_q4_lm_prefill_linear_patch()
+            except Exception:
+                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
+        # SwitchGLU. Strictly gated; decode and unsupported MoE variants fall
+        # through to stock mlx-lm.
+        if (
+            getattr(self._model_settings, "qwen35_moe_weighted_sum_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_weighted_sum import (
+                    apply_qwen35_moe_weighted_sum_patch,
+                )
+
+                apply_qwen35_moe_weighted_sum_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                )
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)

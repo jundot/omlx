@@ -9,13 +9,53 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+
+def _detach_import_error(exc: Exception) -> Exception:
+    """Keep the diagnostic message without retaining import caller frames."""
+    exc.__traceback__ = None
+    exc.__cause__ = None
+    exc.__context__ = None
+    return exc
+
+
 try:
     from . import _ext
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
-    _IMPORT_ERROR = exc
+    _IMPORT_ERROR = _detach_import_error(exc)
 else:
     _IMPORT_ERROR = None
+
+
+def _verify_abi(ext, import_error):
+    """Disable the native symbols when the extension rejects mlx arrays.
+
+    An extension built with a nanobind whose ABI tag differs from the mlx
+    wheel's imports cleanly and lists every symbol, but its type casters
+    live in an isolated NB_DOMAIN, so every call raises ``TypeError:
+    incompatible function arguments`` (issue #2139). Probe once at import
+    and degrade with a single warning instead of failing per call; builds
+    predating the ``abi_probe`` binding are assumed compatible.
+    """
+    if ext is None:
+        return ext, import_error
+    probe = getattr(ext, "abi_probe", None)
+    if probe is None:
+        return ext, import_error
+    try:
+        probe(mx.zeros((1,)))
+    except TypeError as exc:
+        logger.warning(
+            "%s: native kernels disabled — the extension was built with a "
+            "nanobind ABI that does not match this mlx wheel; rebuild it "
+            "against the installed mlx (see pyproject build-system pins).",
+            __name__,
+        )
+        return None, _detach_import_error(exc)
+    return ext, import_error
+
+
+_ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
 NATIVE_SYMBOLS = (
@@ -23,8 +63,15 @@ NATIVE_SYMBOLS = (
     "dsa_topk_indices",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
+    "deepseek_v4_sparse_attention",
     "glm_dsa_q8_vup_flat",
     "glm_moe_weighted_sum",
+    "deepseek_mxfp4_gather_qmm_blocks",
+    "deepseek_mxfp4_gather_qmm_pair_blocks",
+    "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
+    "deepseek_mxfp4_gather_qmm_expert",
+    "deepseek_affine_gather_qmm_blocks",
+    "deepseek_affine_gather_qmm_pair_concat_blocks",
 )
 
 
@@ -196,6 +243,35 @@ def glm_dsa_exact_block_attention(
     )
 
 
+def deepseek_v4_sparse_attention(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk_indices: mx.array,
+    sinks: mx.array,
+    scale: float,
+    q_offset: int,
+    compress_ratio: int,
+    local_window: int,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_v4_sparse_attention"):
+        return _ext.deepseek_v4_sparse_attention(
+            q,
+            local_kv,
+            pooled,
+            topk_indices,
+            sinks,
+            scale,
+            q_offset,
+            compress_ratio,
+            local_window,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_v4_sparse_attention native kernel is unavailable")
+
+
 def glm_dsa_q8_vup_flat(
     x: mx.array,
     weight: mx.array,
@@ -240,6 +316,178 @@ def glm_moe_weighted_sum(
         inv_order,
         scores,
         stream=stream or mx.gpu,
+    )
+
+
+def deepseek_mxfp4_gather_qmm_blocks(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_mxfp4_gather_qmm_blocks"):
+        return _ext.deepseek_mxfp4_gather_qmm_blocks(
+            x,
+            weight,
+            scales,
+            block_meta,
+            block_count,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_mxfp4_gather_qmm_blocks native kernel is unavailable")
+
+
+def deepseek_mxfp4_gather_qmm_pair_blocks(
+    x: mx.array,
+    weight0: mx.array,
+    scales0: mx.array,
+    weight1: mx.array,
+    scales1: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_mxfp4_gather_qmm_pair_blocks"):
+        return _ext.deepseek_mxfp4_gather_qmm_pair_blocks(
+            x,
+            weight0,
+            scales0,
+            weight1,
+            scales1,
+            block_meta,
+            block_count,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_pair_blocks native kernel is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_pair_concat_blocks(
+    x: mx.array,
+    weight0: mx.array,
+    scales0: mx.array,
+    weight1: mx.array,
+    scales1: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(
+        _ext, "deepseek_mxfp4_gather_qmm_pair_concat_blocks"
+    ):
+        return _ext.deepseek_mxfp4_gather_qmm_pair_concat_blocks(
+            x,
+            weight0,
+            scales0,
+            weight1,
+            scales1,
+            block_meta,
+            block_count,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_pair_concat_blocks native kernel is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_expert(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    indices: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_mxfp4_gather_qmm_expert"):
+        return _ext.deepseek_mxfp4_gather_qmm_expert(
+            x,
+            weight,
+            scales,
+            indices,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_mxfp4_gather_qmm_expert native kernel is unavailable")
+
+
+def deepseek_affine_gather_qmm_blocks(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    group_size: int,
+    bits: int,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_affine_gather_qmm_blocks"):
+        return _ext.deepseek_affine_gather_qmm_blocks(
+            x,
+            weight,
+            scales,
+            biases,
+            block_meta,
+            block_count,
+            group_size,
+            bits,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_affine_gather_qmm_blocks native kernel is unavailable")
+
+
+def deepseek_affine_gather_qmm_pair_concat_blocks(
+    x: mx.array,
+    weight0: mx.array,
+    scales0: mx.array,
+    biases0: mx.array,
+    weight1: mx.array,
+    scales1: mx.array,
+    biases1: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    group_size: int,
+    bits: int,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(
+        _ext, "deepseek_affine_gather_qmm_pair_concat_blocks"
+    ):
+        return _ext.deepseek_affine_gather_qmm_pair_concat_blocks(
+            x,
+            weight0,
+            scales0,
+            biases0,
+            weight1,
+            scales1,
+            biases1,
+            block_meta,
+            block_count,
+            group_size,
+            bits,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_affine_gather_qmm_pair_concat_blocks native kernel is unavailable"
     )
 
 

@@ -207,8 +207,8 @@ class MLXRerankerModel:
         """Normalize a rerank input into the mlx-embeddings VL item format.
 
         Accepts either a bare string (text) or a dict with 'text' and/or
-        'image' keys. Image values are strings (URL / base64 data URI / local
-        path) and get loaded via omlx's shared image loader.
+        'image' keys. Request-facing image strings must be base64 data URIs and
+        get loaded via omlx's shared image loader.
         """
         if isinstance(item, str):
             return {"text": item}
@@ -222,7 +222,7 @@ class MLXRerankerModel:
         image_ref = item.get("image")
         if image_ref:
             if isinstance(image_ref, str):
-                result["image"] = load_image(image_ref)
+                result["image"] = load_image(image_ref, field="image")
             else:
                 # Already a PIL image or similar — pass through
                 result["image"] = image_ref

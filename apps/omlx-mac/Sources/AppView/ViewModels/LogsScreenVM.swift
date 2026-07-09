@@ -20,7 +20,7 @@ final class LogsScreenVM {
     var subtitle: String {
         guard !logText.isEmpty else { return "" }
         return String(localized: "logs.subtitle.line_count",
-                      defaultValue: "\(totalLines) lines",
+                      defaultValue: "Lines: \(totalLines)",
                       comment: "Section header subtitle on the Logs screen; placeholder is the total number of log lines")
     }
 

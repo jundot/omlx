@@ -31,6 +31,13 @@ HEAD_DIM = 256
 # fallback's O(L^2) score matrix becomes a memory problem. Below this, the
 # fused-GEMM fallback is faster and fits comfortably. Tunable.
 _SDPA256_MIN_KV_LEN = 8192
+# Decode-shaped multi-row calls (MTP verify: q_len = 1 + draft depth <= 9)
+# must not take this route: the per-KV-tile eval sync only amortizes over
+# prefill-sized q tiles, and at tiny q_len it costs O(kv_len/tile) sequential
+# dispatches per call — 8-22x slower than stock SDPA, collapsing long-context
+# MTP throughput (issue #2127). Below this floor the stock path's score
+# matrix is at most n_q * 15 * kv_len, which is never a memory problem.
+_SDPA256_MIN_Q_LEN = 16
 # Tile sizes for the online-softmax kernel (tuned on M2 Max).
 _Q_TILE = 512
 _KV_TILE = 1024
@@ -112,7 +119,16 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # Never raise: any unexpected input must fall through to the original SDPA,
     # never break a request. Worst case we decline to engage.
+    # Shape gates first: this wrapper is installed unconditionally and runs
+    # on every SDPA call of every decode step, so the common (decode / MTP
+    # verify) case must exit on the q_len check alone (issue #2132).
     try:
+        if queries.shape[-2] < _SDPA256_MIN_Q_LEN:  # decode / MTP verify
+            return False
+        if queries.shape[-1] != HEAD_DIM:
+            return False
+        if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
+            return False
         if sinks is not None:
             return False
         # Quantized KV cache (TurboQuant etc.): keys/values are packed state,
@@ -120,13 +136,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
             return False
-        if queries.shape[-1] != HEAD_DIM:
-            return False
-        if queries.shape[-2] <= 1:  # decode -> fused vector kernel handles 256
-            return False
         if not (mask is None or (isinstance(mask, str) and mask == "causal")):
-            return False
-        if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
             return False
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]

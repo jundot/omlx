@@ -318,27 +318,21 @@ def _patch_gated_delta_net(q35: Any) -> None:
             qkv = mx.where(mask[..., None], qkv, 0)
 
         if n_confirmed > 0 and n_confirmed < S:
-            mask_c = mask[:, :n_confirmed] if mask is not None else None
-            mask_d = mask[:, n_confirmed:] if mask is not None else None
-            out_c, conv_c, ssm_c = self._process_chunk(
-                qkv[:, :n_confirmed],
-                a[:, :n_confirmed],
-                b[:, :n_confirmed],
-                conv_state,
-                ssm_state,
-                mask_c,
+            # MTP verify forward. Unlike PR 990 (which processes the
+            # confirmed prefix and draft suffix as two chunks, snapshotting
+            # in between), run the whole window as ONE chunk — measured
+            # ~2.6ms/cycle cheaper across 48 linear layers on Qwen3.6-27B —
+            # and keep zero-copy *pre-forward* state refs plus the projected
+            # inputs. On a rejection, ``mtp_partial_rollback`` replays the
+            # kept prefix (confirmed + accepted drafts) through
+            # ``_process_chunk`` from those refs; on full accept the refs
+            # are dropped and the verify costs nothing extra.
+            out, conv_f, ssm_f = self._process_chunk(
+                qkv, a, b, conv_state, ssm_state, mask
             )
             if cache is not None:
-                cache.rollback_state = (conv_c, ssm_c)
-            out_d, conv_f, ssm_f = self._process_chunk(
-                qkv[:, n_confirmed:],
-                a[:, n_confirmed:],
-                b[:, n_confirmed:],
-                conv_c,
-                ssm_c,
-                mask_d,
-            )
-            out = mx.concatenate([out_c, out_d], axis=1)
+                cache.rollback_state = (conv_state, ssm_state)
+                cache._mtp_draft_stash = (qkv, a, b)
         else:
             lengths = cache.lengths if cache is not None else None
             out, conv_f, ssm_f = self._process_chunk(
@@ -474,6 +468,12 @@ def _patch_text_model(q35: Any) -> None:
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
         if mtp_decode_enabled:
             self.mtp = q35.MTPModule(args)
+            # Depth-k chained drafting is available on this model: the qwen
+            # patch supports return_hidden mtp_forward + partial rollback.
+            from . import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
 
     def __call__(
         self,
@@ -498,21 +498,93 @@ def _patch_text_model(q35: Any) -> None:
             return out, hidden
         return out
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """MTP-head forward.
+
+        ``return_hidden`` returns the head's post-norm hidden alongside the
+        logits so depth-k drafting can chain the head on its own output.
+        ``logits_keep`` limits the lm_head projection to the last N positions
+        (0 = all): the depth-k history+draft fold only needs logits at the
+        final position, and the vocab is large enough (~250k) that skipping
+        the other rows matters.
+        """
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
         )
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, mtp_out
+        return logits
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
             return [KVCache() for _ in self.mtp.layers]
         return []
+
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """Roll the backbone cache back to ``accepted`` drafts after a depth-k
+        verify forward over ``[confirmed, d1..dk]``.
+
+        Full-attention KV layers trim ``num_drafts - accepted`` positions.
+        GatedDeltaNet layers restore the zero-copy pre-forward state refs
+        (``rollback_state``) and replay the kept prefix — the confirmed
+        token plus the accepted drafts — through ``_process_chunk`` from the
+        stashed projected inputs. One small gated-delta kernel per linear
+        layer, paid only on rejections; the verify forward itself runs
+        unsplit. Returns False if any layer lacks the state needed (caller
+        falls back to the standard step).
+        """
+        layers = self.model.layers
+        if len(cache) != len(layers):
+            return False
+        trim_n = num_drafts - accepted
+        if trim_n <= 0:
+            return True
+        keep = 1 + accepted  # confirmed token + accepted drafts
+        for layer, c in zip(layers, cache):
+            if getattr(layer, "is_linear", False):
+                if getattr(c, "rollback_state", None) is None:
+                    return False
+                if getattr(c, "_mtp_draft_stash", None) is None:
+                    return False
+            else:
+                if not (hasattr(c, "is_trimmable") and c.is_trimmable()):
+                    return False
+        for layer, c in zip(layers, cache):
+            if getattr(layer, "is_linear", False):
+                conv_0, ssm_0 = c.rollback_state
+                qkv_s, a_s, b_s = c._mtp_draft_stash
+                _, conv_m, ssm_m = layer.linear_attn._process_chunk(
+                    qkv_s[:, :keep],
+                    a_s[:, :keep],
+                    b_s[:, :keep],
+                    conv_0,
+                    ssm_0,
+                    None,
+                )
+                c[0] = conv_m
+                c[1] = ssm_m
+                c.rollback_state = None
+                c._mtp_draft_stash = None
+            else:
+                c.trim(trim_n)
+        return True
 
     def sanitize(self, weights):
         # Full PR 990 replacement of TextModel.sanitize. We can't call the
@@ -602,10 +674,21 @@ def _patch_text_model(q35: Any) -> None:
                 # when the outer Model wraps language_model, so test the
                 # ``mtp.`` substring rather than anchoring with startswith.
                 if "mtp." in k:
-                    # Per-key decision: a head norm may still be raw-HF even
-                    # when a sibling head norm (e.g. mtp.norm) is already in
-                    # the +1 convention. Shift only the raw-HF ones.
-                    if _is_oq_tracked_tensor(v):
+                    if should_shift_norm_weights:
+                        # Raw-HF source: every Qwen3-Next RMSNorm gamma is
+                        # zero-centered, so head norms shift uniformly like
+                        # the backbone's. The mean heuristic below
+                        # misclassifies q_norm/k_norm (raw mean ~0.75) and
+                        # mtp.norm (raw ~1.27) as already-shifted, leaving
+                        # them -1 off — measured cost ~14pp of draft
+                        # acceptance on Qwen3.6-27B (prose 62.8% -> 76.3%).
+                        # ``v + 1.0`` also handles oQ _TrackedTensor (its
+                        # __add__ records an unconditional "add" transform).
+                        weights[k] = v + 1.0
+                    # Pre-converted checkpoints: per-key decision — a head
+                    # norm may still be raw-HF even when a sibling is
+                    # already +1 (JANG mixed bundles).
+                    elif _is_oq_tracked_tensor(v):
                         weights[k] = _mark_mtp_norm_conditional_add(v)
                     elif _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
                         weights[k] = v + 1.0
@@ -636,6 +719,7 @@ def _patch_text_model(q35: Any) -> None:
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
 
@@ -667,22 +751,52 @@ def _patch_outer_model(q35: Any) -> None:
             n_confirmed=n_confirmed,
         )
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
         return self.language_model.mtp_forward(
-            hidden_states, next_token_ids, mtp_cache
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            return_hidden=return_hidden,
+            logits_keep=logits_keep,
         )
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
 
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        return self.language_model.mtp_partial_rollback(cache, accepted, num_drafts)
+
     __call__._omlx_mtp_call_marker = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_partial_rollback = mtp_partial_rollback
     # Informational marker for external code that just wants to know "is
     # this class touched by the MTP patch". Idempotency itself uses the
     # function-level _omlx_mtp_call_marker above.
     cls._omlx_mtp_patched = True
+
+    if not getattr(cls, "_omlx_mtp_norm_repair_patched", False):
+        original_load_weights = cls.load_weights
+
+        def load_weights(self, weights, strict=True):
+            from .norm_repair import repair_legacy_head_norms
+
+            try:
+                weights, _ = repair_legacy_head_norms(weights)
+            except Exception:
+                logger.warning("MTP head-norm repair failed", exc_info=True)
+            return original_load_weights(self, weights, strict=strict)
+
+        cls.load_weights = load_weights
+        cls._omlx_mtp_norm_repair_patched = True
 
 
 # ---------------------------------------------------------------------------

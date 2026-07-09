@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Harmony streaming parser (omlx.adapter.harmony)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -101,6 +102,33 @@ class TestToolCallParsing:
         _, stream_token, visible_token, _ = last
         assert stream_token is None
         assert visible_token is None
+
+    def test_get_tool_calls_requires_commentary_channel(self):
+        """Only commentary messages with function recipients become tool calls."""
+        parser = object.__new__(HarmonyStreamingParser)
+        parser._parser = SimpleNamespace(
+            messages=[
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="analysis-noise")],
+                ),
+                SimpleNamespace(
+                    channel="commentary",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"ok.py"}')],
+                ),
+                SimpleNamespace(
+                    channel="final",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="final-noise")],
+                ),
+            ]
+        )
+
+        assert parser.get_tool_calls() == [
+            {"name": "Read", "arguments": '{"path":"ok.py"}'}
+        ]
 
 
 # ── Multi-message sequences ──────────────────────────────────────────
@@ -359,3 +387,49 @@ class TestParseToolCallsFromTokens:
         assert output_text == ""
         assert "thinking" in analysis_text
         assert tool_calls == []
+
+    def test_requires_commentary_channel_for_function_recipient(self, monkeypatch):
+        """Mixed messages keep only commentary function recipients as tool calls."""
+        messages = [
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="analysis-noise")],
+            ),
+            SimpleNamespace(
+                channel="commentary",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"ok.py"}')],
+            ),
+            SimpleNamespace(
+                channel="final",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="final-noise")],
+            ),
+            SimpleNamespace(
+                channel="other",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="other-noise")],
+            ),
+        ]
+
+        class FakeEncoding:
+            def encode(self, text, allowed_special="all"):
+                return [1, 2] if text == "<|start|>assistant" else [3]
+
+            def decode(self, token_ids):
+                return "decoded"
+
+            def parse_messages_from_completion_tokens(self, token_ids, role, strict):
+                return messages
+
+        monkeypatch.setattr(
+            "omlx.adapter.harmony.load_harmony_gpt_oss_encoding",
+            lambda: FakeEncoding(),
+        )
+
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens([99])
+
+        assert analysis_text == "analysis-noise"
+        assert output_text == "final-noise"
+        assert tool_calls == [{"name": "Read", "arguments": '{"path":"ok.py"}'}]

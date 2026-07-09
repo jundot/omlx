@@ -112,6 +112,7 @@ PACKAGING_DIR="$REPO_ROOT/packaging"
 CUSTOM_KERNEL_DIRS=(
     "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
     "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
+    "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
 )
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
@@ -240,7 +241,8 @@ _clean_custom_kernel_build_artifacts() {
     if [ -d "$REPO_ROOT/build" ]; then
         for ext_name in \
             "omlx.custom_kernels.glm_moe_dsa._ext" \
-            "omlx.custom_kernels.minimax_m3._ext"; do
+            "omlx.custom_kernels.minimax_m3._ext" \
+            "omlx.custom_kernels.qwen35_prefill._ext"; do
             find "$REPO_ROOT/build" \
                 -type d \
                 -name "$ext_name" \
@@ -276,6 +278,72 @@ _validate_custom_kernel_deployment_target() {
     done
 }
 
+_check_custom_kernel_nanobind() {
+    # setup.py build_ext runs without pip build isolation, so the pyproject
+    # [build-system] nanobind pin is NOT enforced here — the kernels are
+    # built with whatever nanobind $PYTHON_BIN resolves. A version that does
+    # not match the one the bundled mlx wheel was built with isolates the
+    # nanobind NB_DOMAIN: the extensions import and list symbols normally
+    # but reject every mlx array at call time (issue #2139).
+    local custom_kernel_pythonpath="$1"
+    local expected actual
+    expected="$(sed -n 's/^[[:space:]]*"nanobind==\([0-9][0-9.]*\)".*/\1/p' \
+        "$REPO_ROOT/pyproject.toml" | head -1)"
+    [ -n "$expected" ] || die "could not read the nanobind pin from pyproject.toml [build-system]."
+    actual="$(PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" -c \
+        'import nanobind; print(nanobind.__version__)' 2>/dev/null)" \
+        || die "nanobind is not importable by $PYTHON_BIN — run: $PYTHON_BIN -m pip install nanobind==$expected"
+    [ "$actual" = "$expected" ] \
+        || die "nanobind $actual does not match the pyproject build pin $expected; the kernels would reject every mlx array at runtime (issue #2139). Run: $PYTHON_BIN -m pip install nanobind==$expected"
+}
+
+_check_custom_kernel_abi() {
+    # Import each freshly built extension against the donor (bundled) mlx and
+    # exercise the array type caster once. A metallib existence check cannot
+    # catch a nanobind ABI mismatch — only an actual call does.
+    local custom_kernel_pythonpath="$1"
+    log "Verifying custom kernel ABI against the bundled MLX…"
+    (
+        cd "$REPO_ROOT"
+        PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" - <<'PYEOF'
+import importlib.util
+import pathlib
+import sys
+
+import mlx.core as mx
+
+failures = []
+for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+    ext_dir = pathlib.Path("omlx/custom_kernels") / name
+    so = next(ext_dir.glob("_ext.*.so"), None)
+    if so is None:
+        failures.append(f"{name}: _ext extension missing")
+        continue
+    # Extension modules must load under their compiled name (PyInit__ext);
+    # CPython keys the extension cache by (name, path), so loading three
+    # different .so files as "_ext" is fine.
+    spec = importlib.util.spec_from_file_location("_ext", so)
+    ext = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(ext)
+    except Exception as exc:
+        failures.append(f"{name}: import failed: {exc}")
+        continue
+    probe = getattr(ext, "abi_probe", None)
+    if probe is None:
+        failures.append(f"{name}: abi_probe symbol missing (stale build?)")
+        continue
+    try:
+        probe(mx.zeros((1,)))
+    except TypeError as exc:
+        failures.append(f"{name}: mlx array rejected (nanobind ABI mismatch): {exc}")
+for failure in failures:
+    print(failure, file=sys.stderr)
+sys.exit(1 if failures else 0)
+PYEOF
+    ) || die "custom kernel ABI check failed — the built extensions reject mlx arrays (issue #2139); see output above."
+}
+
 _build_custom_kernels() {
     [ -n "$PYTHON_BIN" ] || die "python3 not found — install Python 3.11+ on PATH or set PYTHON_BIN."
     local deployment_target
@@ -285,6 +353,7 @@ _build_custom_kernels() {
     cmake_args="${CMAKE_ARGS:-}"
     custom_kernel_pythonpath="$(_custom_kernel_pythonpath)"
 
+    _check_custom_kernel_nanobind "$custom_kernel_pythonpath"
     log "Building optional native custom kernels (macOS deployment target $deployment_target)…"
     _clean_custom_kernel_build_artifacts
     (
@@ -301,7 +370,10 @@ _build_custom_kernels() {
         || die "custom kernel build finished but GLM metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
         || die "custom kernel build finished but MiniMax M3 metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
+        || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
     _validate_custom_kernel_deployment_target "$deployment_target"
+    _check_custom_kernel_abi "$custom_kernel_pythonpath"
     ok "  + custom kernels ($deployment_target)"
 }
 

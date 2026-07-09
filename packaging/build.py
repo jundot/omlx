@@ -822,7 +822,7 @@ try:
     _XGRAMMAR_VERSION = _TARGET_XGRAMMAR_VERSIONS[0]
     _TVM_FFI_VERSION = _TARGET_TVM_FFI_VERSIONS[0]
 except Exception:  # pragma: no cover — build runs may not have omlx on path yet
-    _XGRAMMAR_VERSION = "0.2.0"
+    _XGRAMMAR_VERSION = "0.2.3"
     _TVM_FFI_VERSION = "0.1.11"
 
 

@@ -155,6 +155,7 @@ class ModelSettingsRequest(BaseModel):
     guided_grammar: str | None = None
     is_pinned: bool | None = None
     is_default: bool | None = None
+    is_hidden: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
@@ -220,6 +221,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dirs: list[str] | None = None
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool | None = None
+    hide_helper_models: bool | None = None
 
     # Memory enforcement
     memory_prefill_memory_guard: bool | None = None
@@ -1863,6 +1865,18 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
 
+    # Draft-model references pointed at by other models' speculative settings —
+    # used to badge "helper" drafters that only differ by being referenced.
+    referenced_drafts: set[str] = set()
+    for _ms in all_settings.values():
+        for ref in (
+            _ms.specprefill_draft_model,
+            _ms.dflash_draft_model,
+            _ms.vlm_mtp_draft_model,
+        ):
+            if ref:
+                referenced_drafts.add(ref)
+
     # SSD cache dir is set on the scheduler_config when the user enables paged
     # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
     ssd_cache_dir = getattr(
@@ -1906,6 +1920,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "pinned": model_info.get("pinned", False),
             "is_default": (
                 server_state.default_model == model_id if server_state else False
+            ),
+            "is_hidden": bool(settings and settings.is_hidden),
+            "is_helper": (
+                bool(model_info.get("is_helper"))
+                or model_id in referenced_drafts
+                or model_info.get("model_path") in referenced_drafts
+                or model_info.get("source_repo_id") in referenced_drafts
             ),
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
@@ -2400,7 +2421,7 @@ async def update_model_settings(
                         "mlx-lm sanitize() path strips them."
                     ),
                 )
-            # Mutual exclusion with DFlash / TurboQuant — ModelSettings.__post_init__
+            # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
                 bool(request.dflash_enabled)
@@ -2411,16 +2432,6 @@ async def update_model_settings(
                 raise HTTPException(
                     status_code=400,
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
-                )
-            tq_after = (
-                bool(request.turboquant_kv_enabled)
-                if "turboquant_kv_enabled" in sent
-                else current_settings.turboquant_kv_enabled
-            )
-            if tq_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
 
@@ -2487,6 +2498,8 @@ async def update_model_settings(
         # Update server_state.default_model if setting as default
         if request.is_default and server_state:
             server_state.default_model = model_id
+    if request.is_hidden is not None:
+        current_settings.is_hidden = request.is_hidden
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
 
@@ -3188,6 +3201,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 str(d) for d in global_settings.get_effective_model_dirs()
             ],
             "model_fallback": global_settings.model.model_fallback,
+            "hide_helper_models": global_settings.model.hide_helper_models,
         },
         "memory": {
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
@@ -3451,6 +3465,9 @@ async def update_global_settings(
     if request.model_fallback is not None:
         global_settings.model.model_fallback = request.model_fallback
         runtime_applied.append("model_fallback")
+    if request.hide_helper_models is not None:
+        global_settings.model.hide_helper_models = request.hide_helper_models
+        runtime_applied.append("hide_helper_models")
 
     # Apply memory guard tier + custom ceiling change (Live)
     if (

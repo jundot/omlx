@@ -1106,6 +1106,44 @@ def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
 
 
+class _BoundaryStoreUnavailable(Exception):
+    """No boundary-aligned snapshot exists for non-sliceable cache state.
+
+    Raised inside the final-response store path when the model needs
+    boundary snapshots but none were captured (e.g. every capture was
+    skipped by the speculative-decode skew guard). Storing the live
+    state instead would label off-boundary recurrent/rotating state
+    with a block-boundary token count and corrupt later prefix hits;
+    the handler skips the store and releases the block references.
+    """
+
+
+def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
+    """First integer ``offset`` found walking into composite caches.
+
+    CacheList-style wrappers (DeepSeek-V4 / GLM per-layer caches) expose
+    no ``offset`` themselves — the token position lives on their leading
+    sub-cache (RotatingKVCache / KVCache, whose ``offset`` counts
+    forwarded tokens). Walk depth-first so that leading leaf decides;
+    later sub-caches may count something else entirely (PoolingCache's
+    ``offset`` is the pooled-window count).
+    """
+    subs = getattr(cache_obj, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        for sub in subs:
+            offset = _first_leaf_cache_offset(sub)
+            if offset is not None:
+                return offset
+        return None
+    offset = getattr(cache_obj, "offset", None)
+    if offset is None:
+        return None
+    try:
+        return int(offset)
+    except Exception:
+        return None
+
+
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     """Return True if any layer cache is non-sliceable (needs snapshots).
 
@@ -1874,6 +1912,11 @@ class Scheduler:
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+
+        # Drop transient aliases after ownership moves to scheduler fields;
+        # close()/deep_reset() clear those fields during teardown.
+        model = None
+        tokenizer = None
 
     @contextmanager
     def _phase_timer(self, phase: str):
@@ -4727,12 +4770,13 @@ class Scheduler:
         if think_start_id is not None:
             think_start_ids = [think_start_id]
         else:
-            think_start_text = self._get_output_parser_thinking_start_text() or "<think>"
+            think_start_text = (
+                self._get_output_parser_thinking_start_text() or "<think>"
+            )
             try:
                 token_id = self.tokenizer.convert_tokens_to_ids(think_start_text)
-                if (
-                    isinstance(token_id, int)
-                    and token_id != getattr(self.tokenizer, "unk_token_id", None)
+                if isinstance(token_id, int) and token_id != getattr(
+                    self.tokenizer, "unk_token_id", None
                 ):
                     think_start_ids = [token_id]
             except (AttributeError, KeyError, TypeError):
@@ -4948,16 +4992,33 @@ class Scheduler:
             self._boundary_snapshot_required = False
             return False
 
-        self._boundary_snapshot_required = any(
-            self._cache_tree_has_stateful_non_sliceable(layer_cache)
-            for layer_cache in cache_list
-        )
+        try:
+            self._boundary_snapshot_required = any(
+                self._cache_tree_has_stateful_non_sliceable(layer_cache)
+                for layer_cache in cache_list
+            )
+        except TypeError:
+            # make_cache() returned something non-iterable (stub models in
+            # tests); treat as not snapshot-needing.
+            self._boundary_snapshot_required = False
+            return False
 
         if self._boundary_snapshot_required:
             logger.info(
                 "Enabled boundary cache snapshots for stateful non-sliceable "
                 "cache layers"
             )
+            # Ask the speculative (MTP) decode path to land its commits on
+            # block boundaries: its emit queue otherwise leaves the cache a
+            # few tokens ahead of the emitted count when a boundary token
+            # surfaces, which forces the consistency guard in
+            # _extract_boundary_snapshot to skip most captures.
+            block = int(self.config.paged_cache_block_size or 0)
+            if block > 0:
+                try:
+                    self.model._omlx_mtp_commit_align = block
+                except Exception:
+                    pass
         else:
             logger.debug(
                 "Boundary cache snapshots disabled (no stateful non-sliceable "
@@ -4966,11 +5027,24 @@ class Scheduler:
 
         return self._boundary_snapshot_required
 
-    def _extract_boundary_snapshot(self, uid: int) -> list[Any] | None:
+    def _extract_boundary_snapshot(
+        self, uid: int, expected_tokens: int | None = None
+    ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
         Uses BatchGenerator.extract_cache() which returns
         Dict[uid, (cache_list, tokens_list)].
+
+        ``expected_tokens`` guards positional consistency: a snapshot labeled
+        "state at N tokens" must be extracted while the cache holds exactly N
+        forwarded tokens. The standard decode step always satisfies this at
+        emit time, but speculative (MTP) decode advances the cache in bursts
+        and emits from a queue, so the cache can be a few tokens ahead of —
+        or one behind — the emitted count when the boundary token surfaces.
+        A skewed snapshot would pair block-aligned KV with recurrent (SSM)
+        state from a different position and corrupt later prefix-cache hits
+        on hybrid models; skipping the capture merely costs a reuse
+        opportunity.
         """
         if self.batch_generator is None:
             return None
@@ -4986,6 +5060,26 @@ class Scheduler:
                     if uid not in result:
                         return None
                     cache_list, _tokens = result[uid]
+                    if expected_tokens is not None:
+                        # Walk into CacheList wrappers: DeepSeek-V4/GLM layer
+                        # caches carry their token offset on a sub-cache, and
+                        # checking only the wrapper would silently pass a
+                        # skewed capture through.
+                        for c in cache_list:
+                            offset = _first_leaf_cache_offset(c)
+                            if offset is None:
+                                continue
+                            if offset != expected_tokens:
+                                logger.debug(
+                                    "Skipping boundary snapshot for uid=%s: "
+                                    "cache offset %d != boundary %d "
+                                    "(speculative decode skew)",
+                                    uid,
+                                    offset,
+                                    expected_tokens,
+                                )
+                                return None
+                            break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
                     return [
@@ -5018,7 +5112,9 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
-        snapshot_cache = self._extract_boundary_snapshot(uid)
+        snapshot_cache = self._extract_boundary_snapshot(
+            uid, expected_tokens=total_tokens
+        )
         if not snapshot_cache:
             return
 
@@ -5198,6 +5294,246 @@ class Scheduler:
             else:
                 merged.append(bc)
         return merged
+
+    @staticmethod
+    def _is_empty_boundary_placeholder(layer_state: Any) -> bool:
+        if not isinstance(layer_state, dict):
+            return False
+        state = layer_state.get("state", ())
+        return isinstance(state, tuple) and len(state) == 0
+
+    @staticmethod
+    def _extracted_layer_type_name(layer_state: dict[str, Any]) -> str:
+        class_name = str(layer_state.get("class_name") or "")
+        if class_name:
+            return class_name
+        return str(layer_state.get("cache_type") or "")
+
+    @staticmethod
+    def _is_sliceable_extracted_layer(layer_state: dict[str, Any]) -> bool:
+        type_name = Scheduler._extracted_layer_type_name(layer_state)
+        if type_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            return True
+
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None and type_name:
+            try:
+                if type_name not in CacheTypeRegistry.list_known_class_names():
+                    return False
+                handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+                return bool(handler.supports_block_slicing)
+            except Exception:
+                return False
+
+        return False
+
+    def _fill_boundary_placeholders_from_live_cache(
+        self,
+        boundary_cache: list[dict[str, Any]],
+        live_cache: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Fill boundary placeholders only with proven sliceable live layers."""
+        if (
+            not boundary_cache
+            or not live_cache
+            or len(boundary_cache) != len(live_cache)
+        ):
+            return None
+
+        merged: list[dict[str, Any]] = []
+        for layer_idx, (boundary_layer, live_layer) in enumerate(
+            zip(boundary_cache, live_cache)
+        ):
+            if not self._is_empty_boundary_placeholder(boundary_layer):
+                merged.append(boundary_layer)
+                continue
+
+            if not isinstance(
+                live_layer, dict
+            ) or not self._is_sliceable_extracted_layer(live_layer):
+                logger.debug(
+                    "Cannot fill boundary placeholder for layer %s from non-sliceable "
+                    "live cache type %s",
+                    layer_idx,
+                    (
+                        self._extracted_layer_type_name(live_layer)
+                        if isinstance(live_layer, dict)
+                        else type(live_layer).__name__
+                    ),
+                )
+                return None
+
+            merged.append(live_layer)
+
+        if any(self._is_empty_boundary_placeholder(layer) for layer in merged):
+            return None
+        return merged
+
+    def _extract_live_request_cache_for_store(
+        self,
+        request_id: str,
+        uid: int,
+        expected_tokens: list[int],
+    ) -> tuple[list[dict[str, Any]], Optional["ModelCacheConfig"]] | None:
+        """Extract live cache only when its token prefix matches exactly."""
+        if self.batch_generator is None or uid is None or uid < 0:
+            return None
+
+        try:
+            _safe_sync_stream(self._stream)
+            with mx.stream(self._stream):
+                result = self.batch_generator.extract_cache([uid])
+            if uid not in result:
+                logger.debug(
+                    "Cannot extract live cache for %s: uid %s not present",
+                    request_id,
+                    uid,
+                )
+                return None
+
+            live_cache, live_tokens = result[uid]
+            live_tokens_list = list(live_tokens) if live_tokens is not None else []
+            if len(live_tokens_list) < len(expected_tokens) or (
+                live_tokens_list[: len(expected_tokens)] != expected_tokens
+            ):
+                logger.debug(
+                    "Skipping parser-stop cache store for %s: live cache tokens do "
+                    "not match prompt boundary prefix (%s/%s tokens)",
+                    request_id,
+                    min(len(live_tokens_list), len(expected_tokens)),
+                    len(expected_tokens),
+                )
+                return None
+
+            extracted_cache, model_cache_config = self._extract_cache_states(live_cache)
+            if not extracted_cache:
+                return None
+            return extracted_cache, model_cache_config
+        except Exception as e:
+            logger.debug(
+                "Failed to extract live cache for parser-stop cache store %s: %s",
+                request_id,
+                e,
+            )
+            return None
+
+    def _prepare_prompt_boundary_cache_store(
+        self,
+        request_id: str,
+        request: Request,
+        uid: int,
+    ) -> (
+        tuple[
+            list[int],
+            list[dict[str, Any]],
+            Optional["ModelCacheConfig"],
+            Any | None,
+        ]
+        | None
+    ):
+        """Prepare a prompt-only cache payload when a scheduler stop skipped it.
+
+        Parser-side stops (for example tool-call end markers) can finish a request
+        after a normal streaming token response. That response has no
+        ``prompt_cache``, so the usual final-response cache extraction never runs.
+        This fallback stores only prompt tokens up to a prefill block boundary,
+        never generated output tokens.
+        """
+        if self.block_aware_cache is None:
+            return None
+        if request.specprefill_indices is not None:
+            return None
+
+        block_size = self.config.paged_cache_block_size
+        if block_size <= 0:
+            return None
+
+        prompt_tokens = list(request.prompt_token_ids or [])
+        boundary_len = (len(prompt_tokens) // block_size) * block_size
+        if boundary_len <= 0:
+            return None
+
+        token_sequence = prompt_tokens[:boundary_len]
+
+        boundary_override = self._get_boundary_store_override(request_id, prompt_tokens)
+        if boundary_override is not None:
+            (
+                token_sequence,
+                boundary_cache,
+                boundary_model_config,
+                intermediate_snapshots,
+            ) = boundary_override
+
+            live_payload = None
+            if any(
+                self._is_empty_boundary_placeholder(layer) for layer in boundary_cache
+            ):
+                live_payload = self._extract_live_request_cache_for_store(
+                    request_id,
+                    uid,
+                    token_sequence,
+                )
+                if live_payload is None:
+                    return None
+                live_cache, live_model_config = live_payload
+                cache_to_store = self._fill_boundary_placeholders_from_live_cache(
+                    boundary_cache,
+                    live_cache,
+                )
+                if cache_to_store is None:
+                    return None
+                model_cache_config = boundary_model_config or live_model_config
+            else:
+                cache_to_store = boundary_cache
+                model_cache_config = boundary_model_config
+
+            logger.info(
+                "Using prompt boundary cache snapshot for %s: storing %s/%s prompt "
+                "tokens after scheduler-side stop (skipping output tokens, %s "
+                "intermediate snapshots)",
+                request_id,
+                len(token_sequence),
+                len(prompt_tokens),
+                len(intermediate_snapshots) if intermediate_snapshots else 0,
+            )
+            return (
+                token_sequence,
+                cache_to_store,
+                model_cache_config,
+                intermediate_snapshots,
+            )
+
+        # Pure sliceable cache models do not need boundary snapshots. For models
+        # that do need snapshots, a missing snapshot means the non-sliceable state
+        # at this boundary is unavailable, so skip rather than storing an unsafe
+        # live decode tail.
+        if self._detect_boundary_snapshot_need():
+            return None
+
+        live_payload = self._extract_live_request_cache_for_store(
+            request_id,
+            uid,
+            token_sequence,
+        )
+        if live_payload is None:
+            return None
+
+        live_cache, live_model_config = live_payload
+        if not all(self._is_sliceable_extracted_layer(layer) for layer in live_cache):
+            logger.debug(
+                "Skipping parser-stop cache store for %s: live cache has "
+                "non-sliceable layers but no boundary snapshot",
+                request_id,
+            )
+            return None
+
+        logger.info(
+            "Using live prompt cache for %s: storing %s/%s prompt tokens after "
+            "scheduler-side stop (skipping output tokens)",
+            request_id,
+            len(token_sequence),
+            len(prompt_tokens),
+        )
+        return token_sequence, live_cache, live_model_config, None
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -5457,12 +5793,49 @@ class Scheduler:
                                 "CacheList"
                             )
                             state_dict = handler.extract_state(layer_cache)
+                            sub_states = list(state_dict.get("sub_states", []))
+                            sub_class_names = list(
+                                state_dict.get("sub_class_names", [])
+                            )
+                            sub_meta_states = list(
+                                state_dict.get("sub_meta_states", [])
+                            )
+
+                            sub_caches = getattr(layer_cache, "caches", ())
+                            for sub_idx, sub_cache in enumerate(sub_caches):
+                                if sub_idx >= len(sub_states):
+                                    break
+
+                                sub_class_name = type(sub_cache).__name__
+                                if sub_class_name in (
+                                    "RotatingKVCache",
+                                    "BatchRotatingKVCache",
+                                    "PrefillReadyRotatingKVCache",
+                                ):
+                                    normalized_state, normalized_meta = (
+                                        self._normalize_rotating_snapshot_state(
+                                            sub_cache,
+                                            sub_states[sub_idx],
+                                            (
+                                                sub_meta_states[sub_idx]
+                                                if sub_idx < len(sub_meta_states)
+                                                else getattr(
+                                                    sub_cache, "meta_state", ()
+                                                )
+                                            ),
+                                            layer_idx=layer_idx,
+                                        )
+                                    )
+                                    sub_states[sub_idx] = normalized_state
+                                    if sub_idx < len(sub_meta_states):
+                                        sub_meta_states[sub_idx] = normalized_meta
+
                             extracted.append(
                                 {
-                                    "state": state_dict.get("sub_states", []),
+                                    "state": sub_states,
                                     "meta_state": (
-                                        state_dict.get("sub_class_names", []),
-                                        state_dict.get("sub_meta_states", []),
+                                        sub_class_names,
+                                        sub_meta_states,
                                     ),
                                     "class_name": "CacheList",
                                     "cache_type": "CacheList",
@@ -5513,6 +5886,8 @@ class Scheduler:
                     is_rotating_cache = class_name in (
                         "RotatingKVCache",
                         "BatchRotatingKVCache",
+                        "PrefillReadyRotatingKVCache",
+                        "BufferedRotatingKVCache",
                     )
                     if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                         is_rotating_cache = (
@@ -5719,8 +6094,7 @@ class Scheduler:
             return None
         if not (
             best_common >= self._CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS
-            or best_common / len(prompt)
-            >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
+            or best_common / len(prompt) >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
         ):
             return None
 
@@ -6628,10 +7002,7 @@ class Scheduler:
         prompt_tokens = request.prompt_token_ids or []
         if not cache_list or block_table is None or not block_table.block_ids:
             return False
-        if (
-            block_table.num_tokens <= 0
-            or block_table.num_tokens >= len(prompt_tokens)
-        ):
+        if block_table.num_tokens <= 0 or block_table.num_tokens >= len(prompt_tokens):
             return False
 
         minimax_m3_names = frozenset({"MiniMaxM3KVCache"})
@@ -7044,6 +7415,20 @@ class Scheduler:
             _sync_and_clear_cache(self._stream)
         except Exception as e:
             logger.warning(f"Metal cache clear failed during error recovery: {e}")
+        # Requests failed mid-prefill leave PrefillProgressTracker entries
+        # behind (auto-removal only fires at processed >= total). The local
+        # RuntimeError handlers in the prefill paths cover the common memory
+        # errors (#1405), but any other exception type bubbles up here and
+        # would leak a phantom "PP" row on the dashboard.
+        tracker = get_prefill_tracker()
+        for rid in failed_ids:
+            tracker.remove(rid)
+        # Republish the admin snapshot now that the queues are empty. The
+        # snapshot is normally published at the end of a successful step();
+        # when step() raises, the last published snapshot still lists the
+        # failed requests, so the dashboard and the macOS app keep showing
+        # them as "generating" until the next successful step (#2126).
+        self._publish_admin_snapshot()
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -7541,9 +7926,7 @@ class Scheduler:
                         rejected_outputs.append(stalled)
                 else:
                     if self.waiting:
-                        self._clear_memory_admission_blocker(
-                            self.waiting[0].request_id
-                        )
+                        self._clear_memory_admission_blocker(self.waiting[0].request_id)
                     stalled = self._store_cache_admission_stall_output(
                         "store_cache_backpressure",
                         gate_in_flight=gate.in_flight,
@@ -8352,8 +8735,7 @@ class Scheduler:
                         prefix_text = think_tag + "\n"
                     else:
                         prefix_text = (
-                            self._get_output_parser_thinking_start_output_text()
-                            or ""
+                            self._get_output_parser_thinking_start_output_text() or ""
                         )
                     if prefix_text:
                         new_text = prefix_text + new_text
@@ -8560,31 +8942,48 @@ class Scheduler:
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
                     ):
+                        prompt_boundary_store = None
+                    else:
+                        uid_for_store = self.request_id_to_uid.get(request_id, -1)
+                        prompt_boundary_store = (
+                            self._prepare_prompt_boundary_cache_store(
+                                request_id,
+                                request,
+                                uid_for_store,
+                            )
+                        )
+
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ) or prompt_boundary_store is not None:
                         try:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
-                            # For reasoning models, only cache prompt tokens.
-                            # Output contains <think> tokens that the API layer
-                            # strips before the next turn, so they never match.
-                            if getattr(request, "needs_think_prefix", False):
-                                cacheable_sequence = list(request.prompt_token_ids)
+
+                            if prompt_boundary_store is not None:
+                                (
+                                    token_sequence_to_store,
+                                    cache_to_store,
+                                    model_cache_config,
+                                    intermediate_snapshots,
+                                ) = prompt_boundary_store
+                                cacheable_sequence = list(token_sequence_to_store)
                             else:
-                                cacheable_sequence = full_token_sequence
-                            token_sequence_to_store = cacheable_sequence
-                            # DEBUG-only divergence probe (issue #1003)
-                            if logger.isEnabledFor(logging.DEBUG):
-                                self._cache_probe_seqs.append(
-                                    (
-                                        request.request_id,
-                                        list(token_sequence_to_store),
-                                    )
+                                # For reasoning models, only cache prompt tokens.
+                                # Output contains <think> tokens that the API layer
+                                # strips before the next turn, so they never match.
+                                if getattr(request, "needs_think_prefix", False):
+                                    cacheable_sequence = list(request.prompt_token_ids)
+                                else:
+                                    cacheable_sequence = full_token_sequence
+                                token_sequence_to_store = cacheable_sequence
+                                cache_to_store = request._extracted_cache
+                                model_cache_config = getattr(
+                                    request, "_model_cache_config", None
                                 )
-                            cache_to_store = request._extracted_cache
-                            model_cache_config = getattr(
-                                request, "_model_cache_config", None
-                            )
-                            intermediate_snapshots = None
+                                intermediate_snapshots = None
 
                             # Inference-thread store_cache prep, timed as
                             # three sub-phases (boundary / collect / dispatch)
@@ -8598,34 +8997,59 @@ class Scheduler:
                             # -> SIGABRT. See the dispatch-phase comment below.
                             with mx.stream(self._stream):
                                 with self._phase_timer("store_cache_main_boundary"):
-                                    boundary_override = (
-                                        self._get_boundary_store_override(
-                                            request_id,
-                                            cacheable_sequence,
-                                        )
-                                    )
-                                    if boundary_override is not None:
-                                        (
-                                            token_sequence_to_store,
-                                            boundary_cache,
-                                            boundary_model_config,
-                                            intermediate_snapshots,
-                                        ) = boundary_override
-                                        cache_to_store = (
-                                            self._merge_boundary_with_full_cache(
-                                                boundary_cache, request._extracted_cache
+                                    if prompt_boundary_store is None:
+                                        boundary_override = (
+                                            self._get_boundary_store_override(
+                                                request_id,
+                                                cacheable_sequence,
                                             )
                                         )
-                                        if boundary_model_config is not None:
-                                            model_cache_config = boundary_model_config
-                                        logger.info(
-                                            f"Using boundary cache snapshot for {request_id}: "
-                                            f"storing {len(token_sequence_to_store)}/"
-                                            f"{len(full_token_sequence)} tokens "
-                                            f"(skipping trailing partial block, "
-                                            f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
-                                            f"intermediate snapshots)"
+                                        if (
+                                            boundary_override is None
+                                            and self._detect_boundary_snapshot_need()
+                                        ):
+                                            # Non-sliceable cache state is only
+                                            # storable from boundary-aligned
+                                            # snapshots; the live state sits at
+                                            # the current decode offset (which
+                                            # speculative decode can leave off
+                                            # the emitted count entirely).
+                                            raise _BoundaryStoreUnavailable()
+                                        if boundary_override is not None:
+                                            (
+                                                token_sequence_to_store,
+                                                boundary_cache,
+                                                boundary_model_config,
+                                                intermediate_snapshots,
+                                            ) = boundary_override
+                                            cache_to_store = (
+                                                self._merge_boundary_with_full_cache(
+                                                    boundary_cache,
+                                                    request._extracted_cache,
+                                                )
+                                            )
+                                            if boundary_model_config is not None:
+                                                model_cache_config = (
+                                                    boundary_model_config
+                                                )
+                                            logger.info(
+                                                f"Using boundary cache snapshot for {request_id}: "
+                                                f"storing {len(token_sequence_to_store)}/"
+                                                f"{len(full_token_sequence)} tokens "
+                                                f"(skipping trailing partial block, "
+                                                f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
+                                                f"intermediate snapshots)"
+                                            )
+                                # DEBUG-only divergence probe (issue #1003).
+                                # Record the exact token sequence submitted to
+                                # store_cache, including boundary truncation.
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    self._cache_probe_seqs.append(
+                                        (
+                                            request.request_id,
+                                            list(token_sequence_to_store),
                                         )
+                                    )
                                 with self._phase_timer("store_cache_main_collect"):
                                     pre_eval_arrays = (
                                         self._collect_arrays_from_extracted_cache(
@@ -8743,6 +9167,25 @@ class Scheduler:
                                 f"{len(request.prompt_token_ids)} prompt + "
                                 f"{len(request.output_token_ids)} output)"
                             )
+                        except _BoundaryStoreUnavailable:
+                            logger.debug(
+                                "Skipping cache store for %s: no boundary-aligned "
+                                "snapshot for non-sliceable cache state (all "
+                                "captures skipped, e.g. by the speculative-decode "
+                                "skew guard); storing live state would corrupt "
+                                "later prefix hits",
+                                request_id,
+                            )
+                            block_table = None
+                            if self.paged_cache_manager:
+                                block_table = self.paged_cache_manager.get_block_table(
+                                    request_id
+                                )
+                            if block_table and self.paged_cache_manager:
+                                self.paged_cache_manager.release_for_eviction(
+                                    block_table.block_ids
+                                )
+                            self.block_aware_cache.clear_request_entry(request_id)
                         except Exception as e:
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
@@ -9568,6 +10011,11 @@ class Scheduler:
         self.tokenizer = None
 
         # Release all cache-related references for GC
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
         self.paged_cache_manager = None
         self.block_aware_cache = None
         self.memory_monitor = None
@@ -9626,6 +10074,16 @@ class Scheduler:
             self._inflight_store_info.clear()
             self._cache_freshness_waits.clear()
             self._prefix_cache_prepared.clear()
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_all()
+            except Exception as e:
+                logger.warning("Boundary snapshot store cleanup error: %s", e)
+            try:
+                self._boundary_snapshot_store.shutdown()
+            except Exception as e:
+                logger.warning("Boundary snapshot store shutdown error: %s", e)
+            self._boundary_snapshot_store = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -9838,17 +10296,27 @@ class Scheduler:
         except Exception as e:
             logger.debug(f"Failed to extract model info: {e}")
 
-    def _infer_live_layer_cache_types(self) -> list[str] | None:
-        """Infer the layer-cache signature that future SSD saves will use."""
+    def _infer_live_layer_cache_types(
+        self,
+    ) -> tuple[list[str], float | None] | None:
+        """Infer the layer-cache signature that future SSD saves will use.
+
+        Returns ``(layer_cache_types, turboquant_kv_bits)`` — the predicted
+        per-layer type names plus the depth requests will quantize at (None
+        when TurboQuant is inactive or ineligible) — or None when no
+        signature can be inferred.
+        """
         if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
             return None
 
-        make_cache = getattr(self.model, "make_cache", None)
-        if not callable(make_cache):
-            return None
-
+        # Build the cache list the same way the request path does
+        # (make_prompt_cache defers to model.make_cache when the model
+        # defines one, and falls back to plain per-layer KVCache otherwise).
+        # Requiring model.make_cache here made the refresh a silent no-op
+        # for every plain dense model, so the manager never learned the
+        # TurboQuant layout or bit depth (#2045).
         try:
-            cache_list = make_cache()
+            cache_list = make_prompt_cache(self.model)
         except Exception as e:
             logger.debug("Failed to build cache list for SSD signature: %s", e)
             return None
@@ -9871,14 +10339,18 @@ class Scheduler:
             return None
 
         if self._turboquant_kv_bits is None:
-            return layer_cache_types
+            return layer_cache_types, None
 
         try:
-            if not self._turboquant_eligible(cache_list):
-                return layer_cache_types
+            eligible = self._turboquant_eligible(cache_list)
         except Exception as e:
+            # Fail safe: committing an un-rewritten (plain-KV) layout here
+            # would make the stale-signature sweep evict every valid
+            # TurboQuant block, so refuse to infer rather than guess.
             logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
-            return layer_cache_types
+            return None
+        if not eligible:
+            return layer_cache_types, None
 
         kv_indices = [
             i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
@@ -9889,7 +10361,12 @@ class Scheduler:
             if idx != last_kv_idx and idx < len(layer_cache_types):
                 layer_cache_types[idx] = "TurboQuantKVCache"
 
-        return layer_cache_types
+        # The depth is keyed off the same eligibility gate the request path
+        # uses, not the rewritten names: models whose convertible caches sit
+        # inside CacheList layers report bare "CacheList" names at every
+        # depth, so the bits field is the only signature discriminator for
+        # them (#2045).
+        return layer_cache_types, float(self._turboquant_kv_bits)
 
     def refresh_ssd_layer_signature(self) -> list[str] | None:
         """Set the SSD manager's live layer signature before prefix lookup."""
@@ -9897,14 +10374,24 @@ class Scheduler:
         if manager is None:
             return None
 
-        layer_cache_types = self._infer_live_layer_cache_types()
-        if not layer_cache_types:
+        inferred = self._infer_live_layer_cache_types()
+        if inferred is None:
+            if self._turboquant_kv_bits is not None:
+                logger.warning(
+                    "Could not infer the SSD cache layer signature; "
+                    "TurboQuant bit-depth compatibility checks stay disabled "
+                    "for this session (stale-depth blocks are not swept)."
+                )
             return None
+        layer_cache_types, turboquant_kv_bits = inferred
 
         try:
             set_signature = getattr(manager, "set_expected_layer_signature", None)
             if callable(set_signature):
-                set_signature(layer_cache_types)
+                set_signature(
+                    layer_cache_types,
+                    turboquant_kv_bits=turboquant_kv_bits,
+                )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
             manager.invalidate_stale_layer_signature()

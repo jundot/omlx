@@ -85,7 +85,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
       return true;
     }
     const bool weights_lh = weights.ndim() == 3;
-    if (q.shape(1) != 32 || k.shape(1) != 1) {
+    if ((q.shape(1) != 32 && q.shape(1) != 64) || k.shape(1) != 1) {
       return true;
     }
     if (weights_lh) {
@@ -105,7 +105,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
         q.shape(3) % 16 != 0) {
       return true;
     }
-    return k.shape(2) < 4096;
+    return k.shape(2) < 64;
   }
 
   void eval_cpu(
@@ -260,7 +260,7 @@ class DSATopKIndicesPrimitive : public Primitive {
     if (scores.ndim() != 4 || scores.shape(1) != 1) {
       return true;
     }
-    if (topk != 2048) {
+    if (topk != 512 && topk != 2048) {
       return true;
     }
     return scores.shape(-1) < topk;

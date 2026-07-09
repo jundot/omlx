@@ -88,6 +88,13 @@ def test_should_route_gate():
     # decode (qL==1) -> fused vector kernel handles 256
     qd, kd, _ = _qkv(1, 16384)
     assert sdpa256._should_route(qd, kd, None, "causal", None) is False
+    # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
+    # the per-tile eval sync collapses long-context MTP tok/s (issue #2127)
+    for q_len in (2, 4, 9, 15):
+        qv, kv, _ = _qkv(q_len, 16384)
+        assert sdpa256._should_route(qv, kv, None, "causal", None) is False
+    qv, kv, _ = _qkv(16, 16384)
+    assert sdpa256._should_route(qv, kv, None, "causal", None) is True
     # short kv -> keep the faster fallback
     qs, ks, _ = _qkv(2048, 4096)
     assert sdpa256._should_route(qs, ks, None, "causal", None) is False

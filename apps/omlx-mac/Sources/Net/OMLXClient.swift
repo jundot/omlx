@@ -366,7 +366,7 @@ final class OMLXClient: ObservableObject {
         oqLevel: Double,
         preserveMtp: Bool = false
     ) async throws -> OQEstimateResponse {
-        // `oq_level` accepts ints (2,3,4,5,6,8) and 3.5. Send it without a
+        // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
         let levelStr: String = (oqLevel.rounded() == oqLevel)
             ? String(Int(oqLevel))

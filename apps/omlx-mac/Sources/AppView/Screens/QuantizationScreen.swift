@@ -146,8 +146,8 @@ private struct SourceModelSection: View {
                    comment: "Section heading for the source-model picker on the Quantization screen"),
             subtitle: modelsLoaded
                 ? String(localized: "quant.source.subtitle.available",
-                         defaultValue: "\(models.count) full-precision model\(models.count == 1 ? "" : "s") available",
-                         comment: "Subtitle for Source Model section. Placeholders: model count, plural suffix")
+                         defaultValue: "Full-precision models available: \(models.count)",
+                         comment: "Subtitle for Source Model section. Placeholder is the full-precision model count")
                 : String(localized: "quant.source.subtitle.loading",
                          defaultValue: "Loading…",
                          comment: "Subtitle while the source model list is loading")
@@ -249,9 +249,12 @@ private struct SourceModelSection: View {
         return opts
     }
 
-    // 2 / 3 / 3.5 / 4 / 5 / 6 / 8 — mirrors the HTML <option>s.
+    // Mirrors the HTML <option>s.
     static let levelOptions: [PopupOption<Double>] = [
         PopupOption(value: 2,   label: "oQ2"),
+        PopupOption(value: 2.5, label: "oQ2.5"),
+        PopupOption(value: 2.7, label: "oQ2.7"),
+        PopupOption(value: 2.8, label: "oQ2.8"),
         PopupOption(value: 3,   label: "oQ3"),
         PopupOption(value: 3.5, label: "oQ3.5"),
         PopupOption(value: 4,   label: "oQ4"),
@@ -441,8 +444,8 @@ private struct QueueSection: View {
                                   defaultValue: "Queue",
                                   comment: "Section heading for the quantization task queue"),
                           subtitle: String(localized: "quant.queue.subtitle",
-                                           defaultValue: "\(tasks.count) task\(tasks.count == 1 ? "" : "s")",
-                                           comment: "Subtitle for the Queue section. Placeholders: count, plural suffix"))
+                                           defaultValue: "Tasks: \(tasks.count)",
+                                           comment: "Subtitle for the Queue section. Placeholder is the task count"))
 
             ListGroup {
                 ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in
@@ -626,7 +629,7 @@ private struct UploadTasksSection: View {
                        defaultValue: "Uploads",
                        comment: "Section heading for the HF upload task list"),
                 subtitle: String(localized: "quant.uploads.subtitle",
-                                 defaultValue: "\(activeCount) active / \(completedCount) completed",
+                                 defaultValue: "Active: \(activeCount) / completed: \(completedCount)",
                                  comment: "Subtitle for Uploads section. Placeholders: active count, completed count")
             )
 

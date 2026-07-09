@@ -917,6 +917,32 @@ class TestHermesIntegration:
 
         assert captured["argv"] == ["hermes", "chat", "--tui"]
 
+    def test_launch_forwards_extra_args(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.hermes.os.execvpe", side_effect=fake_execvpe),
+        ):
+            hermes.launch(
+                ctx(port=8000, api_key="", model="qwen3.5", extra_args=("--continue",))
+            )
+
+        assert captured["argv"] == [
+            "hermes",
+            "chat",
+            "--tui",
+            "-m",
+            "qwen3.5",
+            "--continue",
+        ]
+
     def test_type(self):
         hermes = HermesIntegration()
         assert hermes.type == "config_file"

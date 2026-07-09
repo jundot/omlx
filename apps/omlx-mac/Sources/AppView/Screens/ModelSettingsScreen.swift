@@ -824,8 +824,8 @@ private struct ChatTemplateKwargsEditor: View {
                                   defaultValue: "No chat-template kwargs.",
                                   comment: "Placeholder text shown when no chat-template kwargs are configured")
                          : String(localized: "settings.advanced.chat_template.count",
-                                  defaultValue: "\(vm.chatTemplateEntries.count) kwarg\(vm.chatTemplateEntries.count == 1 ? "" : "s")",
-                                  comment: "Count summary in the chat-template editor; placeholders are the entry count and an optional plural 's'"))
+                                  defaultValue: "kwargs: \(vm.chatTemplateEntries.count)",
+                                  comment: "Count summary in the chat-template editor; placeholder is the entry count"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()

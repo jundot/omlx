@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Minimal ``torch`` stub for the DMG bundle.
 
-xgrammar 0.2.0 declares ``torch>=1.10.0`` as a runtime dep, but oMLX never
+xgrammar 0.2.3 declares ``torch>=1.10.0`` as a runtime dep, but oMLX never
 exercises its torch-backed code paths: bitmasks are allocated as numpy
 ``int32`` buffers, the C++ binding fills them, and the MLX kernel applies the
 mask. The torch dep is load-bearing only at *import time* — module-level code
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 #     raises a stub-identifying RuntimeError. Module-level
 #     ``_FULL_MASK = torch.tensor(-1, ...)`` patterns succeed at import
 #     time; any subsequent method call (.fill_, .item, ...) fails.
-_TARGET_XGRAMMAR_VERSIONS = ("0.2.0",)
+_TARGET_XGRAMMAR_VERSIONS = ("0.2.3",)
 _TARGET_TVM_FFI_VERSIONS = ("0.1.11",)
 
 # Serialize install() across threads. Without this, two threads that both

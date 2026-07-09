@@ -1459,6 +1459,38 @@ class TestSchedulerReset:
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
         fake_executor.shutdown.assert_called_once_with(wait=False)
 
+    def test_shutdown_closes_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """shutdown() must stop the boundary snapshot writer thread.
+
+        cleanup_all() only clears the store contents. If shutdown() is skipped,
+        the writer thread can keep its last raw tensor-byte queue item alive.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        scheduler.shutdown()
+
+        store.cleanup_all.assert_called_once_with()
+        store.shutdown.assert_called_once_with()
+        assert scheduler._boundary_snapshot_store is None
+
+    def test_deep_reset_closes_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """deep_reset() destroys the scheduler and must stop snapshot writers."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        scheduler.deep_reset()
+
+        store.cleanup_all.assert_called_once_with()
+        store.shutdown.assert_called_once_with()
+        assert scheduler._boundary_snapshot_store is None
+
     def test_shutdown_fatal_exits_when_store_cache_worker_times_out(
         self, mock_model, mock_tokenizer
     ):
@@ -1902,6 +1934,9 @@ class TestSchedulerBoundarySnapshots:
         # which returns {uid: (cache_list, tokens_list)}.
         mock_layer_cache = MagicMock()
         type(mock_layer_cache).__name__ = "BatchArraysCache"
+        # Positional-consistency guard: the cache must hold exactly the
+        # boundary token count at capture time (standard decode invariant).
+        mock_layer_cache.offset = 4
 
         scheduler.batch_generator = MagicMock()
         scheduler.batch_generator.extract_cache.return_value = {
@@ -1923,6 +1958,149 @@ class TestSchedulerBoundarySnapshots:
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
         # Non-sliceable cache layer is kept as-is in the snapshot
         assert snapshot == [mock_layer_cache]
+
+    def test_boundary_snapshot_skipped_on_speculative_skew(
+        self, mock_model, mock_tokenizer
+    ):
+        """Speculative (MTP) decode advances the cache in bursts and emits
+        from a queue, so the cache can be a few tokens ahead of the emitted
+        count when the boundary token surfaces. A snapshot captured then
+        would pair the boundary label with recurrent state from a different
+        position — the capture must be skipped instead."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        mock_layer_cache.offset = 6  # cache ran ahead of the emitted count
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-skew",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]  # Total = 4 (boundary)
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert "req-skew" not in scheduler._boundary_cache_snapshots
+
+    @staticmethod
+    def _cache_list_layer(leaf_offset: int):
+        """CacheList-style wrapper: no own offset, sub-caches carry it."""
+
+        class _Leaf:
+            offset = leaf_offset
+
+        class _PoolingLeaf:
+            # Offset counts pooled windows, not tokens — must not be used
+            # by the guard (it walks depth-first, leading leaf wins).
+            offset = leaf_offset // 4
+
+        class _CacheListLike:
+            caches = [_Leaf(), _PoolingLeaf()]
+
+        return _CacheListLike()
+
+    def test_boundary_snapshot_skew_guard_sees_cachelist_sub_offsets(
+        self, mock_model, mock_tokenizer
+    ):
+        """DeepSeek/GLM-style CacheList layers expose no offset themselves;
+        the guard must walk into sub-caches or a skewed capture passes."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        layer = self._cache_list_layer(leaf_offset=6)  # ran ahead of boundary 4
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([layer], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-cl-skew",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]  # Total = 4 (boundary)
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert "req-cl-skew" not in scheduler._boundary_cache_snapshots
+
+    def test_boundary_snapshot_captured_through_cachelist(
+        self, mock_model, mock_tokenizer
+    ):
+        """Aligned CacheList sub-offsets pass the guard and capture proceeds."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        layer = self._cache_list_layer(leaf_offset=4)
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([layer], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-cl-ok",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert 4 in scheduler._boundary_cache_snapshots["req-cl-ok"]
+
+    def test_cleanup_finished_skips_store_without_boundary_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """Snapshot-needing models must not store live non-sliceable state
+        when no boundary-aligned snapshot exists (e.g. every capture was
+        skipped by the speculative-decode skew guard)."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = True
+
+        request = Request(
+            request_id="req-no-snap",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7, 8]  # Total = 8 (2 full blocks)
+        request._extracted_cache = [{"state": "live-cache"}]
+        request._model_cache_config = "live-config"
+
+        scheduler.running["req-no-snap"] = request
+        scheduler.requests["req-no-snap"] = request
+        # No boundary snapshots recorded for this request.
+
+        scheduler._cleanup_finished({"req-no-snap"})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_called_with(
+            "req-no-snap"
+        )
 
     def test_cleanup_finished_skips_output_tokens_for_reasoning_model(
         self, mock_model, mock_tokenizer
@@ -2727,6 +2905,42 @@ class TestExtractCacheStatesRotatingNormalization:
         assert bool(mx.all(normalized_values == expected_values).item())
         assert normalized_meta == ("0", "128", "1280", "128")
 
+    def test_extract_cache_states_normalizes_nested_cachelist_rotating_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """CacheList sub-caches should receive the same rotating normalization."""
+        mx = pytest.importorskip("mlx.core")
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = cache_mod.CacheList
+        RotatingKVCache = cache_mod.RotatingKVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        rotating = RotatingKVCache(max_size=128, keep=0)
+        rotating.keys = mx.arange(255).reshape(1, 1, 255, 1)
+        rotating.values = mx.arange(1000, 1255).reshape(1, 1, 255, 1)
+        rotating.offset = 1280
+        rotating._idx = 255
+        cache_list = CacheList(rotating)
+
+        expected_keys = rotating.keys[..., -128:, :]
+        expected_values = rotating.values[..., -128:, :]
+
+        extracted, _ = scheduler._extract_cache_states([cache_list])
+
+        assert len(extracted) == 1
+        assert extracted[0]["class_name"] == "CacheList"
+        sub_states = extracted[0]["state"]
+        sub_class_names, sub_meta_states = extracted[0]["meta_state"]
+        normalized_keys, normalized_values = sub_states[0]
+
+        assert sub_class_names == ["RotatingKVCache"]
+        assert tuple(sub_meta_states[0]) == ("0", "128", "1280", "128")
+        assert normalized_keys.shape == (1, 1, 128, 1)
+        assert normalized_values.shape == (1, 1, 128, 1)
+        assert bool(mx.all(normalized_keys == expected_keys).item())
+        assert bool(mx.all(normalized_values == expected_values).item())
+
 
 class TestSchedulerSSDLayerSignature:
     """Tests for pre-lookup SSD layer signature refresh."""
@@ -2736,7 +2950,10 @@ class TestSchedulerSSDLayerSignature:
     ):
         from mlx_lm.models.cache import KVCache
 
-        from omlx.cache.paged_ssd_cache import PagedSSDBlockMetadata
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDBlockMetadata,
+            _cache_compat_signature,
+        )
 
         class TwoLayerModel:
             config = SimpleNamespace(
@@ -2786,6 +3003,16 @@ class TestSchedulerSSDLayerSignature:
                 model_name="test-model",
                 block_size=4,
                 layer_cache_types=["TurboQuantKVCache", "KVCache"],
+                # TurboQuant blocks must prove their bit depth to survive a
+                # sweep under an active depth expectation (#2045); this is
+                # the signature the save path stamps since the fix.
+                cache_signature=_cache_compat_signature(
+                    model_name="test-model",
+                    num_layers=2,
+                    block_size=4,
+                    layer_cache_types=["TurboQuantKVCache", "KVCache"],
+                    turboquant_kv_bits=4.0,
+                ),
             )
             manager._index.add(stale)
             manager._index.add(fresh)
@@ -2799,6 +3026,86 @@ class TestSchedulerSSDLayerSignature:
             assert manager._expected_layer_cache_types == layer_cache_types
             assert manager._index.get(stale.block_hash) is None
             assert manager._index.get(fresh.block_hash) is not None
+        finally:
+            scheduler.shutdown()
+
+    def test_refresh_infers_layout_without_model_make_cache(
+        self, mock_tokenizer, tmp_path
+    ):
+        # Plain dense models (most mlx-lm architectures) define no
+        # make_cache; the request path builds their caches through
+        # make_prompt_cache's per-layer KVCache fallback. The refresh must
+        # infer through the same fallback — requiring model.make_cache made
+        # it a silent no-op for these models, so the manager never learned
+        # the TurboQuant bit depth and mixed-width blocks kept loading
+        # after a turboquant_kv_bits change (#2045).
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDBlockMetadata,
+            _cache_compat_signature,
+        )
+
+        turbo_types = ["TurboQuantKVCache", "KVCache"]
+
+        class PlainDenseModel:
+            config = SimpleNamespace(
+                num_hidden_layers=2,
+                num_key_value_heads=2,
+                num_attention_heads=2,
+                head_dim=32,
+            )
+            layers = [object(), object()]
+
+        scheduler = Scheduler(
+            model=PlainDenseModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=4,
+                model_name="test-model",
+            ),
+        )
+        try:
+            manager = scheduler.paged_ssd_cache_manager
+            assert manager is not None
+
+            def _block(block_hash: bytes, bits: float | None) -> PagedSSDBlockMetadata:
+                return PagedSSDBlockMetadata(
+                    block_hash=block_hash,
+                    file_path=tmp_path / "never-touched.safetensors",
+                    file_size=1024,
+                    token_count=4,
+                    created_at=0.0,
+                    last_access=0.0,
+                    num_layers=2,
+                    model_name="test-model",
+                    block_size=4,
+                    layer_cache_types=turbo_types,
+                    cache_signature=_cache_compat_signature(
+                        model_name="test-model",
+                        num_layers=2,
+                        block_size=4,
+                        layer_cache_types=turbo_types,
+                        turboquant_kv_bits=bits,
+                    ),
+                )
+
+            old_depth = _block(b"old".ljust(32, b"\0"), 4.0)
+            unproven = _block(b"unproven".ljust(32, b"\0"), None)
+            current = _block(b"current".ljust(32, b"\0"), 6.0)
+            manager._index.add(old_depth)
+            manager._index.add(unproven)
+            manager._index.add(current)
+
+            scheduler._turboquant_kv_bits = 6.0
+            scheduler._turboquant_skip_last = True
+
+            layer_cache_types = scheduler.refresh_ssd_layer_signature()
+
+            assert layer_cache_types == turbo_types
+            assert manager._expected_turboquant_kv_bits == 6.0
+            assert manager._index.get(old_depth.block_hash) is None
+            assert manager._index.get(unproven.block_hash) is None
+            assert manager._index.get(current.block_hash) is not None
         finally:
             scheduler.shutdown()
 
@@ -2921,6 +3228,52 @@ class TestCacheCorruptionRecovery:
         # Verify requests dict is also cleaned up (no memory leak)
         for rid in failed_ids:
             assert rid not in scheduler.requests
+
+    def test_fail_all_requests_republishes_admin_snapshot(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests must publish a fresh (empty) admin snapshot.
+
+        The snapshot is normally published at the end of a successful step().
+        When step() raises and fail_all_requests() clears the queues, the
+        stale snapshot would keep listing the dead requests, so the dashboard
+        and the macOS app show them as "generating" forever (#2126).
+        """
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # Simulate the last successful step publishing the running requests.
+        scheduler._publish_admin_snapshot()
+        assert len(scheduler.snapshot_for_admin()["running_by_id"]) == 3
+
+        scheduler.fail_all_requests()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {}
+        assert snap["waiting"] == []
+
+    def test_fail_all_requests_removes_prefill_tracker_entries(
+        self, mock_model, mock_tokenizer
+    ):
+        """fail_all_requests must drop PrefillProgressTracker entries.
+
+        A request failed mid-prefill never reaches processed >= total, so its
+        tracker entry has no auto-removal path. The local RuntimeError
+        handlers in the prefill paths cover memory errors (#1405), but other
+        exception types bubble up to fail_all_requests and would leave a
+        phantom "PP" row on the dashboard forever (#2126).
+        """
+        from omlx.prefill_progress import get_prefill_tracker
+
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        tracker = get_prefill_tracker()
+        tracker.clear()
+        tracker.update("req-0", processed=10, total=100, model_id="test")
+        assert tracker.get_model_progress("test"), "tracker entry not set up"
+
+        try:
+            scheduler.fail_all_requests()
+            assert tracker.get_model_progress("test") == []
+        finally:
+            tracker.clear()
 
     def test_fail_all_requests_preserves_cache(self, mock_model, mock_tokenizer):
         """fail_all_requests resets batch_generator but preserves block cache."""
@@ -3847,6 +4200,16 @@ class TestOutputParserSmoke:
         def decode(self, token_ids, skip_special_tokens: bool = True):
             return "".join(self._token_map.get(token_id, "") for token_id in token_ids)
 
+    class _DeepSeekV4Tokenizer(_GemmaTokenizer):
+        has_tool_calling = True
+        tool_call_start = "<｜DSML｜tool_calls>"
+        tool_call_end = "</｜DSML｜tool_calls>"
+
+        def tool_parser(self, text: str, tools=None):
+            from omlx.patches.deepseek_v4.tool_parser_v4 import parse_tool_call
+
+            return parse_tool_call(text, tools)
+
     def test_gemma4_session_selected_and_markers_hidden(self, mock_model):
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
@@ -3976,6 +4339,62 @@ class TestOutputParserSmoke:
         assert finished_ids == {"parser-stop-req"}
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "stop"
+
+    def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
+        mock_model.config.model_type = "deepseek_v4"
+        tokenizer = self._DeepSeekV4Tokenizer(
+            {
+                11: "Working\n",
+                12: '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n',
+                13: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n"
+                "</｜DSML｜tool_calls>\n"
+                '<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>',
+            }
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="DeepSeek-V4-Flash-oQ4e"),
+        )
+
+        assert scheduler._output_parser_kind == "deepseek_v4"
+
+        request = Request(
+            request_id="deepseek-v4-tool-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 12, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {"deepseek-v4-tool-req"}
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "tool_calls"
+        assert outputs[-1].output_text == "Working\n"
+        assert outputs[-1].new_token_ids == []
+        assert outputs[-1].tool_calls
+        assert outputs[-1].tool_calls[0]["name"] == "Bash"
+        assert json.loads(outputs[-1].tool_calls[0]["arguments"]) == {"command": "ls"}
+
+        full_stream = "".join(output.new_text for output in outputs)
+        assert full_stream == "Working\n"
+        assert "pwd" not in full_stream
+        assert "<｜DSML｜parameter" not in full_stream
 
 
 class TestVLMPositionStateClearing:
