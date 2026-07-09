@@ -300,25 +300,7 @@ class MLXRerankerModel:
             )
 
         # Pre-compute prefix and suffix tokens for the prompt template.
-        # Use apply_chat_template() for portability across tokenizer formats,
-        # then split on a sentinel to extract prefix/suffix boundaries.
-        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
-        messages = [
-            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
-            {"role": "user", "content": _SENTINEL},
-        ]
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        parts = template_str.split(_SENTINEL)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Chat template produced unexpected format; "
-                f"could not split on sentinel. Template: {template_str!r}"
-            )
-        prefix = parts[0]
-        # Append <think> block for models that use thinking-then-answering format
-        suffix = parts[1] + "<think>\n\n</think>\n\n"
+        prefix, suffix = self._extract_causal_lm_affixes(tokenizer)
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
@@ -331,6 +313,114 @@ class MLXRerankerModel:
         )
 
         return model, tokenizer
+
+    def _extract_causal_lm_affixes(self, tokenizer: Any) -> Tuple[str, str]:
+        """Extract the static prompt prefix/suffix around the rerank content.
+
+        Handles two chat template shapes:
+
+        1. Standard chat template (system/user roles): render with a sentinel
+           as the user content and split around it.
+        2. Reranker-native template (Qwen/Qwen3-Reranker ships one as
+           chat_template.jinja since its 2026-04 sentence-transformers
+           update, and MLX conversions made after that inherit it): the
+           template only understands system/query/document roles and silently
+           drops user messages, so the sentinel never appears in the output.
+           Render with per-slot sentinels instead and split around the
+           combined "<Instruct>/<Query>/<Document>" block — the exact content
+           that _rerank_causal_lm reconstructs at scoring time.
+        """
+        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
+        messages = [
+            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+            {"role": "user", "content": _SENTINEL},
+        ]
+        standard_rendered = ""
+        standard_error: Exception | None = None
+        try:
+            standard_rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            standard_error = e
+            logger.warning(
+                f"system/user chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+
+        parts = standard_rendered.split(_SENTINEL)
+        if len(parts) == 2:
+            # Append <think> block for models that use the
+            # thinking-then-answering format
+            return parts[0], parts[1] + "<think>\n\n</think>\n\n"
+
+        native_affixes, native_rendered, native_error = (
+            self._extract_reranker_native_affixes(tokenizer)
+        )
+        if native_affixes is not None:
+            logger.info(
+                "Using reranker-native chat template (query/document roles) "
+                f"for {self.model_name}"
+            )
+            return native_affixes
+
+        raise ValueError(
+            f"Could not extract CausalLM reranker prompt affixes for "
+            f"{self.model_name}. "
+            f"Standard system/user attempt: {standard_rendered!r} "
+            f"(error: {standard_error!r}). "
+            f"Reranker-native query/document attempt: {native_rendered!r} "
+            f"(error: {native_error!r})."
+        ) from (standard_error or native_error)
+
+    def _extract_reranker_native_affixes(
+        self, tokenizer: Any
+    ) -> "Tuple[Tuple[str, str] | None, str, Exception | None]":
+        """Extract affixes from a reranker-native chat template, if present.
+
+        Returns (affixes, rendered, error). Affixes is None when the template
+        raises or does not render the expected "<Instruct>/<Query>/<Document>"
+        content block; the rendered string and the exception (if any) are
+        returned for diagnostics.
+        """
+        instruct_sentinel = "<<__INSTRUCT_SENTINEL__>>"
+        query_sentinel = "<<__QUERY_SENTINEL__>>"
+        document_sentinel = "<<__DOCUMENT_SENTINEL__>>"
+        # The native template maps the system role to the <Instruct> slot; its
+        # judge system prompt is hardcoded inside the template itself.
+        messages = [
+            {"role": "system", "content": instruct_sentinel},
+            {"role": "query", "content": query_sentinel},
+            {"role": "document", "content": document_sentinel},
+        ]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"reranker-native chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+            return None, "", e
+
+        # Intentionally strict, byte-exact match against the content block the
+        # upstream Qwen/Qwen3-Reranker template renders. _rerank_causal_lm
+        # reconstructs this exact block at scoring time, so tolerating
+        # formatting drift here would silently produce prompts that differ
+        # from what the template intends; failing detection loudly is safer.
+        content_block = (
+            f"<Instruct>: {instruct_sentinel}\n"
+            f"<Query>: {query_sentinel}\n"
+            f"<Document>: {document_sentinel}"
+        )
+        parts = rendered.split(content_block)
+        if len(parts) != 2:
+            return None, rendered, None
+
+        # The native template already emits the trailing <think> block, so the
+        # suffix is used as-is.
+        return (parts[0], parts[1]), rendered, None
 
     def _load_jina_reranker(self) -> Tuple[Any, Any]:
         """
