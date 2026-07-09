@@ -174,8 +174,8 @@ private struct ConfigurationSection: View {
                          defaultValue: "Loading models…",
                          comment: "Throughput Bench section subtitle while models are loading")
                 : String(localized: "bench.throughput.subtitle.model_count",
-                         defaultValue: "\(models.count) model\(models.count == 1 ? "" : "s") available",
-                         comment: "Throughput Bench section subtitle showing how many models are available; placeholder is the count with pluralization")
+                         defaultValue: "Models available: \(models.count)",
+                         comment: "Throughput Bench section subtitle showing how many models are available; placeholder is the count")
         )
 
         ListGroup {
@@ -386,8 +386,8 @@ private struct LiveProgressCard: View {
                             .foregroundStyle(theme.textSecondary)
                     } else {
                         Text(String(localized: "bench.throughput.progress.running",
-                                    defaultValue: "Running… (\(resultCount) result\(resultCount == 1 ? "" : "s") so far)",
-                                    comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count with pluralization"))
+                                    defaultValue: "Running… results so far: \(resultCount)",
+                                    comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count"))
                             .font(.omlxText(12))
                             .foregroundStyle(theme.textSecondary)
                     }
@@ -440,8 +440,8 @@ private struct SingleResultsTable: View {
                    defaultValue: "Single Request Results",
                    comment: "Section header for the Throughput Bench single-request results table"),
             subtitle: String(localized: "bench.throughput.single.subtitle",
-                             defaultValue: "\(results.count) trial\(results.count == 1 ? "" : "s")",
-                             comment: "Subtitle for the single-request results table; placeholder is the count with pluralization")
+                             defaultValue: "Trials: \(results.count)",
+                             comment: "Subtitle for the single-request results table; placeholder is the count")
         )
 
         ListGroup {

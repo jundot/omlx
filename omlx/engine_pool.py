@@ -86,6 +86,7 @@ class EngineEntry:
     )
     source_type: str = "local"
     source_repo_id: str | None = None
+    is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -389,6 +390,7 @@ class EnginePool:
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
+                    is_helper=getattr(info, "is_helper", False),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -733,6 +735,7 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
+            unloaded_for_admission = False
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -754,6 +757,7 @@ class EnginePool:
                         model_id,
                     )
                     await self._unload_engine(model_id)
+                    unloaded_for_admission = True
                 # If force_lm requested but current engine is VLM, unload and reload
                 if (
                     entry.engine is not None
@@ -766,6 +770,7 @@ class EnginePool:
                         f"(force_lm=True, reloading as LM)"
                     )
                     await self._unload_engine(model_id)
+                    unloaded_for_admission = True
                 elif entry.engine is not None:
                     self._validate_llm_engine_ready(model_id, entry.engine)
                     if entry.runtime_settings_signature is None:
@@ -787,6 +792,7 @@ class EnginePool:
             # not yet wired up), so we admit unconditionally.
             ceiling = self._current_ceiling()
             if ceiling > 0:
+                evicted_any = unloaded_for_admission
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -812,24 +818,57 @@ class EnginePool:
                             f"{format_size(ceiling)})"
                         )
                         await self._unload_engine(victim)
+                        evicted_any = True
                         continue
-                    # Nothing else to evict -- model cannot fit. Use
+                    failure_current = current
+                    failure_projected = projected
+                    failure_label = "current"
+
+                    if evicted_any:
+                        # Nothing else to evict after unloading at least one
+                        # model in this get_engine() call. Before failing,
+                        # re-test against the *tracked committed* baseline.
+                        # The phys_footprint term folded into `current` is the
+                        # macOS kernel ledger, which can still count
+                        # reclaimable residue from models we just evicted.
+                        # Pinned/in-use models that could not be evicted remain
+                        # counted in _current_model_memory, preserving the
+                        # #1623 undercount guard. Without a local eviction,
+                        # keep trusting phys_footprint because it may be
+                        # unrelated process pressure rather than model residue.
+                        committed = max(
+                            mx.get_active_memory(), self._current_model_memory
+                        )
+                        committed_projected = committed + entry.estimated_size
+                        if committed_projected <= ceiling:
+                            logger.info(
+                                f"Admitting '{model_id}': committed baseline "
+                                f"{format_size(committed_projected)} fits ceiling "
+                                f"{format_size(ceiling)} "
+                                f"(live footprint {format_size(projected)} included "
+                                "reclaimable residue from evicted models)"
+                            )
+                            break
+                        failure_current = committed
+                        failure_projected = committed_projected
+                        failure_label = "committed"
+
+                    # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
                     # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when the model would fit on a clean process but the
-                    # current usage leaves no room.
+                    # when current usage leaves no room.
                     if entry.estimated_size > ceiling:
                         raise ModelTooLargeError(
                             model_id, entry.estimated_size, ceiling
                         )
                     raise InsufficientMemoryError(
                         required=entry.estimated_size,
-                        current=current,
+                        current=failure_current,
                         message=(
                             f"Cannot load {model_id}: projected memory "
-                            f"{format_size(projected)} would exceed the memory "
-                            f"ceiling {format_size(ceiling)} "
-                            f"(current: {format_size(current)}, "
+                            f"{format_size(failure_projected)} would exceed "
+                            f"the memory ceiling {format_size(ceiling)} "
+                            f"({failure_label}: {format_size(failure_current)}, "
                             f"model: {format_size(entry.estimated_size)}). "
                             "Free system memory or lower memory_guard_tier."
                         ),
@@ -1243,6 +1282,55 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    def _schedule_failed_load_reclaim(
+        self, model_id: str, pre_load_memory: int
+    ) -> None:
+        """Reclaim memory left behind by a failed model load.
+
+        When a load raises partway through (e.g. weights loaded, processor
+        construction failed), the weights are often reachable only via the
+        propagating exception's traceback frames. Spawn a background task
+        that waits briefly for the exception to be handled and dropped, then
+        runs gc + synchronize + clear_cache rounds until the live memory
+        reading returns near its pre-load level (or rounds are exhausted).
+        """
+
+        async def _reclaim() -> None:
+            loop = asyncio.get_running_loop()
+            # 2 GB slack over the pre-load level mirrors the unload settle
+            # barrier's small-model tolerance floor.
+            target = pre_load_memory + 2 * 1024**3
+            current = 0
+            for _round in range(6):
+                await asyncio.sleep(0.5 if _round == 0 else 1.0)
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                current = max(mx.get_active_memory(), get_phys_footprint())
+                if current <= target:
+                    logger.info(
+                        f"Reclaimed memory after failed load of '{model_id}': "
+                        f"current={format_size(current)} "
+                        f"(pre-load={format_size(pre_load_memory)})"
+                    )
+                    self._wake_process_memory_enforcer()
+                    return
+            logger.warning(
+                f"Post-failed-load reclaim for '{model_id}' did not settle: "
+                f"current={format_size(current)} "
+                f"(pre-load={format_size(pre_load_memory)}). A server restart "
+                f"may be required to release the leaked memory."
+            )
+            self._wake_process_memory_enforcer()
+
+        # Keep a reference so the task isn't garbage-collected mid-flight;
+        # one slot suffices -- a newer failure supersedes the previous task.
+        self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
+            _reclaim()
+        )
+
     async def _load_engine(
         self,
         model_id: str,
@@ -1286,7 +1374,7 @@ class EnginePool:
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
             # exists on the language model path. mtp_enabled was already
-            # validated as mutually exclusive with dflash / turboquant in
+            # validated as mutually exclusive with dflash in
             # metal-knowledge: with the mlx-vlm runtime MTP patch (see
             # omlx/patches/mlx_vlm_mtp/qwen35_moe_vlm_runtime.py) VLM models
             # can run MTP natively while keeping vision intact. The old
@@ -1637,6 +1725,16 @@ class EnginePool:
                 f"total: {format_size(self._current_model_memory)})"
             )
         except Exception as exc:
+            # A failed load can leave tens of GB of just-loaded weights
+            # reachable only through the propagating exception's traceback
+            # frames (loader-internal locals). Running gc/clear_cache
+            # synchronously here is useless -- the exception is still alive
+            # in the caller. Schedule a deferred reclaim that runs after the
+            # exception has been handled and dropped, so the buffers are
+            # actually released; otherwise the process footprint stays
+            # inflated and the memory-ceiling admission check rejects all
+            # subsequent loads until a server restart.
+            self._schedule_failed_load_reclaim(model_id, pre_load_memory)
             if not entry.abort_loading:
                 self._mark_load_failure(entry, exc)
                 logger.exception(
@@ -1735,6 +1833,7 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,

@@ -36,12 +36,17 @@ class TestRerankRequest:
         assert req.max_chunks_per_doc is None
 
     def test_dict_query_for_multimodal(self):
+        image = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+            "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        )
         req = RerankRequest(
             model="qwen3-vl-reranker",
-            query={"text": "a red car", "image": "https://x/y.jpg"},
+            query={"text": "a red car", "image": image},
             documents=["doc1"],
         )
-        assert req.query == {"text": "a red car", "image": "https://x/y.jpg"}
+        assert req.query == {"text": "a red car", "image": image}
 
     def test_dict_documents_for_multimodal(self):
         req = RerankRequest(

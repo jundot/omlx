@@ -59,6 +59,24 @@ def is_mtp_active() -> bool:
     return _MTP_ACTIVE
 
 
+# Draft depth (number of chained MTP draft tokens per verify cycle) for the
+# next model load. Same construction-time-flag pattern as _MTP_ACTIVE: the
+# patched ``TextModel.__init__`` copies it onto the instance
+# (``_omlx_mtp_depth``) so decode never reads the global. Depth > 1 only
+# engages on models whose patch marks ``_omlx_mtp_chain`` (Qwen3.5/3.6);
+# DeepSeek-V4 stays on the depth-1 legacy cycle.
+_MTP_DEPTH = 1
+
+
+def set_mtp_depth(depth: int) -> None:
+    global _MTP_DEPTH
+    _MTP_DEPTH = max(1, min(8, int(depth)))
+
+
+def get_mtp_depth() -> int:
+    return _MTP_DEPTH
+
+
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 
@@ -78,7 +96,13 @@ def apply_mlx_lm_mtp_patch() -> bool:
         True if the patch is now active. False if a sub-step refused
         to apply (mlx-lm not importable, missing prerequisite patch).
     """
-    from . import batch_generator, cache_rollback, deepseek_v4_model, qwen35_model
+    from . import (
+        batch_generator,
+        cache_rollback,
+        deepseek_v4_model,
+        glm_moe_dsa_model,
+        qwen35_model,
+    )
 
     if not cache_rollback.apply():
         return False
@@ -88,10 +112,21 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
+    if not glm_moe_dsa_model.apply():
+        logger.debug("GLM-5.2 MTP patch did not apply (likely missing base patch)")
     if not batch_generator.apply():
         logger.warning(
             "BatchGenerator MTP dispatch patch failed; MTP path will be inactive"
         )
         return False
+
+    # Verify-shape qmm kernels. Optional: inert unless armed around an MTP
+    # verify forward, and strictly shape-gated at call time.
+    try:
+        from ..qwen35_verify_qmm import apply_verify_qmm_patch
+
+        apply_verify_qmm_patch()
+    except Exception:
+        logger.debug("verify qmm patch not applied", exc_info=True)
 
     return True

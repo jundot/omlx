@@ -30,6 +30,15 @@ def _native_sparse_mla_default_min_k() -> str:
     return "11264" if glm_fast.has("glm_dsa_sparse_mla_attention") else str(2**63 - 1)
 
 
+# Decode-sized multi-row forwards (MTP draft verify and head folds run
+# L = depth+1 <= 8 rows). The min_k threshold above marks where the sparse
+# kernel beats the *prefill* paths; below it, small L would otherwise fall
+# through to the fallback that materializes full-cache multi-head K/V
+# (embed_q/unembed_out over every cached position) — the absorbed latent
+# path and the sparse kernel are both far cheaper at these shapes.
+_ABSORBED_DECODE_MAX_L = 8
+
+
 def _parse_topk_state(topk_state):
     topk_indices = topk_state
     prefix_rows = 0
@@ -259,12 +268,58 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         if self.indexer is not None and cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
+        # Decode-shape multi-row forwards (MTP draft verify and head folds):
+        # generalize the L == 1 per-row topk gather instead of dispatching
+        # the native sparse-MLA kernel, whose prefill-shaped grid runs ~8x
+        # slower than this at tiny L (4.2 ms vs 0.5 ms per layer at K≈4.7k).
+        # Each row attends to its own gathered top-k in latent space, so the
+        # cost is independent of context length. Indices are causally valid
+        # per row by construction (same contract the L == 1 path relies on).
+        if (
+            topk_indices is not None
+            and 1 < L <= _ABSORBED_DECODE_MAX_L
+            and B == 1
+            and topk_indices.shape[2] == L
+            and topk_prefix_rows == 0
+        ):
+            idx = topk_indices[0, 0]  # (L, topk)
+            kv_rows = kv_latent[0, 0][idx]  # (L, topk, latent)
+            pe_rows = k_pe[0, 0][idx]  # (L, topk, rope)
+            q_lat = self.embed_q(q_nope)  # (1, H, L, latent)
+            qg = q_lat.transpose(0, 2, 1, 3)[0][:, :, None]  # (L, H, 1, latent)
+            qp = q_pe.transpose(0, 2, 1, 3)[0][:, :, None]  # (L, H, 1, rope)
+            pe_scores = (qp * self.scale) @ pe_rows[:, None].swapaxes(-1, -2)
+            # The native indexer emits causally valid indices, but the
+            # argpartition fallback can select future rows; mask gathered
+            # keys past each row's own absolute position.
+            row_pos = mx.arange(
+                kv_latent.shape[2] - L, kv_latent.shape[2], dtype=idx.dtype
+            )
+            valid = idx <= row_pos[:, None]  # (L, topk)
+            pe_scores = mx.where(
+                valid[:, None, None, :],
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+            output = scaled_dot_product_attention(
+                qg,
+                kv_rows[:, None],
+                kv_rows[:, None],
+                cache=cache,
+                scale=self.scale,
+                mask=pe_scores,
+            )  # (L, H, 1, latent)
+            output = output[:, :, 0].transpose(1, 0, 2)[None]  # (1, H, L, latent)
+            output = self.unembed_out(output)
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output), topk_state
+
         direct_sparse_mla_min_k = int(
             _native_sparse_mla_default_min_k()
         )
         native_sparse_mla_shape = (
             topk_indices is not None
-            and self.num_heads == 64
+            and self.num_heads in (32, 64)  # 32 = tensor-sharded half of the 64 MLA heads
             and q_pe.shape[-1] == 64
             and kv_latent.shape[-1] == 512
             and k_pe.shape[-1] == 64
@@ -338,7 +393,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L <= _ABSORBED_DECODE_MAX_L
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -348,7 +404,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)

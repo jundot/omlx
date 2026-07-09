@@ -249,6 +249,7 @@ class TestModelSettings:
             "model_dirs": ["/models"],
             "model_dir": "/models",
             "model_fallback": False,
+            "hide_helper_models": False,
         }
 
     def test_from_dict(self):

@@ -1718,7 +1718,7 @@ class TestCountChatTokens:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,abc"},
+                        "image_url": {"url": _png_data_uri(1, 1)},
                     },
                     {"type": "text", "text": "Describe"},
                 ],
@@ -2028,6 +2028,14 @@ class TestReadImageDims:
         part = {"type": "image_url",
                 "image_url": {"url": "https://example.com/x.jpg"}}
         assert _read_image_dims(part) is None
+
+    def test_local_path_returns_none_without_opening(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url", "image_url": {"url": "/tmp/private.png"}}
+        with patch("PIL.Image.open") as image_open:
+            assert _read_image_dims(part) is None
+        image_open.assert_not_called()
 
     def test_garbage_returns_none(self):
         from omlx.engine.vlm import _read_image_dims

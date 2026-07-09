@@ -3,13 +3,13 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.31.2 was built with
-    # (MLX pins nanobind v2.12.0 / ABI v19 via FetchContent in its CMakeLists.txt).
-    # A newer nanobind (e.g. 2.13.0 / ABI v20) isolates the `mlx` NB_DOMAIN, so
-    # custom kernel extensions (omlx.custom_kernels.*) reject every mlx.core.array
-    # at the type caster with `incompatible function arguments`.
-    "nanobind==2.12.0",
-    "mlx==0.31.2",
+    # Pin nanobind to match the ABI version MLX 0.32.0 was built with
+    # (MLX pins nanobind v2.13.0 via FetchContent in its CMakeLists.txt).
+    # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
+    # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
+    # type caster with `incompatible function arguments`.
+    "nanobind==2.13.0",
+    "mlx==0.32.0",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -19,7 +19,7 @@ dynamic = ["version"]
 description = "LLM inference server, optimized for your Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [
     {name = "omlx contributors"}
 ]
@@ -39,24 +39,24 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.31.2; optional custom kernels live under
-    # omlx.custom_kernels.* when built for release.
-    "mlx==0.31.2",
-    # mlx-lm from commit (2ed2231, v0.31.3) - DeepSeek/GLM DSA indexer
-    # RoPE fix, trust_remote_code load gate, transformers 5.7.0 compatibility,
-    # and prior BatchGenerator/cache fixes.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
+    # Vanilla MLX v0.32.0; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release. The bundled kernel
+    # binaries are ABI-coupled to this exact mlx version — bumping the pin
+    # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
+    "mlx==0.32.0",
+    # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
+    # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
+    # RoPE fix, trust_remote_code load gate, transformers 5.7.0
+    # compatibility, and prior BatchGenerator/cache fixes.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    # <5.13: transformers 5.13.0 (released 2026-07-03) tightened
-    # _LazyAutoMapping.register to require config classes, breaking mlx-lm
-    # 0.31.3's AutoTokenizer.register("NewlineTokenizer", ...) at import time
-    # (AttributeError: 'str' object has no attribute '__module__'). Every
-    # `import mlx_lm` fails on a fresh resolve. Lift once the mlx-lm pin
-    # advances past a fix.
+    # Keep <5.13 until the broader dependency set gets a dedicated resolver
+    # smoke test with transformers 5.13+. The mlx-lm pin above includes the
+    # known NewlineTokenizer registration fix.
     "transformers>=5.7.0,<5.13",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
@@ -132,7 +132,7 @@ paroquant = [
     # with --no-deps semantics here because the official [mlx] extra pulls
     # torchvision, which the load path doesn't actually use (verified end
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
-    "paroquant==0.1.15; python_version >= '3.11'",
+    "paroquant==0.1.16; python_version >= '3.11'",
 ]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the
@@ -177,7 +177,7 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
-    "xgrammar==0.2.0",
+    "xgrammar==0.2.3",
     "apache-tvm-ffi==0.1.11",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
@@ -192,7 +192,7 @@ dev = [
     "mypy>=1.0.0",
     "mcp>=1.5.0",
     "venvstacks>=0.7.0",
-    "xgrammar==0.2.0",
+    "xgrammar==0.2.3",
     "apache-tvm-ffi==0.1.11",
 ]
 
@@ -212,18 +212,19 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json"]
+"omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
-    "mlx==0.31.2",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@2ed22318cd6a2fcc5c2e0caa1e1fb0ddeb7cafd5",
+    "mlx==0.32.0",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
 ]
 
 [tool.black]

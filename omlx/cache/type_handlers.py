@@ -963,9 +963,11 @@ class CacheListHandler(CacheTypeHandler):
     ) -> Any:
         """Reconstruct CacheList from stored state.
 
-        Tries new mlx-lm CacheList.from_state() first, then falls back to
-        manual sub-cache reconstruction using CacheTypeRegistry (local import
-        to avoid circular dependency).
+        Rebuild sub-caches through omlx handlers before falling back to
+        upstream ``CacheList.from_state()``. The handler route is required for
+        restored nested caches whose local contracts differ from mlx-lm's raw
+        constructor, notably RotatingKVCache snapshots that must be trimmed into
+        PrefillReadyRotatingKVCache before reuse.
 
         Args:
             state: Dict with 'sub_states' key containing per-sub-cache states.
@@ -996,28 +998,6 @@ class CacheListHandler(CacheTypeHandler):
             )
             return None
 
-        # Sanitize sub_meta_states for sub-cache types that don't support
-        # meta_state (inherit _BaseCache's strict setter which rejects
-        # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        no_meta_state_types = frozenset(
-            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
-        )
-        sanitized_sub_meta_states = [
-            "" if cls_name in no_meta_state_types else sub_meta
-            for cls_name, sub_meta in zip(class_names, sub_meta_states)
-        ]
-
-        # Try new mlx-lm CacheList.from_state() first
-        try:
-            from mlx_lm.models.cache import CacheList
-
-            return CacheList.from_state(
-                sub_states, (class_names, sanitized_sub_meta_states)
-            )
-        except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
-            logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
-
-        # Fallback: manually reconstruct sub-caches
         # NOTE: CacheTypeRegistry must be imported locally to avoid circular import
         # (type_handlers.py is imported by type_registry.py)
         try:
@@ -1028,53 +1008,83 @@ class CacheListHandler(CacheTypeHandler):
 
         from .type_registry import CacheTypeRegistry as _Registry  # local import
 
+        handler_reconstruct_failed = False
         sub_caches = []
-        for sub_state, cls_name, sub_meta in zip(
-            sub_states, class_names, sub_meta_states
-        ):
-            # Normalize class name for handler lookup
-            normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
-            sub_handler = _Registry.get_handler_by_class_name(normalized_name)
+        try:
+            for sub_state, cls_name, sub_meta in zip(
+                sub_states, class_names, sub_meta_states
+            ):
+                # Normalize class name for handler lookup
+                normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
+                sub_handler = _Registry.get_handler_by_class_name(normalized_name)
 
-            try:
-                if normalized_name in ("ArraysCache", "SizedArraysCache"):
-                    sub_cache = sub_handler.reconstruct_cache(
-                        {"states": list(sub_state)}, sub_meta
+                try:
+                    if normalized_name in ("ArraysCache", "SizedArraysCache"):
+                        sub_cache = sub_handler.reconstruct_cache(
+                            {"states": list(sub_state)}, sub_meta
+                        )
+                    elif isinstance(sub_state, (list, tuple)):
+                        # Generic N-tuple dispatch via the new deserialize_state
+                        # interface. Handlers that have a 3-tuple state (e.g.
+                        # PoolingCache: buf_kv, buf_gate, pooled) override
+                        # deserialize_state to consume all elements; default
+                        # implementation maps the first two to (keys, values)
+                        # which matches the legacy contract for KVCache /
+                        # RotatingKVCache.
+                        sub_cache = sub_handler.deserialize_state(
+                            tuple(sub_state), sub_meta
+                        )
+                    else:
+                        logger.debug(
+                            f"CacheList handler reconstruction skipped: "
+                            f"unexpected sub_state format for {cls_name}"
+                        )
+                        handler_reconstruct_failed = True
+                        break
+                except Exception as e:
+                    logger.debug(
+                        f"CacheList handler reconstruction failed for {cls_name}: {e}"
                     )
-                elif isinstance(sub_state, (list, tuple)):
-                    # Generic N-tuple dispatch via the new deserialize_state
-                    # interface. Handlers that have a 3-tuple state (e.g.
-                    # PoolingCache: buf_kv, buf_gate, pooled) override
-                    # deserialize_state to consume all elements; default
-                    # implementation maps the first two to (keys, values)
-                    # which matches the legacy contract for KVCache /
-                    # RotatingKVCache.
-                    sub_cache = sub_handler.deserialize_state(
-                        tuple(sub_state), sub_meta
+                    handler_reconstruct_failed = True
+                    break
+
+                if sub_cache is None:
+                    logger.debug(
+                        f"CacheList handler reconstruction failed: "
+                        f"sub-cache {cls_name} returned None"
                     )
-                else:
-                    logger.error(
-                        f"CacheList fallback: unexpected sub_state format "
-                        f"for {cls_name}"
-                    )
-                    return None
-            except Exception as e:
-                logger.error(
-                    f"CacheList fallback: failed to reconstruct {cls_name}: {e}"
-                )
-                return None
+                    handler_reconstruct_failed = True
+                    break
 
-            if sub_cache is None:
-                logger.error(f"CacheList fallback: sub-cache {cls_name} returned None")
-                return None
+                # Unwrap SizedArraysCache for CacheList (CacheList expects raw ArraysCache)
+                if isinstance(sub_cache, SizedArraysCache):
+                    sub_cache = sub_cache._inner
 
-            # Unwrap SizedArraysCache for CacheList (CacheList expects raw ArraysCache)
-            if isinstance(sub_cache, SizedArraysCache):
-                sub_cache = sub_cache._inner
+                sub_caches.append(sub_cache)
+        except Exception as e:
+            logger.debug(f"CacheList handler reconstruction failed: {e}")
+            handler_reconstruct_failed = True
 
-            sub_caches.append(sub_cache)
+        if not handler_reconstruct_failed:
+            return CacheList(*sub_caches)
 
-        return CacheList(*sub_caches)
+        # Last-resort compatibility path for unknown CacheList sub-caches.
+        # This bypasses omlx handlers, so it must not be the preferred path.
+        no_meta_state_types = frozenset(
+            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
+        )
+        sanitized_sub_meta_states = [
+            "" if cls_name in no_meta_state_types else sub_meta
+            for cls_name, sub_meta in zip(class_names, sub_meta_states)
+        ]
+
+        try:
+            return CacheList.from_state(
+                sub_states, (class_names, sanitized_sub_meta_states)
+            )
+        except Exception as e:
+            logger.error(f"CacheList.from_state() fallback failed: {e}")
+            return None
 
     def _get_state_keys(self) -> tuple[str, ...]:
         return ("sub_states", "sub_class_names", "sub_meta_states")
@@ -1236,13 +1246,9 @@ class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
             return {}
 
         keys_list = [s.get("keys") for s in states if s.get("keys") is not None]
-        values_list = [
-            s.get("values") for s in states if s.get("values") is not None
-        ]
+        values_list = [s.get("values") for s in states if s.get("values") is not None]
         index_list = [
-            s.get("index_keys")
-            for s in states
-            if s.get("index_keys") is not None
+            s.get("index_keys") for s in states if s.get("index_keys") is not None
         ]
         if not keys_list or not values_list:
             return {}

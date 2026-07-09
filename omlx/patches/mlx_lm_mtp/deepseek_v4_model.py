@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` carries our marker. Mirror of the helper
     in qwen35_model — used for self-healing idempotency so a dflash
@@ -69,6 +70,7 @@ def apply() -> bool:
 # ModelArgs — extend compress_ratios to cover MTP layers.
 # ---------------------------------------------------------------------------
 
+
 def _patch_model_args(dsv4: Any) -> None:
     """Wrap ``ModelArgs.from_dict`` so MTP layers get a default compress_ratio.
 
@@ -106,6 +108,7 @@ def _patch_model_args(dsv4: Any) -> None:
 # ---------------------------------------------------------------------------
 # MTPBlock — register on the module.
 # ---------------------------------------------------------------------------
+
 
 def _register_mtp_block(dsv4: Any) -> None:
     """Define ``MTPBlock`` and attach it to the module."""
@@ -162,6 +165,7 @@ def _register_mtp_block(dsv4: Any) -> None:
 # ---------------------------------------------------------------------------
 # DeepseekV4Model — return_raw_hidden support.
 # ---------------------------------------------------------------------------
+
 
 def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     """Replace ``DeepseekV4Model.__call__`` to optionally return the raw 4D hidden."""
@@ -238,6 +242,7 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 # replace sanitize with the PR 15 body that handles MTP weight remapping.
 # ---------------------------------------------------------------------------
 
+
 def _patch_model(dsv4: Any) -> None:
     cls = dsv4.Model
     init_wrapped = getattr(cls, "_omlx_mtp_init_wrapped", False)
@@ -273,6 +278,16 @@ def _patch_model(dsv4: Any) -> None:
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
+            # Depth-k chained drafting is available: mtp_forward supports
+            # return_hidden below, backbone rollback goes through
+            # mtp_partial_rollback, and the head cache is a RotatingKVCache
+            # (not exactly trimmable once rotated) so the chain runs its
+            # speculative head steps on a per-cycle clone.
+            from . import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_head_clone = True
 
     def __call__(
         self,
@@ -311,9 +326,8 @@ def _patch_model(dsv4: Any) -> None:
             ratio = getattr(attn, "compress_ratio", 0)
             if ratio == 0:
                 caches.append(RotatingKVCache(max_size=sw))
-            elif (
-                SparseCompressedAttention is not None
-                and isinstance(attn, SparseCompressedAttention)
+            elif SparseCompressedAttention is not None and isinstance(
+                attn, SparseCompressedAttention
             ):
                 caches.append(
                     CacheList(
@@ -331,7 +345,14 @@ def _patch_model(dsv4: Any) -> None:
                 )
         return caches
 
-    def mtp_forward(self, h, input_ids, cache=None):
+    def mtp_forward(
+        self,
+        h,
+        input_ids,
+        cache=None,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
         """Run the chained MTP blocks + final hc_head/norm/lm_head on a 4D hidden.
 
         Mirrors PR 15: each MTP block fuses ``h`` with the embedded
@@ -339,6 +360,13 @@ def _patch_model(dsv4: Any) -> None:
         passes the result through a ``DeepseekV4Block``. The last block's
         ``hc_head`` collapses the Hyper-head dimension before ``norm`` and
         the shared ``lm_head`` produce logits.
+
+        ``return_hidden`` additionally returns the last block's raw 4D
+        output — the chain feeds it back as the next draft step's ``h``
+        (the same contract the block sees when consuming trunk hidden).
+        ``logits_keep`` limits the hc_head/norm/lm_head tail to the last N
+        positions (0 = all); the chain's history+draft fold only needs the
+        final position and the vocab is large enough that it matters.
         """
         if cache is None:
             cache = [None] * len(self.mtp)
@@ -357,16 +385,79 @@ def _patch_model(dsv4: Any) -> None:
 
         last_block = None
         for mtp_block, layer_cache in zip(self.mtp, cache):
-            h = mtp_block(
-                h, self.model.embed_tokens, input_ids, mask, layer_cache
-            )
+            h = mtp_block(h, self.model.embed_tokens, input_ids, mask, layer_cache)
             last_block = mtp_block
 
         materialize_cache_arrays(cache)
 
-        out = last_block.hc_head(h)
+        logits_source = h
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:]
+        out = last_block.hc_head(logits_source)
         out = last_block.norm(out)
-        return self.lm_head(out)
+        logits = self.lm_head(out)
+        if return_hidden:
+            return logits, h
+        return logits
+
+    def _cache_can_trim(c, n: int) -> bool:
+        """Non-mutating check that ``c.trim(n)`` will succeed.
+
+        Needed because a failed ``trim`` on one layer after earlier layers
+        already trimmed leaves per-layer lengths desynchronised (the hazard
+        ``_restore_or_trim_caches`` documents). PoolingCaches expose the
+        exact undo feasibility; rotating caches accept the trim while the
+        armed undo (or an unrotated buffer) covers it.
+        """
+        if isinstance(c, CacheList):
+            return all(_cache_can_trim(sub, n) for sub in c.caches)
+        remainder = getattr(c, "remainder", None)
+        if remainder is not None:  # PoolingCache / BatchPoolingCache
+            rem_min = remainder if isinstance(remainder, int) else min(remainder)
+            if n <= rem_min:
+                return True
+            can_undo = getattr(c, "_can_undo", None)
+            return bool(can_undo and can_undo(n))
+        is_trimmable = getattr(c, "is_trimmable", None)
+        if callable(is_trimmable) and is_trimmable():
+            return True
+        # Rotated RotatingKVCache: the cache_rollback undo stash covers the
+        # last armed multi-token write.
+        undo = getattr(c, "_mtp_undo", None)
+        if undo is not None:
+            return undo[1].shape[2] >= n
+        return False
+
+    def mtp_clamp_accept(self, cache, accepted: int, num_drafts: int) -> int:
+        """Largest ``m' <= accepted`` whose rollback every layer supports.
+
+        Emitting fewer verified drafts than the acceptance test allowed is
+        always correct (the skipped ones are re-derived next cycle); it
+        just wastes a little verified work. This keeps the chain alive when
+        a PoolingCache can't replay a longer confirmed prefix (its pooled
+        windows can't be reconstructed inside ``trim``).
+        """
+        for m in range(accepted, -1, -1):
+            n = num_drafts - m
+            if n <= 0 or all(_cache_can_trim(c, n) for c in cache):
+                return m
+        return 0
+
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """Trim the verify window back to ``accepted`` drafts on every layer."""
+        n = num_drafts - accepted
+        if n <= 0:
+            return True
+        if not all(_cache_can_trim(c, n) for c in cache):
+            return False
+        for c in cache:
+            if c.trim(n) != n:
+                logger.warning(
+                    "DeepSeek-V4 MTP rollback trim shortfall on %s",
+                    type(c).__name__,
+                )
+                return False
+        return True
 
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         """Combined oMLX-base + PR 15 sanitize.
@@ -455,8 +546,14 @@ def _patch_model(dsv4: Any) -> None:
         remapped = {}
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         mtp_block_subs = (
-            "attn.", "ffn.", "attn_norm.", "ffn_norm.",
-            "hc_attn_", "hc_ffn_",
+            "attn.",
+            "ffn.",
+            "attn_norm.",
+            "ffn_norm.",
+            "hc_attn_",
+            "hc_ffn_",
+            "hc_attn.",
+            "hc_ffn.",
         )
         for k, v in weights.items():
             nk = "model." + k if k.startswith("layers.") else k
@@ -474,6 +571,19 @@ def _patch_model(dsv4: Any) -> None:
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
+            skip = False
+            for old, new in (
+                (".hc_attn.", ".attn_hc."),
+                (".hc_ffn.", ".ffn_hc."),
+            ):
+                if old in nk:
+                    candidate = nk.replace(old, new)
+                    if candidate in weights or candidate in remapped:
+                        skip = True
+                        break
+                    nk = candidate
+            if skip:
+                continue
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             remapped[nk] = v
@@ -548,4 +658,6 @@ def _patch_model(dsv4: Any) -> None:
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_clamp_accept = mtp_clamp_accept
+    cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize

@@ -298,8 +298,8 @@ private struct ConfigurationSection: View {
                                           comment: "Accuracy Bench section subtitle while models are loading") }
         let count = selectedBenchmarks.count
         return String(localized: "bench.accuracy.subtitle.selected_count",
-                      defaultValue: "\(count) benchmark\(count == 1 ? "" : "s") selected",
-                      comment: "Accuracy Bench section subtitle showing how many benchmarks the user has picked; placeholder is the count with pluralization")
+                      defaultValue: "Benchmarks selected: \(count)",
+                      comment: "Accuracy Bench section subtitle showing how many benchmarks the user has picked; placeholder is the count")
     }
 
     private var benchmarksSubtitle: String {
@@ -630,7 +630,7 @@ private struct ResultsSection: View {
                        defaultValue: "Results",
                        comment: "Section header for the Accuracy Bench results list"),
                 subtitle: String(localized: "bench.accuracy.results.subtitle",
-                                 defaultValue: "\(results.count) result\(results.count == 1 ? "" : "s")",
+                                 defaultValue: "Results: \(results.count)",
                                  comment: "Subtitle showing the number of accumulated Accuracy Bench results")
             ) {
                 Button(String(localized: "bench.accuracy.results.clear_all",

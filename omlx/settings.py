@@ -203,6 +203,9 @@ class ModelSettings:
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool = False  # Use default model when requested model not found
+    hide_helper_models: bool = (
+        False  # Hide dFlash/Assistant/Draft helper models from /v1/models
+    )
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -238,6 +241,7 @@ class ModelSettings:
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
             "model_fallback": self.model_fallback,
+            "hide_helper_models": self.hide_helper_models,
         }
 
     @classmethod
@@ -251,6 +255,7 @@ class ModelSettings:
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
             model_fallback=data.get("model_fallback", False),
+            hide_helper_models=data.get("hide_helper_models", False),
         )
 
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from omlx.eval.datasets import deterministic_sample, stratified_sample
@@ -404,3 +406,49 @@ async def test_load_sample_per_benchmark(name):
     items = await BENCHMARKS[name]().load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"
+
+
+class TestEvalSingleSampling:
+    """_eval_single fills benchmark-neutral sampling defaults but lets a
+    caller-supplied sampling_kwargs (the "model_settings" profile) override
+    temperature/penalties; max_tokens stays benchmark-controlled regardless."""
+
+    async def _captured_chat_kwargs(self, sampling_kwargs):
+        bench = MMLUBenchmark()
+        captured = {}
+
+        async def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(text="A")
+
+        engine = MagicMock()
+        engine.chat = fake_chat
+        engine.model_type = "llm"
+        item = {
+            "question": "What is 2+2?",
+            "choices": ["1", "2", "3", "4"],
+            "answer": 3,
+            "subject": "math",
+        }
+        await bench._eval_single(
+            engine, item, 0, sampling_kwargs=sampling_kwargs, enable_thinking=False
+        )
+        return captured
+
+    async def test_defaults_to_greedy_when_empty(self):
+        kwargs = await self._captured_chat_kwargs({})
+        assert kwargs["temperature"] == 0.0
+        assert kwargs["presence_penalty"] == 0.0
+        assert kwargs["repetition_penalty"] == 1.0
+
+    async def test_caller_sampling_overrides_defaults(self):
+        kwargs = await self._captured_chat_kwargs(
+            {"temperature": 0.7, "presence_penalty": 0.3, "repetition_penalty": 1.1}
+        )
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["presence_penalty"] == 0.3
+        assert kwargs["repetition_penalty"] == 1.1
+
+    async def test_max_tokens_always_benchmark_controlled(self):
+        kwargs = await self._captured_chat_kwargs({"max_tokens": 5})
+        assert kwargs["max_tokens"] != 5

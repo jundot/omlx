@@ -19,15 +19,18 @@ except ImportError:
 
 from omlx.oq import (
     _LEVEL_BITS,
+    _LEVEL_EXPERT_DOWN_BOOST,
     _MAX_MODEL_RAM_FRACTION,
     _OQ_BPW_TARGETS,
     _PROXY_QUANT_BITS,
     _PROXY_QUANT_GROUP_SIZE,
+    _ROUTED_LAYER_BOOST_LEVELS,
     OQ_LEVELS,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
     _build_streaming_proxy_for_sensitivity,
+    _config_expects_moe_expert_counts,
     _discover_sanitize_plan,
     _DiscoveredPlan,
     _extract_layer_index,
@@ -38,6 +41,7 @@ from omlx.oq import (
     _ImatrixCaptureWrapper,
     _imatrix_expert_coverage_stats,
     _imatrix_expert_coverage_sufficient,
+    _imatrix_requires_expert_counts,
     _is_audio_tensor,
     _is_moe_router,
     _is_vision_tensor,
@@ -1006,21 +1010,22 @@ class TestLevelBudgetPlan:
 
     def test_bpw_targets_for_level_returns_correct_values(self):
         assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
-        assert _bpw_targets_for_level(2.8) == (3.35, 3.45)
+        assert _bpw_targets_for_level(2.7) == (3.25, 3.35)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
         assert _bpw_targets_for_level(5) == (5.5, 5.7)
         assert _bpw_targets_for_level(6) == (6.5, 6.7)
+        assert _bpw_targets_for_level(2.8) is None
 
-    def test_oq25_base_bits_is_2(self):
+    def test_oq2_fractional_base_bits_are_2(self):
         assert _LEVEL_BITS[2.5] == 2
-        assert _LEVEL_BITS[2.8] == 2
+        assert _LEVEL_BITS[2.7] == 2
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
-    def test_half_level_mandatory_expert_down_proj_boost(self, oq_level, expected_bits):
-        """Fractional levels protect routed expert down_proj above base bits
+    def test_oq35_mandatory_expert_down_proj_boost(self):
+        """oQ3.5 protects routed expert down_proj above base bits
         even with negligible sensitivity scores."""
+        oq_level = 3.5
         named_shapes = {
             "model.layers.0.mlp.switch_mlp.down_proj": (8, 256, 256),
             "model.layers.0.mlp.switch_mlp.gate_proj": (8, 256, 256),
@@ -1038,11 +1043,24 @@ class TestLevelBudgetPlan:
         )
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
-        assert boost["bits"] == expected_bits
+        assert boost["bits"] == 4
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
-    def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
-        """The non-budget predicate floor mirrors the mandatory boost."""
+    def test_oq35_predicate_floor_for_expert_down_proj(self):
+        """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""
+        config = {
+            "num_hidden_layers": 32,
+            "num_experts": 8,
+            "hidden_size": 1024,
+        }
+        result = universal_quant_predicate(
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, 3.5
+        )
+        assert isinstance(result, dict)
+        assert result["bits"] == 4
+
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7])
+    def test_oq2x_predicate_keeps_routed_down_proj_at_base_without_plan(self, oq_level):
+        """oQ2.5/oQ2.7 use budget-planned routed boosts."""
         config = {
             "num_hidden_layers": 32,
             "num_experts": 8,
@@ -1050,19 +1068,6 @@ class TestLevelBudgetPlan:
         }
         result = universal_quant_predicate(
             "model.layers.5.mlp.switch_mlp.down_proj", None, config, oq_level
-        )
-        assert isinstance(result, dict)
-        assert result["bits"] == expected_bits
-
-    def test_oq28_predicate_keeps_routed_down_proj_at_base_without_plan(self):
-        """oQ2.8 uses budget-planned routed boosts, not a blanket predicate floor."""
-        config = {
-            "num_hidden_layers": 32,
-            "num_experts": 8,
-            "hidden_size": 1024,
-        }
-        result = universal_quant_predicate(
-            "model.layers.5.mlp.switch_mlp.down_proj", None, config, 2.8
         )
         assert result is True
 
@@ -1076,6 +1081,14 @@ class TestLevelBudgetPlan:
     def test_budget_plan_oq2_enabled(self):
         assert 2 in _OQ_BPW_TARGETS
         assert _bpw_targets_for_level(2) == (2.8, 3.0)
+
+    def test_oq2_fractional_levels_use_routed_layer_boosts(self):
+        for level in (2.5, 2.7):
+            assert level in OQ_LEVELS
+            assert level in _ROUTED_LAYER_BOOST_LEVELS
+            assert level not in _LEVEL_EXPERT_DOWN_BOOST
+        assert 2.8 not in OQ_LEVELS
+        assert 2.8 not in _ROUTED_LAYER_BOOST_LEVELS
 
     def test_budget_plan_oq8_not_enabled(self):
         assert 8 not in _OQ_BPW_TARGETS
@@ -1181,8 +1194,9 @@ class TestLevelBudgetPlan:
         for k in plan.boost_map:
             assert "switch_mlp" not in k
 
-    def test_oq28_boosts_routed_down_proj_by_layer_sensitivity(self):
-        """oQ2.8 can boost routed projections, but only by whole layer modules."""
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7])
+    def test_oq2x_boosts_routed_down_proj_by_layer_sensitivity(self, oq_level):
+        """oQ2.5/oQ2.7 boost routed projections by whole layer modules."""
         named_shapes = {}
         for i in range(2):
             named_shapes[f"model.layers.{i}.ffn.switch_mlp.gate_proj"] = (8, 64, 64)
@@ -1194,13 +1208,14 @@ class TestLevelBudgetPlan:
             "_oq_sensitivity_map": {"0": 1.0, "1": 0.1},
         }
         plan = _build_quant_plan(
-            named_shapes, config, 2.8, target_bpw=2.65, hard_cap_bpw=2.7
+            named_shapes, config, oq_level, target_bpw=2.65, hard_cap_bpw=2.7
         )
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
         assert "model.layers.1.ffn.switch_mlp.down_proj" not in plan.boost_map
 
-    def test_oq28_boosts_gate_up_pair_after_routed_down_proj(self):
-        """After routed w2/down_proj, oQ2.8 boosts gate+up as a layer pair."""
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7])
+    def test_oq2x_boosts_gate_up_pair_after_routed_down_proj(self, oq_level):
+        """After routed w2/down_proj, oQ2.5/oQ2.7 boost gate+up as a pair."""
         named_shapes = {
             "model.layers.0.ffn.switch_mlp.gate_proj": (8, 64, 64),
             "model.layers.0.ffn.switch_mlp.up_proj": (8, 64, 64),
@@ -1212,11 +1227,29 @@ class TestLevelBudgetPlan:
             "_oq_sensitivity_map": {"0": 1.0},
         }
         plan = _build_quant_plan(
-            named_shapes, config, 2.8, target_bpw=3.4, hard_cap_bpw=3.6
+            named_shapes, config, oq_level, target_bpw=3.4, hard_cap_bpw=3.6
         )
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.gate_proj"]["bits"] == 3
         assert plan.boost_map["model.layers.0.ffn.switch_mlp.up_proj"]["bits"] == 3
+
+    @pytest.mark.parametrize("oq_level", [2.5, 2.7])
+    def test_oq2x_prioritizes_dense_greedy_before_routed_fallback(self, oq_level):
+        """oQ2.5/oQ2.7 spend target budget on dense sensitivity first."""
+        named_shapes = {
+            "model.layers.0.ffn.switch_mlp.down_proj": (8, 64, 64),
+            "model.layers.0.mlp.gate_proj": (8, 64, 64),
+        }
+        config = {
+            "num_hidden_layers": 2,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0, "1": 0.1},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level, target_bpw=3.0, hard_cap_bpw=3.01
+        )
+        assert plan.boost_map["model.layers.0.mlp.gate_proj"]["bits"] == 3
+        assert "model.layers.0.ffn.switch_mlp.down_proj" not in plan.boost_map
 
     def test_oq2_budget_plan_respects_cap(self):
         """oQ2 with budget plan should stay within hard cap."""
@@ -1315,9 +1348,9 @@ class TestLevelBudgetPlan:
         plan = _build_quant_plan(
             named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
         )
-        assert plan.effective_bpw >= 2.7, (
-            f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
-        )
+        assert (
+            plan.effective_bpw >= 2.7
+        ), f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
         assert plan.effective_bpw <= 3.0
         # Attention should be boosted via protection floor
         attn_boosts = [k for k in plan.boost_map if "q_proj" in k or "v_proj" in k]
@@ -1700,6 +1733,52 @@ class TestOQImatrixCollector:
         assert stats["zero_count_experts"] == 0
         assert stats["p05_count"] >= 16
         assert _imatrix_expert_coverage_sufficient(stats) is True
+
+    def test_expert_coverage_requires_counts_for_moe_config(self):
+        dense_only = {
+            "dense": OQImatrixEntry(
+                in_sum2=np.zeros((8,), dtype=np.float32),
+                counts=np.array([1024], dtype=np.int64),
+            )
+        }
+        stats = _imatrix_expert_coverage_stats(dense_only)
+
+        assert stats["has_expert_counts"] is False
+        assert _imatrix_expert_coverage_sufficient(stats) is True
+        assert (
+            _imatrix_expert_coverage_sufficient(stats, require_expert_counts=True)
+            is False
+        )
+        assert _config_expects_moe_expert_counts({"n_routed_experts": 256}) is True
+        assert _imatrix_requires_expert_counts({"n_routed_experts": 256}, 0) is False
+        assert _imatrix_requires_expert_counts({"n_routed_experts": 256}, 3) is True
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+    def test_quantized_switch_linear_capture_uses_logical_input_dims(self):
+        class QuantizedSwitchLinear:
+            weight = mx.zeros((3, 2, 1), dtype=mx.uint32)
+
+            @property
+            def input_dims(self):
+                return 4
+
+            @property
+            def num_experts(self):
+                return 3
+
+        module = QuantizedSwitchLinear()
+        collector = OQImatrixCollector()
+        x = mx.array([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]])
+        indices = mx.array([[[0, 2], [2, 1]]], dtype=mx.int32)
+
+        assert collector._is_capture_module(module) is True
+        collector.collect_switch("experts", module, x, indices)
+
+        entry = collector.entries["experts"]
+        np.testing.assert_array_equal(entry.counts, np.array([1, 1, 2]))
+        np.testing.assert_allclose(entry.in_sum2[0], np.array([1.0, 4.0, 9.0, 16.0]))
+        np.testing.assert_allclose(entry.in_sum2[1], np.array([25.0, 36.0, 49.0, 64.0]))
+        np.testing.assert_allclose(entry.in_sum2[2], np.array([26.0, 40.0, 58.0, 80.0]))
 
 
 class TestOQECalibrationData:
@@ -2235,8 +2314,17 @@ class TestBuildProxyForSensitivity:
 
         calls = []
 
-        def _fake_build(model_path, output_path, *, dtype, trust_remote_code=False):
-            calls.append((model_path, output_path, dtype, trust_remote_code))
+        def _fake_build(
+            model_path,
+            output_path,
+            *,
+            dtype,
+            trust_remote_code=False,
+            preserve_mtp=False,
+        ):
+            calls.append(
+                (model_path, output_path, dtype, trust_remote_code, preserve_mtp)
+            )
             output_path.mkdir()
 
         monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
@@ -2246,7 +2334,9 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
+        assert calls == [
+            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True, False)
+        ]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
@@ -3402,9 +3492,9 @@ class TestQuantizeOqStreamingFp8:
 
         idx = _LazyTensorIndex([str(src / "model.safetensors")])
         assert len(idx._fp8_pairs) == 0, "BF16 weight should not pair with .scale"
-        assert "model.layers.0.self_attn.q_proj.scale" in idx, (
-            "scale key must remain visible"
-        )
+        assert (
+            "model.layers.0.self_attn.q_proj.scale" in idx
+        ), "scale key must remain visible"
 
 
 # =============================================================================
@@ -3854,9 +3944,7 @@ class TestMeasureSensitivityVlmMtp:
         # lm_load_compat from it. Expose the real shim and pin the capability
         # flag so forwarding is deterministic regardless of installed mlx-lm.
         monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", True)
-        sys.modules["omlx.utils.model_loading"].lm_load_compat = (
-            real_ml.lm_load_compat
-        )
+        sys.modules["omlx.utils.model_loading"].lm_load_compat = real_ml.lm_load_compat
 
         _measure_sensitivity(
             "/fake/text",
@@ -4160,7 +4248,7 @@ class TestReplayChainGuards:
 
 
 # =============================================================================
-# End-to-end: oQ2.5 half-level
+# End-to-end: oQ2.5 routed-layer boost
 # =============================================================================
 
 
@@ -4168,7 +4256,7 @@ class TestReplayChainGuards:
 class TestQuantizeOqStreamingOq25:
     def test_oq25_end_to_end_synthetic_moe(self, tmp_path):
         """oQ2.5 output: 2-bit affine base with routed expert down_proj
-        protected at 3-bit via the mandatory half-level boost."""
+        selected at 3-bit through the routed-layer budget plan."""
         from safetensors.numpy import save_file as np_save
 
         src = tmp_path / "src"
@@ -4180,6 +4268,9 @@ class TestQuantizeOqStreamingOq25:
                     8, h, h
                 ).astype(np.float32),
                 "model.layers.0.mlp.switch_mlp.gate_proj.weight": np.random.randn(
+                    8, h, h
+                ).astype(np.float32),
+                "model.layers.0.mlp.switch_mlp.up_proj.weight": np.random.randn(
                     8, h, h
                 ).astype(np.float32),
                 "model.layers.0.self_attn.q_proj.weight": np.random.randn(h, h).astype(
@@ -4223,3 +4314,4 @@ class TestQuantizeOqStreamingOq25:
             tensors.update(mx.load(str(sf)))
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
+        assert "model.layers.0.mlp.switch_mlp.up_proj.scales" in tensors

@@ -31,8 +31,15 @@ from omlx.api.embedding_utils import (
     truncate_embedding,
 )
 from omlx.engine.embedding import EmbeddingEngine
+from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
 from omlx.models.embedding import EmbeddingOutput
+
+IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 class TestEmbeddingModels:
@@ -83,7 +90,7 @@ class TestEmbeddingModels:
         request = EmbeddingRequest(
             items=[
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
             ],
             model="test-model",
         )
@@ -238,19 +245,19 @@ class TestEmbeddingUtils:
         result = normalize_embedding_items(
             [
                 EmbeddingInputItem(text="hello"),
-                EmbeddingInputItem(image="https://example.com/image.jpg"),
+                EmbeddingInputItem(image=IMAGE_DATA_URI),
                 EmbeddingInputItem(
                     text="hello",
-                    image="https://example.com/image.jpg",
+                    image=IMAGE_DATA_URI,
                 ),
             ]
         )
         assert result == [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
 
@@ -716,8 +723,8 @@ class TestEmbeddingCompileFallback:
         mock_generate.assert_not_called()
         assert result.embeddings[0] == pytest.approx([0.7, 0.8, 0.9], abs=1e-5)
 
-    def test_custom_processor_receives_image_items_unchanged(self):
-        """Custom processors should receive raw image strings unchanged."""
+    def test_custom_processor_receives_valid_image_items_unchanged(self):
+        """Custom processors should receive validated data URI strings unchanged."""
         import mlx.core as mx
         from omlx.models.embedding import MLXEmbeddingModel
 
@@ -743,10 +750,10 @@ class TestEmbeddingCompileFallback:
 
         inputs = [
             {"text": "hello"},
-            {"image": "https://example.com/image.jpg"},
+            {"image": IMAGE_DATA_URI},
             {
                 "text": "hello",
-                "image": "https://example.com/image.jpg",
+                "image": IMAGE_DATA_URI,
             },
         ]
         result = model.embed(inputs)
@@ -755,6 +762,20 @@ class TestEmbeddingCompileFallback:
             inputs, return_tensors="mlx"
         )
         assert result.embeddings[0] == pytest.approx([0.3, 0.4, 0.5], abs=1e-5)
+
+    def test_custom_processor_rejects_remote_image_url(self):
+        """Image embedding refs reject remote URLs before processor handling."""
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=[])
+
+        with pytest.raises(InvalidRequestError):
+            model.embed([{"image": "https://example.com/image.jpg"}])
 
     def test_custom_processor_counts_image_only_tokens_from_prepared_inputs(self):
         """Image-only custom processor inputs should contribute to usage stats."""
@@ -781,7 +802,7 @@ class TestEmbeddingCompileFallback:
         )
         model.processor = processor
 
-        result = model.embed([{"image": "https://example.com/image.jpg"}])
+        result = model.embed([{"image": IMAGE_DATA_URI}])
 
         assert result.total_tokens == 4
 
@@ -797,7 +818,7 @@ class TestEmbeddingCompileFallback:
         model.processor = MagicMock()
 
         with pytest.raises(ValueError, match="does not support image inputs"):
-            model.embed([{"image": "https://example.com/image.jpg"}])
+            model.embed([{"image": IMAGE_DATA_URI}])
 
     def test_try_compile_respects_disable_env(self, monkeypatch):
         """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""

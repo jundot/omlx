@@ -9,6 +9,7 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
+import json
 import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -485,6 +486,194 @@ class TestSTTEndpointBasic:
 
 
 # ---------------------------------------------------------------------------
+# TestSTTEnginePromptBiasing
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEnginePromptBiasing:
+    """OpenAI ``prompt`` field maps onto per-backend biasing hooks (#2078)."""
+
+    @staticmethod
+    def _wav(tmp_path):
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+        return str(audio_path)
+
+    @pytest.mark.asyncio
+    async def test_prompt_maps_to_system_prompt_for_qwen3_style(self, tmp_path):
+        """Backends with a system_prompt hook get trained context injection."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(
+            self._wav(tmp_path), prompt="Vocabulary: Kubernetes, issue, omlx."
+        )
+
+        assert generate_kwargs["system_prompt"] == (
+            "Vocabulary: Kubernetes, issue, omlx."
+        )
+        assert "prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_prompt_maps_to_initial_prompt_for_whisper_style(self, tmp_path):
+        """Whisper-family backends get the prompt as a decoder prefix."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, initial_prompt=None, **kwargs):
+                generate_kwargs["initial_prompt"] = initial_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("whisper-large")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path), prompt="ZyntriQix, Digique")
+
+        assert generate_kwargs["initial_prompt"] == "ZyntriQix, Digique"
+        assert "prompt" not in generate_kwargs
+        assert "system_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_prompt_dropped_for_backends_without_hook(self, tmp_path):
+        """Backends with no biasing hook never see the field and never fail."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("plain-asr")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(self._wav(tmp_path), prompt="hint text")
+
+        assert result["text"] == "ok"
+        assert "prompt" not in generate_kwargs
+        assert "system_prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_no_prompt_leaves_generate_kwargs_unchanged(self, tmp_path):
+        """Requests without prompt are byte-for-byte today's behavior."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path))
+
+        assert generate_kwargs["system_prompt"] is None
+
+    @pytest.mark.asyncio
+    async def test_blank_prompt_is_dropped(self, tmp_path):
+        """Whitespace-only prompts keep the backend in its default mode."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path), prompt="   ")
+
+        assert generate_kwargs["system_prompt"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEndpointPrompt
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEndpointPrompt:
+    """POST /v1/audio/transcriptions forwards the OpenAI prompt field (#2078)."""
+
+    def test_prompt_forwarded_to_engine(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={
+                "model": "qwen3-asr",
+                "prompt": "Vocabulary: Kubernetes, issue, omlx.",
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured.get("prompt") == "Vocabulary: Kubernetes, issue, omlx."
+
+    def test_absent_prompt_not_forwarded(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "qwen3-asr"},
+        )
+
+        assert response.status_code == 200
+        assert "prompt" not in captured
+
+
+# ---------------------------------------------------------------------------
 # TestSTTEndpointResponseFormat
 # ---------------------------------------------------------------------------
 
@@ -557,6 +746,347 @@ class TestSTTEndpointErrors:
             "/v1/audio/transcriptions",
             files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
             data={"model": "whisper-tiny"},
+        )
+        assert response.status_code >= 500
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEngineStreaming
+# ---------------------------------------------------------------------------
+
+
+class TestSTTEngineStreaming:
+    """Unit tests for STTEngine.transcribe_stream (#1066)."""
+
+    @pytest.mark.asyncio
+    async def test_native_stream_yields_normalized_chunks(self, tmp_path):
+        """Models with a ``stream`` generate() param yield incremental chunks."""
+        from omlx.engine.stt import STTEngine
+
+        calls = []
+
+        class FakeModel:
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                calls.append({
+                    "audio_path": audio_path, "stream": stream, "kwargs": kwargs,
+                })
+                return iter([
+                    SimpleNamespace(
+                        text="hello ", is_final=False, language="en",
+                        prompt_tokens=0, generation_tokens=0,
+                    ),
+                    SimpleNamespace(
+                        text="world", is_final=True, language="en",
+                        prompt_tokens=5, generation_tokens=2,
+                    ),
+                ])
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("whisper-tiny")
+        engine._model = FakeModel()
+
+        chunks = [c async for c in engine.transcribe_stream(str(audio_path))]
+
+        assert [c["text"] for c in chunks] == ["hello ", "world"]
+        assert chunks[-1]["prompt_tokens"] == 5
+        assert chunks[-1]["generation_tokens"] == 2
+        assert chunks[-1]["language"] == "en"
+        assert calls[0]["audio_path"] == str(audio_path)
+        assert calls[0]["stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_native_stream_normalizes_language(self, tmp_path):
+        """Language hints get the same backend normalization as transcribe()."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            config = SimpleNamespace(support_languages=["Chinese", "English"])
+
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                generate_kwargs.update(kwargs)
+                return iter([
+                    SimpleNamespace(
+                        text="你好", is_final=True, language="zh",
+                        prompt_tokens=0, generation_tokens=0,
+                    ),
+                ])
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        chunks = [
+            c async for c in engine.transcribe_stream(
+                str(audio_path), language="zh"
+            )
+        ]
+
+        assert generate_kwargs["language"] == "chinese"
+        assert chunks[0]["text"] == "你好"
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_native_stream_support(self, tmp_path):
+        """Models without a ``stream`` param fall back to one-shot transcribe."""
+        from omlx.engine.stt import STTEngine
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                assert "stream" not in kwargs
+                return SimpleNamespace(
+                    text="hello world",
+                    language="en",
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("legacy-asr")
+        engine._model = FakeModel()
+
+        chunks = [c async for c in engine.transcribe_stream(str(audio_path))]
+
+        assert len(chunks) == 1
+        assert chunks[0]["text"] == "hello world"
+        assert chunks[0]["language"] == "en"
+
+    def test_supports_native_stt_streaming_detection(self):
+        """Capability check keys off the ``stream`` param in generate()."""
+        from omlx.engine.stt import STTEngine
+
+        class StreamingModel:
+            def generate(self, audio_path, *, stream=False, **kwargs):
+                pass
+
+        class OneShotModel:
+            def generate(self, audio_path, **kwargs):
+                pass
+
+        engine = STTEngine("m")
+        engine._model = StreamingModel()
+        assert engine.supports_native_stt_streaming() is True
+
+        engine._model = OneShotModel()
+        assert engine.supports_native_stt_streaming() is False
+
+    @pytest.mark.asyncio
+    async def test_native_stream_maps_prompt_to_biasing_hook(self, tmp_path):
+        """The OpenAI prompt field biases native streaming too (#2078)."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(
+                self, audio_path, *, stream=False, system_prompt=None, **kwargs
+            ):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return iter([
+                    SimpleNamespace(
+                        text="ok", is_final=True, language="en",
+                        prompt_tokens=0, generation_tokens=0,
+                    ),
+                ])
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        chunks = [
+            c async for c in engine.transcribe_stream(
+                str(audio_path), prompt="Vocabulary: Kubernetes, omlx."
+            )
+        ]
+
+        assert chunks[0]["text"] == "ok"
+        assert generate_kwargs["system_prompt"] == "Vocabulary: Kubernetes, omlx."
+        assert "prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
+    async def test_fallback_stream_forwards_prompt(self, tmp_path):
+        """Non-streaming fallback also applies prompt biasing."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, system_prompt=None, **kwargs):
+                generate_kwargs["system_prompt"] = system_prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language="en", segments=[], total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        chunks = [
+            c async for c in engine.transcribe_stream(
+                str(audio_path), prompt="Vocabulary: omlx."
+            )
+        ]
+
+        assert chunks[0]["text"] == "ok"
+        assert generate_kwargs["system_prompt"] == "Vocabulary: omlx."
+        assert "prompt" not in generate_kwargs
+
+
+# ---------------------------------------------------------------------------
+# TestSTTEndpointStreaming
+# ---------------------------------------------------------------------------
+
+
+def _sse_events(body: str) -> list[dict]:
+    """Parse data-only SSE payloads out of a response body."""
+    events = []
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[len("data: "):]))
+    return events
+
+
+def _set_stream_chunks(engine, chunks):
+    """Install a fake transcribe_stream that records calls and yields chunks."""
+    calls = []
+
+    def fake_stream(path, **kwargs):
+        calls.append({"path": path, "kwargs": kwargs})
+
+        async def _gen():
+            for chunk in chunks:
+                yield chunk
+
+        return _gen()
+
+    engine.transcribe_stream = fake_stream
+    return calls
+
+
+class TestSTTEndpointStreaming:
+    """POST /v1/audio/transcriptions with stream=true returns SSE (#1066)."""
+
+    def test_stream_true_returns_sse_deltas_and_done(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        _set_stream_chunks(engine, [
+            {"text": "hello ", "language": "en",
+             "prompt_tokens": 0, "generation_tokens": 0},
+            {"text": "world", "language": "en",
+             "prompt_tokens": 5, "generation_tokens": 2},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers.get("content-type", "")
+
+        events = _sse_events(response.text)
+        deltas = [e for e in events if e["type"] == "transcript.text.delta"]
+        assert [d["delta"] for d in deltas] == ["hello ", "world"]
+
+        done = events[-1]
+        assert done["type"] == "transcript.text.done"
+        assert done["text"] == "hello world"
+        assert done["usage"] == {
+            "type": "tokens",
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "total_tokens": 7,
+        }
+
+    def test_stream_skips_empty_deltas_and_omits_unknown_usage(
+        self, server_audio_client
+    ):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        _set_stream_chunks(engine, [
+            {"text": "", "language": None,
+             "prompt_tokens": 0, "generation_tokens": 0},
+            {"text": "hi", "language": None,
+             "prompt_tokens": 0, "generation_tokens": 0},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
+        )
+
+        events = _sse_events(response.text)
+        deltas = [e for e in events if e["type"] == "transcript.text.delta"]
+        assert [d["delta"] for d in deltas] == ["hi"]
+        assert "usage" not in events[-1]
+
+    def test_stream_forwards_transcribe_kwargs(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+        calls = _set_stream_chunks(engine, [
+            {"text": "ok", "language": "zh",
+             "prompt_tokens": 0, "generation_tokens": 0},
+        ])
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={
+                "model": "whisper-tiny",
+                "stream": "true",
+                "language": "zh",
+                "prompt": "Vocabulary: omlx.",
+                "max_tokens": "128",
+            },
+        )
+
+        assert response.status_code == 200
+        assert calls[0]["kwargs"]["language"] == "zh"
+        assert calls[0]["kwargs"]["prompt"] == "Vocabulary: omlx."
+        assert calls[0]["kwargs"]["max_tokens"] == 128
+
+    def test_stream_false_keeps_json_response(self, server_audio_client):
+        client, _ = server_audio_client
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "false"},
+        )
+        assert response.status_code == 200
+        assert "application/json" in response.headers.get("content-type", "")
+        assert response.json()["text"] == "hello world"
+
+    def test_stream_engine_error_returns_500(self, server_audio_client):
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        def broken_stream(path, **kwargs):
+            async def _gen():
+                raise RuntimeError("model failed")
+                yield  # pragma: no cover
+
+            return _gen()
+
+        engine.transcribe_stream = broken_stream
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "stream": "true"},
         )
         assert response.status_code >= 500
 

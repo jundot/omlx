@@ -20,6 +20,8 @@ _OPEN_LEN = len(_OPEN_TAG)   # 7
 _CLOSE_LEN = len(_CLOSE_TAG)  # 8
 _MINIMAX_OPEN_TAG = "<mm:think>"
 _MINIMAX_CLOSE_TAG = "</mm:think>"
+_HY3_OPEN_TAG = "<think:opensource>"
+_HY3_CLOSE_TAG = "</think:opensource>"
 
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
@@ -169,8 +171,11 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     if not text:
         return ("", "")
 
-    text = text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG).replace(
-        _MINIMAX_CLOSE_TAG, _CLOSE_TAG
+    text = (
+        text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG)
+        .replace(_MINIMAX_CLOSE_TAG, _CLOSE_TAG)
+        .replace(_HY3_OPEN_TAG, _OPEN_TAG)
+        .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
 
     thinking_parts = []
@@ -273,11 +278,22 @@ class ThinkingParser:
                     i += _OPEN_LEN
                     continue
 
+                if remaining.startswith(_HY3_OPEN_TAG):
+                    self._in_thinking = True
+                    i += len(_HY3_OPEN_TAG)
+                    continue
+
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
                     self._in_thinking = False
                     self._close_seen = True
                     i += _CLOSE_LEN
+                    continue
+
+                if remaining.startswith(_HY3_CLOSE_TAG):
+                    self._in_thinking = False
+                    self._close_seen = True
+                    i += len(_HY3_CLOSE_TAG)
                     continue
 
                 # Check if it could be a partial tag (not enough chars yet)
@@ -360,15 +376,14 @@ class ThinkingParser:
         yet a complete match.
         """
         length = len(text)
-        if length >= _CLOSE_LEN:
+        if length >= len(_HY3_CLOSE_TAG):
             # Long enough to determine - not a partial tag
             return False
 
-        # Check against both tags
-        if _OPEN_TAG[:length] == text:
-            return True
-        if _CLOSE_TAG[:length] == text:
-            return True
+        # Check against all recognised tags
+        for tag in (_OPEN_TAG, _CLOSE_TAG, _HY3_OPEN_TAG, _HY3_CLOSE_TAG):
+            if length < len(tag) and tag[:length] == text:
+                return True
 
         return False
 

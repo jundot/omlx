@@ -245,6 +245,15 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.turboquant_skip_last is False
 
+    def test_native_mtp_allows_turboquant(self):
+        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert settings.mtp_enabled is True
+        assert settings.turboquant_kv_enabled is True
+
+    def test_vlm_mtp_rejects_turboquant(self):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
+            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
+
     def test_vlm_mtp_draft_model_default(self):
         settings = ModelSettings()
         assert settings.vlm_mtp_draft_model is None

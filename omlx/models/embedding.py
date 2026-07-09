@@ -20,6 +20,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from ..utils.compile_cache import clear_thread_compile_cache
+from ..utils.image import validate_image_data_uri
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -567,6 +568,13 @@ class MLXEmbeddingModel:
 
         max_length = self._resolve_max_length(max_length)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
+        for item in normalized_inputs:
+            image_ref = item.get("image")
+            if isinstance(image_ref, str):
+                item["image"] = validate_image_data_uri(
+                    image_ref,
+                    field="items[].image",
+                )
         input_texts = [item["text"] for item in normalized_inputs if "text" in item]
         has_image_inputs = any("image" in item for item in normalized_inputs)
 

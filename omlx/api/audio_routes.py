@@ -373,13 +373,64 @@ async def _stream_with_prefetched_chunk(
 # ---------------------------------------------------------------------------
 
 
+def _sse_event(payload: dict) -> str:
+    """Serialize one data-only SSE event, OpenAI transcription-stream style."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_transcription_events(
+    engine,
+    tmp_path: str,
+    model_id: str,
+    transcribe_kwargs: dict,
+) -> AsyncIterator[str]:
+    """Yield OpenAI-compatible transcript.text.* SSE events.
+
+    Owns the uploaded temp file: it is deleted when the stream finishes,
+    errors, or is cancelled by a client disconnect.
+    """
+    full_text: list[str] = []
+    prompt_tokens = 0
+    generation_tokens = 0
+    try:
+        async for chunk in engine.transcribe_stream(tmp_path, **transcribe_kwargs):
+            # Cumulative totals arrive on the chunks that know them
+            # (typically the final one); keep the max seen.
+            prompt_tokens = max(
+                prompt_tokens, int(chunk.get("prompt_tokens") or 0)
+            )
+            generation_tokens = max(
+                generation_tokens, int(chunk.get("generation_tokens") or 0)
+            )
+            delta = chunk.get("text") or ""
+            if not delta:
+                continue
+            full_text.append(delta)
+            yield _sse_event({"type": "transcript.text.delta", "delta": delta})
+
+        done: dict = {"type": "transcript.text.done", "text": "".join(full_text)}
+        if prompt_tokens or generation_tokens:
+            done["usage"] = {
+                "type": "tokens",
+                "input_tokens": prompt_tokens,
+                "output_tokens": generation_tokens,
+                "total_tokens": prompt_tokens + generation_tokens,
+            }
+        yield _sse_event(done)
+        _record_audio_request(model_id)
+    finally:
+        _cleanup_tempfile(tmp_path)
+
+
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
 async def create_transcription(
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
+    stream: bool = Form(False),
     max_tokens: Optional[int] = Form(None),
     word_timestamps: bool = Form(False),
 ):
@@ -387,6 +438,19 @@ async def create_transcription(
 
     Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
     compatibility but are not yet implemented — they are silently ignored.
+
+    ``stream=true`` switches the response to OpenAI's transcription SSE
+    format: ``transcript.text.delta`` events with incremental text followed
+    by a final ``transcript.text.done`` event with the full transcription
+    (#1066). Models whose mlx-audio backend lacks native streaming still
+    respond in SSE format, with the full text arriving in a single delta.
+
+    ``prompt`` follows the OpenAI spec: optional text to guide recognition
+    toward specific vocabulary, spellings, or style. Mapped onto the
+    backend's biasing hook — Qwen3-ASR receives it as trained context
+    injection (``system_prompt``, strong biasing), Whisper models as a
+    decoder-prefix soft prior (``initial_prompt``, ~224-token window).
+    Backends without a biasing hook ignore it; it never fails a request.
 
     ``max_tokens`` is an oMLX extension that raises the underlying model's
     output cap. Useful for long audio with models like VibeVoice-ASR whose
@@ -453,10 +517,32 @@ async def create_transcription(
                     pass
 
         transcribe_kwargs: dict = {"language": language}
+        if prompt is not None:
+            transcribe_kwargs["prompt"] = prompt
         if effective_max_tokens is not None:
             transcribe_kwargs["max_tokens"] = effective_max_tokens
         if word_timestamps:
             transcribe_kwargs["word_timestamps"] = True
+
+        if stream:
+            # Word timestamps only exist in the JSON segment response;
+            # SSE streaming emits plain text deltas (matching OpenAI, which
+            # also rejects timestamp granularity with stream=true).
+            transcribe_kwargs.pop("word_timestamps", None)
+            # The event generator owns tmp_path from here: its finally block
+            # deletes the file once the stream completes or errors — the
+            # route's finally must not remove it while chunks are pending.
+            events = _stream_transcription_events(
+                engine, tmp_path, resolved_model, transcribe_kwargs
+            )
+            tmp_path = None
+            first_event = await events.__anext__()
+            return StreamingResponse(
+                _stream_with_prefetched_chunk(first_event, events),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+
         result = await engine.transcribe(tmp_path, **transcribe_kwargs)
     except HTTPException:
         raise

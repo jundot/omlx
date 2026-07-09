@@ -3,7 +3,9 @@
 STT (Speech-to-Text) engine for oMLX.
 
 This module provides an engine for audio transcription using mlx-audio.
-Unlike LLM engines, STT engines don't support streaming or chat completion.
+Unlike LLM engines, STT engines don't support chat completion. Transcription
+results can be streamed incrementally via transcribe_stream() for models
+whose mlx-audio backend supports it.
 mlx-audio is imported lazily inside start() to avoid module-level import errors
 when mlx-audio is not installed.
 """
@@ -11,6 +13,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import mlx.core as mx
@@ -101,6 +104,46 @@ def _missing_processor_hint(model_name: str) -> str:
     )
 
 
+def _normalize_result_language(raw_lang: Any) -> Any:
+    """Normalize the language field returned by mlx-audio backends."""
+    if isinstance(raw_lang, list):
+        raw_lang = raw_lang[0] if raw_lang else None
+    if isinstance(raw_lang, str) and raw_lang.lower() == "none":
+        return None
+    return raw_lang
+
+
+def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
+    """Map the OpenAI ``prompt`` field onto the backend's biasing hook.
+
+    Qwen3-ASR-style backends expose ``generate(..., system_prompt=...)`` —
+    a trained context-injection mechanism with strong biasing. Whisper-family
+    backends expose ``generate(..., initial_prompt=...)`` — a decoder-prefix
+    soft prior (~224-token window). Backends with neither hook ignore the
+    field; a request must never fail because of ``prompt``.
+    """
+    if prompt is None or not prompt.strip():
+        return {}
+
+    import inspect
+
+    try:
+        params = inspect.signature(model.generate).parameters
+    except (TypeError, ValueError):
+        return {}
+
+    if "system_prompt" in params:
+        return {"system_prompt": prompt}
+    if "initial_prompt" in params:
+        return {"initial_prompt": prompt}
+
+    logger.debug(
+        "STT backend %s has no prompt-biasing hook; ignoring 'prompt'",
+        type(model).__name__,
+    )
+    return {}
+
+
 def _wrap_stt_load_error(model_name: str, exc: Exception) -> Exception:
     """Return a clearer exception for known mlx-audio STT load failures."""
     message = str(exc)
@@ -133,8 +176,9 @@ class STTEngine(BaseNonStreamingEngine):
     This engine wraps mlx-audio STT models and provides async methods
     for integration with the oMLX server.
 
-    Unlike BaseEngine, this doesn't support streaming or chat
-    since transcription is computed in a single forward pass.
+    Unlike BaseEngine, this doesn't support chat. transcribe() computes the
+    full result in one pass; transcribe_stream() yields incremental chunks
+    for mlx-audio backends that expose ``generate(..., stream=True)``.
     """
 
     def __init__(self, model_name: str, **kwargs):
@@ -221,6 +265,7 @@ class STTEngine(BaseNonStreamingEngine):
         self,
         audio_path: str,
         language: str | None = None,
+        prompt: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """
@@ -229,6 +274,10 @@ class STTEngine(BaseNonStreamingEngine):
         Args:
             audio_path: Path to the audio file to transcribe
             language: Optional language code (e.g. 'en', 'fr')
+            prompt: Optional vocabulary / context biasing text (OpenAI
+                ``prompt`` field), mapped onto the backend's biasing hook
+                (Qwen3-ASR ``system_prompt``, Whisper ``initial_prompt``);
+                ignored by backends without one
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -266,14 +315,6 @@ class STTEngine(BaseNonStreamingEngine):
                 return vars(s)
             return {"text": str(s)}
 
-        def _normalize_language(raw_lang):
-            """Normalize language field from mlx-audio."""
-            if isinstance(raw_lang, list):
-                raw_lang = raw_lang[0] if raw_lang else None
-            if isinstance(raw_lang, str) and raw_lang.lower() == "none":
-                return None
-            return raw_lang
-
         def _transcribe_sync():
             # Call model.generate() directly instead of
             # generate_transcription() which writes files to disk.
@@ -281,13 +322,14 @@ class STTEngine(BaseNonStreamingEngine):
             generate_language = _normalize_stt_generate_language(model, language)
             if generate_language is not None:
                 gen_kwargs["language"] = generate_language
+            gen_kwargs.update(_map_stt_prompt_kwargs(model, prompt))
 
             result = model.generate(audio_path, **gen_kwargs)
 
             # result is typically an STTOutput dataclass with:
             # text, segments, language, total_time, etc.
             if hasattr(result, "text"):
-                raw_lang = _normalize_language(
+                raw_lang = _normalize_result_language(
                     getattr(result, "language", None)
                 )
                 if raw_lang is None:
@@ -334,6 +376,130 @@ class STTEngine(BaseNonStreamingEngine):
             return result
         finally:
             await self._finish_activity(activity_id)
+
+    def supports_native_stt_streaming(self) -> bool:
+        """True when the loaded model's generate() accepts a ``stream`` flag.
+
+        mlx-audio streaming-capable backends (whisper, parakeet, canary,
+        qwen3-asr, ...) all expose ``generate(..., stream: bool)`` that
+        returns a generator of incremental results.
+        """
+        if self._model is None:
+            return False
+        import inspect
+
+        try:
+            params = inspect.signature(self._model.generate).parameters
+        except (TypeError, ValueError):
+            return False
+        return "stream" in params
+
+    async def transcribe_stream(
+        self,
+        audio_path: str,
+        language: str | None = None,
+        prompt: str | None = None,
+        **kwargs,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream transcription chunks as the model decodes them.
+
+        ``prompt`` is the OpenAI vocabulary / context biasing field, mapped
+        onto the backend's biasing hook exactly as in transcribe().
+
+        Yields dicts with keys:
+            text: Incremental text delta for this chunk
+            language: Detected or specified language (may be None)
+            prompt_tokens: Cumulative prompt token count (0 if unknown)
+            generation_tokens: Cumulative generated token count (0 if unknown)
+
+        Models whose generate() lacks native streaming support fall back to
+        one-shot transcribe() and yield a single chunk with the full text.
+        """
+        if self._model is None:
+            raise RuntimeError("Engine not started. Call start() first.")
+
+        if not self.supports_native_stt_streaming():
+            result = await self.transcribe(
+                audio_path, language=language, prompt=prompt, **kwargs
+            )
+            yield {
+                "text": result.get("text", ""),
+                "language": result.get("language"),
+                "prompt_tokens": 0,
+                "generation_tokens": 0,
+            }
+            return
+
+        import os
+        import time
+
+        file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        logger.info(
+            "STT stream transcribe: model=%s, file=%s (%d bytes), language=%s",
+            self._model_name, os.path.basename(audio_path), file_size, language,
+        )
+
+        model = self._model
+        t0 = time.monotonic()
+
+        gen_kwargs = dict(kwargs)
+        generate_language = _normalize_stt_generate_language(model, language)
+        if generate_language is not None:
+            gen_kwargs["language"] = generate_language
+        gen_kwargs.update(_map_stt_prompt_kwargs(model, prompt))
+        gen_kwargs["stream"] = True
+
+        iterator: Any = None
+        sentinel = object()
+
+        def _next_chunk():
+            nonlocal iterator
+            if iterator is None:
+                iterator = iter(model.generate(audio_path, **gen_kwargs))
+            try:
+                result = next(iterator)
+            except StopIteration:
+                return sentinel
+            if isinstance(result, str):
+                return {
+                    "text": result,
+                    "language": None,
+                    "prompt_tokens": 0,
+                    "generation_tokens": 0,
+                }
+            return {
+                "text": getattr(result, "text", "") or "",
+                "language": _normalize_result_language(
+                    getattr(result, "language", None)
+                ),
+                "prompt_tokens": int(getattr(result, "prompt_tokens", 0) or 0),
+                "generation_tokens": int(
+                    getattr(result, "generation_tokens", 0) or 0
+                ),
+            }
+
+        activity_id = self._begin_activity(
+            "transcribing",
+            detail="Streaming transcription",
+            metadata={"file_size_bytes": file_size},
+        )
+        chunk_count = 0
+        text_len = 0
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                chunk = await loop.run_in_executor(get_mlx_executor(), _next_chunk)
+                if chunk is sentinel:
+                    break
+                chunk_count += 1
+                text_len += len(chunk["text"])
+                yield chunk
+        finally:
+            await self._finish_activity(activity_id)
+            logger.info(
+                "STT stream transcribe done: model=%s, %.2fs, chunks=%d, %d chars",
+                self._model_name, time.monotonic() - t0, chunk_count, text_len,
+            )
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
