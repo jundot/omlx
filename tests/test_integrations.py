@@ -1967,6 +1967,7 @@ class TestCopilotIntegration:
         assert captured["argv"] == ["copilot"]
         assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8000/v1"
         assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+        assert env["COPILOT_OFFLINE"] == "true"
         assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
         assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "secret"
         assert env["COPILOT_MODEL"] == "qwen3.5"
@@ -2007,6 +2008,7 @@ class TestCopilotIntegration:
             copilot.launch(ctx(port=8000, api_key="key", model=""))
 
         env = captured["env"]
+        assert env["COPILOT_OFFLINE"] == "true"
         assert "COPILOT_MODEL" not in env
         assert "COPILOT_PROVIDER_MODEL_ID" not in env
         assert "COPILOT_PROVIDER_WIRE_MODEL" not in env

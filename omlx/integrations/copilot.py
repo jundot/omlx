@@ -9,7 +9,7 @@ from omlx.utils.install import get_cli_command_prefix
 
 
 class CopilotIntegration(Integration):
-    """Copilot integration using custom provider BYOK environment variables."""
+    """Copilot integration using custom provider BYOK offline mode."""
 
     def __init__(self):
         super().__init__(
@@ -30,6 +30,7 @@ class CopilotIntegration(Integration):
         env = self._scrubbed_env()
         env["COPILOT_PROVIDER_BASE_URL"] = ctx.openai_base_url
         env["COPILOT_PROVIDER_TYPE"] = "openai"
+        env["COPILOT_OFFLINE"] = "true"
 
         # Copilot CLI appears to have issues with the completions endpoint, responses appears to work as expected.
         env["COPILOT_PROVIDER_WIRE_API"] = "responses"
