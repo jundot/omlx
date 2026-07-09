@@ -40,16 +40,18 @@ def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) -> bool:
+    # Shape gates first: this runs on every MoE block call of every decode
+    # step, so the common (decode) case must exit on the seq-len check
+    # before touching env vars or Metal state (issue #2132).
+    if x.ndim != 3 or x.shape[-2] < min_tokens:
+        return False
     if target_verify:
+        return False
+    if x.dtype not in (mx.float16, mx.bfloat16):
         return False
     if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
         return False
     if not mx.metal.is_available():
-        return False
-    if x.ndim != 3 or x.shape[-2] < min_tokens or x.dtype not in (
-        mx.float16,
-        mx.bfloat16,
-    ):
         return False
     if getattr(self, "sharding_group", None) is not None:
         return False
@@ -126,6 +128,9 @@ def _fast_moe(self: Any, x: mx.array, target_verify: bool) -> mx.array:
 
 def _make_patched_call(orig_call: Callable[..., mx.array], min_tokens: int):
     def patched(self, x: mx.array, *args, **kwargs):
+        # Decode fast path: one shape check before any argument parsing.
+        if x.ndim != 3 or x.shape[-2] < min_tokens:
+            return orig_call(self, x, *args, **kwargs)
         target_verify = _target_verify_arg(args, kwargs)
         if not _should_route(self, x, target_verify, min_tokens):
             return orig_call(self, x, *args, **kwargs)

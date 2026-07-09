@@ -160,12 +160,16 @@ def _make_patched_mlp(
     q8_min_tokens: int,
 ):
     def patched(self, x, *args, **kwargs):
+        # Decode / short-sequence fast path first: this wrapper runs on every
+        # MLP call of every layer of every decode step, so the common case
+        # must exit on a single shape check (issue #2132 — per-call gate
+        # overhead across the qwen35 prefill patches costs ~2% TG).
+        if x.ndim < 3 or x.shape[-2] < min_tokens:
+            return orig_call(self, x, *args, **kwargs)
         target_verify = bool(kwargs.get("target_verify", False))
         if args and isinstance(args[0], bool):
             target_verify = target_verify or bool(args[0])
         if target_verify or os.environ.get("OMLX_QWEN35_Q4_MLP", "1") == "0":
-            return orig_call(self, x, *args, **kwargs)
-        if x.ndim < 3:
             return orig_call(self, x, *args, **kwargs)
         gate_proj = getattr(self, "gate_proj", None)
         up_proj = getattr(self, "up_proj", None)
@@ -292,11 +296,13 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
     )
 
     def should_route(linear: Any, x: mx.array, target_verify: bool) -> bool:
+        # Shape gates first, env kill-switch last: the runtime toggle only
+        # matters on the (rare) routed side, while decode pays this per call.
         return (
             not target_verify
-            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
             and x.ndim == 3
             and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
+            and os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") != "0"
         )
 
     def patched_linear(linear, x: mx.array, target_verify: bool):
@@ -306,10 +312,10 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
 
     def patched_linears(linears, x: mx.array, target_verify: bool):
         if (
-            target_verify
-            or os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0"
-            or x.ndim != 3
+            x.ndim != 3
             or x.shape[-2] < min_tokens
+            or target_verify
+            or os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0"
         ):
             return orig_linears(linears, x, target_verify)
 
@@ -365,10 +371,11 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
     )
 
     def should_route(linear: Any, x: mx.array) -> bool:
+        # Shape gates first, env kill-switch last (decode pays this per call).
         return (
-            os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") != "0"
-            and x.ndim == 3
+            x.ndim == 3
             and _can_route_affine_linear(linear, x, min_tokens, q8_min_tokens)
+            and os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") != "0"
         )
 
     def qmm_or_linear(linear: Any, x: mx.array) -> mx.array:

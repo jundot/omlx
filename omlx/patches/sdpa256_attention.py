@@ -119,7 +119,16 @@ def _flash_sdpa256(queries, keys, values, scale, mask):
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # Never raise: any unexpected input must fall through to the original SDPA,
     # never break a request. Worst case we decline to engage.
+    # Shape gates first: this wrapper is installed unconditionally and runs
+    # on every SDPA call of every decode step, so the common (decode / MTP
+    # verify) case must exit on the q_len check alone (issue #2132).
     try:
+        if queries.shape[-2] < _SDPA256_MIN_Q_LEN:  # decode / MTP verify
+            return False
+        if queries.shape[-1] != HEAD_DIM:
+            return False
+        if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
+            return False
         if sinks is not None:
             return False
         # Quantized KV cache (TurboQuant etc.): keys/values are packed state,
@@ -127,13 +136,7 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
         # hasattr(cache, "bits"); let the quant-aware path handle it.
         if cache is not None and hasattr(cache, "bits"):
             return False
-        if queries.shape[-1] != HEAD_DIM:
-            return False
-        if queries.shape[-2] < _SDPA256_MIN_Q_LEN:  # decode / MTP verify
-            return False
         if not (mask is None or (isinstance(mask, str) and mask == "causal")):
-            return False
-        if keys.shape[-2] < _SDPA256_MIN_KV_LEN:
             return False
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]

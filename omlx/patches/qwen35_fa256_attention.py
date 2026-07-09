@@ -48,13 +48,20 @@ def _has_quantized_cache(cache) -> bool:
 
 
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
+    # Query-shape gates first: this runs on every SDPA call of every decode
+    # step, so the common (decode / MTP verify) case must exit on the q_len
+    # check before touching Metal state or cache attributes (issue #2132).
+    # ``keys`` may be a TurboQuant state proxy without ``ndim``/``dtype``, so
+    # it must not be inspected before the quantized-cache check declines.
+    if queries.ndim != 4 or queries.shape[-2] < _MIN_ROUTE_Q_LEN:
+        return False
     if not mx.metal.is_available() or _has_quantized_cache(cache):
         return False
     if sinks is not None:
         return False
     if mask is not None and not (isinstance(mask, str) and mask == "causal"):
         return False
-    if queries.ndim != 4 or keys.ndim != 4:
+    if keys.ndim != 4:
         return False
     if queries.dtype not in (mx.float16, mx.bfloat16):
         return False
@@ -70,7 +77,6 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
         head_dim == 256
         and q_heads == 24
         and kv_heads == 4
-        and q_len >= _MIN_ROUTE_Q_LEN
         and kv_len >= min_kv_len
         and q_len <= kv_len
     )
