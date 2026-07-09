@@ -472,6 +472,10 @@
             // race a 409 on the server.
             benchOtherActive: null,
 
+            // Persisted throughput run history (newest first), loaded from
+            // /api/bench/throughput/results so it survives server restarts.
+            benchHistory: [],
+
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
             benchDropdown: false,
@@ -649,6 +653,7 @@
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadBenchState();
+                    await this.loadBenchHistory();
                     await this.loadAccState();
                 }
             },
@@ -2928,6 +2933,7 @@
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
+                            this.loadBenchHistory();
                         } else if (data.type === 'upload_skipped') {
                             this.benchUploadSkipped = { features: data.features || [] };
                             this.benchUploading = false;
@@ -2936,6 +2942,7 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                            this.loadBenchHistory();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -3148,6 +3155,45 @@
                 }
             },
 
+            async loadBenchHistory() {
+                // Load accumulated throughput runs (newest first) from disk so
+                // history survives server restarts. Mirrors loadAccState.
+                try {
+                    const resp = await fetch('/admin/api/bench/throughput/results');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.benchHistory = (data.runs || []).map(r => ({ ...r, _expanded: false }));
+                    }
+                } catch (err) {
+                    console.error('Failed to load benchmark history:', err);
+                }
+            },
+
+            async resetBenchHistory() {
+                try {
+                    await fetch('/admin/api/bench/throughput/results/reset', { method: 'POST' });
+                    this.benchHistory = [];
+                } catch (err) {
+                    console.error('Failed to reset benchmark history:', err);
+                }
+            },
+
+            benchHistorySingle(run) {
+                return (run.results || []).filter(r => r.test_type === 'single');
+            },
+
+            benchHistoryBatch(run) {
+                return (run.results || []).filter(r => r.test_type === 'batch');
+            },
+
+            benchFormatTimestamp(ts) {
+                // Stored as ISO-8601 UTC (…Z). Render in the viewer's locale.
+                if (!ts) return '';
+                const d = new Date(ts);
+                if (isNaN(d)) return ts;
+                return d.toLocaleString();
+            },
+
             // User clicked "View live" on the banner — clear the stale
             // result display, attach to the active run. The replay-on-
             // subscribe stream re-delivers every event so the new bench
@@ -3186,6 +3232,7 @@
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
                     this.loadBenchState();
+                    this.loadBenchHistory();
                 }
             },
 

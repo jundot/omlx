@@ -744,6 +744,56 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def bench_history_command(args):
+    """Display history of locally saved benchmarks."""
+    import json
+    from .settings import init_settings
+    settings = init_settings(base_path=None, cli_args=None)
+    
+    acc_path = settings.base_path / "bench_results_accuracy.json"
+    tp_path = settings.base_path / "bench_results_throughput.jsonl"
+    
+    print("=" * 80)
+    print(" OMLX BENCHMARK HISTORY")
+    print("=" * 80)
+    
+    print("\n[Accuracy Benchmarks]")
+    if acc_path.exists():
+        try:
+            with open(acc_path, "r") as f:
+                results = json.load(f)
+            if not results:
+                print("  No accuracy results found.")
+            else:
+                for r in results:
+                    print(f"  {r.get('model_id')} — {r.get('benchmark')}: {r.get('accuracy', 0)*100:.1f}%")
+        except Exception as e:
+            print(f"  Error reading accuracy results: {e}")
+    else:
+        print("  No accuracy results found.")
+        
+    print("\n[Throughput Benchmarks]")
+    if tp_path.exists():
+        try:
+            with open(tp_path, "r") as f:
+                lines = f.readlines()
+            if not lines:
+                print("  No throughput results found.")
+            else:
+                for line in lines:
+                    if not line.strip(): continue
+                    r = json.loads(line)
+                    print(f"  {r.get('timestamp', '')[:10]} - {r.get('model_id')}:")
+                    for single in r.get('results', []):
+                        if single.get('test_type') == 'single':
+                            print(f"    PP={single.get('pp')} | TG={single.get('tg')} -> {single.get('gen_tps', 0):.1f} tok/s")
+        except Exception as e:
+            print(f"  Error reading throughput results: {e}")
+    else:
+        print("  No throughput results found.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -1054,6 +1104,12 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
+    bench_history_parser = subparsers.add_parser(
+        "bench-history",
+        help="View local benchmark history",
+        description="View locally saved accuracy and throughput benchmarks.",
+    )
+
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
     # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
     # Non-launch commands keep the previous strictness by rejecting unknowns.
@@ -1070,6 +1126,8 @@ Example directory structure:
             sys.exit(lifecycle_command(args))
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
+        elif args.command == "bench-history":
+            sys.exit(bench_history_command(args))
         else:
             parser.print_help()
             sys.exit(1)

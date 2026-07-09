@@ -5864,6 +5864,38 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
     }
 
 
+@router.get("/api/bench/throughput/results")
+async def get_throughput_benchmark_history(
+    is_admin: bool = Depends(require_admin),
+):
+    """Get accumulated throughput benchmark runs (newest first).
+
+    Declared before the `/api/bench/{bench_id}/...` routes so the literal
+    `throughput` segment is not captured as a bench_id. Shape mirrors
+    `/api/bench/accuracy/results` so both GUIs poll them the same way.
+    """
+    from .benchmark import get_active_run, get_throughput_history
+
+    active = get_active_run()
+    return {
+        "runs": get_throughput_history(),
+        "running": active is not None,
+        "current_model": active.request.model_id if active is not None else None,
+        "current_bench_id": active.bench_id if active is not None else None,
+    }
+
+
+@router.post("/api/bench/throughput/results/reset")
+async def reset_throughput_benchmark_history(
+    is_admin: bool = Depends(require_admin),
+):
+    """Clear all accumulated throughput benchmark history."""
+    from .benchmark import reset_throughput_history
+
+    reset_throughput_history()
+    return {"status": "reset"}
+
+
 @router.post("/api/bench/start")
 async def start_benchmark(
     request: Request,

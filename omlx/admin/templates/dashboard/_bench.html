@@ -412,6 +412,99 @@
                         </div>
                     </div>
 
+                    <!-- Benchmark History -->
+                    <div x-show="benchHistory.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="history" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Benchmark History</span>
+                                <span class="text-xs text-neutral-400" x-text="benchHistory.length + (benchHistory.length === 1 ? ' run' : ' runs')"></span>
+                            </div>
+                            <button @click="if (confirm('Clear all saved benchmark history? This cannot be undone.')) resetBenchHistory()"
+                                    class="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:text-red-600 transition-colors">
+                                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                Clear
+                            </button>
+                        </div>
+                        <div class="divide-y divide-neutral-100">
+                            <template x-for="(run, idx) in benchHistory" :key="run.timestamp + '-' + idx">
+                                <div>
+                                    <!-- Run header (click to expand) -->
+                                    <button @click="run._expanded = !run._expanded"
+                                            class="w-full flex items-center justify-between px-6 py-4 hover:bg-neutral-50 transition-colors text-left">
+                                        <div class="min-w-0">
+                                            <div class="text-sm font-medium text-neutral-900 truncate" x-text="run.model_id"></div>
+                                            <div class="text-xs text-neutral-400 mt-0.5" x-text="benchFormatTimestamp(run.timestamp)"></div>
+                                        </div>
+                                        <div class="flex items-center gap-4 flex-shrink-0">
+                                            <span class="text-xs text-neutral-500 tabular-nums" x-text="(run.total_time != null ? run.total_time + 's' : '')"></span>
+                                            <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="run._expanded && 'rotate-180'"></i>
+                                        </div>
+                                    </button>
+                                    <!-- Run detail -->
+                                    <div x-show="run._expanded" x-collapse x-cloak class="px-6 pb-5 space-y-4">
+                                        <!-- Single request results -->
+                                        <div x-show="benchHistorySingle(run).length > 0" class="overflow-x-auto">
+                                            <table class="w-full text-sm">
+                                                <thead>
+                                                    <tr class="border-b border-neutral-200 bg-neutral-50">
+                                                        {{ bench_th('bench.results.single.test', 'bench.metrics.test.tooltip', align='left') }}
+                                                        {{ bench_th('bench.results.single.ttft', 'bench.metrics.ttft.tooltip') }}
+                                                        {{ bench_th('bench.results.single.tpot', 'bench.metrics.tpot.tooltip') }}
+                                                        {{ bench_th('bench.results.single.pp_tps', 'bench.metrics.pp_tps.tooltip') }}
+                                                        {{ bench_th('bench.results.single.tg_tps', 'bench.metrics.tg_tps.tooltip') }}
+                                                        {{ bench_th('bench.results.single.e2e_latency', 'bench.metrics.e2e.tooltip') }}
+                                                        {{ bench_th('bench.results.single.throughput', 'bench.metrics.throughput.tooltip') }}
+                                                        {{ bench_th('bench.results.single.peak_mem', 'bench.metrics.peak_mem.tooltip') }}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    <template x-for="r in benchHistorySingle(run)" :key="r.pp">
+                                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
+                                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
+                                                        </tr>
+                                                    </template>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                        <!-- Batch results -->
+                                        <div x-show="benchHistoryBatch(run).length > 0" class="overflow-x-auto">
+                                            <table class="w-full text-sm">
+                                                <thead>
+                                                    <tr class="border-b border-neutral-200 bg-neutral-50">
+                                                        {{ bench_th('bench.results.batch.batch_size', 'bench.metrics.batch_size.tooltip', align='left') }}
+                                                        {{ bench_th('bench.results.batch.tg_tps', 'bench.metrics.tg_tps.tooltip') }}
+                                                        {{ bench_th('bench.results.batch.pp_tps', 'bench.metrics.pp_tps.tooltip') }}
+                                                        {{ bench_th('bench.results.batch.avg_ttft', 'bench.metrics.avg_ttft.tooltip') }}
+                                                        {{ bench_th('bench.results.batch.e2e_latency', 'bench.metrics.e2e.tooltip') }}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    <template x-for="r in benchHistoryBatch(run)" :key="r.batch_size">
+                                                        <tr class="border-b border-neutral-100 hover:bg-neutral-50">
+                                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
+                                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
+                                                        </tr>
+                                                    </template>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
                     <!-- Metrics Reference -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                         <button @click="benchShowMetrics = !benchShowMetrics"

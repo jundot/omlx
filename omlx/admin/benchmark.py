@@ -172,6 +172,63 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
             del _benchmark_runs[bid]
 
 
+# --- Throughput history persistence ---
+#
+# Completed runs are appended to an on-disk JSONL log so history survives
+# server restarts. Surfaced via the throughput history pane (web + app) and
+# the `omlx bench-history` CLI. Append-only — no in-memory accumulation, so
+# there is nothing to clobber.
+
+
+def _throughput_history_path() -> Path:
+    from omlx.settings import get_settings
+
+    path = get_settings().base_path / "bench_results_throughput.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _append_throughput_run(run_data: dict) -> None:
+    """Append one completed throughput run to the on-disk history log."""
+    try:
+        with open(_throughput_history_path(), "a") as f:
+            f.write(json.dumps(run_data) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to save throughput benchmark history: {e}")
+
+
+def get_throughput_history() -> list[dict]:
+    """Read accumulated throughput runs from disk, newest first."""
+    runs: list[dict] = []
+    try:
+        path = _throughput_history_path()
+        if path.exists():
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        runs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        # Skip a partially-written/corrupt line rather than
+                        # failing the whole history read.
+                        continue
+    except Exception as e:
+        logger.error(f"Failed to read throughput benchmark history: {e}")
+    runs.reverse()  # newest first
+    return runs
+
+
+def reset_throughput_history() -> None:
+    """Clear all accumulated throughput history."""
+    try:
+        path = _throughput_history_path()
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        logger.error(f"Failed to reset throughput benchmark history: {e}")
+
 
 def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
     """Generate a prompt with exactly target_tokens tokens.
@@ -1005,6 +1062,17 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Done
         overall_duration = time.perf_counter() - overall_start
         run.status = "completed"
+
+        # Persist to local history (survives restart; surfaced via the
+        # throughput history pane and `omlx bench-history`).
+        import datetime
+
+        _append_throughput_run({
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "model_id": request.model_id,
+            "total_time": round(overall_duration, 1),
+            "results": run.results,
+        })
         await _send_event(run, {
             "type": "done",
             "summary": {
