@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -250,6 +251,104 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
         return 0, None
 
 
+
+class AdaptiveCacheController:
+    """
+    Pressure-coupled MLX buffer-cache pool (OMLX_ADAPTIVE_CACHE=1).
+
+    When HOST memory used% crosses `trigger_pct`, shrink the MLX buffer-reuse
+    pool to `shrink_bytes` (mx.set_cache_limit) and clear it immediately
+    (mx.clear_cache) — reclaiming the pool costs milliseconds, whereas the
+    enforcer's next rung (whole-model eviction) costs a 30-60s reload and
+    chat 502s. When used% falls below trigger - hysteresis, restore the
+    startup limit so throughput recovers.
+
+    Origin: invented by athena-sim's evolutionary search (2026-07-10 evolve
+    run: "AdaptiveCache shrink 2.6G @79% used" survived selection), then
+    hand-ported here. Staged rollout, same env-toggle pattern as
+    OMLX_PRIORITY_SCHEDULING / OMLX_CACHE_LIMIT_GB: default OFF = byte-
+    identical behaviour.
+    """
+
+    def __init__(
+        self,
+        enabled: bool,
+        shrink_bytes: int,
+        trigger_pct: float,
+        hysteresis_pct: float = 4.0,
+        set_cache_limit=None,
+        clear_cache=None,
+        base_limit_bytes: int | None = None,
+    ) -> None:
+        self.enabled = enabled
+        self._shrink_bytes = max(0, shrink_bytes)
+        self._trigger_pct = trigger_pct
+        self._restore_pct = trigger_pct - hysteresis_pct
+        self._set_cache_limit = set_cache_limit or mx.set_cache_limit
+        self._clear_cache = clear_cache or mx.clear_cache
+        self._base_limit_bytes = base_limit_bytes
+        self.shrunk = False
+
+    @classmethod
+    def from_env(cls) -> "AdaptiveCacheController":
+        enabled = os.environ.get("OMLX_ADAPTIVE_CACHE") == "1"
+
+        def _f(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, "") or default)
+            except ValueError:
+                return default
+
+        return cls(
+            enabled=enabled,
+            shrink_bytes=int(_f("OMLX_ADAPTIVE_CACHE_SHRINK_GB", 2.6) * 1024**3),
+            trigger_pct=_f("OMLX_ADAPTIVE_CACHE_TRIGGER_PCT", 79.0),
+        )
+
+    def _base_limit(self) -> int:
+        """Startup pool limit to restore to — same derivation as cli.py."""
+        if self._base_limit_bytes is not None:
+            return self._base_limit_bytes
+        limit = 0
+        if limit_gb := os.environ.get("OMLX_CACHE_LIMIT_GB"):
+            try:
+                limit = int(float(limit_gb) * 1024**3)
+            except ValueError:
+                limit = 0
+        if limit <= 0:
+            limit = int(mx.device_info().get("memory_size", 0)) or 1024**3
+        self._base_limit_bytes = limit
+        return limit
+
+    def maybe_adjust(self, host_used_pct: float) -> None:
+        """One hysteresis step; called from the enforcer poll loop."""
+        if not self.enabled:
+            return
+        if not self.shrunk and host_used_pct >= self._trigger_pct:
+            self._set_cache_limit(self._shrink_bytes)
+            self._clear_cache()
+            self.shrunk = True
+            logger.info(
+                "AdaptiveCache SHRINK: host used %.1f%% >= %.1f%% -> cache pool "
+                "limited to %.1f GiB and cleared (restore below %.1f%%)",
+                host_used_pct,
+                self._trigger_pct,
+                self._shrink_bytes / 1024**3,
+                self._restore_pct,
+            )
+        elif self.shrunk and host_used_pct <= self._restore_pct:
+            base = self._base_limit()
+            self._set_cache_limit(base)
+            self.shrunk = False
+            logger.info(
+                "AdaptiveCache RESTORE: host used %.1f%% <= %.1f%% -> cache pool "
+                "limit back to %.1f GiB",
+                host_used_pct,
+                self._restore_pct,
+                base / 1024**3,
+            )
+
+
 class ProcessMemoryEnforcer:
     """
     Background task that enforces process-level memory limits.
@@ -301,6 +400,7 @@ class ProcessMemoryEnforcer:
             prefill_min_chunk_tokens: Floor for adaptive shrink.
         """
         self._engine_pool = engine_pool
+        self._adaptive_cache = AdaptiveCacheController.from_env()
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
         self._memory_guard_custom_ceiling_bytes = max(
             0, int(memory_guard_custom_ceiling_gb * 1024**3)
@@ -1211,6 +1311,15 @@ class ProcessMemoryEnforcer:
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
         self._propagate_memory_limit()
+
+        # AdaptiveCache: reclaim the MLX buffer-reuse pool under HOST pressure
+        # BEFORE the eviction ladder gets a chance to unload whole models.
+        if self._adaptive_cache.enabled:
+            try:
+                vm = psutil_compat.virtual_memory()
+                self._adaptive_cache.maybe_adjust(float(getattr(vm, "percent", 0.0)))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("AdaptiveCache host-memory read failed: %s", exc)
 
         ceiling = self._get_hard_limit_bytes()
         if ceiling <= 0:

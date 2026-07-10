@@ -2428,3 +2428,72 @@ class TestDFlashGuardPropagation:
         engine.scheduler = scheduler
         entry = _make_entry("model-a", engine=engine)
         assert enforcer._resolve_scheduler(entry) is scheduler
+
+
+class TestAdaptiveCacheController:
+    """OMLX_ADAPTIVE_CACHE: pressure-coupled MLX buffer-cache pool."""
+
+    def _controller(self, enabled=True, trigger=79.0, shrink_gb=2.6, base_gb=6.0):
+        from omlx.process_memory_enforcer import AdaptiveCacheController
+
+        calls = {"set": [], "clear": 0}
+
+        def fake_set(b):
+            calls["set"].append(b)
+
+        def fake_clear():
+            calls["clear"] += 1
+
+        c = AdaptiveCacheController(
+            enabled=enabled,
+            shrink_bytes=int(shrink_gb * 1024**3),
+            trigger_pct=trigger,
+            set_cache_limit=fake_set,
+            clear_cache=fake_clear,
+            base_limit_bytes=int(base_gb * 1024**3),
+        )
+        return c, calls
+
+    def test_disabled_never_touches_cache(self):
+        c, calls = self._controller(enabled=False)
+        for pct in (50.0, 85.0, 99.0, 60.0):
+            c.maybe_adjust(pct)
+        assert calls["set"] == [] and calls["clear"] == 0
+
+    def test_below_trigger_no_action(self):
+        c, calls = self._controller()
+        c.maybe_adjust(70.0)
+        assert calls["set"] == [] and not c.shrunk
+
+    def test_shrinks_once_at_trigger_and_holds(self):
+        c, calls = self._controller()
+        c.maybe_adjust(80.0)
+        c.maybe_adjust(90.0)  # stays shrunk, no repeat calls
+        assert calls["set"] == [int(2.6 * 1024**3)]
+        assert calls["clear"] == 1
+        assert c.shrunk
+
+    def test_hysteresis_restore(self):
+        c, calls = self._controller()
+        c.maybe_adjust(80.0)  # shrink
+        c.maybe_adjust(77.0)  # inside hysteresis band (restore at <= 75) -> hold
+        assert c.shrunk
+        c.maybe_adjust(74.0)  # restore
+        assert not c.shrunk
+        assert calls["set"][-1] == int(6.0 * 1024**3)
+        # full cycle can repeat
+        c.maybe_adjust(80.0)
+        assert c.shrunk and calls["clear"] == 2
+
+    def test_from_env_parsing(self, monkeypatch):
+        from omlx.process_memory_enforcer import AdaptiveCacheController
+
+        monkeypatch.setenv("OMLX_ADAPTIVE_CACHE", "1")
+        monkeypatch.setenv("OMLX_ADAPTIVE_CACHE_SHRINK_GB", "3.0")
+        monkeypatch.setenv("OMLX_ADAPTIVE_CACHE_TRIGGER_PCT", "82")
+        c = AdaptiveCacheController.from_env()
+        assert c.enabled
+        assert c._shrink_bytes == int(3.0 * 1024**3)
+        assert c._trigger_pct == 82.0
+        monkeypatch.delenv("OMLX_ADAPTIVE_CACHE")
+        assert not AdaptiveCacheController.from_env().enabled
