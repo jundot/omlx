@@ -4892,3 +4892,39 @@ class TestTurboQuantAttentionSinkGuard:
 
         assert scheduler._model_uses_attention_sinks() is False
         assert scheduler._turboquant_eligible([KVCache()]) is True
+
+
+class TestSchedulerModelIdDerivation:
+    """Regression tests for PR #2178: the scheduler must use
+    config.model_name directly as model_id for tracker lookups, rather than
+    os.path.basename(config.model_name).  HF cache snapshot hashes must not
+    leak into prefill progress tracking."""
+
+    def test_prompt_progress_uses_model_name_not_basename(
+        self, mock_model, mock_tokenizer
+    ):
+        """_on_prompt_progress passes config.model_name to the tracker, not
+        os.path.basename(config.model_name)."""
+        from omlx.prefill_progress import get_prefill_tracker
+
+        config = SchedulerConfig(
+            model_name="Jundot--Qwen3.6-35B-oQ4",
+            model_path="/cache/models--Jundot--Qwen3.6-35B-oQ4/snapshots/def456",
+        )
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=config,
+        )
+        tracker = get_prefill_tracker()
+        tracker.clear()
+
+        # _on_prompt_progress looks up request_id via uid_to_request_id
+        scheduler.uid_to_request_id[0] = "test-req"
+        scheduler._on_prompt_progress([(0, 50, 200)])
+
+        progress = tracker.get_model_progress("Jundot--Qwen3.6-35B-oQ4")
+        assert len(progress) == 1
+        progress_none = tracker.get_model_progress("def456")
+        assert len(progress_none) == 0
+        tracker.clear()

@@ -2658,3 +2658,27 @@ class TestFailedLoadReclaim:
         scheduled.assert_called_once()
         args = scheduled.call_args[0]
         assert args[0] == "model-a"
+
+
+class TestSchedulerConfigModelId:
+    """engine_pool sets model_name=model_id and model_path=entry.model_path
+    on the shared scheduler config so the scheduler uses the engine pool's
+    canonical model_id (not a filesystem snapshot hash) for tracker lookups."""
+
+    async def test_wires_model_name_and_model_path(self, small_mock_model_dir):
+        """engine_pool sets model_name=model_id and model_path on the
+        scheduler config when loading an engine."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            return_value=mock_engine,
+        ):
+            await pool.get_engine("model-a")
+
+        assert pool._scheduler_config.model_name == "model-a"
+        assert pool._scheduler_config.model_path == str(small_mock_model_dir / "model-a")
