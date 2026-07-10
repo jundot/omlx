@@ -57,6 +57,12 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     Reading top-level only keeps the gate aligned with what dflash will
     actually load.
 
+    ``gemma4_unified`` (current mlx-community/lmstudio Gemma 4 exports,
+    #2153) is accepted too: mlx-lm's MODEL_REMAPPING loads those
+    checkpoints through the same ``gemma4`` module — the vision/audio
+    towers are dropped in sanitize and the text stack DFlash drives is
+    identical, which live-testing against z-lab's 12B drafter confirmed.
+
     Returns:
         (is_compatible, reason). ``reason`` is empty when compatible.
     """
@@ -72,7 +78,7 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     model_type = str(cfg.get("model_type") or "").lower()
 
     is_qwen = "qwen" in model_type
-    is_gemma4 = model_type in ("gemma4", "gemma4_text")
+    is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     if not (is_qwen or is_gemma4 or is_laguna):
         return False, (

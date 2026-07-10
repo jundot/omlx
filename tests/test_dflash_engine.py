@@ -806,6 +806,27 @@ class TestDFlashCompatibility:
         assert compatible is True
         assert reason == ""
 
+    def test_gemma4_unified_top_level_is_compatible(self, tmp_path):
+        """Current mlx-community Gemma 4 exports declare gemma4_unified at the
+        top level with text_config.model_type=gemma4_unified_text (#2153).
+        mlx-lm remaps gemma4_unified onto the gemma4 module, so DFlash drives
+        the same text stack and the gate must accept it."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "gemma4_unified",
+                    "text_config": {"model_type": "gemma4_unified_text"},
+                }
+            )
+        )
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
     def test_gemma4_assistant_is_incompatible(self, tmp_path):
         """MTP -assistant variants declare gemma4_assistant at the top level
         even though their text_config.model_type is gemma4_text. The toggle
