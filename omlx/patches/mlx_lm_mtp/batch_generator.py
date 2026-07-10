@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -135,6 +136,7 @@ def apply() -> bool:
             realign_rows = getattr(self, "_omlx_realign_rows", None)
             if callable(realign_rows):
                 realign_rows()
+            _maybe_clear_multirow_marker(self)
 
             if _is_mtp_batch_eligible(self):
                 try:
@@ -159,6 +161,7 @@ def apply() -> bool:
                     _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             return original_next(self, *args, **kwargs)
 
@@ -317,10 +320,41 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
     return True
 
 
+_ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
+
+
+def _rowwise_batch_mtp_enabled() -> bool:
+    """Opt-in for row-wise MTP on multi-row batches (default off).
+
+    The row-wise path runs one backbone forward per row per cycle, so its
+    aggregate throughput is roughly single-stream MTP throughput regardless
+    of batch size, while standard batched decode amortizes one forward over
+    all rows. Measured on Qwen3.6-27B-oQ4e-mtp / M3 Ultra (pp1024/tg128):
+    row-wise 53.3 / 52.5 tok/s aggregate at batch 2 / 4 versus 65.2 / 86.5
+    for standard batched decode — despite 83-93% draft acceptance. It only
+    pays off when tokens-per-cycle exceeds the row count, so it stays off
+    unless explicitly requested.
+    """
+    return os.environ.get(_ROWWISE_BATCH_MTP_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
     if getattr(gen_batch, state_attr, None) is not None:
         return True
-    if getattr(gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False):
+    # The multirow-decode marker guards the singleton-init invariant only
+    # (see _mark_standard_multirow_decode). Row-wise batch activation seeds
+    # every row from a freshly extracted per-row cache, so a prior standard
+    # multi-row decode is exactly the state it expects — blocking it here
+    # would permanently lock batches out of MTP, because a batch's first
+    # decode step is always standard.
+    if state_attr == "_omlx_mtp_state" and getattr(
+        gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False
+    ):
         return False
     return bool(getattr(gen_batch, "_omlx_mtp_activation_safe", True))
 
@@ -332,6 +366,10 @@ def _mark_standard_multirow_decode(gen_batch: Any) -> None:
     no longer satisfies the narrow invariant that singleton MTP initialization
     relies on. Existing row-wise MTP state may continue, but starting a fresh
     singleton MTP state after late-join/late-finish reshaping is unsafe.
+
+    The marker is not permanent: once the batch shrinks back to one row with a
+    verifiably compact cache, ``_maybe_clear_multirow_marker`` lifts it so the
+    surviving request regains MTP for the rest of its generation.
     """
     try:
         if len(getattr(gen_batch, "uids", []) or []) > 1:
@@ -340,21 +378,65 @@ def _mark_standard_multirow_decode(gen_batch: Any) -> None:
         pass
 
 
-def _batch_rows_aligned_for_mtp(gen_batch: Any) -> bool:
-    """True when all batch rows share the same target-cache decode position."""
-    prompt_cache = getattr(gen_batch, "prompt_cache", None) or []
-    for cache in prompt_cache:
-        offset = getattr(cache, "offset", None)
-        if offset is None:
+def _log_multirow_mtp_inactive_once(gen_batch: Any) -> None:
+    """Say once, at INFO, why an MTP-capable batch is decoding without MTP.
+
+    #2150 showed the silent fallback is easy to misread: the benchmark's
+    batched phases report plain continuous-batching numbers while every log
+    line about MTP inactivity hides at DEBUG. One line per batch keeps the
+    signal visible without per-step spam.
+    """
+    if getattr(gen_batch, "_omlx_mtp_inactive_logged", False):
+        return
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) <= 1:
+        return
+    if not _mtp_common_eligible(gen_batch):
+        return
+    gen_batch._omlx_mtp_inactive_logged = True
+    if not _rowwise_batch_mtp_enabled():
+        logger.info(
+            "MTP inactive for %d-row batch: standard batched decode is faster "
+            "at this batch size (set %s=1 to force row-wise MTP)",
+            len(uids),
+            _ROWWISE_BATCH_MTP_ENV,
+        )
+    else:
+        logger.info(
+            "MTP inactive for %d-row batch: %s",
+            len(uids),
+            _ineligibility_reason(gen_batch) or "activation deferred",
+        )
+
+
+def _maybe_clear_multirow_marker(gen_batch: Any) -> None:
+    """Re-enable singleton MTP once a shrunken batch is verifiably safe again.
+
+    The multirow marker exists because a row surviving batch reshaping may sit
+    in a cache whose layout singleton MTP's raw backbone calls don't expect
+    (left padding). ``BatchKVCache.filter()`` shifts out the minimum shared
+    left padding, so a batch filtered down to one row is compact again in the
+    common case — verify that per layer instead of assuming, and only then
+    lift the marker. Without this, a request that ever shared a decode step
+    with another request is locked out of MTP for the rest of its generation
+    even once it is running alone (#2150).
+    """
+    if not getattr(gen_batch, "_omlx_mtp_saw_standard_multirow_decode", False):
+        return
+    uids = getattr(gen_batch, "uids", None)
+    if uids is None or len(uids) != 1:
+        return
+    for cache in getattr(gen_batch, "prompt_cache", None) or []:
+        left_padding = getattr(cache, "left_padding", None)
+        if left_padding is None:
             continue
         try:
-            if hasattr(offset, "tolist"):
-                values = [int(v) for v in offset.tolist()]
-                return len(set(values)) <= 1
-            return True
+            if max(int(v) for v in left_padding.tolist()) > 0:
+                return
         except Exception:
-            return False
-    return True
+            return
+    gen_batch._omlx_mtp_saw_standard_multirow_decode = False
+    logger.info("MTP singleton recovery: multirow marker cleared (compact cache)")
 
 
 def _is_mtp_eligible(gen_batch: Any) -> bool:
@@ -390,8 +472,14 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if getattr(
         gen_batch, "_omlx_mtp_batch_state", None
-    ) is None and not _batch_rows_aligned_for_mtp(gen_batch):
+    ) is None and not _rowwise_batch_mtp_enabled():
         return False
+    # No cache-position alignment requirement: activation seeds each row from
+    # its own extract_cache(idx) view and steady-state row cycles diverge the
+    # per-row offsets immediately anyway (accept counts differ per row), so
+    # the merge path already handles ragged rows. Under continuous batching
+    # rows join at different times, so requiring aligned offsets at
+    # activation kept this path from ever engaging (#2150).
     return True
 
 
@@ -419,8 +507,15 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if uids is None:
         return "GenerationBatch has no uids"
     if len(uids) != 1:
-        if not _batch_rows_aligned_for_mtp(gen_batch):
-            return "row-wise MTP requires aligned target-cache positions"
+        if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
+            return "pending prompt work may still merge into this batch"
+        if getattr(
+            gen_batch, "_omlx_mtp_batch_state", None
+        ) is None and not _rowwise_batch_mtp_enabled():
+            return (
+                f"row-wise batch MTP is opt-in ({_ROWWISE_BATCH_MTP_ENV}=1); "
+                "standard batched decode is faster at batch >= 2"
+            )
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
         return "pending prompt work may still merge into this singleton batch"

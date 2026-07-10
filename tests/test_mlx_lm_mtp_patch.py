@@ -989,9 +989,11 @@ class TestBatchGeneratorDispatch:
 
         assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
 
-    def test_rowwise_batch_eligibility_requires_safe_activation(self):
+    def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _MtpModel:
             def __init__(self):
@@ -1023,9 +1025,51 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
-    def test_rowwise_batch_new_activation_requires_aligned_offsets(self):
+    def test_rowwise_batch_new_activation_is_opt_in(self, monkeypatch):
+        # Default (env unset): no NEW row-wise activation — standard batched
+        # decode measured faster at batch >= 2. Existing batch state still
+        # continues so a mid-flight batch is not torn down by a config flip.
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch._omlx_mtp_batch_state = batch_generator._MtpBatchState(
+                states={1: batch_generator._MtpState(uid=1)}
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_rowwise_batch_new_activation_allows_ragged_offsets(self, monkeypatch):
+        # Continuous batching admits rows at different times, so per-row
+        # cache offsets rarely align. Activation must not require alignment:
+        # each row is seeded from its own extract_cache view and steady-state
+        # row cycles diverge the offsets anyway (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _Offset:
             def __init__(self, values):
@@ -1052,12 +1096,92 @@ class TestBatchGeneratorDispatch:
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
             )
-            assert batch_generator._is_mtp_batch_eligible(batch) is False
-
-            batch.prompt_cache = [SimpleNamespace(offset=_Offset([8, 8]))]
             assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
+
+    def test_rowwise_batch_activation_allowed_after_standard_multirow_decode(
+        self, monkeypatch
+    ):
+        # The multirow-decode marker protects singleton re-initialization
+        # only. A batch's first decode step is always standard (MTP has not
+        # activated yet), so blocking batch activation on the marker would
+        # permanently lock every batch out of row-wise MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+
+            singleton = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(singleton) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_recovery_clears_marker_when_cache_compact(self):
+        # A batch that shrinks back to one row with no residual left padding
+        # satisfies the singleton-init invariant again, so the multirow
+        # marker must lift and the surviving request regains MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(batch)
+        assert batch._omlx_mtp_saw_standard_multirow_decode is False
+
+        # Residual padding: the invariant does not hold — keep the marker.
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([3]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        # Still multi-row: never clears.
+        multirow = SimpleNamespace(
+            uids=[1, 2],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0, 0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(multirow)
+        assert multirow._omlx_mtp_saw_standard_multirow_decode is True
 
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
