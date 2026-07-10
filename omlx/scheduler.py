@@ -1296,6 +1296,14 @@ class SchedulerConfig:
     max_num_batched_tokens: int = 8192
     # Scheduling policy
     policy: SchedulingPolicy = SchedulingPolicy.FCFS
+    # Interactive slot reservation (staged rollout via OMLX_INTERACTIVE_RESERVED_SLOTS).
+    # When > 0 and policy is PRIORITY, background requests (priority > 0) may occupy at
+    # most max_num_seqs - reserved running slots, so an interactive request (priority 0)
+    # never waits out a full background generation just to be admitted — the measured
+    # 60-220s interactive tail under daemon load is exactly that wait. Background can
+    # never be starved entirely (its share is floored at 1 slot). 0 = disabled (today's
+    # admission behaviour, byte-for-byte).
+    reserved_interactive_slots: int = 0
     # BatchGenerator settings (passed directly to mlx-lm)
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
@@ -7108,6 +7116,30 @@ class Scheduler:
         """Return requests already occupying scheduler capacity."""
         return len(self.running) + len(self.prefilling)
 
+    def _background_slots_exhausted(self, request: "Request") -> bool:
+        """
+        Interactive slot reservation (OMLX_INTERACTIVE_RESERVED_SLOTS).
+
+        True when `request` is a background request (priority > 0) and background
+        work already occupies its allowed share of admission slots
+        (max_num_seqs - reserved, floored at 1 so background is never starved).
+        Interactive requests (priority <= 0) are never reservation-blocked. Inert
+        unless the PRIORITY policy is enabled and reserved > 0.
+        """
+        reserved = self.config.reserved_interactive_slots
+        if reserved <= 0 or self.config.policy is not SchedulingPolicy.PRIORITY:
+            return False
+        if getattr(request, "priority", 0) <= 0:
+            return False
+        cap = self._effective_max_num_seqs()
+        background_cap = max(1, cap - reserved)
+        admitted_background = sum(
+            1
+            for r in list(self.running.values()) + list(self.prefilling)
+            if getattr(r, "priority", 0) > 0
+        )
+        return admitted_background >= background_cap
+
     def _preflight_memory_check(
         self, request: "Request"
     ) -> "_PreflightRejection | None":
@@ -7626,6 +7658,21 @@ class Scheduler:
                     break
 
             request = self.waiting[0]
+            # Interactive slot reservation: if the queue head is a background request
+            # and background already holds its allowed share of slots, stop admitting.
+            # The waiting queue is priority-ordered (_admit_to_waiting), so no
+            # interactive request can be behind a background head — breaking here never
+            # delays interactive work, and the reserved slot stays free for the next
+            # priority-0 arrival instead of being consumed by a multi-minute background
+            # generation.
+            if self._background_slots_exhausted(request):
+                logger.debug(
+                    "Admission deferred: background slots exhausted "
+                    "(reserved_interactive_slots=%d, admitted=%d)",
+                    self.config.reserved_interactive_slots,
+                    self._num_admitted_requests(),
+                )
+                break
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):

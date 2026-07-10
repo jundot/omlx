@@ -1445,8 +1445,22 @@ class GlobalSettings:
             else SchedulingPolicy.FCFS
         )
 
+        # Interactive slot reservation (OMLX_INTERACTIVE_RESERVED_SLOTS=1): with the
+        # PRIORITY policy on, background requests may hold at most
+        # max_concurrent_requests - N running slots, so an interactive turn is admitted
+        # into the reserved slot immediately instead of waiting out a multi-minute
+        # background generation (the measured 60-220s tail). Same env-toggle staged-
+        # rollout pattern as OMLX_PRIORITY_SCHEDULING; default 0 = admission unchanged.
+        try:
+            reserved_interactive_slots = int(
+                os.environ.get("OMLX_INTERACTIVE_RESERVED_SLOTS", "0") or "0"
+            )
+        except ValueError:
+            reserved_interactive_slots = 0
+
         return SchedulerConfig(
             policy=scheduling_policy,
+            reserved_interactive_slots=max(0, reserved_interactive_slots),
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,

@@ -100,3 +100,70 @@ class TestAdmissionPausedField:
         s._prefill_memory_guard = False
         s._admission_paused = False
         assert s._admission_paused is False
+
+
+class TestInteractiveSlotReservation:
+    """OMLX_INTERACTIVE_RESERVED_SLOTS -> Scheduler._background_slots_exhausted."""
+
+    def _scheduler(self, *, max_num_seqs=2, reserved=1, policy=None):
+        from omlx.scheduler import SchedulerConfig, SchedulingPolicy
+
+        s = Scheduler.__new__(Scheduler)
+        s.config = SchedulerConfig(
+            max_num_seqs=max_num_seqs,
+            policy=policy if policy is not None else SchedulingPolicy.PRIORITY,
+            reserved_interactive_slots=reserved,
+        )
+        s.running = {}
+        s.prefilling = []
+        s.waiting = deque()
+        s._serialize_llama4_requests = False
+        s._generation_overflow_recovery_ids = set()
+        return s
+
+    def _req(self, rid: str, priority: int):
+        r = _make_request(rid)
+        r.priority = priority
+        return r
+
+    def test_disabled_by_default_is_inert(self):
+        s = self._scheduler(reserved=0)
+        s.running["bg1"] = self._req("bg1", 10)
+        s.running["bg2"] = self._req("bg2", 10)
+        assert not s._background_slots_exhausted(self._req("bg3", 10))
+
+    def test_blocks_background_when_share_full(self):
+        # max=2, reserved=1 -> background share = 1 slot.
+        s = self._scheduler()
+        s.running["bg1"] = self._req("bg1", 10)
+        assert s._background_slots_exhausted(self._req("bg2", 10))
+
+    def test_admits_background_when_share_free(self):
+        s = self._scheduler()
+        s.running["chat"] = self._req("chat", 0)  # interactive occupies, bg share free
+        assert not s._background_slots_exhausted(self._req("bg1", 10))
+
+    def test_interactive_never_reservation_blocked(self):
+        s = self._scheduler()
+        s.running["bg1"] = self._req("bg1", 10)
+        s.prefilling.append(self._req("bg2", 10))
+        assert not s._background_slots_exhausted(self._req("chat", 0))
+
+    def test_background_never_fully_starved(self):
+        # max=1, reserved=1 -> background share floors at 1, not 0.
+        s = self._scheduler(max_num_seqs=1, reserved=1)
+        assert not s._background_slots_exhausted(self._req("bg1", 10))
+        s.running["bg1"] = self._req("bg1", 10)
+        assert s._background_slots_exhausted(self._req("bg2", 10))
+
+    def test_inert_under_fcfs_policy(self):
+        from omlx.scheduler import SchedulingPolicy
+
+        s = self._scheduler(policy=SchedulingPolicy.FCFS)
+        s.running["bg1"] = self._req("bg1", 10)
+        assert not s._background_slots_exhausted(self._req("bg2", 10))
+
+    def test_prefilling_counts_toward_background_share(self):
+        s = self._scheduler()
+        s.prefilling.append(self._req("bg1", 10))
+        assert s._background_slots_exhausted(self._req("bg2", 10))
