@@ -136,6 +136,14 @@ def serve_command(args):
         logging.getLogger("httpcore").setLevel(logging.INFO)
         logging.getLogger("httpx").setLevel(logging.INFO)
 
+    # Warn when an installed git-pinned dependency drifted from pyproject.
+    # pip skips `pkg @ git+...@SHA` pins whose version number already
+    # matches, so a source install upgraded with `pip install -e .` can run
+    # new omlx code against stale dependency commits.
+    from .utils.pin_drift import log_git_pin_drift
+
+    log_git_pin_drift()
+
     # Ensure required directories exist
     settings.ensure_directories()
 
