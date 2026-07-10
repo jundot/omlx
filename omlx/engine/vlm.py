@@ -2720,6 +2720,10 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            # Admission-scheduling priority: this non-streaming fast path bypasses
+            # stream_generate and was the hop that silently dropped every caller's
+            # priority for the primary chat model (see engine/batched.py pattern).
+            priority=kwargs.get("priority", 0),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -2841,6 +2845,11 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            # Admission-scheduling priority (same forwarding as engine/batched.py).
+            # Without this the VLM engine — which serves the PRIMARY chat model —
+            # silently dropped every caller's priority to the default, making
+            # OMLX_PRIORITY_SCHEDULING and slot reservation inert for it.
+            priority=kwargs.get("priority", 0),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,

@@ -167,3 +167,11 @@ class TestInteractiveSlotReservation:
         s = self._scheduler()
         s.prefilling.append(self._req("bg1", 10))
         assert s._background_slots_exhausted(self._req("bg2", 10))
+
+    def test_same_pass_scheduled_counts_toward_share(self):
+        # Two simultaneous background arrivals in ONE _schedule_waiting pass:
+        # the first is admitted (in `scheduled`, not yet running); the second
+        # must still be blocked. Regression: live probe showed both admitted.
+        s = self._scheduler()
+        first_bg = self._req("bg1", 10)
+        assert s._background_slots_exhausted(self._req("bg2", 10), [first_bg])

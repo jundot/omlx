@@ -7116,7 +7116,9 @@ class Scheduler:
         """Return requests already occupying scheduler capacity."""
         return len(self.running) + len(self.prefilling)
 
-    def _background_slots_exhausted(self, request: "Request") -> bool:
+    def _background_slots_exhausted(
+        self, request: "Request", pending_scheduled: "list[Request] | tuple" = ()
+    ) -> bool:
         """
         Interactive slot reservation (OMLX_INTERACTIVE_RESERVED_SLOTS).
 
@@ -7125,6 +7127,11 @@ class Scheduler:
         (max_num_seqs - reserved, floored at 1 so background is never starved).
         Interactive requests (priority <= 0) are never reservation-blocked. Inert
         unless the PRIORITY policy is enabled and reserved > 0.
+
+        `pending_scheduled` must include requests admitted EARLIER IN THE SAME
+        _schedule_waiting pass — they are not yet in running/prefilling, and two
+        simultaneous background arrivals would otherwise both be admitted in one
+        pass, silently bypassing the reservation.
         """
         reserved = self.config.reserved_interactive_slots
         if reserved <= 0 or self.config.policy is not SchedulingPolicy.PRIORITY:
@@ -7135,7 +7142,11 @@ class Scheduler:
         background_cap = max(1, cap - reserved)
         admitted_background = sum(
             1
-            for r in list(self.running.values()) + list(self.prefilling)
+            for r in (
+                list(self.running.values())
+                + list(self.prefilling)
+                + list(pending_scheduled)
+            )
             if getattr(r, "priority", 0) > 0
         )
         return admitted_background >= background_cap
@@ -7665,12 +7676,13 @@ class Scheduler:
             # delays interactive work, and the reserved slot stays free for the next
             # priority-0 arrival instead of being consumed by a multi-minute background
             # generation.
-            if self._background_slots_exhausted(request):
-                logger.debug(
+            if self._background_slots_exhausted(request, scheduled):
+                logger.info(
                     "Admission deferred: background slots exhausted "
-                    "(reserved_interactive_slots=%d, admitted=%d)",
+                    "(reserved_interactive_slots=%d, admitted=%d, in_pass=%d)",
                     self.config.reserved_interactive_slots,
                     self._num_admitted_requests(),
+                    len(scheduled),
                 )
                 break
             self._clear_memory_admission_blocker(request.request_id)
