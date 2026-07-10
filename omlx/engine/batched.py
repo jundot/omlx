@@ -395,9 +395,7 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = (
-            self._model_name
-        )  # Ensure cache isolation per model
+        # Ensure cache isolation per model
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

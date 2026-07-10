@@ -1371,6 +1371,12 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
+            # Wire the correct model_id / model_path into the shared scheduler
+            # config so every engine (Batched/VLM/DFlash/Embedding) sees the
+            # right values when it builds `SchedulerConfig` internally.
+            self._scheduler_config.model_name = model_id
+            self._scheduler_config.model_path = entry.model_path
+
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
             # exists on the language model path. mtp_enabled was already
