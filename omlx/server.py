@@ -2150,6 +2150,7 @@ async def health():
 @app.get("/api/status")
 async def server_status(_: bool = Depends(verify_api_key)):
     """Lightweight status endpoint for external tool polling (statuslines, scripts)."""
+    from .custom_kernels import native_kernel_status
     from .model_discovery import format_size
     from .server_metrics import get_server_metrics
 
@@ -2225,6 +2226,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "model_memory_max_formatted": (
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
+        "custom_kernels": native_kernel_status(),
     }
 
 
