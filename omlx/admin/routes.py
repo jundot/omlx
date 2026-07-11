@@ -681,7 +681,11 @@ def _model_has_mtp_weight_tensors(model_dir) -> bool:
         try:
             index = json.loads(index_path.read_text())
             weight_map = index.get("weight_map", {})
-            return any("mtp." in key for key in weight_map.keys())
+            if any("mtp." in key for key in weight_map.keys()):
+                return True
+            # Index exists but lists no mtp keys. OptiQ models store MTP weights
+            # in a separate mtp.safetensors that is not referenced by the index.
+            # Fall through to scan for it explicitly before giving up.
         except Exception:
             return False
 

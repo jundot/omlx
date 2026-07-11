@@ -529,7 +529,11 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
         try:
             data = json.loads(index_path.read_text())
             weight_map = data.get("weight_map") or {}
-            return any(k.startswith(prefixes) for k in weight_map)
+            if any(k.startswith(prefixes) for k in weight_map):
+                return True
+            # Index exists but lists no mtp keys. OptiQ models store MTP weights
+            # in a separate mtp.safetensors that is not referenced by the index.
+            # Fall through to scan for it explicitly before giving up.
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
