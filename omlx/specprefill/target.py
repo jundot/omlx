@@ -75,10 +75,11 @@ def run_specprefill_target_prefill(
                 with mx.stream(stream):
                     target_model(sys_arr[:prefill_step_size][None], cache=prompt_cache)
                     mx.eval([cache_layer.state for cache_layer in prompt_cache])
+                    # Keep the next chunk view on the target-model stream.
+                    sys_arr = sys_arr[prefill_step_size:]
                 system_processed += prefill_step_size
                 check_abort(system_processed)
                 report_system_progress(system_processed, system_token_count)
-                sys_arr = sys_arr[prefill_step_size:]
                 # Drain before clear to avoid the stream/cache race in #557.
                 sync_and_clear_cache()
             if sys_arr.size > 0:

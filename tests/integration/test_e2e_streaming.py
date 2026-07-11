@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from omlx.engine.base import BaseEngine
+
 
 @dataclass
 class MockGenerationOutput:
@@ -51,7 +53,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine with streaming support for testing."""
 
     def __init__(self, model_name: str = "test-model"):
@@ -76,6 +78,12 @@ class MockBaseEngine:
     @property
     def prefix_cache_enabled(self) -> bool:
         return False
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
 
     def set_stream_outputs(self, outputs: List[MockGenerationOutput]):
         """Set custom streaming outputs for testing."""
@@ -108,7 +116,9 @@ class MockBaseEngine:
                 finish_reason="stop",
             )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
+    def count_chat_tokens(
+        self, messages: List[Dict], tools=None, chat_template_kwargs=None, **kwargs
+    ) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -139,6 +149,12 @@ class MockBaseEngine:
                 finish_reason="stop",
             )
 
+    def get_stats(self) -> Dict[str, Any]:
+        return {}
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        return None
+
 
 class MockEnginePool:
     """Mock engine pool for testing."""
@@ -148,6 +164,7 @@ class MockEnginePool:
         self._models = [
             {"id": "test-model", "loaded": True, "pinned": False, "size": 1000000}
         ]
+        self._entries: Dict[str, Any] = {}
 
     @property
     def model_count(self) -> int:
@@ -165,6 +182,9 @@ class MockEnginePool:
     def current_model_memory(self) -> int:
         return 1000000
 
+    def get_entry(self, model_id: str):
+        return self._entries.get(model_id)
+
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
 
@@ -174,8 +194,11 @@ class MockEnginePool:
     def get_status(self) -> Dict[str, Any]:
         return {"models": self._models}
 
-    async def get_engine(self, model_id: str):
+    async def get_engine(self, model_id: str, _lease: bool = False):
         return self._engine
+
+    async def release_engine(self, model_id: str) -> None:
+        return None
 
 
 def parse_sse_events(response_text: str) -> List[Dict]:

@@ -47,13 +47,13 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -261,6 +261,10 @@ class ServerState:
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
+    # False while the startup pinned-model preload is still running.
+    # /health returns 503 with status "loading" until it flips to True so
+    # port watchdogs see liveness instead of a closed port (#2184).
+    pinned_preload_complete: bool = True
 
 
 # Global server state instance
@@ -379,10 +383,6 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
-    # Startup: Preload pinned models
-    if _server_state.engine_pool is not None:
-        await _server_state.engine_pool.preload_pinned_models()
-
     # Start process memory enforcer if configured
     if (
         _server_state.global_settings is not None
@@ -408,6 +408,26 @@ async def lifespan(app: FastAPI):
         # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
         enforcer.start()
+
+    # Startup: Preload pinned models in the background so uvicorn binds the
+    # HTTP port immediately after this lifespan yields. A large pinned
+    # preload (hundreds of GB) otherwise keeps the port closed for minutes,
+    # and anything watchdogging the port hard-kills the process mid-load —
+    # the worst moment for the kernel wired-memory stranding in #2184.
+    # /health answers 503 with status "loading" until the preload finishes.
+    # Runs after the enforcer wiring above so the preload sees the final
+    # memory ceiling.
+    preload_task = None
+    if _server_state.engine_pool is not None:
+        _server_state.pinned_preload_complete = False
+
+        async def _preload_pinned() -> None:
+            try:
+                await _server_state.engine_pool.preload_pinned_models()
+            finally:
+                _server_state.pinned_preload_complete = True
+
+        preload_task = asyncio.create_task(_preload_pinned())
 
     # Start TTL-only checker if process memory enforcer is not running
     # (enforcer already includes TTL checks in its polling loop)
@@ -448,6 +468,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    if preload_task is not None and not preload_task.done():
+        # SIGTERM arrived while pinned models were still loading. Cancel the
+        # await; engine_pool.shutdown() below unloads whatever finished.
+        preload_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await preload_task
     get_server_metrics().save_alltime()
     if ttl_task is not None:
         ttl_task.cancel()
@@ -2106,8 +2132,13 @@ async def _with_json_keepalive(
 
 
 @app.get("/health")
-async def health():
-    """Health check endpoint."""
+async def health(response: Response):
+    """Health check endpoint.
+
+    Answers 503 with status "loading" while the startup pinned-model
+    preload is still running: the port is already bound (liveness for
+    watchdogs, #2184) but the server is not ready to serve those models.
+    """
     mcp_info = None
     if _server_state.mcp_manager is not None:
         connected = sum(
@@ -2139,8 +2170,11 @@ async def health():
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
 
+    loading = not _server_state.pinned_preload_complete
+    if loading:
+        response.status_code = 503
     return {
-        "status": "healthy",
+        "status": "loading" if loading else "healthy",
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,

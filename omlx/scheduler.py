@@ -3019,7 +3019,12 @@ class Scheduler:
         last_token = tokens[-1:]
         total_length = len(tokens)
 
-        input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
+        # Build the input row on the engine stream: the chunk forwards below
+        # run inside mx.stream(self._stream), and a worker-default-stream
+        # view would split the chunk eval graph across two streams (see the
+        # loop comment below).
+        with mx.stream(self._stream):
+            input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
         uid = self.request_id_to_uid.get(request.request_id)
 
@@ -3070,27 +3075,36 @@ class Scheduler:
                 request_id=request.request_id,
             )
 
-            model_kwargs: dict[str, Any] = {}
-            if embeds_array is not None and embeds_array.shape[1] > 0:
-                model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
-                if extra_kwargs:
-                    model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
-                        extra_kwargs, n_to_process
-                    )
-
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
             # fail at mx.eval with "There is no Stream(gpu, X) in current
-            # thread" (issue #2170).
+            # thread" (issue #2170). The chunk views (input slices, VLM embed
+            # slices, and the advance views for the next chunk) stay inside
+            # the same context: a worker-default-stream view splits the chunk
+            # eval graph across two streams and adds a per-chunk cross-stream
+            # fence, the synchronization pattern implicated in the #2197 and
+            # #2183 engine hangs on macOS 26.
             with mx.stream(self._stream):
+                model_kwargs: dict[str, Any] = {}
+                if embeds_array is not None and embeds_array.shape[1] > 0:
+                    model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
+                    if extra_kwargs:
+                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                            extra_kwargs, n_to_process
+                        )
                 self.model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
                     **model_kwargs,
                 )
                 mx.eval([c.state for c in prompt_cache])
+                input_arr = input_arr[:, n_to_process:]
+                if embeds_array is not None:
+                    embeds_array = embeds_array[:, n_to_process:]
+                    if extra_kwargs:
+                        extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -3100,11 +3114,6 @@ class Scheduler:
                 loop_label="external",
             )
 
-            input_arr = input_arr[:, n_to_process:]
-            if embeds_array is not None:
-                embeds_array = embeds_array[:, n_to_process:]
-                if extra_kwargs:
-                    extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             processed_tokens += n_to_process
 
             # Progress callback
@@ -3985,7 +3994,10 @@ class Scheduler:
 
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
-        input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
+        # Build the input row on the engine stream so chunk eval graphs stay
+        # single-stream (see _do_external_prefill, #2197/#2183).
+        with mx.stream(self._stream):
+            input_arr = mx.array(prefill_tokens)[None]  # (1, N-1)
 
         return _PrefillState(
             request=request,
@@ -4055,12 +4067,14 @@ class Scheduler:
             request_id=state.request.request_id,
         )
 
-        chunk = state.tokens_remaining[:, :n]
-        state.tokens_remaining = state.tokens_remaining[:, n:]
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
+        # The chunk views stay inside it for the same reason (single-stream
+        # chunk eval graph, #2197/#2183).
         with mx.stream(self._stream):
+            chunk = state.tokens_remaining[:, :n]
+            state.tokens_remaining = state.tokens_remaining[:, n:]
             self.model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()

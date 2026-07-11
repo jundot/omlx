@@ -1232,10 +1232,13 @@ class TestMetalWiredLimit:
                 patch.object(asyncio, "create_task", side_effect=_close_coro),
             ):
                 enforcer.start()
-        # balanced @ 512 GB static = 506 GB. The scheduler still clamps to the
-        # 128 GB effective cap, but MLX's wired limit is left untouched.
+        # balanced @ 512 GB static = 506 GB, clamped to the 5%-of-RAM
+        # recommendation reserve for the admin banner (#2184). The scheduler
+        # still clamps to the 128 GB effective cap, but MLX's wired limit is
+        # left untouched.
         mock_mx.set_wired_limit.assert_not_called()
-        assert enforcer._metal_wired_limit_request == 506 * 1024**3
+        total = 512 * 1024**3
+        assert enforcer._metal_wired_limit_request == total - total // 20
         assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
@@ -2428,3 +2431,93 @@ class TestDFlashGuardPropagation:
         engine.scheduler = scheduler
         entry = _make_entry("model-a", engine=engine)
         assert enforcer._resolve_scheduler(entry) is scheduler
+
+
+class TestWiredLimitSuggestionClamp:
+    """The recommended iogpu.wired_limit_mb must leave the OS headroom (#2184)."""
+
+    def _with_total(self, total):
+        return patch("omlx.settings.get_system_memory", return_value=total)
+
+    def test_suggestion_below_reserve_unchanged(self):
+        total = 512 * 1024**3
+        desired = 400 * 1024**3
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_near_physical_suggestion_clamped(self):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3  # safe-tier static ceiling: 504 GiB
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(desired)
+        # 5% of 512 GiB = 25.6 GiB reserve
+        assert clamped == total - total // 20
+        assert clamped < desired
+
+    def test_small_mac_recommendation_unchanged(self):
+        """Small-memory Macs keep the tier recommendation: 5% of RAM stays
+        below the tier static reserve there, so the clamp does not bite and
+        users can wire as much as before (#2184 targets large boxes)."""
+        total = 32 * 1024**3
+        desired = total - 2 * 1024**3  # custom tier ceiling: RAM - 2 GiB
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_desired_above_cap_clamps_to_cap(self):
+        total = 4 * 1024**3
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(8 * 1024**3)
+        assert clamped == total - total // 20
+
+    def test_log_hint_uses_clamped_value(self, caplog):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3
+        with (
+            self._with_total(total),
+            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=0),
+            patch.object(
+                pme,
+                "_get_max_metal_working_set_bytes",
+                return_value=384 * 1024**3,
+            ),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        hints = [r for r in caplog.records if "iogpu.wired_limit_mb=" in r.message]
+        assert hints
+        suggested_mb = (total - total // 20) // (1024**2)
+        assert f"iogpu.wired_limit_mb={suggested_mb}" in hints[0].getMessage()
+
+    def test_reasonable_user_cap_not_nagged(self, caplog):
+        """A user cap at the recommended level must not trigger the raise hint
+        even when the static ceiling is higher (the #2184 report followed the
+        old hint into a jetsam crash-loop)."""
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3  # 504 GiB ceiling
+        user_cap = total - total // 20  # exactly the recommendation
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        assert not [
+            r for r in caplog.records if "Raise it with" in r.message
+        ]
+
+    def test_near_physical_user_cap_warns_jetsam(self, caplog):
+        total = 512 * 1024**3
+        user_cap = total - 2 * 1024**3  # 510 GiB, the crash-loop setting
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(400 * 1024**3)
+        assert [r for r in caplog.records if "jetsam" in r.message]

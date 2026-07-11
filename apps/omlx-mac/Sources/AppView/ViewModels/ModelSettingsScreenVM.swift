@@ -424,67 +424,72 @@ final class ModelSettingsScreenVM {
             self.allModels = models
             if let m = models.first(where: { $0.id == modelID }) {
                 self.model = m
-                if let s = m.settings {
-                    self.alias = s.modelAlias ?? ""
-                    self.modelTypeOverride = s.modelTypeOverride ?? ""
-                    self.contextLength = s.maxContextWindow.map(String.init) ?? ""
-                    self.maxTokens = s.maxTokens.map(String.init) ?? ""
-                    self.temperature = s.temperature.map { String($0) } ?? ""
-                    self.topP = s.topP.map { String($0) } ?? ""
-                    self.topK = s.topK.map(String.init) ?? ""
-                    self.minP = s.minP.map { String($0) } ?? ""
-                    self.repetitionPenalty = s.repetitionPenalty.map { String($0) } ?? ""
-                    self.presencePenalty = s.presencePenalty.map { String($0) } ?? ""
-                    self.ttlSeconds = s.ttlSeconds.map(String.init) ?? ""
-                    self.enableThinking = s.enableThinking ?? true
-                    self.thinkingBudgetEnabled = s.thinkingBudgetEnabled ?? false
-                    self.thinkingBudgetTokens = s.thinkingBudgetTokens.map(String.init) ?? "8192"
-                    self.limitToolResults = (s.maxToolResultTokens ?? 0) > 0
-                    if let n = s.maxToolResultTokens, n > 0 {
-                        self.toolResultLimitTokens = String(n)
-                    }
-                    self.forceSampling = s.forceSampling ?? false
-                    self.isPinned = s.isPinned ?? false
-                    self.isFavorite = s.isFavorite ?? false
-                    self.trustRemoteCode = s.trustRemoteCode ?? false
-                    self.reasoningParser = s.reasoningParser ?? ""
-                    self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
-                        ChatTemplateKwargsCodec.decode(
-                            kwargs: s.chatTemplateKwargs,
-                            forced: s.forcedCtKwargs
-                        )
-                    )
-                    self.turboquantKvEnabled = s.turboquantKvEnabled ?? false
-                    self.turboquantKvBits = s.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
-                    self.indexCacheEnabled = s.indexCacheFreq != nil
-                    self.indexCacheFreq = s.indexCacheFreq.map(String.init) ?? "4"
-                    self.specprefillEnabled = s.specprefillEnabled ?? false
-                    self.specprefillDraftModel = s.specprefillDraftModel ?? ""
-                    self.specprefillKeepPct = s.specprefillKeepPct.map { Self.formatPct($0) } ?? "0.2"
-                    self.specprefillThreshold = s.specprefillThreshold.map(String.init) ?? "8192"
-                    self.dflashEnabled = s.dflashEnabled ?? false
-                    self.dflashDraftModel = s.dflashDraftModel ?? ""
-                    self.dflashDraftQuantEnabled = s.dflashDraftQuantEnabled ?? false
-                    self.dflashDraftQuantWeightBits = s.dflashDraftQuantWeightBits.map(String.init) ?? "4"
-                    self.dflashDraftQuantActivationBits = s.dflashDraftQuantActivationBits.map(String.init) ?? ""
-                    self.dflashDraftQuantGroupSize = s.dflashDraftQuantGroupSize.map(String.init) ?? ""
-                    self.dflashMaxCtx = s.dflashMaxCtx.map(String.init) ?? ""
-                    self.dflashVerifyMode = s.dflashVerifyMode ?? ""
-                    self.dflashDraftWindowSize = s.dflashDraftWindowSize.map(String.init) ?? ""
-                    self.dflashDraftSinkSize = s.dflashDraftSinkSize.map(String.init) ?? ""
-                    self.dflashInMemoryCache = s.dflashInMemoryCache ?? false
-                    self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s.dflashInMemoryCacheMaxBytes)
-                        .map(String.init) ?? "8"
-                    self.dflashInMemoryCacheMaxEntries = s.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
-                    self.dflashSsdCache = s.dflashSsdCache ?? false
-                    self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s.dflashSsdCacheMaxBytes)
-                        .map(String.init) ?? "20"
-                    self.mtpEnabled = s.mtpEnabled ?? false
-                    self.vlmMtpEnabled = s.vlmMtpEnabled ?? false
-                    self.vlmMtpDraftModel = s.vlmMtpDraftModel ?? ""
-                    self.vlmMtpDraftBlockSize = s.vlmMtpDraftBlockSize.map(String.init) ?? ""
-                    self.activeProfileName = s.activeProfileName
+                // A never-customized model has no settings record on the
+                // server, so `settings` arrives nil. Repopulate with the
+                // defaults anyway; skipping would leave edited values on
+                // screen after Discard (#2182).
+                let s = m.settings
+                self.alias = s?.modelAlias ?? ""
+                self.modelTypeOverride = s?.modelTypeOverride ?? ""
+                self.contextLength = s?.maxContextWindow.map(String.init) ?? ""
+                self.maxTokens = s?.maxTokens.map(String.init) ?? ""
+                self.temperature = s?.temperature.map { String($0) } ?? ""
+                self.topP = s?.topP.map { String($0) } ?? ""
+                self.topK = s?.topK.map(String.init) ?? ""
+                self.minP = s?.minP.map { String($0) } ?? ""
+                self.repetitionPenalty = s?.repetitionPenalty.map { String($0) } ?? ""
+                self.presencePenalty = s?.presencePenalty.map { String($0) } ?? ""
+                self.ttlSeconds = s?.ttlSeconds.map(String.init) ?? ""
+                self.enableThinking = s?.enableThinking ?? true
+                self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
+                self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
+                self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
+                if let n = s?.maxToolResultTokens, n > 0 {
+                    self.toolResultLimitTokens = String(n)
+                } else {
+                    self.toolResultLimitTokens = "4096"
                 }
+                self.forceSampling = s?.forceSampling ?? false
+                self.isPinned = s?.isPinned ?? false
+                self.isFavorite = s?.isFavorite ?? false
+                self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.reasoningParser = s?.reasoningParser ?? ""
+                self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
+                    ChatTemplateKwargsCodec.decode(
+                        kwargs: s?.chatTemplateKwargs,
+                        forced: s?.forcedCtKwargs
+                    )
+                )
+                self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
+                self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
+                self.indexCacheEnabled = s?.indexCacheFreq != nil
+                self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
+                self.specprefillEnabled = s?.specprefillEnabled ?? false
+                self.specprefillDraftModel = s?.specprefillDraftModel ?? ""
+                self.specprefillKeepPct = s?.specprefillKeepPct.map { Self.formatPct($0) } ?? "0.2"
+                self.specprefillThreshold = s?.specprefillThreshold.map(String.init) ?? "8192"
+                self.dflashEnabled = s?.dflashEnabled ?? false
+                self.dflashDraftModel = s?.dflashDraftModel ?? ""
+                self.dflashDraftQuantEnabled = s?.dflashDraftQuantEnabled ?? false
+                self.dflashDraftQuantWeightBits = s?.dflashDraftQuantWeightBits.map(String.init) ?? "4"
+                self.dflashDraftQuantActivationBits = s?.dflashDraftQuantActivationBits.map(String.init) ?? ""
+                self.dflashDraftQuantGroupSize = s?.dflashDraftQuantGroupSize.map(String.init) ?? ""
+                self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
+                self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
+                self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
+                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? ""
+                self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
+                self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s?.dflashInMemoryCacheMaxBytes)
+                    .map(String.init) ?? "8"
+                self.dflashInMemoryCacheMaxEntries = s?.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
+                self.dflashSsdCache = s?.dflashSsdCache ?? false
+                self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
+                    .map(String.init) ?? "20"
+                self.mtpEnabled = s?.mtpEnabled ?? false
+                self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
+                self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
+                self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
+                self.activeProfileName = s?.activeProfileName
             }
             self.profiles = (try? await client.listModelProfiles(id: modelID).profiles) ?? []
             self.templates = (try? await client.listProfileTemplates().templates) ?? []

@@ -118,7 +118,8 @@ def run_specprefill_draft_scoring(
                 existing_cache=draft_cache,
                 progress_callback=report_score_progress,
             )
-        selected_indices = select_chunks(importance, keep_pct=plan.keep_pct)
+            # Keep the lazy selection ops on the scoring stream (#2183, #2197).
+            selected_indices = select_chunks(importance, keep_pct=plan.keep_pct)
         scoring_seconds = time.monotonic() - scoring_started_at
 
         selected_token_count = selected_indices.shape[0]

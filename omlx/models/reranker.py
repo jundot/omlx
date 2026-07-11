@@ -330,6 +330,14 @@ class MLXRerankerModel:
            combined "<Instruct>/<Query>/<Document>" block — the exact content
            that _rerank_causal_lm reconstructs at scoring time.
         """
+        # Fail fast with a clear error when the tokenizer has no chat template
+        # at all — rendering would only produce an opaque downstream failure.
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is None:
+            raise ValueError(
+                f"Tokenizer for {self.model_name} has no chat template; "
+                f"cannot derive the CausalLM reranker prompt prefix/suffix."
+            )
+
         _SENTINEL = "<<__CONTENT_SENTINEL__>>"
         messages = [
             {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
@@ -350,9 +358,13 @@ class MLXRerankerModel:
 
         parts = standard_rendered.split(_SENTINEL)
         if len(parts) == 2:
+            suffix = parts[1]
             # Append <think> block for models that use the
-            # thinking-then-answering format
-            return parts[0], parts[1] + "<think>\n\n</think>\n\n"
+            # thinking-then-answering format, unless the template already
+            # emitted a think prefill of its own.
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            return parts[0], suffix
 
         native_affixes, native_rendered, native_error = (
             self._extract_reranker_native_affixes(tokenizer)
